@@ -3,7 +3,7 @@
 // The IMAGE mechanism (RasterImage + ImageDefinition) stores only a file path,
 // so a drawing copied to another machine loses its pictures. An OLE2FRAME
 // instead carries the encoded raster inside an OLE compound file embedded in
-// the entity data — the same mechanism AutoCAD uses for pasted pictures — so
+// the entity data, so
 // the .dwg is self-contained. cadcodec both builds the compound storage and
 // reads it back, and the renderer already paints OLE2FRAMEs via
 // ImageModel::from_ole2frame, so this module only packs and unpacks.

@@ -1,7 +1,7 @@
 // IMAGE / IMAGEEMBED commands — place a raster image in the drawing.
 //
-// IMAGE references the picture by path (RasterImage + ImageDefinition, like
-// AutoCAD's IMAGEATTACH); IMAGEEMBED packs the encoded raster inside the
+// IMAGE references the picture by path (RasterImage + ImageDefinition);
+// IMAGEEMBED packs the encoded raster inside the
 // drawing as an OLE2FRAME so the .dwg travels alone.
 //
 // Workflow (both commands):

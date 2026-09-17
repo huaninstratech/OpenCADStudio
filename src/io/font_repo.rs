@@ -8,14 +8,14 @@
 // from the community folder, where anyone can contribute (see
 // `fonts/README.md` in the repository root).
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use acadrust::CadDocument;
 
 /// The community folder's GitHub contents API (lists name + download URL).
 const REPO_API_URL: &str =
-    "https://api.github.com/repos/huaninstratech/OpenCADStudio/contents/fonts";
+    "https://api.github.com/repos/HakanSeven12/OpenCADStudio/contents/fonts";
+const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Local store for fonts downloaded from the community repository. Text
 /// resolution searches here after the drawing folder.
@@ -184,11 +184,11 @@ pub fn download_fonts(
         if response.status() != 200 {
             continue;
         }
-        let mut bytes = Vec::new();
-        response
+        let bytes = response
             .body_mut()
-            .as_reader()
-            .read_to_end(&mut bytes)
+            .with_config()
+            .limit(MAX_FONT_BYTES)
+            .read_to_vec()
             .map_err(|e| format!("Could not download {file}: {e}"))?;
         if bytes.is_empty() {
             continue;

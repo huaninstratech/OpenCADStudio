@@ -15,7 +15,7 @@ rendering with a mismatched substitute font.
 2. Giữ nguyên **tên file viết thường** như bản vẽ tham chiếu, ví dụ
    `vnarial.shx`, `romans.shx`, `simplex.shx`. Ứng dụng so khớp tên file
    không phân biệt hoa/thường.
-3. Định dạng hỗ trợ: `.shx` (AutoCAD compiled shape font).
+3. Định dạng hỗ trợ: `.shx` (compiled shape font).
 4. **Giấy phép / License**: chỉ đóng góp font bạn có quyền phân phối lại —
    font do bạn tự vẽ, font nguồn mở, hoặc font thuộc public domain.
    Ghi nguồn + giấy phép vào cuối file này theo mẫu bên dưới.

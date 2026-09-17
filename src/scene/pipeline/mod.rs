@@ -1,5 +1,22 @@
+// WGSL has no includes. Compose one shared draw-order function into each 2D
+// shader at compile time, including the sources used by shader validation tests.
+macro_rules! draw_order_shader {
+    ($file:literal) => {
+        concat!(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/shaders/draw_order.wgsl"
+            )),
+            "\n",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shaders/", $file))
+        )
+    };
+}
+
 #[cfg(test)]
 mod gpu_tests;
+#[cfg(test)]
+mod depth_tests;
 mod device_capabilities;
 pub mod circle_gpu;
 pub mod ellipse_gpu;
@@ -36,10 +53,10 @@ use crate::scene::model::image_model::ImageModel;
 use crate::scene::model::mesh_model::MeshLodSet;
 use crate::scene::model::wire_model::WireModel;
 
-/// Constant depth bias (in 24-bit quanta, toward the camera) the wipeout
-/// pipeline applies so a mask wins against geometry coincident at its own
-/// depth. Regression tests assert block text keeps more than this margin over
-/// wipes it is drawn after, so change both together.
+/// Worst-case raster depth bias (in 24-bit quanta, toward the camera) block
+/// text is required to clear. The wipeout pipeline currently carries no bias
+/// (see #1304), so this is a safety budget: the block-text regression asserts
+/// a larger margin over whatever bias the pipeline could reintroduce.
 pub const WIPEOUT_DEPTH_BIAS_QUANTA: i32 = 2;
 
 struct SilhouetteChunk {
@@ -620,18 +637,18 @@ impl Pipeline {
             label: Some("wire.shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(match wire_mode {
                 wire_gpu::WirePipelineMode::IndexedStorage => {
-                    include_str!("../../shaders/wire_indexed.wgsl")
+                    draw_order_shader!("wire_indexed.wgsl")
                 }
-                wire_gpu::WirePipelineMode::Packed => include_str!("../../shaders/wire.wgsl"),
+                wire_gpu::WirePipelineMode::Packed => draw_order_shader!("wire.wgsl"),
             })),
         });
         let block_wire_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("block_wire.shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
                 if wire_mode.uses_storage() {
-                    include_str!("../../shaders/block_wire_storage.wgsl")
+                    draw_order_shader!("block_wire_storage.wgsl")
                 } else {
-                    include_str!("../../shaders/block_wire.wgsl")
+                    draw_order_shader!("block_wire.wgsl")
                 },
             )),
         });
@@ -1017,8 +1034,8 @@ impl Pipeline {
 
         let wipeout_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wipeout.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/wipeout.wgsl"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
+                "wipeout.wgsl"
             ))),
         });
 
@@ -1044,22 +1061,15 @@ impl Pipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: content_stencil.clone(),
-                // Bias TOWARD the camera: a wipeout must win against geometry
-                // coincident at its own depth (a block's wipeout + shapes are
-                // coincident at Z=0), which only needs to break exact ties.
-                // Keep the constant SMALL: block siblings are separated by a
-                // few 24-bit depth quanta once their draw-order labels are
-                // compressed into the insert's band (half ≈ 0.001 → ~3 quanta
-                // per sibling step, ~9-16 quanta from a wipeout to text drawn
-                // after it). At -8 the bias ate that whole budget and the
-                // later-drawing text lost its own block's mask. -2 still wins
-                // ties (and the slope term covers tilted fills) while leaving
-                // the within-block ordering alive.
-                bias: wgpu::DepthBiasState {
-                    constant: WIPEOUT_DEPTH_BIAS_QUANTA,
-                    slope_scale: -1.0,
-                    clamp: 0.0,
-                },
+                // The shader already applies draw order, and #1304 showed a
+                // raster bias can jump across a block's narrow depth band and
+                // erase its foreground — so the bias stays at zero. Coincident
+                // ties still resolve toward the mask because it draws later
+                // under LessEqual. Block text keeps 9-16 depth quanta of
+                // margin over the wipes it is drawn after; if a raster bias
+                // ever returns here, WIPEOUT_DEPTH_BIAS_QUANTA is the budget
+                // the block-text regression asserts against.
+                bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
                 count: MSAA_SAMPLES,
@@ -1838,14 +1848,14 @@ impl Pipeline {
         // ── Face3D pipeline ────────────────────────────────────────────────
         let face3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("face3d.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/face3d.wgsl"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
+                "face3d.wgsl"
             ))),
         });
         let block_face3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("block_face3d.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/block_face3d.wgsl"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
+                "block_face3d.wgsl"
             ))),
         });
 
@@ -2050,8 +2060,8 @@ impl Pipeline {
 
         let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("image.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/image.wgsl"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
+                "image.wgsl"
             ))),
         });
 

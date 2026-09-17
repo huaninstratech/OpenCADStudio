@@ -183,7 +183,7 @@ pub struct SelectionEntity {
 }
 
 /// Association source with an optional sub-entity marker.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DimensionAssociationSource {
     pub handle: Handle,
     pub marker: Option<i32>,
@@ -1248,6 +1248,16 @@ pub struct CoincidentPick {
     pub whole_curve: bool,
 }
 
+/// The two input forms accepted by the Horizontal geometric constraint.
+/// Object picks are resolved while the entity snapshot is available; point
+/// picks are resolved by the host against the live document so two points on
+/// the same entity remain distinguishable.
+#[derive(Clone, Copy, Debug)]
+pub enum HorizontalConstraintSelection {
+    Reference(crate::scene::parametric_constraints::ParametricRef),
+    Points(CoincidentPick, CoincidentPick),
+}
+
 /// Construction options shared by SWEEP creation and its live preview.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SweepOptions {
@@ -1343,6 +1353,23 @@ pub enum DimensionBreakOperation {
     Object(Handle),
     Manual(DVec3, DVec3),
     Remove,
+}
+
+/// A transient dimension built for the placement preview.
+pub struct DimensionPreview {
+    pub entity: EntityType,
+    /// Keep the base dimension's style instead of the current one
+    /// (`DIMCONTINUE` / `DIMBASELINE` with `DIMCONTINUEMODE=1`).
+    pub preserve_base_style: bool,
+}
+
+impl DimensionPreview {
+    pub fn current_style(entity: EntityType) -> Self {
+        Self {
+            entity,
+            preserve_base_style: false,
+        }
+    }
 }
 
 /// Returned by every `CadCommand` method to tell main.rs what to do.
@@ -1475,6 +1502,39 @@ pub enum CmdResult {
         /// geometric kind.
         driving_param: Option<crate::scene::named_parameters::DrivingValue>,
         /// Undo-history label, e.g. `"Horizontal constraint"`.
+        label: &'static str,
+    },
+    /// Adds a Horizontal relation against the UCS X direction captured when
+    /// the command starts. The direction is persisted with the constraint so
+    /// later edits and save/reopen do not silently fall back to world X.
+    AddHorizontalConstraint {
+        selection: HorizontalConstraintSelection,
+        direction: acadrust::types::Vector3,
+        label: &'static str,
+    },
+    /// Adds an ordered perpendicular relation. The first picked direction and
+    /// the second direction's start point stay fixed during the initial solve;
+    /// those temporary anchors are not persisted as geometric constraints.
+    AddPerpendicularConstraint {
+        first: crate::scene::parametric_constraints::ParametricRef,
+        second: crate::scene::parametric_constraints::ParametricRef,
+        first_fixed: crate::scene::parametric_constraints::ParametricRef,
+        second_start: crate::scene::parametric_constraints::ParametricRef,
+        label: &'static str,
+    },
+    /// Adds an ordered tangent relation. The first picked reference stays
+    /// fixed during the initial solve and the second keeps its intrinsic
+    /// shape while it moves into tangency.
+    AddTangentConstraint {
+        first: crate::scene::parametric_constraints::ParametricRef,
+        second: crate::scene::parametric_constraints::ParametricRef,
+        label: &'static str,
+    },
+    /// Adds an ordered concentric relation. The first picked center remains
+    /// fixed during the initial solve while the second curve moves rigidly.
+    AddConcentricConstraint {
+        first: crate::scene::parametric_constraints::ParametricRef,
+        second: crate::scene::parametric_constraints::ParametricRef,
         label: &'static str,
     },
     /// Opens the Auto Constrain settings dialog from the selection prompt.
@@ -2245,7 +2305,30 @@ pub trait CadCommand: Send {
         CmdResult::Cancel
     }
 
-    /// Returns `true` when the command needs entity picking (hit-test) instead of point picking.
+    /// Supports acquiring dimension geometry through a paper-space viewport.
+    fn measures_through_viewports(&self) -> bool {
+        false
+    }
+
+    /// Definition points acquired so far, in the command's working space.
+    /// Used to retain references only for accepted measuring inputs.
+    fn dimension_acquired_points(&self) -> Vec<DVec3> {
+        Vec::new()
+    }
+
+    /// The next point places annotation rather than acquiring geometry.
+    fn dimension_placement_pending(&self) -> bool {
+        false
+    }
+
+    /// Dimensions the command would commit if the cursor were clicked now.
+    /// `None` means this stage has no committable dimension; an empty list
+    /// means the geometry is degenerate and nothing styled should be shown.
+    fn dimension_preview(&self, _cursor: DVec3) -> Option<Vec<DimensionPreview>> {
+        None
+    }
+
+    /// Needs entity hit-testing instead of point input.
     fn needs_entity_pick(&self) -> bool {
         false
     }
@@ -2609,6 +2692,12 @@ pub trait CadCommand: Send {
     /// Default: no-op.
     fn inject_picked_entity(&mut self, _entity: acadrust::EntityType) {}
 
+    /// The host undid one document step on the command's behalf
+    /// (`CmdResult::UndoDocument`) and the command stays active. Commands
+    /// that cache document entities (FILLET, CHAMFER) refresh them here so
+    /// the next pick sees the restored geometry. Default: no-op.
+    fn on_document_undone(&mut self, _document: &acadrust::CadDocument) {}
+
     /// Supply the tessellated surface area associated with the picked entity.
     /// Commands that measure mesh-backed objects can opt in without owning the
     /// scene's render cache.
@@ -2706,13 +2795,14 @@ mod constraint_registry_tests {
             "CPCONSTRAINT",
             "MPCONSTRAINT",
             "OCCONSTRAINT",
-            "HCONSTRAINT",
+            "GCHORIZONTAL",
             "VCONSTRAINT",
             "PCONSTRAINT",
             "QCONSTRAINT",
+            "GCPERPENDICULAR",
             "ECONSTRAINT",
             "TCONSTRAINT",
-            "NCONSTRAINT",
+            "GCCONCENTRIC",
             "NRCONSTRAINT",
             "LCONSTRAINT",
             "FXCONSTRAINT",

@@ -26,6 +26,7 @@ fn is_modal_blocked_key_msg(msg: &Message) -> bool {
             | Message::MTextCaretMove(_)
             | Message::DeleteSelected
             | Message::ToggleSnapEnabled
+            | Message::ToggleSnap3dEnabled
             | Message::ToggleGrid
             | Message::ToggleOrtho
             | Message::ToggleGridSnap
@@ -89,12 +90,14 @@ fn reorder_insertion_index(from: usize, to: usize, after: bool, len: usize) -> O
 }
 
 mod command;
+mod context_menu;
 mod dialog;
 mod dynamic;
 mod file;
 mod style;
 mod util;
 mod viewport;
+mod viewport_snap;
 
 impl OpenCADStudio {
     pub(in crate::app) fn reset_modal_geometry(&mut self) {
@@ -200,7 +203,12 @@ impl OpenCADStudio {
             Some(GeometricTolerance) => self.geometric_tolerance = None,
             // Closing (✕) discards edits made since the last Apply — matching the
             // style editors. Committing happens only through the Apply button.
-            Some(Aliases) => self.alias_editor_rows.clear(),
+            Some(Aliases) => {
+                self.alias_editor_rows.clear();
+                self.alias_pending_add = false;
+                self.alias_reset_confirm = false;
+                self.alias_close_confirm = false;
+            }
             Some(Shortcuts) => {
                 self.shortcut_editor_rows.clear();
                 self.shortcut_capture_row = None;
@@ -282,10 +290,24 @@ impl OpenCADStudio {
             if matches!(msg, Message::CommandEscape)
                 || matches!(&msg, Message::ShortcutPressed(key) if key.rsplit('+').next() == Some("ESCAPE"))
             {
+                // Esc backs out of a pending ALIASEDIT draft first, mirroring
+                // the shortcut editor's capture cancel; the next Esc closes.
+                if self.active_modal == Some(super::ModalKind::Aliases) && self.alias_pending_add
+                {
+                    return self.update(Message::AliasEditorDraftCancel);
+                }
                 return self.update(Message::CloseModal);
             }
             if is_modal_blocked_key_msg(&msg) {
                 return Task::none();
+            }
+        }
+        // The open right-click context menu owns the keyboard the same way:
+        // arrows / Enter / mnemonic letters drive it, any other key closes it
+        // and falls through to the command line (the behaviour of commercial solutions).
+        if self.context_menu_open() {
+            if let Some(task) = self.intercept_context_menu_key(&msg) {
+                return task;
             }
         }
         let task = self.update_inner(msg);
@@ -357,6 +379,7 @@ impl OpenCADStudio {
             self.block_palette.placing = None;
         }
         self.control_settle();
+        self.sync_spacemouse();
         task
     }
 
@@ -372,6 +395,48 @@ impl OpenCADStudio {
 
     fn update_inner(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            Message::SpaceMouseWake => self.on_spacemouse_wake(),
+            Message::SpaceMouseFrame(time) => {
+                self.spacemouse.frame(
+                    time.saturating_duration_since(self.start).as_secs_f64() * 1000.,
+                );
+                Task::none()
+            }
+            Message::SpaceMouseFocus(id, focused) => {
+                if Some(id) == self.main_window {
+                    self.spacemouse_focused = focused;
+                }
+                Task::none()
+            }
+            Message::SpaceMouseEnabled(enabled) => {
+                self.spacemouse_preferences.enabled = enabled;
+                Task::none()
+            }
+            Message::SpaceMouseMode(mode) => {
+                self.spacemouse_preferences.mode = mode;
+                Task::none()
+            }
+            Message::SpaceMousePanSpeed(speed) => {
+                self.spacemouse_preferences.pan_speed = speed.clamp(10, 300);
+                Task::none()
+            }
+            Message::SpaceMousePanReversed(reversed) => {
+                self.spacemouse_preferences.pan_reversed = reversed;
+                Task::none()
+            }
+            Message::SpaceMousePause => {
+                self.spacemouse_paused = !self.spacemouse_paused;
+                Task::none()
+            }
+            Message::SpaceMousePreferences => {
+                self.open_spacemouse_preferences();
+                Task::none()
+            }
+            Message::SpaceMouseDriverSettings => self.open_spacemouse_driver_settings(),
+            Message::SpaceMouseDetails => {
+                self.spacemouse_details = !self.spacemouse_details;
+                Task::none()
+            }
             Message::ControlRequest(envelope) => {
                 let (response, task) = self.control_request(envelope.request);
                 envelope.reply.send(response);
@@ -686,6 +751,14 @@ impl OpenCADStudio {
                     .unwrap_or("Snap");
                 self.command_line
                     .push_info(crate::tf!("Snap override: {label} (next pick only).").as_ref());
+                Task::none()
+            }
+
+            Message::SnapOverrideNone => {
+                self.snap_override_popup = None;
+                self.snapper.set_override_none();
+                self.command_line
+                    .push_info(crate::t!("Snap override: None (next pick only).").as_ref());
                 Task::none()
             }
 
@@ -1435,8 +1508,7 @@ impl OpenCADStudio {
             Message::ClearScene => {
                 let i = self.active_tab;
                 self.push_undo_snapshot(i, "CLEAR");
-                self.tabs[i].scene.clear();
-                crate::io::linetypes::populate_document(&mut self.tabs[i].scene.document);
+                self.tabs[i].scene.reset_to_new_drawing();
                 self.tabs[i].properties = PropertiesPanel::empty();
                 let doc_layers = self.tabs[i].scene.document.layers.clone();
                 let vp_info = self.tabs[i].scene.viewport_list();
@@ -1757,7 +1829,8 @@ impl OpenCADStudio {
                 // MTEXT bodies), where the typed case is the content and
                 // Space must stay in the buffer.
                 let text_with_spaces = self.is_free_text_active();
-                let s = if text_with_spaces {
+                let literal = self.command_line.literal_spaces || s.starts_with('>');
+                let s = if text_with_spaces || literal {
                     s
                 } else {
                     s.to_uppercase()
@@ -1774,7 +1847,7 @@ impl OpenCADStudio {
                     && s.contains(' ')
                 {
                     self.command_line.input = s;
-                    return Task::batch(vec![sweep, self.update(Message::CommandSubmit)]);
+                    return Task::batch(vec![sweep, self.on_command_submit()]);
                 }
                 let live_input = s.clone();
                 self.command_line.input = live_input.clone();
@@ -2319,6 +2392,10 @@ impl OpenCADStudio {
                 self.xref_manager.path_open ^= true;
                 self.xref_manager.attach_open = false;
                 self.xref_manager.refresh_open = false;
+                Task::none()
+            }
+            Message::XrefHelpOpen => {
+                self.active_modal = Some(super::ModalKind::XrefHelp);
                 Task::none()
             }
             Message::XrefManagerDismissMenus => {
@@ -3479,6 +3556,10 @@ impl OpenCADStudio {
                     return Task::none();
                 }
                 let was_click = !sel.right_dragging;
+                // How long the button was held, for the time-sensitive mode.
+                let held_ms = sel
+                    .right_press_time
+                    .map_or(0, |t| t.elapsed().as_millis() as i32);
                 sel.right_down = false;
                 sel.right_press_pos = None;
                 sel.right_press_time = None;
@@ -3503,21 +3584,43 @@ impl OpenCADStudio {
                     drop(sel);
                     return self.update(Message::CommandFinalize);
                 }
-                // A right-click (no orbit). While a command is active the first
-                // right-click acts as Enter (commit / close); a second
-                // consecutive right-click opens the context menu instead. When
-                // idle it always opens the menu. (Right-drag, handled above,
-                // always orbits.) Any other interaction — a left-click pick or a
-                // new command — resets the cycle so the next right-click is Enter.
-                if self.tabs[i].active_cmd.is_some() && !sel.right_click_entered {
+                // A right-click. What it does is the user's choice (Options →
+                // User Preferences, SHORTCUTMENU in commercial solutions):
+                //  • Shortcut menu — always open the context menu, whose
+                //    default row (Enter / Repeat) sits under the pointer.
+                //  • Time-sensitive — a quick click is Enter while a command
+                //    runs (repeat the last command when idle); a held click
+                //    opens the menu.
+                //  • Enter first — while a command is active the first
+                //    right-click acts as Enter and a second consecutive one
+                //    opens the menu; idle always opens the menu. Any other
+                //    interaction — a left-click pick or a new command — resets
+                //    that cycle so the next right-click is Enter again.
+                let has_cmd = self.tabs[i].active_cmd.is_some();
+                let open_menu = match self.right_click_mode {
+                    super::settings::RightClickMode::ShortcutMenu => true,
+                    super::settings::RightClickMode::TimeSensitive => {
+                        held_ms >= self.right_click_hold_ms
+                    }
+                    super::settings::RightClickMode::EnterFirst => {
+                        !(has_cmd && !sel.right_click_entered)
+                    }
+                };
+                if !open_menu {
                     sel.right_click_entered = true;
                     drop(sel);
+                    // CommandFinalize is Enter during a command and "repeat
+                    // the last command" when idle — exactly the quick
+                    // right-click.
                     return self.update(Message::CommandFinalize);
                 }
                 sel.right_click_entered = false;
-                sel.context_menu = Some(click_pos);
-                sel.draworder_submenu = false;
-                Task::none()
+                sel.open_context_menu(click_pos);
+                drop(sel);
+                // Take the keyboard away from the command-line field so keys
+                // reach the menu through the global subscription; the field
+                // is re-focused when the menu closes.
+                self.unfocus_widgets()
             }
 
             Message::ViewportMiddlePress => self.on_viewport_middle_press(),
@@ -3732,6 +3835,11 @@ impl OpenCADStudio {
                 self.snapper.toggle_global();
                 self.sync_vport_display(self.active_tab);
                 self.persist_settings_if_changed();
+                Task::none()
+            }
+            Message::ToggleSnap3dEnabled => {
+                self.snapper.toggle_snap3d();
+                self.sync_vport_display(self.active_tab);
                 Task::none()
             }
             Message::ToggleGridSnap => {
@@ -4516,6 +4624,63 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
+            Message::DraftingSettingsSnapXChanged(value) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.snap_x_input = value.clone();
+                    if state.snap_equal {
+                        state.snap_y_input = value;
+                    }
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsSnapYChanged(value) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.snap_y_input = value.clone();
+                    if state.snap_equal {
+                        state.snap_x_input = value;
+                    }
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsGridXChanged(value) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.grid_x_input = value;
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsGridYChanged(value) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.grid_y_input = value;
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsGridMajorChanged(value) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.grid_major_input = value;
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsToggleAdaptiveGrid => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.grid_adaptive = !state.grid_adaptive;
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsToggleBeyondLimits => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.grid_beyond_limits = !state.grid_beyond_limits;
+                }
+                Task::none()
+            }
+            Message::DraftingSettingsToggleEqualSnap => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    state.snap_equal = !state.snap_equal;
+                    if state.snap_equal {
+                        state.snap_y_input = state.snap_x_input.clone();
+                    }
+                }
+                Task::none()
+            }
             Message::DraftingSettingsToggleIsometric => {
                 if let Some(state) = &mut self.drafting_settings_state {
                     state.isometric = !state.isometric;
@@ -4567,6 +4732,14 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
+            Message::DraftingSettingsToggleSnapMode3d(snap_type) => {
+                if let Some(state) = &mut self.drafting_settings_state {
+                    if !state.snap3d_modes.remove(&snap_type) {
+                        state.snap3d_modes.insert(snap_type);
+                    }
+                }
+                Task::none()
+            }
             Message::DraftingSettingsSnapSelectAll => {
                 if let Some(state) = &mut self.drafting_settings_state {
                     for &(snap_type, _, _) in crate::snap::ALL_SNAP_MODES {
@@ -4606,17 +4779,19 @@ impl OpenCADStudio {
                 Task::none()
             }
             Message::DraftingSettingsApply => {
-                self.apply_drafting_settings();
-                self.drafting_settings_saved = self.drafting_settings_state.clone();
-                self.persist_settings_if_changed();
+                if self.apply_drafting_settings() {
+                    self.drafting_settings_saved = self.drafting_settings_state.clone();
+                    self.persist_settings_if_changed();
+                }
                 Task::none()
             }
             Message::DraftingSettingsOk => {
-                self.apply_drafting_settings();
-                self.drafting_settings_saved = self.drafting_settings_state.clone();
-                self.drafting_settings_close_confirm = false;
-                self.persist_settings_if_changed();
-                self.close_active_modal();
+                if self.apply_drafting_settings() {
+                    self.drafting_settings_saved = self.drafting_settings_state.clone();
+                    self.drafting_settings_close_confirm = false;
+                    self.persist_settings_if_changed();
+                    self.close_active_modal();
+                }
                 Task::none()
             }
             Message::DraftingSettingsClose => {
@@ -5207,12 +5382,9 @@ impl OpenCADStudio {
                 self.post_editor_closed(committed)
             }
 
-            Message::DrawOrderSubmenuToggle => {
-                let i = self.active_tab;
-                let mut sel = self.tabs[i].scene.selection.borrow_mut();
-                sel.draworder_submenu = !sel.draworder_submenu;
-                Task::none()
-            }
+            Message::ContextMenuPick(action) => self.on_context_menu_pick(action),
+            Message::ContextMenuSubmenuToggle(id) => self.on_context_menu_submenu_toggle(id),
+            Message::ContextMenuNavigate(nav) => self.on_context_menu_navigate(nav),
 
             Message::DrawOrderPickRef(above) => {
                 let i = self.active_tab;
@@ -6620,6 +6792,9 @@ impl OpenCADStudio {
                     .collect();
                 rows.sort_by(|a, b| a.0.cmp(&b.0));
                 self.alias_editor_rows = rows;
+                self.alias_pending_add = false;
+                self.alias_reset_confirm = false;
+                self.alias_close_confirm = false;
                 self.active_modal = Some(super::ModalKind::Aliases);
                 Task::none()
             }
@@ -6634,23 +6809,78 @@ impl OpenCADStudio {
                         AliasField::Command => rowdata.1 = value,
                     }
                 }
+                // Typing never finishes the addition — only the draft row's
+                // check button does, so no half-visible "ghost" row appears.
                 Task::none()
             }
             Message::AliasEditorAdd => {
-                self.alias_editor_rows.push((String::new(), String::new()));
+                if self.alias_pending_add {
+                    // One draft at a time: keep the existing top draft.
+                } else {
+                    // The draft row goes to the top of the list so it is
+                    // visible without scrolling.
+                    self.alias_editor_rows
+                        .insert(0, (String::new(), String::new()));
+                    self.alias_pending_add = true;
+                }
+                Task::none()
+            }
+            Message::AliasEditorDraftAccept => {
+                // The check button: finish the addition (keep the row in the
+                // working table) without applying it. Only complete drafts
+                // can be accepted — the button is disabled otherwise.
+                self.finish_pending_alias_add();
+                Task::none()
+            }
+            Message::AliasEditorDraftCancel => {
+                // Esc backs out and abandons an unfinished draft.
+                if self.alias_pending_add && !self.alias_editor_rows.is_empty() {
+                    self.alias_editor_rows.remove(0);
+                    self.alias_pending_add = false;
+                }
                 Task::none()
             }
             Message::AliasEditorRemove(idx) => {
                 if idx < self.alias_editor_rows.len() {
                     self.alias_editor_rows.remove(idx);
                 }
+                if idx == 0 {
+                    // Removing the draft row is the ✕ cancel path.
+                    self.alias_pending_add = false;
+                }
                 Task::none()
             }
             Message::AliasEditorApply => {
-                self.apply_alias_editor_rows();
+                self.finish_alias_editor();
+                Task::none()
+            }
+            Message::AliasEditorApplyExit => {
+                self.finish_alias_editor();
+                self.close_active_modal();
+                Task::none()
+            }
+            Message::AliasEditorResetAsk => {
+                self.alias_reset_confirm = true;
+                Task::none()
+            }
+            Message::AliasEditorResetDeny => {
+                self.alias_reset_confirm = false;
+                Task::none()
+            }
+            Message::AliasEditorResetConfirm => {
+                self.reset_aliases_to_defaults();
                 self.command_line.push_info(
                     crate::tf!("{} alias(es) applied.", self.command_aliases.len()).as_ref(),
                 );
+                Task::none()
+            }
+            Message::AliasEditorCloseDiscard => {
+                self.alias_close_confirm = false;
+                self.close_active_modal();
+                Task::none()
+            }
+            Message::AliasEditorCloseKeep => {
+                self.alias_close_confirm = false;
                 Task::none()
             }
 
@@ -7049,6 +7279,18 @@ impl OpenCADStudio {
                 Task::none()
             }
 
+            Message::RightClickModeChanged(mode) => {
+                self.right_click_mode = mode;
+                self.persist_settings_if_changed();
+                Task::none()
+            }
+
+            Message::RightClickHoldMsChanged(ms) => {
+                self.right_click_hold_ms = super::settings::clamp_right_click_hold_ms(ms);
+                self.persist_settings_if_changed();
+                Task::none()
+            }
+
             Message::TextEditModeChanged(single) => {
                 self.texteditmode = single;
                 self.persist_settings_if_changed();
@@ -7303,6 +7545,14 @@ impl OpenCADStudio {
                     return Task::none();
                 }
                 self.shortcut_close_confirm = false;
+                if self.active_modal == Some(super::ModalKind::Aliases)
+                    && !self.alias_close_confirm
+                    && self.alias_editor_dirty()
+                {
+                    self.alias_close_confirm = true;
+                    return Task::none();
+                }
+                self.alias_close_confirm = false;
                 if self.active_modal == Some(super::ModalKind::DraftingSettings)
                     && !self.drafting_settings_close_confirm
                     && self.drafting_settings_dirty()
@@ -8448,14 +8698,6 @@ impl OpenCADStudio {
             Message::PlotExportPath(None) => Task::none(),
             Message::PlotExportPath(Some(path)) => self.on_plot_export_path_some(path),
 
-            Message::PlotFormat(f) => {
-                self.plot_format = f;
-                Task::none()
-            }
-            Message::PlotOrientation(o) => {
-                self.plot_orientation = o;
-                Task::none()
-            }
             Message::PlotWindowExport => {
                 let i = self.active_tab;
                 let stem = self.tabs[i]
@@ -9786,6 +10028,14 @@ mod free_text_entry_tests {
             "Space submitted the line"
         );
         assert_eq!(app.text_entry_mode(), TextEntryMode::Command);
+    }
+
+    #[test]
+    fn literal_command_input_preserves_case() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.update(Message::CommandInput(">Plugin MixedCase".into()));
+        assert_eq!(app.command_line.input, ">Plugin MixedCase");
     }
 }
 

@@ -1,5 +1,4 @@
 use crate::command::CadCommand;
-use crate::io::linetypes;
 use crate::modules::draw::modify::block_edit::BlockEditSession;
 use crate::modules::draw::modify::refedit::RefEditSession;
 use crate::scene::pick::grip::GripEdit;
@@ -33,7 +32,7 @@ pub(super) enum DynComponent {
     Z,
     /// Linear distance from the last point.
     Distance,
-    /// Angle from the last point, in degrees.
+    /// Angle from the last point, displayed and entered in the drawing's units.
     Angle,
     /// A scalar the command reads from the command line (a count, a radius,
     /// a delta). Typed-only — it has no geometric live value derived from
@@ -146,6 +145,12 @@ pub(super) struct DocumentTab {
     pub(super) selected_grip_handles: Vec<Handle>,
     /// Shift-selected grips, keyed by entity and object-local grip id.
     pub(super) hot_grips: rustc_hash::FxHashSet<(Handle, usize)>,
+    /// Grip-mode "Copy" toggle (context menu): each grip placement leaves the
+    /// original in place and adds a modified copy, until Enter / Esc.
+    pub(super) grip_copy: bool,
+    /// Grip-mode "Base Point" (context menu): the next left-click re-bases
+    /// the active grip edit instead of committing it.
+    pub(super) grip_base_pending: bool,
     pub(super) selected_handle: Option<Handle>,
     /// Dynamic-block visibility grip for the current single selection.
     pub(super) visibility_grip: Option<super::visibility::VisibilityGrip>,
@@ -225,6 +230,9 @@ pub(super) struct DocumentTab {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(super) plugin_state: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
     pub(super) suspended_cmd: Option<Box<dyn CadCommand>>,
+    /// `suspended_cmd` was parked by a transparent command (`'ZOOM`) and is
+    /// restored as soon as the transparent one ends.
+    pub(super) transparent_resume: bool,
 }
 
 impl DocumentTab {
@@ -558,24 +566,7 @@ impl DocumentTab {
 
     pub(super) fn new_drawing(n: usize) -> Self {
         let mut scene = Scene::new();
-        linetypes::populate_document(&mut scene.document);
-        // Paper layouts start as A4 landscape.
-        for obj in scene.document.objects.values_mut() {
-            if let acadrust::objects::ObjectType::Layout(l) = obj {
-                if l.name != "Model" {
-                    l.min_limits = (0.0, 0.0);
-                    l.max_limits = (297.0, 210.0);
-                    l.min_extents = (0.0, 0.0, 0.0);
-                    l.max_extents = (297.0, 210.0, 0.0);
-                    l.paper_width = 297.0;
-                    l.paper_height = 210.0;
-                    l.plot_paper_units = 1;
-                    l.plot_scale_numerator = 1.0;
-                    l.plot_scale_denominator = 1.0;
-                    l.paper_size = "ISO_A4_(297.00_x_210.00_MM)".into();
-                }
-            }
-        }
+        scene.populate_new_drawing_defaults();
         Self {
             id: NEXT_DOCUMENT_TAB_ID.fetch_add(1, Ordering::Relaxed),
             scene,
@@ -601,6 +592,8 @@ impl DocumentTab {
             selected_grips: vec![],
             selected_grip_handles: vec![],
             hot_grips: rustc_hash::FxHashSet::default(),
+            grip_copy: false,
+            grip_base_pending: false,
             selected_handle: None,
             visibility_grip: None,
             wireframe: false,
@@ -634,6 +627,7 @@ impl DocumentTab {
             zoom_dynamic_mode: false,
             plugin_state: HashMap::new(),
             suspended_cmd: None,
+            transparent_resume: false,
         }
     }
 
