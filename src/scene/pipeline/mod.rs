@@ -36,6 +36,12 @@ use crate::scene::model::image_model::ImageModel;
 use crate::scene::model::mesh_model::MeshLodSet;
 use crate::scene::model::wire_model::WireModel;
 
+/// Constant depth bias (in 24-bit quanta, toward the camera) the wipeout
+/// pipeline applies so a mask wins against geometry coincident at its own
+/// depth. Regression tests assert block text keeps more than this margin over
+/// wipes it is drawn after, so change both together.
+pub const WIPEOUT_DEPTH_BIAS_QUANTA: i32 = 2;
+
 struct SilhouetteChunk {
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
@@ -1038,13 +1044,19 @@ impl Pipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: content_stencil.clone(),
-                // Bias TOWARD the camera: a wipeout must win against geometry at
-                // its own depth (a block's wipeout + shapes are coincident at
-                // Z=0). A positive bias pushed the mask behind, so LessEqual
-                // rejected it and the geometry showed through. Tiny enough that
-                // meaningfully-nearer geometry still occludes the mask.
+                // Bias TOWARD the camera: a wipeout must win against geometry
+                // coincident at its own depth (a block's wipeout + shapes are
+                // coincident at Z=0), which only needs to break exact ties.
+                // Keep the constant SMALL: block siblings are separated by a
+                // few 24-bit depth quanta once their draw-order labels are
+                // compressed into the insert's band (half ≈ 0.001 → ~3 quanta
+                // per sibling step, ~9-16 quanta from a wipeout to text drawn
+                // after it). At -8 the bias ate that whole budget and the
+                // later-drawing text lost its own block's mask. -2 still wins
+                // ties (and the slope term covers tilted fills) while leaving
+                // the within-block ordering alive.
                 bias: wgpu::DepthBiasState {
-                    constant: -8,
+                    constant: WIPEOUT_DEPTH_BIAS_QUANTA,
                     slope_scale: -1.0,
                     clamp: 0.0,
                 },
