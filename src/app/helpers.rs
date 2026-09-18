@@ -291,6 +291,29 @@ pub(super) fn drafting_axes(
     (direction(a), direction(b), z.normalize_or(x.cross(y)))
 }
 
+/// `drafting_axes` restricted to what may rotate the grid overlay: the UCS
+/// plane plus the snap angle. The isometric plane is a drawing aid — it turns
+/// the crosshair/polar directions while drawing — and must not rotate the
+/// grid or its coloured axis lines, which have to keep matching the UCS icon.
+/// A grid rotated onto the isoplane fans parallel grid lines across the whole
+/// viewport in perspective views and draws the red/green axis lines
+/// vertical/diagonal while the icon still shows 0°/90°.
+pub(super) fn grid_axes(
+    x: glam::DVec3,
+    y: glam::DVec3,
+    z: glam::DVec3,
+    snap_angle_deg: f32,
+) -> (glam::DVec3, glam::DVec3, glam::DVec3) {
+    drafting_axes(
+        x,
+        y,
+        z,
+        false,
+        super::settings::IsoPlane::default(),
+        snap_angle_deg,
+    )
+}
+
 /// Constrain `pt` to the nearest live drafting direction from `base`.
 pub(super) fn drafting_constrain(
     pt: glam::DVec3,
@@ -576,4 +599,50 @@ pub(super) fn build_window_icon() -> Option<Vec<u8>> {
     .pre_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Some(pixmap.take())
+}
+
+#[cfg(test)]
+mod grid_axes_tests {
+    use super::super::settings::IsoPlane;
+    use super::{drafting_angles, drafting_axes, grid_axes};
+    use glam::DVec3;
+
+    const X: DVec3 = DVec3::new(1.0, 0.0, 0.0);
+    const Y: DVec3 = DVec3::new(0.0, 1.0, 0.0);
+    const Z: DVec3 = DVec3::new(0.0, 0.0, 1.0);
+
+    fn close(a: DVec3, b: DVec3) -> bool {
+        (a - b).length() < 1e-9
+    }
+
+    /// The bs33 screenshot regression: with isometric drafting on the Left
+    /// isoplane, the grid's red X axis drew vertical (90°) and the green Y
+    /// axis at 150° while the UCS icon still showed 0°/90°. The grid overlay
+    /// must keep following the UCS whatever the isoplane does; only the
+    /// drawing-aid axes rotate onto the isoplane.
+    #[test]
+    fn grid_axes_stay_on_the_ucs_under_isometric_drafting() {
+        // The drawing-aid pair does rotate onto the isoplane…
+        assert_eq!(
+            drafting_angles(true, IsoPlane::Left, 0.0),
+            [90.0, 150.0]
+        );
+        let (ix, _, _) = drafting_axes(X, Y, Z, true, IsoPlane::Left, 0.0);
+        assert!(close(ix, Y), "isoplane X' = {ix:?}, want vertical Y");
+
+        // …but the grid axes must not.
+        let (gx, gy, gz) = grid_axes(X, Y, Z, 0.0);
+        assert!(close(gx, X) && close(gy, Y) && close(gz, Z));
+    }
+
+    /// SNAPANG keeps rotating the grid — that part matches AutoCAD.
+    #[test]
+    fn snap_angle_still_rotates_the_grid() {
+        let (gx, gy, gz) = grid_axes(X, Y, Z, 30.0);
+        let r = 30f64.to_radians();
+        let r2 = 120f64.to_radians();
+        assert!(close(gx, DVec3::new(r.cos(), r.sin(), 0.0)));
+        assert!(close(gy, DVec3::new(r2.cos(), r2.sin(), 0.0)));
+        assert!(close(gz, Z));
+    }
 }

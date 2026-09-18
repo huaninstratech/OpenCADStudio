@@ -397,14 +397,11 @@ impl OpenCADStudio {
             let (vw, vh) = tab.scene.selection.borrow().vp_size;
             let model_basis = {
                 let (o, ux, uy, uz) = tab.ucs_xform().axes();
-                let (ux, uy, uz) = super::helpers::drafting_axes(
-                    ux,
-                    uy,
-                    uz,
-                    self.isometric_drafting,
-                    self.iso_plane,
-                    self.snap_angle_deg,
-                );
+                // Grid + coloured axis lines follow the UCS and the snap angle
+                // only; the isometric plane is a drawing aid and must not
+                // rotate them (they have to keep matching the UCS icon).
+                let (ux, uy, uz) =
+                    super::helpers::grid_axes(ux, uy, uz, self.snap_angle_deg);
                 (o, (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()))
             };
             // The first paper frame spends seconds in this block and `grid`
@@ -433,12 +430,12 @@ impl OpenCADStudio {
                         model_basis
                     };
                     if is_paper {
-                        let (ux, uy, uz) = super::helpers::drafting_axes(
+                        // Same policy as the model grid: snap angle rotates the
+                        // grid, the isoplane does not.
+                        let (ux, uy, uz) = super::helpers::grid_axes(
                             axes.0.as_dvec3(),
                             axes.1.as_dvec3(),
                             axes.2.as_dvec3(),
-                            self.isometric_drafting,
-                            self.iso_plane,
                             self.snap_angle_deg,
                         );
                         axes = (ux.as_vec3(), uy.as_vec3(), uz.as_vec3());
