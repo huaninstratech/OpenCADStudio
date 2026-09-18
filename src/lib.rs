@@ -20,6 +20,7 @@ pub mod par;
 pub mod patreon;
 pub mod perf;
 pub mod plugin;
+pub mod rest;
 pub mod scene;
 pub mod snap;
 pub mod sys;

@@ -6,7 +6,7 @@
 
 use OpenCADStudio::app;
 #[cfg(not(target_arch = "wasm32"))]
-use OpenCADStudio::{cli, io, mcp};
+use OpenCADStudio::{cli, io, mcp, rest};
 #[cfg(target_arch = "wasm32")]
 use OpenCADStudio::sys;
 
@@ -92,6 +92,10 @@ fn main() -> iced::Result {
         }
 
         // Headless modes exit without ever creating a window.
+        if let Some(port) = args.http {
+            rest::serve(port);
+            return Ok(());
+        }
         if args.serve {
             // `app::serve` reads --port itself from the raw args.
             app::serve();
