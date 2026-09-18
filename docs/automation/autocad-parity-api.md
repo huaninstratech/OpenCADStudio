@@ -30,8 +30,8 @@ completeness), **P2** (niche or deliberately out of scope).
 | `Application.DocumentManager` (MDI), `Document`, `MdiActiveDocument` | Exists — `{"op":"state"}` returns `documents[]` + `document_id`; `new`/`open`/`activate` switch tabs. |
 | `Document.LockDocument()` | N/A — single-writer dispatcher with request idempotency replaces it. |
 | `Document.SendStringToExecute` | Exists — `run` / `start` + `input`. |
-| `Document.Close`, `DocumentCollection.CloseAll` | **Proposed P1** — `{"op":"close","document_id":N,"discard":true}`; today a document can only be replaced, never closed. |
-| `Application.GetSystemVariable / SetSystemVariable` | Partial — `header` op exposes a fixed set (current layer/style, ltscale, pdmode, annotation scale). **Proposed P1** — `{"op":"sysvar","names":[...]}` / `{"op":"sysvar","name":"...","value":...}` over a generated registry of supported variables. |
+| `Document.Close`, `DocumentCollection.CloseAll` | **Shipped** — `{"op":"close","document_id":N,"discard":true}`; a dirty document is refused without `discard`, the last tab is replaced by a fresh drawing. |
+| `Application.GetSystemVariable / SetSystemVariable` | **Shipped** — `{"op":"sysvar","get":[…]}` / `{"op":"sysvar","set":{…}}` over the readable registry (`ltscale`, `clayer`, `ctextstyle`, `celtscale`, `textsize`, `filletrad`, `mirrtext`, `insunits`, `osmode`, `pdmode`, `pdsize`, `extmin`, `extmax`); the writable subset applies atomically and `clayer`/`ctextstyle` validate against the tables. |
 | File identity (`SPMDOCUNIQUE`, Catalog §1.6) | Partial — header/summary records are readable; **Proposed P1** — stable `file_identity` (GUID) surfaced in `state` and stored per document. |
 
 ## 2. Working with objects and the database (AcDbMgd) — the core gap
@@ -48,12 +48,12 @@ completeness), **P2** (niche or deliberately out of scope).
 
 | .NET API | OpenCAD status |
 |---|---|
-| `Editor.SelectCrossingWindow` + `SelectionFilter` (TypedValue lists) | Exists — `select` (handles/type/layer) and `query` with `layer`, `type`, `handles`, world-XY `bounds`, `near` (kernel distance ranking), `contains_point`, exact `intersections`. TypedValue-style cross-object filters (`where` on any property path) exist for records; **Proposed P1** — the same `where` filter list on `query` entities. |
+| `Editor.SelectCrossingWindow` + `SelectionFilter` (TypedValue lists) | Exists — `select` (handles/type/layer) and `query` with `layer`, `type`, `handles`, world-XY `bounds`, `near` (kernel distance ranking), `contains_point`, exact `intersections`. **Shipped** — the TypedValue-style `where` filter list on `query` entities: RFC 6901 property pointers with `eq/ne/lt/lte/gt/gte/contains/starts_with/ends_with/in/exists/not_exists`, AND-combined, validated up front; also on REST `GET /entities?where=`. |
 | Point-in-polyline (`MPolygon`, Catalog §3.6) | Exists — `contains_point` over closed planar curves. |
 | Curve/curve intersections, nearest point, length/area | Exists — `query intersections`, `near` + `measure` (kernel). |
 | Polyline segment extraction (Catalog §3.7) | Exists — `query detail:"full"` exposes vertices/properties; **Proposed P2** — arc-segment bulge normalization if clients need exact arc data in one call. |
-| Hatch boundary extraction (Catalog §3.8) | **Proposed P1** — `query` on Hatch returns loop definitions under `properties`; document the shape. |
-| Named selection sets with filters | **Proposed P2** — `selection_sets` create/list/reuse; today clients re-send the filter. |
+| Hatch boundary extraction (Catalog §3.8) | **Shipped** — `query` on Hatch exposes the loop definitions under `properties` so boundaries read back like any record. |
+| Named selection sets with filters | **Shipped** — `selection_set_save` / `selection_set_load` (`select:true` recalls as the current selection); session-scoped by design, like a held `SelectionSet` object id. |
 
 ### 2.3 Create / modify / erase (the main missing DatabaseServices surface)
 
@@ -64,11 +64,11 @@ completeness), **P2** (niche or deliberately out of scope).
 | `entity.TransformBy / Matrix3d` (move/copy/rotate/scale/mirror/array) | **Shipped** — `entities_transform` — `entities_transform` with `action` ∈ `move\|copy\|rotate\|scale\|mirror\|array`, `handles`, and action parameters (displacement, center+angle, base+factor, axis, rows/columns/spacing). Copy returns the new handles. Today these are reachable only through interactive command syntax via `run`. |
 | `entity.LayerId = …` before append (create-if-missing, Catalog §1.4) | Partial — `layers` + `records` can create layer records; **Proposed P0 nicety** — `entities_create` accepts `"create_layers":true`. |
 | `BlockTableRecord` + `AppendEntity` into a block (Catalog §2.3) | **Shipped** — `block_define` — `block_define` `{"name":"…","base":[x,y,z],"handles":[…]}` creates a definition from existing entities and optionally places one `Insert`; result returns definition + insert handles. |
-| `DeepCloneObjects` / `CopyObjects` between databases | Partial — `wblock` (shipped) clones to a *file*; **Proposed P1** — `entities_copy_to` targeting another open `document_id`, and `wblock` gaining `"template":"…dwt"` (Catalog §2.1) so the new database inherits the template's tables/styles. |
-| New database from template (`DocumentManager.Add(dwt)`, Catalog §2.1–2.2) | **Proposed P1** — `new` gaining `"template":"path.dwt"` and `save` gaining `"format":"dwt"`. |
+| `DeepCloneObjects` / `CopyObjects` between databases | **Shipped** — `wblock` clones to a *file* (with `"template"` the new database inherits that file's tables/styles, Catalog §2.1) and `entities_copy_to` clones into another open `document_id`, carrying the referenced layer definitions along. |
+| New database from template (`DocumentManager.Add(dwt)`, Catalog §2.1–2.2) | **Shipped** — `new` accepts `"template":"path.dwt"` (a `.dwt` is DWG bytes; `save` to a `*.dwt` path writes the template through a scratch file renamed into place, holding no lock); REST `POST /documents` with an empty body is `Add()` — a fresh document in its own tab. |
 | `XData` / `RegAppTable` (Catalog §1.5–1.6) | **Shipped** — `xdata_set`/`xdata_get`; entity records also expose `extended_data` — `xdata_set` `{"handles":[…],"app":"SPM","data":{"1000":"tag","1070":42}}` with implicit RegApp registration, and `xdata_get`/`xdata_clear`. This is SPM's marking mechanism and several workflows depend on it. |
-| `Group` dictionary | **Proposed P2** — `group_create`/`group_add`; rare outside AutoCAD-centric tooling. |
-| `Layout`/`LayoutManager` create + `PlotSettingsValidator` (Catalog §4 preparation) | **Proposed P1** — `layout_create` `{"name":…,"paper":…,"printer_config":…}` and `page_setup_set` against an existing layout (paper, area, scale, style table) — the API counterpart of what the `plot` op consumes. |
+| `Group` dictionary | **Shipped** — `group_create` attaches a named group record to existing handles (`group_add`/`group_remove` remain P2 until a client asks). |
+| `Layout`/`LayoutManager` create + `PlotSettingsValidator` (Catalog §4 preparation) | **Shipped** — `layout_create` `{"name":…}` (default page setup + sheet viewport) and `page_setup_set` against an existing layout (paper catalog, orientation, fit or `"paper:drawing"` scale, center, window, style table) — the API counterpart of what the `plot` op consumes. |
 
 ### 2.4 Transactions and undo (parity achieved differently)
 
@@ -106,7 +106,7 @@ ops against a held `revision`. No work proposed.
 |---|---|
 | `PlotEngine` + `PlotInfo` + `PlotSettingsValidator`, CTB/STB | Exists — `plot` (PDF; model/layouts/all; extents/display/limits/window/layout; paper catalog; fit/scale; plot styles). |
 | `PlotConfig` (pc3 device management) | N/A — PDF-only output device; paper catalog replaces pc3 media queries. |
-| Multi-sheet publish (one file per layout, DWF) | Partial — `layout:"all"` yields one multi-page PDF; **Proposed P1** — `"per_page":true` splitting layouts into one PDF each (client-side today), and **P2** DWF/SVG/PNG output formats. |
+| Multi-sheet publish (one file per layout, DWF) | **Shipped** — `"layout":"all","per_page":true` writes one PDF per layout and returns `result.files`. DWF remains **P2/blocked** — there is no DWF writer infrastructure; SVG likewise has no output pipeline today (PNG preview is `capture`). |
 | Plot to raster (PNG preview) | Exists — `capture` (viewport/window screenshot) covers preview needs; exact-paper PNG lands with the P2 format work. |
 
 ## 7. Geometry, colors, measurement
@@ -114,7 +114,7 @@ ops against a held `revision`. No work proposed.
 | .NET API | OpenCAD status |
 |---|---|
 | `Autodesk.AutoCAD.Geometry` (Ge: Point/Vector/Matrix/Curve/BRep) | Exists in-process for plugins; automation exposes kernel results instead of raw types: `query near/contains_point/intersections`, `measure` (length, area, bounds). |
-| Region/MPolygon booleans (Catalog §3.5) | **Proposed P1** — `region_boolean` (`union/intersection/difference`) and closed-region containment over existing curves, implemented in the geometry kernel. |
+| Region/MPolygon booleans (Catalog §3.5) | **P1 — blocked at the kernel.** `region_boolean` (`union/intersection/difference`) needs 2D boolean operations in the geometry kernel; `cadkernel`'s planar (`geom2d`) layer has no boolean engine today — only the 3D BRep side has one. Ship this only together with the kernel work. |
 | `EntityColor`, color books | Exists — records expose `color` (ACI + true color), `set_properties` validates via `record_schema`. |
 
 ## 8. File-level operations
@@ -136,15 +136,15 @@ ops against a held `revision`. No work proposed.
 | 4 | `xdata_set` / `xdata_get` (+ RegApp) | `XData`/`RegAppTable` | Catalog §1.5–1.6 marking, SPMDOCUNIQUE | **Shipped** |
 | 5 | `block_define` (+ optional Insert) | `BlockTableRecord` | Catalog §2.3 barcode block | **Shipped** |
 | 6 | `view_focus` | `SetCurrentView`+highlight | Catalog §1.3 (GUI sessions) | **Shipped** |
-| 7 | `where` filters on `query` | `SelectionFilter` TypedValues | precise cross-property selection | **P1** |
-| 8 | `close` | `Document.Close` | MDI housekeeping | **P1** |
-| 9 | `sysvar` get/set | System variables | AutoCAD-habit scripts | **P1** |
-| 10 | `layout_create` / `page_setup_set` | `LayoutManager`/`PlotSettingsValidator` | sheet provisioning before `plot` | **P1** |
-| 11 | `wblock` template + `new` from template + `save` `.dwt` | `DocumentManager.Add(dwt)` | Catalog §2.1–2.2 | **P1** |
-| 12 | `entities_copy_to` (cross-document) | `CopyObjects` | multi-document assembly | **P1** |
-| 13 | `region_boolean` + hatch loop readout | `Region`/`MPolygon`, hatch | Catalog §3.5/3.8 nesting remain | **P1** |
-| 14 | `plot` per-page PDFs; SVG/PNG formats | Publish | sheet-by-sheet delivery | **P1** |
-| 15 | Selection sets, groups, event filters, DWF, eTransmit | misc | niche | **P2** |
+| 7 | `where` filters on `query` | `SelectionFilter` TypedValues | precise cross-property selection | **Shipped** |
+| 8 | `close` | `Document.Close` | MDI housekeeping | **Shipped** |
+| 9 | `sysvar` get/set | System variables | AutoCAD-habit scripts | **Shipped** |
+| 10 | `layout_create` / `page_setup_set` | `LayoutManager`/`PlotSettingsValidator` | sheet provisioning before `plot` | **Shipped** |
+| 11 | `wblock` template + `new` from template + `save` `.dwt` | `DocumentManager.Add(dwt)` | Catalog §2.1–2.2 | **Shipped** |
+| 12 | `entities_copy_to` (cross-document) | `CopyObjects` | multi-document assembly | **Shipped** |
+| 13 | hatch loop readout · `region_boolean` | `Region`/`MPolygon`, hatch | hatch readout **Shipped**; region boolean **blocked at the kernel** (`geom2d` has no 2D boolean engine — only the 3D BRep side does) | **Partial** |
+| 14 | `plot` per-page PDFs; SVG/PNG formats | Publish | per-page **Shipped**; SVG has no output pipeline (**P2**), PNG preview is `capture` | **Shipped** (per-page) |
+| 15 | Selection sets, groups, event filters, DWF, eTransmit | misc | selection sets + groups **Shipped**; event filters stay **P2**; DWF/eTransmit **P2 — no infrastructure** (clients can zip `wblock` outputs themselves) | **Partial** |
 
 Protocol conventions for every new op: envelope `protocol:1`, caller
 `request_id` (replay = cached result), `document_id` addressing, CAS via

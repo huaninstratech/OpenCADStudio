@@ -52,10 +52,13 @@ def legacy(server: Path) -> None:
     names = set(definitions)
     assert names == TOOLS, names
     execute_request = definitions["ocs_execute"]["inputSchema"]["properties"]["request"]
-    assert len(execute_request["oneOf"]) == 25
+    assert len(execute_request["oneOf"]) == 33
     op_enum = execute_request["properties"]["op"]["enum"]
     for shipped in ("entities_create", "entities_delete", "entities_transform",
-                    "block_define", "xdata_set", "view_focus", "wblock", "plot"):
+                    "block_define", "xdata_set", "view_focus", "wblock", "plot",
+                    "entities_copy_to", "group_create", "selection_set_save",
+                    "selection_set_load", "close", "sysvar", "layout_create",
+                    "page_setup_set"):
         assert shipped in op_enum, shipped
     assert "xdata_get" in definitions["ocs_read"]["inputSchema"]["properties"]["op"]["enum"]
     assert execute_request["properties"]["steps"]["maxItems"] == 64

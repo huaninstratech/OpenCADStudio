@@ -4,7 +4,11 @@
 Drives the whole entity lifecycle over plain HTTP — the same API surface any
 language can call — against a real drawing session: create → verify by query
 → transform → mark with xdata → define a block → save → reopen → verify
-everything persisted → erase → undo. Uses only the Python standard library.
+everything persisted → erase → undo. Then exercises the P1 surface the same
+way, always through real files: where filters, sysvars, layouts + page setups
++ per-page plotting to real PDFs, a .dwt template → new-from-template round
+trip, a cross-document copy between two open documents, groups and selection
+sets, and a close-with-discard. Uses only the Python standard library.
 
     python3 docs/automation/rest_smoke.py target/debug/OpenCADStudio
 """
@@ -15,6 +19,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -142,6 +147,108 @@ def main() -> None:
         expect(undone["ok"], f"undo: {undone}")
         status, query = call(port, "GET", "/entities?type=Text")
         expect(query["count"] == 1, "undo restored the text")
+
+        # 8. Where filters over entity properties (RFC 6901 pointers).
+        status, circles = call(port, "POST", "/entities", {
+            "entities": [
+                {"type": "Circle", "center": [0, -40], "radius": 2},
+                {"type": "Circle", "center": [30, -40], "radius": 8},
+            ]
+        })
+        expect(status == 201, f"filter circles: {circles}")
+        where = urllib.parse.quote(json.dumps([{"path": "/radius", "op": "gt", "value": 6}]))
+        status, query = call(port, "GET", f"/entities?type=Circle&detail=geometry&where={where}")
+        expect(query["count"] == 1 and query["entities"][0]["radius"] == 8.0, f"where filter: {query}")
+        status, query = call(port, "GET", f"/entities?where={urllib.parse.quote('not-json')}")
+        expect(status == 400 and query["code"] == "invalid_where", f"bad where: {query}")
+
+        # 9. Sysvars: set over POST, read back over GET, unknown refused.
+        status, set_response = call(port, "POST", "/sysvars", {"set": {"ltscale": 3.5, "mirrtext": 1}})
+        expect(status == 200 and set_response["ok"], f"sysvar set: {set_response}")
+        status, read_back = call(port, "GET", "/sysvars?names=ltscale,mirrtext")
+        expect(read_back["result"]["values"]["ltscale"] == 3.5, f"sysvar read: {read_back}")
+        expect(read_back["result"]["values"]["mirrtext"] == 1, "mirrtext read back")
+        status, refused = call(port, "POST", "/sysvars", {"set": {"not_a_sysvar": 1}})
+        expect(status == 400 and refused["code"] == "unknown_sysvar", f"unknown sysvar: {refused}")
+
+        # 10. Sheets: a layout, its page setup, then one PDF per layout.
+        status, layout = call(port, "POST", "/layouts", {"name": "PLAN"})
+        expect(status == 201 and "PLAN" in layout["result"]["layouts"], f"layout: {layout}")
+        status, setup = call(port, "PUT", "/layouts/PLAN/page-setup", {
+            "paper": "ISO_A4_(210.00_x_297.00_MM)", "orientation": "landscape",
+            "fit": True, "center": True,
+        })
+        expect(status == 200 and "ISO_A4" in setup["result"]["paper"], f"page setup: {setup}")
+        plot_base = out_dir / "smoke_plot.pdf"
+        status, plotted = call(port, "POST", "/plot", {
+            "path": str(plot_base), "layout": "all", "per_page": True,
+        })
+        expect(plotted["ok"] and len(plotted["result"]["files"]) >= 2, f"per-page plot: {plotted}")
+        for entry in plotted["result"]["files"]:
+            pdf = Path(entry["path"])
+            expect(pdf.read_bytes().startswith(b"%PDF"), f"not a PDF: {pdf}")
+            pdf.unlink()
+
+        # 11. Template round trip: save as .dwt, then start the drawing from
+        # the template — the entities and their xdata survive.
+        status, query = call(port, "GET", "/entities")
+        count_before = query["count"]
+        template = out_dir / "rest_smoke.dwt"
+        status, saved_dwt = call(port, "POST", "/save", {"path": str(template)})
+        expect(saved_dwt["ok"], f"dwt save: {saved_dwt}")
+        expect(template.stat().st_size > 64, ".dwt written (DWG bytes)")
+        status, templated = call(port, "POST", "/documents", {"template": str(template)})
+        expect(templated["ok"] and templated["result"]["total"] == count_before,
+               f"new from template: {templated}")
+        status, query = call(port, "GET", "/entities?type=Text")
+        expect(query["count"] == 1, "text survived the template")
+        text_handle = query["entities"][0]["handle"]
+        status, xdata = call(port, "GET", f"/entities/{text_handle}/xdata?app=SPM")
+        expect(xdata["items"][0]["xdata"]["SPM"][0] == "PAGE-01", "xdata survived the template")
+
+        # 12. Cross-document copy: an empty POST /documents is
+        # DocumentManager.Add() — a fresh second document in its own tab.
+        status, state = call(port, "GET", "/state")
+        source_doc = state["document_id"]
+        status, fresh = call(port, "POST", "/documents", {})
+        expect(status == 201 and fresh["ok"], f"second document: {fresh}")
+        status, state = call(port, "GET", "/state")
+        target_doc = state["document_id"]
+        expect(target_doc != source_doc, "two open documents")
+        status, switched = call(port, "POST", "/activate", {"document_id": source_doc})
+        expect(switched["ok"], f"activate source: {switched}")
+        status, query = call(port, "GET", "/entities?type=Line")
+        line_handles = [entity["handle"] for entity in query["entities"]]
+        expect(len(line_handles) == 2, f"source lines: {query}")
+        status, copy_op = call(port, "POST", "/entities/copy-to", {
+            "handles": line_handles, "document_id": target_doc,
+        })
+        expect(status == 201 and copy_op["result"]["count"] == 2, f"copy-to: {copy_op}")
+        status, switched = call(port, "POST", "/activate", {"document_id": target_doc})
+        expect(switched["ok"], f"activate target: {switched}")
+        status, query = call(port, "GET", "/entities?type=Line")
+        expect(query["count"] == 2, f"lines copied into the second document: {query}")
+
+        # 13. Groups and selection sets over the second document.
+        all_lines = [entity["handle"] for entity in query["entities"]]
+        status, group = call(port, "POST", "/groups", {
+            "name": "SMOKE-GROUP", "handles": all_lines,
+        })
+        expect(status == 201 and group["ok"], f"group: {group}")
+        status, selection = call(port, "POST", "/selection-sets", {
+            "name": "smoke-set", "handles": all_lines,
+        })
+        expect(status == 201 and selection["ok"], f"selection set save: {selection}")
+        status, recalled = call(port, "GET", "/selection-sets/smoke-set")
+        expect(len(recalled["result"]["handles"]) == 2, f"selection set load: {recalled}")
+        status, selected = call(port, "GET", "/selection-sets/smoke-set?select=true")
+        expect(selected["result"]["selected"] == 2, f"selection set select: {selected}")
+
+        # 14. Close the dirty second document with discard.
+        status, closed = call(port, "DELETE", f"/documents/{target_doc}?discard=true")
+        expect(status == 200 and closed["result"]["closed"] is True, f"close: {closed}")
+        status, state = call(port, "GET", "/state")
+        expect(state["document_id"] == source_doc, "back on the first document")
 
         print("rest smoke: OK")
     finally:

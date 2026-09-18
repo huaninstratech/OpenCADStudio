@@ -233,17 +233,24 @@ curl http://127.0.0.1:8090/api/v1/ready
 | `GET  /api/v1/state` | Full editor state (documents, selection, command, camera). |
 | `GET  /api/v1/capabilities` | Feature/collection advertisement incl. `operations`. |
 | `GET  /api/v1/openapi` | OpenAPI 3 description of this whole surface. |
-| `GET  /api/v1/documents` · `POST /api/v1/documents` | List; open `{"path":…}` or start empty (no body). |
-| `GET  /api/v1/entities` | Query — `type`, `layer`, `detail`, `offset`, `limit`, `fields`, `handles`, `bounds`, `near`, `contains_point`, `intersections` (comma-separated). |
+| `GET  /api/v1/documents` · `POST /api/v1/documents` | List; open `{"path":…}`, start from a template `{"template":…}` (a `.dwt`/`.dwg` file; the active drawing is replaced), or `Add()` a fresh untitled document (empty body) → **201**. |
+| `DELETE /api/v1/documents/{id}?discard=true` | Close a document; `discard=true` drops unsaved changes, otherwise a dirty document is refused (`document_dirty`). |
+| `GET  /api/v1/entities` | Query — `type`, `layer`, `detail`, `offset`, `limit`, `fields`, `handles`, `bounds`, `near`, `contains_point`, `intersections` (comma-separated) and `where` (a JSON-encoded property filter array, e.g. `[{"path":"/radius","op":"gt","value":2}]`). |
 | `GET  /api/v1/entities/{handle}` | One entity, `detail:"full"`. |
 | `POST /api/v1/entities` | Create a typed batch → **201** with `handles`. |
 | `DELETE /api/v1/entities?handles=a,b` | Erase by handle (body `{"handles":[…]}` also accepted). |
 | `POST /api/v1/entities/transform` | move/copy/rotate/scale/mirror/array. |
+| `POST /api/v1/entities/copy-to` | Copy entities into another open document: `{"handles":[…],"document_id":target}` → **201** with the new handles. |
 | `GET  /api/v1/entities/{h}/xdata?app=` · `PUT …/xdata/{app}` · `DELETE …/xdata/{app}` | Read / replace / remove extended data. |
 | `POST /api/v1/blocks` | Define a block from entities (+ Insert). |
-| `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export · DWG/DXF export · attach picture. |
+| `POST /api/v1/groups` | Create a named group from handles → **201**. |
+| `POST /api/v1/selection-sets` · `GET /api/v1/selection-sets/{name}` | Save a named selection set → **201**; recall it (`?select=true` also makes it the current selection). |
+| `GET  /api/v1/sysvars?names=a,b` · `POST /api/v1/sysvars` | Read sysvars (`{"get":[…]}` in the body also works) / set them (`{"set":{"ltscale":2.5}}`). |
+| `POST /api/v1/layouts` | Create a layout with default page setup → **201**. |
+| `PUT  /api/v1/layouts/{name}/page-setup` | Write a layout's plot configuration (paper, orientation, fit/scale, center, window, plot style). |
+| `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export (`"layout":"all","per_page":true` writes one PDF per layout) · DWG/DXF export (`"template"` bases the new database on a file) · attach picture. |
 | `POST /api/v1/commands` | Run one command line (`{"cmd":"LINE 0,0 10,10"}`). |
-| `POST /api/v1/undo` · `/redo` · `/save` | Lifecycle. |
+| `POST /api/v1/undo` · `/redo` · `/save` | Lifecycle (`/save` to a `*.dwt` path writes the template — DWG bytes). |
 | `GET  /api/v1/layers` · `/header` · `/records?collection=…` | Database reads. |
 | `POST /api/v1/{op}` | Generic passthrough for any automation op. |
 
@@ -293,11 +300,55 @@ curl -s -X POST http://127.0.0.1:8090/api/v1/blocks \
 # 6. Save and prove persistence.
 curl -s -X POST http://127.0.0.1:8090/api/v1/save \
   -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwg"}'
+
+# 7. Filter entities by any property (RFC 6901 pointers, SQL-ish operators).
+curl -s "http://127.0.0.1:8090/api/v1/entities?type=Circle&detail=geometry&where=%5B%7B%22path%22%3A%22%2Fradius%22%2C%22op%22%3A%22gt%22%2C%22value%22%3A2%7D%5D"
+
+# 8. Set and read back drawing sysvars.
+curl -s -X POST http://127.0.0.1:8090/api/v1/sysvars \
+  -H "Content-Type: application/json" -d '{"set":{"ltscale":2.5}}'
+curl -s "http://127.0.0.1:8090/api/v1/sysvars?names=ltscale,mirrtext"
+
+# 9. Provision a sheet: create the layout, write its page setup, then
+#    plot every layout to its own PDF (one file per entry in result.files).
+curl -s -X POST http://127.0.0.1:8090/api/v1/layouts \
+  -H "Content-Type: application/json" -d '{"name":"PLAN"}'
+curl -s -X PUT http://127.0.0.1:8090/api/v1/layouts/PLAN/page-setup \
+  -H "Content-Type: application/json" \
+  -d '{"paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true}'
+curl -s -X POST http://127.0.0.1:8090/api/v1/plot \
+  -H "Content-Type: application/json" \
+  -d '{"path":"C:/out/plan.pdf","layout":"all","per_page":true}'
+
+# 10. Save the drawing as a template (a .dwt is DWG bytes — same writer,
+#     no lock held on the file) and start a fresh drawing from it.
+curl -s -X POST http://127.0.0.1:8090/api/v1/save \
+  -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwt"}'
+curl -s -X POST http://127.0.0.1:8090/api/v1/documents \
+  -H "Content-Type: application/json" -d '{"template":"C:/out/session.dwt"}'
+
+# 11. Second document, then copy entities across documents.
+curl -s -X POST http://127.0.0.1:8090/api/v1/documents -d '{}'   # DocumentManager.Add()
+curl -s -X POST http://127.0.0.1:8090/api/v1/entities/copy-to \
+  -H "Content-Type: application/json" \
+  -d '{"handles":["63","67"],"document_id":2}'
+
+# 12. Group the copies, save them as a named selection set, recall it.
+curl -s -X POST http://127.0.0.1:8090/api/v1/groups \
+  -H "Content-Type: application/json" -d '{"name":"FRAME","handles":["63","67"]}'
+curl -s -X POST http://127.0.0.1:8090/api/v1/selection-sets \
+  -H "Content-Type: application/json" -d '{"name":"frame-set","handles":["63","67"]}'
+curl -s "http://127.0.0.1:8090/api/v1/selection-sets/frame-set?select=true"
+
+# 13. Close a document, discarding unsaved changes.
+curl -s -X DELETE "http://127.0.0.1:8090/api/v1/documents/2?discard=true"
 ```
 
-The same lifecycle (create → verify → transform → xdata → block →
-save → reopen → verify persisted → erase → undo) runs as an automated
-black-box check:
+The same lifecycle — create → verify → transform → xdata → block →
+save → reopen → verify persisted → erase → undo, then where filters,
+sysvars, layout + page setup + per-page plotting, a `.dwt` template →
+new-from-template round trip, a cross-document copy, groups and selection
+sets, and a close-with-discard — runs as an automated black-box check:
 
 ```sh
 python3 docs/automation/rest_smoke.py target/debug/OpenCADStudio
@@ -369,7 +420,6 @@ the clear operation.
 `{"ok":true,"items":[{"handle":"65","xdata":{"SPM":["PAGE-01",7]}}]}` — no
 `request_id`, no `document_id` needed.
 
-### `block_define` — BlockTableReco
 ### `block_define` — BlockTableRecord parity
 
 ```json
@@ -392,3 +442,145 @@ via `entities_create`.
 
 Fits the entities into the view and selects them. Headless servers refuse
 with `code:"gui_required"`; REST clients get HTTP 409.
+
+## Document, sheet and organization operations (protocol ops)
+
+Same envelope conventions as the entity operations: `protocol:1`,
+caller-generated `request_id`, `document_id` addressing, one undo step.
+Angles stay **degrees** on the wire everywhere below.
+
+### `close` — Document.Close parity
+
+```json
+{"protocol":1,"op":"close","request_id":"cl-1","document_id":1,"discard":true}
+```
+
+Closes the addressed document. A document with unsaved changes is refused
+with `code:"document_dirty"` unless `"discard":true`; an unknown document id
+is `document_closed`. The last tab is replaced by a fresh empty drawing, so
+the session always keeps one document. `result.closed` reports the outcome.
+`activate`, `close` and `entities_copy_to` are exempt from the
+active-document guard — they may address any open document.
+
+### `sysvar` — GetSystemVariable / SetSystemVariable parity
+
+```json
+{"protocol":1,"op":"sysvar","request_id":"sv-1","document_id":1,"set":{"ltscale":2.5,"clayer":"Walls"}}
+{"protocol":1,"op":"sysvar","request_id":"sv-2","document_id":1,"get":["ltscale","extmax"]}
+```
+
+`set` applies a JSON object of name → value pairs atomically (unknown names
+→ `unknown_sysvar`, wrong values → `invalid_sysvar_value`, nothing partial).
+`get` (also with an omitted list = every readable name) returns
+`result.values`. The registry:
+
+| var | meaning | writable |
+|---|---|---|
+| `ltscale` | global linetype scale (positive) | ✓ |
+| `celtscale` | current-entity linetype scale | ✓ |
+| `clayer` | current layer (must exist) | ✓ |
+| `ctextstyle` | current text style (must exist) | ✓ |
+| `textsize` | default text height | ✓ |
+| `filletrad` | fillet radius (≥ 0) | ✓ |
+| `mirrtext` | mirror-text flag (`0`/`1`) | ✓ |
+| `insunits` | insertion units (integer) | ✓ |
+| `osmode` | object-snap bitmask (integer) | ✓ |
+| `pdmode` / `pdsize` | point display mode / size | ✓ |
+| `extmin` / `extmax` | model-space extents `[x,y,z]` | read-only |
+
+### `layout_create` / `page_setup_set` — LayoutManager + PlotSettingsValidator parity
+
+```json
+{"protocol":1,"op":"layout_create","request_id":"lc-1","document_id":1,"name":"PLAN"}
+{"protocol":1,"op":"page_setup_set","request_id":"ps-1","document_id":1,"layout":"PLAN",
+ "paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true,
+ "scale":"1:100","window":[0,0,210,297],"plot_style":"monochrome.ctb"}
+```
+
+`layout_create` adds a layout with the default page setup and a sheet
+viewport; duplicates are refused (`layout_exists`). `page_setup_set` writes
+the named layout's plot configuration — explicit fields win, the rest keeps
+the stored setup. `paper` resolves through the paper catalog
+(`invalid_paper` lists nothing — use a canonical catalog name);
+`orientation` is `portrait`/`landscape` (degrees of sheet rotation);
+sizing is `"fit":true` or `"scale":"paper:drawing"` like `"1:100"` (both
+parts positive — `nonsense` is refused with `invalid_scale`, it does not
+silently mean 1:1); `center` centers the plot; `window` sets a plot window;
+`plot_style` names a CTB/STB. Unknown layouts are `layout_missing`. The
+stored setup is what `plot` consumes when the op's own fields are absent.
+
+### Templates — `DocumentManager.Add(dwt)` / `SaveAs(.dwt)` parity
+
+```json
+{"protocol":1,"op":"new","request_id":"nt-1","template":"C:/tpl/base.dwt"}
+{"protocol":1,"op":"wblock","request_id":"wb-1","document_id":1,"path":"C:/out/x.dxf","handles":["2A"],"template":"C:/tpl/base.dwg"}
+```
+
+`new` with `"template"` starts an untitled drawing from a `.dwg`/`.dxf`/
+`.dwt` file: tables, styles and entities come from the template and the
+document keeps no source path (`result.total` counts the imported
+entities). A `.dwt` file is **DWG bytes** — the same binary DWG writer
+produces it through a hidden scratch file that is renamed into place, so
+no lock is held on the target and a save can never leave a half-written
+template. `wblock` with `"template"` bases the exported database on the
+template's tables/styles instead of the source drawing's.
+
+### `entities_copy_to` — CopyObjects/DeepClone parity
+
+```json
+{"protocol":1,"op":"entities_copy_to","request_id":"cp-1","document_id":2,"handles":["2A","31"]}
+```
+
+Copies the entities from the active document into the open document
+addressed by `document_id`. Every handle must exist in the source
+(`entity_absent` otherwise); the target must be open (`document_closed`).
+Referenced (missing) layer definitions travel along. `result.created` lists
+the new handles in the target, `result.count` their number. Combined with
+an empty `POST /documents` (REST) this is the multi-document assembly
+workflow.
+
+### `group_create` — Group dictionary parity
+
+```json
+{"protocol":1,"op":"group_create","request_id":"g-1","document_id":1,"name":"FRAME","handles":["2A","31"]}
+```
+
+Creates an anonymous-group-record-backed named group over existing handles
+(`entity_absent` if any is missing). `result` reports the `group` name and
+its object `handle`.
+
+### `selection_set_save` / `selection_set_load` — SelectionSet reuse
+
+```json
+{"protocol":1,"op":"selection_set_save","request_id":"s-1","document_id":1,"name":"frame-set","handles":["2A","31"]}
+{"protocol":1,"op":"selection_set_load","request_id":"s-2","document_id":1,"name":"frame-set","select":false}
+```
+
+Named handle sets are **session-scoped** by design (like a held
+`SelectionSet` object id, they live while the session lives). `save` stores
+and returns the handle list; `load` recalls it and, with `"select":true`
+(the default), also makes the entities the current selection
+(`result.selected` counts). Unknown names are `selection_set_missing`.
+
+### `plot` per-page publishing
+
+`{"op":"plot", …, "layout":"all","per_page":true}` writes **one PDF per
+layout** instead of one multi-page document, returning `result.files`
+(`[{path,…},…]`) — one entry per layout, ready for sheet-by-sheet delivery.
+Without `per_page` the result stays `{path, pages, page_sizes}`.
+
+### `query` `where` — SelectionFilter TypedValue parity
+
+```json
+{"op":"query","type":"Circle","detail":"geometry",
+ "where":[{"path":"/radius","op":"gt","value":2},{"path":"/common/layer","op":"eq","value":"Walls"}]}
+```
+
+`where` filters query results on serialized entity properties using RFC
+6901 JSON Pointer paths (`/radius`, `/common/layer`, …) and the operators
+`eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `contains`, `starts_with`,
+`ends_with`, `in`, `exists`, `not_exists`. Filters combine with
+AND and are validated up front (a bad pointer or unknown operator fails the
+query before any entity is inspected). The same filter shape works over the
+REST `GET /entities?where=<json-encoded>` parameter. Hatch queries expose
+their loop definitions under `properties` so boundaries can be read back.
