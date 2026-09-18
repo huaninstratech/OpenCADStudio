@@ -28,9 +28,47 @@
     "/api/v1/documents": {
       "get": {"summary": "Open documents", "responses": {"200": {"description": "Documents"}}},
       "post": {
-        "summary": "Open a drawing ({path}) or start an empty one (no body)",
-        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"path": {"type": "string"}}}}}},
-        "responses": {"200": {"description": "Document ready"}, "400": {"description": "Open failed"}}
+        "summary": "Open a drawing ({path}), start from a template ({template}, .dwt/.dwg/.dxf), or create a fresh untitled document in its own tab (empty body, DocumentManager.Add parity)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"path": {"type": "string"}, "template": {"type": "string"}}}}}},
+        "responses": {"200": {"description": "Document ready"}, "201": {"description": "Fresh document created"}, "400": {"description": "Open failed"}}
+      }
+    },
+    "/api/v1/documents/{id}": {
+      "delete": {
+        "summary": "Close a document; a dirty document needs ?discard=true",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "Closed"}, "400": {"description": "Dirty document without discard"}}
+      }
+    },
+    "/api/v1/sysvars": {
+      "get": {
+        "summary": "Read sysvars (?names=csv; empty list returns every readable name)",
+        "parameters": [{"name": "names", "in": "query", "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "Values"}}
+      },
+      "post": {
+        "summary": "Set sysvars atomically ({set:{name:value,…}}; unknown_sysvar / invalid_sysvar_value refused)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"set": {"type": "object"}, "get": {"type": "array", "items": {"type": "string"}}}}}}},
+        "responses": {"200": {"description": "Applied"}, "400": {"description": "Unknown sysvar or invalid value"}}
+      }
+    },
+    "/api/v1/layouts": {
+      "post": {
+        "summary": "Create a layout with the default page setup (LayoutManager.Add parity)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}}}},
+        "responses": {"201": {"description": "Layout created"}, "400": {"description": "Duplicate or invalid name"}}
+      }
+    },
+    "/api/v1/layouts/{name}/page-setup": {
+      "put": {
+        "summary": "Write a layout's plot configuration (PlotSettingsValidator parity; explicit fields win)",
+        "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {
+          "paper": {"type": "string"}, "orientation": {"type": "string", "enum": ["portrait", "landscape"]},
+          "fit": {"type": "boolean"}, "scale": {"type": "string"}, "center": {"type": "boolean"},
+          "window": {"type": "array", "items": {"type": "number"}}, "plot_style": {"type": "string"}
+        }}}}},
+        "responses": {"200": {"description": "Stored setup"}, "400": {"description": "Unknown layout, paper or scale"}}
       }
     },
     "/api/v1/entities": {
@@ -46,7 +84,8 @@
           {"name": "bounds", "in": "query", "schema": {"type": "string"}, "description": "min_x,min_y,max_x,max_y"},
           {"name": "near", "in": "query", "schema": {"type": "string"}, "description": "x,y[,z] distance ranking"},
           {"name": "contains_point", "in": "query", "schema": {"type": "string"}},
-          {"name": "intersections", "in": "query", "schema": {"type": "string"}, "description": "handle1,handle2"}
+          {"name": "intersections", "in": "query", "schema": {"type": "string"}, "description": "handle1,handle2"},
+          {"name": "where", "in": "query", "schema": {"type": "string"}, "description": "JSON-encoded filter array over serialized properties, e.g. [{\"path\":\"/radius\",\"op\":\"gt\",\"value\":2}] with ops eq,ne,lt,lte,gt,gte,contains,starts_with,ends_with,in,exists,not_exists"}
         ],
         "responses": {"200": {"description": "Matched entities"}, "400": {"description": "Invalid filters"}}
       },
@@ -83,6 +122,16 @@
           "row_spacing": {"type": "number"}, "column_spacing": {"type": "number"}
         }}}}},
         "responses": {"200": {"description": "Transformed; `created` lists new handles"}, "400": {"description": "Invalid action or parameters"}}
+      }
+    },
+    "/api/v1/entities/copy-to": {
+      "post": {
+        "summary": "Copy entities into another open document (CopyObjects parity; referenced layer definitions travel along)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["handles", "document_id"], "properties": {
+          "handles": {"type": "array", "items": {"type": "string"}},
+          "document_id": {"type": "integer", "description": "Target document"}
+        }}}}},
+        "responses": {"201": {"description": "New handles in the target document"}, "404": {"description": "Unknown handle"}, "400": {"description": "Target absent"}}
       }
     },
     "/api/v1/entities/{handle}/xdata": {
@@ -125,15 +174,43 @@
         "responses": {"201": {"description": "Definition + insert handle"}, "400": {"description": "Invalid name, duplicate or empty selection"}}
       }
     },
+    "/api/v1/groups": {
+      "post": {
+        "summary": "Create a named group over existing entities (Group dictionary parity)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["name", "handles"], "properties": {
+          "name": {"type": "string"}, "handles": {"type": "array", "items": {"type": "string"}}
+        }}}}},
+        "responses": {"201": {"description": "Group name + handle"}, "404": {"description": "Unknown handle"}}
+      }
+    },
+    "/api/v1/selection-sets": {
+      "post": {
+        "summary": "Save a named handle set for this session (session-scoped by design)",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["name", "handles"], "properties": {
+          "name": {"type": "string"}, "handles": {"type": "array", "items": {"type": "string"}}
+        }}}}},
+        "responses": {"201": {"description": "Stored set"}}
+      }
+    },
+    "/api/v1/selection-sets/{name}": {
+      "get": {
+        "summary": "Recall a named selection set (?select=true also makes it the current selection)",
+        "parameters": [
+          {"name": "name", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"name": "select", "in": "query", "schema": {"type": "boolean"}}
+        ],
+        "responses": {"200": {"description": "Handles (+ selected count)"}, "404": {"description": "Unknown set"}}
+      }
+    },
     "/api/v1/plot": {
       "post": {
-        "summary": "Render to PDF (layout Model|name|all, area, paper, fit/scale, plot_style)",
+        "summary": "Render to PDF (layout Model|name|all, area, paper, fit/scale, plot_style; per_page:true with layout all writes one PDF per layout and returns result.files)",
         "responses": {"200": {"description": "Pages written"}, "400": {"description": "Plot failed"}}
       }
     },
     "/api/v1/wblock": {
       "post": {
-        "summary": "Export entities (handles) or a block definition to a new DWG/DXF",
+        "summary": "Export entities (handles) or a block definition to a new DWG/DXF; template:<file> bases the new database on that file's tables/styles",
         "responses": {"200": {"description": "File written"}, "400": {"description": "Export failed"}}
       }
     },
@@ -151,7 +228,7 @@
     },
     "/api/v1/undo": {"post": {"summary": "Undo one step", "responses": {"200": {"description": "Undone"}}}},
     "/api/v1/redo": {"post": {"summary": "Redo one step", "responses": {"200": {"description": "Redone"}}}},
-    "/api/v1/save": {"post": {"summary": "Save the active document ({path} optional once opened)", "responses": {"200": {"description": "Saved"}, "400": {"description": "Save failed"}}}},
+    "/api/v1/save": {"post": {"summary": "Save the active document ({path} optional once opened); a *.dwt path writes DWG bytes through a scratch file renamed into place", "responses": {"200": {"description": "Saved"}, "400": {"description": "Save failed"}}}},
     "/api/v1/layers": {"get": {"summary": "Layer table", "responses": {"200": {"description": "Layers"}}}},
     "/api/v1/header": {"get": {"summary": "Drawing header summary", "responses": {"200": {"description": "Header"}}}},
     "/api/v1/records": {"get": {"summary": "Database records (collection, type, offset, limit)", "responses": {"200": {"description": "Records"}, "400": {"description": "Invalid query"}}}},

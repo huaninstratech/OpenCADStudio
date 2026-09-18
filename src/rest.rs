@@ -248,10 +248,14 @@ fn route(
         }
         ("POST", ["documents"]) => {
             let body = request.json();
-            let response = if let Some(path) = body["path"].as_str() {
+            let response = if let Some(template) = body["template"].as_str() {
+                run_mutation(app, "new", json!({"template": template}), document_id, counter, 200).1
+            } else if let Some(path) = body["path"].as_str() {
                 app.automation_op(&json!({"op":"open","path":path}).to_string())
             } else {
-                app.automation_op(r#"{"op":"new"}"#)
+                // DocumentManager.Add() parity: a fresh untitled document in
+                // its own tab, so cross-document operations have a target.
+                run_mutation(app, "new", json!({}), document_id, counter, 201).1
             };
             let status = map_status(response.clone(), true);
             if response["ok"] == true {
@@ -260,6 +264,58 @@ fn route(
                 }
             }
             (status, response)
+        }
+        ("DELETE", ["documents", id]) => {
+            let document = id.parse::<u64>().ok();
+            let mut fields = json!({});
+            if let Some(id) = document {
+                fields["document_id"] = json!(id);
+            }
+            if request.param("discard").is_some_and(|v| v == "true" || v == "1") {
+                fields["discard"] = json!(true);
+            }
+            let (status, body) = run_mutation(app, "close", fields, document_id, counter, 200);
+            if body["ok"] == true {
+                if let Some(state) = fetch_state(app) {
+                    *document_id = Some(state);
+                }
+            }
+            (status, body)
+        }
+        ("GET", ["sysvars"]) => {
+            let names = request
+                .param("names")
+                .map(|csv| json!(csv.split(',').collect::<Vec<_>>()))
+                .unwrap_or_else(|| json!([]));
+            let (status, body) = run_mutation(app, "sysvar", json!({"get": names}), document_id, counter, 200);
+            (status, body)
+        }
+        ("POST", ["sysvars"]) => {
+            run_mutation(app, "sysvar", request.json(), document_id, counter, 200)
+        }
+        ("POST", ["layouts"]) => {
+            run_mutation(app, "layout_create", request.json(), document_id, counter, 201)
+        }
+        ("PUT", ["layouts", layout, "page-setup"]) => {
+            let mut fields = request.json();
+            fields["layout"] = json!(layout);
+            run_mutation(app, "page_setup_set", fields, document_id, counter, 200)
+        }
+        ("POST", ["entities", "copy-to"]) => {
+            run_mutation(app, "entities_copy_to", request.json(), document_id, counter, 201)
+        }
+        ("POST", ["groups"]) => {
+            run_mutation(app, "group_create", request.json(), document_id, counter, 201)
+        }
+        ("POST", ["selection-sets"]) => {
+            run_mutation(app, "selection_set_save", request.json(), document_id, counter, 201)
+        }
+        ("GET", ["selection-sets", name]) => {
+            let mut fields = json!({"name": name, "select": false});
+            if request.param("select").is_some_and(|v| v == "true" || v == "1") {
+                fields["select"] = json!(true);
+            }
+            run_mutation(app, "selection_set_load", fields, document_id, counter, 200)
         }
         ("GET", ["entities"]) => {
             let mut request_json = json!({"op":"query"});
@@ -290,6 +346,17 @@ fn route(
             }
             if let Some(v) = request.param("intersections") {
                 request_json["intersections"] = json!(v.split(',').collect::<Vec<_>>());
+            }
+            if let Some(v) = request.param("where") {
+                match serde_json::from_str::<Value>(v) {
+                    Ok(filters) => request_json["where"] = filters,
+                    Err(error) => {
+                        return (
+                            400,
+                            json!({"ok": false, "code": "invalid_where", "error": format!("where must be a JSON array: {error}")}),
+                        )
+                    }
+                }
             }
             let response = app.automation_op(&request_json.to_string());
             (map_status(response.clone(), false), response)
@@ -628,5 +695,164 @@ mod tests {
         // Unknown routes are 404, not panics.
         let (status, _) = route(&mut app, &request("GET", "/api/v1/nope", ""), &mut document_id, &mut counter);
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn rest_p1_document_surface_routes_end_to_end() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"CIRCLE 0,0 1"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"CIRCLE 20,0 5"}"#);
+        let mut document_id = None;
+        let mut counter = 0;
+
+        // GET /state primes the document-id cache the mutations address.
+        let (status, body) = route(&mut app, &request("GET", "/api/v1/state", ""), &mut document_id, &mut counter);
+        assert_eq!(status, 200);
+        let doc = document_id.expect("state caches the document id");
+        assert_eq!(body["document_id"].as_u64(), Some(doc));
+
+        // Where filters travel as the JSON-encoded `where` query parameter.
+        let mut get = request("GET", "/api/v1/entities", "");
+        get.query = vec![
+            ("type".into(), "Circle".into()),
+            ("detail".into(), "geometry".into()),
+            ("where".into(), r#"[{"path":"/radius","op":"gt","value":2}]"#.into()),
+        ];
+        let (status, body) = route(&mut app, &get, &mut document_id, &mut counter);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["entities"][0]["radius"], 5.0);
+
+        // A malformed filter is refused before touching the dispatcher.
+        let mut get = request("GET", "/api/v1/entities", "");
+        get.query = vec![("where".into(), "not-json".into())];
+        let (status, body) = route(&mut app, &get, &mut document_id, &mut counter);
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "invalid_where");
+
+        // Sysvars read through GET with a `names` CSV, write through POST.
+        let mut get = request("GET", "/api/v1/sysvars", "");
+        get.query = vec![("names".into(), "ltscale,mirrtext".into())];
+        let (status, body) = route(&mut app, &get, &mut document_id, &mut counter);
+        assert_eq!(status, 200, "{body}");
+        assert!(body["result"]["values"]["ltscale"].is_number());
+        assert_eq!(body["result"]["values"]["mirrtext"], 0);
+
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/sysvars", r#"{"set":{"ltscale":2.5}}"#),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        let mut get = request("GET", "/api/v1/sysvars", "");
+        get.query = vec![("names".into(), "ltscale".into())];
+        let (_, body) = route(&mut app, &get, &mut document_id, &mut counter);
+        assert_eq!(body["result"]["values"]["ltscale"], 2.5);
+
+        // A layout is created (201) and its page setup patched via PUT.
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/layouts", r#"{"name":"PLAN"}"#),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        assert!(body["result"]["layouts"].as_array().unwrap().iter().any(|n| n == "PLAN"));
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "PUT",
+                "/api/v1/layouts/PLAN/page-setup",
+                r#"{"paper":"ISO_A4_(210.00_x_297.00_MM)","orientation":"landscape","fit":true,"center":true}"#,
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["layout"], "PLAN");
+        assert!(body["result"]["paper"].as_str().unwrap().contains("ISO_A4"));
+        assert_eq!(body["result"]["scale"]["fit"], true);
+
+        // Groups and selection sets address the drawing's entities (the
+        // created layout also owns a sheet viewport, so filter to circles).
+        let q = app.automation_op(r#"{"op":"query","type":"Circle","detail":"summary"}"#);
+        let joined = q["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| format!("\"{}\"", e["handle"].as_str().unwrap()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/groups", &format!(r#"{{"name":"FRAME","handles":[{joined}]}}"#)),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/selection-sets",
+                &format!(r#"{{"name":"rest-set","handles":[{joined}]}}"#),
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        app.automation_op(r#"{"op":"select","clear":true}"#);
+        // Default GET recalls without touching the selection; ?select=true
+        // additionally makes the set the current selection.
+        let (status, body) = route(
+            &mut app,
+            &request("GET", "/api/v1/selection-sets/rest-set", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["handles"].as_array().unwrap().len(), 2);
+        assert_eq!(body["result"]["selected"], 0);
+        let mut get = request("GET", "/api/v1/selection-sets/rest-set", "");
+        get.query = vec![("select".into(), "true".into())];
+        let (status, body) = route(&mut app, &get, &mut document_id, &mut counter);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["selected"], 2);
+
+        // Copy between documents: the body names the target document.
+        let target = app.push_test_document();
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/entities/copy-to",
+                &format!(r#"{{"handles":[{joined}],"document_id":{target}}}"#),
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["result"]["count"], 2);
+
+        // An empty POST /documents is DocumentManager.Add(): a fresh
+        // untitled document in its own tab — a copy-to target.
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/documents", "{}"),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        let fresh = document_id.expect("fresh document cached");
+        assert_ne!(fresh, doc, "a second document opened");
+
+        // Close with discard: the dirty document is dropped, 200 returned.
+        let mut delete = request("DELETE", &format!("/api/v1/documents/{doc}"), "");
+        delete.query = vec![("discard".into(), "true".into())];
+        let (status, body) = route(&mut app, &delete, &mut document_id, &mut counter);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["closed"], true);
     }
 }
