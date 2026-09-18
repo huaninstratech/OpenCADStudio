@@ -403,6 +403,7 @@ impl OpenCADStudio {
                 | "layers"
                 | "header"
                 | "history"
+                | "xdata_get"
         );
         if !query && !self.control.enabled {
             return (
@@ -603,6 +604,7 @@ impl OpenCADStudio {
             let response = match op {
                 "properties" => self.control_properties(),
                 "measure" => self.control_measure(&req),
+                "xdata_get" => self.xdata_read(&req),
                 "history" => {
                     json!({"ok":true,"entries":self.command_line.history.iter().map(|e|json!({"kind":format!("{:?}",e.kind),"text":e.text})).collect::<Vec<_>>()})
                 }
@@ -801,6 +803,17 @@ impl OpenCADStudio {
             "action" => self.control_ui_action(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "embed_image" => self.control_embed_image(req)?,
+            #[cfg(not(target_arch = "wasm32"))]
+            "wblock" => self.control_wblock(req)?,
+            #[cfg(not(target_arch = "wasm32"))]
+            "plot" => self.control_plot(req)?,
+            "entities_create" => self.control_entities_create(req)?,
+            "entities_delete" => self.control_entities_delete(req)?,
+            "entities_transform" => self.control_entities_transform(req)?,
+            "xdata_set" => self.control_xdata_set(req)?,
+            "block_define" => self.control_block_define(req)?,
+            #[cfg(not(target_arch = "wasm32"))]
+            "view_focus" => self.control_view_focus(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "save" => {
                 let path = req["path"]
@@ -1100,6 +1113,7 @@ impl OpenCADStudio {
     }
 }
 mod actions;
+mod entities;
 pub(super) fn action_names() -> &'static [&'static str] {
     actions::NAMES
 }

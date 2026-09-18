@@ -3666,7 +3666,7 @@ impl OpenCADStudio {
         self.layout_plot_page_for(&self.plot_dialog.area)
     }
 
-    fn layout_plot_page_for(&self, plot_area: &str) -> PdfPageInput {
+    pub(in crate::app) fn layout_plot_page_for(&self, plot_area: &str) -> PdfPageInput {
         let i = self.active_tab;
         let scene = &self.tabs[i].scene;
         let paper_space = scene.current_layout != "Model";
@@ -4751,7 +4751,7 @@ impl OpenCADStudio {
     }
 
     /// Load a `PlotSettings` into the dialog editor fields.
-    fn load_plotsettings_into_dialog(&mut self, ps: &acadrust::objects::PlotSettings) {
+    pub(in crate::app) fn load_plotsettings_into_dialog(&mut self, ps: &acadrust::objects::PlotSettings) {
         use acadrust::objects::{PlotType, ShadePlotMode, ShadePlotResolutionLevel};
         self.plot_setup_template = Some(ps.clone());
         if matches!(ps.plot_type, PlotType::Window) && !ps.plot_window.is_empty() {
@@ -5076,15 +5076,15 @@ impl OpenCADStudio {
             .cloned()
     }
 
-    fn window_plot_job(&self) -> Option<PdfPageInput> {
+    pub(in crate::app) fn window_plot_job(&self) -> Option<PdfPageInput> {
         self.area_plot_job(self.plot_window?)
     }
 
-    fn display_plot_job(&self) -> Option<PdfPageInput> {
+    pub(in crate::app) fn display_plot_job(&self) -> Option<PdfPageInput> {
         self.area_plot_job(self.display_plot_window()?)
     }
 
-    fn limits_plot_job(&self) -> Option<PdfPageInput> {
+    pub(in crate::app) fn limits_plot_job(&self) -> Option<PdfPageInput> {
         let (min, max) = self.tabs[self.active_tab].scene.current_drawing_limits()?;
         self.area_plot_job((min.x, min.y, max.x, max.y))
     }
@@ -5111,7 +5111,7 @@ impl OpenCADStudio {
         ))
     }
 
-    fn extents_plot_job(&self) -> Option<PdfPageInput> {
+    pub(in crate::app) fn extents_plot_job(&self) -> Option<PdfPageInput> {
         let scene = &self.tabs[self.active_tab].scene;
         if scene.current_layout == "Model" {
             let (min, max) = scene.model_space_extents()?;

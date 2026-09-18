@@ -3763,7 +3763,7 @@ impl OpenCADStudio {
         self.videos = videos;
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let config = config::AppConfig::load();
         if let Err(error) = crate::i18n::set_language(config.settings.language) {
             eprintln!("Unable to apply saved UI language: {error}");
