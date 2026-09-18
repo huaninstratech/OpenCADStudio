@@ -1,8 +1,6 @@
 # OpenCADStudio MCP control
 
-Every native OpenCADStudio build contains the same MCP server as the editor. `OpenCADStudio --mcp` starts it over stdio, opens the desktop editor when needed, and exposes the live document without Python, a package manager, a sidecar service, or client-specific code.
-
-MCP lets an AI client inspect the open drawing, execute editor commands, and verify the result through a shared protocol. Install OpenCADStudio, then add a local MCP server in the client and set its command to:
+Every native OpenCADStudio build contains the same MCP server as the editor. `OpenCADStudio --mcp` starts it over stdio, opens the desktop editor when needed, and exposes the live document without Python, a package manager, a sidecar service, or client-specific code.MCP lets an AI client inspect the open drawing, execute editor commands, and verify the result through a shared protocol. Install OpenCADStudio, then add a local MCP server in the client and set its command to:
 
 ```sh
 OpenCADStudio --mcp
@@ -156,3 +154,241 @@ The repeatable live-editor evaluation draws three isolated entities in one batch
 ```sh
 python3 docs/automation/mcp_eval.py target/debug/OpenCADStudio
 ```
+
+## Headless automation server (`--serve`)
+
+Application clients that do not speak MCP spawn `OpenCADStudio --serve` and exchange one JSON object per line over stdin/stdout (`--port N` switches to `127.0.0.1:<N>`, one client at a time). The greeting line carries the build version and the session identity:
+
+```json
+{"ok":true,"ready":true,"version":"2026.38","session_id":"…"}
+```
+
+Legacy ops (`new`, `open`, `run`, `entities`, `query`, `records`, `layers`, `header`, `save`, …) act on the active document and need no envelope. Mutation ops of the shared control protocol — `wblock`, `plot`, `embed_image`, `set_properties`, `undo`, … — are addressed with an envelope: `"protocol":1`, a caller-generated `request_id` (≤128 bytes), and the `document_id` from `{"protocol":1,"op":"state"}`. An absent `session_id` is accepted; only a wrong one is refused. Settled responses carry `{ok, status, request_id, result, changes, state}`; `status` stays `accepted`/`running` for asynchronous work, polled with `{"protocol":1,"op":"operation","request_id":…}`.
+
+### `wblock` — export entities or a block to a new DWG/DXF
+
+Either a handle list or a block name, never both. The open document is not modified; the output format follows the path extension (`.dwg` or `.dxf`).
+
+```json
+{"protocol":1,"op":"wblock","request_id":"clone-1","document_id":1,"path":"C:/out/page-01.dwg","handles":["2A","31"]}
+{"protocol":1,"op":"wblock","request_id":"clone-2","document_id":1,"path":"C:/out/cover.dwg","block":"A_CPT"}
+```
+
+The result reports `{"path":…, "entities":<count>}`. Referenced layer definitions travel with the entities; block definitions export flattened into model space.
+
+### `plot` — render to PDF
+
+Plots the active document without any dialog. `layout` selects `"Model"` (default), one layout name, or `"all"`. `area` is `"extents"` (default), `"display"`, `"limits"`, `"window"` (needs `window:[x0,y0,x1,y1]`), or `"layout"` (the laid-out sheet, layouts only). `paper` names a catalog sheet, `orientation` is `"Portrait"`/`"Landscape"`, sizing is `"fit":true` (default) or `"scale":"1:100"`, plus `center`, `offset_x/offset_y`, `upside_down`, `plot_style` (CTB path or discovered name) and the output toggles `transparency`, `lineweights`, `merge_lines`, `stamp`:
+
+```json
+{"protocol":1,"op":"plot","request_id":"plot-1","document_id":1,"path":"C:/out/pages.pdf","layout":"all","paper":"ISO_A4_(210.00_x_297.00_MM)","fit":true,"center":true}
+```
+
+Explicitly supplied fields override a layout's stored page setup; unspecified fields keep it. The result reports `{"path":…, "pages":<n>, "page_sizes":[[w,h],…]}` in millimetres.
+
+### `embed_image` — attach a picture
+
+Places the picture at `at:[x,y]` with `width` in drawing units (default ≈ pixels/100). The default embeds the raster into the drawing as a self-contained OLE2FRAME (`"kind":"Ole2Frame"`). `"linked":true` stores a `RasterImage` + `ImageDefinition` referencing the file path instead (`"kind":"RasterImage"`) — the image file must then travel with the drawing.
+
+### Text content and bounds
+
+`query` entities of type `TEXT`/`MTEXT` return the raw stored string in `value` plus a formatting-free rendering in `text` (MTEXT inline codes such as `\A1;` or `\P` are resolved; `%%d`-style TEXT codes become their glyphs). With `detail:"full"`, degenerate-width text bounds are widened with a documented estimate (height × 0.8 × character count) so `bounds`-based region filters stay usable.
+
+### Smoke test
+
+The stdio path is covered black-box by a Python script that draws two entities, exports them with `wblock`, plots them with `plot`, and checks the capability advertisement:
+
+```sh
+python3 docs/automation/serve_smoke.py target/debug/OpenCADStudio
+```
+
+## AutoCAD .NET parity
+
+The automation surface is designed to mirror the capability areas of the
+AutoCAD .NET (ObjectARX) developer API — application/documents, database
+objects, editor, events, plotting. `autocad-parity-api.md` maps every .NET
+API area to the existing operations and lists the remaining work items
+(`entities_create`, `xdata_set`, `block_define`, …) with priorities.
+
+## REST API (`--http`) — for ordinary HTTP clients
+
+`OpenCADStudio --http 8090` runs the same headless session behind a
+resource-oriented REST surface on `http://127.0.0.1:<port>/api/v1`. Any
+HTTP client works — curl, Python, C# `HttpClient`, JS `fetch`; there is no
+SDK and nothing AI-specific. The server keeps one drawing session alive
+across requests, binds loopback only, sends permissive CORS headers, and
+serves its machine-readable description at `GET /api/v1/openapi`
+(OpenAPI 3, embedded from `src/rest_openapi.json`).
+
+```sh
+OpenCADStudio --http 8090            # start the REST server (headless)
+curl http://127.0.0.1:8090/api/v1/ready
+```
+
+### Endpoints
+
+| Method & path | Purpose |
+|---|---|
+| `GET  /api/v1/ready` | Version, session id, active document id. |
+| `GET  /api/v1/state` | Full editor state (documents, selection, command, camera). |
+| `GET  /api/v1/capabilities` | Feature/collection advertisement incl. `operations`. |
+| `GET  /api/v1/openapi` | OpenAPI 3 description of this whole surface. |
+| `GET  /api/v1/documents` · `POST /api/v1/documents` | List; open `{"path":…}` or start empty (no body). |
+| `GET  /api/v1/entities` | Query — `type`, `layer`, `detail`, `offset`, `limit`, `fields`, `handles`, `bounds`, `near`, `contains_point`, `intersections` (comma-separated). |
+| `GET  /api/v1/entities/{handle}` | One entity, `detail:"full"`. |
+| `POST /api/v1/entities` | Create a typed batch → **201** with `handles`. |
+| `DELETE /api/v1/entities?handles=a,b` | Erase by handle (body `{"handles":[…]}` also accepted). |
+| `POST /api/v1/entities/transform` | move/copy/rotate/scale/mirror/array. |
+| `GET  /api/v1/entities/{h}/xdata?app=` · `PUT …/xdata/{app}` · `DELETE …/xdata/{app}` | Read / replace / remove extended data. |
+| `POST /api/v1/blocks` | Define a block from entities (+ Insert). |
+| `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export · DWG/DXF export · attach picture. |
+| `POST /api/v1/commands` | Run one command line (`{"cmd":"LINE 0,0 10,10"}`). |
+| `POST /api/v1/undo` · `/redo` · `/save` | Lifecycle. |
+| `GET  /api/v1/layers` · `/header` · `/records?collection=…` | Database reads. |
+| `POST /api/v1/{op}` | Generic passthrough for any automation op. |
+
+Status codes: `200`/`201` on success; `400` validation; `404` unknown route
+or handle (`code:"entity_absent"`); `409` stale state or GUI required;
+`503` busy. Every failure body keeps the symbolic `code` and message, so
+clients can branch on either. The server-generated `request_id` and the
+retry-on-stale-state dance happen inside the REST layer — callers just do
+HTTP.
+
+### Walkthrough with curl
+
+```sh
+# 1. Create entities (the missing layer "FRAME" is created automatically;
+#    the whole batch commits as one undoable step or not at all).
+curl -s -X POST http://127.0.0.1:8090/api/v1/entities \
+  -H "Content-Type: application/json" \
+  -d '{"entities":[
+        {"type":"Line","start":[0,0],"end":[100,0],"layer":"FRAME"},
+        {"type":"LwPolyline","vertices":[[0,0],[100,0],[100,60],[0,60]],"closed":true},
+        {"type":"Text","value":"PAGE-01","position":[10,50],"height":3.0},
+        {"type":"Circle","center":[80,30],"radius":5}
+      ]}'
+# → 201 {"ok":true,"status":"completed","result":{"handles":["63","64","65","66"],…}}
+
+# 2. Verify: query it back.
+curl -s "http://127.0.0.1:8090/api/v1/entities?type=Line&detail=full"
+# → {"ok":true,"entities":[{"handle":"63","start":[0,0,0],"end":[100,0,0],…},…]
+
+# 3. Move the circle 10 units right.
+curl -s -X POST http://127.0.0.1:8090/api/v1/entities/transform \
+  -H "Content-Type: application/json" \
+  -d '{"handles":["66"],"action":"move","vector":[10,0]}'
+
+# 4. Mark the text with extended data (RegApp "SPM" registered implicitly).
+curl -s -X PUT http://127.0.0.1:8090/api/v1/entities/65/xdata/SPM \
+  -H "Content-Type: application/json" \
+  -d '[{"code":1000,"value":"PAGE-01"},{"code":1070,"value":3}]'
+curl -s "http://127.0.0.1:8090/api/v1/entities/65/xdata?app=SPM"
+
+# 5. Turn the two frame lines into a block definition + Insert.
+curl -s -X POST http://127.0.0.1:8090/api/v1/blocks \
+  -H "Content-Type: application/json" \
+  -d '{"name":"FRAME-MARK","base":[0,0,0],"handles":["63","67"]}'
+# → 201 {"result":{"block":"FRAME-MARK","insert":"6B"}}
+
+# 6. Save and prove persistence.
+curl -s -X POST http://127.0.0.1:8090/api/v1/save \
+  -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwg"}'
+```
+
+The same lifecycle (create → verify → transform → xdata → block →
+save → reopen → verify persisted → erase → undo) runs as an automated
+black-box check:
+
+```sh
+python3 docs/automation/rest_smoke.py target/debug/OpenCADStudio
+```
+
+## Entity operations reference (protocol ops)
+
+These are the underlying operations the REST routes call; every native
+transport (stdio `--serve`, TCP, MCP, wasm) exposes them under the same
+names and semantics. Angles are **degrees** on the wire; points accept
+`[x,y]` (z=0) or `[x,y,z]`; handles are hexadecimal strings.
+
+### `entities_create` — AppendEntity parity
+
+Batch of typed definitions, validated in full before anything commits; one
+undo step; missing `layer`s are created and reported in `layers_created`.
+
+| type | fields |
+|---|---|
+| `Line` | `start`, `end`, optional `thickness` |
+| `Circle` | `center`, `radius` (≥ 0) |
+| `Arc` | `center`, `radius` (> 0), `start_angle_deg`, `end_angle_deg` |
+| `LwPolyline` | `vertices` (≥ 2), `closed`, optional `constant_width` |
+| `Point` | `location` |
+| `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
+| `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `Solid` | `corners` (3 or 4 `[x,y,z]`) |
+| `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
+
+Every definition also accepts `layer` and `color` (ACI index). Response:
+`{"handles":[…], "created":N, "layers_created":[…]}`. An invalid definition
+(`unknown_entity_type`, `invalid_radius`, `invalid_vertices`, …) aborts the
+whole batch with nothing committed.
+
+### `entities_delete` — Erase parity
+
+`{"op":"entities_delete","handles":[…]}` — every handle must exist
+(`entity_absent` lists the missing ones and nothing is erased). One undo
+step; `result.erased` counts.
+
+### `entities_transform` — TransformBy parity
+
+`{"op":"entities_transform","handles":[…],"action":…}` with, per action:
+
+- `move` / `copy` — `vector:[dx,dy(,dz)]`; `copy` keeps the originals and
+  returns the new handles in `result.created`.
+- `rotate` — `center:[x,y]`, `angle_deg` (CCW positive).
+- `scale` — `center`, `factor` (nonzero).
+- `mirror` — `axis:[[x1,y1],[x2,y2]]` (points must differ); optional
+  `"copy":true` to keep the originals.
+- `array` — `rows`, `columns`, `row_spacing`, `column_spacing`; creates
+  rows×columns−1 copies (the original counts as cell 0,0).
+
+`result.affected` counts the addressed entities; `result.created` lists new
+handles for copy/mirror-copy/array.
+
+### `xdata_set` / `xdata_get` — XData + RegAppTable parity
+
+`{"op":"xdata_set","handles":[…],"app":"SPM","data":[{"code":1000,"value":"PAGE-01"},{"code":1070,"value":7}]}` —
+replaces that application's record on every handle and registers the APPID
+table entry implicitly. Supported codes: `1000` string, `1003` layer name,
+`1004` hex bytes, `1005` hex handle, `1010`–`1013` `[x,y,z]` (point,
+position, displacement, direction), `1040`/`1041`/`1042` real, `1070` int16,
+`1071` int32. An empty (or absent) `data` list removes the record — that is
+the clear operation.
+
+`xdata_get` is a **read**: `{"op":"xdata_get","handles":[…],"app":"SPM"}` →
+`{"ok":true,"items":[{"handle":"65","xdata":{"SPM":["PAGE-01",7]}}]}` — no
+`request_id`, no `document_id` needed.
+
+### `block_define` — BlockTableReco
+### `block_define` — BlockTableRecord parity
+
+```json
+{"op":"block_define","name":"MARK","base":[0,0,0],"handles":["63","67"],"insert_at":[0,0,0]}
+```
+
+AutoCAD BLOCK semantics: the sources move into the definition (flattened at
+`base` = block origin) and one `Insert` is placed at `insert_at` (default
+`base`), so the drawing looks unchanged while the entities became one
+reusable block. Response: `{"block":"MARK","insert":"6B"}`. Names must be
+unique and may not start with `*`. Definitions survive save/open round
+trips and are consumable by `wblock` (by block name) and `INSERT` creation
+via `entities_create`.
+
+### `view_focus` — GUI sessions
+
+```json
+{"op":"view_focus","handles":["65"],"highlight":true}
+```
+
+Fits the entities into the view and selects them. Headless servers refuse
+with `code:"gui_required"`; REST clients get HTTP 409.
