@@ -226,6 +226,31 @@ fn entity_json(e: &acadrust::EntityType, detail: &str) -> Value {
         }
         _ => {}
     }
+    if matches!(e, E::Hatch(_)) {
+        // Flattened first-loop boundary (world XY) so clients do not have to
+        // dig through the serialized path/edge structures.
+        if let E::Hatch(hatch) = e {
+            if let Some(path) = hatch.paths.first() {
+                let loops: Vec<Value> = path
+                    .edges
+                    .iter()
+                    .filter_map(|edge| match edge {
+                        acadrust::entities::BoundaryEdge::Polyline(polyline) => Some(
+                            json!(polyline
+                                .vertices
+                                .iter()
+                                .map(|v| [v.x, v.y])
+                                .collect::<Vec<_>>()),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                if !loops.is_empty() {
+                    map.insert("boundary".into(), json!(loops));
+                }
+            }
+        }
+    }
     if detail == "full" {
         let (mut min, mut max) = crate::scene::convert::tess::entity_bounds(e);
         // Text bounds come from the shaped glyphs, and some paths leave the
@@ -322,6 +347,18 @@ impl OpenCADStudio {
         };
         match req["op"].as_str().unwrap_or("") {
             "new" => {
+                if let Some(template) = req["template"].as_str() {
+                    let purged = match self.apply_template(template) {
+                        Ok(purged) => purged,
+                        Err(error) => return error,
+                    };
+                    let mut summary = self.entity_summary();
+                    if let Some(obj) = summary.as_object_mut() {
+                        obj.insert("template".into(), json!(template));
+                        obj.insert("purged".into(), json!(purged));
+                    }
+                    return summary;
+                }
                 let i = self.active_tab;
                 self.tabs[i].scene.reset_to_new_drawing();
                 self.tabs[i].scene.material_base_dir = None;
@@ -500,9 +537,29 @@ impl OpenCADStudio {
                     .as_str()
                     .map(PathBuf::from)
                     .or_else(|| self.tabs[i].current_path.clone());
-                let Some(path) = path else {
+                let Some(mut path) = path else {
                     return err("save: no \"path\" and the document has none");
                 };
+                // A .dwt target is written as DWG bytes through a hidden
+                // scratch file and renamed afterwards — DWT is a DWG-family
+                // file, and the plain io path keeps no locks on the scratch.
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dwt"))
+                {
+                    let scratch = path.with_file_name(format!(
+                        ".{}.tmp.dwg",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                    let document = self.tabs[i].scene.document.clone();
+                    if let Err(e) = crate::io::save(&document, &scratch) {
+                        return err(format!("save: {e}"));
+                    }
+                    if let Err(e) = std::fs::rename(&scratch, &path) {
+                        return err(format!("save: rename to .dwt failed: {e}"));
+                    }
+                    return json!({ "ok": true, "saved": path.to_string_lossy() });
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 let result = self.save_tab_synchronously_protected(i, path.clone(), true);
                 #[cfg(target_arch = "wasm32")]
@@ -665,6 +722,25 @@ impl OpenCADStudio {
         let limit = req["limit"].as_u64().unwrap_or(1000).min(10000) as usize;
         let offset = req["offset"].as_u64().unwrap_or(0) as usize;
 
+        const WHERE_OPS: &[&str] = &[
+            "eq", "ne", "lt", "lte", "gt", "gte", "contains",
+            "starts_with", "ends_with", "in", "exists", "not_exists",
+        ];
+        if let Some(filters) = req["where"].as_array() {
+            for filter in filters {
+                let path_ok = filter["path"]
+                    .as_str()
+                    .is_some_and(|path| path.is_empty() || path.starts_with('/'));
+                let op_ok = filter["op"].as_str().unwrap_or("eq");
+                if !path_ok || !WHERE_OPS.contains(&op_ok) {
+                    return err(format!(
+                        "where filters need a JSON Pointer path and one op: {}",
+                        WHERE_OPS.join(", ")
+                    ));
+                }
+            }
+        }
+
         let mut matched = Vec::new();
         for e in tab.scene.document.entities() {
             if handles
@@ -677,6 +753,37 @@ impl OpenCADStudio {
                 || layer_filter.is_some_and(|value| e.common().layer != value)
             {
                 continue;
+            }
+            if let Some(filters) = req["where"].as_array() {
+                // Filters address  with RFC 6901 pointers, the
+                // same contract as the records op (SelectionFilter parity).
+                let properties = serde_json::to_value(e).ok().and_then(|wrapper| {
+                    wrapper.as_object().and_then(|object| object.values().next().cloned())
+                });
+                let mut matches = true;
+                for filter in filters {
+                    let path = filter["path"].as_str().unwrap_or("");
+                    let actual = if path.is_empty() {
+                        properties.as_ref()
+                    } else {
+                        properties.as_ref().and_then(|properties| properties.pointer(path))
+                    };
+                    match crate::app::record_api::compare(
+                        actual,
+                        filter["op"].as_str().unwrap_or("eq"),
+                        filter.get("value"),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            matches = false;
+                            break;
+                        }
+                        Err(error) => return err(format!("where filter: {error}")),
+                    }
+                }
+                if !matches {
+                    continue;
+                }
             }
             if let Some(bounds) = bounds {
                 let (min, max) = crate::scene::convert::tess::entity_bounds(e);

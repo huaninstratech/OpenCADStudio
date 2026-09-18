@@ -24,6 +24,18 @@ pub fn tool() -> ToolDef {
 ///
 /// Returns `Err` if the block is not found or has no entities.
 pub fn extract_block_to_doc(src: &CadDocument, block_name: &str) -> Result<CadDocument, String> {
+    let mut out = CadDocument::new();
+    extract_block_into(src, block_name, &mut out)?;
+    Ok(out)
+}
+
+/// Extract the block's entities into `out` (a fresh document or a loaded
+/// template whose tables/styles should survive — Catalog §2.1).
+pub fn extract_block_into(
+    src: &CadDocument,
+    block_name: &str,
+    out: &mut CadDocument,
+) -> Result<(), String> {
     let br = src
         .block_records
         .get(block_name)
@@ -38,7 +50,6 @@ pub fn extract_block_to_doc(src: &CadDocument, block_name: &str) -> Result<CadDo
         .into_owned());
     }
 
-    let mut out = CadDocument::new();
     // Copy layers referenced by the block entities.
     for h in &handles {
         if let Some(e) = src.get_entity(*h) {
@@ -71,7 +82,7 @@ pub fn extract_block_to_doc(src: &CadDocument, block_name: &str) -> Result<CadDo
         .into_owned());
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Build a standalone `CadDocument` from an explicit list of entity handles
@@ -80,11 +91,20 @@ pub fn extract_entities_to_doc(
     src: &CadDocument,
     handles: &[acadrust::Handle],
 ) -> Result<CadDocument, String> {
+    let mut out = CadDocument::new();
+    extract_entities_into(src, handles, &mut out)?;
+    Ok(out)
+}
+
+/// Extract the listed entities into `out` (fresh document or template base).
+pub fn extract_entities_into(
+    src: &CadDocument,
+    handles: &[acadrust::Handle],
+    out: &mut CadDocument,
+) -> Result<(), String> {
     if handles.is_empty() {
         return Err(t!("No entities selected for WBLOCK.").into_owned());
     }
-
-    let mut out = CadDocument::new();
 
     for &h in handles {
         if let Some(entity) = src.get_entity(h) {
@@ -109,5 +129,5 @@ pub fn extract_entities_to_doc(
         return Err(t!("None of the selected entities could be exported.").into_owned());
     }
 
-    Ok(out)
+    Ok(())
 }

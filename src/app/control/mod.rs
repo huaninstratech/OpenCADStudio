@@ -109,6 +109,8 @@ pub(super) struct State {
     serial: u64,
     events: VecDeque<Value>,
     pub(super) routing: bool,
+    /// Session-scoped named handle sets for selection_set_save/load.
+    selection_sets: std::collections::BTreeMap<String, Vec<acadrust::Handle>>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -569,7 +571,9 @@ impl OpenCADStudio {
                     Task::none(),
                 );
             }
-            if self.tabs[self.active_tab].id != id && op != "activate" {
+            if self.tabs[self.active_tab].id != id
+                && !matches!(op, "activate" | "close" | "entities_copy_to")
+            {
                 return (
                     failure(
                         "document_not_active",
@@ -704,7 +708,23 @@ impl OpenCADStudio {
     fn control_action(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let i = self.active_tab;
         Ok(match req["op"].as_str().unwrap_or("") {
-            "new" => self.update(Message::TabNew),
+            "new" => {
+                if let Some(template) = req["template"].as_str() {
+                    match self.apply_template(template) {
+                        Ok(purged) => {
+                            self.set_control_result(json!({
+                                "template": template,
+                                "purged": purged,
+                                "total": self.tabs[i].scene.document.entities().count(),
+                            }));
+                            Task::none()
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    self.update(Message::TabNew)
+                }
+            }
             "open" => self.update(Message::OpenExternal(std::path::PathBuf::from(string(
                 req, "path",
             )?))),
@@ -810,8 +830,16 @@ impl OpenCADStudio {
             "entities_create" => self.control_entities_create(req)?,
             "entities_delete" => self.control_entities_delete(req)?,
             "entities_transform" => self.control_entities_transform(req)?,
+            "entities_copy_to" => self.control_entities_copy_to(req)?,
             "xdata_set" => self.control_xdata_set(req)?,
             "block_define" => self.control_block_define(req)?,
+            "group_create" => self.control_group_create(req)?,
+            "selection_set_save" => self.control_selection_set_save(req)?,
+            "selection_set_load" => self.control_selection_set_load(req)?,
+            "close" => self.control_close(req)?,
+            "sysvar" => self.control_sysvar(req)?,
+            "layout_create" => self.control_layout_create(req)?,
+            "page_setup_set" => self.control_page_setup_set(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "view_focus" => self.control_view_focus(req)?,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1114,6 +1142,10 @@ impl OpenCADStudio {
 }
 mod actions;
 mod entities;
+mod sheets;
+
+#[cfg(test)]
+mod p1_tests;
 pub(super) fn action_names() -> &'static [&'static str] {
     actions::NAMES
 }

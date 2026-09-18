@@ -166,8 +166,24 @@ impl OpenCADStudio {
     pub(super) fn control_wblock(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let path = string(req, "path")?;
         let document = &self.tabs[self.active_tab].scene.document;
+        // A template base keeps its tables/styles in the exported file
+        // (Catalog §2.1: clone from a .dwt/.dwg template).
+        let template_base = match req["template"].as_str().filter(|t| !t.is_empty()) {
+            Some(template) => Some(
+                crate::io::load_file(std::path::Path::new(template))
+                    .map_err(|e| failure("template_missing", e))?,
+            ),
+            None => None,
+        };
         let extracted = if let Some(block) = req["block"].as_str() {
-            crate::modules::insert::wblock::extract_block_to_doc(document, block)
+            match &template_base {
+                Some(base) => {
+                    let mut base = base.clone();
+                    crate::modules::insert::wblock::extract_block_into(document, block, &mut base)?;
+                    Ok(base)
+                }
+                None => crate::modules::insert::wblock::extract_block_to_doc(document, block),
+            }
         } else if let Some(listed) = req["handles"].as_array() {
             let handles: Result<Vec<acadrust::Handle>, Value> = listed
                 .iter()
@@ -188,7 +204,18 @@ impl OpenCADStudio {
                     })
                 })
                 .collect();
-            crate::modules::insert::wblock::extract_entities_to_doc(document, &handles?)
+            match &template_base {
+                Some(base) => {
+                    let mut base = base.clone();
+                    crate::modules::insert::wblock::extract_entities_into(
+                        document,
+                        &handles?,
+                        &mut base,
+                    )?;
+                    Ok(base)
+                }
+                None => crate::modules::insert::wblock::extract_entities_to_doc(document, &handles?),
+            }
         } else {
             return Err(failure(
                 "selection_required",
@@ -197,8 +224,25 @@ impl OpenCADStudio {
         };
         let extracted = extracted.map_err(|e| failure("wblock_failed", e))?;
         let entities = extracted.entities().count();
-        crate::io::save(&extracted, std::path::Path::new(path))
-            .map_err(|e| failure("save_failed", e))?;
+        // A .dwt target is written as DWG bytes under a hidden scratch name,
+        // then renamed (DWT is a DWG-family file).
+        let mut target = std::path::PathBuf::from(path);
+        let mut scratch = None;
+        if target
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dwt"))
+        {
+            scratch = Some(target.clone());
+            target = target.with_file_name(format!(
+                ".{}.tmp.dwg",
+                target.file_name().unwrap().to_string_lossy()
+            ));
+        }
+        crate::io::save(&extracted, &target).map_err(|e| failure("save_failed", e))?;
+        if let Some(final_path) = scratch {
+            std::fs::rename(&target, &final_path)
+                .map_err(|e| failure("save_failed", format!("rename to .dwt failed: {e}")))?;
+        }
         self.set_control_result(json!({
             "path": path,
             "entities": entities,
@@ -430,6 +474,24 @@ impl OpenCADStudio {
         *self.tabs[i].scene.camera.borrow_mut() = original_camera;
         self.tabs[i].scene.camera_generation = original_camera_generation;
         let pages = built.map_err(|e| failure("plot_failed", e))?;
+        if req["per_page"].as_bool().unwrap_or(false) {
+            // One PDF per layout: <stem>-<Layout>.pdf beside the requested
+            // path (Publish parity for sheet-by-sheet delivery).
+            let stem = path.strip_suffix(".pdf").unwrap_or(path).to_owned();
+            let mut files = Vec::with_capacity(pages.len());
+            for (name, page) in targets.iter().zip(&pages) {
+                let safe: String = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .collect();
+                let file = format!("{stem}-{safe}.pdf");
+                crate::io::pdf_export::export_pdf(page, std::path::Path::new(&file))
+                    .map_err(|e| failure("plot_failed", e))?;
+                files.push(json!({"layout": name, "path": file}));
+            }
+            self.set_control_result(json!({ "files": files, "pages": pages.len() }));
+            return Ok(Task::none());
+        }
         crate::io::pdf_export::export_pdf_pages(&pages, std::path::Path::new(path), None)
             .map_err(|e| failure("plot_failed", e))?;
         self.set_control_result(json!({

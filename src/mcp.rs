@@ -64,6 +64,14 @@ const EXECUTE_OPS: &[&str] = &[
     "block_define",
     "xdata_set",
     "view_focus",
+    "entities_copy_to",
+    "group_create",
+    "selection_set_save",
+    "selection_set_load",
+    "close",
+    "sysvar",
+    "layout_create",
+    "page_setup_set",
     "save",
     "stop",
     "batch",
@@ -91,6 +99,14 @@ const BATCH_STEP_OPS: &[&str] = &[
     "block_define",
     "xdata_set",
     "view_focus",
+    "entities_copy_to",
+    "group_create",
+    "selection_set_save",
+    "selection_set_load",
+    "close",
+    "sysvar",
+    "layout_create",
+    "page_setup_set",
     "save",
     "stop",
 ];
@@ -789,6 +805,36 @@ fn validate_execute_request(request: &Value, op: &str) -> Result<(), String> {
                 r#"{"op":"xdata_set","app":"SPM","handles":["2A"],"data":[{"code":1000,"value":"tag"}]}"#,
             )
         }
+        "entities_copy_to"
+            if request["handles"].as_array().is_none_or(Vec::is_empty)
+                || request["document_id"].as_u64().is_none() =>
+        {
+            missing(
+                "handles and document_id",
+                r#"{"op":"entities_copy_to","handles":["2A"],"document_id":2}"#,
+            )
+        }
+        "group_create" | "selection_set_save"
+            if request["name"].as_str().is_none_or(str::is_empty)
+                || request["handles"].as_array().is_none_or(Vec::is_empty) =>
+        {
+            missing(
+                "name and handles",
+                r#"{"op":"group_create","name":"Frame","handles":["2A"]}"#,
+            )
+        }
+        "selection_set_load" if request["name"].as_str().is_none_or(str::is_empty) => {
+            missing("name", r#"{"op":"selection_set_load","name":"Frame"}"#)
+        }
+        "layout_create" if request["name"].as_str().is_none_or(str::is_empty) => {
+            missing("name", r#"{"op":"layout_create","name":"Plan"}"#)
+        }
+        "page_setup_set" if request["layout"].as_str().is_none_or(str::is_empty) => {
+            missing(
+                "layout",
+                r#"{"op":"page_setup_set","layout":"Plan","paper":"ISO_A4_(210.00_x_297.00_MM)"}"#,
+            )
+        }
         _ => Ok(()),
     }
 }
@@ -1010,6 +1056,13 @@ fn execute_request_schema() -> Value {
             "app":{"type":"string","minLength":1,"description":"xdata_set: application name; its RegApp table entry is registered automatically."},
             "data":{"type":"array","description":"xdata_set typed values [{code,value}]: 1000 string, 1003 layer, 1004 hex bytes, 1005 hex handle, 1010-1013 [x,y,z], 1040/1041/1042 real, 1070 int16, 1071 int32. An empty or absent list removes the application record.","items":{"type":"object","properties":{"code":{"type":"integer"},"value":{}},"required":["code","value"]}},
             "highlight":{"type":"boolean","description":"view_focus: also select the entities (default true)."},
+            "template":{"type":"string","description":"new/wblock: load this DWG/DXF/DWT file as the base document so its tables and styles survive."},
+            "discard":{"type":"boolean","description":"close: true erases unsaved changes instead of refusing a dirty document."},
+            "per_page":{"type":"boolean","description":"plot: write one PDF per layout as <stem>-<Layout>.pdf."},
+            "get":{"type":"array","items":{"type":"string"},"description":"sysvar: variable names to read (ltscale, pdmode, pdsize, celtscale, textsize, filletrad, mirrtext, insunits, osmode, clayer, ctextstyle, extmin, extmax)."},
+            "set":{"type":"object","description":"sysvar: name=value pairs to write in one undo step.","additionalProperties":true},
+            "select":{"type":"boolean","description":"selection_set_load: also select the recalled entities (default true)."},
+            "where":{"type":"array","description":"query: cross-property filters over entity properties with RFC 6901 paths and the records operator set.","items":{"type":"object","properties":{"path":{"type":"string"},"op":{"type":"string"},"value":{}},"required":["path"]}},
             "at":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"World [x,y] or [x,y,z] placement corner for embed_image (picture grows up-right)."},
             "width":{"type":"number","exclusiveMinimum":0,"description":"World width for embed_image; height follows the image aspect ratio. Defaults to pixel_width/100."},
             "kind":{"type":"string","enum":["text","token","point","entity","structure","selection","enter"],"description":"Input kind listed in state.command.accepts."},
@@ -1061,6 +1114,14 @@ fn execute_request_schema() -> Value {
             {"properties":{"op":{"const":"block_define"}},"required":["name","base","handles"]},
             {"properties":{"op":{"const":"xdata_set"}},"required":["app","handles"]},
             {"properties":{"op":{"const":"view_focus"}},"required":["handles"]},
+            {"properties":{"op":{"const":"entities_copy_to"}},"required":["handles","document_id"]},
+            {"properties":{"op":{"const":"group_create"}},"required":["name","handles"]},
+            {"properties":{"op":{"const":"selection_set_save"}},"required":["name","handles"]},
+            {"properties":{"op":{"const":"selection_set_load"}},"required":["name"]},
+            {"properties":{"op":{"const":"close"}}},
+            {"properties":{"op":{"const":"sysvar"}}},
+            {"properties":{"op":{"const":"layout_create"}},"required":["name"]},
+            {"properties":{"op":{"const":"page_setup_set"}},"required":["layout"]},
             {"properties":{"op":{"const":"save"}}},
             {"properties":{"op":{"const":"stop"}}},
             {"properties":{"op":{"const":"batch"}},"required":["steps"]}

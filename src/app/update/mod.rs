@@ -95,7 +95,7 @@ mod dialog;
 mod dynamic;
 mod file;
 mod style;
-mod util;
+pub(in crate::app) mod util;
 mod viewport;
 mod viewport_snap;
 

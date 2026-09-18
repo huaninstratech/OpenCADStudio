@@ -4315,6 +4315,17 @@ impl OpenCADStudio {
         app
     }
 
+    /// Test hook for transports outside `crate::app` (the REST routing
+    /// tests): push a fresh tab and return its document id, so a second
+    /// open document can be addressed without reaching into `tabs`.
+    #[cfg(test)]
+    pub(crate) fn push_test_document(&mut self) -> u64 {
+        let tab = document::DocumentTab::new_drawing(1000 + self.tabs.len());
+        let id = tab.id;
+        self.tabs.push(tab);
+        id
+    }
+
     /// Install `cmd` as the active interactive command for tab `tab`.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn set_active_command(

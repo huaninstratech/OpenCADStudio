@@ -28,7 +28,7 @@ fn deg_field(req: &Value, key: &str) -> f64 {
     req[key].as_f64().unwrap_or(0.0).to_radians()
 }
 
-fn hex_handles(req: &Value, key: &str) -> Parsed<Vec<acadrust::Handle>> {
+pub(super) fn hex_handles(req: &Value, key: &str) -> Parsed<Vec<acadrust::Handle>> {
     let list = req[key]
         .as_array()
         .filter(|v| !v.is_empty())
@@ -55,7 +55,7 @@ fn hex_handles(req: &Value, key: &str) -> Parsed<Vec<acadrust::Handle>> {
 
 /// Every handle must exist in the document; otherwise `entity_absent` naming
 /// the missing ones so the caller can refresh instead of guessing.
-fn require_existing(document: &acadrust::CadDocument, handles: &[acadrust::Handle]) -> Parsed<()> {
+pub(super) fn require_existing(document: &acadrust::CadDocument, handles: &[acadrust::Handle]) -> Parsed<()> {
     let missing: Vec<String> = handles
         .iter()
         .filter(|h| document.get_entity(**h).is_none())
