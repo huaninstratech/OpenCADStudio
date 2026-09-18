@@ -1058,20 +1058,32 @@ impl OpenCADStudio {
                 Task::none()
             }
             Message::MissingFontsDownload => {
-                // Remember the source across sessions — and across drawings.
-                let source = self.font_source_input.trim().to_string();
-                if self.font_source_url != source {
-                    self.font_source_url = source.clone();
-                    self.save_config();
+                // Downloading from the community repository needs the desktop
+                // network stack; the web build serves its fonts embedded, so
+                // it answers with an empty result instead.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Remember the source across sessions — and across drawings.
+                    let source = self.font_source_input.trim().to_string();
+                    if self.font_source_url != source {
+                        self.font_source_url = source.clone();
+                        self.save_config();
+                    }
+                    let fonts = self.missing_fonts.take().unwrap_or_default();
+                    return Task::perform(
+                        async move {
+                            let source = crate::io::font_repo::FontSource::from_url(&source);
+                            crate::io::font_repo::download_fonts(&fonts, &source)
+                        },
+                        Message::MissingFontsResult,
+                    );
                 }
-                let fonts = self.missing_fonts.take().unwrap_or_default();
-                Task::perform(
-                    async move {
-                        let source = crate::io::font_repo::FontSource::from_url(&source);
-                        crate::io::font_repo::download_fonts(&fonts, &source)
-                    },
-                    Message::MissingFontsResult,
-                )
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.missing_fonts = None;
+                    self.close_active_modal();
+                    Task::none()
+                }
             }
             Message::MissingFontsDismiss => {
                 self.missing_fonts = None;
@@ -2482,7 +2494,12 @@ impl OpenCADStudio {
                             if is_dwg {
                                 return self.update(Message::OpenRecent(std::path::PathBuf::from(found)));
                             } else {
+                                // Handing a file to the host OS needs a
+                                // desktop shell; the browser build has none.
+                                #[cfg(not(target_arch = "wasm32"))]
                                 let _ = open::that_detached(&found);
+                                #[cfg(target_arch = "wasm32")]
+                                let _ = &found;
                             }
                         } else {
                             self.command_line.push_error(

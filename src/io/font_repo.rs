@@ -104,6 +104,7 @@ pub fn local_font_file(name: &str) -> Option<PathBuf> {
 }
 
 /// List the community folder through the GitHub contents API.
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_repo_fonts() -> Result<Vec<RepoFont>, String> {
     let agent = crate::network::agent(std::time::Duration::from_secs(15));
     let mut response = agent
@@ -142,7 +143,9 @@ fn parse_contents(body: &str) -> Result<Vec<RepoFont>, String> {
 
 /// Download every `missing` font that exists in the community folder into the
 /// local fonts directory. Returns the (requested, saved-path) pairs that were
-/// actually fetched; names absent from the repository are skipped.
+/// actually fetched; names absent from the repository are skipped. Desktop
+/// only — the web build ships its fonts embedded and has no network stack.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn download_fonts(
     missing: &[String],
     source: &FontSource,
