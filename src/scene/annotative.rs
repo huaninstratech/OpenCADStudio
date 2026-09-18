@@ -711,6 +711,16 @@ pub fn effective_annotation_scale_for(
     if !context_annotative && (text_like || !style_annotative) {
         return 1.0;
     }
+    // A representation that belongs to a scale other than the active one draws
+    // at its stored size. Scaling it by the ACTIVE annotation scale inflates a
+    // 1:100-only text to the 1:150 size — 150× its stored height, blanketing
+    // the whole drawing. The `all_visible = false` argument here does not
+    // decide visibility; it makes `annotative_offscale_for` actually compare
+    // the object's scale memberships against the active scale so this answers
+    // "is this representation for another scale?".
+    if annotative_offscale_for(doc, entity.common(), scale_handle, false) {
+        return 1.0;
+    }
     // Annotative TEXT/MTEXT store their paper text height as the base value.
     // `fallback` is the absolute paper-to-model multiplier for the active
     // annotation scale and already includes the drawing's INSUNITS conversion.
