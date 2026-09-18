@@ -2204,6 +2204,7 @@ bg={bg_ms:.1}ms n={view_count}"
                         scale_pill_enabled,
                         tab.scene.annotation_all_visible(),
                         self.annotation_auto_scale > 0,
+                        self.annotation_scale_modelspace,
                         tab.scene.viewport_annotation_scale_synced(),
                         tab.scene.document.header.lineweight_display,
                         cursor_coord,

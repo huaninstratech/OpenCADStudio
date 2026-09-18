@@ -1333,6 +1333,43 @@ impl OpenCADStudio {
                 self.command_line.push_info(&c.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(c));
             }
+            // ANNOSCALEMODEL — apply (or stop applying) the annotation scale to
+            // model-space display. Off, annotative objects show as drawn; paper
+            // space is never affected. App preference, not stored in the file.
+            "ANNOSCALEMODEL" => {
+                use crate::command::ValuePromptCommand;
+                let c = ValuePromptCommand::new(
+                    "ANNOSCALEMODEL",
+                    "ANNOSCALEMODEL  new value [ON/OFF]:",
+                );
+                self.command_line.push_info(&c.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(c));
+            }
+            cmd if cmd.starts_with("ANNOSCALEMODEL ") => {
+                let value = cmd.split_whitespace().nth(1).unwrap_or("");
+                if value.is_empty() {
+                    let state = if self.annotation_scale_modelspace { "ON" } else { "OFF" };
+                    self.command_line.push_output(crate::tf!(
+                        "Annotation scale in model space: {state}"
+                    ).as_ref());
+                    return Some(Task::none());
+                }
+                match value {
+                    "0" | "OFF" | "FALSE" => {
+                        self.set_annotation_scale_modelspace(false);
+                        self.command_line
+                            .push_output(crate::t!("Annotation scale in model space: OFF").as_ref());
+                    }
+                    "1" | "ON" | "TRUE" => {
+                        self.set_annotation_scale_modelspace(true);
+                        self.command_line
+                            .push_output(crate::t!("Annotation scale in model space: ON").as_ref());
+                    }
+                    _ => self.command_line.push_error(
+                        crate::t!("ANNOSCALEMODEL: enter ON or OFF.").as_ref(),
+                    ),
+                }
+            }
             cmd if cmd.starts_with("ANNOAUTOSCALE ") => {
                 let value = cmd.split_whitespace().nth(1).unwrap_or("");
                 match value.parse::<i8>() {

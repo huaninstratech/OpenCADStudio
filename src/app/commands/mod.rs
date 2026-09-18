@@ -451,6 +451,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "CANNOSCALE",
         "ANNOALLVISIBLE",
         "ANNOAUTOSCALE",
+        "ANNOSCALEMODEL",
         "ANNOUPDATE",
         "SCALELISTEDIT",
         "OBJECTSCALE",

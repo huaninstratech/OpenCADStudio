@@ -32,6 +32,10 @@ pub struct AppConfig {
     pub dock: crate::ui::dock::DockState,
     /// Add a newly selected annotation scale to existing annotative objects.
     pub annotation_auto_scale: i8,
+    /// Apply the annotation scale to model-space display. `false` (the
+    /// default) shows annotative objects in model space at their stored size,
+    /// as drawn; paper space is never affected.
+    pub annotation_scale_modelspace: bool,
     /// Ribbon collapse density.
     pub ribbon: RibbonConfig,
     /// Print dialog preferences (only the persisted fields; runtime state is
@@ -53,6 +57,7 @@ impl Default for AppConfig {
             statusbar: StatusBarConfig::default(),
             dock: crate::ui::dock::DockState::default(),
             annotation_auto_scale: -4,
+            annotation_scale_modelspace: false,
             ribbon: RibbonConfig::default(),
             plot: PlotDialogState::default(),
             shortcuts: ShortcutConfig::default(),

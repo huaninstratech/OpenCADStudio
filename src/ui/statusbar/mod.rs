@@ -35,6 +35,7 @@ pub const ROW_HEIGHT: f32 = 30.0;
 
 const ST_ANNO_VISIBILITY: &[u8] = include_bytes!("../../../assets/icons/scale_list.svg");
 const ST_ANNO_AUTO_ADD: &[u8] = include_bytes!("../../../assets/icons/add_scale.svg");
+const ST_ANNO_SCALE_MODEL: &[u8] = include_bytes!("../../../assets/icons/scale.svg");
 const ST_VP_SCALE_SYNC: &[u8] = include_bytes!("../../../assets/icons/sync.svg");
 
 pub struct StatusMenuData<'a> {
@@ -95,6 +96,8 @@ impl StatusBar {
         scale_pill_enabled: bool,
         annotation_all_visible: bool,
         annotation_auto_add: bool,
+        // True when the annotation scale applies to model-space display.
+        annotation_scale_modelspace: bool,
         viewport_scale_synced: Option<bool>,
         // LWDISPLAY header flag — controls lineweight visibility in the viewport.
         lineweight_display: bool,
@@ -409,6 +412,19 @@ impl StatusBar {
                         Message::ToggleAnnotationAutoAdd,
                     ),
                     t!("Automatically Add Scales"),
+                )
+                .into(),
+            );
+        }
+        if vis(StatusPill::AnnoScaleModel) {
+            pills.push(
+                tip(
+                    toggle_pill(
+                        ST_ANNO_SCALE_MODEL,
+                        annotation_scale_modelspace,
+                        Message::ToggleAnnotationScaleModel,
+                    ),
+                    t!("Annotation Scale in Model Space"),
                 )
                 .into(),
             );

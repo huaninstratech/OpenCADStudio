@@ -636,6 +636,11 @@ impl Scene {
                 crate::t!("Hyperlink").into_owned(),
                 QSelectValueEditor::Text,
             ),
+            choice(
+                "annotative",
+                crate::t!("Annotative").into_owned(),
+                QSelectValueEditor::Choice(vec!["Yes".into(), "No".into()]),
+            ),
         ];
         if let Some(t) = type_name {
             let text_style_names: Vec<String> = self
@@ -842,6 +847,14 @@ impl Scene {
                 }
             }),
             "hyperlink" => Some(pe_url_of(entity).unwrap_or_default().to_owned()),
+            "annotative" => Some(
+                if crate::scene::annotative::is_annotative(&self.document, entity) {
+                    "Yes"
+                } else {
+                    "No"
+                }
+                .to_string(),
+            ),
             "material" => Some(
                 match entity.common().material_flags {
                     0 => "ByLayer",

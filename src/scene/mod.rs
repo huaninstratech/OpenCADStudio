@@ -2257,6 +2257,12 @@ pub struct Scene {
     /// Multiplier applied to Text/MText/Dimension sizes during tessellation.
     /// 1.0 = no scaling. 50.0 = "1:50" drawing scale.
     pub annotation_scale: f32,
+    /// Whether the annotation scale applies to model-space display. When off,
+    /// annotative content in model space renders at its stored size (as drawn)
+    /// and the paper-space behaviour is untouched. The app default is `false`
+    /// per user preference; `Scene::new` still starts `true` so programmatic
+    /// uses keep the standard annotative behaviour unless they opt out.
+    pub annotation_scale_modelspace: bool,
     /// Cached per-epoch: does annotation scale actually change wire geometry?
     /// PSLTSCALE is handled by a per-viewport GPU uniform, so only real
     /// annotative entities require a scale-specific resident set.
@@ -2615,6 +2621,7 @@ impl Scene {
             local_extent_max: 1e9,
             local_center: [0.0, 0.0],
             annotation_scale: 1.0,
+            annotation_scale_modelspace: true,
             annotation_affects_wires: std::cell::Cell::new(None),
             model_extents_cache: RefCell::new(None),
             entity_block_map_cache: RefCell::new(None),
@@ -5277,6 +5284,58 @@ impl Scene {
             .or_else(|| self.paper_annotation_scale_handle())
     }
 
+    /// Whether annotation scaling applies to the model-side content that
+    /// renders `block`. Off means model space (and the block editor) shows
+    /// annotative objects exactly as drawn; layout/paper content always
+    /// keeps annotation scaling.
+    fn annotation_scale_applies_to(&self, block: Handle) -> bool {
+        if self.annotation_scale_modelspace {
+            return true;
+        }
+        let model_side =
+            block == self.model_space_block_handle() || self.block_edit_block == Some(block);
+        !model_side
+    }
+
+    /// The annotation-scale handle display paths should resolve with. When the
+    /// model-space toggle is off, model-side display resolves placements from
+    /// the object's stored representation (no scale handle) so nothing scales.
+    pub(crate) fn display_annotation_scale_handle(&self) -> Option<Handle> {
+        if !self.annotation_scale_modelspace && self.current_layout == "Model" {
+            return None;
+        }
+        self.displayed_annotation_scale_handle()
+    }
+
+    /// Apply the model-space display policy to the wire-build annotation
+    /// arguments. With the toggle off, model-side content tessellates at
+    /// scale 1.0 (stored size) with no scale context, and idempotent: an
+    /// already-normalized argument set passes through unchanged.
+    fn annotation_display_args(
+        &self,
+        block: Handle,
+        anno_scale_override: Option<f32>,
+        annotation_scale_handle: Option<Handle>,
+    ) -> (Option<f32>, Option<Handle>) {
+        if self.annotation_scale_applies_to(block) {
+            return (anno_scale_override, annotation_scale_handle);
+        }
+        (Some(anno_scale_override.unwrap_or(1.0)), None)
+    }
+
+    /// Toggle whether the annotation scale applies to model-space display.
+    /// Paper space is never affected.
+    pub fn set_annotation_scale_modelspace(&mut self, value: bool) {
+        if self.annotation_scale_modelspace != value {
+            self.annotation_scale_modelspace = value;
+            // The resident wire key mixes the resolved annotation arguments, so
+            // the rebuild is keyed correctly — but the per-epoch caches of the
+            // fill/wipeout/image/mesh sets are not, so drop them wholesale.
+            self.bump_geometry();
+        }
+    }
+
+
     /// Resolve a named annotation scale to a real `Scale` object handle,
     /// materializing the object from the scale list when the drawing names the
     /// scale (e.g. a virtual fallback scale) but has no `Scale` object for it.
@@ -6047,6 +6106,10 @@ impl Scene {
         frozen_layers: Option<&HashSet<Handle>>,
         style_viewport: Option<Handle>,
     ) -> Arc<Vec<WireModel>> {
+        // The model-space annotation-scale toggle collapses model-side builds
+        // to "as drawn" before any key or cache decision sees the arguments.
+        let (anno_scale_override, annotation_scale_handle) =
+            self.annotation_display_args(block, anno_scale_override, annotation_scale_handle);
         // Normalize an inert anno override away so distinct viewport scales
         // share one resident set when annotation can't change the wires.
         let anno_scale_override = if self.annotation_affects_wires() {
@@ -7076,11 +7139,7 @@ impl Scene {
                 return arc;
             }
         }
-        let scale = if self.current_layout == "Model" {
-            self.displayed_annotation_scale_handle()
-        } else {
-            self.paper_annotation_scale_handle()
-        };
+        let scale = self.display_annotation_scale_handle();
         let arc = Arc::new(self.synced_hatch_models(
             target_block,
             None,
@@ -7154,11 +7213,7 @@ impl Scene {
                 return arc;
             }
         }
-        let scale = if self.current_layout == "Model" {
-            self.displayed_annotation_scale_handle()
-        } else {
-            self.paper_annotation_scale_handle()
-        };
+        let scale = self.display_annotation_scale_handle();
         let arc =
             Arc::new(self.wipeout_models(target_block, None, scale, self.annotation_all_visible()));
         self.wipeout_cache
@@ -7194,11 +7249,7 @@ impl Scene {
                 return arc;
             }
         }
-        let scale = if self.current_layout == "Model" {
-            self.displayed_annotation_scale_handle()
-        } else {
-            self.paper_annotation_scale_handle()
-        };
+        let scale = self.display_annotation_scale_handle();
         let arc = Arc::new(self.image_models(
             target_block,
             None,
@@ -7227,11 +7278,7 @@ impl Scene {
     }
 
     pub fn paper_plot_images(&self) -> Vec<crate::io::pdf_export::PlotImage> {
-        let scale = if self.current_layout == "Model" {
-            self.displayed_annotation_scale_handle()
-        } else {
-            self.paper_annotation_scale_handle()
-        };
+        let scale = self.display_annotation_scale_handle();
         self.placed_images(self.current_layout_block_handle(), None,
             scale, self.annotation_all_visible(), None, true)
     }
@@ -7414,11 +7461,7 @@ impl Scene {
                 return arc;
             }
         }
-        let scale = if self.current_layout == "Model" {
-            self.displayed_annotation_scale_handle()
-        } else {
-            self.paper_annotation_scale_handle()
-        };
+        let scale = self.display_annotation_scale_handle();
         let arc = Arc::new(self.mesh_models(
             target_block,
             None,
@@ -7534,7 +7577,7 @@ impl Scene {
         let meshes = Arc::new(self.mesh_models(
             block,
             None,
-            self.displayed_annotation_scale_handle(),
+            self.display_annotation_scale_handle(),
             self.annotation_all_visible(),
             self.active_viewport,
         ));
@@ -8447,7 +8490,7 @@ impl Scene {
             || crate::scene::annotative::annotative_offscale_for(
                 &self.document,
                 common,
-                self.displayed_annotation_scale_handle(),
+                self.display_annotation_scale_handle(),
                 self.annotation_all_visible(),
             )
         {
@@ -8495,7 +8538,7 @@ impl Scene {
         // is memoised across instances.
         let mut hatch_memo: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
-        let annotation_scale_handle = self.displayed_annotation_scale_handle();
+        let annotation_scale_handle = self.display_annotation_scale_handle();
         let all_visible = self.annotation_all_visible();
         let depth_map = self.draw_depth_map();
         let frozen: HashSet<Handle> = self
@@ -10004,6 +10047,11 @@ impl Scene {
         style_viewport: Option<Handle>,
     ) -> Vec<WireModel> {
         use acadrust::objects::ObjectType;
+
+        // The model-space annotation-scale toggle collapses model-side builds
+        // to "as drawn" before anything downstream sees the arguments.
+        let (anno_scale_override, annotation_scale_handle) =
+            self.annotation_display_args(block_handle, anno_scale_override, annotation_scale_handle);
 
         // Skip diagnostic clock reads when PERF is disabled.
         let perf = crate::perf::enabled();

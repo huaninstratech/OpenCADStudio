@@ -494,6 +494,9 @@ pub(super) struct OpenCADStudio {
     statusbar_config: crate::ui::statusbar::statusbar_config::StatusBarConfig,
     /// Add selected scales to existing annotative objects.
     annotation_auto_scale: i8,
+    /// Apply the annotation scale to model-space display (persisted; default
+    /// off, so model space shows annotative objects as drawn).
+    annotation_scale_modelspace: bool,
     /// Last persisted user preferences (DYN/OSNAP/OTRACK/POLAR/…). Compared
     /// after each message so a change is written to disk exactly once.
     last_saved_config: Option<config::AppConfig>,
@@ -2190,6 +2193,8 @@ pub enum Message {
     QdimSnapPriorityChanged(u8),
     /// Change which annotative objects pick up a new scale (ANNOAUTOSCALE).
     AnnoAutoScaleChanged(i8),
+    /// Apply (or stop applying) the annotation scale to model-space display.
+    AnnotationScaleModelspaceChanged(bool),
     /// Edit the drafting rotation field; parsed when it holds a valid angle (SNAPANG).
     SnapAngleInputChanged(String),
     /// Change the polar tracking increment in degrees.
@@ -2674,6 +2679,8 @@ pub enum Message {
     SetViewportScale(String),
     ToggleAnnotationVisibility,
     ToggleAnnotationAutoAdd,
+    /// Toggle whether the annotation scale applies to model-space display.
+    ToggleAnnotationScaleModel,
     SyncViewportAnnotationScale,
     /// Toggle the scale picker popup open/closed.
     ToggleScalePopup,
@@ -3812,6 +3819,7 @@ impl OpenCADStudio {
             status_menu_tooltip_hidden: false,
             statusbar_config: crate::ui::statusbar::statusbar_config::StatusBarConfig::default(),
             annotation_auto_scale: -4,
+            annotation_scale_modelspace: false,
             last_saved_config: None,
             otrack_active: None,
             otrack_kind: None,

@@ -884,6 +884,7 @@ impl OpenCADStudio {
         let bg = self.default_bg_color;
         let paper_bg = self.default_paper_bg_color;
         let tab = &mut self.tabs[idx];
+        tab.scene.annotation_scale_modelspace = self.annotation_scale_modelspace;
         if tab.is_start {
             return;
         }
@@ -901,6 +902,19 @@ impl OpenCADStudio {
         }
         tab.scene.recolor_meshes();
         tab.scene.bump_geometry();
+    }
+
+    /// Apply the model-space annotation-scale preference to every open tab and
+    /// persist it. Display-only: no document state changes, so tabs stay clean.
+    pub(in crate::app) fn set_annotation_scale_modelspace(&mut self, value: bool) {
+        if self.annotation_scale_modelspace == value {
+            return;
+        }
+        self.annotation_scale_modelspace = value;
+        for tab in &mut self.tabs {
+            tab.scene.set_annotation_scale_modelspace(value);
+        }
+        self.save_config();
     }
 
     /// Check if a suspended command exists on the active tab and resume it
@@ -1045,6 +1059,7 @@ impl OpenCADStudio {
                 dock
             },
             annotation_auto_scale: self.annotation_auto_scale,
+            annotation_scale_modelspace: self.annotation_scale_modelspace,
             ribbon: crate::app::config::RibbonConfig {
                 collapse: self.ribbon.collapse_mode(),
             },
@@ -1103,6 +1118,10 @@ impl OpenCADStudio {
         dock.ensure_settings();
         self.dock = dock;
         self.annotation_auto_scale = cfg.annotation_auto_scale.clamp(-4, 4);
+        self.annotation_scale_modelspace = cfg.annotation_scale_modelspace;
+        for tab in &mut self.tabs {
+            tab.scene.annotation_scale_modelspace = self.annotation_scale_modelspace;
+        }
         self.ribbon.set_collapse_mode(cfg.ribbon.collapse);
         self.plot_dialog = cfg.plot;
         self.shortcut_bindings = cfg.shortcuts.bindings.into_iter().collect();

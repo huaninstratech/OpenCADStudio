@@ -1353,7 +1353,7 @@ impl Scene {
             hatch_bg,
             true,
             (!frozen.is_empty()).then_some(&frozen),
-            self.displayed_annotation_scale_handle(),
+            self.display_annotation_scale_handle(),
             self.annotation_all_visible(),
             self.active_viewport,
             Some(&targets),
@@ -2180,7 +2180,7 @@ impl Scene {
             crate::scene::annotative::entity_for_annotation_context(
                 &self.document,
                 entity,
-                self.displayed_annotation_scale_handle(),
+                self.display_annotation_scale_handle(),
             )
         });
         let new_model = match contextual.as_deref() {
@@ -2216,7 +2216,7 @@ impl Scene {
                     crate::scene::annotative::entity_for_annotation_context(
                         &self.document,
                         e,
-                        self.displayed_annotation_scale_handle(),
+                        self.display_annotation_scale_handle(),
                     )
                     .into_owned(),
                 )),

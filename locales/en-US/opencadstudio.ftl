@@ -314,6 +314,7 @@ common =
     .angular-unit-dimaunit = Angular unit (DIMAUNIT)
     .angular-zero-supp-dimazin = Angular zero supp (DIMAZIN)
     .annotation = Annotation
+    .apply-the-annotation-scale-in-model-space = Apply the annotation scale in model space (annotative objects scale as drawn)
     .annotative = Annotative
     .apparent-intersection = Apparent Intersection
     .apply = Apply
@@ -2447,6 +2448,7 @@ inquiry =
     .measure-geometry = Measure Geometry
     .qselect-no-matching-entities = QSELECT: no matching entities.
     .qselect-entity-ies-selected = QSELECT: __ocs_fmt_0__ entity(ies) selected.
+    .qselect-annotative-enter-yes-or-no = QSELECT ANNOTATIVE: enter YES or NO.
     .refclose-block-saved-all-references-updated = REFCLOSE: Block "__ocs_fmt_0__" saved. All references updated.
     .refclose-changes-discarded = REFCLOSE: Changes discarded.
     .refclose-no-refedit-session-active = REFCLOSE: no REFEDIT session active.
@@ -2459,7 +2461,7 @@ inquiry =
     .selectall-object-s-selected = SELECTALL: __ocs_fmt_0__ object(s) selected.
     .selhandles-no-entities-selected-select-entitie = SELHANDLES: no entities selected. Select entities first.
     .usage-cal-expression-e-g-cal-2-3-4 = Usage: CAL <expression>   e.g. CAL (2+3)*4
-    .usage-qselect-type-layer-color-linetype-value = Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE <value>
+    .usage-qselect-type-layer-color-linetype-value = Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE|ANNOTATIVE <value>
     .x-x-y-y-z-z = X = __ocs_arg_x__,  Y = __ocs_arg_y__,  Z = __ocs_arg_z__
     .type-name-handle-x-layer-color-lt = __ocs_fmt_0__  Handle:__ocs_fmt_1__  Layer:__ocs_fmt_2__  Color:__ocs_fmt_3__  LT:__ocs_fmt_4____ocs_fmt_5__
     .area-4-perimeter-4-centroid-4-4 = __ocs_fmt_0__  Area=__ocs_fmt_1__  Perimeter=__ocs_fmt_2__  Centroid=(__ocs_fmt_3__,__ocs_fmt_4__)
@@ -4024,6 +4026,11 @@ view =
     .adjust-action-v-on-changed-image-s = ADJUST: __ocs_fmt_0__ = __ocs_fmt_1__ on __ocs_fmt_2__ image(s).
     .annoallvisible-new-value-0-1 = ANNOALLVISIBLE  new value [0/1]:
     .annoallvisible-enter-0-or-1 = ANNOALLVISIBLE: enter 0 or 1.
+    .annotation-scale-in-model-space = Annotation Scale in Model Space
+    .annotation-scale-in-model-space-off = Annotation scale in model space: __ocs_fmt_0__
+    .annotation-scale-in-model-space-on = Annotation scale in model space: __ocs_fmt_0__
+    .annoscalemodel-enter-on-or-off = ANNOSCALEMODEL: enter ON or OFF.
+    .annoscalemodel-new-value-on-off = ANNOSCALEMODEL  new value [ON/OFF]:
     .annoautoscale-new-value-4-4 = ANNOAUTOSCALE  new value [-4..4]:
     .annoscale-new-annotation-scale-e-g-1-50-2-1-or = ANNOSCALE  new annotation scale  (e.g. 1:50, 2:1, or a factor):
     .annoupdate-select-annotation-objects-first = ANNOUPDATE: select annotation objects first.

@@ -297,6 +297,7 @@ impl OpenCADStudio {
                             dimension_continue_mode: self.dimension_continue_mode,
                             qdim_snap_priority: self.quick_dimension_snap_priority,
                             annotation_auto_scale: self.annotation_auto_scale,
+                            annotation_scale_modelspace: self.annotation_scale_modelspace,
                             polar_increment_deg: self.polar_increment_deg,
                             show_viewcube: self.show_viewcube,
                             show_ucs_icon: self.show_ucs_icon,

@@ -3714,6 +3714,11 @@ impl Scene {
         let content_viewport = !inst.paper_sheet
             && inst.tile_idx.is_none()
             && inst.handle != Handle::NULL;
+        // With model-space annotation scaling off, every representation already
+        // draws at stored size in the base wire set — nothing left to highlight.
+        if !inst.paper_sheet && !content_viewport && !self.annotation_scale_modelspace {
+            return Arc::new(Vec::new());
+        }
         let target_block = if inst.paper_sheet {
             self.current_layout_block_handle()
         } else {

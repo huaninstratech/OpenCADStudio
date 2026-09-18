@@ -1195,12 +1195,15 @@ impl OpenCADStudio {
             // QSELECT LAYER <name>         — select all entities on layer
             // QSELECT COLOR <n>            — select all entities with color index n
             // QSELECT LINETYPE <name>      — select all entities with linetype
+            // QSELECT ANNOTATIVE YES|NO    — select all annotative / non-annotative objects
             cmd if cmd == "QSELECT" || cmd.starts_with("QSELECT ") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                 let prop = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
                 let val = parts.get(1).map(|s| s.trim()).unwrap_or("").to_uppercase();
 
+                let annotative_want = matches!(val.as_str(), "YES" | "1" | "TRUE" | "ON");
+                let annotative_reject = matches!(val.as_str(), "NO" | "0" | "FALSE" | "OFF");
                 let matched: Vec<acadrust::Handle> = self.tabs[i]
                     .scene
                     .document
@@ -1216,6 +1219,12 @@ impl OpenCADStudio {
                                 .map(|n| n.to_string() == val)
                                 .unwrap_or(val == "BYLAYER"),
                             "LINETYPE" => c.linetype.to_uppercase() == val,
+                            "ANNOTATIVE" if annotative_want || annotative_reject => {
+                                crate::scene::annotative::is_annotative(
+                                    &self.tabs[i].scene.document,
+                                    e,
+                                ) == annotative_want
+                            }
                             _ => false,
                         }
                     })
@@ -1224,7 +1233,13 @@ impl OpenCADStudio {
 
                 if prop.is_empty() {
                     self.command_line
-                        .push_info(crate::t!("Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE <value>").as_ref());
+                        .push_info(crate::t!("Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE|ANNOTATIVE <value>").as_ref());
+                } else if matches!(prop.as_str(), "ANNOTATIVE")
+                    && !annotative_want
+                    && !annotative_reject
+                {
+                    self.command_line
+                        .push_error(crate::t!("QSELECT ANNOTATIVE: enter YES or NO.").as_ref());
                 } else if matched.is_empty() {
                     self.command_line
                         .push_output(crate::t!("QSELECT: no matching entities.").as_ref());

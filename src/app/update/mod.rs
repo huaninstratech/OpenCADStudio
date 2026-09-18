@@ -4107,6 +4107,14 @@ impl OpenCADStudio {
                 };
                 Task::none()
             }
+            Message::ToggleAnnotationScaleModel => {
+                self.set_annotation_scale_modelspace(!self.annotation_scale_modelspace);
+                Task::none()
+            }
+            Message::AnnotationScaleModelspaceChanged(value) => {
+                self.set_annotation_scale_modelspace(value);
+                Task::none()
+            }
             Message::SyncViewportAnnotationScale => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.scene.sync_viewport_annotation_scale() {

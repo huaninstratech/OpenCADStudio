@@ -65,6 +65,9 @@ pub struct AppPrefs {
     /// ANNOAUTOSCALE, -4..=4. The sign is on/off; the magnitude selects which
     /// objects a newly added scale reaches.
     pub annotation_auto_scale: i8,
+    /// Apply the annotation scale to model-space display (off = annotative
+    /// objects show as drawn in model space).
+    pub annotation_scale_modelspace: bool,
     /// Polar tracking increment in degrees.
     pub polar_increment_deg: f32,
     /// NAVVCUBE: show the navigation cube.
@@ -1220,6 +1223,18 @@ pub fn view_window<'a>(
         Space::new().height(24),
         text(crate::t!("Annotation")).size(15),
         Space::new().height(10),
+        row![
+            iced::widget::checkbox(prefs.annotation_scale_modelspace)
+                .on_toggle(Message::AnnotationScaleModelspaceChanged)
+                .size(15),
+            text(crate::t!(
+                "Apply the annotation scale in model space (annotative objects scale as drawn)"
+            ))
+            .size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(12),
         row![
             text(crate::t!("Add scales automatically")).size(12).width(150),
             iced::widget::pick_list(selected_auto_scale, auto_scale_options, |choice| {
