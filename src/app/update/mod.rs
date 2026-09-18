@@ -1086,8 +1086,40 @@ impl OpenCADStudio {
                 }
             }
             Message::MissingFontsDismiss => {
-                self.missing_fonts = None;
+                // Skipping the download substitutes every still-missing font
+                // with the default one (`txt`, the `TextStyle::new` face) so
+                // text renders with the standard strokes instead of the
+                // stem-name LFF guess — and the prompt does not come back on
+                // the next open. One undo step covers all rewritten styles.
+                let missing = self.missing_fonts.take().unwrap_or_default();
                 self.close_active_modal();
+                if missing.is_empty() {
+                    return Task::none();
+                }
+                let i = self.active_tab;
+                let names = crate::io::font_repo::styles_using_missing_fonts(
+                    &self.tabs[i].scene.document,
+                    &missing,
+                );
+                if names.is_empty() {
+                    return Task::none();
+                }
+                let undo = self.begin_text_style_undo(i, "Replace missing fonts", &names);
+                let replaced =
+                    crate::io::font_repo::substitute_missing_fonts(
+                        &mut self.tabs[i].scene.document,
+                        &names,
+                    );
+                self.tabs[i].dirty = true;
+                self.tabs[i]
+                    .scene
+                    .invalidate_text_style_dependencies_many(&names);
+                self.commit_text_style_undo(i, undo);
+                for (style, old) in &replaced {
+                    self.command_line.push_output(
+                        crate::tf!("FONT  {old} → txt (style '{style}')").as_ref(),
+                    );
+                }
                 Task::none()
             }
             Message::MissingFontsResult(result) => {

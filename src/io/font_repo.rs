@@ -86,6 +86,43 @@ pub fn missing_shx_fonts(doc: &CadDocument) -> Vec<String> {
     missing
 }
 
+/// Text-style names whose `.shx` font file is one of `missing` (matched by
+/// bare file name, case-insensitively). Xref-dependent styles are left alone —
+/// they belong to the referenced drawing, not this one.
+pub fn styles_using_missing_fonts(doc: &CadDocument, missing: &[String]) -> Vec<String> {
+    doc.text_styles
+        .iter()
+        .filter(|style| {
+            if style.xref_dependent {
+                return false;
+            }
+            let file = style.font_file.trim();
+            if file.is_empty() || !file.to_ascii_lowercase().ends_with(".shx") {
+                return false;
+            }
+            let bare = file.rsplit(['/', '\\']).next().unwrap_or(file);
+            missing.iter().any(|m| m.eq_ignore_ascii_case(bare))
+        })
+        .map(|style| style.name.clone())
+        .collect()
+}
+
+/// Point each named style's font file at the default font (`txt`, the
+/// `TextStyle::new` face — resolves to the embedded stroke font everywhere,
+/// or to a downloaded `txt.shx` when one exists). Returns the (style name,
+/// replaced font file) pairs so the caller can report them.
+pub fn substitute_missing_fonts(doc: &mut CadDocument, names: &[String]) -> Vec<(String, String)> {
+    let mut replaced = Vec::new();
+    for name in names {
+        if let Some(style) = doc.text_styles.get_mut(name) {
+            let old = style.font_file.trim().to_string();
+            style.font_file = "txt".to_string();
+            replaced.push((name.clone(), old));
+        }
+    }
+    replaced
+}
+
 /// A font file previously downloaded into the local fonts directory, matched
 /// case-insensitively by file name.
 pub fn local_font_file(name: &str) -> Option<PathBuf> {
@@ -272,5 +309,71 @@ mod tests {
         let missing = missing_shx_fonts(&doc);
         assert_eq!(missing, vec!["MISSING1.shx".to_string()]);
         let _ = std::fs::remove_file(dir.join("exists.shx"));
+    }
+
+    #[test]
+    fn skip_fallback_rewrites_only_missing_shx_styles_to_default_font() {
+        // The Skip path: every style whose font is still missing switches to
+        // the default `txt`; resolvable fonts, xref-dependent styles, TTF-only
+        // styles, and fonts not in the missing list stay untouched.
+        let dir = std::env::temp_dir().join("ocs_font_repo_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vntime.shx"), b"stub").unwrap();
+        let mut doc = CadDocument::new();
+        let mut style = acadrust::TextStyle::new("A");
+        style.font_file = "CRO_ROM.shx".into();
+        let _ = doc.text_styles.add(style);
+        let mut style = acadrust::TextStyle::new("B");
+        style.font_file = "cro_rom.shx".into();
+        let _ = doc.text_styles.add(style);
+        let mut style = acadrust::TextStyle::new("C");
+        style.font_file = "vntime.shx".into();
+        let _ = doc.text_styles.add(style);
+        let mut style = acadrust::TextStyle::new("D");
+        style.font_file = "also_gone.shx".into();
+        style.xref_dependent = true;
+        let _ = doc.text_styles.add(style);
+        let mut style = acadrust::TextStyle::new("E");
+        style.font_file = String::new();
+        style.true_type_font = "Arial".into();
+        let _ = doc.text_styles.add(style);
+        doc.source_path = Some(dir.join("drawing.dwg").to_string_lossy().into_owned());
+
+        let missing = vec!["cro_rom.shx".to_string()];
+        let names = styles_using_missing_fonts(&doc, &missing);
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["A".to_string(), "B".to_string()]);
+
+        let mut replaced = substitute_missing_fonts(&mut doc, &names);
+        replaced.sort();
+        assert_eq!(
+            replaced,
+            vec![
+                ("A".to_string(), "CRO_ROM.shx".to_string()),
+                ("B".to_string(), "cro_rom.shx".to_string()),
+            ]
+        );
+        let get = |doc: &CadDocument, name: &str| {
+            doc.text_styles
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.font_file.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&doc, "A"), "txt");
+        assert_eq!(get(&doc, "B"), "txt");
+        assert_eq!(get(&doc, "C"), "vntime.shx");
+        assert_eq!(get(&doc, "D"), "also_gone.shx");
+        assert_eq!(get(&doc, "E"), "");
+
+        // After the swap every own style resolves, so the prompt must not
+        // fire for them again. The xref-dependent style (which Skip must not
+        // rewrite — it belongs to the referenced drawing) is still flagged.
+        assert_eq!(
+            missing_shx_fonts(&doc),
+            vec!["also_gone.shx".to_string()]
+        );
+        let _ = std::fs::remove_file(dir.join("vntime.shx"));
     }
 }
