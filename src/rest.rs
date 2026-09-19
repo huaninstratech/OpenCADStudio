@@ -27,6 +27,8 @@ const ENVELOPE_OPS: &[&str] = &[
     "entities_delete",
     "entities_transform",
     "block_define",
+    "block_delete",
+    "file_identity",
     "xdata_set",
     "view_focus",
     "wblock",
@@ -413,6 +415,12 @@ fn route(
         }
         ("POST", ["blocks"]) => {
             run_mutation(app, "block_define", request.json(), document_id, counter, 201)
+        }
+        ("DELETE", ["blocks", name]) => {
+            run_mutation(app, "block_delete", json!({"name": name}), document_id, counter, 200)
+        }
+        ("POST", ["file-identity"]) => {
+            run_mutation(app, "file_identity", request.json(), document_id, counter, 200)
         }
         ("POST", ["plot"]) => run_mutation(app, "plot", request.json(), document_id, counter, 200),
         ("POST", ["wblock"]) => run_mutation(app, "wblock", request.json(), document_id, counter, 200),
@@ -835,6 +843,62 @@ mod tests {
         );
         assert_eq!(status, 201, "{body}");
         assert_eq!(body["result"]["count"], 2);
+
+        // Blocks: define → replace → delete; the drawing carries a stable
+        // file identity GUID.
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/blocks",
+                &format!(r#"{{"name":"MARK","base":[0,0,0],"handles":[{joined}]}}"#),
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        // Replace re-blocks fresh content under the same name — the define
+        // consumed the original circles, SPM-style re-import draws new
+        // content and wraps it again.
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/entities",
+                r#"{"entities":[{"type":"Point","location":[9,9]}]}"#,
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        let fresh = body["result"]["handles"][0].as_str().unwrap().to_owned();
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/blocks",
+                &format!(r#"{{"name":"MARK","base":[0,0,0],"handles":["{fresh}"],"replace":true}}"#),
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 201, "{body}");
+        let (status, body) = route(
+            &mut app,
+            &request("DELETE", "/api/v1/blocks/MARK", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body["result"]["erased"].as_u64().unwrap() >= 1);
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/file-identity", "{}"),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["identity"].as_str().unwrap().len(), 36);
 
         // An empty POST /documents is DocumentManager.Add(): a fresh
         // untitled document in its own tab — a copy-to target.

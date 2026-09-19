@@ -165,13 +165,28 @@
     },
     "/api/v1/blocks": {
       "post": {
-        "summary": "Define a block from entities (AutoCAD BLOCK semantics: sources become the definition, one Insert placed at insert_at or base)",
+        "summary": "Define a block from entities (AutoCAD BLOCK semantics: sources become the definition, one Insert placed at insert_at or base; replace:true drops a same-named definition first)",
         "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["name", "base", "handles"], "properties": {
           "name": {"type": "string"}, "base": {"type": "array", "items": {"type": "number"}},
           "handles": {"type": "array", "items": {"type": "string"}},
-          "insert_at": {"type": "array", "items": {"type": "number"}}
+          "insert_at": {"type": "array", "items": {"type": "number"}},
+          "replace": {"type": "boolean"}
         }}}}},
         "responses": {"201": {"description": "Definition + insert handle"}, "400": {"description": "Invalid name, duplicate or empty selection"}}
+      }
+    },
+    "/api/v1/blocks/{name}": {
+      "delete": {
+        "summary": "Delete a block definition with its children, markers and every Insert referencing it",
+        "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "Erased count"}, "404": {"description": "Unknown block"}}
+      }
+    },
+    "/api/v1/file-identity": {
+      "post": {
+        "summary": "Stable per-document GUID (SPMDOCUNIQUE parity); idempotent get-or-create, renew:true mints a fresh one",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"renew": {"type": "boolean"}}}}}},
+        "responses": {"200": {"description": "The identity GUID"}}
       }
     },
     "/api/v1/groups": {
@@ -210,7 +225,7 @@
     },
     "/api/v1/wblock": {
       "post": {
-        "summary": "Export entities (handles) or a block definition to a new DWG/DXF; template:<file> bases the new database on that file's tables/styles",
+        "summary": "Export entities (handles) or a block definition to a new DWG/DXF; template:<file> bases the new database on that file's tables/styles, normalize:true shifts the export so its minimum lands on the origin",
         "responses": {"200": {"description": "File written"}, "400": {"description": "Export failed"}}
       }
     },
