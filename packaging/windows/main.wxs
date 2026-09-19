@@ -20,8 +20,13 @@
       InstallScope='perMachine'
       SummaryCodepage='1252' />
 
+    <!-- AllowSameVersionUpgrades: rebuilds that carry the same ProductVersion
+         (a locally rebuilt weekly MSI, a hotfix repackage) replace the
+         installed product instead of being refused as downgrades. Lower
+         versions still upgrade; higher installed versions still refuse. -->
     <MajorUpgrade
       Schedule='afterInstallInitialize'
+      AllowSameVersionUpgrades='yes'
       DowngradeErrorMessage='!(loc.DowngradeError)' />
 
     <Media Id='1' Cabinet='product.cab' EmbedCab='yes' />
