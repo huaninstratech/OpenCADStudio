@@ -131,3 +131,28 @@ pub fn extract_entities_into(
 
     Ok(())
 }
+
+/// Translate every entity of `out` so the overall bounds minimum lands on
+/// the origin — SPM.ACAD's clone flow normalizes the new drawing to 0,0,0
+/// after the copy (Catalog §2.1/CF-01.2). Opt-in per request; the
+/// interactive WBLOCK export keeps the source coordinates.
+pub fn normalize_to_origin(out: &mut CadDocument) {
+    let mut min = [f64::INFINITY; 3];
+    for entity in out.entities() {
+        let (lo, _) = crate::scene::convert::tess::entity_bounds(entity);
+        for axis in 0..3 {
+            if lo[axis] < min[axis] {
+                min[axis] = lo[axis];
+            }
+        }
+    }
+    if min.iter().any(|v| !v.is_finite()) {
+        return;
+    }
+    let shift = crate::command::EntityTransform::Affine(acadrust::types::Transform::from_translation(
+        acadrust::types::Vector3::new(-min[0], -min[1], -min[2]),
+    ));
+    for entity in out.entities_mut() {
+        crate::scene::view::dispatch::apply_transform(entity, &shift);
+    }
+}

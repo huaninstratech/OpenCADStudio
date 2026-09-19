@@ -62,6 +62,7 @@ const EXECUTE_OPS: &[&str] = &[
     "entities_delete",
     "entities_transform",
     "block_define",
+    "block_delete",
     "xdata_set",
     "view_focus",
     "entities_copy_to",
@@ -72,6 +73,7 @@ const EXECUTE_OPS: &[&str] = &[
     "sysvar",
     "layout_create",
     "page_setup_set",
+    "file_identity",
     "save",
     "stop",
     "batch",
@@ -97,6 +99,7 @@ const BATCH_STEP_OPS: &[&str] = &[
     "entities_delete",
     "entities_transform",
     "block_define",
+    "block_delete",
     "xdata_set",
     "view_focus",
     "entities_copy_to",
@@ -107,6 +110,7 @@ const BATCH_STEP_OPS: &[&str] = &[
     "sysvar",
     "layout_create",
     "page_setup_set",
+    "file_identity",
     "save",
     "stop",
 ];
@@ -826,6 +830,9 @@ fn validate_execute_request(request: &Value, op: &str) -> Result<(), String> {
         "selection_set_load" if request["name"].as_str().is_none_or(str::is_empty) => {
             missing("name", r#"{"op":"selection_set_load","name":"Frame"}"#)
         }
+        "block_delete" if request["name"].as_str().is_none_or(str::is_empty) => {
+            missing("name", r#"{"op":"block_delete","name":"Frame"}"#)
+        }
         "layout_create" if request["name"].as_str().is_none_or(str::is_empty) => {
             missing("name", r#"{"op":"layout_create","name":"Plan"}"#)
         }
@@ -1112,6 +1119,7 @@ fn execute_request_schema() -> Value {
             {"properties":{"op":{"const":"entities_delete"}},"required":["handles"]},
             {"properties":{"op":{"const":"entities_transform"}},"required":["handles"]},
             {"properties":{"op":{"const":"block_define"}},"required":["name","base","handles"]},
+            {"properties":{"op":{"const":"block_delete"}},"required":["name"]},
             {"properties":{"op":{"const":"xdata_set"}},"required":["app","handles"]},
             {"properties":{"op":{"const":"view_focus"}},"required":["handles"]},
             {"properties":{"op":{"const":"entities_copy_to"}},"required":["handles","document_id"]},
@@ -1122,6 +1130,7 @@ fn execute_request_schema() -> Value {
             {"properties":{"op":{"const":"sysvar"}}},
             {"properties":{"op":{"const":"layout_create"}},"required":["name"]},
             {"properties":{"op":{"const":"page_setup_set"}},"required":["layout"]},
+            {"properties":{"op":{"const":"file_identity"}}},
             {"properties":{"op":{"const":"save"}}},
             {"properties":{"op":{"const":"stop"}}},
             {"properties":{"op":{"const":"batch"}},"required":["steps"]}

@@ -581,6 +581,12 @@ impl OpenCADStudio {
         let block_to_world =
             acadrust::types::Transform::from_translation(insert_at);
         self.push_undo_snapshot(i, "BLOCKDEFINE");
+        // CF-01.3 (barcode re-import): `replace:true` drops the previous
+        // definition — its children, markers and inserts — inside the same
+        // undo step, so the new definition can take the name.
+        if req["replace"].as_bool().unwrap_or(false) {
+            erase_block_definition(&mut self.tabs[i].scene, &name);
+        }
         let insert = self.tabs[i]
             .scene
             .create_block_from_entities(&handles, &name, &world_to_block, &block_to_world)
@@ -590,6 +596,31 @@ impl OpenCADStudio {
             "block": name,
             "insert": format!("{:X}", insert.value()),
         }));
+        Ok(Task::none())
+    }
+
+    /// `block_delete` — remove a block definition together with its child
+    /// entities, the Block/BlockEnd markers and every Insert referencing it
+    /// (BlockTableRecord.Erase + reference cleanup parity).
+    pub(super) fn control_block_delete(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let name = string(req, "name")?.to_owned();
+        if name.starts_with('*') {
+            return Err(failure(
+                "block_protected",
+                "Layout block records cannot be deleted",
+            ));
+        }
+        let i = self.active_tab;
+        if self.tabs[i].scene.document.block_records.get(&name).is_none() {
+            return Err(failure(
+                "block_missing",
+                format!("Block '{name}' does not exist"),
+            ));
+        }
+        self.push_undo_snapshot(i, "BLOCKDELETE");
+        let erased = erase_block_definition(&mut self.tabs[i].scene, &name);
+        self.post_ref_op(i);
+        self.set_control_result(json!({ "block": name, "erased": erased }));
         Ok(Task::none())
     }
 
@@ -619,6 +650,37 @@ impl OpenCADStudio {
         self.set_control_result(json!({ "zoomed": zoomed, "selected": selected }));
         Ok(Task::none())
     }
+}
+
+/// Remove one block definition from the scene: every entity owned by the
+/// BlockTableRecord, every Insert referencing the name, the Block/BlockEnd
+/// markers (which the entity iterator skips) and the table record itself.
+/// Silent no-op for an unknown name (callers validate first);
+/// `*`-prefixed layout records are rejected by the callers. Returns the
+/// number of entities erased.
+fn erase_block_definition(scene: &mut crate::scene::Scene, name: &str) -> usize {
+    let Some(record) = scene.document.block_records.get(name) else {
+        return 0;
+    };
+    let owner = record.handle;
+    let block_markers = [record.block_entity_handle, record.block_end_handle];
+    let mut victims: Vec<acadrust::Handle> = scene
+        .document
+        .entities()
+        .filter(|entity| {
+            entity.common().owner_handle == owner
+                || matches!(
+                    entity,
+                    acadrust::EntityType::Insert(insert)
+                        if insert.block_name.eq_ignore_ascii_case(name)
+                )
+        })
+        .map(|entity| entity.common().handle)
+        .collect();
+    victims.extend_from_slice(&block_markers);
+    scene.erase_entities(&victims);
+    scene.document.block_records.remove(name);
+    victims.len()
 }
 
 /// `data:[{code,value},…]` → typed XData values; an absent or empty list

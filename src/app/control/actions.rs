@@ -222,7 +222,13 @@ impl OpenCADStudio {
                 "Supply \"handles\" or \"block\"",
             ));
         };
-        let extracted = extracted.map_err(|e| failure("wblock_failed", e))?;
+        let mut extracted = extracted.map_err(|e| failure("wblock_failed", e))?;
+        // CF-01.2: optionally shift the export so its overall bounds minimum
+        // lands on the origin (SPM.ACAD normalizes cloned drawings to 0,0,0).
+        let normalized = req["normalize"].as_bool().unwrap_or(false);
+        if normalized {
+            crate::modules::insert::wblock::normalize_to_origin(&mut extracted);
+        }
         let entities = extracted.entities().count();
         // A .dwt target is written as DWG bytes under a hidden scratch name,
         // then renamed (DWT is a DWG-family file).
@@ -246,6 +252,7 @@ impl OpenCADStudio {
         self.set_control_result(json!({
             "path": path,
             "entities": entities,
+            "normalized": normalized,
         }));
         Ok(Task::none())
     }

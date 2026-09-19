@@ -426,6 +426,104 @@ impl OpenCADStudio {
         self.tabs[i].dirty = true;
         Ok(purged)
     }
+
+    /// `file_identity` — stable per-document GUID (SPMDOCUNIQUE parity,
+    /// Catalog §1.6). The identity lives on a single invisible marker text
+    /// at the origin carrying the XData application "SPMDOCUNIQUE" — the
+    /// same marker SPM.ACAD writes — so it survives save/open round trips.
+    /// Idempotent get-or-create; `"renew":true` rewrites the marker with a
+    /// fresh GUID instead of adding a second one.
+    pub(super) fn control_file_identity(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        let renew = req["renew"].as_bool().unwrap_or(false);
+        let i = self.active_tab;
+        let marker = find_file_identity_marker(&self.tabs[i].scene.document);
+        if !renew {
+            if let Some(handle) = marker {
+                if let Some(identity) = marker_identity(&self.tabs[i].scene.document, handle) {
+                    self.set_control_result(json!({ "identity": identity, "created": false }));
+                    return Ok(Task::none());
+                }
+            }
+        }
+        let identity = new_guid_v4();
+        self.push_undo_snapshot(i, "FILEIDENTITY");
+        match marker {
+            Some(handle) => {
+                crate::scene::view::dispatch::set_entity_xdata(
+                    &mut self.tabs[i].scene.document,
+                    handle,
+                    FILE_IDENTITY_APP,
+                    Some(vec![acadrust::xdata::XDataValue::String(identity.clone())]),
+                );
+            }
+            None => {
+                let mut text = acadrust::entities::Text::with_value(
+                    FILE_IDENTITY_APP,
+                    acadrust::types::Vector3::ZERO,
+                )
+                .with_height(0.0001);
+                text.common.invisible = true;
+                let handle = self.tabs[i].scene.add_entity(acadrust::EntityType::Text(text));
+                crate::scene::view::dispatch::set_entity_xdata(
+                    &mut self.tabs[i].scene.document,
+                    handle,
+                    FILE_IDENTITY_APP,
+                    Some(vec![acadrust::xdata::XDataValue::String(identity.clone())]),
+                );
+            }
+        }
+        self.tabs[i].dirty = true;
+        self.post_ref_op(i);
+        self.set_control_result(json!({ "identity": identity, "created": true }));
+        Ok(Task::none())
+    }
+}
+
+/// The XData application name that carries a drawing's stable identity.
+const FILE_IDENTITY_APP: &str = "SPMDOCUNIQUE";
+
+/// The handle of the entity carrying the file identity, if present.
+fn find_file_identity_marker(document: &acadrust::CadDocument) -> Option<acadrust::Handle> {
+    document
+        .entities()
+        .find(|entity| {
+            entity
+                .common()
+                .extended_data
+                .get_record(FILE_IDENTITY_APP)
+                .is_some()
+        })
+        .map(|entity| entity.common().handle)
+}
+
+/// The identity GUID from the marker entity's XData.
+fn marker_identity(document: &acadrust::CadDocument, handle: acadrust::Handle) -> Option<String> {
+    let record = document
+        .get_entity(handle)?
+        .common()
+        .extended_data
+        .get_record(FILE_IDENTITY_APP)?;
+    match record.values.first() {
+        Some(acadrust::xdata::XDataValue::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// A random RFC 4122 version-4 GUID string, from the OS entropy pool.
+fn new_guid_v4() -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS entropy unavailable");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// The readable registry; `WRITABLE_SYSVARS` is the subset `set` accepts.

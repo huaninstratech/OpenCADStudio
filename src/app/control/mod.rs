@@ -370,6 +370,7 @@ impl OpenCADStudio {
         json!({"ok":true,"protocol":1,"session_id":session_id(),"version":env!("OCS_APP_VERSION"),
             "mode":if self.main_window.is_some(){"gui"}else{"headless"},"enabled":self.control.enabled,
             "document_id":tab.id,"revision":tab.edit_revision,"geometry_revision":tab.scene.geometry_epoch,"camera_revision":tab.scene.camera_generation,
+            "hand_seed":format!("{:X}",tab.scene.document.header.handle_seed.max(tab.scene.document.next_handle())),
             "plugins":plugin_ids(),
             "documents":self.tabs.iter().map(|t|json!({"id":t.id,"title":t.tab_title,"path":t.current_path,"dirty":t.dirty,"revision":t.edit_revision,"start":t.is_start})).collect::<Vec<_>>(),
             "selection":tab.scene.selected_handles_in_order().iter().map(|h|format!("{:X}",h.value())).collect::<Vec<_>>(),
@@ -833,6 +834,7 @@ impl OpenCADStudio {
             "entities_copy_to" => self.control_entities_copy_to(req)?,
             "xdata_set" => self.control_xdata_set(req)?,
             "block_define" => self.control_block_define(req)?,
+            "block_delete" => self.control_block_delete(req)?,
             "group_create" => self.control_group_create(req)?,
             "selection_set_save" => self.control_selection_set_save(req)?,
             "selection_set_load" => self.control_selection_set_load(req)?,
@@ -840,6 +842,7 @@ impl OpenCADStudio {
             "sysvar" => self.control_sysvar(req)?,
             "layout_create" => self.control_layout_create(req)?,
             "page_setup_set" => self.control_page_setup_set(req)?,
+            "file_identity" => self.control_file_identity(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "view_focus" => self.control_view_focus(req)?,
             #[cfg(not(target_arch = "wasm32"))]

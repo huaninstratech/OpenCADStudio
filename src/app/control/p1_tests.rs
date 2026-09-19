@@ -417,3 +417,152 @@ fn diagnostic_layer_survives_plain_io_round_trip() {
         "Walls lost in plain io round trip; layers = {names:?}"
     );
 }
+
+#[test]
+fn block_delete_and_define_replace_manage_definitions() {
+    let mut app = OpenCADStudio::new_for_test();
+    app.automation_op(r#"{"op":"new"}"#);
+    app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 1,0"}"#);
+    app.automation_op(r#"{"op":"run","cmd":"CIRCLE 5,5 2"}"#);
+    let q = app.automation_op(r#"{"op":"query","detail":"summary"}"#);
+    let joined = q["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| format!("\"{}\"", e["handle"].as_str().unwrap()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
+    let doc = state["document_id"].as_u64().unwrap();
+
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"block_define","request_id":"bl0","document_id":{doc},"name":"MARK","base":[0,0,0],"handles":[{joined}]}}"#
+    ));
+    assert_eq!(r["ok"], true, "{}", r["error"]);
+    assert_eq!(count_type(&mut app, "Insert"), 1);
+
+    // Re-import parity (CF-01.3): replace drops the previous definition,
+    // its children and its insert inside one undoable step.
+    app.automation_op(r#"{"op":"run","cmd":"POINT 9,9"}"#);
+    let handle = app.automation_op(r#"{"op":"query","type":"Point","detail":"summary"}"#)
+        ["entities"][0]["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"block_define","request_id":"bl1","document_id":{doc},"name":"MARK","base":[0,0,0],"handles":["{handle}"],"replace":true}}"#
+    ));
+    assert_eq!(r["ok"], true, "{}", r["error"]);
+    assert_eq!(count_type(&mut app, "Insert"), 1, "one insert after replace");
+    assert_eq!(count_type(&mut app, "Line"), 0, "old children erased");
+    assert_eq!(count_type(&mut app, "Circle"), 0, "old children erased");
+
+    // Delete removes the insert, the markers, the children and the record.
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"block_delete","request_id":"bl2","document_id":{doc},"name":"MARK"}}"#
+    ));
+    assert_eq!(r["ok"], true, "{}", r["error"]);
+    assert!(r["result"]["erased"].as_u64().unwrap() >= 3, "insert + markers + child");
+    assert_eq!(count_type(&mut app, "Insert"), 0);
+
+    // Unknown names and protected layout records are refused.
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"block_delete","request_id":"bl3","document_id":{doc},"name":"GHOST"}}"#
+    ));
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["code"], "block_missing");
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"block_delete","request_id":"bl4","document_id":{doc},"name":"*Model_Space"}}"#
+    ));
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["code"], "block_protected");
+}
+
+#[test]
+fn wblock_normalize_shifts_the_export_to_the_origin() {
+    let mut app = OpenCADStudio::new_for_test();
+    app.automation_op(r#"{"op":"new"}"#);
+    app.automation_op(r#"{"op":"run","cmd":"LINE 100,200 110,210"}"#);
+    let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
+    let doc = state["document_id"].as_u64().unwrap();
+    let handle = app.automation_op(r#"{"op":"query","type":"Line","detail":"summary"}"#)
+        ["entities"][0]["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let out = std::env::temp_dir().join(format!("ocs_wbnorm_{}.dxf", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let op = out.to_string_lossy().replace('\\', "\\\\");
+    let r = app.automation_op(&format!(
+        r#"{{"protocol":1,"op":"wblock","request_id":"wn1","document_id":{doc},"path":"{op}","handles":["{handle}"],"normalize":true}}"#
+    ));
+    assert_eq!(r["ok"], true, "{}", r["error"]);
+    assert_eq!(r["result"]["normalized"], true);
+    assert_eq!(app.automation_op(&format!(r#"{{"op":"open","path":"{op}"}}"#))["ok"], true);
+    let q = app.automation_op(r#"{"op":"query","type":"Line","detail":"full"}"#);
+    assert_eq!(q["entities"][0]["start"], json!([0.0, 0.0, 0.0]));
+    assert_eq!(q["entities"][0]["end"], json!([10.0, 10.0, 0.0]));
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn file_identity_is_stable_and_survives_a_round_trip() {
+    let mut app = OpenCADStudio::new_for_test();
+    app.automation_op(r#"{"op":"new"}"#);
+    let r1 = mutate(
+        &mut app,
+        r#"{"protocol":1,"op":"file_identity","request_id":"fi1","document_id":{doc}}"#,
+    );
+    assert_eq!(r1["ok"], true, "{}", r1["error"]);
+    assert_eq!(r1["result"]["created"], true);
+    let identity = r1["result"]["identity"].as_str().unwrap().to_owned();
+    assert_eq!(identity.len(), 36, "RFC 4122 shape: {identity}");
+    assert_eq!(&identity[8..9], "-");
+
+    // Idempotent: the second call returns the same identity.
+    let r2 = mutate(
+        &mut app,
+        r#"{"protocol":1,"op":"file_identity","request_id":"fi2","document_id":{doc}}"#,
+    );
+    assert_eq!(r2["result"]["created"], false);
+    assert_eq!(r2["result"]["identity"], identity.as_str());
+
+    // renew mints a fresh one.
+    let r3 = mutate(
+        &mut app,
+        r#"{"protocol":1,"op":"file_identity","request_id":"fi3","document_id":{doc},"renew":true}"#,
+    );
+    let renewed = r3["result"]["identity"].as_str().unwrap().to_owned();
+    assert_ne!(renewed, identity);
+
+    // The marker survives a save → open round trip.
+    let path = std::env::temp_dir().join(format!("ocs_fid_{}.dwg", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let p = path.to_string_lossy().replace('\\', "\\\\");
+    assert_eq!(app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"], true);
+    assert_eq!(app.automation_op(&format!(r#"{{"op":"open","path":"{p}"}}"#))["ok"], true);
+    let r4 = mutate(
+        &mut app,
+        r#"{"protocol":1,"op":"file_identity","request_id":"fi4","document_id":{doc}}"#,
+    );
+    assert_eq!(r4["result"]["identity"], renewed.as_str());
+    drop(app);
+    let sidecar = path.with_file_name(format!(
+        ".{}.ocs.lock",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(sidecar);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn state_reports_the_hand_seed() {
+    let mut app = OpenCADStudio::new_for_test();
+    app.automation_op(r#"{"op":"new"}"#);
+    let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
+    let before = u64::from_str_radix(state["hand_seed"].as_str().unwrap(), 16).unwrap();
+    app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 1,1"}"#);
+    let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
+    let after = u64::from_str_radix(state["hand_seed"].as_str().unwrap(), 16).unwrap();
+    assert!(after > before, "issuing a handle advances the seed");
+}
