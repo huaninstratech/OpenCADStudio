@@ -124,16 +124,32 @@ impl Scene {
             .remove(&self.current_layout);
     }
 
-    /// ZOOM All frames the configured drawing limits. Object-only framing
-    /// remains the responsibility of ZOOM Extents.
+    /// ZOOM All frames the configured drawing limits, extended to include
+    /// the drawing extents whenever entities reach beyond them (AutoCAD
+    /// parity): a drawing inside the limits still shows the whole limits
+    /// rectangle, a drawing that spills out is framed in full. Object-only
+    /// framing without the limits remains the responsibility of ZOOM Extents.
     pub fn fit_all_with_limits(&mut self) {
         let Some((limit_min, limit_max)) = self.current_drawing_limits() else {
             self.fit_all();
             return;
         };
 
-        let min = glam::Vec3::new(limit_min.x as f32, limit_min.y as f32, 0.0);
-        let max = glam::Vec3::new(limit_max.x as f32, limit_max.y as f32, 0.0);
+        let mut min = glam::Vec3::new(limit_min.x as f32, limit_min.y as f32, 0.0);
+        let mut max = glam::Vec3::new(limit_max.x as f32, limit_max.y as f32, 0.0);
+
+        // Model-space content counts toward the frame — drawings exported by
+        // nesting/CAM tools routinely sit far outside a template's default
+        // LIMITS. Paper space keeps the sheet rectangle: the sheet is the
+        // frame there.
+        if self.current_layout == "Model" || self.active_viewport.is_some() {
+            if let Some((extents_min, extents_max)) = self.model_space_extents() {
+                if extents_min.is_finite() && extents_max.is_finite() {
+                    min = min.min(extents_min);
+                    max = max.max(extents_max);
+                }
+            }
+        }
 
         // MSPACE owns a camera encoded on the active viewport entity.
         if self.active_viewport.is_some() {
@@ -144,5 +160,45 @@ impl Scene {
         let aspect = self.active_camera_aspect();
         self.camera.borrow_mut().fit_to_bounds(min, max, aspect);
         self.camera_generation += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drawings exported by nesting/CAM tools sit far outside a template's
+    /// default LIMITS: ZOOM All must frame the union of limits and extents
+    /// (the U311 nest-file case), while a drawing inside the limits keeps
+    /// the limits rectangle as its frame.
+    #[test]
+    fn zoom_all_frames_entities_that_spill_past_the_limits() {
+        let frame = |entity: EntityType| {
+            let mut scene = Scene::new();
+            scene.add_entity(entity);
+            scene.set_current_drawing_limits(glam::DVec2::ZERO, glam::DVec2::new(12.0, 9.0));
+            scene.fit_all_with_limits();
+            let target = scene.camera.borrow().target;
+            target
+        };
+
+        // Template-default limits in inches while the geometry sits at
+        // millimetre nesting coordinates: the frame centres on the union of
+        // limits and extents, not on the 12×9 limits rectangle.
+        let mut line = acadrust::entities::Line::new();
+        line.start = acadrust::types::Vector3::new(1000.0, 1000.0, 0.0);
+        line.end = acadrust::types::Vector3::new(2000.0, 2000.0, 0.0);
+        let target = frame(EntityType::Line(line));
+        assert!((target.x - 1000.0).abs() < 1.0, "target: {target:?}");
+        assert!((target.y - 1000.0).abs() < 1.0, "target: {target:?}");
+
+        // A drawing fully inside the limits still frames the whole limits
+        // rectangle (AutoCAD keeps the limits as the frame).
+        let mut line = acadrust::entities::Line::new();
+        line.start = acadrust::types::Vector3::new(3.0, 3.0, 0.0);
+        line.end = acadrust::types::Vector3::new(5.0, 5.0, 0.0);
+        let target = frame(EntityType::Line(line));
+        assert!((target.x - 6.0).abs() < 1.0, "target: {target:?}");
+        assert!((target.y - 4.5).abs() < 1.0, "target: {target:?}");
     }
 }
