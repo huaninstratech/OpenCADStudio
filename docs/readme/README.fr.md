@@ -187,9 +187,6 @@ Les rapports de bogues, pull requests ciblées, traductions, améliorations de d
   </picture>
 </a>
 
-## Soutenir le projet
-
-Si Open CAD Studio vous aide dans votre travail, soutenez son développement via [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) ou [Patreon](https://www.patreon.com/HakanSeven12).
 
 ## Licence
 

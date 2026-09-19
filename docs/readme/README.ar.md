@@ -187,9 +187,6 @@ OpenCADStudio --mcp
   </picture>
 </a>
 
-## دعم المشروع
-
-إذا ساعدك Open CAD Studio في عملك، فادعم استمرار التطوير عبر [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) أو [Patreon](https://www.patreon.com/HakanSeven12).
 
 ## الترخيص
 

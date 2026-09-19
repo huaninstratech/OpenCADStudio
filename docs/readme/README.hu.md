@@ -187,9 +187,6 @@ Hibajelentéseket, célzott pull requesteket, fordításokat, dokumentációfejl
   </picture>
 </a>
 
-## A projekt támogatása
-
-Ha az Open CAD Studio segíti a munkádat, támogasd a további fejlesztést a [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) vagy a [Patreon](https://www.patreon.com/HakanSeven12) oldalán.
 
 ## Licenc
 

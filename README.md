@@ -236,10 +236,6 @@ and `cargo test --lib i18n::tests`.
   </picture>
 </a>
 
-## Support the project
-
-If Open CAD Studio helps your work, support continued development through [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) or [Patreon](https://www.patreon.com/HakanSeven12).
-
 ## License
 
 Open CAD Studio is distributed under the [GNU General Public License v3.0](LICENSE).

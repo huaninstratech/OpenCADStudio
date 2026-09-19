@@ -189,9 +189,6 @@ Hata bildirimleri, odaklı pull request'ler, çeviriler, belge iyileştirmeleri 
   </picture>
 </a>
 
-## Projeyi destekleyin
-
-Open CAD Studio işinize yardımcı oluyorsa geliştirmeyi [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) veya [Patreon](https://www.patreon.com/HakanSeven12) üzerinden destekleyin.
 
 ## Lisans
 

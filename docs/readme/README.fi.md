@@ -187,9 +187,6 @@ Virheraportit, rajatut pull requestit, käännökset, dokumentaatioparannukset j
   </picture>
 </a>
 
-## Tue projektia
-
-Jos Open CAD Studio auttaa työssäsi, tue jatkokehitystä [GitHub Sponsorsin](https://github.com/sponsors/HakanSeven12) tai [Patreonin](https://www.patreon.com/HakanSeven12) kautta.
 
 ## Lisenssi
 

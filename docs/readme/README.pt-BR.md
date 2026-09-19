@@ -187,9 +187,6 @@ Relatos de erros, pull requests focados, traduções, melhorias na documentaçã
   </picture>
 </a>
 
-## Apoie o projeto
-
-Se o Open CAD Studio ajuda no seu trabalho, apoie o desenvolvimento contínuo pelo [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) ou [Patreon](https://www.patreon.com/HakanSeven12).
 
 ## Licença
 

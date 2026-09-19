@@ -187,9 +187,6 @@ Vítáme hlášení chyb, cílené pull requesty, překlady, vylepšení dokumen
   </picture>
 </a>
 
-## Podpořte projekt
-
-Pokud vám Open CAD Studio pomáhá, podpořte další vývoj přes [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) nebo [Patreon](https://www.patreon.com/HakanSeven12).
 
 ## Licence
 
