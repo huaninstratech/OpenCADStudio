@@ -1,5 +1,10 @@
 # OpenCADStudio MCP control
 
+> **Client developers start here:** [`API-SPEC.md`](API-SPEC.md) is the
+> consolidated, transport-neutral API specification — conventions, envelope,
+> error codes and the full operation catalogue in one document. This README
+> remains the operator-facing guide (setup, smoke tests, walkthroughs).
+
 Every native OpenCADStudio build contains the same MCP server as the editor. `OpenCADStudio --mcp` starts it over stdio, opens the desktop editor when needed, and exposes the live document without Python, a package manager, a sidecar service, or client-specific code.MCP lets an AI client inspect the open drawing, execute editor commands, and verify the result through a shared protocol. Install OpenCADStudio, then add a local MCP server in the client and set its command to:
 
 ```sh
