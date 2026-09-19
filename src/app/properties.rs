@@ -2791,7 +2791,16 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         handles: &[Handle],
         driven_refs: &[crate::scene::parametric_constraints::ParametricRef],
     ) {
-        self.invalidate_property_targets_with_originals(i, handles, driven_refs, &[]);
+        let retain_size = self.constraint_solve_mode
+            && !driven_refs.is_empty()
+            && driven_refs.iter().all(|reference| reference.marker.is_some());
+        self.invalidate_property_targets_with_originals(
+            i,
+            handles,
+            driven_refs,
+            retain_size,
+            &[],
+        );
     }
 
     pub(super) fn invalidate_property_targets_with_originals(
@@ -2799,6 +2808,7 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         i: usize,
         handles: &[Handle],
         driven_refs: &[crate::scene::parametric_constraints::ParametricRef],
+        retain_size: bool,
         retained_originals: &[(Handle, acadrust::EntityType)],
     ) {
         let mut context_object_changed = false;
@@ -2835,7 +2845,7 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
             .bump_entities_with_parametric_originals(
                 &changes,
                 driven_refs,
-                self.constraint_solve_mode && !driven_refs.is_empty(),
+                retain_size,
                 retained_originals,
             );
     }
@@ -3234,6 +3244,7 @@ fn make_sections_read_only(sections: &mut [crate::scene::model::object::PropSect
             | PropValue::ReadOnlyWithTooltip { value, .. }
             | PropValue::EditText(value)
             | PropValue::PlainText(value)
+            | PropValue::Hyperlink(value)
             | PropValue::LayerChoice(value)
             | PropValue::LinetypeChoice(value)
             | PropValue::HatchPatternChoice(value) => value.clone(),
@@ -3508,6 +3519,9 @@ fn merge_prop_value(
         (PropValue::PlainText(_), PropValue::PlainText(_)) => {
             PropValue::PlainText(VARIES_LABEL.into())
         }
+        (PropValue::Hyperlink(_), PropValue::Hyperlink(_)) => {
+            PropValue::Hyperlink(VARIES_LABEL.into())
+        }
         (PropValue::ReadOnly(_), PropValue::ReadOnly(_)) => {
             PropValue::ReadOnly(VARIES_LABEL.into())
         }
@@ -3581,7 +3595,8 @@ fn update_row_text(
         match &mut row.value {
             PropValue::ReadOnly(current)
             | PropValue::EditText(current)
-            | PropValue::PlainText(current) => *current = value,
+            | PropValue::PlainText(current)
+            | PropValue::Hyperlink(current) => *current = value,
             PropValue::ReadOnlyWithTooltip { value: current, .. } => *current = value,
             PropValue::Choice { selected, .. } => *selected = value,
             _ => {}

@@ -34,11 +34,21 @@ fn is_compact_coincident_glyph(label: &str) -> bool {
     matches!(label, "≡" | "∈")
 }
 
+/// Fixed's two padlock labels (`parametric_constraints::fixed_glyph_label`).
+fn is_fixed_glyph(label: &str) -> bool {
+    label == "F" || label == crate::scene::parametric_constraints::FIXED_POINT_GLYPH
+}
+
+/// Vertical's two axis-mark labels (`parametric_constraints::vertical_glyph_label`).
+fn is_vertical_glyph(label: &str) -> bool {
+    label == "│" || label == crate::scene::parametric_constraints::VERTICAL_POINTS_GLYPH
+}
+
 fn constraint_glyph_size(label: &str) -> Size {
     if is_compact_coincident_glyph(label) {
         return Size::new(COINCIDENT_GLYPH_SIZE, COINCIDENT_GLYPH_SIZE);
     }
-    if label == "G²" {
+    if label == "G²" || is_fixed_glyph(label) || is_vertical_glyph(label) {
         let side = CONSTRAINT_GLYPH_SIZE + CONSTRAINT_GLYPH_PAD_Y * 2.0;
         return Size::new(side, side);
     }
@@ -92,6 +102,107 @@ fn draw_concentric_constraint_glyph(
     let stroke = canvas::Stroke::default().with_color(color).with_width(1.25);
     frame.stroke(&canvas::Path::circle(center, 4.7), stroke.clone());
     frame.stroke(&canvas::Path::circle(center, 2.15), stroke);
+}
+
+/// The reference bar's padlock: white with a small orange point marker
+/// when one point is held, red when a whole curve or segment is.
+fn draw_fixed_constraint_glyph(
+    frame: &mut canvas::Frame,
+    center: Point,
+    text: Color,
+    badge: Color,
+    point_marker: bool,
+) {
+    let lock = if point_marker {
+        text
+    } else {
+        Color::from_rgb8(214, 76, 76)
+    };
+    let shackle = canvas::Path::new(|builder| {
+        let shackle_center = Point::new(center.x, center.y - 1.6);
+        for step in 0..=12 {
+            let angle = std::f32::consts::PI * (1.0 - step as f32 / 12.0);
+            let point = Point::new(
+                shackle_center.x + angle.cos() * 3.1,
+                shackle_center.y - angle.sin() * 3.1,
+            );
+            if step == 0 {
+                builder.move_to(Point::new(point.x, center.y - 0.6));
+                builder.line_to(point);
+            } else {
+                builder.line_to(point);
+            }
+        }
+        builder.line_to(Point::new(center.x + 3.1, center.y - 0.6));
+    });
+    frame.stroke(
+        &shackle,
+        canvas::Stroke::default().with_color(lock).with_width(1.5),
+    );
+    let body = canvas::Path::rounded_rectangle(
+        Point::new(center.x - 5.0, center.y - 0.8),
+        Size::new(10.0, 7.6),
+        1.4.into(),
+    );
+    frame.fill(&body, lock);
+    frame.stroke(
+        &canvas::Path::line(
+            Point::new(center.x, center.y + 1.4),
+            Point::new(center.x, center.y + 4.6),
+        ),
+        canvas::Stroke::default().with_color(badge).with_width(1.3),
+    );
+    if point_marker {
+        frame.stroke(
+            &canvas::Path::rectangle(Point::new(center.x + 4.0, center.y + 3.6), Size::new(4.6, 4.6)),
+            canvas::Stroke::default()
+                .with_color(Color::from_rgb8(224, 130, 62))
+                .with_width(1.2),
+        );
+    }
+}
+
+/// The reference bar's Vertical mark: a red datum line hatched on its left,
+/// the constrained direction beside it, plus the orange point marker for a
+/// two-point relation.
+fn draw_vertical_constraint_glyph(
+    frame: &mut canvas::Frame,
+    center: Point,
+    text: Color,
+    point_marker: bool,
+) {
+    let datum = Color::from_rgb8(214, 76, 76);
+    let datum_x = center.x - 2.5;
+    let stroke = canvas::Stroke::default().with_color(datum).with_width(1.5);
+    frame.stroke(
+        &canvas::Path::line(
+            Point::new(datum_x, center.y - 6.5),
+            Point::new(datum_x, center.y + 6.5),
+        ),
+        stroke.clone(),
+    );
+    for step in 0..3 {
+        let y = center.y - 4.5 + step as f32 * 4.0;
+        frame.stroke(
+            &canvas::Path::line(Point::new(datum_x, y), Point::new(datum_x - 4.0, y + 3.5)),
+            stroke.clone(),
+        );
+    }
+    frame.stroke(
+        &canvas::Path::line(
+            Point::new(center.x + 2.5, center.y - 6.0),
+            Point::new(center.x + 2.5, center.y + 6.0),
+        ),
+        canvas::Stroke::default().with_color(text).with_width(1.4),
+    );
+    if point_marker {
+        frame.stroke(
+            &canvas::Path::rectangle(Point::new(center.x + 4.5, center.y - 2.3), Size::new(4.6, 4.6)),
+            canvas::Stroke::default()
+                .with_color(Color::from_rgb8(224, 130, 62))
+                .with_width(1.2),
+        );
+    }
 }
 
 fn constraint_glyph_box(
@@ -2020,6 +2131,21 @@ impl canvas::Program<Message> for SelectionCanvas {
                         draw_smooth_constraint_glyph(&mut frame, glyph_center, fg);
                     } else if label == "◎" {
                         draw_concentric_constraint_glyph(&mut frame, glyph_center, fg);
+                    } else if is_fixed_glyph(label) {
+                        draw_fixed_constraint_glyph(
+                            &mut frame,
+                            glyph_center,
+                            fg,
+                            bg,
+                            label == crate::scene::parametric_constraints::FIXED_POINT_GLYPH,
+                        );
+                    } else if is_vertical_glyph(label) {
+                        draw_vertical_constraint_glyph(
+                            &mut frame,
+                            glyph_center,
+                            fg,
+                            label == crate::scene::parametric_constraints::VERTICAL_POINTS_GLYPH,
+                        );
                     } else {
                         frame.fill_text(canvas::Text {
                             content: label.clone(),

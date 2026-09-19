@@ -737,6 +737,12 @@ pub(super) struct OpenCADStudio {
     pub(crate) show_block_palette: bool,
     /// Docked External References panel visibility (EXTERNALREFERENCES).
     pub(crate) show_external_references: bool,
+    /// Whether the Browser panel is shown. Off until BROWSER opens it, so
+    /// the default layout is unchanged for existing users.
+    pub(crate) show_browser: bool,
+    /// Which viewport background the colour wheel is editing, or `None` when
+    /// it is closed. One slot, because only one wheel can be open at a time.
+    pub(crate) bg_picker: Option<BgTarget>,
     /// General edge-stack dock layout for the side panels.
     pub(crate) dock: crate::ui::dock::DockState,
     /// Which panel is currently floated at full height (hovered, or a pinned
@@ -800,6 +806,12 @@ pub(super) struct OpenCADStudio {
     /// The open in-canvas modal dialog, if any (Plan B: shared overlay instead
     /// of OS windows).
     active_modal: Option<ModalKind>,
+    /// Selection and staged values owned by the Properties hyperlink dialog.
+    hyperlink_editor_handles: Vec<acadrust::Handle>,
+    hyperlink_editor_url: String,
+    hyperlink_editor_description: String,
+    hyperlink_editor_mixed: bool,
+    hyperlink_editor_dirty: bool,
     pending_startup_modals: std::collections::VecDeque<ModalKind>,
     /// What is drawing the scene, once the first frame has told us. Drives
     /// the graphics warning (popup, status-bar pill, command line).
@@ -1445,6 +1457,14 @@ pub struct SaveOutcome {
     refreshed_preview: Option<Option<acadrust::Preview>>,
     result: Result<(), crate::io::SaveFailure>,
 }
+/// Which viewport background a colour-wheel session is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BgTarget {
+    Model,
+    Paper,
+    Desk,
+}
+
 /// Active page in the shared CAD colour picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorPickerTab {
@@ -1851,6 +1871,8 @@ pub enum ModalKind {
     /// Add / remove the annotation scales a single selected object has a
     /// per-object representation for.
     AnnoObjectScale,
+    /// URL/description collection editor opened by the Hyperlink property row.
+    Hyperlink,
     InsertTable,
     DataLinkManager,
     DataExtraction,
@@ -2130,6 +2152,12 @@ pub enum Message {
     ModelSpaceModeChanged(config::ModelSpaceMode),
     /// Change Model Space custom background color as hex or empty for default.
     ModelSpaceBgChanged(String),
+    /// Open the colour wheel on one of the viewport backgrounds.
+    BgPickerOpen(BgTarget),
+    /// Dismiss the wheel, changing nothing.
+    BgPickerCancel,
+    /// Accept the wheel's colour for whichever background it was opened on.
+    BgPickerSubmit(iced::Color),
     /// Change Paper Space custom sheet background color as hex or empty for default.
     PaperSpaceBgChanged(String),
     /// Change Paper Space desk surround background (#RRGGBB).
@@ -2690,6 +2718,13 @@ pub enum Message {
     ScaleManagerOpen,
     /// Open the Annotation Object Scale dialog for the current single selection.
     AnnoObjectScaleOpen,
+    /// Open and edit the selected objects' PE_URL hyperlink collection.
+    PropHyperlinkOpen,
+    HyperlinkUrlChanged(String),
+    HyperlinkDescriptionChanged(String),
+    HyperlinkApply,
+    HyperlinkRemove,
+    HyperlinkCancel,
     /// Toggle whether the dialog's object has a representation for this scale.
     AnnoObjectScaleToggle(String),
     /// Select a scale row in the manager (loads it into the editor).
@@ -3939,6 +3974,8 @@ impl OpenCADStudio {
             show_properties: true,
             show_block_palette: false,
             show_external_references: false,
+            show_browser: false,
+            bg_picker: None,
             block_palette: Default::default(),
             xref_manager: Default::default(),
             dock: Default::default(),
@@ -3966,6 +4003,11 @@ impl OpenCADStudio {
             color_picker_tab: ColorPickerTab::Index,
             recent_colors: Vec::new(),
             active_modal: None,
+            hyperlink_editor_handles: Vec::new(),
+            hyperlink_editor_url: String::new(),
+            hyperlink_editor_description: String::new(),
+            hyperlink_editor_mixed: false,
+            hyperlink_editor_dirty: false,
             pending_startup_modals: std::collections::VecDeque::new(),
             gpu_status: crate::scene::pipeline::GpuStatus::Unknown,
             gpu_status_generation: 0,
@@ -4390,6 +4432,17 @@ impl OpenCADStudio {
         // `--read-only` disables saving. `--script` queues command lines.
         let cfg = crate::cli::gui_config();
         s.read_only = cfg.read_only;
+        // GPU backend / renderer fallback: the resolver ran before iced
+        // booted, so surface its verdict here where the user can see it.
+        if let Some(notice) = cfg.gpu_fallback_notice {
+            s.command_line.push_warning(&notice);
+            crate::scene::pipeline::report_gpu_line(&format!("[gpu] {notice}"));
+        }
+        if cfg.gpu_compat_auto {
+            let notice = crate::gpu_backend::compat_notice();
+            s.command_line.push_warning(&notice);
+            crate::scene::pipeline::report_gpu_line(&format!("[gpu] {notice}"));
+        }
         let cli_open: Task<Message> = if !cfg.files.is_empty() {
             Task::batch(
                 cfg.files

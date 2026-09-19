@@ -56,6 +56,7 @@ use crate::scene::model::wire_model::WireModel;
 /// Worst-case raster depth bias (in 24-bit quanta, toward the camera) block
 /// text is required to clear. The wipeout pipeline currently carries no bias
 /// (see #1304), so this is a safety budget: the block-text regression asserts
+/// (see #1304), so this is a safety budget: the block-text regression asserts
 /// a larger margin over whatever bias the pipeline could reintroduce.
 pub const WIPEOUT_DEPTH_BIAS_QUANTA: i32 = 2;
 
@@ -1061,6 +1062,14 @@ impl Pipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: content_stencil.clone(),
+                // The shader already applies draw order, and #1304 showed a
+                // raster bias can jump across a block's narrow depth band and
+                // erase its foreground — so the bias stays at zero. Coincident
+                // ties still resolve toward the mask because it draws later
+                // under LessEqual. Block text keeps 9-16 depth quanta of
+                // margin over the wipes it is drawn after; if a raster bias
+                // ever returns here, WIPEOUT_DEPTH_BIAS_QUANTA is the budget
+                // the block-text regression asserts against.
                 // The shader already applies draw order, and #1304 showed a
                 // raster bias can jump across a block's narrow depth band and
                 // erase its foreground — so the bias stays at zero. Coincident

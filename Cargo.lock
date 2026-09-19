@@ -45,6 +45,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "ocs_plugin_api",
  "open",
+ "pollster",
  "printpdf",
  "rayon",
  "resvg",
@@ -85,7 +86,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "acadrust"
 version = "0.5.5"
-source = "git+https://github.com/HakanSeven12/cadcodec.git?rev=8a28c21#8a28c21537d5e5ab06a431b1741d0c2d2b098b15"
+source = "git+https://github.com/HakanSeven12/cadcodec.git?rev=7ea4247#7ea4247134af60c8c1617426849d4fa8233660c8"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -921,7 +922,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "cadkernel"
 version = "0.1.0"
-source = "git+https://github.com/HakanSeven12/cadkernel.git?rev=d2a288b#d2a288b5f397ad7941719119f216a048d6cdcc6f"
+source = "git+https://github.com/HakanSeven12/cadkernel.git?rev=a0b962a#a0b962ae8045e7221ecb5d478adc5ad58e2706ba"
 dependencies = [
  "acadrust",
  "cavalier_contours",
@@ -932,7 +933,7 @@ dependencies = [
 [[package]]
 name = "cadkernel-constraints"
 version = "0.1.0"
-source = "git+https://github.com/HakanSeven12/cadkernel.git?rev=d2a288b#d2a288b5f397ad7941719119f216a048d6cdcc6f"
+source = "git+https://github.com/HakanSeven12/cadkernel.git?rev=a0b962a#a0b962ae8045e7221ecb5d478adc5ad58e2706ba"
 dependencies = [
  "nalgebra",
 ]

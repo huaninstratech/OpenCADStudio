@@ -347,6 +347,72 @@ impl CadCommand for ValuePromptCommand {
     }
 }
 
+/// Interactive pick for `UCS FACE` and `UCS OBJECT`.
+///
+/// Hands the picked entity to the inline `UCS FACE <handle> <x,y,z>` /
+/// `UCS OBJECT <handle>` handler via [`CmdResult::Dispatch`], so the plane
+/// construction lives in one place whether the user clicked or typed the
+/// arguments. For a face the click lands *on the solid's surface*
+/// (`entity_pick_uses_surface_point`) and that point becomes the plane
+/// origin; for an object only the handle matters.
+pub struct UcsPickCommand {
+    /// `true` picks a solid face; `false` picks a planar entity.
+    pub face: bool,
+}
+
+impl CadCommand for UcsPickCommand {
+    fn name(&self) -> &'static str {
+        "UCS"
+    }
+
+    fn prompt(&self) -> String {
+        if self.face {
+            crate::t!("UCS FACE  Select a face to draw on:").into_owned()
+        } else {
+            crate::t!("UCS OBJECT  Select object to align UCS:").into_owned()
+        }
+    }
+
+    fn needs_entity_pick(&self) -> bool {
+        true
+    }
+
+    fn entity_pick_uses_surface_point(&self) -> bool {
+        self.face
+    }
+
+    fn entity_pick_highlights_hover(&self) -> bool {
+        true
+    }
+
+    fn on_entity_pick(&mut self, handle: Handle, pt: DVec3) -> CmdResult {
+        if handle.is_null() {
+            return CmdResult::NeedPoint;
+        }
+        if !self.face {
+            return CmdResult::Dispatch(format!("UCS OBJECT {:X}", handle.value()));
+        }
+        // Hex handle and comma-separated coordinates are what the inline
+        // parser reads back. Full `{}` precision, not a rounded format: the
+        // point has to stay on the face for the planar-face lookup.
+        CmdResult::Dispatch(format!(
+            "UCS FACE {:X} {},{},{}",
+            handle.value(),
+            pt.x,
+            pt.y,
+            pt.z
+        ))
+    }
+
+    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        CmdResult::Cancel
+    }
+}
+
 /// Interactive front-end for RENAME. Prompts for the object type (as clickable
 /// buttons), then the current name, then the new name, and delegates to the
 /// inline `RENAME <type> <old> <new>` handler via [`CmdResult::Dispatch`] — the
@@ -1258,6 +1324,18 @@ pub enum HorizontalConstraintSelection {
     Points(CoincidentPick, CoincidentPick),
 }
 
+/// The two input forms accepted by the Symmetric geometric constraint.
+/// Object picks retain their curve or segment references; point picks are
+/// resolved by the host against the live document.
+#[derive(Clone, Copy, Debug)]
+pub enum SymmetricConstraintSelection {
+    Objects(
+        crate::scene::parametric_constraints::ParametricRef,
+        crate::scene::parametric_constraints::ParametricRef,
+    ),
+    Points(CoincidentPick, CoincidentPick),
+}
+
 /// Construction options shared by SWEEP creation and its live preview.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SweepOptions {
@@ -1504,12 +1582,28 @@ pub enum CmdResult {
         /// Undo-history label, e.g. `"Horizontal constraint"`.
         label: &'static str,
     },
-    /// Adds a Horizontal relation against the UCS X direction captured when
-    /// the command starts. The direction is persisted with the constraint so
-    /// later edits and save/reopen do not silently fall back to world X.
+    /// Adds a Horizontal or Vertical relation (`kind`) against the UCS X or
+    /// Y direction captured when the command starts. The direction is
+    /// persisted with the constraint so later edits and save/reopen do not
+    /// silently fall back to the world axis.
     AddHorizontalConstraint {
+        kind: crate::scene::parametric_constraints::ConstraintKind,
         selection: HorizontalConstraintSelection,
         direction: acadrust::types::Vector3,
+        label: &'static str,
+    },
+    /// Resolves the first 2Points pick of a Horizontal or Vertical constraint
+    /// against the live document so a miss is reported at once, before the
+    /// second point is asked for.
+    CheckHorizontalPoint {
+        kind: crate::scene::parametric_constraints::ConstraintKind,
+        pick: CoincidentPick,
+    },
+    /// Adds a point or object symmetry relation around a picked line. The
+    /// first reference and axis remain fixed during initial placement.
+    AddSymmetricConstraint {
+        selection: SymmetricConstraintSelection,
+        axis: crate::scene::parametric_constraints::ParametricRef,
         label: &'static str,
     },
     /// Adds an ordered perpendicular relation. The first picked direction and
@@ -1570,6 +1664,11 @@ pub enum CmdResult {
         kind: crate::scene::parametric_constraints::ConstraintKind,
         label: &'static str,
     },
+    /// Add a persistent `Fixed` constraint (`crate::modules::parametric::fixed`)
+    /// at one picked constraint point (`whole_curve == false`, resolved by the
+    /// host like `AddPointOnEntityConstraint`'s point) or on the whole curve /
+    /// polyline segment under the pick (`whole_curve == true`).
+    AddFixedConstraint(CoincidentPick),
     /// Add a persistent `EqualDistance` constraint
     /// (`crate::modules::parametric::equal_distance`): the distance
     /// between `points[0]`/`points[1]` equals the distance between
@@ -2797,6 +2896,7 @@ mod constraint_registry_tests {
             "OCCONSTRAINT",
             "GCHORIZONTAL",
             "VCONSTRAINT",
+            "GCVERTICAL",
             "PCONSTRAINT",
             "QCONSTRAINT",
             "GCPERPENDICULAR",
@@ -2806,6 +2906,7 @@ mod constraint_registry_tests {
             "NRCONSTRAINT",
             "LCONSTRAINT",
             "FXCONSTRAINT",
+            "GCFIX",
             "SYCONSTRAINT",
             "DCONSTRAINT",
             "ACONSTRAINT",

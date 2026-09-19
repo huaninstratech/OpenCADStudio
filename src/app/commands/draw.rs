@@ -1377,18 +1377,34 @@ impl OpenCADStudio {
                 }
             }
 
-            "GCHORIZONTAL" => {
+            "GCHORIZONTAL" | "VCONSTRAINT" | "GCVERTICAL" => {
                 use crate::command::{CmdResult, HorizontalConstraintSelection};
                 use crate::modules::parametric::HorizontalConstraintCommand;
+                use crate::scene::parametric_constraints::ConstraintKind;
 
+                // Vertical is Horizontal mirrored onto the working plane's Y
+                // axis: same picks, same 2Points flow, same reference types.
+                let vertical = cmd != "GCHORIZONTAL";
+                let (kind, axis, label) = if vertical {
+                    (ConstraintKind::Vertical, "Vertical", "Vertical constraint")
+                } else {
+                    (ConstraintKind::Horizontal, "Horizontal", "Horizontal constraint")
+                };
+                let new_command = || {
+                    if vertical {
+                        HorizontalConstraintCommand::vertical()
+                    } else {
+                        HorizontalConstraintCommand::new()
+                    }
+                };
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
-                    let command = HorizontalConstraintCommand::new();
+                    let command = new_command();
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                 } else if handles.len() != 1 {
                     self.command_line
-                        .push_error("Horizontal: select exactly one compatible object.");
+                        .push_error(&format!("{axis}: select exactly one compatible object."));
                 } else {
                     let handle = handles[0];
                     let reference = self.tabs[i]
@@ -1399,52 +1415,61 @@ impl OpenCADStudio {
                             HorizontalConstraintCommand::preselected_reference(entity, handle)
                         });
                     if let Some(reference) = reference {
-                        let direction = self.tabs[i].ucs_xform().working_plane().x;
+                        let plane = self.tabs[i].ucs_xform().working_plane();
+                        let direction = if vertical { plane.y } else { plane.x };
                         return Some(self.apply_cmd_result(CmdResult::AddHorizontalConstraint {
+                            kind,
                             selection: HorizontalConstraintSelection::Reference(reference),
                             direction: acadrust::types::Vector3::new(
                                 direction.x,
                                 direction.y,
                                 direction.z,
                             ),
-                            label: "Horizontal constraint",
+                            label,
                         }));
                     }
                     self.tabs[i].scene.deselect_all();
-                    self.command_line.push_error(
-                        "Horizontal: select a line, straight polyline segment, text, MText, or an ellipse axis.",
-                    );
-                    let command = HorizontalConstraintCommand::new();
+                    self.command_line.push_error(&format!(
+                        "Invalid selection for {axis}. Select a line segment, polyline segment, text, MText, major or minor axis of ellipse or elliptical arc."
+                    ));
+                    let command = new_command();
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                 }
             }
 
-            "VCONSTRAINT" | "FXCONSTRAINT" => {
+            "FXCONSTRAINT" | "GCFIX" => {
+                use crate::command::CmdResult;
+                use crate::modules::parametric::FixConstraintCommand;
+                use crate::scene::parametric_constraints::ConstraintKind;
+
+                // One preselected whole curve applies at once (ribbon
+                // "select first, then click"); anything else goes through
+                // the reference's own point-or-object prompt.
                 let handles = self.tabs[i].scene.selected_handles_in_order();
-                if handles.is_empty() {
-                    use crate::modules::draw::select::SelectObjectsCommand;
-                    let sel = SelectObjectsCommand::new(cmd);
-                    self.command_line.push_info(&sel.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(sel));
-                } else if handles.len() != 1 {
-                    self.command_line
-                        .push_output("Select exactly one entity, then run this constraint again.");
-                } else {
-                    use crate::command::CmdResult;
-                    use crate::scene::parametric_constraints::{ConstraintKind, ParametricRef};
-                    let (kind, label) = if cmd == "VCONSTRAINT" {
-                        (ConstraintKind::Vertical, "Vertical constraint")
-                    } else {
-                        (ConstraintKind::Fixed, "Fixed constraint")
-                    };
-                    return Some(self.apply_cmd_result(CmdResult::AddParametricConstraint {
-                        kind,
-                        refs: vec![ParametricRef::whole(handles[0])],
-                        driving_param: None,
-                        label,
-                    }));
+                if let [handle] = handles.as_slice() {
+                    let reference = self.tabs[i]
+                        .scene
+                        .document
+                        .get_entity(*handle)
+                        .and_then(|entity| {
+                            FixConstraintCommand::preselected_reference(entity, *handle)
+                        });
+                    if let Some(reference) = reference {
+                        return Some(self.apply_cmd_result(CmdResult::AddParametricConstraint {
+                            kind: ConstraintKind::Fixed,
+                            refs: vec![reference],
+                            driving_param: None,
+                            label: "Fixed constraint",
+                        }));
+                    }
                 }
+                if !handles.is_empty() {
+                    self.tabs[i].scene.deselect_all();
+                }
+                let command = FixConstraintCommand::new();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
             }
 
             "CCONSTRAINT" | "GCCOINCIDENT" => {
@@ -1618,27 +1643,40 @@ impl OpenCADStudio {
             "SYCONSTRAINT" => {
                 let handles = self.tabs[i].scene.selected_handles_in_order();
                 if handles.is_empty() {
-                    use crate::modules::draw::select::SelectObjectsCommand;
-                    let sel = SelectObjectsCommand::new(cmd);
-                    self.command_line.push_info(&sel.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(sel));
-                } else if handles.len() != 3 {
-                    self.command_line.push_output(
-                        "Select exactly three entities (two circles/arcs, then the mirror line), then run this constraint again.",
-                    );
+                    use crate::modules::parametric::SymmetricConstraintCommand;
+                    let command = SymmetricConstraintCommand::new();
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
                 } else {
-                    use crate::command::CmdResult;
-                    use crate::scene::parametric_constraints::{ConstraintKind, ParametricRef};
-                    return Some(self.apply_cmd_result(CmdResult::AddParametricConstraint {
-                        kind: ConstraintKind::Symmetric,
-                        refs: vec![
-                            ParametricRef::center(handles[0]),
-                            ParametricRef::center(handles[1]),
-                            ParametricRef::whole(handles[2]),
-                        ],
-                        driving_param: None,
-                        label: "Symmetric constraint",
-                    }));
+                    use crate::command::{
+                        CmdResult, SymmetricConstraintSelection,
+                    };
+                    use crate::modules::parametric::SymmetricConstraintCommand;
+
+                    let refs = (handles.len() == 3).then(|| {
+                        let first = self.tabs[i].scene.document.get_entity(handles[0])?;
+                        let second = self.tabs[i].scene.document.get_entity(handles[1])?;
+                        let axis = self.tabs[i].scene.document.get_entity(handles[2])?;
+                        SymmetricConstraintCommand::preselected_refs(
+                            (first, handles[0]),
+                            (second, handles[1]),
+                            (axis, handles[2]),
+                        )
+                    }).flatten();
+                    if let Some([first, second, axis]) = refs {
+                        return Some(self.apply_cmd_result(CmdResult::AddSymmetricConstraint {
+                            selection: SymmetricConstraintSelection::Objects(first, second),
+                            axis,
+                            label: "Symmetric constraint",
+                        }));
+                    }
+                    self.tabs[i].scene.deselect_all();
+                    self.command_line.push_error(
+                        "Symmetric: select two compatible objects followed by a line axis.",
+                    );
+                    let command = SymmetricConstraintCommand::new();
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
                 }
             }
 
@@ -2458,5 +2496,24 @@ mod region_tests {
             }
             assert_eq!(app.tabs[i].scene.document.entities().count(), 2);
         }
+    }
+}
+
+#[cfg(test)]
+mod degenerate_constraint_tests {
+    use crate::app::OpenCADStudio;
+
+    /// Retaining a zero-length line's size used to hand the solver a NaN
+    /// Jacobian, and its SVD fallback never returned.
+    #[test]
+    fn equal_constraint_with_a_zero_length_line_returns() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 0,0 "}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 5,5 20,7 "}"#);
+        app.automation_op(r#"{"op":"select","type":"Line"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"ECONSTRAINT"}"#);
+        let lines = app.automation_op(r#"{"op":"query","type":"Line","detail":"geometry"}"#);
+        assert_eq!(lines["ok"], true, "{lines}");
     }
 }

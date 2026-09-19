@@ -6,6 +6,8 @@ mod coincident;
 mod concentric;
 mod constraint_bar;
 mod equal_distance;
+#[path = "fixed.rs"]
+mod fixed_command;
 mod geom_constraint;
 #[path = "horizontal.rs"]
 mod horizontal_command;
@@ -13,6 +15,8 @@ mod horizontal_command;
 mod perpendicular_command;
 mod point_on_entity;
 mod smooth;
+#[path = "symmetric.rs"]
+mod symmetric_command;
 #[path = "tangent.rs"]
 mod tangent_command;
 mod tools;
@@ -21,6 +25,7 @@ pub use coincident::{coincident_tool, CoincidentConstraintCommand};
 pub use concentric::ConcentricConstraintCommand;
 pub use constraint_bar::ConstraintBarOptionCommand;
 pub use equal_distance::{equal_distance_tool, EqualDistanceConstraintCommand};
+pub use fixed_command::FixConstraintCommand;
 pub use geom_constraint::GeomConstraintCommand;
 pub use horizontal_command::HorizontalConstraintCommand;
 pub use perpendicular_command::{PerpendicularConstraintCommand, PerpendicularPick};
@@ -28,6 +33,7 @@ pub use point_on_entity::{
     center_point_tool, midpoint_tool, point_on_curve_tool, PointOnEntityConstraintCommand,
 };
 pub use smooth::SmoothConstraintCommand;
+pub use symmetric_command::SymmetricConstraintCommand;
 pub use tangent_command::TangentConstraintCommand;
 pub use tools::{
     colinear, concentric as concentric_tool, equal, fixed, horizontal, normal, parallel,

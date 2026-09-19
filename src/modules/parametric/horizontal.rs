@@ -5,7 +5,7 @@ use crate::command::{
     CadCommand, CmdOption, CmdResult, CoincidentPick, HorizontalConstraintSelection, WorkingPlane,
 };
 use crate::scene::parametric_constraints::{
-    directional_axis_endpoints, is_parametric_point_near, ParametricRef,
+    directional_axis_endpoints, is_parametric_point_near, ConstraintKind, ParametricRef,
 };
 
 #[derive(Clone, Copy)]
@@ -15,8 +15,10 @@ enum Step {
     SecondPoint(CoincidentPick),
 }
 
-/// Interactive front end for the Horizontal geometric constraint.
+/// Interactive front end for the Horizontal and Vertical geometric
+/// constraints — one flow, mirrored across the working plane's X or Y axis.
 pub struct HorizontalConstraintCommand {
+    kind: ConstraintKind,
     step: Step,
     picked_entity: Option<EntityType>,
     plane: WorkingPlane,
@@ -24,10 +26,48 @@ pub struct HorizontalConstraintCommand {
 
 impl HorizontalConstraintCommand {
     pub fn new() -> Self {
+        Self::for_kind(ConstraintKind::Horizontal)
+    }
+
+    pub fn vertical() -> Self {
+        Self::for_kind(ConstraintKind::Vertical)
+    }
+
+    fn for_kind(kind: ConstraintKind) -> Self {
         Self {
+            kind,
             step: Step::ObjectOrTwoPoints,
             picked_entity: None,
             plane: WorkingPlane::default(),
+        }
+    }
+
+    /// Re-enter the 2Points flow after the host rejected a pick: back at
+    /// the first point, or at the second with `first` kept.
+    pub fn resume(kind: ConstraintKind, first: Option<CoincidentPick>) -> Self {
+        let mut command = Self::for_kind(kind);
+        command.step = match first {
+            Some(first) => Step::SecondPoint(first),
+            None => Step::FirstPoint,
+        };
+        command
+    }
+
+    pub fn kind(&self) -> ConstraintKind {
+        self.kind
+    }
+
+    fn axis(&self) -> &'static str {
+        match self.kind {
+            ConstraintKind::Vertical => "Vertical",
+            _ => "Horizontal",
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            ConstraintKind::Vertical => "Vertical constraint",
+            _ => "Horizontal constraint",
         }
     }
 
@@ -40,21 +80,22 @@ impl HorizontalConstraintCommand {
     }
 
     fn direction(&self) -> acadrust::types::Vector3 {
-        let direction = self.plane.x.normalize_or(DVec3::X);
+        let direction = match self.kind {
+            ConstraintKind::Vertical => self.plane.y.normalize_or(DVec3::Y),
+            _ => self.plane.x.normalize_or(DVec3::X),
+        };
         acadrust::types::Vector3::new(direction.x, direction.y, direction.z)
     }
 
-    fn invalid_object() -> CmdResult {
-        CmdResult::ReportError(
-            "Horizontal: select a line, straight polyline segment, text, MText, or an ellipse axis."
-                .to_string(),
-        )
+    fn invalid_object(&self) -> CmdResult {
+        CmdResult::ReportError(format!(
+            "Invalid selection for {}. Select a line segment, polyline segment, text, MText, major or minor axis of ellipse or elliptical arc.",
+            self.axis()
+        ))
     }
 
     fn invalid_point() -> CmdResult {
-        CmdResult::ReportError(
-            "Horizontal: select an endpoint, center, midpoint, or polyline vertex.".to_string(),
-        )
+        CmdResult::ReportError("No valid constraint point found.".to_string())
     }
 
     fn segment_is_straight(entity: &EntityType, index: usize) -> bool {
@@ -153,27 +194,40 @@ impl HorizontalConstraintCommand {
         }
     }
 
-    fn finish_points(&self, first: CoincidentPick, second: CoincidentPick) -> CmdResult {
+    fn finish_points(&mut self, first: CoincidentPick, second: CoincidentPick) -> CmdResult {
+        // The reference refuses the same pick twice and asks again for the
+        // second point (the host repeats this check on the resolved refs).
+        if first.handle == second.handle && (first.point - second.point).length() <= 1.0e-9 {
+            self.step = Step::SecondPoint(first);
+            return CmdResult::ReportError(
+                "The object or point is already selected. Select a different object or constraint point."
+                    .to_string(),
+            );
+        }
         CmdResult::AddHorizontalConstraint {
+            kind: self.kind,
             selection: HorizontalConstraintSelection::Points(first, second),
             direction: self.direction(),
-            label: "Horizontal constraint",
+            label: self.label(),
         }
     }
 }
 
 impl CadCommand for HorizontalConstraintCommand {
     fn name(&self) -> &'static str {
-        "GCHORIZONTAL"
+        match self.kind {
+            ConstraintKind::Vertical => "GCVERTICAL",
+            _ => "GCHORIZONTAL",
+        }
     }
 
     fn prompt(&self) -> String {
         match self.step {
             Step::ObjectOrTwoPoints => {
-                "GCHORIZONTAL  Select an object or [2Points] <2Points>:".to_string()
+                format!("{}  Select an object or [2Points] <2Points>:", self.name())
             }
-            Step::FirstPoint => "GCHORIZONTAL  Select first point:".to_string(),
-            Step::SecondPoint(_) => "GCHORIZONTAL  Select second point:".to_string(),
+            Step::FirstPoint => format!("{}  Select first point:", self.name()),
+            Step::SecondPoint(_) => format!("{}  Select second point:", self.name()),
         }
     }
 
@@ -237,12 +291,13 @@ impl CadCommand for HorizontalConstraintCommand {
         match self.step {
             Step::ObjectOrTwoPoints => {
                 let Some(reference) = Self::picked_reference(&entity, handle, point) else {
-                    return Self::invalid_object();
+                    return self.invalid_object();
                 };
                 CmdResult::AddHorizontalConstraint {
+                    kind: self.kind,
                     selection: HorizontalConstraintSelection::Reference(reference),
                     direction: self.direction(),
-                    label: "Horizontal constraint",
+                    label: self.label(),
                 }
             }
             Step::FirstPoint | Step::SecondPoint(_) => {
@@ -266,10 +321,12 @@ impl CadCommand for HorizontalConstraintCommand {
     fn on_point(&mut self, point: DVec3) -> CmdResult {
         let pick = Self::point_pick(None, point);
         match self.step {
-            Step::ObjectOrTwoPoints | Step::FirstPoint => {
-                self.step = Step::SecondPoint(pick);
-                CmdResult::NeedPoint
-            }
+            // The host resolves the pick against the document: a hit resumes
+            // at the second point, a miss re-asks for the first one at once.
+            Step::ObjectOrTwoPoints | Step::FirstPoint => CmdResult::CheckHorizontalPoint {
+                kind: self.kind,
+                pick,
+            },
             Step::SecondPoint(first) => self.finish_points(first, pick),
         }
     }
@@ -320,10 +377,12 @@ mod tests {
     fn enter_starts_the_two_point_flow() {
         let mut command = HorizontalConstraintCommand::new();
         assert!(matches!(command.on_enter(), CmdResult::NeedPoint));
-        assert!(matches!(
-            command.on_point(DVec3::new(1.0, 2.0, 0.0)),
-            CmdResult::NeedPoint
-        ));
+        let CmdResult::CheckHorizontalPoint { kind, pick } =
+            command.on_point(DVec3::new(1.0, 2.0, 0.0))
+        else {
+            panic!("the host must check the first point");
+        };
+        let mut command = HorizontalConstraintCommand::resume(kind, Some(pick));
         let CmdResult::AddHorizontalConstraint {
             selection: HorizontalConstraintSelection::Points(first, second),
             direction,
@@ -339,5 +398,5 @@ mod tests {
 }
 
 inventory::submit!(crate::command::CommandRegistration {
-    names: &["GCHORIZONTAL"]
+    names: &["GCHORIZONTAL", "GCVERTICAL"]
 });

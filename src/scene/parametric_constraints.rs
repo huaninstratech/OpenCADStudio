@@ -231,13 +231,19 @@ pub(crate) fn grip_solve_anchor_refs(
         }
         acadrust::EntityType::Arc(_) => match grip_id {
             0 => vec![ParametricRef::center(handle)],
-            1 => vec![ParametricRef::point(handle, 0)],
-            2 => vec![ParametricRef::point(handle, 1)],
+            1..=3 => vec![ParametricRef::whole(handle)],
             _ => Vec::new(),
         },
-        acadrust::EntityType::Circle(_) if grip_id == 0 => {
-            vec![ParametricRef::center(handle)]
-        }
+        acadrust::EntityType::Circle(_) => match grip_id {
+            0 => vec![ParametricRef::center(handle)],
+            1..=4 => vec![ParametricRef::whole(handle)],
+            _ => Vec::new(),
+        },
+        acadrust::EntityType::Ellipse(_) => match grip_id {
+            0 => vec![ParametricRef::center(handle)],
+            1..=6 => vec![ParametricRef::whole(handle)],
+            _ => Vec::new(),
+        },
         acadrust::EntityType::Point(_)
         | acadrust::EntityType::Insert(_)
         | acadrust::EntityType::Text(_)
@@ -304,11 +310,11 @@ pub enum ConstraintKind {
     /// For the supported entity types, equal curvature is already covered
     /// by the circle/circle radius branch of `Equal`.
     EqualDistance,
-    /// Two circles/arcs are mirror images of each other across a line —
-    /// `refs`: `[center(a), center(b), whole(mirror_line)]`. Scoped to the
-    /// circle-center-pair case (unambiguous with whole-entity selection);
-    /// point-symmetry about a point, and symmetry between two lines, aren't
-    /// modeled.
+    /// Two points or compatible curves are symmetric across a line.
+    /// Point mode stores two point refs plus the axis. Object mode stores two
+    /// whole/segment refs plus the axis and constrains the complete relevant
+    /// geometry: line direction, circular center/radius, or ellipse
+    /// center/axes.
     Symmetric,
     /// A circle/arc's diameter (twice `Radius`'s target) — `refs`:
     /// `[whole(circle_or_arc)]`. Same DWG class as `Radius`
@@ -587,7 +593,29 @@ impl ParametricConstraintSet {
 ///
 /// Solver-side registration reads raw entity fields directly. This helper is
 /// for UI-side consumers that need the current world-space position.
+/// The single addressable point (marker `0`) of a point-like entity: the
+/// node, insertion, or table origin the solver registers as its
+/// `EntityGeom::Point` / text baseline start. `None` for curve entities,
+/// whose marker `0` is a `source_points()` endpoint.
+pub(crate) fn insertion_point(entity: &acadrust::EntityType) -> Option<Vector3> {
+    match entity {
+        acadrust::EntityType::Point(point) => Some(point.location),
+        acadrust::EntityType::Insert(insert) => Some(insert.insert_point),
+        acadrust::EntityType::Text(text) => Some(text.insertion_point),
+        acadrust::EntityType::MText(text) => Some(text.insertion_point),
+        acadrust::EntityType::AttributeDefinition(attribute) => Some(attribute.insertion_point),
+        acadrust::EntityType::AttributeEntity(attribute) => Some(attribute.insertion_point),
+        acadrust::EntityType::Table(table) => Some(table.insertion_point),
+        _ => None,
+    }
+}
+
 pub(crate) fn resolve_point(entity: &acadrust::EntityType, marker: i32) -> Option<Vector3> {
+    if marker == 0 {
+        if let Some(point) = insertion_point(entity) {
+            return Some(point);
+        }
+    }
     if marker == -3 {
         return match entity {
             acadrust::EntityType::Circle(circle) => Some(circle.center_wcs()),
@@ -645,6 +673,12 @@ pub(crate) fn parametric_point_candidates(
         .enumerate()
         .map(|(marker, point)| (marker as i32, point))
         .collect();
+    // A node / insertion point is a constraint point too (the reference
+    // fixes a POINT via NODe and TEXT via INSert), and these entities have
+    // no `source_points()` to collide with marker `0`.
+    if let Some(point) = insertion_point(entity) {
+        points.push((0, point));
+    }
     match entity {
         acadrust::EntityType::Circle(circle) => points.push((-3, circle.center_wcs())),
         acadrust::EntityType::Arc(arc) => points.push((-3, arc.center_wcs())),
@@ -863,6 +897,36 @@ impl ConstraintKind {
     }
 }
 
+/// Fixed draws a padlock (`src/ui/overlay.rs`), the way the reference bar
+/// does: the plain symbol for a held curve or segment, this variant when one
+/// addressable point is held (white lock with the point marker).
+pub(crate) const FIXED_POINT_GLYPH: &str = "F·";
+
+pub(crate) fn fixed_glyph_label(constraint: &ParametricConstraint) -> &'static str {
+    let point = constraint
+        .refs
+        .first()
+        .is_some_and(|reference| reference.marker.is_some() && reference.segment_index().is_none());
+    if point {
+        FIXED_POINT_GLYPH
+    } else {
+        ConstraintKind::Fixed.glyph_symbol()
+    }
+}
+
+/// Vertical draws the reference bar's axis mark (`src/ui/overlay.rs`): the
+/// plain symbol for an object, this variant — with the point marker — for a
+/// two-point relation.
+pub(crate) const VERTICAL_POINTS_GLYPH: &str = "│·";
+
+pub(crate) fn vertical_glyph_label(constraint: &ParametricConstraint) -> &'static str {
+    if constraint.refs.len() == 2 {
+        VERTICAL_POINTS_GLYPH
+    } else {
+        ConstraintKind::Vertical.glyph_symbol()
+    }
+}
+
 /// The full glyph text for one constraint: its symbol, plus the driving
 /// value for a dimensional kind (Distance/Angle/Radius).
 pub(crate) fn glyph_label(constraint: &ParametricConstraint) -> String {
@@ -951,6 +1015,10 @@ fn glyph_placement_for_reference(
             let anchor = arc.midpoint_wcs();
             Some((anchor, anchor - center))
         }
+        (acadrust::EntityType::Ellipse(ellipse), None | Some(-3)) => {
+            let anchor = ellipse.center + ellipse.major_axis;
+            Some((anchor, ellipse.major_axis))
+        }
         (acadrust::EntityType::Line(line), Some(marker)) => {
             let anchor = resolve_point(entity, marker)?;
             let direction = anchor - line_midpoint(line);
@@ -983,7 +1051,10 @@ fn glyph_placements(
     document: &acadrust::CadDocument,
     constraint: &ParametricConstraint,
 ) -> Vec<(Vector3, Vector3)> {
-    if constraint.kind == ConstraintKind::Parallel {
+    if matches!(
+        constraint.kind,
+        ConstraintKind::Parallel | ConstraintKind::Symmetric
+    ) {
         return constraint
             .refs
             .iter()
@@ -1659,7 +1730,11 @@ impl super::Scene {
             })
             .flat_map(|c| {
                 let is_conflicting = set.conflicts.iter().any(|(id, _)| *id == c.id);
-                let label = if show_values {
+                let base_label = if c.kind == ConstraintKind::Fixed {
+                    fixed_glyph_label(c).to_string()
+                } else if c.kind == ConstraintKind::Vertical {
+                    vertical_glyph_label(c).to_string()
+                } else if show_values {
                     glyph_label(c)
                 } else {
                     c.kind.glyph_symbol().to_string()
@@ -1682,7 +1757,22 @@ impl super::Scene {
                     .collect();
                 glyph_placements(&self.document, c)
                     .into_iter()
-                    .filter_map(|(anchor, outward)| {
+                    .enumerate()
+                    .filter_map(|(index, (anchor, outward))| {
+                        let label = if c.kind == ConstraintKind::Symmetric {
+                            if index == 2 {
+                                "S│".to_string()
+                            } else if c.refs.get(index).is_some_and(|reference| {
+                                reference.marker.is_some()
+                                    && reference.segment_index().is_none()
+                            }) {
+                                "S•".to_string()
+                            } else {
+                                "S◇".to_string()
+                            }
+                        } else {
+                            base_label.clone()
+                        };
                         let screen = crate::scene::pick::grip::project_rte(
                             glam::DVec3::new(anchor.x, anchor.y, anchor.z),
                             view_rot,
@@ -1706,7 +1796,7 @@ impl super::Scene {
                             c.id,
                             point,
                             direction.to_array(),
-                            label.clone(),
+                            label,
                             is_conflicting,
                             hover_points.clone(),
                         ))
@@ -2132,7 +2222,10 @@ mod tests {
     }
 
     #[test]
-    fn arc_grips_drive_center_start_and_end_but_not_midpoint() {
+    fn arc_grips_beyond_the_center_anchor_the_whole_entity() {
+        // Fixed-constraint parity: every non-center arc grip is a whole-entity
+        // ref, so a Fix (or any solver consumer) pins the arc as one object
+        // instead of addressing start/end points that a sweep would move.
         let handle = h(8);
         let arc = acadrust::EntityType::Arc(acadrust::entities::Arc::from_coords(
             0.0,
@@ -2147,15 +2240,13 @@ mod tests {
             grip_solve_anchor_refs(&arc, handle, 0),
             vec![ParametricRef::center(handle)]
         );
-        assert_eq!(
-            grip_solve_anchor_refs(&arc, handle, 1),
-            vec![ParametricRef::point(handle, 0)]
-        );
-        assert_eq!(
-            grip_solve_anchor_refs(&arc, handle, 2),
-            vec![ParametricRef::point(handle, 1)]
-        );
-        assert_eq!(grip_solve_anchor_refs(&arc, handle, 3), Vec::new());
+        for grip in 1..=3 {
+            assert_eq!(
+                grip_solve_anchor_refs(&arc, handle, grip),
+                vec![ParametricRef::whole(handle)]
+            );
+        }
+        assert_eq!(grip_solve_anchor_refs(&arc, handle, 4), Vec::new());
     }
 
     #[test]
