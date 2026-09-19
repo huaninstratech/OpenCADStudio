@@ -404,8 +404,6 @@ pub struct UserSettings {
     /// so an intranet folder or a private GitHub raw folder both work.
     #[serde(default)]
     pub font_source_url: String,
-    /// App version whose donation prompt has been displayed.
-    pub donation_prompt_version: String,
     /// The graphics verdict (`GpuStatus::identity()`) whose warning popup the
     /// user chose not to see again. Empty = always show. Keyed by verdict so
     /// silencing "software rendering on llvmpipe" does not silence a later,
@@ -651,7 +649,6 @@ impl Default for UserSettings {
             default_assoc_prompted: false,
             check_missing_fonts: true,
             font_source_url: String::new(),
-            donation_prompt_version: String::new(),
             gpu_warning_silenced: String::new(),
             disabled_plugins: Vec::new(),
             plugin_repos: Vec::new(),

@@ -102,8 +102,15 @@ fn main() -> iced::Result {
 
         // Headless modes exit without ever creating a window.
         if let Some(port) = args.http {
-            rest::serve(port);
-            return Ok(());
+            if args.files.is_empty() {
+                rest::serve(port);
+                return Ok(());
+            }
+            // Files + --http: boot the GUI and host the loopback REST channel
+            // on this very process, so a client can open a drawing, let the
+            // person pick sample entities, and read them back with
+            // get_selection (see app::control::http_bridge).
+            rest::set_gui_http_port(port);
         }
         if args.serve {
             // `app::serve` reads --port itself from the raw args.
@@ -128,8 +135,14 @@ fn main() -> iced::Result {
                 // Only bare files forward. `--read-only` / `--script` / `--new`
                 // configure the whole editor rather than a tab, so they always
                 // get a process of their own.
-                let plain_open =
-                    !args.read_only && args.script.is_none() && !args.new && !args.files.is_empty();
+                let plain_open = !args.read_only
+                    && args.script.is_none()
+                    && !args.new
+                    && !args.files.is_empty()
+                    // --http hosts its REST channel in this very process, so
+                    // the drawing must open here too, never in the existing
+                    // editor.
+                    && args.http.is_none();
                 if plain_open && io::single_instance::handoff(stream, &args.files) {
                     return Ok(());
                 }

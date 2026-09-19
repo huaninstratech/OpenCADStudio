@@ -74,7 +74,7 @@ fn version_card<'a>(
 ///   * `**bold**` runs and `` `code` `` runs (rendered tonally, not styled
 ///     differently — iced's text widget has no inline run styling).
 /// Anything else is plain body text. Strips the markdown markers so the
-/// dialog reads cleanly even if the user has a Patreon-formatted note.
+/// dialog reads cleanly even if the release note uses loose markdown.
 fn render_notes_line<'a>(raw: &str) -> Element<'a, Message> {
     let trimmed = raw.trim_end();
     if trimmed.is_empty() {

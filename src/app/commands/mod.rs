@@ -346,7 +346,6 @@ pub fn start_allowed(cmd: &str) -> bool {
             | "ABOUT"
             | "PLUGINS"
             | "PLUGINMANAGER"
-            | "DONATE"
             | "WEBVERSION"
             | "HELP"
             | "PERF"
@@ -656,7 +655,6 @@ inventory::submit!(crate::command::CommandRegistration {
         "DESELALL",
         "DESELECT",
         "DIMSTYLE",
-        "DONATE",
         "DRAWORDER",
         "DRAWORDER_FRONT",
         "DRAWORDER_BACK",

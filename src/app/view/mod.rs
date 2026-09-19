@@ -298,7 +298,6 @@ impl OpenCADStudio {
             .into()
         } else if tab.is_start {
             start_page_view(
-                &self.patrons,
                 &self.videos,
                 self.videos_loading,
                 &self.video_thumbs,
@@ -2695,7 +2694,11 @@ impl OpenCADStudio {
             })
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let control = super::control::subscribe().map(Message::ControlRequest);
+        let control = iced::Subscription::batch([
+            super::control::subscribe().map(Message::ControlRequest),
+            // Loopback REST channel when launched with files + --http.
+            super::control::http_bridge::subscribe().map(Message::ControlRequest),
+        ]);
         #[cfg(target_arch = "wasm32")]
         let control = iced::time::every(std::time::Duration::from_millis(50))
             .map(|_| Message::PollWebControl);
@@ -3311,7 +3314,6 @@ fn start_action_shape(mut style: button::Style) -> button::Style {
 }
 
 pub(super) fn start_page_view<'a>(
-    patrons: &'a [(String, i64)],
     videos: &'a [crate::videos::VideoEntry],
     videos_loading: bool,
     video_thumbs: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
@@ -3326,7 +3328,6 @@ pub(super) fn start_page_view<'a>(
 ) -> Element<'a, Message> {
     responsive(move |size| {
         start_page_content(
-            patrons,
             videos,
             videos_loading,
             video_thumbs,
@@ -3345,7 +3346,6 @@ pub(super) fn start_page_view<'a>(
 }
 
 fn start_page_content<'a>(
-    patrons: &'a [(String, i64)],
     videos: &'a [crate::videos::VideoEntry],
     videos_loading: bool,
     video_thumbs: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
@@ -3385,28 +3385,9 @@ fn start_page_content<'a>(
             })
     };
 
-    // Donate — the prominent call-to-action, using the theme's danger role.
-    let donate_btn = {
-        button(
-            row![
-                crate::ui::icons::themed_danger_text(crate::ui::icons::HEART, 14.0),
-                text(crate::tr!("start", "donate")).size(14),
-            ]
-            .spacing(5)
-            .align_y(iced::Center),
-        )
-        .on_press(Message::RibbonToolClick {
-            tool_id: "DONATE".to_string(),
-            event: crate::modules::ModuleEvent::Command("DONATE".to_string()),
-        })
-        .padding([10, 22])
-        .style(|theme: &Theme, status| start_action_shape(button::danger(theme, status)))
-    };
-
     let primary_row = WrapFlow::new(vec![
         outline_btn(crate::tr!("start", "new-drawing"), Message::TabNew).into(),
         outline_btn(crate::tr!("start", "open-file"), Message::OpenFile).into(),
-        donate_btn.into(),
     ])
     .spacing_x(12.0)
     .row_h(48.0)
@@ -3812,107 +3793,23 @@ fn start_page_content<'a>(
         .into()
     };
 
-    // Right rail: Patreon supporters, fetched at boot. When the list is empty
-    // (no token configured / offline) only the "Support on Patreon" button
-    // shows, so the rail always invites support.
-    let supporters: Element<'a, Message> = {
-        let mut list = column![
-            text(crate::tr!("start", "supporters")).size(15),
-            Space::new().height(iced::Length::Fixed(12.0)),
-        ]
-        .spacing(6)
-        .padding(iced::Padding {
-            right: 12.0,
-            ..iced::Padding::ZERO
-        })
-        .width(Fill);
-        for (name, cents) in patrons {
-            // Patreon payments are normalized to USD cents while the list is
-            // generated; hand-maintained entries use USD cents as well.
-            let amount = format!("${:.2}", *cents as f64 / 100.0);
-            list = list.push(
-                iced::widget::row![
-                    text(name).size(12).style(start_muted_style).width(Fill),
-                    text(amount).size(12).style(start_muted_style),
-                ]
-                .spacing(6),
-            );
-        }
-        let support_btn = mouse_area(
-            container(
-                iced::widget::row![
-                    crate::ui::icons::themed_danger_text(crate::ui::icons::HEART, 13.0),
-                    text(crate::tr!("start", "support-on-patreon")).size(12),
-                ]
-                .spacing(6)
-                .align_y(iced::Center),
-            )
-            .padding([6, 10])
-            .width(Fill)
-            .center_x(Fill)
-            .style(|theme: &Theme| {
-                let pair = theme.palette().danger.base;
-                container::Style {
-                    background: Some(Background::Color(pair.color)),
-                    border: Border {
-                        color: Color::TRANSPARENT,
-                        width: 0.0,
-                        radius: 6.0.into(),
-                    },
-                    text_color: Some(pair.text),
-                    ..Default::default()
-                }
-            }),
-        )
-        .interaction(iced::mouse::Interaction::Pointer)
-        .on_press(Message::OpenUrl(
-            "https://patreon.com/HakanSeven12".to_string(),
-        ));
-        container(column![
-            iced::widget::scrollable(list).height(Fill),
-            Space::new().height(iced::Length::Fixed(12.0)),
-            support_btn,
-        ])
-        .width(match start_layout {
-            StartLayout::AllPanels
-            | StartLayout::WithoutVideos
-            | StartLayout::WithoutVideosAndDiscussions => iced::Length::Fixed(panel_w),
-            StartLayout::RecentAndWelcome | StartLayout::Compact => iced::Length::Fill,
-        })
-        .height(Fill)
-        .padding(20)
-        .style(|theme: &Theme| {
-            let palette = theme.palette();
-            container::Style {
-                background: Some(Background::Color(palette.background.weak.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            }
-        })
-        .into()
-    };
-
+    // Right rail panels beside the recent-files list.
     let body: Element<'a, Message> = match start_layout {
         StartLayout::AllPanels => {
-            iced::widget::row![recent, videos_panel, welcome, discussions_panel, supporters,]
+            iced::widget::row![recent, videos_panel, welcome, discussions_panel]
                 .spacing(16)
                 .height(Fill)
                 .into()
         }
         StartLayout::WithoutVideos => {
-            iced::widget::row![recent, welcome, discussions_panel, supporters]
+            iced::widget::row![recent, welcome, discussions_panel]
                 .spacing(16)
                 .height(Fill)
                 .into()
         }
-        StartLayout::WithoutVideosAndDiscussions => iced::widget::row![recent, welcome, supporters]
-            .spacing(16)
-            .height(Fill)
-            .into(),
+        StartLayout::WithoutVideosAndDiscussions => {
+            iced::widget::row![recent, welcome].spacing(16).height(Fill).into()
+        }
         StartLayout::RecentAndWelcome => iced::widget::row![recent, welcome]
             .spacing(16)
             .height(Fill)
@@ -3961,11 +3858,6 @@ fn start_page_content<'a>(
                     super::StartSection::Discussions,
                 )
                 .into(),
-                tab_btn(
-                    crate::tr!("start", "supporters"),
-                    super::StartSection::Supporters,
-                )
-                .into(),
             ])
             .spacing(6.0)
             .align_y(iced::Center)
@@ -3988,11 +3880,9 @@ fn start_page_content<'a>(
                     .height(Fill)
                     .center_x(Fill)
                     .into(),
-                super::StartSection::Supporters => container(supporters)
-                    .width(Fill)
-                    .height(Fill)
-                    .center_x(Fill)
-                    .into(),
+                // No longer reachable from the UI (supporters rail removed);
+                // the variant survives so saved configs still deserialize.
+                super::StartSection::Supporters => welcome.into(),
             };
             column![
                 container(tab_bar).center_x(Fill),

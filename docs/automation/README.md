@@ -239,9 +239,7 @@ python3 docs/automation/serve_smoke.py target/debug/OpenCADStudio
 
 The automation surface is designed to mirror the capability areas of the
 AutoCAD .NET (ObjectARX) developer API — application/documents, database
-objects, editor, events, plotting. `autocad-parity-api.md` maps every .NET
-API area to the existing operations and lists the remaining work items
-(`entities_create`, `xdata_set`, `block_define`, …) with priorities.
+objects, editor, events, plotting.
 
 ## REST API (`--http`) — for ordinary HTTP clients
 
@@ -257,6 +255,58 @@ serves its machine-readable description at `GET /api/v1/openapi`
 OpenCADStudio --http 8090            # start the REST server (headless)
 curl http://127.0.0.1:8090/api/v1/ready
 ```
+
+### GUI-hosted REST channel (`--http` + file)
+
+`OpenCADStudio.exe "<file>" --http 8090` boots the **normal editor** and
+hosts a small loopback REST channel on this very process, bound to
+`http://127.0.0.1:8090/api/v1`. This is the "lấy mẫu" (sampling) flow for
+clients that need a human in the loop: open the drawing, let the person
+select entities with the normal gestures, then read them back over HTTP.
+
+The channel is deliberately **read-only** — it serves:
+
+| Call | Purpose |
+|---|---|
+| `POST /api/v1/get_selection` | Snapshot of the current selection (below). |
+| `POST /api/v1/getpoint` | Ask the person to pick one point; the connection stays open until they click (or Esc). |
+| `GET /api/v1/state` · `/api/v1/capabilities` | Session discovery (`document_id`, command state). |
+| `OPTIONS *` | CORS preflight → **204**. |
+
+Anything else answers `403 {"code":"read_only_channel"}` — use the headless
+server or the automation bridge for mutations. `session_id` is not needed
+(the channel has no descriptor handshake; a guessed value is stripped).
+Requests run one thread per connection, so a parked `getpoint` never blocks
+other reads; a `getpoint` may park up to 30 minutes before the bridge
+answers `response_timeout`.
+
+**`getpoint`** — `{"prompt"}` is optional (shown on the command line):
+
+```json
+{"ok":true,"status":"completed","result":{"point":[125.5,64.25,0.0]}}
+```
+
+The next left-click in the drawing answers with the same snapped world
+point a command would receive; **Escape** (or `{"op":"cancel"}`) answers
+`{"ok":true,"status":"cancelled","result":{"cancelled":true}}`. While the
+pick is pending, other mutations wait (`busy`), so `status:"running"` on a
+poll means the person has not clicked yet.
+
+**`get_selection` response** — `handle`/`type`/`layer`/`bounds` match the
+`query` output exactly so clients share one parser; `text` is the
+MTEXT-stripped string and `value` the raw one (both `null` for non-text
+entities), and `block`/`position` identify an INSERT's block definition and
+insertion point (`null` otherwise):
+
+```json
+{"ok":true,"status":"completed","result":{"count":2,"entities":[
+  {"handle":"2A","type":"LwPolyline","layer":"CUT","bounds":{"min":[0,0,0],"max":[100,50,0]},"text":null,"value":null,"block":null,"position":null},
+  {"handle":"31","type":"Block Reference","layer":"TITLE","bounds":{"min":[0,0,0],"max":[420,297,0]},
+   "text":null,"value":null,"block":"A3","position":[0,0,0]}]}}
+```
+
+The read is passive — it never changes the selection, and the person can
+keep working while the client polls.
 
 ### Endpoints
 
@@ -280,6 +330,7 @@ curl http://127.0.0.1:8090/api/v1/ready
 | `POST /api/v1/file-identity` | Stable per-document GUID (`{"renew":true}` mints a fresh one). |
 | `POST /api/v1/groups` | Create a named group from handles → **201**. |
 | `POST /api/v1/selection-sets` · `GET /api/v1/selection-sets/{name}` | Save a named selection set → **201**; recall it (`?select=true` also makes it the current selection). |
+| `POST /api/v1/get_selection` | Read-only snapshot of the current selection (see [the GUI-hosted channel](#gui-hosted-rest-channel---http--file) below). |
 | `GET  /api/v1/sysvars?names=a,b` · `POST /api/v1/sysvars` | Read sysvars (`{"get":[…]}` in the body also works) / set them (`{"set":{"ltscale":2.5}}`). |
 | `POST /api/v1/layouts` | Create a layout with default page setup → **201**. |
 | `PUT  /api/v1/layouts/{name}/page-setup` | Write a layout's plot configuration (paper, orientation, fit/scale, center, window, plot style). |
@@ -621,6 +672,30 @@ Named handle sets are **session-scoped** by design (like a held
 and returns the handle list; `load` recalls it and, with `"select":true`
 (the default), also makes the entities the current selection
 (`result.selected` counts). Unknown names are `selection_set_missing`.
+
+### `user_select` — ask the person at the screen to pick entities
+
+```json
+{"protocol":1,"op":"user_select","request_id":"us-1","document_id":1,"type":"CIRCLE","layer":"Equipment","prompt":"Pick the equipment circles","detail":"full","clear":true}
+```
+
+Hands the screen to the person operating the GUI (Editor.GetSelection
+parity): they pick entities with the normal gestures and **Enter confirms,
+Escape cancels**. The operation resolves only after that answer — pollers
+see `status:"running"` the whole time, and every other mutation waits, so
+treat `running` as "the person is still picking", not as a hang. When they
+confirm, `result` carries `cancelled:false`, the picked `handles` and the
+matching `entities` with their attributes (`detail`: `summary`, `geometry`
+or `full` — default `full`, the whole entity object). Escape answers
+`cancelled:true` with empty lists; an immediate Enter with nothing picked
+is an empty answer (ssget semantics).
+
+Optional filters: `type` / `layer` gate the *answer*, not the gestures —
+picks outside the filter are deselected at confirm time and counted in
+`result.ignored`. `prompt` replaces the on-screen instruction, `clear`
+(default `true`) starts from an empty selection, and `detail` controls the
+attribute depth. Requires the desktop GUI (headless `--http`/`--serve`
+sessions answer `gui_required` — there is nobody at a screen to ask).
 
 ### `plot` per-page publishing
 

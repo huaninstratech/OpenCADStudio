@@ -111,6 +111,30 @@ pub(super) struct State {
     pub(super) routing: bool,
     /// Session-scoped named handle sets for selection_set_save/load.
     selection_sets: std::collections::BTreeMap<String, Vec<acadrust::Handle>>,
+    /// Live `user_select` request — the client asked the person at the screen
+    /// to pick entities; Some until that person answers with Enter/Escape.
+    pub(super) user_select: Option<UserSelectSession>,
+    /// Live `getpoint` request — the client asked for one picked point; Some
+    /// until the person clicks (answer) or presses Escape (cancel).
+    pub(super) get_point: Option<UserPointSession>,
+}
+
+/// The pending half of an interactive `user_select` operation (`interactive`
+/// module owns the flow): which request it answers, which document's
+/// selection to read, and the filter the answer must satisfy.
+pub(super) struct UserSelectSession {
+    pub(super) request_id: String,
+    pub(super) document_id: u64,
+    pub(super) type_filter: Option<String>,
+    pub(super) layer_filter: Option<String>,
+    pub(super) detail: String,
+}
+
+/// The pending half of a `getpoint` operation: which request it answers and
+/// which document's viewport the pick must land in.
+pub(super) struct UserPointSession {
+    pub(super) request_id: String,
+    pub(super) document_id: u64,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -129,6 +153,9 @@ struct Operation {
     origin_document: u64,
     geometry_revision: u64,
     result: Value,
+    /// Set when an interactive request (`getpoint`/`user_select`) was answered
+    /// with a cancellation, so the final status reports "cancelled".
+    cancelled: bool,
 }
 fn failure(code: &str, error: impl ToString) -> Value {
     json!({"ok":false,"status":"failed","code":code,"error":error.to_string()})
@@ -401,7 +428,7 @@ impl OpenCADStudio {
             "mtext_editor":self.mtext_editor.as_ref().map(|e|json!({"text":e.content.text(),"height":e.height,"style":e.style})),
             "text_editor":self.text_inline.is_some(),"event_cursor":self.control.serial,
             "operation":self.control.pending.as_ref().map(|p| &p.id),
-            "capabilities":["commands","command_manifest","step_input","batch","compact_results","entity_pick","structure_pick","selection","properties","records","record_schemas","record_filters","atomic_record_updates","layers","history","documents","events","capture","viewport_capture","measure","spatial_query"]
+            "capabilities":["commands","command_manifest","step_input","batch","compact_results","entity_pick","structure_pick","selection","user_select","properties","records","record_schemas","record_filters","atomic_record_updates","layers","history","documents","events","capture","viewport_capture","measure","spatial_query"]
         })
     }
 
@@ -425,6 +452,7 @@ impl OpenCADStudio {
                 | "header"
                 | "history"
                 | "xdata_get"
+                | "get_selection"
         );
         if !query && !self.control.enabled {
             return (
@@ -572,12 +600,38 @@ impl OpenCADStudio {
                 );
             }
             if let Some(p) = &self.control.pending {
-                return (
-                    if p.id == id && p.request == req {
-                        json!({"ok":true,"status":"running","request_id":id})
+                if p.id == id && p.request == req {
+                    return (
+                        json!({"ok":true,"status":"running","request_id":id}),
+                        Task::none(),
+                    );
+                }
+                // An interactive request (`user_select`/`getpoint`) outlives
+                // normal request handling — it only ends when the person
+                // answers. Let a client retract it with `cancel` instead of
+                // waiting for their Escape.
+                let pending_op = p.request["op"].as_str().unwrap_or("").to_owned();
+                let pending_id = p.id.clone();
+                if op == "cancel" && matches!(pending_op.as_str(), "user_select" | "getpoint") {
+                    if pending_op == "getpoint" {
+                        self.resolve_get_point(None);
                     } else {
-                        failure("busy", "Wait for the running operation")
-                    },
+                        self.resolve_user_select(false);
+                    }
+                    let response = self
+                        .control
+                        .completed
+                        .iter()
+                        .find(|(i, _, _)| *i == pending_id)
+                        .map(|(_, _, r)| r.clone());
+                    return (
+                        response
+                            .unwrap_or_else(|| failure("busy", "Wait for the running operation")),
+                        Task::none(),
+                    );
+                }
+                return (
+                    failure("busy", "Wait for the running operation"),
                     Task::none(),
                 );
             }
@@ -601,12 +655,19 @@ impl OpenCADStudio {
                     Task::none(),
                 );
             }
-        } else if !query && !matches!(op, "new" | "open" | "stop") {
-            return (
-                failure("document_required", "Read state and supply document_id"),
-                Task::none(),
-            );
-        }
+            // Interactive requests operate on the active tab by definition, so
+            // a client may omit document_id (the GUI-hosted REST channel does).
+            } else if !query
+                && !matches!(
+                    op,
+                    "new" | "open" | "stop" | "user_select" | "getpoint"
+                )
+            {
+                return (
+                    failure("document_required", "Read state and supply document_id"),
+                    Task::none(),
+                );
+            }
         let tab = &self.tabs[self.active_tab];
         if req["revision"]
             .as_u64()
@@ -628,6 +689,7 @@ impl OpenCADStudio {
                 "properties" => self.control_properties(),
                 "measure" => self.control_measure(&req),
                 "xdata_get" => self.xdata_read(&req),
+                "get_selection" => self.control_get_selection(),
                 "history" => {
                     json!({"ok":true,"entries":self.command_line.history.iter().map(|e|json!({"kind":format!("{:?}",e.kind),"text":e.text})).collect::<Vec<_>>()})
                 }
@@ -683,6 +745,7 @@ impl OpenCADStudio {
             origin_document: tab.id,
             geometry_revision: tab.scene.geometry_epoch,
             result: json!({}),
+            cancelled: false,
         });
         self.control.routing = true;
         let action = self.control_action(&req);
@@ -711,7 +774,12 @@ impl OpenCADStudio {
         self.finish_all_pending_history();
         let task = self.control_track(task);
         if let Some(p) = self.control.pending.as_mut() {
-            p.pending -= 1;
+            // Interactive requests hold their slot open on purpose: the
+            // counter stays at one so settle keeps returning `running` until
+            // the person at the screen answers and the resolver zeroes it.
+            if !matches!(p.request["op"].as_str(), Some("user_select" | "getpoint")) {
+                p.pending -= 1;
+            }
         }
         self.control_settle();
         let response = self
@@ -875,6 +943,8 @@ impl OpenCADStudio {
             "group_create" => self.control_group_create(req)?,
             "selection_set_save" => self.control_selection_set_save(req)?,
             "selection_set_load" => self.control_selection_set_load(req)?,
+            "user_select" => self.control_user_select(req)?,
+            "getpoint" => self.control_getpoint(req)?,
             "close" => self.control_close(req)?,
             "sysvar" => self.control_sysvar(req)?,
             "layout_create" => self.control_layout_create(req)?,
@@ -1037,7 +1107,7 @@ impl OpenCADStudio {
         }
         let status = if failed {
             "failed"
-        } else if p.request["op"] == "cancel" {
+        } else if p.cancelled || p.request["op"] == "cancel" {
             "cancelled"
         } else if waiting {
             "waiting_input"
@@ -1192,6 +1262,8 @@ impl OpenCADStudio {
 }
 mod actions;
 mod entities;
+pub(crate) mod http_bridge;
+mod interactive;
 mod sheets;
 
 #[cfg(test)]
@@ -1573,5 +1645,188 @@ mod tests {
         assert_eq!(ole_count(&app), 0);
         let _ = std::fs::remove_file(path);
         let _ = handle;
+    }
+
+    fn user_select_pick(app: &mut OpenCADStudio, kind: &str) -> String {
+        let handle = app.automation_op(
+            format!(r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#).as_str(),
+        )["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let value = u64::from_str_radix(&handle, 16).unwrap();
+        app.tabs[app.active_tab]
+            .scene
+            .select_entity(acadrust::Handle::new(value), false);
+        handle
+    }
+
+    fn user_select_result(app: &mut OpenCADStudio, request_id: &str) -> Value {
+        app.control_request(json!({"op":"operation","request_id":request_id}))
+            .0
+    }
+
+    #[test]
+    fn user_select_stays_running_until_the_user_confirms_then_returns_entities() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        assert_eq!(request(&mut app, json!({"op":"new"}))["status"], "completed");
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        let asked = request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-1","type":"LINE"}),
+        );
+        assert_eq!(asked["status"], "running", "{asked}");
+        // A second request waits like any other mutation while one is open.
+        let busy = request(&mut app, json!({"op":"user_select","request_id":"us-2"}));
+        assert_eq!(busy["code"], "busy", "{busy}");
+        // The person picks the line in the viewport and presses Enter.
+        let handle = user_select_pick(&mut app, "LINE");
+        app.update(Message::CommandFinalize);
+        let done = user_select_result(&mut app, "us-1");
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["cancelled"], false);
+        assert_eq!(done["result"]["count"], 1);
+        assert_eq!(done["result"]["handles"][0], json!(handle));
+        assert_eq!(done["result"]["entities"][0]["type"], "Line");
+        // detail defaults to full, so the whole entity object rides along.
+        assert!(
+            done["result"]["entities"][0]["properties"].is_object(),
+            "{done}"
+        );
+    }
+
+    #[test]
+    fn user_select_filter_deselects_entities_outside_the_request() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        request(&mut app, json!({"op":"run","cmd":"CIRCLE 0,0 5"}));
+        request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-f","type":"CIRCLE"}),
+        );
+        user_select_pick(&mut app, "LINE");
+        user_select_pick(&mut app, "CIRCLE");
+        app.update(Message::CommandFinalize);
+        let done = user_select_result(&mut app, "us-f");
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["count"], 1);
+        assert_eq!(done["result"]["ignored"], 1);
+        assert_eq!(done["result"]["entities"][0]["type"], "Circle");
+        // The filtered-out pick is deselected in the drawing too.
+        assert_eq!(
+            app.tabs[app.active_tab]
+                .scene
+                .selected_handles_in_order()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn user_select_escape_cancels_and_an_empty_enter_confirms_zero() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        request(&mut app, json!({"op":"user_select","request_id":"us-x"}));
+        app.update(Message::CommandEscape);
+        let cancelled = user_select_result(&mut app, "us-x");
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        assert_eq!(cancelled["result"]["cancelled"], true);
+        assert_eq!(cancelled["result"]["count"], 0);
+        // ssget semantics: an immediate Enter with nothing picked answers the
+        // request with an empty set rather than hanging forever.
+        request(&mut app, json!({"op":"user_select","request_id":"us-e"}));
+        app.update(Message::CommandFinalize);
+        let empty = user_select_result(&mut app, "us-e");
+        assert_eq!(empty["result"]["cancelled"], false, "{empty}");
+        assert_eq!(empty["result"]["count"], 0);
+        // A client can also retract its own request programmatically.
+        request(&mut app, json!({"op":"user_select","request_id":"us-c"}));
+        let retracted = request(&mut app, json!({"op":"cancel","request_id":"us-c-x"}));
+        assert_eq!(retracted["status"], "cancelled", "{retracted}");
+        assert_eq!(retracted["result"]["cancelled"], true, "{retracted}");
+    }
+
+    #[test]
+    fn user_select_requires_a_gui_window() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let reply = request(&mut app, json!({"op":"user_select","request_id":"us-h"}));
+        assert_eq!(reply["code"], "gui_required", "{reply}");
+    }
+
+    #[test]
+    fn getpoint_resolves_with_the_clicked_point_and_esc_cancels() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        let asked = request(
+            &mut app,
+            json!({"op":"getpoint","request_id":"gp-1","prompt":"Chọn vị trí QR"}),
+        );
+        assert_eq!(asked["status"], "running", "{asked}");
+        // While the pick is pending, everything else waits.
+        let busy = request(&mut app, json!({"op":"getpoint","request_id":"gp-2"}));
+        assert_eq!(busy["code"], "busy", "{busy}");
+        // The person clicks: the snapped world point under the cursor is the
+        // answer, and the click leaves the selection untouched.
+        app.tabs[app.active_tab].last_cursor_world = glam::DVec3::new(125.5, 64.25, 0.0);
+        app.update(Message::ViewportLeftPress);
+        let done = user_select_result(&mut app, "gp-1");
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["point"], json!([125.5, 64.25, 0.0]));
+        // Escape with no request pending is still just Escape.
+        let _ = app.update(Message::CommandEscape);
+        // A second pick parks again and cancels on Escape.
+        request(&mut app, json!({"op":"getpoint","request_id":"gp-3"}));
+        app.update(Message::CommandEscape);
+        let cancelled = user_select_result(&mut app, "gp-3");
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        assert_eq!(cancelled["result"]["cancelled"], true);
+    }
+
+    #[test]
+    fn get_selection_reports_insert_block_and_position() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        let line = app.automation_op(r#"{"op":"query","type":"LINE","detail":"summary"}"#)
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // A title-block-style definition with one placed reference.
+        request(
+            &mut app,
+            json!({"op":"block_define","name":"A3","base":[0,0],"handles":[line]}),
+        );
+        let insert = app.automation_op(r#"{"op":"query","type":"Insert","detail":"summary"}"#)
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        app.automation_op(&format!(r#"{{"op":"select","handles":["{insert}"]}}"#));
+        let read = request(&mut app, json!({"op":"get_selection"}));
+        assert_eq!(read["status"], "completed", "{read}");
+        assert_eq!(read["result"]["count"], 1);
+        let entity = &read["result"]["entities"][0];
+        assert_eq!(entity["type"], "Block Reference");
+        assert_eq!(entity["block"], "A3");
+        assert!(entity["position"].is_array(), "{entity}");
+        // Non-inserts answer null for the block field.
+        app.tabs[app.active_tab].scene.deselect_all();
+        let circle = request(
+            &mut app,
+            json!({"op":"entities_create","entities":[{"type":"Circle","center":[0,0],"radius":2}]}),
+        );
+        let circle_handle = circle["result"]["handles"][0].as_str().unwrap().to_owned();
+        app.automation_op(&format!(r#"{{"op":"select","handles":["{circle_handle}"]}}"#));
+        let read = request(&mut app, json!({"op":"get_selection"}));
+        assert_eq!(read["result"]["count"], 1);
+        assert_eq!(read["result"]["entities"][0]["block"], Value::Null);
     }
 }

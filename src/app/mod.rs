@@ -1,6 +1,6 @@
 mod alias;
 mod automation;
-mod control;
+pub(crate) mod control;
 pub(crate) fn automation_action_names() -> &'static [&'static str] {
     control::action_names()
 }
@@ -390,9 +390,6 @@ pub(super) struct OpenCADStudio {
     /// mid-edit; applied on Enter). Kept in sync when the +/- buttons change it.
     recent_limit_input: String,
     command_line: CommandLine,
-    /// Recent Patreon supporters shown on the Start page (name, USD cents),
-    /// fetched once at boot, highest payment first.
-    patrons: Vec<(String, i64)>,
     /// Tutorial-playlist videos for the Start page: seeded from the on-disk
     /// cache at boot, refreshed by a live playlist fetch.
     videos: Vec<crate::videos::VideoEntry>,
@@ -931,7 +928,6 @@ pub(super) struct OpenCADStudio {
     font_source_url: String,
     /// Editable copy of `font_source_url` shown in the missing-fonts prompt.
     font_source_input: String,
-    donation_prompt_version: String,
     /// Read-only session (`--read-only`): editing is allowed but every save
     /// path is refused. Set once at boot from the CLI config.
     read_only: bool,
@@ -1829,7 +1825,6 @@ pub enum ModalKind {
     Shortcuts,
     PluginManager,
     UpdateNotice,
-    DonationPrompt,
     Layers,
     LayerStateManager,
     LayerTranslator,
@@ -3226,8 +3221,6 @@ pub enum Message {
     PluginRegistryErrorDetailsToggle,
     /// Copy registry URL, platform, version, and raw error details.
     PluginRegistryCopyDiagnostics,
-    /// Patreon supporters fetched at boot for the Start page (name, USD cents).
-    PatronsFetched(Result<Vec<(String, i64)>, String>),
     /// Tutorial-playlist videos fetched at boot for the Start page.
     VideosFetched(Result<Vec<crate::videos::VideoEntry>, String>),
     /// GitHub Discussions fetched at boot for the Start page.
@@ -3407,7 +3400,6 @@ pub enum Message {
     UpdateCheckResult(Option<crate::io::update_check::UpdateInfo>),
     /// User dismissed the update-notice window.
     UpdateNoticeClose,
-    DonationPromptDonate,
     /// First-launch default-association prompt: user accepted — register this
     /// app as the default handler for .dwg / .dxf.
     AssocPromptYes,
@@ -3821,7 +3813,6 @@ impl OpenCADStudio {
             recent_limit: recent::RECENT_DEFAULT,
             recent_limit_input: recent::RECENT_DEFAULT.to_string(),
             command_line: CommandLine::new(),
-            patrons: Vec::new(),
             videos: Vec::new(),
             video_thumbs: std::collections::HashMap::new(),
             videos_loading: false,
@@ -4055,7 +4046,6 @@ impl OpenCADStudio {
             check_missing_fonts: true,
             font_source_url: String::new(),
             font_source_input: String::new(),
-            donation_prompt_version: String::new(),
             read_only: false,
             update_notice_version: None,
             update_notice_body: None,
@@ -4466,14 +4456,6 @@ impl OpenCADStudio {
             )
         };
         s.queue_startup_prompts();
-        // Fetch the Patreon supporters list once at boot for the Start page.
-        #[cfg(not(target_arch = "wasm32"))]
-        let patrons_fetch = Task::perform(
-            async { crate::patreon::fetch_patrons() },
-            Message::PatronsFetched,
-        );
-        #[cfg(target_arch = "wasm32")]
-        let patrons_fetch = Task::none();
         // Tutorial videos: show the on-disk cache instantly, refresh from the
         // live playlist in the background. Nothing ships in the binary. The
         // fetch runs on its own OS thread — its several sequential HTTP
@@ -4528,7 +4510,6 @@ impl OpenCADStudio {
                 focus_cmd,
                 cli_open,
                 script,
-                patrons_fetch,
                 videos_fetch,
                 discussions_fetch,
                 thumbs_fetch,
@@ -4551,9 +4532,6 @@ impl OpenCADStudio {
             Task::done(Message::PollWebFonts),
             Task::done(Message::ApplyWebFont(primary_font)),
         ]);
-        // Web can't reach the Patreon API directly (CORS); fetch the CI-built
-        // supporters.json served on the same origin instead.
-        let patrons = Task::perform(crate::patreon::fetch_patrons_web(), Message::PatronsFetched);
         s.videos_loading = true;
         let videos = Task::perform(crate::videos::fetch_playlist_web(), Message::VideosFetched);
         s.discussions_loading = true;
@@ -4564,7 +4542,7 @@ impl OpenCADStudio {
         let thumbs_fetch = s.refresh_recent_thumbs();
         (
             s,
-            Task::batch([focus, fonts, patrons, videos, discussions, thumbs_fetch]),
+            Task::batch([focus, fonts, videos, discussions, thumbs_fetch]),
         )
     }
 }

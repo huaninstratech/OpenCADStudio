@@ -22,7 +22,7 @@ const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_REQUEST: usize = 1_048_576;
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 3_600_000;
-const INSTRUCTIONS: &str = "Call ocs_sessions, then pass its session_id as ocs_session_id to ocs_read, ocs_execute and ocs_capture. Read capabilities to discover the complete CAD automation surface. Call record_schema to discover every record type, property path, JSON type, enum, unit, constraint and write rule before editing unfamiliar data. Use records to inspect every serializable entity, object, table, header and document record; filter with RFC 6901 JSON Pointer paths. Use set_properties for atomic, type-checked record edits and preserve document_id, revision and request_id. Use commands with parameters.name for a command manifest. Use batch when several steps are known, and request changed_entities when resulting geometry is needed. For interactive work, call start and follow state.command.accepts, options and input_example. A run.cmd contains the command name followed by prompt answers separated by spaces; points use x,y or x,y,z. After a timeout, query the existing operation and never replay a mutation with a new request_id. waiting_input and running are not completion. Let OCS and its geometry kernel calculate geometry; use query near, contains_point and intersections for exact relationships. Verify important results with queries and a viewport capture, and save only to an explicit path.";
+const INSTRUCTIONS: &str = "Call ocs_sessions, then pass its session_id as ocs_session_id to ocs_read, ocs_execute and ocs_capture. Read capabilities to discover the complete CAD automation surface. Call record_schema to discover every record type, property path, JSON type, enum, unit, constraint and write rule before editing unfamiliar data. Use records to inspect every serializable entity, object, table, header and document record; filter with RFC 6901 JSON Pointer paths. Use set_properties for atomic, type-checked record edits and preserve document_id, revision and request_id. Use commands with parameters.name for a command manifest. Use batch when several steps are known, and request changed_entities when resulting geometry is needed. For interactive work, call start and follow state.command.accepts, options and input_example. To have the person at the screen pick entities for you, call user_select and keep polling until it completes; running means they are still picking. A run.cmd contains the command name followed by prompt answers separated by spaces; points use x,y or x,y,z. After a timeout, query the existing operation and never replay a mutation with a new request_id. waiting_input and running are not completion. Let OCS and its geometry kernel calculate geometry; use query near, contains_point and intersections for exact relationships. Verify important results with queries and a viewport capture, and save only to an explicit path.";
 const READ_OPS: &[&str] = &[
     "state",
     "hello",
@@ -69,6 +69,8 @@ const EXECUTE_OPS: &[&str] = &[
     "group_create",
     "selection_set_save",
     "selection_set_load",
+    "user_select",
+    "getpoint",
     "close",
     "sysvar",
     "layout_create",
@@ -106,6 +108,8 @@ const BATCH_STEP_OPS: &[&str] = &[
     "group_create",
     "selection_set_save",
     "selection_set_load",
+    "user_select",
+    "getpoint",
     "close",
     "sysvar",
     "layout_create",
@@ -1126,6 +1130,8 @@ fn execute_request_schema() -> Value {
             {"properties":{"op":{"const":"group_create"}},"required":["name","handles"]},
             {"properties":{"op":{"const":"selection_set_save"}},"required":["name","handles"]},
             {"properties":{"op":{"const":"selection_set_load"}},"required":["name"]},
+            {"properties":{"op":{"const":"user_select"},"description":"Ask the person at the screen to pick entities; resolves when they press Enter (or cancel on Escape). Optional type/layer/prompt/detail/clear."}},
+            {"properties":{"op":{"const":"getpoint"},"description":"Ask the person at the screen to pick one point; resolves with the picked point when they click, or cancels on Escape. Optional prompt."}},
             {"properties":{"op":{"const":"close"}}},
             {"properties":{"op":{"const":"sysvar"}}},
             {"properties":{"op":{"const":"layout_create"}},"required":["name"]},
@@ -1182,7 +1188,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name":"ocs_execute",
-            "description":"Execute semantic OCS actions. Use current state fields and a unique request_id. Use run for one complete command, batch to remove round trips, or start plus input for guided steps. accepted, running and waiting_input are not completion.",
+            "description":"Execute semantic OCS actions. Use current state fields and a unique request_id. Use run for one complete command, batch to remove round trips, or start plus input for guided steps. user_select asks the person at the screen to pick entities and stays running until they press Enter (answer with entities) or Escape (cancelled). accepted, running and waiting_input are not completion.",
             "inputSchema":{"type":"object","properties":{"ocs_session_id":{"type":"string","minLength":1,"description":"Value of session_id returned by ocs_sessions."},"request":execute_request_schema(),"wait_seconds":{"type":"number","minimum":0,"maximum":60,"default":30,"description":"Total time to wait for completion before returning."},"response_detail":{"type":"string","enum":["compact","changed_entities","full"],"default":"compact","description":"compact returns only state needed for the next edit; changed_entities also returns current geometry for changed handles; full preserves the complete editor state."}},"required":["ocs_session_id","request"],"additionalProperties":false},
             "outputSchema":execute_output_schema(),
             "annotations":{"title":"Execute OCS action","readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false}

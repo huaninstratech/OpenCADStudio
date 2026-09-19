@@ -37,7 +37,18 @@ const ENVELOPE_OPS: &[&str] = &[
     "set_properties",
     "property",
     "activate",
+    "get_selection",
+    "getpoint",
 ];
+
+/// Loopback REST channel hosted by the GUI process: `OpenCADStudio.exe
+/// "<file>" --http <port>` boots the editor with a bridge that forwards
+/// requests into the live app (see `app::control::http_bridge`), so a client
+/// can read what the person at the screen selected. `--http` without files
+/// keeps the headless server above.
+pub fn set_gui_http_port(port: u16) {
+    crate::app::control::http_bridge::set_gui_http_port(port);
+}
 
 /// Failure codes worth one state refresh + retry (the request never started).
 const RETRYABLE: &[&str] = &[
@@ -53,9 +64,9 @@ pub fn serve(port: u16) {
     listen(&mut app, port);
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
     query: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -68,7 +79,7 @@ impl HttpRequest {
             .map(|(_, v)| v.as_str())
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
@@ -101,7 +112,7 @@ fn listen(app: &mut OpenCADStudio, port: u16) {
 }
 
 /// Parse one HTTP/1.1 request. `Ok(None)` = the peer hung up cleanly.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<HttpRequest>> {
+pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<HttpRequest>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -183,7 +194,7 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, body: &Value) -> std::io::Result<()> {
+pub(crate) fn write_response(stream: &mut TcpStream, status: u16, body: &Value) -> std::io::Result<()> {
     let body = if body.is_null() {
         Vec::new()
     } else {
@@ -194,6 +205,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &Value) -> std::io:
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -555,7 +567,7 @@ fn fetch_state(app: &mut OpenCADStudio) -> Option<u64> {
 /// ok:true → 200 (the caller may upgrade to 201 for resource creation);
 /// failures map to the closest HTTP status so ordinary clients can branch
 /// on the status code, with the symbolic `code` preserved in the body.
-fn map_status(response: Value, created: bool) -> u16 {
+pub(crate) fn map_status(response: Value, created: bool) -> u16 {
     if response["ok"] == true {
         return if created { 201 } else { 200 };
     }
@@ -596,6 +608,64 @@ mod tests {
         assert_eq!(map_status(json!({"ok": false, "code": "stale_state"}), false), 409);
         assert_eq!(map_status(json!({"ok": false, "code": "busy"}), false), 503);
         assert_eq!(map_status(json!({"ok": false, "code": "invalid_point"}), false), 400);
+    }
+
+    #[test]
+    fn get_selection_reports_selected_entities_read_only() {
+        let mut app = OpenCADStudio::new();
+        let mut document_id: Option<u64> = None;
+        let mut counter: u64 = 0;
+        let (_, body) = route(
+            &mut app,
+            &request(
+                "POST",
+                "/api/v1/entities",
+                r#"{"entities":[
+                    {"type":"Line","start":[0,0],"end":[10,0]},
+                    {"type":"Text","value":"PAGE-01","position":[1,1],"height":2.5}
+                ]}"#,
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        let handles = body["result"]["handles"].as_array().unwrap().clone();
+        assert_eq!(handles.len(), 2);
+
+        // The person "picks" the line and the text; the read mirrors the
+        // selection order and matches the `query` field formats.
+        app.automation_op(&format!(
+            r#"{{"op":"select","handles":["{}","{}"]}}"#,
+            handles[0].as_str().unwrap(),
+            handles[1].as_str().unwrap()
+        ));
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/get_selection", "{}"),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["result"]["count"], 2);
+        assert_eq!(
+            body["result"]["entities"][0]["handle"],
+            handles[0].as_str().unwrap()
+        );
+        assert_eq!(body["result"]["entities"][0]["type"], "Line");
+        assert_eq!(body["result"]["entities"][0]["text"], Value::Null);
+        let sample = &body["result"]["entities"][1];
+        assert_eq!(sample["type"], "Text");
+        assert_eq!(sample["text"], "PAGE-01");
+        assert_eq!(sample["value"], "PAGE-01");
+        assert!(sample["bounds"].is_object(), "{sample}");
+        // A second read is identical — the read is passive.
+        let (_, again) = route(
+            &mut app,
+            &request("POST", "/api/v1/get_selection", "{}"),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(again, body);
     }
 
     #[test]

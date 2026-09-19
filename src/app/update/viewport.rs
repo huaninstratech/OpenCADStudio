@@ -3104,6 +3104,22 @@ impl OpenCADStudio {
                 return Task::none();
             }
         }
+        // A pending client `getpoint` request turns this click into the
+        // answer: the snapped world point under the cursor. The pick must
+        // not change the selection while the person is answering, and only
+        // the pinned document's viewport may answer.
+        if self.tabs[i].active_cmd.is_none() {
+            let answers = self
+                .control
+                .get_point
+                .as_ref()
+                .is_some_and(|session| session.document_id == self.tabs[i].id);
+            if answers {
+                let world = self.tabs[i].last_cursor_world;
+                self.resolve_get_point(Some([world.x, world.y, world.z]));
+                return Task::none();
+            }
+        }
         let (p, vp_size) = {
             let sel = self.tabs[i].scene.selection.borrow();
             let p = match sel.last_move_pos {

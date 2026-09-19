@@ -585,7 +585,6 @@ impl OpenCADStudio {
             default_assoc_prompted: self.default_assoc_prompted,
             check_missing_fonts: self.check_missing_fonts,
             font_source_url: self.font_source_url.clone(),
-            donation_prompt_version: self.donation_prompt_version.clone(),
             gpu_warning_silenced: self.gpu_warning_silenced.clone(),
             disabled_plugins: {
                 let mut v: Vec<String> = self.disabled_plugins.iter().cloned().collect();
@@ -682,7 +681,6 @@ impl OpenCADStudio {
         self.check_missing_fonts = s.check_missing_fonts;
         self.font_source_url = s.font_source_url.clone();
         self.font_source_input = s.font_source_url.clone();
-        self.donation_prompt_version = s.donation_prompt_version.clone();
         self.gpu_warning_silenced = s.gpu_warning_silenced.clone();
         self.disabled_plugins = s.disabled_plugins.iter().cloned().collect();
         self.plugin_repos = s.plugin_repos.clone();
@@ -3595,10 +3593,11 @@ impl OpenCADStudio {
             }
         };
         let worker_path = path.clone();
+        let fallback_style = self.dialog_plot_style(&dialog);
         self.save_config();
         self.close_active_modal();
         let work = move || {
-            crate::io::pdf_export::export_pdf_pages(&pages, &worker_path, None)
+            crate::io::pdf_export::export_pdf_pages(&pages, &worker_path, fallback_style.as_ref())
                 .map(|_| {
                     crate::tf!(
                         "Exported {} layouts to {}",
@@ -3637,13 +3636,14 @@ impl OpenCADStudio {
                 }
             };
             let options = self.plot_print_options(&dialog);
+            let fallback_style = self.dialog_plot_style(&dialog);
             let temp_path = crate::io::print_to_printer::temp_pdf_path("print_all");
             self.save_config();
             self.close_active_modal();
             self.command_line
                 .push_info(crate::t!("Sending selected layouts to the system printer…").as_ref());
             let work = move || {
-                crate::io::pdf_export::export_pdf_pages(&pages, &temp_path, None)
+                crate::io::pdf_export::export_pdf_pages(&pages, &temp_path, fallback_style.as_ref())
                     .and_then(|_| {
                         crate::io::print_to_printer::print_existing_pdf(&temp_path, &options)
                     })

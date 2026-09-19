@@ -143,7 +143,7 @@ fn v3(v: acadrust::types::Vector3) -> Value {
     json!([v.x, v.y, v.z])
 }
 
-fn entity_type_matches(entity: &acadrust::EntityType, requested: &str) -> bool {
+pub(crate) fn entity_type_matches(entity: &acadrust::EntityType, requested: &str) -> bool {
     if crate::entities::names::ui_name(entity).eq_ignore_ascii_case(requested) {
         return true;
     }
@@ -153,7 +153,7 @@ fn entity_type_matches(entity: &acadrust::EntityType, requested: &str) -> bool {
 
 /// One entity as JSON. Summary mode carries identity only, geometry adds the
 /// entity's defining values, and full also includes its world bounds.
-fn entity_json(e: &acadrust::EntityType, detail: &str) -> Value {
+pub(crate) fn entity_json(e: &acadrust::EntityType, detail: &str) -> Value {
     use acadrust::EntityType as E;
     let c = e.common();
     let mut obj = json!({
@@ -1787,7 +1787,6 @@ mod tests {
             .expect("the start_allowed gate moved — re-point this test");
         // Welcome-page links plus app-wide configuration commands.
         let standalone = [
-            "DONATE",
             "REPORT",
             "WEBVERSION",
             "ABOUT",

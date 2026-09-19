@@ -60,14 +60,6 @@ fn ensure_draw_order_table(
 impl OpenCADStudio {
     pub(crate) fn dispatch_view(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         match cmd {
-            "DONATE" => {
-                self.command_line.push_info(crate::t!("Opening Patreon page...").as_ref());
-                return Some(crate::sys::open_url(
-                    "https://patreon.com/HakanSeven12",
-                    self.main_window,
-                ));
-            }
-
             "WEBVERSION" => {
                 self.command_line.push_info(crate::t!("Opening OCS Web...").as_ref());
                 return Some(crate::sys::open_url(
