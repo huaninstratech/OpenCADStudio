@@ -122,7 +122,7 @@ ops against a held `revision`. No work proposed.
 | .NET API | OpenCAD status |
 |---|---|
 | `Database.WblockCloneObjects` to file / `Database.SaveAs` | Exists — `wblock`, `save` (dwg/dxf). |
-| Raster image attach (`RasterImageDef`/`RasterImage`, Catalog §5) | Exists — `embed_image` (embedded OLE2FRAME default, `"linked":true` path-linked). **Proposed P1** — image placement inside block definitions (Catalog §5.2/5.3) once `block_define` ships. |
+| Raster image attach (`RasterImageDef`/`RasterImage`, Catalog §5) | Exists — `embed_image`: the default embeds the bytes as a self-contained OLE2FRAME (no path to lose — the SPM QR flow should stay on it; broken-by-file-loss is impossible), `"linked":true` keeps a path-linked `RasterImage` for swappable images. Legacy linked images can break; the §5.3 re-link (`FindAndChangeRasterImagePath`) maps onto a composition: read the entity's `file_path`/`bounds` via query/records → `entities_delete` → re-`embed_image` (embedded) at the old extents. Image inside a block definition (Catalog §5.2) composes today as `embed_image` → `block_define` over the image handle (the CF-05.6 flow); a direct into-BTR op stays **P2**. |
 | Transmittal (eTransmit) | **P2** — a packaging op only if a client needs it; clients can zip `wblock` outputs themselves. |
 | Format conversion | Exists — `--export IN OUT` (dwg/dxf) headless. |
 

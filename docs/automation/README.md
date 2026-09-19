@@ -190,6 +190,34 @@ Explicitly supplied fields override a layout's stored page setup; unspecified fi
 
 Places the picture at `at:[x,y]` with `width` in drawing units (default ≈ pixels/100). The default embeds the raster into the drawing as a self-contained OLE2FRAME (`"kind":"Ole2Frame"`). `"linked":true` stores a `RasterImage` + `ImageDefinition` referencing the file path instead (`"kind":"RasterImage"`) — the image file must then travel with the drawing.
 
+#### Embedded vs linked — when images can "break"
+
+The embedded default carries the image bytes **inside** the DWG. There is no
+path to lose, so the classic broken-image failure (PNG moved, renamed or
+deleted after placing) cannot happen: the drawing renders the same on any
+machine, and embedded images travel normally through `block_define`,
+`wblock` and `entities_copy_to` like any other entity. Barcode/QR placement
+(the SPM flow: attach → wrap into a block → plot → clone) should stay on
+this default. Two deliberate trade-offs: the DWG grows by the image's file
+size, and the picture never updates when the source PNG changes — which is
+exactly what self-contained means.
+
+`"linked":true` keeps the path and therefore keeps the failure mode. It
+exists for images that must be swappable without touching the drawing.
+Legacy SPM.ACAD files arrive with linked QR images, so a broken one is
+still possible there; repair is a three-step composition, no dedicated op
+needed:
+
+1. Find it: `query` with `type:"RasterImage"` (or the `records` op) —
+   `detail:"full"` exposes the definition path and the entity `bounds`.
+2. Erase the broken reference by handle (`entities_delete`).
+3. Re-place a fresh `embed_image` (embedded, so it cannot break again) at
+   the same `at`/`width` read from the old `bounds`.
+
+An image inside a block definition is reached the same way after opening
+the block's content — SPM's `FindAndChangeRasterImagePath` (Catalog §5.3)
+maps onto these three steps rather than a native op.
+
 ### Text content and bounds
 
 `query` entities of type `TEXT`/`MTEXT` return the raw stored string in `value` plus a formatting-free rendering in `text` (MTEXT inline codes such as `\A1;` or `\P` are resolved; `%%d`-style TEXT codes become their glyphs). With `detail:"full"`, degenerate-width text bounds are widened with a documented estimate (height × 0.8 × character count) so `bounds`-based region filters stay usable.
