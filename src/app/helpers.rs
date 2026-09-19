@@ -665,6 +665,7 @@ mod grid_axes_tests {
         assert!(close(gz, Z));
     }
 }
+#[cfg(test)]
 mod ucs_from_normal_tests {
     use super::ucs_from_normal;
     use glam::DVec3;
