@@ -1721,6 +1721,71 @@ mod tests {
         assert!(bytes.len() > 200, "suspiciously small: {}", bytes.len());
     }
 
+    /// Everything searchable in the exported file: the raw bytes (printpdf
+    /// leaves small content streams uncompressed) plus any zlib streams that
+    /// decode to mostly-printable text, so the assertions hold either way.
+    fn pdf_stream_text(bytes: &[u8]) -> String {
+        use std::io::Read as _;
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        for start in 0..bytes.len().saturating_sub(2) {
+            // zlib streams start with a 2-byte header: deflate method, valid check.
+            let (cmf, flg) = (bytes[start], bytes[start + 1]);
+            if cmf & 0x0f != 8 || ((cmf as u16) << 8 | flg as u16) % 31 != 0 {
+                continue;
+            }
+            let mut decoded = Vec::new();
+            if flate2::read::ZlibDecoder::new(&bytes[start..])
+                .read_to_end(&mut decoded)
+                .is_ok()
+                && decoded.len() > 32
+            {
+                let printable = decoded
+                    .iter()
+                    .filter(|&&b| matches!(b, b'\n' | b'\r' | b'\t' | 32..=126))
+                    .count();
+                if printable * 10 >= decoded.len() * 9 {
+                    text.push_str(&String::from_utf8_lossy(&decoded));
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn export_fallback_plot_style_recolors_wires() {
+        // ACI 1 carrying pure device red: without a style it must export as an
+        // RGB operator; the monochrome fallback must recolor it. Guards the
+        // automation plot path, where the per-page style can be dropped.
+        let make_page = || {
+            let mut wire = PlotWire {
+                wire: WireModel::solid(
+                    "test".into(),
+                    vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                    [1.0, 0.0, 0.0, 1.0],
+                    false,
+                ),
+                draw_depth: 0.0,
+            };
+            wire.wire.aci = 1;
+            test_page(vec![wire])
+        };
+
+        let unstyled = pdf_stream_text(&build_pdf_pages(&[make_page()], None).unwrap());
+        let monochrome =
+            PlotStyleTable::builtin("monochrome.ctb").expect("shipped monochrome.ctb parses");
+        let styled =
+            pdf_stream_text(&build_pdf_pages(&[make_page()], Some(&monochrome)).unwrap());
+
+        assert!(
+            unstyled.contains("1 0 0 rg") || unstyled.contains("1 0 0 RG"),
+            "unstyled export should keep the wire's RGB color"
+        );
+        assert!(
+            !styled.contains("1 0 0 rg") && !styled.contains("1 0 0 RG"),
+            "monochrome fallback must recolor the wire"
+        );
+    }
+
     // Build a WireModel carrying the SDF glyph quads for `text` in the embedded
     // "txt" stroke font, laid out into the process-wide atlas emit_text reads.
     fn text_wire(text: &str, origin: [f64; 3]) -> PlotWire {

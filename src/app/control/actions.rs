@@ -492,15 +492,26 @@ impl OpenCADStudio {
                     .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
                     .collect();
                 let file = format!("{stem}-{safe}.pdf");
-                crate::io::pdf_export::export_pdf(page, std::path::Path::new(&file))
-                    .map_err(|e| failure("plot_failed", e))?;
+                crate::io::pdf_export::export_pdf_pages(
+                    std::slice::from_ref(page),
+                    std::path::Path::new(&file),
+                    loaded_style.as_ref(),
+                )
+                .map_err(|e| failure("plot_failed", e))?;
                 files.push(json!({"layout": name, "path": file}));
             }
             self.set_control_result(json!({ "files": files, "pages": pages.len() }));
             return Ok(Task::none());
         }
-        crate::io::pdf_export::export_pdf_pages(&pages, std::path::Path::new(path), None)
-            .map_err(|e| failure("plot_failed", e))?;
+        // Pages may drop the style when a stored page setup overwrites the
+        // dialog's style fields, so the explicit request style rides along as
+        // the export-level fallback.
+        crate::io::pdf_export::export_pdf_pages(
+            &pages,
+            std::path::Path::new(path),
+            loaded_style.as_ref(),
+        )
+        .map_err(|e| failure("plot_failed", e))?;
         self.set_control_result(json!({
             "path": path,
             "pages": pages.len(),
