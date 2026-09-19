@@ -35,3 +35,7 @@ __pycache__/
 
 # Claude Code local preview/dev-server config
 .claude/launch.json
+
+# Local AI-tool session state (never commit)
+.claude/
+.zcode/
