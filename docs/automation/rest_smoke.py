@@ -229,7 +229,8 @@ def main() -> None:
         status, query = call(port, "GET", "/entities?type=Line")
         expect(query["count"] == 2, f"lines copied into the second document: {query}")
 
-        # 13. Groups and selection sets over the second document.
+        # 13. Groups, selection sets, block replace/delete and a stable file
+        # identity over the second document.
         all_lines = [entity["handle"] for entity in query["entities"]]
         status, group = call(port, "POST", "/groups", {
             "name": "SMOKE-GROUP", "handles": all_lines,
@@ -243,6 +244,29 @@ def main() -> None:
         expect(len(recalled["result"]["handles"]) == 2, f"selection set load: {recalled}")
         status, selected = call(port, "GET", "/selection-sets/smoke-set?select=true")
         expect(selected["result"]["selected"] == 2, f"selection set select: {selected}")
+        status, identity = call(port, "POST", "/file-identity", {})
+        expect(status == 200 and len(identity["result"]["identity"]) == 36,
+               f"file identity: {identity}")
+        status, again = call(port, "POST", "/file-identity", {})
+        expect(again["result"]["identity"] == identity["result"]["identity"],
+               "file identity stable")
+        status, block = call(port, "POST", "/blocks", {
+            "name": "MARK", "base": [0, 0, 0], "handles": all_lines,
+        })
+        expect(status == 201, f"block define: {block}")
+        # The define consumed the source lines; replace wraps fresh content
+        # (SPM re-import draws new content and blocks it under the barcode).
+        status, fresh = call(port, "POST", "/entities", {
+            "entities": [{"type": "Point", "location": [9, 9]}],
+        })
+        expect(status == 201, f"fresh point: {fresh}")
+        status, replaced = call(port, "POST", "/blocks", {
+            "name": "MARK", "base": [0, 0, 0],
+            "handles": fresh["result"]["handles"], "replace": True,
+        })
+        expect(status == 201, f"block replace: {replaced}")
+        status, deleted = call(port, "DELETE", "/blocks/MARK")
+        expect(status == 200 and deleted["result"]["erased"] >= 1, f"block delete: {deleted}")
 
         # 14. Close the dirty second document with discard.
         status, closed = call(port, "DELETE", f"/documents/{target_doc}?discard=true")

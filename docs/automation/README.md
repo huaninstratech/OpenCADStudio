@@ -242,13 +242,15 @@ curl http://127.0.0.1:8090/api/v1/ready
 | `POST /api/v1/entities/transform` | move/copy/rotate/scale/mirror/array. |
 | `POST /api/v1/entities/copy-to` | Copy entities into another open document: `{"handles":[…],"document_id":target}` → **201** with the new handles. |
 | `GET  /api/v1/entities/{h}/xdata?app=` · `PUT …/xdata/{app}` · `DELETE …/xdata/{app}` | Read / replace / remove extended data. |
-| `POST /api/v1/blocks` | Define a block from entities (+ Insert). |
+| `POST /api/v1/blocks` | Define a block from entities (+ Insert); `"replace":true` drops a same-named definition first. |
+| `DELETE /api/v1/blocks/{name}` | Delete a block definition with its children, markers and every Insert referencing it. |
+| `POST /api/v1/file-identity` | Stable per-document GUID (`{"renew":true}` mints a fresh one). |
 | `POST /api/v1/groups` | Create a named group from handles → **201**. |
 | `POST /api/v1/selection-sets` · `GET /api/v1/selection-sets/{name}` | Save a named selection set → **201**; recall it (`?select=true` also makes it the current selection). |
 | `GET  /api/v1/sysvars?names=a,b` · `POST /api/v1/sysvars` | Read sysvars (`{"get":[…]}` in the body also works) / set them (`{"set":{"ltscale":2.5}}`). |
 | `POST /api/v1/layouts` | Create a layout with default page setup → **201**. |
 | `PUT  /api/v1/layouts/{name}/page-setup` | Write a layout's plot configuration (paper, orientation, fit/scale, center, window, plot style). |
-| `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export (`"layout":"all","per_page":true` writes one PDF per layout) · DWG/DXF export (`"template"` bases the new database on a file) · attach picture. |
+| `POST /api/v1/plot` · `/api/v1/wblock` · `/api/v1/images` | PDF export (`"layout":"all","per_page":true` writes one PDF per layout) · DWG/DXF export (`"template"` bases the new database on a file, `"normalize":true` shifts the export to the origin) · attach picture. |
 | `POST /api/v1/commands` | Run one command line (`{"cmd":"LINE 0,0 10,10"}`). |
 | `POST /api/v1/undo` · `/redo` · `/save` | Lifecycle (`/save` to a `*.dwt` path writes the template — DWG bytes). |
 | `GET  /api/v1/layers` · `/header` · `/records?collection=…` | Database reads. |
@@ -420,19 +422,44 @@ the clear operation.
 `{"ok":true,"items":[{"handle":"65","xdata":{"SPM":["PAGE-01",7]}}]}` — no
 `request_id`, no `document_id` needed.
 
-### `block_define` — BlockTableRecord parity
+### `block_define` / `block_delete` — BlockTableRecord lifecycle
 
 ```json
 {"op":"block_define","name":"MARK","base":[0,0,0],"handles":["63","67"],"insert_at":[0,0,0]}
+{"op":"block_define","name":"MARK","base":[0,0,0],"handles":["6C"],"replace":true}
+{"op":"block_delete","name":"MARK"}
 ```
 
 AutoCAD BLOCK semantics: the sources move into the definition (flattened at
 `base` = block origin) and one `Insert` is placed at `insert_at` (default
 `base`), so the drawing looks unchanged while the entities became one
 reusable block. Response: `{"block":"MARK","insert":"6B"}`. Names must be
-unique and may not start with `*`. Definitions survive save/open round
-trips and are consumable by `wblock` (by block name) and `INSERT` creation
-via `entities_create`.
+unique and may not start with `*`. `"replace":true` drops a same-named
+definition — its children, markers and inserts — inside the same undo step
+before creating the new one: that is SPM's barcode re-import flow, so
+`block_define` never fails with "already exists" on a re-import.
+`block_delete` removes a definition completely (children, Block/BlockEnd
+markers, every Insert referencing it and the table record) and reports
+`result.erased`; unknown names are `block_missing`, `*`-prefixed layout
+records are `block_protected`. Definitions survive save/open round trips
+and are consumable by `wblock` (by block name) and `INSERT` creation via
+`entities_create`.
+
+### `file_identity` — SPMDOCUNIQUE parity
+
+```json
+{"op":"file_identity"}                     → {"identity":"<guid>","created":true}
+{"op":"file_identity"}                     → {"identity":"<same guid>","created":false}
+{"op":"file_identity","renew":true}        → {"identity":"<new guid>","created":true}
+```
+
+A stable RFC 4122 v4 GUID per drawing, minted on first call and rewritten
+only with `"renew":true`. The identity lives on a single invisible marker
+text (height 0.0001) at the origin carrying the XData application
+`SPMDOCUNIQUE` — exactly how SPM.ACAD marks files — so it survives
+save/open round trips and travels with clones that include the marker.
+`GET /api/v1/state` also reports the document's `hand_seed` (the DWG handle
+seed, hex — `Database.Handseed` parity).
 
 ### `view_focus` — GUI sessions
 
