@@ -352,6 +352,34 @@ fn plot_content_extents(content: &PlotContent) -> Option<(f64, f64, f64, f64)> {
         .then_some(bounds)
 }
 
+/// Stamp the owning entity's effective color index onto a plot wire so CTB
+/// plot-style lookups (`wire.aci > 0`) apply: an entity's own ACI 1-255 is
+/// used as-is, ByLayer resolves through the layer table, and true-color
+/// objects keep `aci = 0` ("0 means true-color" — no CTB mapping). Wires
+/// whose owner cannot be resolved keep the index they carry.
+fn plot_owner_aci(scene: &crate::scene::Scene, wire: &mut crate::scene::WireModel) {
+    let Some(handle) = crate::scene::Scene::handle_from_wire_name(&wire.name) else {
+        return;
+    };
+    let Some(entity) = scene.document.get_entity(handle) else {
+        return;
+    };
+    let common = entity.common();
+    wire.aci = match &common.color {
+        acadrust::types::Color::Index(index) => *index,
+        acadrust::types::Color::ByLayer => scene
+            .document
+            .layers
+            .get(&common.layer)
+            .map(|layer| match &layer.color {
+                acadrust::types::Color::Index(index) => *index,
+                _ => 0,
+            })
+            .unwrap_or(7),
+        _ => 0,
+    };
+}
+
 fn plot_scene_content(
     scene: &crate::scene::Scene,
     paper_space_last: bool,
@@ -383,7 +411,10 @@ fn plot_scene_content(
         wires
             .into_iter()
             .zip(depths)
-            .map(|(wire, draw_depth)| crate::io::pdf_export::PlotWire { wire, draw_depth })
+            .map(|(mut wire, draw_depth)| {
+                plot_owner_aci(scene, &mut wire);
+                crate::io::pdf_export::PlotWire { wire, draw_depth }
+            })
             .collect::<Vec<_>>()
     };
     let paper_wires = with_depth(paper_wires);
@@ -411,7 +442,10 @@ fn plot_scene_content(
     model_pattern_wires.retain(|(wire, _)| wire.plot_visible);
     let model_pattern_wires = model_pattern_wires
         .into_iter()
-        .map(|(wire, draw_depth)| crate::io::pdf_export::PlotWire { wire, draw_depth })
+        .map(|(mut wire, draw_depth)| {
+            plot_owner_aci(scene, &mut wire);
+            crate::io::pdf_export::PlotWire { wire, draw_depth }
+        })
         .collect::<Vec<_>>();
 
     let (wires, hatches, wipeouts, images, splits) = if paper_space_last {

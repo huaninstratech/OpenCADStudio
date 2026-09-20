@@ -1682,7 +1682,7 @@ mod tests {
         assert_eq!(busy["code"], "busy", "{busy}");
         // The person picks the line in the viewport and presses Enter.
         let handle = user_select_pick(&mut app, "LINE");
-        app.update(Message::CommandFinalize);
+        let _ = app.update(Message::CommandFinalize);
         let done = user_select_result(&mut app, "us-1");
         assert_eq!(done["status"], "completed", "{done}");
         assert_eq!(done["result"]["cancelled"], false);
@@ -1709,7 +1709,7 @@ mod tests {
         );
         user_select_pick(&mut app, "LINE");
         user_select_pick(&mut app, "CIRCLE");
-        app.update(Message::CommandFinalize);
+        let _ = app.update(Message::CommandFinalize);
         let done = user_select_result(&mut app, "us-f");
         assert_eq!(done["status"], "completed", "{done}");
         assert_eq!(done["result"]["count"], 1);
@@ -1740,7 +1740,7 @@ mod tests {
         // ssget semantics: an immediate Enter with nothing picked answers the
         // request with an empty set rather than hanging forever.
         request(&mut app, json!({"op":"user_select","request_id":"us-e"}));
-        app.update(Message::CommandFinalize);
+        let _ = app.update(Message::CommandFinalize);
         let empty = user_select_result(&mut app, "us-e");
         assert_eq!(empty["result"]["cancelled"], false, "{empty}");
         assert_eq!(empty["result"]["count"], 0);
@@ -1885,5 +1885,108 @@ mod tests {
             "0.50 mm vs 0.13 mm hierarchy: {widths:?}"
         );
         let _ = std::fs::remove_file(&pdf);
+    }
+
+    #[test]
+    fn plot_op_applies_ctb_colors_through_layer_aci() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        {
+            let scene = &mut app.tabs[app.active_tab].scene;
+            // Frame layer carries the classic cyan ACI 4; its entity is ByLayer.
+            let mut frame = acadrust::tables::Layer::new("FRAME-CYAN");
+            frame.color = acadrust::types::Color::Index(4);
+            let _ = scene.document.layers.add(frame);
+            let mut frame_line = acadrust::entities::Line::new();
+            frame_line.common.layer = "FRAME-CYAN".to_string();
+            frame_line.start = acadrust::types::Vector3::new(0.0, 0.0, 0.0);
+            frame_line.end = acadrust::types::Vector3::new(3000.0, 0.0, 0.0);
+            scene.add_entity(acadrust::EntityType::Line(frame_line));
+
+            // An explicit red ACI 1 and a true-color green: index must map
+            // through the CTB, the true color must stay RGB (aci 0).
+            let mut red = acadrust::entities::Line::new();
+            red.common.color = acadrust::types::Color::Index(1);
+            red.start = acadrust::types::Vector3::new(0.0, 1000.0, 0.0);
+            red.end = acadrust::types::Vector3::new(3000.0, 1000.0, 0.0);
+            scene.add_entity(acadrust::EntityType::Line(red));
+
+            let mut true_color = acadrust::entities::Line::new();
+            true_color.common.color = acadrust::types::Color::from_true_color_value(0x0000FF00);
+            true_color.start = acadrust::types::Vector3::new(0.0, 2000.0, 0.0);
+            true_color.end = acadrust::types::Vector3::new(3000.0, 2000.0, 0.0);
+            scene.add_entity(acadrust::EntityType::Line(true_color));
+        }
+
+        let pdf = std::env::temp_dir().join(format!("ocs-plot-aci-{}.pdf", std::process::id()));
+        let response = request(
+            &mut app,
+            json!({"op":"plot","path":pdf.to_string_lossy(),"plot_style":"monochrome.ctb"}),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+
+        let text = String::from_utf8_lossy(&std::fs::read(&pdf).expect("pdf written")).into_owned();
+        // Monochrome maps every index colour (ByLayer cyan frame, explicit
+        // red) to black; the true-color line keeps its RGB by definition.
+        assert!(
+            !text.contains("0 1 1 rg") && !text.contains("0 1 1 RG"),
+            "cyan frame must be CTB-mapped to monochrome"
+        );
+        assert!(
+            !text.contains("1 0 0 rg") && !text.contains("1 0 0 RG"),
+            "explicit red must be CTB-mapped to monochrome"
+        );
+        assert!(
+            text.contains("0 1 0 rg") || text.contains("0 1 0 RG"),
+            "true-color line keeps its RGB (aci 0 is not CTB-mapped)"
+        );
+        assert!(
+            text.contains("0 0 0 rg") || text.contains("0 0 0 RG"),
+            "monochrome strokes must plot black"
+        );
+
+        // Without a plot style the same drawing keeps its colours: the cyan
+        // frame plots as the dark-blue print remap, the red line stays red.
+        let plain = std::env::temp_dir().join(format!("ocs-plot-aci-plain-{}.pdf", std::process::id()));
+        let response = request(&mut app, json!({"op":"plot","path":plain.to_string_lossy()}));
+        assert_eq!(response["status"], "completed", "{response}");
+        let text =
+            String::from_utf8_lossy(&std::fs::read(&plain).expect("pdf written")).into_owned();
+        let color_ops: Vec<[f32; 3]> = {
+            let tokens: Vec<&str> = text.split_whitespace().collect();
+            tokens
+                .windows(4)
+                .filter_map(|quad| {
+                    if quad[3] != "rg" && quad[3] != "RG" {
+                        return None;
+                    }
+                    Some([
+                        quad[0].parse::<f32>().ok()?,
+                        quad[1].parse::<f32>().ok()?,
+                        quad[2].parse::<f32>().ok()?,
+                    ])
+                })
+                .collect()
+        };
+        let near = |color: &[f32; 3], target: [f32; 3]| {
+            color
+                .iter()
+                .zip(target)
+                .all(|(channel, expected)| (channel - expected).abs() < 0.02)
+        };
+        assert!(
+            color_ops.iter().any(|c| near(c, [0.0, 0.15, 0.5])),
+            "unstyled cyan frame plots as the dark-blue print remap: {color_ops:?}"
+        );
+        assert!(
+            color_ops.iter().any(|c| near(c, [1.0, 0.0, 0.0])),
+            "unstyled red line keeps its colour: {color_ops:?}"
+        );
+        assert!(
+            color_ops.iter().any(|c| near(c, [0.0, 1.0, 0.0])),
+            "unstyled true-color line keeps its colour: {color_ops:?}"
+        );
+        let _ = std::fs::remove_file(&pdf);
+        let _ = std::fs::remove_file(&plain);
     }
 }
