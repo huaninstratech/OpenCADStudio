@@ -128,6 +128,10 @@ pub(super) struct UserSelectSession {
     pub(super) type_filter: Option<String>,
     pub(super) layer_filter: Option<String>,
     pub(super) detail: String,
+    /// The pinned command-line line shown while the person picks — the
+    /// prompt plus the request identity, so the screen keeps saying who is
+    /// waiting for what until they answer.
+    pub(super) label: String,
 }
 
 /// The pending half of a `getpoint` operation: which request it answers and
@@ -135,6 +139,8 @@ pub(super) struct UserSelectSession {
 pub(super) struct UserPointSession {
     pub(super) request_id: String,
     pub(super) document_id: u64,
+    /// Same pinned line as `UserSelectSession::label`.
+    pub(super) label: String,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -1749,6 +1755,51 @@ mod tests {
         let retracted = request(&mut app, json!({"op":"cancel","request_id":"us-c-x"}));
         assert_eq!(retracted["status"], "cancelled", "{retracted}");
         assert_eq!(retracted["result"]["cancelled"], true, "{retracted}");
+    }
+
+    #[test]
+    fn user_select_request_is_printed_and_stays_visible_until_answered() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-ui","type":"LINE","prompt":"Chọn block"}),
+        );
+        // The message list names the request — who asked and what for.
+        let last = app.command_line.history.last().unwrap();
+        assert!(
+            last.text.contains("us-ui") && last.text.contains("Chọn block"),
+            "{last:?}"
+        );
+        // The end-of-update driver pins that line so it cannot fade away
+        // while the pick is still open.
+        let label = app.pending_pick_label().expect("pending label");
+        app.command_line.set_step_prompt(Some(label));
+        assert!(
+            app.command_line.history.last().unwrap().pinned,
+            "{:?}",
+            app.command_line.history.last().unwrap()
+        );
+        // The person answers: the line un-pins and the resolution is printed
+        // with the same identity.
+        user_select_pick(&mut app, "LINE");
+        let _ = app.update(Message::CommandFinalize);
+        assert!(app.pending_pick_label().is_none());
+        let tail: Vec<String> = app
+            .command_line
+            .history
+            .iter()
+            .rev()
+            .take(3)
+            .map(|e| e.text.clone())
+            .collect();
+        assert!(
+            tail.iter()
+                .any(|t| t.contains("us-ui") && t.contains("1 object(s)")),
+            "{tail:?}"
+        );
     }
 
     #[test]

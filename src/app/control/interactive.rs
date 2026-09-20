@@ -67,16 +67,28 @@ impl OpenCADStudio {
                 crate::t!("Select objects, then press Enter to finish (Esc cancels).")
                     .into_owned()
             });
-        self.command_line.push_info(&prompt);
+        // Label the request on screen: the message list must say WHO is
+        // waiting and for what, and the line stays pinned (non-fading) for
+        // as long as the request is open — see `pending_pick_label`.
+        let request_id = req["request_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let label = crate::tf!(
+            "[user_select · {}] {}  ({})",
+            if request_id.is_empty() { "client" } else { &request_id },
+            prompt,
+            crate::t!("Enter confirms, Esc cancels"),
+        )
+        .into_owned();
+        self.command_line.push_info(&label);
         self.control.user_select = Some(UserSelectSession {
-            request_id: req["request_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            request_id,
             document_id: self.tabs[i].id,
             type_filter,
             layer_filter,
             detail: detail.to_owned(),
+            label,
         });
         Ok(Task::none())
     }
@@ -93,6 +105,13 @@ impl OpenCADStudio {
         if !confirmed {
             self.command_line
                 .push_info(crate::t!("*Cancel*").as_ref());
+            self.command_line.push_info(
+                crate::tf!(
+                    "user_select {}: the request was answered with no objects.",
+                    session.request_id
+                )
+                .as_ref(),
+            );
             self.finish_interactive(
                 "user_select",
                 &session.request_id,
@@ -165,6 +184,14 @@ impl OpenCADStudio {
             })
             .collect();
         let count = entities.len();
+        self.command_line.push_info(
+            crate::tf!(
+                "user_select {}: handed {} object(s) to the client.",
+                session.request_id,
+                count
+            )
+            .as_ref(),
+        );
         self.finish_interactive(
             "user_select",
             &session.request_id,
@@ -212,13 +239,22 @@ impl OpenCADStudio {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| crate::t!("Pick a point, then click (Esc cancels).").into_owned());
-        self.command_line.push_info(&prompt);
+        let request_id = req["request_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let label = crate::tf!(
+            "[getpoint · {}] {}  ({})",
+            if request_id.is_empty() { "client" } else { &request_id },
+            prompt,
+            crate::t!("Click confirms, Esc cancels"),
+        )
+        .into_owned();
+        self.command_line.push_info(&label);
         self.control.get_point = Some(UserPointSession {
-            request_id: req["request_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            request_id,
             document_id: self.tabs[i].id,
+            label,
         });
         Ok(Task::none())
     }
@@ -236,7 +272,30 @@ impl OpenCADStudio {
         if cancelled {
             self.command_line.push_info(crate::t!("*Cancel*").as_ref());
         }
+        self.command_line.push_info(
+            crate::tf!(
+                "getpoint {}: {}",
+                session.request_id,
+                match point {
+                    Some(point) => format!("{point:?}"),
+                    None => crate::t!("no point — the request was cancelled.").into_owned(),
+                }
+            )
+            .as_ref(),
+        );
         self.finish_interactive("getpoint", &session.request_id, cancelled, result);
+    }
+
+    /// The pinned command-line label of a pending client pick (`user_select`
+    /// or `getpoint`). The end-of-update driver feeds this to
+    /// `CommandLine::set_step_prompt` so the request line stays on screen —
+    /// pinned, non-fading — until the person answers, then it un-pins.
+    pub(in crate::app) fn pending_pick_label(&self) -> Option<String> {
+        self.control
+            .user_select
+            .as_ref()
+            .map(|session| session.label.clone())
+            .or_else(|| self.control.get_point.as_ref().map(|s| s.label.clone()))
     }
 
     /// Stamp an interactive answer into the pending operation and let it

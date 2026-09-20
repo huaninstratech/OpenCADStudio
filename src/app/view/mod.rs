@@ -910,6 +910,7 @@ bg={bg_ms:.1}ms n={view_count}"
                     isometric: self.isometric_drafting,
                     iso_plane: self.iso_plane,
                     snap_angle_deg: self.snap_angle_deg,
+                    pick_pending: self.pending_pick_label().is_some(),
                 },
                 crate::ui::overlay::SelectionVisualOptions {
                     area: self.model_space.selection_area,
@@ -2057,6 +2058,7 @@ bg={bg_ms:.1}ms n={view_count}"
             self.win_size.1,
             self.control.enabled,
             self.control_busy(),
+            self.pending_pick_label().is_some(),
         );
         let center_stack: Element<'_, Message> = if thumbnail_capture_clean {
             workspace
