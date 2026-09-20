@@ -1,13 +1,18 @@
-# OpenCAD Studio Automation API — Specification
+# OpenCADStudio Automation API — Specification
 
-Specification version **1.0** · API protocol **1** · applies to builds `2026.38` and later.
+Specification version **1.1** · API protocol **1** · applies to fork builds
+`2026.41` and later (`2026.40` for everything except §3.5 and §6.12).
 
-This document is the complete, self-contained reference for the OpenCAD Studio
+This document is the complete, self-contained reference for the OpenCADStudio
 automation API. Everything a client needs — conventions, transports, the
 operation catalogue, validation rules, error codes and worked examples — lives
 here. The API is transport-neutral: one operation dispatcher serves every
 client, so a request has identical semantics whether it arrives over a local
 HTTP port, a stdio pipe, a TCP socket or an AI-tool (MCP) session.
+
+MCP session set-up and a hands-on REST walkthrough live in
+[`docs/automation/README.md`](README.md); this file links to it rather than
+repeating either.
 
 ---
 
@@ -20,6 +25,7 @@ HTTP port, a stdio pipe, a TCP socket or an AI-tool (MCP) session.
 | **Handle** | Identity of every database object — a hexadecimal string (e.g. `"2A"`). Handles are stable across save/open and are the key for all read, edit, erase and clone operations. |
 | **Operation** | One atomic, undoable step. Validated in full before anything commits; a rejected request changes nothing. |
 | **Envelope** | The mutation wrapper: `"protocol":1`, a caller-generated `request_id`, and the `document_id` under edit. |
+| **Pick** | A human-in-the-loop operation (`user_select`, `getpoint`, §6.12): the operation stays pending while a *person* answers at the screen. |
 
 Design rules, in priority order:
 
@@ -29,7 +35,7 @@ Design rules, in priority order:
    retry after a timeout.
 2. **Optimistic state** — read `state` first, pass `document_id` (and
    `revision`/`geometry_revision` when you hold them) back on mutations. A
-   refusals whose code is in the retryable set (§5.2) means "your snapshot is
+   refusal whose code is in the retryable set (§5.2) means "your snapshot is
    behind": refresh state and retry once with a *new* `request_id`.
 3. **Atomicity** — every operation is all-or-nothing and produces exactly one
    undo step. Multi-step transactions are the client's `batch` op or a
@@ -59,11 +65,16 @@ Design rules, in priority order:
 
 ## 3. Transports
 
-### 3.1 HTTP REST (`--http <port>`)
+All transports speak to the same dispatcher; pick one per client. REST and
+MCP advertise the whole surface; feature detection is `capabilities` (§4).
 
-Base URL `http://127.0.0.1:<port>/api/v1` (loopback bind only, permissive
-CORS, JSON bodies, one request per connection). A machine-readable OpenAPI 3
-description of the whole surface is served at `GET /api/v1/openapi`.
+### 3.1 HTTP REST — headless (`--http <port>`)
+
+`OpenCADStudio --http 8090` runs a private, window-less session behind a
+resource-oriented REST surface at `http://127.0.0.1:<port>/api/v1` (loopback
+bind only, permissive CORS, JSON bodies, one request per connection). A
+machine-readable OpenAPI 3 description of the whole surface is served at
+`GET /api/v1/openapi`.
 
 | Status | Meaning |
 |---|---|
@@ -79,23 +90,45 @@ server-side, retrying once on retryable refusals — plain HTTP clients do not
 need envelope bookkeeping. Power clients may instead POST any operation name
 to `/api/v1/{op}` with an explicit body.
 
-### 3.2 stdio JSONL (`--serve`)
+### 3.2 HTTP REST — GUI-hosted (`--http <port>` **with a drawing file**)
+
+`OpenCADStudio.exe "<file>" --http 8090` boots the **normal editor** and hosts
+the same REST surface on this very process, aimed at the drawing the person at
+the screen is working on: identical routes, identical semantics, plus the
+human-in-the-loop picks of §6.12 (which need the window this process owns).
+Differences worth knowing:
+
+- `GET /state` primes a server-side `document_id` cache; later mutations
+  address the live drawing without the caller repeating the id. A stale cache
+  (the person switched documents) costs one state refresh and one retry, not
+  an error.
+- `session_id` is not needed (the channel has no descriptor handshake; a
+  guessed value is stripped).
+- One thread per connection: a parked pick never blocks other calls. A pick
+  may park up to **30 minutes**; any other op answers within **300 s** or the
+  bridge replies `response_timeout`.
+- Unknown POST paths are treated as op attempts and forwarded (any op of the
+  surface works); truly unrouted paths answer `404 {"code":"unknown_route"}`.
+- `OPTIONS *` answers **204** (CORS preflight).
+
+### 3.3 stdio JSONL (`--serve`)
 
 One JSON value per line over stdin/stdout. The **first** stdout line is the
 ready greeting: `{"ok":true,"ready":true,"version":"…","session_id":"…"}`.
 Every subsequent line is one request/response pair (legacy reads need no
 envelope; mutations use the envelope of §1).
 
-### 3.3 TCP (`--serve --port N`)
+### 3.4 TCP (`--serve --port N`)
 
-The same JSONL protocol as §3.2 over `127.0.0.1:<N>`, one client at a time.
+The same JSONL protocol as §3.3 over `127.0.0.1:<N>`, one client at a time.
 
-### 3.4 AI-tool session (`--mcp`)
+### 3.5 AI-tool session (`--mcp`)
 
 Exposes four tools — `ocs_sessions`, `ocs_read`, `ocs_execute`, `ocs_capture`
-— with JSON-Schema validated arguments (`ocs_execute` alone accepts all 35
-mutation operations). Session discovery and capability advertisement follow
-the same protocol-1 semantics.
+— with JSON-Schema validated arguments (`ocs_execute` alone accepts all 36
+mutation operations, §6). Session discovery and capability advertisement
+follow the same protocol-1 semantics. Set-up instructions: see the MCP section
+of [`README.md`](README.md).
 
 ---
 
@@ -113,9 +146,11 @@ client needs to act:
 | `documents[]` | Every open document: `id`, `title`, `path`, `dirty`, `revision` |
 | `selection[]` | Handles currently selected, in pick order |
 | `command` | An interactive command's state, when one is running: `accepts[]`, `options[]`, `input_example` |
+| `operation` | The `request_id` of the operation currently pending, when one is |
 | `capabilities` | Feature list (also available as the dedicated `capabilities` read) |
 
-`file_identity` (§6.1) additionally gives every drawing a stable GUID.
+`hello` is an alias of `state`. `file_identity` (§6.1) additionally gives
+every drawing a stable GUID.
 
 ---
 
@@ -146,22 +181,26 @@ and stable; branch on it, not on message text.
 | `document_dirty` | Closing would lose unsaved changes | no — resend with `"discard":true` to confirm |
 | `entity_absent` | A listed handle does not exist (the message names them) | refresh and re-read |
 | `command_busy` | An interactive command is active | finish or `cancel` first |
-| `gui_required` | Operation needs the editor window (e.g. `view_focus`) | headless sessions only |
+| `gui_required` | Operation needs the editor window (`view_focus`, and the picks of §6.12 over headless transports) | headless sessions only |
 | `busy` | Async work still running | poll `operation` |
+| `interactive_pending` | Another person-pick (§6.12) is already waiting for the user | wait for it, or retract it with `cancel` |
+| `user_input_busy` | The person is mid-command or in a dialog; their keystrokes own Enter/Esc | wait, then retry |
+| `invalid_detail` | `user_select` `detail` outside `summary`/`geometry`/`full` | no |
 | `selection_changed` | Precondition `selection[]` no longer matches | re-read and confirm |
-| `name_required`, `entities_required`, `selection_required`, `app_required`, `path_required` | Missing mandatory field | no |
+| `name_required`, `entities_required`, `selection_required`, `app_required`, `path_required`, `handles_required`, `block_required` | Missing mandatory field | no |
 | `unknown_entity_type`, `invalid_radius`, `invalid_vertices`, `invalid_point`, `invalid_text`, `invalid_scale`, `invalid_paper`, `invalid_handle`, `invalid_xdata`, `invalid_sysvar_value` | Validation failures — nothing commits | no |
 | `unknown_sysvar` | Variable outside the registry (§6.7) | no |
 | `layout_exists`, `layout_missing`, `layer_failed`, `block_failed`, `block_missing`, `block_protected`, `selection_set_missing`, `template_missing`, `template_failed`, `save_failed` | Domain refusals, self-explanatory | no |
 
-Unknown routes answer `code:"unknown_route"` (HTTP 404).
+Unknown routes answer `code:"unknown_route"` (HTTP 404). A timed-out parked
+request answers `code:"response_timeout"`.
 
 ---
 
 ## 6. Operations reference
 
 Every mutation below is an envelope op (§1). Reads (`query`, `records`,
-`layers`, `header`, `xdata_get`, `capabilities`, …) need no envelope. All 35
+`layers`, `header`, `xdata_get`, `capabilities`, …) need no envelope. All 36
 mutations are listed in the `capabilities` advertisement and in the MCP
 schema; the REST passthrough accepts any of them at `POST /api/v1/{op}`.
 
@@ -242,7 +281,7 @@ usable.
 Companion reads: `entities` (alias), `layers`, `header`, `records`
 (paged, filterable database records), `record_schema` (generated type
 registry with write rules), `properties`, `measure` (length/area/bounds),
-`xdata_get`.
+`xdata_get`, `get_selection` (§6.12).
 
 ### 6.5 Blocks
 
@@ -336,13 +375,13 @@ dedicated op needed:
 
 | Op | Purpose |
 |---|---|
-| `run` | Execute one command line headlessly (`"cmd":"LINE 0,0 10,10"` — command name + space-separated prompt answers; points `x,y[,z]`, options by displayed token). Response `status` is `completed` or `waiting_input`. |
+| `run` | Execute one command line headlessly (`"cmd":"LINE 0,0 10,10"` — command name + space-separated prompt answers; points `x,y[,z]`, options by displayed token). Response `status` is `completed` or `waiting_input`. Requires `document_id`. |
 | `start` / `input` | Interactive dialog: `start` opens a command, `state.command.accepts` lists the valid input kinds (`text`, `token`, `point`, `entity`, `structure`, `selection`, `enter`), `input` feeds one. |
-| `cancel` | Aborts the running command. |
+| `cancel` | Aborts the running command — or retracts this client's own pending pick (§6.12). |
 | `batch` | `steps[]` — sequential ops (≤ 64) where each step sees the previous step's state; stops at the first failure and reports `completed_steps` / `next_step`. |
 | `select` | Change the current selection (`handles`, `clear`, filters). |
 | `events` | Cursor-paged event stream (command lifecycle, document and selection changes, 128-event ring, `resync` flag). Polling by design. |
-| `history` | Command-line history. |
+| `history` | Command-line history (also the person's view of what clients did — see §6.12). |
 | `capture` | PNG snapshot of the viewport or full window (`scope`, `max_dimension`). |
 | `view_focus` | Zoom-to-fit + highlight the listed handles (GUI sessions; headless answers `gui_required`). |
 | `action` | The 20 UI toggles (grid, ortho, …) by name. |
@@ -360,10 +399,81 @@ dedicated op needed:
 | `GET/PUT/DELETE /entities/{h}/xdata[/{app}]` | Extended data |
 | `POST /blocks` · `DELETE /blocks/{name}` | Define (+`replace`) · delete |
 | `POST /groups` · `POST /selection-sets` · `GET /selection-sets/{name}` | Groups · selection sets |
+| `POST /getpoint` · `POST /user_select` | Person-in-the-loop picks (§6.12; the connection parks) |
 | `POST /plot` · `/wblock` · `/images` · `/commands` · `/undo` · `/redo` · `/save` | Publishing, export, command line, lifecycle |
 | `GET /layers` · `/header` · `/records` | Database reads |
 | `POST /file-identity` | Stable drawing GUID |
-| `POST /{op}` | Passthrough for any envelope op |
+| `POST /{op}` | Passthrough for any envelope op, including `cancel` and `history` |
+
+### 6.12 Human-in-the-loop picks — `user_select` & `getpoint`
+
+These two operations hand the screen to the person at the desk. They are
+answerable only where a person exists: on the GUI-hosted channel (§3.2) or
+MCP sessions attached to a desktop build, a headless session answers
+`gui_required`. Both stay pending — pollers see `running` — until that person
+answers, and both can be retracted programmatically with
+`{"op":"cancel","request_id":"<a fresh id>"}`.
+
+**`user_select`** — ssget-style sampling. The person picks entities with the
+normal gestures (click, window, crossing), **Enter** confirms, **Escape**
+cancels.
+
+```json
+{"protocol":1,"op":"user_select","request_id":"sample-1","document_id":1,
+ "type":"INSERT","layer":"TITLE","prompt":"Chọn các block cần lấy props",
+ "detail":"full","clear":true}
+```
+
+| Field | Meaning |
+|---|---|
+| `type`, `layer` | optional filters for what counts as picked; matching is case-insensitive against the display name (`"Block Reference"`) and the DXF name (`"INSERT"`) |
+| `prompt` | optional; replaces the default hint on the command line |
+| `detail` | `summary` / `geometry` / `full` (default) — `full` returns each entity's complete serialized properties |
+| `clear` | default `true`: the request starts a fresh selection; `false` keeps whatever is selected |
+
+Confirm resolves with:
+
+```json
+{"ok":true,"status":"completed","result":{
+  "cancelled":false,"count":1,"ignored":1,
+  "handles":["6F"],
+  "entities":[{"handle":"6F","type":"Block Reference","block":"ANCHOR_A",
+               "position":[0,0,0],"properties":{…}}]}}
+```
+
+`ignored` counts picks the `type`/`layer` filter deselected at confirm time
+(the person's gestures are never blocked; only the answer is filtered).
+Escape — or a `cancel` retraction, or the document closing — resolves with
+`status:"cancelled"` and `{"cancelled":true,"count":0}`. Starting a pick
+while a command or dialog is active is refused (`user_input_busy`); a second
+concurrent pick is refused (`interactive_pending`).
+
+**`getpoint`** — one snapped world point from the next left-click.
+
+```json
+{"protocol":1,"op":"getpoint","request_id":"qr-spot","document_id":1,
+ "prompt":"Chọn vị trí đặt QR code"}
+→ {"ok":true,"status":"completed","result":{"point":[125.5,64.25,0.0]}}
+```
+
+Escape cancels with `{"cancelled":true}`. `detail` does not apply.
+
+**What the person sees while a pick is pending** (so integrators know the
+request is visible even before anyone clicks):
+
+- the command line pins a labeled, non-fading request line:
+  `[user_select · sample-1] Chọn các block cần lấy props  (Enter confirms, Esc cancels)`;
+- the automation pill on the command line turns blue — *"MCP is waiting for
+  you to pick — Enter confirms, Esc cancels"*;
+- the viewport cursor trades its crosshair arms for a blue pickbox;
+- the answer is printed back into the message list with the same identity
+  (`user_select sample-1: handed 1 object(s) to the client.`), and the full
+  trail of every client operation — including failures — stays reviewable in
+  the command-line history.
+
+On the GUI-hosted HTTP channel (§3.2) the whole exchange rides one parked
+connection: the request holds until the person answers (up to 30 minutes,
+then `response_timeout`), so no polling loop is needed.
 
 ---
 
@@ -394,7 +504,26 @@ curl -s -X POST http://127.0.0.1:8090/api/v1/save \
   -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwt"}'
 ```
 
-### 7.2 Clone a region into a new, normalized drawing
+### 7.2 Sample entities with the person at the screen (GUI-hosted)
+
+```sh
+OpenCADStudio.exe "C:/drawings/plan.dwg" --http 8090   # the editor stays interactive
+
+# Ask the person to pick block references; the connection parks until they
+# press Enter (or Esc). No polling loop needed.
+curl -s -m 1800 -X POST http://127.0.0.1:8090/api/v1/user_select \
+  -H "Content-Type: application/json" \
+  -d '{"request_id":"sample-1","type":"INSERT","detail":"full","prompt":"Pick the title blocks"}'
+# → {"ok":true,"status":"completed","result":{"cancelled":false,"count":2,…}}
+
+# Read the same entities back, then continue driving the live drawing.
+curl -s -X POST http://127.0.0.1:8090/api/v1/get_selection -d '{}'
+curl -s -X POST http://127.0.0.1:8090/api/v1/entities/transform \
+  -H "Content-Type: application/json" \
+  -d '{"handles":["6F"],"action":"move","vector":[5,0]}'
+```
+
+### 7.3 Clone a region into a new, normalized drawing
 
 ```json
 {"protocol":1,"op":"wblock","request_id":"clone-1","document_id":1,
@@ -408,7 +537,7 @@ The export inherits the template's tables/styles and is shifted so its
 minimum lands on the origin. Open it afterwards with `{"op":"open","path":…}`
 and verify with `query`.
 
-### 7.3 Stable identity + idempotent retry
+### 7.4 Stable identity + idempotent retry
 
 ```json
 {"protocol":1,"op":"file_identity","request_id":"fid-1","document_id":1}
@@ -419,7 +548,35 @@ and verify with `query`.
 
 ---
 
-## 8. Versioning and compatibility
+## 8. Surface status and upstreaming map
+
+This spec documents the fork's surface, which is a strict superset of
+upstream `main`. Everything in the **core** column exists upstream today and
+is documented here unchanged; each **piece** row is a self-contained,
+independently reviewable addition — the matching section of this spec is
+meant to travel with its piece's PR, so no section ever runs ahead of the
+code it describes.
+
+| Scope | Contents | Spec sections |
+|---|---|---|
+| **Core (upstream `main`)** | Transports `--serve` (stdio JSONL), `--serve --port` (TCP), `--mcp`; ops `new`, `open`, `save`, `activate`, `select`, `run`, `start`, `input`, `cancel`, `stop`, `action`, `property`, `set_properties`, `embed_image`, `capture`, `undo`, `redo`; reads `state`, `hello`, `capabilities`, `query`/`entities`, `records`, `record_schema`, `layers`, `header`, `properties`, `measure`, `history`; envelope conventions and the core error codes | §1–§5, §6.1, §6.4, §6.10 |
+| Piece A — entity CRUD | `entities_create`, `entities_delete`, `entities_transform`, `entities_copy_to` | §6.2, §6.3 |
+| Piece B — blocks & export | `block_define`, `block_delete`, `wblock` | §6.5 |
+| Piece C — publishing | `layout_create`, `page_setup_set`, `plot` (incl. `per_page`) | §6.6 |
+| Piece D — metadata | `sysvar`, `xdata_set`/`xdata_get`, `file_identity` | §6.7 |
+| Piece E — collections | `group_create`, `selection_set_save`/`load` | §6.8 |
+| Piece F — control plane | `batch`, `events`, `view_focus`, `close`, `where` filters | §6.4 (`where`), §6.10 |
+| Piece G — REST transport | `--http` headless server, `/api/v1` routes, OpenAPI 3 document | §3.1, §6.11, §7.1 |
+| Piece H — person-in-the-loop | GUI-hosted `--http` channel, `user_select`, `getpoint`, the on-screen pending signals | §3.2, §6.12, §7.2 |
+
+Sections §3.2/§6.12 (piece H) additionally require the desktop build; over a
+headless session every documented request still answers truthfully
+(`gui_required`), so a client written against this spec behaves consistently
+on both.
+
+---
+
+## 9. Versioning and compatibility
 
 - The wire protocol version is **1**; it is declared in every envelope and in
   the greeting line. Additions (new ops, new optional fields, new error
@@ -430,5 +587,6 @@ and verify with `query`.
 - Drawing files: DWG and DXF readers/writers are version-tolerant; templates
   (`*.dwt`) are byte-compatible DWG files.
 
-*Companion documents: the REST walkthrough (`README.md`) and the OpenAPI 3
-description served at `GET /api/v1/openapi`.*
+*Companion documents: the automation walkthrough and MCP set-up
+([`README.md`](README.md)) and the OpenAPI 3 description served at
+`GET /api/v1/openapi`.*
