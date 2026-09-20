@@ -1,6 +1,6 @@
 # Native vs. Web (WebAssembly)
 
-Open CAD Studio ships as a native desktop app and as a WebAssembly build that
+OpenCADStudio ships as a native desktop app and as a WebAssembly build that
 runs in the browser (https://hakanseven12.github.io/OpenCADStudio/). Both are
 built from the same source; the web target drops or shims the pieces that a
 browser can't provide. This page lists the differences.

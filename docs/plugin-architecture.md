@@ -1,15 +1,15 @@
-# Open CAD Studio — Plugin Architecture
+# OpenCADStudio — Plugin Architecture
 
 **Status:** Accepted
-**Author:** Open CAD Studio contributors
+**Author:** OpenCADStudio contributors
 **Date:** June 2026
 
 This document is the **authoritative spec** for how add-on packages integrate
-with Open CAD Studio. The model follows [QGIS](https://plugins.qgis.org/)-style
+with OpenCADStudio. The model follows [QGIS](https://plugins.qgis.org/)-style
 extensibility: a small metadata file, a single entry point, an optional separate
 engine crate, and user-installable packages from a curated index.
 
-> **Open CAD Studio ships no built-in plugins.** Every add-on is an **external
+> **OpenCADStudio ships no built-in plugins.** Every add-on is an **external
 > dynamic library** (`cdylib`) the host loads at runtime from the user plugins
 > folder. The host source only contains the generic plugin *runtime*
 > (`src/plugin/`, `src/app/plugin_host.rs`) and the stable contract crate

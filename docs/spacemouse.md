@@ -1,7 +1,7 @@
 # SpaceMouse
 
 The Windows desktop app supports 3Dconnexion SpaceMouse devices through the
-installed [3DxWare driver](https://3dconnexion.com/drivers/). Open CAD Studio
+installed [3DxWare driver](https://3dconnexion.com/drivers/). OpenCADStudio
 loads NavLib from the Windows system directory at runtime. An SDK installation
 is not needed to build or run the app. macOS, Linux, and the web build currently
 show an unavailable state; their device adapters are not implemented.
@@ -57,7 +57,7 @@ not apply to these flat-navigation modes. Button assignments continue to work in
 all modes.
 
 For orbiting with a fixed up direction, enable **Lock Horizon** in the driver's
-Advanced Settings for Open CAD Studio. The adapter reads `settings.LockHorizon`
+Advanced Settings for OpenCADStudio. The adapter reads `settings.LockHorizon`
 through NavLib at connection/focus and after `settings.changed` notifications.
 When enabled, accepted orbit matrices remove roll relative to world Z. Pitch
 stops just short of the top/bottom pole, retaining heading instead of flipping

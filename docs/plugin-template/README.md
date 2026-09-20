@@ -1,6 +1,6 @@
-# Open CAD Studio plugin template
+# OpenCADStudio plugin template
 
-A complete scaffold for an **external** Open CAD Studio add-on. A plugin is its
+A complete scaffold for an **external** OpenCADStudio add-on. A plugin is its
 own repository that builds a `cdylib`; the host loads it at runtime. Copy this
 folder into a new repo and rename the placeholders.
 
@@ -32,7 +32,7 @@ sed "s|__RUSTC_VERSION__|$(rustc --version)|" plugin.toml > \
   "<config>/OpenCADStudio/plugins/opencad.my_plugin/plugin.toml"
 ```
 
-Restart Open CAD Studio: the ribbon tab appears and `MP_` commands route to your
+Restart OpenCADStudio: the ribbon tab appears and `MP_` commands route to your
 plugin. (`<config>` = `%APPDATA%` / `~/Library/Application Support` /
 `$XDG_CONFIG_HOME`.)
 
