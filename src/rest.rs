@@ -12,6 +12,11 @@
 //! bodies, permissive CORS for local browser clients, loopback bind only.
 //! Mutation endpoints get a server-generated `request_id` and the active
 //! `document_id`; a stale-state refusal refreshes state and retries once.
+//!
+//! The route table is shared: `plan` resolves (method, path) to a `Plan`
+//! that this headless server executes directly and the GUI-hosted bridge
+//! executes over the live editor's envelope queue (`app::control::http_bridge`),
+//! so both `--http` modes serve the identical surface.
 
 use crate::app::OpenCADStudio;
 use serde_json::{json, Value};
@@ -51,7 +56,7 @@ pub fn set_gui_http_port(port: u16) {
 }
 
 /// Failure codes worth one state refresh + retry (the request never started).
-const RETRYABLE: &[&str] = &[
+pub(crate) const RETRYABLE: &[&str] = &[
     "document_required",
     "document_closed",
     "document_not_active",
@@ -223,113 +228,101 @@ pub(crate) fn write_response(stream: &mut TcpStream, status: u16, body: &Value) 
     stream.flush()
 }
 
-/// The whole REST surface. Returns (http status, json body).
-fn route(
-    app: &mut OpenCADStudio,
-    request: &HttpRequest,
-    document_id: &mut Option<u64>,
-    counter: &mut u64,
-) -> (u16, Value) {
-    let path = request.path.trim_end_matches('/');
-    let path = if path.is_empty() { "/" } else { path };
-    let method = request.method.as_str();
+/// One resolved REST call, shared by the two `--http` transports: this
+/// headless server executes it against its private app, and the GUI-hosted
+/// bridge (`app::control::http_bridge`) forwards the same request into the
+/// live editor's automation queue. Building the request here keeps both
+/// surfaces identical — same URLs, same ops, same document-id handling.
+pub(crate) enum Plan {
+    /// Answer without the automation pipeline (OpenAPI, unknown routes).
+    Local(u16, Value),
+    /// `GET /ready`: a state read rebuilt as the readiness snapshot.
+    Ready,
+    /// Run one prebuilt protocol-1 request as-is — reads, and callers that
+    /// manage `document_id` themselves (the MCP-style clients).
+    Run { request: Value, created: u16 },
+    /// Run one op through the mutation wrapper: envelope with a request id,
+    /// the cached `document_id` when the caller omitted it, one state-refresh
+    /// retry after a stale refusal, and the bulky `state` snapshot stripped
+    /// from the answer.
+    Mutate { op: String, fields: Value, created: u16 },
+}
 
-    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if segments.first() != Some(&"api") || segments.get(1) != Some(&"v1") {
-        return (404, json!({"ok": false, "code": "unknown_route", "error": "Use /api/v1/…"}));
+impl Plan {
+    /// The automation op this plan runs, for transports that vary connection
+    /// behavior per op (the GUI bridge parks the interactive picks).
+    pub(crate) fn op(&self) -> Option<&str> {
+        match self {
+            Plan::Local(..) | Plan::Ready => None,
+            Plan::Run { request, .. } => request["op"].as_str(),
+            Plan::Mutate { op, .. } => Some(op),
+        }
     }
-    let rest: &[&str] = &segments[2..];
+}
 
+/// The whole REST surface: map (method, path) to the automation request it
+/// runs. The caller splits `/api/v1` off already; the remaining segments
+/// select the arm.
+pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
+    let raw = request.json();
+    let body = if raw.is_object() { raw } else { json!({}) };
     match (method, rest) {
-        ("GET", ["ready"]) | ("GET", []) | ("GET", [""]) => {
-            let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
-            (200, json!({
-                "ok": true,
-                "ready": true,
-                "version": state["version"],
-                "session_id": state["session_id"],
-                "document_id": state["document_id"],
-            }))
-        }
-        ("GET", ["capabilities"]) => {
-            let response = app.automation_op(r#"{"op":"capabilities"}"#);
-            (map_status(response.clone(), false), response)
-        }
-        ("GET", ["state"]) | ("GET", ["documents"]) => {
-            let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
-            *document_id = state["document_id"].as_u64();
-            (200, state)
-        }
+        ("GET", ["ready"]) | ("GET", []) | ("GET", [""]) => Plan::Ready,
+        ("GET", ["capabilities"]) => Plan::Run {
+            request: json!({"op":"capabilities"}),
+            created: 200,
+        },
+        ("GET", ["state"]) | ("GET", ["documents"]) => Plan::Run {
+            request: json!({"protocol":1,"op":"state"}),
+            created: 200,
+        },
         ("POST", ["documents"]) => {
-            let body = request.json();
-            let response = if let Some(template) = body["template"].as_str() {
-                run_mutation(app, "new", json!({"template": template}), document_id, counter, 200).1
+            if let Some(template) = body["template"].as_str() {
+                Plan::Mutate { op: "new".into(), fields: json!({"template": template}), created: 201 }
             } else if let Some(path) = body["path"].as_str() {
-                app.automation_op(&json!({"op":"open","path":path}).to_string())
+                Plan::Run { request: json!({"op":"open","path":path}), created: 201 }
             } else {
                 // DocumentManager.Add() parity: a fresh untitled document in
                 // its own tab, so cross-document operations have a target.
-                run_mutation(app, "new", json!({}), document_id, counter, 201).1
-            };
-            let status = map_status(response.clone(), true);
-            if response["ok"] == true {
-                if let Some(state) = fetch_state(app) {
-                    *document_id = Some(state);
-                }
+                Plan::Mutate { op: "new".into(), fields: json!({}), created: 201 }
             }
-            (status, response)
         }
         ("DELETE", ["documents", id]) => {
-            let document = id.parse::<u64>().ok();
             let mut fields = json!({});
-            if let Some(id) = document {
+            if let Some(id) = id.parse::<u64>().ok() {
                 fields["document_id"] = json!(id);
             }
             if request.param("discard").is_some_and(|v| v == "true" || v == "1") {
                 fields["discard"] = json!(true);
             }
-            let (status, body) = run_mutation(app, "close", fields, document_id, counter, 200);
-            if body["ok"] == true {
-                if let Some(state) = fetch_state(app) {
-                    *document_id = Some(state);
-                }
-            }
-            (status, body)
+            Plan::Mutate { op: "close".into(), fields, created: 200 }
         }
         ("GET", ["sysvars"]) => {
             let names = request
                 .param("names")
                 .map(|csv| json!(csv.split(',').collect::<Vec<_>>()))
                 .unwrap_or_else(|| json!([]));
-            let (status, body) = run_mutation(app, "sysvar", json!({"get": names}), document_id, counter, 200);
-            (status, body)
+            Plan::Mutate { op: "sysvar".into(), fields: json!({"get": names}), created: 200 }
         }
-        ("POST", ["sysvars"]) => {
-            run_mutation(app, "sysvar", request.json(), document_id, counter, 200)
-        }
-        ("POST", ["layouts"]) => {
-            run_mutation(app, "layout_create", request.json(), document_id, counter, 201)
-        }
+        ("POST", ["sysvars"]) => Plan::Mutate { op: "sysvar".into(), fields: body, created: 200 },
+        ("POST", ["layouts"]) => Plan::Mutate { op: "layout_create".into(), fields: body, created: 201 },
         ("PUT", ["layouts", layout, "page-setup"]) => {
-            let mut fields = request.json();
+            let mut fields = body;
             fields["layout"] = json!(layout);
-            run_mutation(app, "page_setup_set", fields, document_id, counter, 200)
+            Plan::Mutate { op: "page_setup_set".into(), fields, created: 200 }
         }
-        ("POST", ["entities", "copy-to"]) => {
-            run_mutation(app, "entities_copy_to", request.json(), document_id, counter, 201)
-        }
-        ("POST", ["groups"]) => {
-            run_mutation(app, "group_create", request.json(), document_id, counter, 201)
-        }
-        ("POST", ["selection-sets"]) => {
-            run_mutation(app, "selection_set_save", request.json(), document_id, counter, 201)
-        }
+        ("POST", ["entities", "copy-to"]) =>
+            Plan::Mutate { op: "entities_copy_to".into(), fields: body, created: 201 },
+        ("POST", ["groups"]) => Plan::Mutate { op: "group_create".into(), fields: body, created: 201 },
+        ("POST", ["selection-sets"]) =>
+            Plan::Mutate { op: "selection_set_save".into(), fields: body, created: 201 },
         ("GET", ["selection-sets", name]) => {
-            let mut fields = json!({"name": name, "select": false});
-            if request.param("select").is_some_and(|v| v == "true" || v == "1") {
-                fields["select"] = json!(true);
+            let select = request.param("select").is_some_and(|v| v == "true" || v == "1");
+            Plan::Mutate {
+                op: "selection_set_load".into(),
+                fields: json!({"name": name, "select": select}),
+                created: 200,
             }
-            run_mutation(app, "selection_set_load", fields, document_id, counter, 200)
         }
         ("GET", ["entities"]) => {
             let mut request_json = json!({"op":"query"});
@@ -365,140 +358,157 @@ fn route(
                 match serde_json::from_str::<Value>(v) {
                     Ok(filters) => request_json["where"] = filters,
                     Err(error) => {
-                        return (
+                        return Plan::Local(
                             400,
                             json!({"ok": false, "code": "invalid_where", "error": format!("where must be a JSON array: {error}")}),
                         )
                     }
                 }
             }
-            let response = app.automation_op(&request_json.to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: request_json, created: 200 }
         }
-        ("GET", ["entities", handle]) => {
-            let response = app.automation_op(
-                &json!({"op":"query","handles":[handle],"detail":"full"}).to_string(),
-            );
-            (map_status(response.clone(), false), response)
-        }
-        ("POST", ["entities"]) => {
-            let body = request.json();
-            run_mutation(app, "entities_create", body, document_id, counter, 201)
-        }
+        ("GET", ["entities", handle]) => Plan::Run {
+            request: json!({"op":"query","handles":[handle],"detail":"full"}),
+            created: 200,
+        },
+        ("POST", ["entities"]) =>
+            Plan::Mutate { op: "entities_create".into(), fields: body, created: 201 },
         ("DELETE", ["entities"]) => {
             let handles = match request.param("handles") {
                 Some(csv) => json!(csv.split(',').collect::<Vec<_>>()),
-                None => request.json()["handles"].clone(),
+                None => body["handles"].clone(),
             };
-            run_mutation(app, "entities_delete", json!({"handles": handles}), document_id, counter, 200)
+            Plan::Mutate { op: "entities_delete".into(), fields: json!({"handles": handles}), created: 200 }
         }
-        ("POST", ["entities", "transform"]) => {
-            run_mutation(app, "entities_transform", request.json(), document_id, counter, 200)
-        }
+        ("POST", ["entities", "transform"]) =>
+            Plan::Mutate { op: "entities_transform".into(), fields: body, created: 200 },
         ("GET", ["entities", handle, "xdata"]) => {
             let mut request_json = json!({"protocol":1,"op":"xdata_get","handles":[handle]});
             if let Some(app_name) = request.param("app") {
                 request_json["app"] = json!(app_name);
             }
-            let response = app.automation_op(&request_json.to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: request_json, created: 200 }
         }
         ("PUT", ["entities", handle, "xdata", app_name]) => {
             let data = request.json();
             let data = if data.is_null() { json!([]) } else { data };
-            run_mutation(
-                app,
-                "xdata_set",
-                json!({"handles":[handle], "app": app_name, "data": data}),
-                document_id,
-                counter,
-                200,
-            )
+            Plan::Mutate {
+                op: "xdata_set".into(),
+                fields: json!({"handles":[handle], "app": app_name, "data": data}),
+                created: 200,
+            }
         }
-        ("DELETE", ["entities", handle, "xdata", app_name]) => {
-            run_mutation(
-                app,
-                "xdata_set",
-                json!({"handles":[handle], "app": app_name, "data": []}),
-                document_id,
-                counter,
-                200,
-            )
-        }
-        ("POST", ["blocks"]) => {
-            run_mutation(app, "block_define", request.json(), document_id, counter, 201)
-        }
-        ("DELETE", ["blocks", name]) => {
-            run_mutation(app, "block_delete", json!({"name": name}), document_id, counter, 200)
-        }
-        ("POST", ["file-identity"]) => {
-            run_mutation(app, "file_identity", request.json(), document_id, counter, 200)
-        }
-        ("POST", ["plot"]) => run_mutation(app, "plot", request.json(), document_id, counter, 200),
-        ("POST", ["wblock"]) => run_mutation(app, "wblock", request.json(), document_id, counter, 200),
-        ("POST", ["images"]) => {
-            run_mutation(app, "embed_image", request.json(), document_id, counter, 201)
-        }
-        ("POST", ["commands"]) => {
-            let body = request.json();
-            let response = app.automation_op(&json!({"op":"run","cmd":body["cmd"]}).to_string());
-            (map_status(response.clone(), false), response)
-        }
+        ("DELETE", ["entities", handle, "xdata", app_name]) => Plan::Mutate {
+            op: "xdata_set".into(),
+            fields: json!({"handles":[handle], "app": app_name, "data": []}),
+            created: 200,
+        },
+        ("POST", ["blocks"]) => Plan::Mutate { op: "block_define".into(), fields: body, created: 201 },
+        ("DELETE", ["blocks", name]) =>
+            Plan::Mutate { op: "block_delete".into(), fields: json!({"name": name}), created: 200 },
+        ("POST", ["file-identity"]) =>
+            Plan::Mutate { op: "file_identity".into(), fields: body, created: 200 },
+        ("POST", ["plot"]) => Plan::Mutate { op: "plot".into(), fields: body, created: 200 },
+        ("POST", ["wblock"]) => Plan::Mutate { op: "wblock".into(), fields: body, created: 200 },
+        ("POST", ["images"]) => Plan::Mutate { op: "embed_image".into(), fields: body, created: 201 },
+        ("POST", ["commands"]) => Plan::Run {
+            request: json!({"op":"run","cmd":body["cmd"]}),
+            created: 200,
+        },
         ("POST", ["undo"]) | ("POST", ["redo"]) => {
             let op = if rest == ["undo"] { "undo" } else { "redo" };
-            let response = app.automation_op(&json!({"op":op}).to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: json!({"op":op}), created: 200 }
         }
         ("POST", ["save"]) => {
-            let body = request.json();
             let mut request_json = json!({"op":"save"});
             if let Some(path) = body["path"].as_str() {
                 request_json["path"] = json!(path);
             }
-            let response = app.automation_op(&request_json.to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: request_json, created: 200 }
         }
-        ("GET", ["layers"]) => {
-            let response = app.automation_op(r#"{"op":"layers"}"#);
-            (map_status(response.clone(), false), response)
-        }
-        ("GET", ["header"]) => {
-            let response = app.automation_op(r#"{"op":"header"}"#);
-            (map_status(response.clone(), false), response)
-        }
+        ("GET", ["layers"]) => Plan::Run { request: json!({"op":"layers"}), created: 200 },
+        ("GET", ["header"]) => Plan::Run { request: json!({"op":"header"}), created: 200 },
         ("GET", ["records"]) => {
             let mut request_json = json!({"op":"records"});
             if let Some(v) = request.param("collection") { request_json["collection"] = json!(v); }
             if let Some(v) = request.param("type") { request_json["type"] = json!(v); }
             if let Some(v) = request.param("offset") { request_json["offset"] = json!(v); }
             if let Some(v) = request.param("limit") { request_json["limit"] = json!(v); }
-            let response = app.automation_op(&request_json.to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: request_json, created: 200 }
         }
-        ("GET", ["openapi"]) => {
-            (200, serde_json::from_str(include_str!("rest_openapi.json")).unwrap_or(json!({})))
-        }
-        ("POST", [op]) if ENVELOPE_OPS.contains(op) => {
-            run_mutation(app, op, request.json(), document_id, counter, 200)
-        }
+        ("GET", ["openapi"]) => Plan::Local(
+            200,
+            serde_json::from_str(include_str!("rest_openapi.json")).unwrap_or(json!({})),
+        ),
+        ("POST", [op]) if ENVELOPE_OPS.contains(op) =>
+            Plan::Mutate { op: op.to_string(), fields: body, created: 200 },
         ("POST", [op]) => {
-            let mut body = request.json();
-            if !body.is_object() {
-                body = json!({});
-            }
             let mut request_json = body;
             request_json["op"] = json!(op);
-            let response = app.automation_op(&request_json.to_string());
-            (map_status(response.clone(), false), response)
+            Plan::Run { request: request_json, created: 200 }
         }
-        (method, _) if matches!(method, "GET" | "POST" | "PUT" | "DELETE") => (
-            404,
-            json!({"ok": false, "code": "unknown_route", "error": format!("No route {method} {path}")}),
-        ),
-        _ => (
+        (method, _) if matches!(method, "GET" | "POST" | "PUT" | "DELETE") => {
+            let path = request.path.trim_end_matches('/');
+            let path = if path.is_empty() { "/" } else { path };
+            Plan::Local(
+                404,
+                json!({"ok": false, "code": "unknown_route", "error": format!("No route {method} {path}")}),
+            )
+        }
+        _ => Plan::Local(
             405,
             json!({"ok": false, "code": "method_not_allowed", "error": format!("{method} not supported here")}),
         ),
+    }
+}
+
+/// The headless executor: run a resolved plan against this server's private
+/// app. The GUI-hosted bridge runs the same plans over its envelope queue.
+fn route(
+    app: &mut OpenCADStudio,
+    request: &HttpRequest,
+    document_id: &mut Option<u64>,
+    counter: &mut u64,
+) -> (u16, Value) {
+    let path = request.path.trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segments.first() != Some(&"api") || segments.get(1) != Some(&"v1") {
+        return (404, json!({"ok": false, "code": "unknown_route", "error": "Use /api/v1/…"}));
+    }
+    match plan(&request.method, &segments[2..], request) {
+        Plan::Local(status, body) => (status, body),
+        Plan::Ready => {
+            let state = app.automation_op(r#"{"protocol":1,"op":"state"}"#);
+            harvest(document_id, &state);
+            (200, json!({
+                "ok": true,
+                "ready": true,
+                "version": state["version"],
+                "session_id": state["session_id"],
+                "document_id": state["document_id"],
+            }))
+        }
+        Plan::Run { request, created } => {
+            let response = app.automation_op(&request.to_string());
+            harvest(document_id, &response);
+            (map_status(response.clone(), created == 201), response)
+        }
+        Plan::Mutate { op, fields, created } => {
+            run_mutation(app, &op, fields, document_id, counter, created)
+        }
+    }
+}
+
+/// Track the active document from automation responses so later mutations
+/// address it without the caller repeating `document_id`.
+fn harvest(document_id: &mut Option<u64>, response: &Value) {
+    let id = response
+        .get("document_id")
+        .and_then(Value::as_u64)
+        .or_else(|| response["state"]["document_id"].as_u64());
+    if let Some(id) = id {
+        *document_id = Some(id);
     }
 }
 
@@ -513,14 +523,15 @@ fn run_mutation(
     counter: &mut u64,
     created: u16,
 ) -> (u16, Value) {
-    let mut attempt = |app: &mut OpenCADStudio, id: u64, document_id: Option<u64>| -> Value {
+    let mut attempt = |app: &mut OpenCADStudio, id: u64, document_id: &mut Option<u64>| -> Value {
         *counter += 1;
+        let cached = *document_id;
         let mut envelope = json!({
             "protocol": 1,
             "op": op,
             "request_id": format!("http-{id}-{}", *counter),
         });
-        if let Some(id) = document_id {
+        if let Some(id) = cached {
             envelope["document_id"] = json!(id);
         }
         if let Some(object) = fields.as_object_mut() {
@@ -529,17 +540,19 @@ fn run_mutation(
             }
         }
         let response = app.automation_op(&envelope.to_string());
+        // Track the active document before the snapshot is stripped below.
+        harvest(document_id, &response);
         compact(response)
     };
 
     let id = u64::from(std::process::id());
-    let mut response = attempt(app, id, *document_id);
+    let mut response = attempt(app, id, document_id);
     let code = response["code"].as_str().unwrap_or("");
     if response["ok"] == false && RETRYABLE.contains(&code) {
         if let Some(state) = fetch_state(app) {
             *document_id = Some(state);
         }
-        response = attempt(app, id, *document_id);
+        response = attempt(app, id, document_id);
     }
     let status = map_status(response.clone(), created == 201);
     (if status == 200 { created } else { status }, response)

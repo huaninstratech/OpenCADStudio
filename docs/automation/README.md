@@ -259,25 +259,31 @@ curl http://127.0.0.1:8090/api/v1/ready
 ### GUI-hosted REST channel (`--http` + file)
 
 `OpenCADStudio.exe "<file>" --http 8090` boots the **normal editor** and
-hosts a small loopback REST channel on this very process, bound to
-`http://127.0.0.1:8090/api/v1`. This is the "lấy mẫu" (sampling) flow for
-clients that need a human in the loop: open the drawing, let the person
-select entities with the normal gestures, then read them back over HTTP.
+hosts a loopback REST channel on this very process, bound to
+`http://127.0.0.1:8090/api/v1`: the **full REST API aimed at the live
+session** — control the drawing (create, move, plot, query, records, …)
+while the person keeps working, plus two person-in-the-loop picks only this
+process can answer. Routes resolve through the same table as the headless
+server, with the same ergonomics.
 
-The channel is deliberately **read-only** — it serves:
+`GET /api/v1/state` caches the active `document_id` and later mutations
+address the drawing without the caller repeating it; a stale cache (the
+person switched documents) costs one state refresh and a retry, not an
+error. `session_id` is not needed (the channel has no descriptor handshake;
+a guessed value is stripped). Unknown POST paths are treated as automation
+ops and forwarded — MCP-style, any op works; truly unrouted paths answer
+`404 {"code":"unknown_route"}`.
+
+On top of the shared surface, two **person-in-the-loop** picks exist only
+on this channel — they need the GUI and the person at the screen:
 
 | Call | Purpose |
 |---|---|
-| `POST /api/v1/get_selection` | Snapshot of the current selection (below). |
 | `POST /api/v1/getpoint` | Ask the person to pick one point; the connection stays open until they click (or Esc). |
-| `GET /api/v1/state` · `/api/v1/capabilities` | Session discovery (`document_id`, command state). |
-| `OPTIONS *` | CORS preflight → **204**. |
+| `POST /api/v1/user_select` | Ask the person to pick a sample set; the connection stays open until they press Enter (or Esc). |
 
-Anything else answers `403 {"code":"read_only_channel"}` — use the headless
-server or the automation bridge for mutations. `session_id` is not needed
-(the channel has no descriptor handshake; a guessed value is stripped).
-Requests run one thread per connection, so a parked `getpoint` never blocks
-other reads; a `getpoint` may park up to 30 minutes before the bridge
+Requests run one thread per connection, so a parked `getpoint`/`user_select`
+never blocks other calls; a pick may park up to 30 minutes before the bridge
 answers `response_timeout`.
 
 **`getpoint`** — `{"prompt"}` is optional (shown on the command line):
@@ -291,6 +297,29 @@ point a command would receive; **Escape** (or `{"op":"cancel"}`) answers
 `{"ok":true,"status":"cancelled","result":{"cancelled":true}}`. While the
 pick is pending, other mutations wait (`busy`), so `status:"running"` on a
 poll means the person has not clicked yet.
+
+**`user_select`** — ssget-style sampling: the person picks entities with the
+normal gestures, **Enter** confirms, **Escape** cancels. The request body is
+the `user_select` op verbatim (`type`/`layer` filter what counts as picked,
+`prompt` replaces the command-line hint, `detail` is `summary`/`geometry`/
+`full`, `clear` starts a fresh selection — all optional):
+
+```json
+POST /api/v1/user_select
+{"request_id":"sample-1","type":"LINE","prompt":"Chọn đối tượng mẫu","detail":"full","clear":true}
+```
+
+The connection stays open while the person picks and answers with the same
+payload the MCP/native callers see:
+
+```json
+{"ok":true,"status":"completed","result":{"cancelled":false,"count":1,"ignored":0,
+ "handles":["2A"],"entities":[{"handle":"2A","type":"Line","layer":"0","start":[0,0,0],"end":[10,10,0],…}]}}
+```
+
+Escape (or `{"op":"cancel"}`) answers `status:"cancelled"` with
+`{"cancelled":true,"count":0}`. Picks outside the `type`/`layer` filter are
+deselected and reported in `ignored`.
 
 **`get_selection` response** — `handle`/`type`/`layer`/`bounds` match the
 `query` output exactly so clients share one parser; `text` is the

@@ -1,21 +1,23 @@
 //! Loopback REST channel hosted by the GUI process. `OpenCADStudio.exe
 //! "<file>" --http <port>` boots the normal editor AND serves this bridge, so
-//! a client can open a drawing, let the person at the screen pick sample
-//! entities, and read them back with `get_selection` over plain HTTP —
-//! something the headless `--http` server cannot do (it owns a private,
-//! window-less app). Requests are forwarded into the GUI's automation queue
-//! (`Envelope`, exactly like the native bridge in `transport`); the JSON
-//! response is written back over HTTP. The channel is deliberately
-//! read-only: a local process that can reach the port must not be able to
-//! mutate the drawing a person is working on.
+//! a client gets the full REST surface of `--http` — create, move, plot,
+//! query, everything the headless server does — aimed at the drawing the
+//! person at the screen is working on, plus the two interactive operations
+//! only this process can answer (`getpoint`, `user_select`: the person
+//! picks, and the HTTP connection is the thing that waits). Routes resolve
+//! through the same `rest::plan` table as the headless server; requests are
+//! forwarded into the GUI's automation queue (`Envelope`, exactly like the
+//! native bridge in `transport`) and the JSON response is written back over
+//! HTTP. The channel binds loopback only — anything that can reach the port
+//! can drive the session, exactly like the headless server.
 
 use super::{Envelope, Reply};
-use crate::rest::{self, HttpRequest};
+use crate::rest::{self, HttpRequest, Plan, RETRYABLE};
 use iced::futures::{channel::mpsc, Stream};
 use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicU16, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Port handed over by `main` when the GUI hosts the channel. Set before the
@@ -55,9 +57,14 @@ fn listen(
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     bound_port.store(listener.local_addr()?.port(), Ordering::SeqCst);
     eprintln!("OpenCADStudio GUI REST listening on http://127.0.0.1:{port}/api/v1");
-    // One thread per connection: a `getpoint` request stays open until the
-    // person answers, and must not block the other reads (get_selection…).
+    // One thread per connection: a `getpoint` or `user_select` request stays
+    // open until the person answers, and must not block the other reads
+    // (get_selection…).
     let clients = Arc::new(AtomicUsize::new(0));
+    // One document-id cache for the whole listener: a state read primes it,
+    // later mutations address the live drawing without the caller repeating
+    // the id — the same ergonomics as the headless server.
+    let document_cache: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     for stream in listener.incoming().flatten() {
         if clients.fetch_add(1, Ordering::SeqCst) >= 8 {
             clients.fetch_sub(1, Ordering::SeqCst);
@@ -65,6 +72,7 @@ fn listen(
         }
         let clients = clients.clone();
         let sender = sender.clone();
+        let document_cache = document_cache.clone();
         std::thread::spawn(move || {
             let mut stream = stream;
             let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
@@ -73,7 +81,7 @@ fn listen(
                 if request.method == "OPTIONS" {
                     let _ = rest::write_response(&mut stream, 204, &Value::Null);
                 } else {
-                    let (status, body) = forward(&request, &sender);
+                    let (status, body) = forward(&request, &sender, &document_cache);
                     let _ = rest::write_response(&mut stream, status, &body);
                 }
             }
@@ -83,88 +91,172 @@ fn listen(
     Ok(())
 }
 
-/// The (method, path) pairs this channel serves, with how long one request
-/// may wait for the GUI's answer. Reads only — `get_selection` is the read
-/// back, `getpoint` parks until the person clicks (or presses Escape); a
-/// long wait is the point, so pollers see `running` the whole time. Anything
-/// else is refused before it can touch the GUI.
-fn route(method: &str, segments: &[&str]) -> Option<(&'static str, u64)> {
-    const PICK_WAIT_SECS: u64 = 30 * 60;
-    match (method, segments) {
-        ("POST", ["get_selection"]) => Some(("get_selection", 15)),
-        ("POST", ["getpoint"]) => Some(("getpoint", PICK_WAIT_SECS)),
-        ("GET", ["state"] | ["documents"]) => Some(("state", 15)),
-        ("GET", ["capabilities"]) => Some(("capabilities", 15)),
-        _ => None,
+/// How long one request may hold its connection. The interactive picks wait
+/// for the person; everything else bounds a slow op (plot, open a large
+/// drawing) without wedging the connection forever.
+const DEFAULT_WAIT_SECS: u64 = 300;
+const PICK_WAIT_SECS: u64 = 30 * 60;
+
+fn forward(
+    request: &HttpRequest,
+    sender: &mpsc::Sender<Envelope>,
+    document_cache: &Mutex<Option<u64>>,
+) -> (u16, Value) {
+    let path = request.path.trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segments.first() != Some(&"api") || segments.get(1) != Some(&"v1") {
+        return (404, json!({"ok": false, "code": "unknown_route", "error": "Use /api/v1/…"}));
+    }
+    let plan = rest::plan(&request.method, &segments[2..], request);
+    // The picks park until the person answers; an `operation` call is itself
+    // a poll and must come straight back.
+    let wait = match plan.op() {
+        Some("getpoint" | "user_select") => PICK_WAIT_SECS,
+        Some("operation") | None => 15,
+        Some(_) => DEFAULT_WAIT_SECS,
+    };
+    match plan {
+        Plan::Local(status, body) => (status, body),
+        Plan::Ready => {
+            let state = transact(sender, json!({"protocol":1,"op":"state"}), wait);
+            harvest(document_cache, &state);
+            (200, json!({
+                "ok": true,
+                "ready": true,
+                "version": state["version"],
+                "session_id": state["session_id"],
+                "document_id": state["document_id"],
+            }))
+        }
+        Plan::Run { request, created } => {
+            let response = transact(sender, prepare(request), wait);
+            harvest(document_cache, &response);
+            (rest::map_status(response.clone(), created == 201), response)
+        }
+        Plan::Mutate { op, fields, created } => {
+            let cached = *document_cache.lock().unwrap();
+            let mut response = transact(sender, mutate_request(&op, &fields, cached), wait);
+            let code = response["code"].as_str().unwrap_or("");
+            if response["ok"] == false && RETRYABLE.contains(&code) {
+                // The cache is behind the live GUI; refresh from a state read
+                // and retry once, exactly like the headless server.
+                let state = transact(sender, json!({"protocol":1,"op":"state"}), wait);
+                harvest(document_cache, &state);
+                let cached = *document_cache.lock().unwrap();
+                response = transact(sender, mutate_request(&op, &fields, cached), wait);
+            }
+            harvest(document_cache, &response);
+            let status = rest::map_status(response.clone(), created == 201);
+            (if status == 200 { created } else { status }, compact(response))
+        }
     }
 }
 
-fn forward(request: &HttpRequest, sender: &mpsc::Sender<Envelope>) -> (u16, Value) {
-    let path = request.path.trim_start_matches("/api/v1");
-    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let (op, wait) = match route(&request.method, &segments) {
-        Some(route) => route,
-        None => return (403, json!({"ok":false,"code":"read_only_channel","error":"The GUI-hosted --http channel serves reads only: POST get_selection, POST getpoint, GET state, GET capabilities"})),
-    };
-    let mut request_json = request.json();
-    if !request_json.is_object() {
-        request_json = json!({});
-    }
-    request_json["op"] = json!(op);
-    // The HTTP channel has no descriptor handshake — drop whatever the caller
-    // guesses for session_id so the pipeline's session check stays silent.
-    if let Some(object) = request_json.as_object_mut() {
-        object.remove("session_id");
-    }
-    request_json["protocol"] = json!(1);
-    if request_json["request_id"].as_str().is_none_or(str::is_empty) {
-        let serial = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        request_json["request_id"] = json!(format!("gui-http-{serial}"));
-    }
+/// One envelope round trip: queue the request into the GUI and wait up to
+/// `wait_secs` for its reply.
+fn call(sender: &mpsc::Sender<Envelope>, request: Value, wait_secs: u64) -> Option<Value> {
     let (reply, response) = std::sync::mpsc::channel();
-    if sender
+    sender
         .clone()
         .try_send(Envelope {
-            request: request_json,
+            request,
             reply: Reply::Native(reply),
         })
-        .is_err()
+        .ok()?;
+    response.recv_timeout(Duration::from_secs(wait_secs)).ok()
+}
+
+/// Send one request and hold the connection for the GUI's answer.
+/// Interactive requests (`getpoint`, `user_select`) and async ops answer
+/// `accepted` first and only complete when the person at the screen acts or
+/// the task finishes; poll the operation on the caller's behalf so the HTTP
+/// connection is the one thing that waits.
+fn transact(sender: &mpsc::Sender<Envelope>, request: Value, wait: u64) -> Value {
+    let Some(mut response) = call(sender, request, wait) else {
+        return json!({"ok":false,"code":"response_timeout","error":"The GUI did not answer in time"});
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    while matches!(response["status"].as_str(), Some("accepted" | "running"))
+        && std::time::Instant::now() < deadline
     {
-        return (503, json!({"ok":false,"code":"busy","error":"GUI queue full"}));
-    }
-    let mut response = response
-        .recv_timeout(Duration::from_secs(15))
-        .unwrap_or_else(|_| {
-            json!({"ok":false,"code":"response_timeout","error":"The GUI did not answer in time"})
-        });
-    // Interactive requests (`getpoint`) answer `accepted` first and only
-    // complete when the person at the screen acts. Poll the operation on the
-    // caller's behalf so the HTTP connection is the one thing that waits.
-    if matches!(response["status"].as_str(), Some("accepted" | "running")) {
+        std::thread::sleep(Duration::from_millis(100));
         let request_id = response["request_id"].clone();
-        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
-        while matches!(response["status"].as_str(), Some("accepted" | "running"))
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(100));
-            let (poll_reply, poll_rx) = std::sync::mpsc::channel();
-            if sender
-                .clone()
-                .try_send(Envelope {
-                    request: json!({"protocol":1,"op":"operation","request_id":request_id}),
-                    reply: Reply::Native(poll_reply),
-                })
-                .is_err()
-            {
-                break;
-            }
-            match poll_rx.recv_timeout(Duration::from_secs(15)) {
-                Ok(poll) => response = poll,
-                Err(_) => break,
-            }
+        let Some(poll) = call(
+            sender,
+            json!({"protocol":1,"op":"operation","request_id":request_id}),
+            15,
+        ) else {
+            break;
+        };
+        response = poll;
+    }
+    response
+}
+
+/// The bridge has no descriptor handshake: drop any guessed `session_id`,
+/// stamp protocol 1, and give requests without one a bridge request id.
+fn prepare(mut request: Value) -> Value {
+    if !request.is_object() {
+        request = json!({});
+    }
+    if let Some(object) = request.as_object_mut() {
+        object.remove("session_id");
+    }
+    request["protocol"] = json!(1);
+    if request["request_id"].as_str().is_none_or(str::is_empty) {
+        let serial = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        request["request_id"] = json!(format!("gui-http-{serial}"));
+    }
+    request
+}
+
+/// Build the mutation envelope: a request id (the caller's wins), the cached
+/// `document_id`, then the body fields on top.
+fn mutate_request(op: &str, fields: &Value, document_id: Option<u64>) -> Value {
+    let mut envelope = json!({"protocol":1,"op":op});
+    if let Some(id) = document_id {
+        envelope["document_id"] = json!(id);
+    }
+    if let Some(object) = fields.as_object() {
+        for (key, value) in object {
+            envelope[key] = value.clone();
         }
     }
-    (rest::map_status(response.clone(), false), response)
+    if envelope["request_id"].as_str().is_none_or(str::is_empty) {
+        let serial = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        envelope["request_id"] = json!(format!("gui-http-{serial}"));
+    }
+    if let Some(object) = envelope.as_object_mut() {
+        object.remove("session_id");
+    }
+    envelope
+}
+
+/// Track the active document from responses (state reads and settle
+/// snapshots both carry it) so later mutations address the live drawing.
+fn harvest(document_cache: &Mutex<Option<u64>>, response: &Value) {
+    let id = response
+        .get("document_id")
+        .and_then(Value::as_u64)
+        .or_else(|| response["state"]["document_id"].as_u64());
+    if let Some(id) = id {
+        *document_cache.lock().unwrap() = Some(id);
+    }
+}
+
+/// Drop the bulky `state` snapshot from mutation answers, like the headless
+/// server; clients read it explicitly from GET /state.
+fn compact(response: Value) -> Value {
+    if let Some(object) = response.as_object() {
+        let trimmed: serde_json::Map<String, Value> = object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "state")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        return Value::Object(trimmed);
+    }
+    response
 }
 
 #[cfg(test)]
@@ -229,10 +321,10 @@ mod tests {
     }
 
     #[test]
-    fn bridge_serves_get_selection_over_http_and_refuses_writes() {
+    fn bridge_serves_get_selection_over_http_and_refuses_unknown_paths() {
         let mut app = OpenCADStudio::new_for_test();
         app.main_window = Some(iced::window::Id::unique());
-        app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
+        let _ = app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
         app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,10"}"#);
         let handle = app.automation_op(r#"{"op":"query","type":"LINE","detail":"summary"}"#)
             ["entities"][0]["handle"]
@@ -274,19 +366,37 @@ mod tests {
         assert!(body["result"]["entities"][0]["bounds"].is_object(), "{body}");
         assert_eq!(body["result"]["entities"][0]["type"], "Line");
 
-        // Writes are refused on this channel even though the op exists; the
-        // bridge answers them locally without waking the GUI.
-        let mut stream = post(port, "/api/v1/entities_delete", "{}");
+        // Unrouted paths are refused locally; the GUI is never woken for
+        // them. (Unknown POSTs are op attempts and DO reach the pipeline,
+        // same as the headless server.)
+        let mut stream = get(port, "/api/v1/nope");
         let (status, body) = read_response(&mut stream);
-        assert_eq!(status, 403);
-        assert_eq!(body["code"], "read_only_channel", "{body}");
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], "unknown_route", "{body}");
+    }
+
+    /// GET without a body — the read half of the REST surface.
+    fn get(port: u16, target: &str) -> std::net::TcpStream {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let http = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        stream.write_all(http.as_bytes()).unwrap();
+        stream
+    }
+
+    /// Answer the next `count` envelopes the way the live GUI would.
+    fn drain(app: &mut OpenCADStudio, receiver: &mut mpsc::Receiver<Envelope>, count: usize) {
+        for _ in 0..count {
+            let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+            let reply = app.control_request(envelope.request.clone()).0;
+            envelope.reply.send(reply);
+        }
     }
 
     #[test]
     fn bridge_parks_getpoint_without_blocking_other_reads() {
         let mut app = OpenCADStudio::new_for_test();
         app.main_window = Some(iced::window::Id::unique());
-        app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
+        let _ = app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
         app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,10"}"#);
         let handle = app.automation_op(r#"{"op":"query","type":"LINE","detail":"summary"}"#)
             ["entities"][0]["handle"]
@@ -324,7 +434,7 @@ mod tests {
                 envelope.reply.send(reply);
                 app.tabs[app.active_tab].last_cursor_world =
                     glam::DVec3::new(1.5, 2.5, 0.0);
-                app.update(crate::app::Message::ViewportLeftPress);
+                let _ = app.update(crate::app::Message::ViewportLeftPress);
             } else if envelope.request["op"] == "get_selection" {
                 envelope.reply.send(reply);
                 let (status, body) = read_response(&mut sel_conn);
@@ -346,5 +456,174 @@ mod tests {
         assert_eq!(point_body["status"], "completed", "{point_body}");
         assert_eq!(point_body["result"]["point"], json!([1.5, 2.5, 0.0]));
         assert!(sel_body.is_null());
+    }
+
+    #[test]
+    fn bridge_parks_user_select_until_the_person_answers() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        let _ = app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,10"}"#);
+        let handle = app.automation_op(r#"{"op":"query","type":"LINE","detail":"summary"}"#)
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
+        let bound = Arc::new(AtomicU16::new(0));
+        let listen_bound = bound.clone();
+        std::thread::spawn(move || listen(sender, 0, listen_bound).unwrap());
+        let port = wait_for_bridge(&bound);
+
+        // Park one `user_select` POST; the test plays the person at the
+        // screen: accept, pick, then press Enter (confirm) or Escape
+        // (cancel), and read the final HTTP answer the client receives.
+        fn park_and_answer(
+            app: &mut OpenCADStudio,
+            receiver: &mut mpsc::Receiver<Envelope>,
+            port: u16,
+            body: &str,
+            confirm: bool,
+            handle: &str,
+        ) -> (u16, Value) {
+            let mut conn = post(port, "/api/v1/user_select", body);
+            let handle_value = u64::from_str_radix(handle, 16).unwrap();
+            let mut polls = 0usize;
+            loop {
+                let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+                let reply = app.control_request(envelope.request.clone()).0;
+                if envelope.request["op"] == "user_select" {
+                    // The GUI accepted the pick; the bridge now polls
+                    // `operation` until the person answers.
+                    assert_eq!(reply["status"], "accepted", "{reply}");
+                    envelope.reply.send(reply);
+                    app.tabs[app.active_tab]
+                        .scene
+                        .select_entity(acadrust::Handle::new(handle_value), false);
+                    let _ = app.update(if confirm {
+                        crate::app::Message::CommandFinalize
+                    } else {
+                        crate::app::Message::CommandEscape
+                    });
+                } else {
+                    // An `operation` poll from the parked user_select
+                    // connection: relay it until it settles.
+                    polls += 1;
+                    assert!(polls < 100, "user_select never settled: {reply}");
+                    envelope.reply.send(reply.clone());
+                    if reply["status"] != "running" {
+                        return read_response(&mut conn);
+                    }
+                }
+            }
+        }
+
+        // Enter after picking the line hands the picked set back with full
+        // entity data, the same contract the MCP/native callers see.
+        let (status, body) = park_and_answer(
+            &mut app,
+            &mut receiver,
+            port,
+            r#"{"request_id":"us-http","type":"LINE","prompt":"Chọn đối tượng mẫu","detail":"full","clear":true}"#,
+            true,
+            &handle,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "completed", "{body}");
+        assert_eq!(body["result"]["cancelled"], false);
+        assert_eq!(body["result"]["count"], 1);
+        assert_eq!(body["result"]["handles"][0], json!(handle));
+        assert_eq!(body["result"]["entities"][0]["handle"], handle.as_str());
+        assert_eq!(body["result"]["entities"][0]["type"], "Line");
+        assert_eq!(body["result"]["entities"][0]["layer"], "0");
+
+        // Escape answers with the cancelled contract over the same route.
+        let (status, body) = park_and_answer(
+            &mut app,
+            &mut receiver,
+            port,
+            r#"{"request_id":"us-http-esc","prompt":"Chọn lại"}"#,
+            false,
+            &handle,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "cancelled", "{body}");
+        assert_eq!(body["result"]["cancelled"], true);
+        assert_eq!(body["result"]["count"], 0);
+    }
+
+    #[test]
+    fn bridge_runs_the_full_rest_surface_against_the_live_gui() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        let _ = app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
+
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
+        let bound = Arc::new(AtomicU16::new(0));
+        let listen_bound = bound.clone();
+        std::thread::spawn(move || listen(sender, 0, listen_bound).unwrap());
+        let port = wait_for_bridge(&bound);
+
+        // GET /state primes the document-id cache; the mutations below carry
+        // no document_id of their own.
+        let mut state_conn = get(port, "/api/v1/state");
+        drain(&mut app, &mut receiver, 1);
+        let (status, body) = read_response(&mut state_conn);
+        assert_eq!(status, 200, "{body}");
+        assert!(body["document_id"].is_u64(), "{body}");
+
+        // CREATE through the headless REST URL: 201 with handles, the cached
+        // document id addressed for us.
+        let mut create_conn = post(
+            port,
+            "/api/v1/entities",
+            r#"{"entities":[{"type":"Line","start":[0,0],"end":[10,0]}]}"#,
+        );
+        drain(&mut app, &mut receiver, 1);
+        let (status, body) = read_response(&mut create_conn);
+        assert_eq!(status, 201, "{body}");
+        let handle = body["result"]["handles"][0].as_str().unwrap().to_owned();
+
+        // MOVE it through the same URL the headless server serves.
+        let mut move_conn = post(
+            port,
+            "/api/v1/entities/transform",
+            &format!(r#"{{"handles":["{handle}"],"action":"move","vector":[5,0]}}"#),
+        );
+        drain(&mut app, &mut receiver, 1);
+        let (status, body) = read_response(&mut move_conn);
+        assert_eq!(status, 200, "{body}");
+        let mut query_conn = get(port, "/api/v1/entities?type=Line&detail=full");
+        drain(&mut app, &mut receiver, 1);
+        let (_, body) = read_response(&mut query_conn);
+        assert_eq!(body["entities"][0]["start"], json!([5.0, 0.0, 0.0]), "{body}");
+
+        // A stale cache (the person switched documents) costs one state
+        // refresh and a retry, not an error.
+        let fresh = app.push_test_document();
+        let _ = app.control_request(
+            json!({"protocol":1,"op":"activate","document_id":fresh,"request_id":"a1"}),
+        );
+        let mut stale_conn = post(
+            port,
+            "/api/v1/entities",
+            r#"{"entities":[{"type":"Circle","center":[0,0],"radius":1}]}"#,
+        );
+        // mutate refused (stale) → state read → retry succeeds.
+        drain(&mut app, &mut receiver, 3);
+        let (status, body) = read_response(&mut stale_conn);
+        assert_eq!(status, 201, "{body}");
+
+        // The plain op passthrough works too — MCP-style, explicit
+        // document_id, any op the automation surface knows.
+        let mut run_conn = post(
+            port,
+            "/api/v1/run",
+            &format!(r#"{{"document_id":{fresh},"cmd":"CIRCLE 5,5 2"}}"#),
+        );
+        drain(&mut app, &mut receiver, 1);
+        let (status, body) = read_response(&mut run_conn);
+        assert_eq!(status, 200, "{body}");
     }
 }
