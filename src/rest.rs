@@ -26,11 +26,16 @@ use crate::app::OpenCADStudio;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Serial for request ids stamped onto `POST /api/v1/{op}` passthroughs that
+/// arrive without one — the protocol-1 envelope requires a unique id, and
+/// the caller's own id always wins when present.
+static PASSTHROUGH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Connections served at once. A client that connects and stalls pins one
 /// thread until its idle timeout, not the whole listener.
@@ -518,6 +523,16 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         ("POST", [op]) => {
             let mut request_json = body;
             request_json["op"] = json!(op);
+            // Stamp protocol and a request id the way the GUI bridge's
+            // `prepare` does: the passthrough exists for ops only the
+            // protocol-1 envelope knows (`user_select`, `operation`,
+            // `cancel`), and unstamped they die as "unknown op" on the
+            // legacy path instead of answering with their real contract.
+            request_json["protocol"] = json!(1);
+            if request_json["request_id"].as_str().is_none_or(str::is_empty) {
+                let serial = PASSTHROUGH_SERIAL.fetch_add(1, Ordering::Relaxed);
+                request_json["request_id"] = json!(format!("rest-{serial}"));
+            }
             Plan::Run { request: request_json, created: 200 }
         }
         (method, _) if matches!(method, "GET" | "POST" | "PUT" | "DELETE") => {
@@ -729,6 +744,36 @@ mod tests {
         assert_eq!(map_status(json!({"ok": false, "code": "stale_state"}), false), 409);
         assert_eq!(map_status(json!({"ok": false, "code": "busy"}), false), 503);
         assert_eq!(map_status(json!({"ok": false, "code": "invalid_point"}), false), 400);
+    }
+
+    /// The generic `POST /api/v1/{op}` passthrough must reach the protocol-1
+    /// envelope: ops like `user_select`/`operation`/`cancel` only exist
+    /// there, and unstamped they died as "unknown op" on the legacy path.
+    #[test]
+    fn passthrough_reaches_envelope_only_ops() {
+        let mut app = OpenCADStudio::new();
+        app.automation_op(r#"{"op":"new"}"#);
+        let mut document_id: Option<u64> = None;
+        let mut counter: u64 = 0;
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/user_select", r#"{"request_id":"us-headless"}"#),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["code"], "gui_required", "{body}");
+
+        // `operation` is a query: an unknown id answers `unknown_operation`,
+        // not "unknown op".
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/operation", r#"{"request_id":"gone"}"#),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], "unknown_operation", "{body}");
     }
 
     #[test]
