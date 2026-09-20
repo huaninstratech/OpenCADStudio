@@ -82,6 +82,10 @@ impl OpenCADStudio {
         )
         .into_owned();
         self.command_line.push_info(&label);
+        eprintln!(
+            "[pick] user_select {}: start -- waiting for the person (Enter confirms, Esc cancels)",
+            display_id(&request_id)
+        );
         self.control.user_select = Some(UserSelectSession {
             request_id,
             document_id: self.tabs[i].id,
@@ -112,6 +116,10 @@ impl OpenCADStudio {
                 )
                 .as_ref(),
             );
+            eprintln!(
+                "[pick] user_select {}: the person pressed Esc -- cancelled",
+                display_id(&session.request_id)
+            );
             self.finish_interactive(
                 "user_select",
                 &session.request_id,
@@ -125,6 +133,10 @@ impl OpenCADStudio {
             .iter()
             .position(|tab| tab.id == session.document_id);
         let Some(i) = index else {
+            eprintln!(
+                "[pick] user_select {}: document closed -- cancelled",
+                display_id(&session.request_id)
+            );
             self.finish_interactive(
                 "user_select",
                 &session.request_id,
@@ -192,6 +204,11 @@ impl OpenCADStudio {
             )
             .as_ref(),
         );
+        eprintln!(
+            "[pick] user_select {}: the person confirmed -- {} object(s) handed over",
+            display_id(&session.request_id),
+            count
+        );
         self.finish_interactive(
             "user_select",
             &session.request_id,
@@ -251,6 +268,10 @@ impl OpenCADStudio {
         )
         .into_owned();
         self.command_line.push_info(&label);
+        eprintln!(
+            "[pick] getpoint {}: start -- waiting for the person (Click confirms, Esc cancels)",
+            display_id(&request_id)
+        );
         self.control.get_point = Some(UserPointSession {
             request_id,
             document_id: self.tabs[i].id,
@@ -283,6 +304,17 @@ impl OpenCADStudio {
             )
             .as_ref(),
         );
+        match point {
+            Some(point) => eprintln!(
+                "[pick] getpoint {}: the person picked {:?}",
+                display_id(&session.request_id),
+                point
+            ),
+            None => eprintln!(
+                "[pick] getpoint {}: the person pressed Esc -- cancelled",
+                display_id(&session.request_id)
+            ),
+        }
         self.finish_interactive("getpoint", &session.request_id, cancelled, result);
     }
 
@@ -355,5 +387,16 @@ impl OpenCADStudio {
             "status": "completed",
             "result": {"count": entities.len(), "entities": entities},
         })
+    }
+}
+
+/// Stable diagnostic name for a request that arrived without an id, shared
+/// by the on-screen label and the stderr `[pick]` lifecycle lines so the
+/// client's own log can be cross-referenced line for line.
+fn display_id(request_id: &str) -> &str {
+    if request_id.is_empty() {
+        "client"
+    } else {
+        request_id
     }
 }

@@ -10,8 +10,12 @@
 //!
 //! Conventions: one request per connection (`Connection: close`), JSON
 //! bodies, permissive CORS for local browser clients, loopback bind only.
-//! Mutation endpoints get a server-generated `request_id` and the active
-//! `document_id`; a stale-state refusal refreshes state and retries once.
+//! Connections are served one thread each: a slow op (plot, open a large
+//! drawing) or a client that connects and stalls must never keep other
+//! callers — `state`, `get_selection`, `cancel`, `operation` — from being
+//! answered. Mutation endpoints get a server-generated `request_id` and the
+//! active `document_id`; a stale-state refusal refreshes state and retries
+//! once.
 //!
 //! The route table is shared: `plan` resolves (method, path) to a `Plan`
 //! that this headless server executes directly and the GUI-hosted bridge
@@ -22,8 +26,20 @@ use crate::app::OpenCADStudio;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Connections served at once. A client that connects and stalls pins one
+/// thread until its idle timeout, not the whole listener.
+const MAX_CONNECTIONS: usize = 8;
+
+/// How long one connection may sit between bytes before the server gives up
+/// on it (a client that opened a socket and never sent the request). Bounded
+/// so a stuck client cannot pin a thread forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Ops that go through the protocol-1 control envelope when posted via the
 /// generic `POST /api/v1/{op}` passthrough. Everything else runs legacy.
@@ -65,8 +81,7 @@ pub(crate) const RETRYABLE: &[&str] = &[
 ];
 
 pub fn serve(port: u16) {
-    let mut app = OpenCADStudio::new();
-    listen(&mut app, port);
+    listen(OpenCADStudio::new(), port, Arc::new(AtomicU16::new(0)));
 }
 
 pub(crate) struct HttpRequest {
@@ -89,7 +104,18 @@ impl HttpRequest {
     }
 }
 
-fn listen(app: &mut OpenCADStudio, port: u16) {
+/// One request handed from a connection thread to the dispatcher that owns
+/// the private app. `OpenCADStudio` is not `Send` (it holds `Rc`/`RefCell`
+/// scene state), so — exactly like the GUI-hosted bridge queues envelopes
+/// into the editor — connections funnel JSON through this channel and the
+/// dispatcher (the thread that called `listen`) answers on the per-request
+/// reply channel.
+struct Job {
+    request: HttpRequest,
+    reply: std::sync::mpsc::Sender<(u16, Value)>,
+}
+
+fn listen(mut app: OpenCADStudio, port: u16, bound_port: Arc<AtomicU16>) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -97,22 +123,69 @@ fn listen(app: &mut OpenCADStudio, port: u16) {
             return;
         }
     };
-    eprintln!("OpenCADStudio REST listening on http://127.0.0.1:{port}/api/v1");
-    let mut document_id: Option<u64> = None;
-    let mut counter: u64 = 0;
-    for stream in listener.incoming().flatten() {
-        let mut stream = stream;
-        if let Ok(Some(request)) = read_request(&mut stream) {
-            if request.method == "OPTIONS" {
-                let _ = write_response(&mut stream, 204, &Value::Null);
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    bound_port.store(bound, Ordering::SeqCst);
+    eprintln!("OpenCADStudio REST listening on http://127.0.0.1:{bound}/api/v1");
+    let (jobs, incoming) = std::sync::mpsc::channel::<Job>();
+    // Connections are served one thread each: a slow op (plot, open a large
+    // drawing) or a client that connects and stalls must never keep other
+    // callers — `state`, `get_selection`, `cancel`, `operation` — from being
+    // accepted and answered.
+    let clients = Arc::new(AtomicUsize::new(0));
+    let acceptor = jobs.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if clients.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                clients.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
-            let (status, mut body) = route(app, &request, &mut document_id, &mut counter);
-            if let Some(object) = body.as_object_mut() {
-                object.insert("http_status".into(), json!(status));
-            }
-            let _ = write_response(&mut stream, status, &body);
+            let jobs = acceptor.clone();
+            let clients = clients.clone();
+            std::thread::spawn(move || {
+                serve_connection(stream, jobs);
+                clients.fetch_sub(1, Ordering::SeqCst);
+            });
         }
+    });
+    // The dispatcher keeps the private app on the thread that called
+    // `listen` and answers one request at a time — the same one-session
+    // pipeline every transport shares; concurrency lives in the connection
+    // threads above, not in the app.
+    let mut document_id: Option<u64> = None;
+    let mut counter: u64 = 0;
+    for job in incoming {
+        let (status, body) = route(&mut app, &job.request, &mut document_id, &mut counter);
+        let _ = job.reply.send((status, body));
+    }
+}
+
+/// Read one request off a connection, hand it to the dispatcher, write the
+/// answer. Everything here is per-connection I/O; the app is never touched.
+fn serve_connection(mut stream: TcpStream, jobs: std::sync::mpsc::Sender<Job>) {
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IDLE_TIMEOUT));
+    let Ok(Some(request)) = read_request(&mut stream) else {
+        return;
+    };
+    if request.method == "OPTIONS" {
+        let _ = write_response(&mut stream, 204, &Value::Null);
+        return;
+    }
+    let (reply, answer) = std::sync::mpsc::channel();
+    if jobs
+        .send(Job {
+            request,
+            reply,
+        })
+        .is_err()
+    {
+        return;
+    }
+    if let Ok((status, mut body)) = answer.recv() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("http_status".into(), json!(status));
+        }
+        let _ = write_response(&mut stream, status, &body);
     }
 }
 
@@ -611,6 +684,41 @@ mod tests {
         assert_eq!(percent_decode("Walls%20and%2BFloors"), "Walls and+Floors");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("bad%2"), "bad%2");
+    }
+
+    /// One connection that never sends a request must not keep the listener
+    /// from answering the next caller — the whole point of
+    /// thread-per-connection (a wedged client used to freeze every read).
+    #[test]
+    fn listener_answers_while_one_connection_stalls() {
+        let bound = Arc::new(AtomicU16::new(0));
+        let listen_bound = bound.clone();
+        std::thread::spawn(move || {
+            listen(OpenCADStudio::new_for_test(), 0, listen_bound);
+        });
+        let mut port = 0;
+        for _ in 0..50 {
+            port = bound.load(Ordering::SeqCst);
+            if port != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_ne!(port, 0, "listener never bound a port");
+
+        // Stalls the thread that accepted it: no request line, ever.
+        let _stalled = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"GET /api/v1/ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("readiness answered");
+        assert!(status_line.contains("200"), "{status_line}");
     }
 
     #[test]

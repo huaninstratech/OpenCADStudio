@@ -15,7 +15,8 @@ use super::{Envelope, Reply};
 use crate::rest::{self, HttpRequest, Plan, RETRYABLE};
 use iced::futures::{channel::mpsc, Stream};
 use serde_json::{json, Value};
-use std::net::TcpListener;
+use std::io::ErrorKind;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,7 +82,7 @@ fn listen(
                 if request.method == "OPTIONS" {
                     let _ = rest::write_response(&mut stream, 204, &Value::Null);
                 } else {
-                    let (status, body) = forward(&request, &sender, &document_cache);
+                    let (status, body) = forward(&request, &sender, &document_cache, &stream);
                     let _ = rest::write_response(&mut stream, status, &body);
                 }
             }
@@ -101,6 +102,7 @@ fn forward(
     request: &HttpRequest,
     sender: &mpsc::Sender<Envelope>,
     document_cache: &Mutex<Option<u64>>,
+    stream: &TcpStream,
 ) -> (u16, Value) {
     let path = request.path.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
@@ -119,7 +121,7 @@ fn forward(
     match plan {
         Plan::Local(status, body) => (status, body),
         Plan::Ready => {
-            let state = transact(sender, json!({"protocol":1,"op":"state"}), wait);
+            let state = transact(sender, json!({"protocol":1,"op":"state"}), wait, stream);
             harvest(document_cache, &state);
             (200, json!({
                 "ok": true,
@@ -130,21 +132,21 @@ fn forward(
             }))
         }
         Plan::Run { request, created } => {
-            let response = transact(sender, prepare(request), wait);
+            let response = transact(sender, prepare(request), wait, stream);
             harvest(document_cache, &response);
             (rest::map_status(response.clone(), created == 201), response)
         }
         Plan::Mutate { op, fields, created } => {
             let cached = *document_cache.lock().unwrap();
-            let mut response = transact(sender, mutate_request(&op, &fields, cached), wait);
+            let mut response = transact(sender, mutate_request(&op, &fields, cached), wait, stream);
             let code = response["code"].as_str().unwrap_or("");
             if response["ok"] == false && RETRYABLE.contains(&code) {
                 // The cache is behind the live GUI; refresh from a state read
                 // and retry once, exactly like the headless server.
-                let state = transact(sender, json!({"protocol":1,"op":"state"}), wait);
+                let state = transact(sender, json!({"protocol":1,"op":"state"}), wait, stream);
                 harvest(document_cache, &state);
                 let cached = *document_cache.lock().unwrap();
-                response = transact(sender, mutate_request(&op, &fields, cached), wait);
+                response = transact(sender, mutate_request(&op, &fields, cached), wait, stream);
             }
             harvest(document_cache, &response);
             let status = rest::map_status(response.clone(), created == 201);
@@ -172,26 +174,93 @@ fn call(sender: &mpsc::Sender<Envelope>, request: Value, wait_secs: u64) -> Opti
 /// `accepted` first and only complete when the person at the screen acts or
 /// the task finishes; poll the operation on the caller's behalf so the HTTP
 /// connection is the one thing that waits.
-fn transact(sender: &mpsc::Sender<Envelope>, request: Value, wait: u64) -> Value {
+///
+/// A parked pick is also watched from the other end: the moment the HTTP
+/// client hangs up (its own timeout, a crash, a killed probe), the pending
+/// pick is retracted with `cancel` so the next pick starts clean instead of
+/// dying on `interactive_pending` until the person happens to press Esc.
+fn transact(
+    sender: &mpsc::Sender<Envelope>,
+    request: Value,
+    wait: u64,
+    stream: &TcpStream,
+) -> Value {
+    let op = request["op"].as_str().unwrap_or("").to_owned();
+    let request_id = request["request_id"].as_str().unwrap_or("").to_owned();
+    let interactive = matches!(op.as_str(), "getpoint" | "user_select");
+    if interactive {
+        eprintln!(
+            "[pick] {op} {request_id}: parked -- the connection stays open until the person answers"
+        );
+    }
     let Some(mut response) = call(sender, request, wait) else {
+        if interactive {
+            eprintln!("[pick] {op} {request_id}: the GUI never accepted the request");
+        }
         return json!({"ok":false,"code":"response_timeout","error":"The GUI did not answer in time"});
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
     while matches!(response["status"].as_str(), Some("accepted" | "running"))
         && std::time::Instant::now() < deadline
     {
+        if interactive && peer_gone(stream) {
+            eprintln!("[pick] {op} {request_id}: client disconnected -- cancelling the pending pick");
+            // The cancel reuses the pick's own request id: if the person
+            // answered in the race window, the settled id makes the retract
+            // a harmless no-op instead of an Escape into the live session.
+            let _ = call(
+                sender,
+                json!({"protocol":1,"op":"cancel","request_id":request_id}),
+                15,
+            );
+            return json!(
+                {"ok":false,"code":"client_disconnected","error":"The HTTP client hung up; the pending pick was cancelled"}
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
-        let request_id = response["request_id"].clone();
+        let poll_id = response["request_id"].clone();
         let Some(poll) = call(
             sender,
-            json!({"protocol":1,"op":"operation","request_id":request_id}),
+            json!({"protocol":1,"op":"operation","request_id":poll_id}),
             15,
         ) else {
             break;
         };
         response = poll;
     }
+    if interactive {
+        if matches!(response["status"].as_str(), Some("accepted" | "running")) {
+            eprintln!(
+                "[pick] {op} {request_id}: no answer in {wait}s -- cancelling the pending pick"
+            );
+            let _ = call(
+                sender,
+                json!({"protocol":1,"op":"cancel","request_id":request_id}),
+                15,
+            );
+        } else {
+            eprintln!(
+                "[pick] {op} {request_id}: settled as {}",
+                response["status"].as_str().unwrap_or("unknown")
+            );
+        }
+    }
     response
+}
+
+/// True once the HTTP client has hung up: a graceful close surfaces as EOF,
+/// an aborted one as a socket error. No bytes waiting (`WouldBlock`) means
+/// the client is still there, holding its half of the parked connection.
+fn peer_gone(stream: &TcpStream) -> bool {
+    let _ = stream.set_nonblocking(true);
+    let gone = match stream.peek(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
+        Err(_) => true,
+        Ok(_) => false,
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 /// The bridge has no descriptor handshake: drop any guessed `session_id`,
@@ -458,6 +527,79 @@ mod tests {
         assert!(sel_body.is_null());
     }
 
+    /// The client stops waiting mid-pick (its own timeout, a killed probe):
+    /// the bridge must notice the hang-up, retract the pending pick with
+    /// `cancel`, and leave the channel free for the next pick — instead of
+    /// holding the session until the person happens to press Esc.
+    #[test]
+    fn bridge_cancels_a_parked_pick_when_the_client_disconnects() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        let _ = app.control_request(json!({"protocol":1,"op":"new","request_id":"n1"}));
+
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
+        let bound = Arc::new(AtomicU16::new(0));
+        let listen_bound = bound.clone();
+        std::thread::spawn(move || listen(sender, 0, listen_bound).unwrap());
+        let port = wait_for_bridge(&bound);
+
+        // The client parks a pick…
+        let mut point_conn = post(port, "/api/v1/getpoint", r#"{"request_id":"gp-drop"}"#);
+        let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+        assert_eq!(envelope.request["op"], "getpoint");
+        let reply = app.control_request(envelope.request.clone()).0;
+        assert_eq!(reply["status"], "accepted", "{reply}");
+        envelope.reply.send(reply);
+
+        // …then gives up: the connection closes while the person is
+        // presumably still deciding.
+        drop(point_conn);
+
+        // The bridge notices and retracts the pick; `operation` polls that
+        // slip in first are answered as `running` like the GUI would.
+        let mut polls = 0usize;
+        loop {
+            let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+            if envelope.request["op"] == "cancel" {
+                assert_eq!(envelope.request["request_id"], "gp-drop");
+                let reply = app.control_request(envelope.request).0;
+                assert_eq!(reply["status"], "cancelled", "{reply}");
+                assert_eq!(reply["result"]["cancelled"], true, "{reply}");
+                break;
+            }
+            assert_eq!(envelope.request["op"], "operation", "unexpected envelope");
+            polls += 1;
+            assert!(polls < 100, "the disconnect was never noticed");
+            let reply = app.control_request(envelope.request.clone()).0;
+            envelope.reply.send(reply);
+        }
+
+        // The channel is free: the next pick is accepted right away instead
+        // of dying on `interactive_pending`. Answer it with a click so the
+        // test leaves no session behind.
+        let mut next_conn = post(port, "/api/v1/getpoint", r#"{"request_id":"gp-next"}"#);
+        let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+        assert_eq!(envelope.request["op"], "getpoint");
+        let reply = app.control_request(envelope.request).0;
+        assert_eq!(reply["status"], "accepted", "{reply}");
+        envelope.reply.send(reply);
+        app.tabs[app.active_tab].last_cursor_world = glam::DVec3::new(2.0, 3.0, 0.0);
+        let _ = app.update(crate::app::Message::ViewportLeftPress);
+        let mut polls = 0usize;
+        let (_, body) = loop {
+            let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
+            let reply = app.control_request(envelope.request.clone()).0;
+            envelope.reply.send(reply.clone());
+            polls += 1;
+            assert!(polls < 100, "the retry pick never completed: {reply}");
+            if reply["status"] == "completed" {
+                break read_response(&mut next_conn);
+            }
+        };
+        assert_eq!(body["status"], "completed", "{body}");
+        assert_eq!(body["result"]["point"], json!([2.0, 3.0, 0.0]));
+    }
+
     #[test]
     fn bridge_parks_user_select_until_the_person_answers() {
         let mut app = OpenCADStudio::new_for_test();
@@ -616,14 +758,16 @@ mod tests {
         assert_eq!(status, 201, "{body}");
 
         // The plain op passthrough works too — MCP-style, explicit
-        // document_id, any op the automation surface knows.
-        let mut run_conn = post(
+        // document_id, any op the automation surface knows. `select`
+        // settles inline; `run` would park the connection on `operation`
+        // polls until the live editor's update loop finishes the command.
+        let mut select_conn = post(
             port,
-            "/api/v1/run",
-            &format!(r#"{{"document_id":{fresh},"cmd":"CIRCLE 5,5 2"}}"#),
+            "/api/v1/select",
+            &format!(r#"{{"document_id":{fresh},"clear":true}}"#),
         );
         drain(&mut app, &mut receiver, 1);
-        let (status, body) = read_response(&mut run_conn);
+        let (status, body) = read_response(&mut select_conn);
         assert_eq!(status, 200, "{body}");
     }
 }

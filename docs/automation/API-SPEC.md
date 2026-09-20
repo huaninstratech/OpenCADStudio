@@ -88,7 +88,15 @@ machine-readable OpenAPI 3 description of the whole surface is served at
 The REST layer generates `request_id`s and caches the active `document_id`
 server-side, retrying once on retryable refusals — plain HTTP clients do not
 need envelope bookkeeping. Power clients may instead POST any operation name
-to `/api/v1/{op}` with an explicit body.
+to `/api/v1/{op}` with an explicit body — including `operation` (poll a
+pending op) and `cancel`.
+
+Connections are served one thread each: a slow op (`plot`, opening a large
+drawing) or a client that connects and stalls holds only its own connection,
+never the other callers. The ops themselves still execute one at a time on
+the private session (the same one-dispatcher pipeline as every transport), so
+the concurrency buys responsiveness, not parallel mutation. A connection that
+sends nothing for **15 s** is dropped.
 
 ### 3.2 HTTP REST — GUI-hosted (`--http <port>` **with a drawing file**)
 
@@ -107,8 +115,17 @@ Differences worth knowing:
 - One thread per connection: a parked pick never blocks other calls. A pick
   may park up to **30 minutes**; any other op answers within **300 s** or the
   bridge replies `response_timeout`.
+- A parked pick watches its own connection: the moment the client hangs up
+  (its own timeout, a crash, a killed probe), the pending pick is retracted
+  with `cancel` and the channel is free again — the next pick starts clean
+  instead of dying on `interactive_pending` until the person happens to press
+  Esc. The same retraction fires if the caller waits out the full 30 minutes.
+- Every pick logs its lifecycle to stderr as `[pick] <op> <request_id>` lines
+  (start, cancelled-by-disconnect, settled), one per state, so a client-side
+  log can be cross-referenced line for line.
 - Unknown POST paths are treated as op attempts and forwarded (any op of the
-  surface works); truly unrouted paths answer `404 {"code":"unknown_route"}`.
+  surface works — including `operation` to poll a pending pick and `cancel`
+  to retract it); truly unrouted paths answer `404 {"code":"unknown_route"}`.
 - `OPTIONS *` answers **204** (CORS preflight).
 
 ### 3.3 stdio JSONL (`--serve`)
@@ -473,7 +490,13 @@ request is visible even before anyone clicks):
 
 On the GUI-hosted HTTP channel (§3.2) the whole exchange rides one parked
 connection: the request holds until the person answers (up to 30 minutes,
-then `response_timeout`), so no polling loop is needed.
+then `response_timeout`), so no polling loop is needed. Callers that prefer
+polling may treat an `accepted` reply as the answer and follow the operation
+with `{"op":"operation","request_id":…}` reads; a parked pick that loses its
+connection (or its caller) is retracted automatically, and the server-side
+trail of every state change — start, answer, cancel — lands on stderr as
+`[pick] <op> <request_id>: …` lines for cross-referencing against the
+client's own log.
 
 ---
 
