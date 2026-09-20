@@ -1829,4 +1829,61 @@ mod tests {
         assert_eq!(read["result"]["count"], 1);
         assert_eq!(read["result"]["entities"][0]["block"], Value::Null);
     }
+
+    #[test]
+    fn plot_op_applies_per_layer_lineweights() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        {
+            let scene = &mut app.tabs[app.active_tab].scene;
+            // Two layers set to different pen weights; entities fully ByLayer.
+            for (name, weight) in [
+                ("THIN", acadrust::types::LineWeight::Value(13)),
+                ("THICK", acadrust::types::LineWeight::Value(50)),
+            ] {
+                let mut layer = acadrust::tables::Layer::new(name);
+                layer.line_weight = weight;
+                let _ = scene.document.layers.add(layer);
+            }
+            for (name, origin) in [("THIN", 0.0), ("THICK", 3000.0)] {
+                let mut line = acadrust::entities::Line::new();
+                line.common.layer = name.to_string();
+                line.start = acadrust::types::Vector3::new(origin, origin, 0.0);
+                line.end = acadrust::types::Vector3::new(origin + 3000.0, origin + 2000.0, 0.0);
+                scene.add_entity(acadrust::EntityType::Line(line));
+            }
+        }
+
+        let pdf = std::env::temp_dir().join(format!("ocs-plot-lw-{}.pdf", std::process::id()));
+        let response = request(
+            &mut app,
+            json!({"op":"plot","path":pdf.to_string_lossy(),"plot_style":"monochrome.ctb"}),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+
+        // The plotted PDF carries two distinct pen widths — the per-layer
+        // 0.13 mm / 0.50 mm hierarchy survives the plot style (thin clamps to
+        // the 1 px floor, so the ratio is the clamped-pixel ratio 1.889).
+        let text = String::from_utf8_lossy(&std::fs::read(&pdf).expect("pdf written")).into_owned();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let mut widths: Vec<f32> = tokens
+            .windows(2)
+            .filter_map(|pair| {
+                if pair[1] == "w" {
+                    pair[0].parse::<f32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        widths.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        widths.retain(|width| *width > 0.2);
+        assert_eq!(widths.len(), 2, "two layer weights in the plotted PDF: {widths:?}");
+        assert!(
+            (widths[1] / widths[0] - 1.889).abs() < 0.15,
+            "0.50 mm vs 0.13 mm hierarchy: {widths:?}"
+        );
+        let _ = std::fs::remove_file(&pdf);
+    }
 }

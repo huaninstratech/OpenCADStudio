@@ -1786,6 +1786,80 @@ mod tests {
         );
     }
 
+    /// Parse every stroke-width operator (`<pt> w`) out of the content text.
+    fn stroke_widths(text: &str) -> Vec<f32> {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        tokens
+            .windows(2)
+            .filter_map(|pair| {
+                if pair[1] == "w" {
+                    pair[0].parse::<f32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn distinct_widths(mut widths: Vec<f32>) -> Vec<f32> {
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        widths.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        widths
+    }
+
+    #[test]
+    fn plot_honors_per_object_lineweight_with_and_without_style() {
+        // Two objects whose resolved lineweights differ (as two layers set to
+        // 0.13 mm and 0.50 mm produce): the PDF must carry two distinct pen
+        // widths, and a plot style that leaves weights at "use object" must
+        // keep that hierarchy.
+        let make_page = |px: f32| {
+            let mut wire = PlotWire {
+                wire: WireModel::solid(
+                    "test".into(),
+                    vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                    [1.0, 0.0, 0.0, 1.0],
+                    false,
+                ),
+                draw_depth: 0.0,
+            };
+            wire.wire.aci = 7;
+            wire.wire.line_weight_px = px;
+            test_page(vec![wire])
+        };
+
+        let monochrome =
+            PlotStyleTable::builtin("monochrome.ctb").expect("shipped monochrome.ctb parses");
+        eprintln!(
+            "monochrome resolve_lineweight(7) = {:?}",
+            monochrome.resolve_lineweight(7)
+        );
+
+        let unstyled = stroke_widths(&pdf_stream_text(
+            &build_pdf_pages(&[make_page(1.0), make_page(3.0)], None).unwrap(),
+        ));
+        let unstyled = distinct_widths(unstyled);
+        assert_eq!(unstyled.len(), 2, "two object weights, two pens: {unstyled:?}");
+        assert!(
+            (unstyled[1] / unstyled[0] - 3.0).abs() < 0.1,
+            "pen widths follow the object weights 1px:3px: {unstyled:?}"
+        );
+
+        let styled = stroke_widths(&pdf_stream_text(
+            &build_pdf_pages(&[make_page(1.0), make_page(3.0)], Some(&monochrome)).unwrap(),
+        ));
+        let styled = distinct_widths(styled);
+        assert_eq!(
+            styled.len(),
+            2,
+            "monochrome.ctb leaves weights at 'use object', so the two weights survive: {styled:?}"
+        );
+        assert!(
+            (styled[1] / styled[0] - 3.0).abs() < 0.1,
+            "weight hierarchy matches the unstyled plot: {styled:?}"
+        );
+    }
+
     // Build a WireModel carrying the SDF glyph quads for `text` in the embedded
     // "txt" stroke font, laid out into the process-wide atlas emit_text reads.
     fn text_wire(text: &str, origin: [f64; 3]) -> PlotWire {
