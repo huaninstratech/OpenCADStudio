@@ -1841,6 +1841,128 @@ mod tests {
     }
 
     #[test]
+    fn getpoint_snap_marker_and_snapped_answer_while_pending() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,0"}));
+        let i = app.active_tab;
+        {
+            let tab = &mut app.tabs[i];
+            tab.scene.selection.borrow_mut().vp_size = (1920.0, 1080.0);
+            tab.scene.sync_tiles_from_panes(1920.0, 1080.0);
+            tab.scene.fit_all();   // bring the line into the pane so snaps can hit
+        }
+        // Park a client pick: with no command running, a cursor move must
+        // still run the object-snap engine so the marker shows and the
+        // click hands the snapped point back.
+        let asked = request(
+            &mut app,
+            json!({"op":"getpoint","request_id":"gp-snap","prompt":"Chọn góc"}),
+        );
+        assert_eq!(asked["status"], "running", "{asked}");
+
+        // Screen position of the line's endpoint through the live camera.
+        let endpoint = glam::DVec3::new(100.0, 0.0, 0.0);
+        let (sx, sy) = {
+            let cam = app.tabs[i].scene.camera.borrow();
+            let bounds = iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            };
+            let view = cam.view_proj_rte(bounds);
+            let eye = cam.eye();
+            let ndc = view.project_point3((endpoint - eye).as_vec3());
+            (
+                (ndc.x + 1.0) * 0.5 * bounds.width,
+                (1.0 - ndc.y) * 0.5 * bounds.height,
+            )
+        };
+        app.update(Message::ViewportMove(iced::Point::new(
+            sx as f32,
+            sy as f32,
+        )));
+
+        assert!(
+            app.tabs[i].snap_result.is_some(),
+            "no object-snap marker while a getpoint is pending"
+        );
+        let snapped = app.tabs[i].last_cursor_world;
+        assert!(
+            (snapped - endpoint).length() < 1e-6,
+            "cursor point not snapped to the endpoint: {snapped:?}"
+        );
+
+        // The click answers the pick with the snapped endpoint.
+        app.update(Message::ViewportLeftPress);
+        let done = user_select_result(&mut app, "gp-snap");
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["point"], json!([100.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn user_select_snap_marker_shows_while_pending() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,0"}));
+        let i = app.active_tab;
+        {
+            let tab = &mut app.tabs[i];
+            tab.scene.selection.borrow_mut().vp_size = (1920.0, 1080.0);
+            tab.scene.sync_tiles_from_panes(1920.0, 1080.0);
+            tab.scene.fit_all();
+        }
+        let asked = request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-snap","prompt":"Chọn trường","clear":true}),
+        );
+        assert_eq!(asked["status"], "running", "{asked}");
+
+        let endpoint = glam::DVec3::new(100.0, 0.0, 0.0);
+        let (sx, sy) = {
+            let cam = app.tabs[i].scene.camera.borrow();
+            let bounds = iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            };
+            let view = cam.view_proj_rte(bounds);
+            let eye = cam.eye();
+            let ndc = view.project_point3((endpoint - eye).as_vec3());
+            (
+                (ndc.x + 1.0) * 0.5 * bounds.width,
+                (1.0 - ndc.y) * 0.5 * bounds.height,
+            )
+        };
+        app.update(Message::ViewportMove(iced::Point::new(
+            sx as f32,
+            sy as f32,
+        )));
+        assert!(
+            app.tabs[i].snap_result.is_some(),
+            "no object-snap marker while a user_select is pending"
+        );
+
+        // The pick itself stays entity-based: selecting the line + Enter still
+        // answers the request — the marker must not break selection.
+        let handle = app.automation_op(r#"{"op":"query","type":"LINE","detail":"summary"}"#)
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let value = u64::from_str_radix(&handle, 16).unwrap();
+        app.tabs[i].scene.select_entity(acadrust::Handle::new(value), false);
+        app.update(Message::CommandFinalize);
+        let done = user_select_result(&mut app, "us-snap");
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["result"]["count"], 1);
+    }
+
+    #[test]
     fn get_selection_reports_insert_block_and_position() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));

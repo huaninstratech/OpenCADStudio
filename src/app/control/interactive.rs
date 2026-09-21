@@ -286,6 +286,11 @@ impl OpenCADStudio {
         let Some(session) = self.control.get_point.take() else {
             return;
         };
+        // Drop the snap marker the pending pick was showing — no command is
+        // running, so nothing else would clear it after the session ends.
+        if let Some(i) = self.tabs.iter().position(|tab| tab.id == session.document_id) {
+            self.tabs[i].snap_result = None;
+        }
         let (cancelled, result) = match point {
             Some(point) => (false, json!({"point": point})),
             None => (true, json!({"cancelled": true})),
