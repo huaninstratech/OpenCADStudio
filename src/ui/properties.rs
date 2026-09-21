@@ -843,6 +843,9 @@ impl PropertiesPanel {
             }
             PropValue::LwVaries => self.render_lw_varies_row(label),
             PropValue::LinetypeChoice(lt) => self.render_linetype_row(label, lt),
+            PropValue::Choice { selected, options } if prop.field == "annotative_scale" => {
+                self.render_annotative_scale_choice_row(label, selected, options)
+            }
             PropValue::Choice { selected, options } => {
                 self.render_choice_row(label, prop.field, selected, options)
             }
@@ -1206,6 +1209,52 @@ impl PropertiesPanel {
         .width(Length::Fill);
 
         prop_row_widget(label, combo.into())
+    }
+
+    /// The Annotative scale row: a scale-list dropdown (picking a scale gives
+    /// every selected annotative entity a representation at it) beside the
+    /// "..." button that opens the full per-object scale manager.
+    fn render_annotative_scale_choice_row<'a>(
+        &'a self,
+        label: &'a str,
+        current: &'a str,
+        _options: &'a [String],
+    ) -> Element<'a, Message> {
+        let Some(state) = self.choice_combos.get("annotative_scale") else {
+            return render_annotative_scale_row(label, current);
+        };
+        let selected = if current == VARIES_LABEL {
+            None
+        } else {
+            Some(LocalizedChoice::new(current.to_string()))
+        };
+        let combo = combo_box(state, VARIES_LABEL, selected.as_ref(), move |choice| {
+            Message::PropGeomChoiceChanged {
+                field: "annotative_scale",
+                value: choice.raw,
+            }
+        })
+        .size(FONT_SZ)
+        .padding(Padding {
+            top: COMBO_PAD_V,
+            bottom: COMBO_PAD_V,
+            left: 6.0,
+            right: 6.0,
+        })
+        .input_style(combo_input_style)
+        .on_open(Message::PropColorPickerClose)
+        .width(Length::Fill);
+        let manage = button(text("...").size(FONT_SZ))
+            .on_press(Message::AnnoObjectScaleOpen)
+            .style(button::secondary)
+            .padding([2, 7]);
+
+        let controls = row![combo, manage, iced::widget::space().width(10)]
+            .spacing(2)
+            .align_y(iced::Center)
+            .width(Length::Fill);
+
+        prop_row_widget(label, controls.into())
     }
 
     // ── Editable geometry row (text_input) ────────────────────────────────

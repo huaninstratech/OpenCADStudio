@@ -2323,7 +2323,76 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
             }
             self.push_undo_snapshot(i, "CHPROP");
 
-            if crate::scene::model::solid_history::is_surface_property_choice(field) {
+            if matches!(
+                field,
+                "annotative" | "is_annotative" | "annotative_ctx" | "enable_annotation_scale"
+            ) {
+                // A Yes/No pick from the Annotative row (single or folded
+                // multi-selection): set every selected entity to the picked
+                // state. Doc-aware like the toggle so turning it on
+                // synthesizes a real per-scale representation.
+                let want = value.eq_ignore_ascii_case("Yes");
+                let scale = self.tabs[i].scene.creation_annotation_scale_handle();
+                for &handle in &handles {
+                    if self.tabs[i].scene.is_layer_locked(handle) {
+                        continue;
+                    }
+                    let cur = match self.tabs[i].scene.document.get_entity(handle) {
+                        Some(acadrust::EntityType::MText(t)) => t.is_annotative,
+                        Some(acadrust::EntityType::MultiLeader(m)) => m.enable_annotation_scale,
+                        Some(entity) => crate::scene::annotative::is_annotative(
+                            &self.tabs[i].scene.document,
+                            entity,
+                        ),
+                        None => continue,
+                    };
+                    if cur == want {
+                        continue;
+                    }
+                    crate::scene::annotative::set_entity_annotative(
+                        &mut self.tabs[i].scene.document,
+                        handle,
+                        want,
+                    );
+                    if want {
+                        if let Some(sh) = scale {
+                            crate::scene::annotative::create_annotation_context(
+                                &mut self.tabs[i].scene.document,
+                                handle,
+                                sh,
+                            );
+                        }
+                    }
+                }
+            } else if field == "annotative_scale" {
+                // A scale picked from the Annotative scale choice: give every
+                // annotative selected entity a per-scale representation at it.
+                for &handle in &handles {
+                    if self.tabs[i].scene.is_layer_locked(handle) {
+                        continue;
+                    }
+                    let annotative = self.tabs[i]
+                        .scene
+                        .document
+                        .get_entity(handle)
+                        .is_some_and(|entity| {
+                            crate::scene::annotative::is_annotative(
+                                &self.tabs[i].scene.document,
+                                entity,
+                            )
+                        });
+                    if !annotative {
+                        continue;
+                    }
+                    if let Some(sh) = self.tabs[i].scene.scale_handle_ensuring(&value) {
+                        crate::scene::annotative::create_annotation_context(
+                            &mut self.tabs[i].scene.document,
+                            handle,
+                            sh,
+                        );
+                    }
+                }
+            } else if crate::scene::model::solid_history::is_surface_property_choice(field) {
                 use crate::scene::model::solid_history::{
                     PROP_SURFACE_MAINTAIN_ASSOCIATIVITY, PROP_SURFACE_SHOW_ASSOCIATIVITY,
                     PROP_SURFACE_WIREFRAME_TYPE,

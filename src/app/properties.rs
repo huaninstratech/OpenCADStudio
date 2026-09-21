@@ -2050,141 +2050,16 @@ impl OpenCADStudio {
 
                     // Annotative Yes/No + a conditional "Annotative scale" row.
                     // Annotative state and assigned scale names need the
-                    // document, so they are resolved here.
+                    // document, so they are resolved here (shared with the
+                    // multi-selection fold).
                     {
-                        // Which entities show an Annotative row, the field it uses,
-                        // and — for those that don't already carry the row
-                        // (dimension / table / tolerance) — the existing field to insert it
-                        // after. MLeader uses its editable toggle field.
-                        let anno: Option<(&str, Option<&str>)> = match entity {
-                            acadrust::EntityType::Text(_)
-                            | acadrust::EntityType::MText(_)
-                            | acadrust::EntityType::Insert(_)
-                            | acadrust::EntityType::Leader(_)
-                            | acadrust::EntityType::Hatch(_) => Some(("annotative", None)),
-                            acadrust::EntityType::MultiLeader(_) => {
-                                Some(("enable_annotation_scale", None))
-                            }
-                            acadrust::EntityType::Dimension(_) => {
-                                Some(("annotative", Some("style_name")))
-                            }
-                            acadrust::EntityType::Tolerance(_) => {
-                                Some(("annotative", Some("tol_dim_style")))
-                            }
-                            acadrust::EntityType::Table(_) => {
-                                Some(("annotative", Some("tbl_style_handle")))
-                            }
-                            _ => None,
-                        };
-                        if let Some((anno_field, insert_after)) = anno {
-                            let is_anno = crate::scene::annotative::is_annotative(doc, entity)
-                                || match entity {
-                                    acadrust::EntityType::Dimension(
-                                        acadrust::entities::Dimension::Arc(dimension),
-                                    ) => crate::scene::annotative::dim_style_is_annotative(
-                                        doc,
-                                        &dimension.base.style_name,
-                                    ),
-                                    acadrust::EntityType::Tolerance(_) => {
-                                        crate::scene::annotative::annotation_style_is_annotative(
-                                            doc, entity,
-                                        )
-                                    }
-                                    acadrust::EntityType::Leader(_) => {
-                                        crate::scene::annotative::annotation_style_is_annotative(
-                                            doc, entity,
-                                        )
-                                    }
-                                    _ => false,
-                                };
-                            // Dimensions/tables/tolerances carry no Annotative row yet — add one
-                            // right after their style row.
-                            if let Some(anchor) = insert_after {
-                                insert_row_after(
-                                    &mut sections,
-                                    anchor,
-                                    crate::entities::common::ro_prop(
-                                        t!("Annotative").as_ref(),
-                                        "annotative",
-                                        "No",
-                                    ),
-                                );
-                            }
-                            // Objects that carry a per-object annotation context
-                            // (MTEXT via its native flag, single-line TEXT via the
-                            // context alone) get an editable toggle: turning it on
-                            // synthesizes a real per-scale representation. The
-                            // remaining style-only types stay read-only.
-                            if anno_field == "annotative" {
-                                match entity {
-                                    acadrust::EntityType::MText(t) => set_row_value(
-                                        &mut sections,
-                                        "annotative",
-                                        crate::scene::model::object::PropValue::BoolToggle {
-                                            field: "is_annotative",
-                                            value: t.is_annotative,
-                                        },
-                                    ),
-                                    acadrust::EntityType::Dimension(
-                                        acadrust::entities::Dimension::Arc(_),
-                                    ) => set_row(
-                                        &mut sections,
-                                        "annotative",
-                                        if is_anno { "Yes" } else { "No" }.to_string(),
-                                    ),
-                                    acadrust::EntityType::Leader(_)
-                                        if crate::scene::annotative::annotation_style_is_annotative(
-                                            doc, entity,
-                                        ) => set_row(
-                                            &mut sections,
-                                            "annotative",
-                                            "Yes".to_string(),
-                                        ),
-                                    acadrust::EntityType::Text(_)
-                                    | acadrust::EntityType::Insert(_)
-                                    | acadrust::EntityType::Leader(_)
-                                    | acadrust::EntityType::Hatch(_)
-                                    | acadrust::EntityType::Dimension(_) => set_row_value(
-                                        &mut sections,
-                                        "annotative",
-                                        crate::scene::model::object::PropValue::BoolToggle {
-                                            field: "annotative_ctx",
-                                            value: is_anno,
-                                        },
-                                    ),
-                                    _ => set_row(
-                                        &mut sections,
-                                        "annotative",
-                                        if is_anno { "Yes" } else { "No" }.to_string(),
-                                    ),
-                                }
-                            }
-                            if is_anno {
-                                let memberships =
-                                    crate::scene::annotative::object_scale_memberships(
-                                        doc,
-                                        entity.common().handle,
-                                    );
-                                let assigned_scales = if memberships.is_empty() {
-                                    doc.header.current_annotation_scale.clone()
-                                } else {
-                                    memberships
-                                        .into_iter()
-                                        .map(|(name, _)| name)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                };
-                                insert_row_after(
-                                    &mut sections,
-                                    anno_field,
-                                    crate::entities::common::ro_prop(
-                                        t!("Annotative scale").as_ref(),
-                                        "annotative_scale",
-                                        assigned_scales,
-                                    ),
-                                );
-                            }
-                        }
+                        let scale_names: Vec<String> = self.tabs[i]
+                            .scene
+                            .scale_list()
+                            .into_iter()
+                            .map(|(name, _, _)| name)
+                            .collect();
+                        apply_annotative_doc_rows(doc, entity, &mut sections, &scale_names);
                     }
 
                     // Single-line text height rows depend on both the
@@ -2382,7 +2257,15 @@ impl OpenCADStudio {
                         .map(|(handle, entity)| (*handle, entity.as_ref()))
                         .collect();
                     let t_local = t_arm.map(|t| t.elapsed().as_secs_f64() * 1000.0);
-                    let mut sections = aggregate_sections(&local_refs, &text_style_names);
+                    let doc = &self.tabs[i].scene.document;
+                    let scale_names: Vec<String> = self.tabs[i]
+                        .scene
+                        .scale_list()
+                        .into_iter()
+                        .map(|(name, _, _)| name)
+                        .collect();
+                    let mut sections =
+                        aggregate_sections(doc, &local_refs, &text_style_names, &scale_names);
                     if let (Some(t), Some(groups_ms), Some(filter_ms), Some(local_ms)) =
                         (t_arm, t_groups, t_filter, t_local)
                     {
@@ -3290,6 +3173,140 @@ fn make_sections_read_only(sections: &mut [crate::scene::model::object::PropSect
 
 // ── Multi-selection property aggregation ───────────────────────────────────
 
+/// Fill in the document-dependent Annotative rows on an entity's already-built
+/// property sections: the Yes/No row (an editable toggle for the types that
+/// carry a per-object annotation context) and, when annotative, the
+/// "Annotative scale" row as a choice over the drawing's scale list. Shared by
+/// the single-entity panel and the multi-selection fold so both expose the
+/// same rows; a picked scale then applies to every selected entity.
+pub(super) fn apply_annotative_doc_rows(
+    doc: &acadrust::CadDocument,
+    entity: &EntityType,
+    sections: &mut [crate::scene::model::object::PropSection],
+    scale_names: &[String],
+) {
+    // Which entities show an Annotative row, the field it uses, and — for
+    // those that don't already carry the row (dimension / table / tolerance)
+    // — the existing field to insert it after. MLeader uses its editable
+    // toggle field.
+    let anno: Option<(&str, Option<&str>)> = match entity {
+        acadrust::EntityType::Text(_)
+        | acadrust::EntityType::MText(_)
+        | acadrust::EntityType::Insert(_)
+        | acadrust::EntityType::Leader(_)
+        | acadrust::EntityType::Hatch(_) => Some(("annotative", None)),
+        acadrust::EntityType::MultiLeader(_) => Some(("enable_annotation_scale", None)),
+        acadrust::EntityType::Dimension(_) => Some(("annotative", Some("style_name"))),
+        acadrust::EntityType::Tolerance(_) => Some(("annotative", Some("tol_dim_style"))),
+        acadrust::EntityType::Table(_) => Some(("annotative", Some("tbl_style_handle"))),
+        _ => None,
+    };
+    let Some((anno_field, insert_after)) = anno else {
+        return;
+    };
+    let is_anno = crate::scene::annotative::is_annotative(doc, entity)
+        || match entity {
+            acadrust::EntityType::Dimension(acadrust::entities::Dimension::Arc(dimension)) => {
+                crate::scene::annotative::dim_style_is_annotative(
+                    doc,
+                    &dimension.base.style_name,
+                )
+            }
+            acadrust::EntityType::Tolerance(_) => {
+                crate::scene::annotative::annotation_style_is_annotative(doc, entity)
+            }
+            acadrust::EntityType::Leader(_) => {
+                crate::scene::annotative::annotation_style_is_annotative(doc, entity)
+            }
+            _ => false,
+        };
+    // Dimensions/tables/tolerances carry no Annotative row yet — add one
+    // right after their style row.
+    if let Some(anchor) = insert_after {
+        insert_row_after(
+            sections,
+            anchor,
+            crate::entities::common::ro_prop(t!("Annotative").as_ref(), "annotative", "No"),
+        );
+    }
+    // Objects that carry a per-object annotation context (MTEXT via its native
+    // flag, single-line TEXT via the context alone) get an editable toggle:
+    // turning it on synthesizes a real per-scale representation. The remaining
+    // style-only types stay read-only.
+    if anno_field == "annotative" {
+        match entity {
+            acadrust::EntityType::MText(t) => set_row_value(
+                sections,
+                "annotative",
+                crate::scene::model::object::PropValue::BoolToggle {
+                    field: "is_annotative",
+                    value: t.is_annotative,
+                },
+            ),
+            acadrust::EntityType::Dimension(acadrust::entities::Dimension::Arc(_)) => set_row(
+                sections,
+                "annotative",
+                if is_anno { "Yes" } else { "No" }.to_string(),
+            ),
+            acadrust::EntityType::Leader(_)
+                if crate::scene::annotative::annotation_style_is_annotative(doc, entity) =>
+            {
+                set_row(sections, "annotative", "Yes".to_string())
+            }
+            acadrust::EntityType::Text(_)
+            | acadrust::EntityType::Insert(_)
+            | acadrust::EntityType::Leader(_)
+            | acadrust::EntityType::Hatch(_)
+            | acadrust::EntityType::Dimension(_) => set_row_value(
+                sections,
+                "annotative",
+                crate::scene::model::object::PropValue::BoolToggle {
+                    field: "annotative_ctx",
+                    value: is_anno,
+                },
+            ),
+            _ => set_row(
+                sections,
+                "annotative",
+                if is_anno { "Yes" } else { "No" }.to_string(),
+            ),
+        }
+    }
+    if is_anno {
+        let memberships =
+            crate::scene::annotative::object_scale_memberships(doc, entity.common().handle);
+        let assigned_scales = if memberships.is_empty() {
+            doc.header.current_annotation_scale.clone()
+        } else {
+            memberships
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut options: Vec<String> = scale_names.to_vec();
+        // A membership outside the drawing's own scale list (an xref-inherited
+        // name, say) must stay selectable or it would be un-settable.
+        for name in assigned_scales.split(", ") {
+            if !name.is_empty() && !options.iter().any(|opt| opt == name) {
+                options.push(name.to_string());
+            }
+        }
+        insert_row_after(
+            sections,
+            anno_field,
+            crate::scene::model::object::Property {
+                label: t!("Annotative scale").into_owned(),
+                field: "annotative_scale",
+                value: crate::scene::model::object::PropValue::Choice {
+                    selected: assigned_scales,
+                    options,
+                },
+            },
+        );
+    }
+}
+
 pub(super) fn build_selection_groups(
     selected: &[(Handle, &EntityType)],
 ) -> Vec<ui::properties::SelectionGroup> {
@@ -3318,8 +3335,10 @@ pub(super) fn build_selection_groups(
 }
 
 pub(super) fn aggregate_sections(
+    doc: &acadrust::CadDocument,
     selected: &[(Handle, &EntityType)],
     text_style_names: &[String],
+    scale_names: &[String],
 ) -> Vec<crate::scene::model::object::PropSection> {
     if selected.is_empty() {
         return vec![];
@@ -3330,14 +3349,24 @@ pub(super) fn aggregate_sections(
         return vec![];
     };
     let mut result = dispatch::properties_sectioned(*handle, entity, text_style_names);
+    apply_annotative_doc_rows(doc, entity, &mut result, scale_names);
+    let mut union = UnionRows::default();
+    union.absorb(&result);
     for (handle, entity) in entities {
         // Nothing in common left to narrow: every later entity can only
         // intersect against an empty set.
         if result.is_empty() {
             break;
         }
-        let sections = dispatch::properties_sectioned(*handle, entity, text_style_names);
+        let mut sections = dispatch::properties_sectioned(*handle, entity, text_style_names);
+        apply_annotative_doc_rows(doc, entity, &mut sections, scale_names);
+        union.absorb(&sections);
         result = merge_sections(&result, &sections);
+    }
+    // Re-add the rows some (but not all) selected kinds build — a mixed
+    // selection keeps "Background mask" so one pick covers every MTEXT in it.
+    if !result.is_empty() {
+        union.apply_to(&mut result);
     }
     // Sum the filled area while individual Area rows may still vary.
     if selected.len() > 1
@@ -3357,6 +3386,78 @@ pub(super) fn aggregate_sections(
         set_row(&mut result, "cumulative_area", format!("{total:.4}"));
     }
     result
+}
+
+/// Property rows a mixed-kind selection keeps even though only some of the
+/// selected kinds build them. Committing such a row no-ops on the kinds that
+/// don't support the field (`apply_geom_prop` dispatches per entity type, the
+/// annotative handlers skip non-annotative entities), so one pick still lands
+/// on every element that can take it.
+const UNIONABLE_ROW_FIELDS: &[&str] = &["background_mask", "text_frame", "annotative_scale"];
+
+/// Folds a [`UNIONABLE_ROW_FIELDS`] row across every selected entity that
+/// builds it, remembering the section to re-insert it into after the
+/// intersect-fold dropped it.
+#[derive(Default)]
+struct UnionRows {
+    rows: rustc_hash::FxHashMap<&'static str, UnionRow>,
+}
+
+#[derive(Default)]
+struct UnionRow {
+    title: String,
+    label: String,
+    value: Option<crate::scene::model::object::PropValue>,
+}
+
+impl UnionRows {
+    fn absorb(&mut self, sections: &[crate::scene::model::object::PropSection]) {
+        for section in sections {
+            for prop in &section.props {
+                let Some(&field) = UNIONABLE_ROW_FIELDS.iter().find(|f| **f == prop.field) else {
+                    continue;
+                };
+                let entry = self.rows.entry(field).or_default();
+                match &mut entry.value {
+                    None => {
+                        entry.title = section.title.clone();
+                        entry.label = prop.label.clone();
+                        entry.value = Some(prop.value.clone());
+                    }
+                    Some(current) => {
+                        *current = merge_prop_value(current, &prop.value);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_to(&self, sections: &mut [crate::scene::model::object::PropSection]) {
+        for (field, row) in &self.rows {
+            let Some(value) = &row.value else {
+                continue;
+            };
+            let already_present = sections
+                .iter()
+                .any(|section| section.props.iter().any(|prop| &prop.field == field));
+            if already_present {
+                continue;
+            }
+            // The section the row came from, else the first one.
+            let target_idx = sections
+                .iter()
+                .position(|section| section.title == row.title)
+                .unwrap_or(0);
+            let Some(target) = sections.get_mut(target_idx) else {
+                continue;
+            };
+            target.props.push(crate::scene::model::object::Property {
+                label: row.label.clone(),
+                field,
+                value: value.clone(),
+            });
+        }
+    }
 }
 
 fn aggregate_solid_history_sections(
@@ -3542,11 +3643,18 @@ fn merge_prop_value(
             PropValue::HatchPatternChoice(VARIES_LABEL.into())
         }
         (
-            PropValue::BoolToggle { field, .. },
-            PropValue::BoolToggle {
-                field: other_field, ..
-            },
-        ) if field == other_field => PropValue::ReadOnly(VARIES_LABEL.into()),
+            PropValue::BoolToggle { .. },
+            PropValue::BoolToggle { .. },
+        ) => {
+            // Disagreeing toggles stay actionable: the fold shows a Yes/No
+            // choice (annotative on/off, text frame, …) and picking a side
+            // sets every selected entity to it, instead of the old read-only
+            // *VARIES* that made a one-shot change impossible.
+            PropValue::Choice {
+                selected: VARIES_LABEL.into(),
+                options: vec!["Yes".to_string(), "No".to_string()],
+            }
+        }
         _ => left.clone(),
     }
 }
@@ -4129,6 +4237,88 @@ mod chprop_integration_tests {
             .expect("line should commit")
     }
 
+    fn mtext_handle(app: &mut OpenCADStudio) -> acadrust::Handle {
+        app.commit_entity_handle(acadrust::EntityType::MText(
+            acadrust::entities::MText::default(),
+        ))
+        .expect("mtext should commit")
+    }
+
+    /// A Yes/No pick on the Annotative row covers the whole selection: both
+    /// MTEXTs turn annotative and gain a real per-scale context at the
+    /// current creation scale, and undo restores the pre-pick state. This is
+    /// the folded multi-selection change path — one edit, every element.
+    #[test]
+    fn annotative_yes_applies_to_every_selected_mtext() {
+        let mut app = OpenCADStudio::new_for_test();
+        let i = app.active_tab;
+        let h1 = mtext_handle(&mut app);
+        let h2 = mtext_handle(&mut app);
+        app.tabs[i].properties.source_handles = vec![h1, h2];
+
+        let _ = app.update(Message::PropGeomChoiceChanged {
+            field: "annotative",
+            value: "Yes".to_string(),
+        });
+
+        let doc = &app.tabs[i].scene.document;
+        for handle in [h1, h2] {
+            let entity = doc.get_entity(handle).expect("mtext present");
+            assert!(
+                crate::scene::annotative::is_annotative(doc, entity),
+                "mtext {handle:?} turned annotative"
+            );
+            assert!(
+                !crate::scene::annotative::object_scale_memberships(doc, handle).is_empty(),
+                "mtext {handle:?} gained a per-scale context"
+            );
+        }
+
+        app.undo_active_tab();
+        let doc = &app.tabs[i].scene.document;
+        for handle in [h1, h2] {
+            let entity = doc.get_entity(handle).expect("mtext present");
+            assert!(
+                !crate::scene::annotative::is_annotative(doc, entity),
+                "undo restores the non-annotative state on {handle:?}"
+            );
+        }
+    }
+
+    /// Picking a scale on the folded Annotative scale row gives every
+    /// selected annotative entity a representation at that scale.
+    #[test]
+    fn a_scale_pick_applies_to_every_annotative_selection_member() {
+        let mut app = OpenCADStudio::new_for_test();
+        let i = app.active_tab;
+        let h1 = mtext_handle(&mut app);
+        let h2 = mtext_handle(&mut app);
+        // Turn both annotative first (as the toggle would).
+        for handle in [h1, h2] {
+            crate::scene::annotative::set_entity_annotative(
+                &mut app.tabs[i].scene.document,
+                handle,
+                true,
+            );
+        }
+        app.tabs[i].properties.source_handles = vec![h1, h2];
+
+        let _ = app.update(Message::PropGeomChoiceChanged {
+            field: "annotative_scale",
+            value: "1:2".to_string(),
+        });
+
+        let doc = &app.tabs[i].scene.document;
+        for handle in [h1, h2] {
+            assert!(
+                crate::scene::annotative::object_scale_memberships(doc, handle)
+                    .iter()
+                    .any(|(name, _)| name == "1:2"),
+                "mtext {handle:?} carries the 1:2 representation"
+            );
+        }
+    }
+
     /// Full-handler integration: a colour change on a multi-entity
     /// selection flows through `Message::PropColorChanged` -> the
     /// property-op handler -> `apply_property_op`, and is reversible
@@ -4507,8 +4697,9 @@ mod aggregation_tests {
             .enumerate()
             .map(|(i, entity)| (Handle::new(i as u64 + 1), entity))
             .collect();
+        let doc = acadrust::CadDocument::default();
 
-        let sections = aggregate_sections(&selected, &[]);
+        let sections = aggregate_sections(&doc, &selected, &[], &[]);
         assert!(!sections.is_empty(), "three lines share their layer rows");
 
         // A colour the entities disagree on has its own variant rather than
@@ -4533,8 +4724,118 @@ mod aggregation_tests {
     fn a_single_entity_aggregates_to_its_own_rows() {
         let entity = line("WALLS", 1);
         let selected = [(Handle::new(1), &entity)];
-        let sections = aggregate_sections(&selected, &[]);
+        let doc = acadrust::CadDocument::default();
+        let sections = aggregate_sections(&doc, &selected, &[], &[]);
         let layer = row(&sections, "layer").expect("a layer row");
         assert!(format!("{:?}", layer.value).contains("WALLS"));
+    }
+
+    // Two MTEXTs annotative on and off fold to an actionable Yes/No choice
+    // (not the old read-only *VARIES*), so one pick annotates both.
+    #[test]
+    fn disagreeing_annotative_toggles_stay_settable() {
+        let mut on = acadrust::entities::mtext::MText::default();
+        on.is_annotative = true;
+        let off = acadrust::entities::mtext::MText::default();
+        let entities = [EntityType::MText(on), EntityType::MText(off)];
+        let selected: Vec<(Handle, &EntityType)> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, entity)| (Handle::new(i as u64 + 1), entity))
+            .collect();
+        let doc = acadrust::CadDocument::default();
+
+        let sections = aggregate_sections(&doc, &selected, &[], &[]);
+        let annotative = row(&sections, "annotative").expect("an annotative row");
+        assert!(
+            format!("{:?}", annotative.value).contains("VARIES"),
+            "mixed annotative states fold to the varies choice: {:?}",
+            annotative.value,
+        );
+        assert!(
+            format!("{:?}", annotative.value).contains("Yes"),
+            "the fold offers Yes/No, not read-only: {:?}",
+            annotative.value,
+        );
+    }
+
+    // The doc-dependent rows survive the fold at all: both MTEXTs carry the
+    // Annotative toggle and — with the current scale assigned — the scale
+    // choice, where the pre-fold builders only leave read-only placeholders.
+    #[test]
+    fn the_fold_keeps_the_annotative_and_scale_rows() {
+        let mut first = acadrust::entities::mtext::MText::default();
+        first.is_annotative = true;
+        first.common.handle = Handle::new(1);
+        let mut second = first.clone();
+        second.common.handle = Handle::new(2);
+        let entities = [EntityType::MText(first), EntityType::MText(second)];
+        let selected: Vec<(Handle, &EntityType)> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, entity)| (Handle::new(i as u64 + 1), entity))
+            .collect();
+        let mut doc = acadrust::CadDocument::default();
+        let scale_handle = crate::scene::annotative::ensure_scale_object(
+            &mut doc,
+            &acadrust::objects::Scale::new("1:2", 1.0, 2.0),
+        );
+        crate::scene::annotative::create_annotation_context(
+            &mut doc,
+            Handle::new(1),
+            scale_handle,
+        );
+        crate::scene::annotative::create_annotation_context(
+            &mut doc,
+            Handle::new(2),
+            scale_handle,
+        );
+
+        let sections = aggregate_sections(&doc, &selected, &[], &["1:2".to_string()]);
+        let annotative = row(&sections, "annotative").expect("an annotative row");
+        assert!(
+            format!("{:?}", annotative.value).contains("BoolToggle"),
+            "a shared per-context toggle stays a toggle: {:?}",
+            annotative.value,
+        );
+        let scale = row(&sections, "annotative_scale").expect("a scale row");
+        assert!(
+            format!("{:?}", scale.value).contains("\"1:2\""),
+            "the assigned scale shows as the selection: {:?}",
+            scale.value,
+        );
+    }
+
+    // Rows only some kinds build survive a mixed fold, so one pick covers
+    // every element that supports them. The line leads the fold so the rows
+    // genuinely have to be re-added; the MTEXT is annotative so its scale
+    // row joins the mask row.
+    #[test]
+    fn a_mask_row_survives_a_mixed_text_fold() {
+        let mut mtext = acadrust::entities::mtext::MText::default();
+        mtext.is_annotative = true;
+        let entities = [line("WALLS", 1), EntityType::MText(mtext)];
+        let selected: Vec<(Handle, &EntityType)> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, entity)| (Handle::new(i as u64 + 1), entity))
+            .collect();
+        let doc = acadrust::CadDocument::default();
+
+        let sections = aggregate_sections(&doc, &selected, &[], &["1:1".to_string()]);
+        let mask = row(&sections, "background_mask")
+            .expect("the MTEXT-only mask row survives the fold");
+        assert!(
+            format!("{:?}", mask.value).contains("Off"),
+            "the MTEXT's own value shows: {:?}",
+            mask.value,
+        );
+        let scale = row(&sections, "annotative_scale")
+            .expect("the annotative MTEXT's scale row survives the fold");
+        assert!(
+            format!("{:?}", scale.value).contains("Choice"),
+            "the scale row stays a pickable choice: {:?}",
+            scale.value,
+        );
     }
 }
