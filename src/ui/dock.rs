@@ -290,8 +290,8 @@ mod tests {
             state.location(PanelId::Properties),
             Some((DockSide::Right, 0))
         );
-        // It no longer occupies the left edge.
-        assert!(state.left.is_empty());
+        // It no longer occupies the left edge (the Model Tree stays there).
+        assert_eq!(state.left, vec![PanelId::ModelTree]);
         assert_eq!(state.right.len(), 2);
     }
 
