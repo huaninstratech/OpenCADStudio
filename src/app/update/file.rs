@@ -2043,7 +2043,16 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTIFC");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    let mut entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    // Carry the file's colour on the entity as well —
+                    // wireframe/edge rendering reads entity colour, while the
+                    // shaded pass reads the mesh colour; keep both in step.
+                    let [r, g, b, _a] = mesh.color;
+                    entity.common_mut().color = acadrust::types::Color::from_rgb(
+                        (r * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (g * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (b * 255.0).round().clamp(0.0, 255.0) as u8,
+                    );
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
                         self.tabs[i]
@@ -2105,7 +2114,13 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTSTEP");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    let mut entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    let [r, g, b, _a] = mesh.color;
+                    entity.common_mut().color = acadrust::types::Color::from_rgb(
+                        (r * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (g * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (b * 255.0).round().clamp(0.0, 255.0) as u8,
+                    );
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
                         self.tabs[i]
