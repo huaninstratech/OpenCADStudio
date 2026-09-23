@@ -56,8 +56,12 @@ struct Reader<'a> {
     type_props: std::collections::HashMap<u64, Vec<u64>>,
     /// element entity id → relating type entity id
     element_type: std::collections::HashMap<u64, u64>,
-    /// shape item entity id → RGBA colour
+    /// element entity id → RGBA colour (styled items on the element itself)
     colors: std::collections::HashMap<u64, [f32; 4]>,
+    /// element id → IfcMaterial entity id (IfcRelAssociatesMaterial)
+    materials: std::collections::HashMap<u64, u64>,
+    /// IfcMaterial id → RGBA colour (IfcMaterialDefinitionRepresentation)
+    material_colors: std::collections::HashMap<u64, [f32; 4]>,
     /// Shared so meshing can fan out across threads (rayon) on desktop.
     warnings: std::sync::Mutex<Vec<String>>,
 }
@@ -79,9 +83,12 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
         type_props: std::collections::HashMap::new(),
         element_type: std::collections::HashMap::new(),
         colors: std::collections::HashMap::new(),
+        materials: std::collections::HashMap::new(),
+        material_colors: std::collections::HashMap::new(),
         warnings: std::sync::Mutex::new(warnings),
     };
     reader.build_colors();
+    reader.build_materials();
     reader.build_relationships();
 
     // Mesh every product that carries a placement and a representation.
@@ -107,7 +114,7 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
             spf.get(rep_id)?;
             let type_name = ent.ty().trim_start_matches("IFC").to_string();
             let name = element_display_name(ent, &type_name);
-            let color = reader.colors.get(&ent.id).copied().unwrap_or(DEFAULT_COLOR);
+            let color = reader.element_color(ent.id, rep_id);
             Some(Pending {
                 placement_id,
                 rep_id,
@@ -121,7 +128,6 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
         let base = reader.placement_matrix(item.placement_id, 0);
         let mut sink = TriSink::default();
         reader.mesh_representation(item.rep_id, &base, 0, &mut sink);
-        eprintln!("[ifc-debug] item {} tris={}", item.name, sink.tris.len());
         if sink.tris.is_empty() {
             return None;
         }
@@ -321,39 +327,156 @@ impl<'a> Reader<'a> {
     }
 
     /// Styled-item colours: IfcStyledItem(Item, Styles) → surface style →
-    /// rendering → colour RGB.
+    /// rendering/shading → colour RGB. Keyed by whatever the style decorates
+    /// — usually a representation item, occasionally the element itself.
     fn build_colors(&mut self) {
         for ent in self.spf.iter() {
             if !ent.is("IFCSTYLEDITEM") {
                 continue;
             }
             let Some(item) = ent.ref_id(0) else { continue };
-            let Some(styles) = ent.list(1) else { continue };
-            for style_ref in styles {
-                let Some(style_id) = style_ref.as_ref() else { continue };
-                let Some(style) = self.spf.get(style_id) else { continue };
-                if !(style.is("IFCSURFACESTYLE")) {
-                    continue;
+            if let Some(colour) = self.styles_colour(ent.get(1)) {
+                self.colors.insert(item, colour);
+            }
+        }
+    }
+
+    /// Material associations and material-derived colours:
+    /// IfcRelAssociatesMaterial (element → material) and
+    /// IfcMaterialDefinitionRepresentation (material → styled item → colour).
+    fn build_materials(&mut self) {
+        for ent in self.spf.iter() {
+            if ent.is("IFCRELASSOCIATESMATERIAL") {
+                if let (Some(material), Some(related)) = (ent.ref_id(5), ent.list(4)) {
+                    for object in related.iter().filter_map(Val::as_ref) {
+                        self.materials.insert(object, material);
+                    }
                 }
-                let Some(subs) = style.list(1) else { continue };
-                for sub in subs {
-                    let Some(sub_id) = sub.as_ref() else { continue };
-                    let Some(rendering) = self.spf.get(sub_id) else { continue };
-                    if !rendering.is("IFCSURFACESTYLERENDERING") {
-                        continue;
+            } else if ent.is("IFCMATERIALDEFINITIONREPRESENTATION") {
+                let Some(material) = ent.ref_id(3) else { continue };
+                let Some(reps) = ent.list(2) else { continue };
+                for rep in reps {
+                    let Some(rep_id) = rep.as_ref() else { continue };
+                    let Some(rep_ent) = self.spf.get(rep_id) else { continue };
+                    // IfcStyledRepresentation keeps styled items at slot 3.
+                    let Some(items) = rep_ent.list(3) else { continue };
+                    for item in items {
+                        let Some(item_id) = item.as_ref() else { continue };
+                        let Some(styled) = self.spf.get(item_id) else { continue };
+                        if !styled.is("IFCSTYLEDITEM") {
+                            continue;
+                        }
+                        if let Some(colour) = self.styles_colour(styled.get(1)) {
+                            self.material_colors.insert(material, colour);
+                        }
                     }
-                    let Some(colour_id) = rendering.ref_id(0) else { continue };
-                    let Some(colour) = self.spf.get(colour_id) else { continue };
-                    if !colour.is("IFCCOLOURRGB") {
-                        continue;
-                    }
-                    let r = colour.num(1).unwrap_or(0.0) as f32;
-                    let g = colour.num(2).unwrap_or(0.0) as f32;
-                    let b = colour.num(3).unwrap_or(0.0) as f32;
-                    self.colors.insert(item, [r, g, b, 1.0]);
                 }
             }
         }
+    }
+
+    /// Surface style list → RGBA, via rendering (with transparency) or
+    /// shading styles.
+    fn styles_colour(&self, styles: Option<&Val>) -> Option<[f32; 4]> {
+        for style_ref in styles?.as_list()? {
+            let Some(style_id) = style_ref.as_ref() else { continue };
+            let Some(style) = self.spf.get(style_id) else { continue };
+            if !style.is("IFCSURFACESTYLE") {
+                continue;
+            }
+            let Some(subs) = style.list(1) else { continue };
+            for sub in subs {
+                let Some(sub_id) = sub.as_ref() else { continue };
+                if let Some(colour) = self.style_component_colour(sub_id, 0) {
+                    return Some(colour);
+                }
+            }
+        }
+        None
+    }
+
+    fn style_component_colour(&self, ent_id: u64, depth: usize) -> Option<[f32; 4]> {
+        if depth > 4 {
+            return None;
+        }
+        let ent = self.spf.get(ent_id)?;
+        if ent.is("IFCSURFACESTYLERENDERING") || ent.is("IFCSURFACESTYLESHADING") {
+            let Some(colour_id) = ent.ref_id(0) else { return None };
+            let Some(colour) = self.spf.get(colour_id) else { return None };
+            let mut rgba = colour_rgb(colour)?;
+            // Transparency 0 = opaque; alpha = 1 - transparency.
+            if ent.is("IFCSURFACESTYLERENDERING") {
+                let transparency = ent.num(4).unwrap_or(0.0);
+                rgba[3] = (1.0 - transparency.clamp(0.0, 1.0)) as f32;
+            }
+            return Some(rgba);
+        }
+        None
+    }
+
+    /// Colour for an element: its own styled item, then anything styled in
+    /// its representation tree (including mapped items), then its material's
+    /// styled colour, then a stable palette colour derived from the material
+    /// name, then the neutral default.
+    fn element_color(&self, element_id: u64, rep_id: u64) -> [f32; 4] {
+        if let Some(colour) = self.colors.get(&element_id) {
+            return *colour;
+        }
+        if let Some(colour) = self.representation_colour(rep_id, 0) {
+            return colour;
+        }
+        if let Some(material_id) = self.materials.get(&element_id) {
+            if let Some(colour) = self.material_colors.get(material_id) {
+                return *colour;
+            }
+            if let Some(name) = self.spf.get(*material_id).and_then(|m| m.str(0)) {
+                return palette_colour(name);
+            }
+        }
+        DEFAULT_COLOR
+    }
+
+    fn representation_colour(&self, rep_id: u64, depth: usize) -> Option<[f32; 4]> {
+        if depth > MAX_ITEM_DEPTH {
+            return None;
+        }
+        let rep = self.spf.get(rep_id)?;
+        let items_idx = if rep.is("IFCSHAPEREPRESENTATION") {
+            3
+        } else {
+            rep.args.len().saturating_sub(1)
+        };
+        for item in rep.list(items_idx)? {
+            let Some(item_id) = item.as_ref() else { continue };
+            if let Some(colour) = self.colors.get(&item_id) {
+                return Some(*colour);
+            }
+            let Some(item_ent) = self.spf.get(item_id) else { continue };
+            if item_ent.is("IFCMAPPEDITEM") {
+                let mapped_rep = item_ent
+                    .ref_id(0)
+                    .and_then(|id| self.spf.get(id))
+                    .and_then(|map| map.ref_id(1));
+                if let Some(mapped_rep) = mapped_rep {
+                    if let Some(colour) = self.representation_colour(mapped_rep, depth + 1) {
+                        return Some(colour);
+                    }
+                }
+            } else if item_ent.ty().ends_with("REPRESENTATION") {
+                if let Some(colour) = self.representation_colour(item_id, depth + 1) {
+                    return Some(colour);
+                }
+            }
+        }
+        None
+    }
+
+    /// Material display name for an element, for the property report.
+    fn material_name(&self, element_id: u64) -> Option<String> {
+        let material_id = self.materials.get(&element_id)?;
+        self.spf.get(*material_id)
+            .and_then(|m| m.str(0))
+            .map(|s| s.to_string())
     }
 
     fn build_relationships(&mut self) {
@@ -478,6 +601,9 @@ impl<'a> Reader<'a> {
                         self.collect_property_set(self.spf.get(*set), &mut props);
                     }
                 }
+            }
+            if let Some(material) = self.material_name(ent.id) {
+                props.push(("Material".into(), "Name".into(), material));
             }
             elements.push(IfcElement {
                 guid: guid.to_string(),
@@ -1342,6 +1468,42 @@ fn format_measure(value: f64) -> String {
     } else {
         format!("{value:.3}")
     }
+}
+
+/// IfcColourRgb(Name, Red, Green, Blue) → RGBA.
+fn colour_rgb(ent: &super::spf::Ent) -> Option<[f32; 4]> {
+    if !ent.is("IFCCOLOURRGB") {
+        return None;
+    }
+    Some([
+        ent.num(1)? as f32,
+        ent.num(2)? as f32,
+        ent.num(3)? as f32,
+        1.0,
+    ])
+}
+
+/// Stable, distinct colour for a material name (FNV-1a → hue).
+fn palette_colour(name: &str) -> [f32; 4] {
+    let mut hash = 2166136261u32;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let hue = (hash % 3600) as f32 / 3600.0;
+    // Soft pastel: saturation 0.42, value 0.86.
+    let (s, v) = (0.42f32, 0.86f32);
+    let sector = (hue * 6.0).floor() as i32 % 6;
+    let f = hue * 6.0 - (hue * 6.0).floor();
+    let (r, g, b) = match sector.rem_euclid(6) {
+        0 => (v, v * (1.0 - s * (1.0 - f)), v * (1.0 - s)),
+        1 => (v * (1.0 - s * f), v, v * (1.0 - s)),
+        2 => (v * (1.0 - s), v, v * (1.0 - s * (1.0 - f))),
+        3 => (v * (1.0 - s), v * (1.0 - s * f), v),
+        4 => (v * (1.0 - s * (1.0 - f)), v * (1.0 - s), v),
+        _ => (v, v * (1.0 - s), v * (1.0 - s * f)),
+    };
+    [r, g, b, 1.0]
 }
 
 fn sample_circle(center: [f64; 2], radius: f64, segments: usize) -> Vec<[f64; 2]> {

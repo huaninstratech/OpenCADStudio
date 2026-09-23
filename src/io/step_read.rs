@@ -39,6 +39,7 @@ pub fn parse_step(bytes: &[u8]) -> Result<StepImportResult, String> {
         spf: &spf,
         scale,
         names: product_names(&spf),
+        colors: styled_colours(&spf),
         warnings: std::sync::Mutex::new(Vec::new()),
     };
     const SOLID_TYPES: [&str; 4] = [
@@ -48,7 +49,7 @@ pub fn parse_step(bytes: &[u8]) -> Result<StepImportResult, String> {
         "SHELL_BASED_SURFACE_MODEL",
     ];
     // Solids are independent — mesh them across threads on desktop builds.
-    let pending: Vec<(u64, String)> = spf
+    let pending: Vec<(u64, String, [f32; 4])> = spf
         .iter()
         .filter(|ent| SOLID_TYPES.iter().any(|t| ent.is(t)))
         .map(|ent| {
@@ -57,11 +58,12 @@ pub fn parse_step(bytes: &[u8]) -> Result<StepImportResult, String> {
                 .get(&ent.id)
                 .cloned()
                 .unwrap_or_else(|| format!("Solid {}", ent.id));
-            (ent.id, name)
+            let color = reader.colors.get(&ent.id).copied().unwrap_or(DEFAULT_COLOR);
+            (ent.id, name, color)
         })
         .collect();
 
-    let mesh_one = |item: &(u64, String)| -> Option<MeshModel> {
+    let mesh_one = |item: &(u64, String, [f32; 4])| -> Option<MeshModel> {
         let ent = spf.get(item.0)?;
         let mut sink = TriSink::default();
         if ent.is("SHELL_BASED_SURFACE_MODEL") {
@@ -87,7 +89,7 @@ pub fn parse_step(bytes: &[u8]) -> Result<StepImportResult, String> {
         if sink.tris.is_empty() {
             return None;
         }
-        Some(sink_to_mesh(&sink, &item.1, DEFAULT_COLOR, reader.scale))
+        Some(sink_to_mesh(&sink, &item.1, item.2, reader.scale))
     };
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -235,12 +237,63 @@ fn product_names(spf: &Spf) -> std::collections::HashMap<u64, String> {
         .collect()
 }
 
+/// AP214 styled colours: STYLED_ITEM(Name, Styles, Item) → walk the style
+/// wrappers (surface style usage, side style, fill area style, …) down to a
+/// COLOUR_RGB. Breadth-first over entity references keeps it simple.
+fn styled_colours(spf: &Spf) -> std::collections::HashMap<u64, [f32; 4]> {
+    use std::collections::HashMap;
+    let mut out: HashMap<u64, [f32; 4]> = HashMap::new();
+    for ent in spf.iter() {
+        if !ent.is("STYLED_ITEM") {
+            continue;
+        }
+        let Some(item) = ent.ref_id(2) else { continue };
+        let Some(styles) = ent.list(1) else { continue };
+        let mut queue: Vec<u64> = styles.iter().filter_map(Val::as_ref).collect();
+        let mut steps = 0usize;
+        let mut colour = None;
+        while let Some(id) = queue.pop() {
+            steps += 1;
+            if steps > 64 {
+                break;
+            }
+            let Some(style_ent) = spf.get(id) else { continue };
+            if style_ent.is("COLOUR_RGB") {
+                colour = Some([
+                    style_ent.num(1).unwrap_or(0.0) as f32,
+                    style_ent.num(2).unwrap_or(0.0) as f32,
+                    style_ent.num(3).unwrap_or(0.0) as f32,
+                    1.0,
+                ]);
+                break;
+            }
+            for arg in &style_ent.args {
+                if let Some(reference) = arg.as_ref() {
+                    queue.push(reference);
+                } else if let Some(list) = arg.as_list() {
+                    for value in list {
+                        if let Some(reference) = value.as_ref() {
+                            queue.push(reference);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(colour) = colour {
+            out.insert(item, colour);
+        }
+    }
+    out
+}
+
 // ── geometry ─────────────────────────────────────────────────────────────
 
 struct Reader<'a> {
     spf: &'a Spf,
     scale: f64,
     names: std::collections::HashMap<u64, String>,
+    /// solid entity id → RGBA colour (STYLED_ITEM → … → COLOUR_RGB)
+    colors: std::collections::HashMap<u64, [f32; 4]>,
     /// Shared so meshing can fan out across threads (rayon) on desktop.
     warnings: std::sync::Mutex<Vec<String>>,
 }
