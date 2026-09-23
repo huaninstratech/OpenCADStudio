@@ -870,6 +870,11 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::IfcDataExport));
             }
 
+            // IMPORT — pick any supported mesh model; routed by extension.
+            "IMPORT" | "IMPORTFILE" | "MODELIN" => {
+                return Some(Task::done(Message::Import));
+            }
+
             // ── Plot Style Editor GUI ─────────────────────────────────────
             "PLOTSTYLEPANEL" | "PLOTSTYLEEDITOR" | "STYLESMANAGER" => {
                 return Some(Task::done(Message::PlotStylePanelOpen));

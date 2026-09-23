@@ -873,6 +873,32 @@ impl OpenCADStudio {
             }
 
             Message::OpenPathPicked(Some((path, size_bytes))) => {
+                // Mesh-exchange formats are imports, not drawings: route them
+                // to their importers instead of failing inside the DWG/DXF
+                // loader.
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                match ext.as_str() {
+                    "ifc" | "ifczip" if !self.tabs[self.active_tab].is_start => {
+                        self.command_line
+                            .push_info("Opening an IFC model — importing into the current drawing (IMPORTIFC).");
+                        return self.on_ifc_import_path_some(path);
+                    }
+                    "stp" | "step" if !self.tabs[self.active_tab].is_start => {
+                        self.command_line
+                            .push_info("Opening a STEP model — importing into the current drawing (IMPORTSTEP).");
+                        return self.on_step_import_path_some(path);
+                    }
+                    "ifc" | "ifczip" | "stp" | "step" => {
+                        self.command_line.push_info(
+                            "Start a drawing first (NEW), then open the IFC/STEP file to import it.",
+                        );
+                        return Task::none();
+                    }
+                    _ => {}
+                }
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1625,6 +1651,40 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
+
+            // ── Generic mesh import ───────────────────────────────────────
+            Message::Import => Task::perform(
+                async {
+                    crate::sys::file_dialog()
+                        .set_title("Import IFC / STEP / OBJ Model")
+                        .add_filter("Mesh Models", &["ifc", "IFC", "step", "stp", "STEP", "STP", "obj", "OBJ"])
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                        .await
+                        .map(|h| crate::sys::handle_path(&h))
+                },
+                Message::ImportByPath,
+            ),
+
+            Message::ImportByPath(Some(path)) => {
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                match ext.as_str() {
+                    "ifc" | "ifczip" => self.on_ifc_import_path_some(path),
+                    "stp" | "step" => self.on_step_import_path_some(path),
+                    "obj" => self.on_obj_import_path_some(path),
+                    _ => {
+                        self.command_line.push_error(&format!(
+                            "IMPORT: unsupported model format .{ext} (use IFC, STEP or OBJ)"
+                        ));
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::ImportByPath(None) => Task::none(),
 
             Message::SaveFile => self.on_save_file(),
 

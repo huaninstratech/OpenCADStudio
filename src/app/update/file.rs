@@ -2054,6 +2054,10 @@ impl OpenCADStudio {
                     }
                 }
                 self.tabs[i].dirty = true;
+                // Mesh imports land wherever the file's coordinates are —
+                // bring them into view immediately.
+                self.tabs[i].scene.remember_current_view();
+                self.tabs[i].scene.fit_all();
                 self.command_line.push_output(&format!(
                     "IMPORTIFC: imported {added} mesh(es) from {} (schema {}; {} elements)",
                     path.display(),
@@ -2112,6 +2116,10 @@ impl OpenCADStudio {
                     }
                 }
                 self.tabs[i].dirty = true;
+                // Mesh imports land wherever the file's coordinates are —
+                // bring them into view immediately.
+                self.tabs[i].scene.remember_current_view();
+                self.tabs[i].scene.fit_all();
                 self.command_line.push_output(&format!(
                     "IMPORTSTEP: imported {added} solid(s) from {} (schema {}; {} products)",
                     path.display(),

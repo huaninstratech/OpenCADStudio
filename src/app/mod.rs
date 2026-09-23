@@ -3785,6 +3785,9 @@ pub enum Message {
     IfcDataExportBuilt(Result<String, String>),
     IfcDataExportSaveResult(String, Option<std::path::PathBuf>),
     IfcDataWriteFinished(std::path::PathBuf, Result<(), String>),
+    // ── Generic mesh import (routes by file extension) ────────────────────
+    Import,
+    ImportByPath(Option<std::path::PathBuf>),
 }
 
 #[derive(Debug, Clone)]
