@@ -4788,6 +4788,13 @@ properties={:.1}ms picked={}",
                             let hit =
                                 hit.filter(|&h| self.tabs[i].scene.passes_selection_filter(h));
                             if let Some(handle) = hit {
+                                // IFC hierarchical selection: re-clicking the
+                                // same element climbs to its assembly parent.
+                                let handle = if !self.shift_down && !self.select_remove_mode {
+                                    self.tabs[i].scene.ifc_cycle_advance(handle)
+                                } else {
+                                    handle
+                                };
                                 // Individual picks accumulate (issue #47):
                                 // each plain click adds to the selection,
                                 // Shift+click removes the picked entity.

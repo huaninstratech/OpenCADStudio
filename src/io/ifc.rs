@@ -41,6 +41,7 @@ pub struct IfcMeshOut {
     pub mesh: MeshModel,
     pub guid: String,
     pub class: String,
+    pub element_id: u64,
     pub params: Option<IfcExtrusionParams>,
 }
 
@@ -168,6 +169,9 @@ pub struct IfcElementRecord {
     pub class: String,
     pub name: String,
     pub storey: String,
+    /// Aggregation parent among elements (assembly chains) — drives
+    /// hierarchical (first/leaf/last) selection.
+    pub parent_guid: Option<String>,
     pub params: Option<IfcExtrusionParams>,
 }
 
@@ -200,6 +204,8 @@ struct Reader<'a> {
     container: std::collections::HashMap<u64, String>,
     /// aggregate child id → parent id (site→building→storey chains)
     parents: std::collections::HashMap<u64, u64>,
+    /// element aggregation chains (assembly → parts): child id → parent id
+    element_parents: std::collections::HashMap<u64, u64>,
     /// element entity id → property-definition entity ids
     prop_defs: std::collections::HashMap<u64, Vec<u64>>,
     /// type entity id → its own property-definition ids
@@ -268,6 +274,7 @@ fn parse_ifc_impl(
         len_scale,
         container: std::collections::HashMap::new(),
         parents: std::collections::HashMap::new(),
+        element_parents: std::collections::HashMap::new(),
         prop_defs: std::collections::HashMap::new(),
         type_props: std::collections::HashMap::new(),
         element_type: std::collections::HashMap::new(),
@@ -286,6 +293,7 @@ fn parse_ifc_impl(
     struct Pending {
         guid: String,
         class: String,
+        element_id: u64,
         placement_id: u64,
         rep_id: u64,
         name: String,
@@ -309,6 +317,7 @@ fn parse_ifc_impl(
             Some(Pending {
                 guid: ent.str(0).unwrap_or_default().to_string(),
                 class: ent.ty().to_string(),
+                element_id: ent.id,
                 placement_id,
                 rep_id,
                 name,
@@ -341,6 +350,7 @@ fn parse_ifc_impl(
             mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),
             guid: item.guid.clone(),
             class: item.class.clone(),
+            element_id: item.element_id,
             params,
         })
     };
@@ -373,6 +383,12 @@ fn parse_ifc_impl(
                 .copied()
                 .unwrap_or_default()
                 .to_string(),
+            parent_guid: reader
+                .element_parents
+                .get(&m.element_id)
+                .and_then(|parent_id| reader.spf.get(*parent_id))
+                .and_then(|parent| parent.str(0))
+                .map(|g| g.to_string()),
             params: m.params.clone(),
         })
         .collect();
@@ -390,8 +406,36 @@ fn parse_ifc_impl(
 /// Spatial tree: one root, one node per storey (in first-seen order),
 /// element leaves labelled "CLASS · Name" and carrying their GlobalId.
 fn build_model_tree(records: &[IfcElementRecord]) -> Vec<IfcTreeNode> {
+    // Nesting: elements whose parent is another *element* (assembly chains)
+    // become children; only top-level elements hang directly off a storey.
+    let by_guid: std::collections::HashMap<&str, &IfcElementRecord> = records
+        .iter()
+        .map(|r| (r.guid.as_str(), r))
+        .collect();
+    fn nest<'a>(
+        rec: &'a IfcElementRecord,
+        records: &'a [IfcElementRecord],
+    ) -> IfcTreeNode {
+        let children = records
+            .iter()
+            .filter(|r| r.parent_guid.as_deref() == Some(rec.guid.as_str()))
+            .map(|r| nest(r, records))
+            .collect();
+        IfcTreeNode {
+            label: format!("{} · {}", rec.class, rec.name),
+            children,
+            leaf_guid: Some(rec.guid.clone()),
+        }
+    }
+    let top: Vec<&IfcElementRecord> = records
+        .iter()
+        .filter(|r| match &r.parent_guid {
+            Some(parent) => !by_guid.contains_key(parent.as_str()),
+            None => true,
+        })
+        .collect();
     let mut storeys: Vec<(String, Vec<&IfcElementRecord>)> = Vec::new();
-    for rec in records {
+    for rec in &top {
         let key = if rec.storey.is_empty() {
             "(no storey)".to_string()
         } else {
@@ -404,14 +448,7 @@ fn build_model_tree(records: &[IfcElementRecord]) -> Vec<IfcTreeNode> {
     }
     let mut roots = Vec::new();
     for (storey, items) in storeys {
-        let children = items
-            .iter()
-            .map(|r| IfcTreeNode {
-                label: format!("{} · {}", r.class, r.name),
-                children: Vec::new(),
-                leaf_guid: Some(r.guid.clone()),
-            })
-            .collect();
+        let children = items.iter().map(|r| nest(r, records)).collect();
         roots.push(IfcTreeNode {
             label: storey,
             children,
@@ -779,8 +816,25 @@ impl<'a> Reader<'a> {
         for ent in self.spf.iter() {
             if ent.is("IFCRELAGGREGATES") {
                 if let (Some(parent), Some(related)) = (ent.ref_id(4), ent.list(5)) {
+                    // Spatial containers feed the storey path; any other
+                    // aggregate parent is an element assembly chain.
+                    let spatial = self
+                        .spf
+                        .get(parent)
+                        .map(|p| {
+                            p.is("IFCPROJECT")
+                                || p.is("IFCSITE")
+                                || p.is("IFCBUILDING")
+                                || p.is("IFCBUILDINGSTOREY")
+                                || p.is("IFCSPACE")
+                        })
+                        .unwrap_or(true);
                     for child in related.iter().filter_map(Val::as_ref) {
-                        self.parents.insert(child, parent);
+                        if spatial {
+                            self.parents.insert(child, parent);
+                        } else {
+                            self.element_parents.insert(child, parent);
+                        }
                     }
                 }
             }

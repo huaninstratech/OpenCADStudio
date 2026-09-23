@@ -2702,6 +2702,7 @@ impl Scene {
         self.ifc_elements = HashMap::default();
         self.ifc_handle_by_guid = HashMap::default();
         self.ifc_tree = Vec::new();
+        self.ifc_cycle = None;
         *self.camera.borrow_mut() = Camera::default();
         self.camera_generation += 1;
         // A brand-new/replaced document has none of these yet — without

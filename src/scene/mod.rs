@@ -2246,6 +2246,9 @@ pub struct Scene {
     pub ifc_handle_by_guid: HashMap<String, Handle>,
     /// Spatial model tree from the last IFC import.
     pub ifc_tree: Vec<crate::io::ifc::IfcTreeNode>,
+    /// Hierarchical-selection state: (clicked handle, currently selected
+    /// ancestor, unused level slot). Cleared on any other selection change.
+    pub ifc_cycle: Option<(Handle, Handle, usize)>,
     /// GPU render data for raster images (RasterImage entities), keyed by handle.
     pub images: HashMap<Handle, ImageModel>,
     /// The viewport that is currently "entered" (MSPACE mode).
@@ -2625,6 +2628,7 @@ impl Scene {
             ifc_elements: HashMap::default(),
             ifc_handle_by_guid: HashMap::default(),
             ifc_tree: Vec::new(),
+            ifc_cycle: None,
             images: HashMap::default(),
             active_viewport: None,
             bg_color: [33.0 / 255.0, 40.0 / 255.0, 48.0 / 255.0, 1.0],

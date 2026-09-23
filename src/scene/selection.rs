@@ -148,8 +148,31 @@ impl Scene {
         }
     }
 
+    /// IFC hierarchical selection (first/leaf/last, IFC.js-style): the
+    /// first click selects the deepest element; re-clicking the same element
+    /// climbs its assembly chain one ancestor per click and wraps at the top.
+    pub fn ifc_cycle_advance(&mut self, clicked: Handle) -> Handle {
+        if let Some((prev_clicked, current, _level)) = self.ifc_cycle {
+            if prev_clicked == clicked && self.selected.contains(&current) {
+                let next = self
+                    .ifc_elements
+                    .get(&current)
+                    .and_then(|record| record.parent_guid.as_ref())
+                    .and_then(|guid| self.ifc_handle_by_guid.get(guid))
+                    .copied();
+                if let Some(parent) = next {
+                    self.ifc_cycle = Some((clicked, parent, 0));
+                    return parent;
+                }
+            }
+        }
+        self.ifc_cycle = Some((clicked, clicked, 0));
+        clicked
+    }
+
     pub fn deselect_all(&mut self) {
         self.selected_constraint = None;
+        self.ifc_cycle = None;
         if self.selected.is_empty() {
             return;
         }
