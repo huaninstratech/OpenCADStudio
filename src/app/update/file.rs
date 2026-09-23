@@ -2375,10 +2375,18 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                         .push_info("IMPORTIFC: target drawing was closed.");
                     return Task::none();
                 };
-                self.push_undo_snapshot(i, "IMPORTIFC");
+                // Snapshotting a six-figure entity import would freeze the UI
+                // thread; skip undo for very large imports.
+                let undo_worthwhile = import.meshes.len() <= 20_000;
+                if undo_worthwhile {
+                    self.push_undo_snapshot(i, "IMPORTIFC");
+                }
                 let mut added = 0usize;
                 let records = import.records;
                 let tree = import.tree;
+                // Snapshotting a six-figure entity import would freeze the UI
+                // thread; skip undo for very large imports.
+                let undo_worthwhile = import.meshes.len() <= 20_000;
                 let mut guid_handles: Vec<(String, acadrust::Handle)> = Vec::new();
                 // GUID → property rows, attached to each entity as XDATA.
                 let props_by_guid: std::collections::HashMap<

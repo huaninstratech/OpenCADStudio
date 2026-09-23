@@ -57,6 +57,22 @@ pub fn ear_clip(outer: &[[f64; 2]], holes: &[&[[f64; 2]]]) -> Vec<[[f64; 2]; 3]>
     if outer.len() < 3 {
         return Vec::new();
     }
+    // Ear clipping is quadratic — beyond this size the caps degrade to a
+    // fast centre fan instead of stalling the import.
+    if outer.len() > 5000 {
+        let c = [
+            outer.iter().map(|p| p[0]).sum::<f64>() / outer.len() as f64,
+            outer.iter().map(|p| p[1]).sum::<f64>() / outer.len() as f64,
+        ];
+        let centre = [c[0], c[1]];
+        return (0..outer.len())
+            .map(|i| {
+                let a = outer[i];
+                let b = outer[(i + 1) % outer.len()];
+                [centre, a, b]
+            })
+            .collect();
+    }
 
     // Build the combined ring: outer (CCW) with each hole (CW) spliced in.
     let mut ring: Vec<[f64; 2]> = if signed_area(outer) < 0.0 {
@@ -251,6 +267,11 @@ const MAX_FEATURE_EDGES: usize = 300_000;
 /// soup vertices merge. Returns (high, low_residual) pair lists ready for
 /// `MeshLodSet::edge_verts` / `edge_verts_low`.
 pub fn feature_edges(verts: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    // The edge table is linear but hash-heavy; skip pathological meshes
+    // entirely rather than stalling the caller.
+    if verts.len() > 600_000 {
+        return (Vec::new(), Vec::new());
+    }
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     for p in verts {

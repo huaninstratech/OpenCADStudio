@@ -1,27 +1,7 @@
 [
 {
-  "file": "src/scene/entity.rs",
-  "find": "        self.ifc_cycle = None;\n",
-  "replace": ""
-},
-{
-  "file": "src/scene/selection.rs",
-  "find": "        self.ifc_cycle = None;\n",
-  "replace": ""
-},
-{
-  "file": "src/scene/mod.rs",
-  "find": "    /// Hierarchical-selection state: (clicked handle, currently selected\n    /// ancestor, unused level slot). Cleared on any other selection change.\n    pub ifc_cycle: Option<(Handle, Handle, usize)>,",
-  "replace": ""
-},
-{
-  "file": "src/scene/mod.rs",
-  "find": "            ifc_cycle: None,\n",
-  "replace": ""
-},
-{
-  "file": "src/scene/mod.rs",
-  "find": "            EntityType::Solid3D(_)\n                | EntityType::Region(_)\n                | EntityType::Body(_)\n                | EntityType::Surface(_)\n        )\n    }",
-  "replace": "            EntityType::Solid3D(_)\n                | EntityType::Region(_)\n                | EntityType::Body(_)\n                | EntityType::Surface(_)\n                | EntityType::Mesh(_)\n                | EntityType::PolygonMesh(_)\n                | EntityType::PolyfaceMesh(_)\n        )\n    }"
+  "file": "src/app/update/file.rs",
+  "find": "                if undo_worthwhile {\n                    self.push_undo_snapshot(i, \"IMPORTIFC\");\n                }\n                let mut added = 0usize;\n                let records = import.records;",
+  "replace": "                // Snapshotting a six-figure entity import would freeze the UI\n                // thread; skip undo for very large imports.\n                let undo_worthwhile = import.meshes.len() <= 20_000;\n                if undo_worthwhile {\n                    self.push_undo_snapshot(i, \"IMPORTIFC\");\n                }\n                let mut added = 0usize;\n                let records = import.records;"
 }
 ]
