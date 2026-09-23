@@ -148,31 +148,60 @@ impl Scene {
         }
     }
 
-    /// IFC hierarchical selection (first/leaf/last, IFC.js-style): the
-    /// first click selects the deepest element; re-clicking the same element
-    /// climbs its assembly chain one ancestor per click and wraps at the top.
-    pub fn ifc_cycle_advance(&mut self, clicked: Handle) -> Handle {
-        if let Some((prev_clicked, current, _level)) = self.ifc_cycle {
-            if prev_clicked == clicked && self.selected.contains(&current) {
-                let next = self
-                    .ifc_elements
-                    .get(&current)
-                    .and_then(|record| record.parent_guid.as_ref())
-                    .and_then(|guid| self.ifc_handle_by_guid.get(guid))
-                    .copied();
-                if let Some(parent) = next {
-                    self.ifc_cycle = Some((clicked, parent, 0));
-                    return parent;
+    /// Resolve which handle a click selects at the given IFC hierarchy
+    /// level. Storey-level returns the clicked handle plus its storey path
+    /// so the caller can expand the selection to the whole storey.
+    pub fn ifc_select_at_level(
+        &self,
+        handle: Handle,
+        level: crate::app::IfcSelectLevel,
+    ) -> (Handle, Option<String>) {
+        if level == crate::app::IfcSelectLevel::Object {
+            return (handle, None);
+        }
+        let Some(record) = self.ifc_elements.get(&handle) else {
+            return (handle, None);
+        };
+        if level == crate::app::IfcSelectLevel::Storey {
+            let storey = if record.storey.is_empty() {
+                None
+            } else {
+                Some(record.storey.clone())
+            };
+            return (handle, storey);
+        }
+        let resolve_parent = |current: Handle| -> Option<Handle> {
+            self.ifc_elements
+                .get(&current)
+                .and_then(|r| r.parent_guid.as_ref())
+                .and_then(|guid| self.ifc_handle_by_guid.get(guid))
+                .copied()
+        };
+        match level {
+            crate::app::IfcSelectLevel::Assembly => {
+                (resolve_parent(handle).unwrap_or(handle), None)
+            }
+            _ => {
+                let mut current = handle;
+                while let Some(parent) = resolve_parent(current) {
+                    current = parent;
                 }
+                (current, None)
             }
         }
-        self.ifc_cycle = Some((clicked, clicked, 0));
-        clicked
+    }
+
+    /// Every IFC element handle sharing `storey` (for storey-level select).
+    pub fn ifc_storey_handles(&self, storey: &str) -> Vec<Handle> {
+        self.ifc_elements
+            .iter()
+            .filter(|(_, record)| record.storey == storey)
+            .map(|(handle, _)| *handle)
+            .collect()
     }
 
     pub fn deselect_all(&mut self) {
         self.selected_constraint = None;
-        self.ifc_cycle = None;
         if self.selected.is_empty() {
             return;
         }

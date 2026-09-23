@@ -1708,6 +1708,11 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
+            Message::IfcSelectLevel(level) => {
+                self.ifc_select_level = level;
+                Task::none()
+            }
+
             Message::IfcTreeSelect(guid) => {
                 let i = self.active_tab;
                 let Some(handle) = self.tabs[i].scene.ifc_handle_by_guid.get(&guid).copied()

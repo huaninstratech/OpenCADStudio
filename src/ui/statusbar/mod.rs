@@ -92,6 +92,7 @@ impl StatusBar {
         show_layout_tabs: bool,
         // Current annotation scale for model space (1.0 = 1:1, 50.0 = 1:50, etc.).
         annotation_scale: f32,
+        ifc_select_level: crate::app::IfcSelectLevel,
         // True when the scale pill is interactive (always model space; paper space only when a viewport is active/selected).
         scale_pill_enabled: bool,
         annotation_all_visible: bool,
@@ -362,6 +363,9 @@ impl StatusBar {
                 )
                 .into(),
             );
+        }
+        if vis(StatusPill::Osnap) {
+            pills.push(ifc_select_pill(ifc_select_level));
         }
         if vis(StatusPill::Osnap) {
             pills.push(
@@ -896,6 +900,41 @@ fn polar_pill<'a>(
     );
 
     split_pill(main.into(), caret, active)
+}
+
+// ── IFC selection level pill ────────────────────────────────────────────────
+// Footer combobox: chooses which hierarchy level an IFC click selects.
+fn ifc_select_pill(level: crate::app::IfcSelectLevel) -> Element<'static, Message> {
+    let label = match level {
+        crate::app::IfcSelectLevel::Object => "IFC ▸ Object",
+        crate::app::IfcSelectLevel::Assembly => "IFC ▸ Assembly",
+        crate::app::IfcSelectLevel::TopAssembly => "IFC ▸ Top",
+        crate::app::IfcSelectLevel::Storey => "IFC ▸ Storey",
+    };
+    let entries = vec![
+        (crate::app::IfcSelectLevel::Object, "Object (element leaf)"),
+        (crate::app::IfcSelectLevel::Assembly, "Parent assembly"),
+        (crate::app::IfcSelectLevel::TopAssembly, "Top assembly"),
+        (crate::app::IfcSelectLevel::Storey, "Whole storey"),
+    ]
+    .into_iter()
+    .map(|(level, row_label)| {
+        crate::ui::statusbar::status_menu::Entry::close(
+            button(
+                container(text(row_label.to_string()).size(11))
+                    .width(iced::Length::Fill)
+                    .padding([3, 8]),
+            )
+            .on_press(Message::IfcSelectLevel(level))
+            .width(iced::Length::Fill),
+        )
+    })
+    .collect();
+    let root = tip(
+        container(text(label.to_string()).size(11)).padding([4, 8]).into(),
+        "IFC hierarchical selection: which level a click selects".into(),
+    );
+    crate::ui::statusbar::status_menu::menu_bar(root, entries, 170.0)
 }
 
 // ── OSNAP pill ─────────────────────────────────────────────────────────────

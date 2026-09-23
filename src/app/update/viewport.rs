@@ -4790,8 +4790,11 @@ properties={:.1}ms picked={}",
                             if let Some(handle) = hit {
                                 // IFC hierarchical selection: re-clicking the
                                 // same element climbs to its assembly parent.
+                                let mut ifc_storey_expand: Option<String> = None;
                                 let handle = if !self.shift_down && !self.select_remove_mode {
-                                    self.tabs[i].scene.ifc_cycle_advance(handle)
+                                    let (resolved, storey) = self.tabs[i].scene.ifc_select_at_level(handle, self.ifc_select_level);
+                                    ifc_storey_expand = storey;
+                                    resolved
                                 } else {
                                     handle
                                 };
@@ -4822,6 +4825,12 @@ properties={:.1}ms picked={}",
                                 }
                                 self.refresh_properties();
                                 selection_just_completed = true;
+                                if let Some(storey) = ifc_storey_expand {
+                                    for h in self.tabs[i].scene.ifc_storey_handles(&storey) {
+                                        self.tabs[i].scene.select_entity(h, true);
+                                    }
+                                    self.refresh_properties();
+                                }
                             } else {
                                 // Empty-space click only ARMS a box here; it
                                 // no longer clears the selection, so a box can

@@ -2204,6 +2204,7 @@ bg={bg_ms:.1}ms n={view_count}"
                         tab.scene.active_viewport.is_some(),
                         self.show_layout_tabs,
                         tab.scene.annotation_scale,
+                        self.ifc_select_level,
                         scale_pill_enabled,
                         tab.scene.annotation_all_visible(),
                         self.annotation_auto_scale > 0,

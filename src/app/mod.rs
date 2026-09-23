@@ -297,6 +297,19 @@ pub const OPEN_PHASE_XREF: u8 = 2;
 pub const OPEN_PHASE_CACHING: u8 = 3;
 pub const OPEN_PHASE_FINALIZING: u8 = 4;
 
+/// Which hierarchy level an IFC click selects (footer combobox).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfcSelectLevel {
+    /// The element leaf itself.
+    Object,
+    /// Its parent assembly (one level up).
+    Assembly,
+    /// The topmost assembly in its chain.
+    TopAssembly,
+    /// Every element in the element's storey.
+    Storey,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenProgress {
     pub id: u64,
@@ -730,6 +743,7 @@ pub(super) struct OpenCADStudio {
     render_mode_preview: Option<acadrust::entities::ViewportRenderMode>,
     /// Whether the Properties panel is shown on the left (PROPERTIES).
     show_properties: bool,
+    ifc_select_level: IfcSelectLevel,
     show_ifc_tree: bool,
     /// Docked Insert Block panel visibility.
     pub(crate) show_block_palette: bool,
@@ -3791,6 +3805,8 @@ pub enum Message {
     ImportByPath(Option<std::path::PathBuf>),
     /// Click an element leaf in the IFC Model Tree → select it in the view.
     IfcTreeSelect(String),
+    /// Footer combobox: which IFC hierarchy level a click selects.
+    IfcSelectLevel(IfcSelectLevel),
     // ── IFC export (round-trip) ──────────────────────────────────────────
     IfcExport,
     IfcExportPath(Option<std::path::PathBuf>),
@@ -3997,6 +4013,7 @@ impl OpenCADStudio {
             render_mode_menu_open: false,
             render_mode_preview: None,
             show_properties: true,
+            ifc_select_level: IfcSelectLevel::Object,
             show_ifc_tree: true,
             show_block_palette: false,
             show_external_references: false,

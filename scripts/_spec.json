@@ -1,0 +1,27 @@
+[
+{
+  "file": "src/scene/entity.rs",
+  "find": "        self.ifc_cycle = None;\n",
+  "replace": ""
+},
+{
+  "file": "src/scene/selection.rs",
+  "find": "        self.ifc_cycle = None;\n",
+  "replace": ""
+},
+{
+  "file": "src/scene/mod.rs",
+  "find": "    /// Hierarchical-selection state: (clicked handle, currently selected\n    /// ancestor, unused level slot). Cleared on any other selection change.\n    pub ifc_cycle: Option<(Handle, Handle, usize)>,",
+  "replace": ""
+},
+{
+  "file": "src/scene/mod.rs",
+  "find": "            ifc_cycle: None,\n",
+  "replace": ""
+},
+{
+  "file": "src/scene/mod.rs",
+  "find": "            EntityType::Solid3D(_)\n                | EntityType::Region(_)\n                | EntityType::Body(_)\n                | EntityType::Surface(_)\n        )\n    }",
+  "replace": "            EntityType::Solid3D(_)\n                | EntityType::Region(_)\n                | EntityType::Body(_)\n                | EntityType::Surface(_)\n                | EntityType::Mesh(_)\n                | EntityType::PolygonMesh(_)\n                | EntityType::PolyfaceMesh(_)\n        )\n    }"
+}
+]
