@@ -1,7 +1,17 @@
 [
 {
+  "file": "src/io/ifc.rs",
+  "find": "pub struct IfcMeshOut {\n    pub mesh: MeshModel,\n    pub guid: String,\n    pub class: String,\n    pub element_id: u64,\n    pub params: Option<IfcExtrusionParams>,\n}",
+  "replace": "pub struct IfcMeshOut {\n    pub mesh: MeshModel,\n    pub guid: String,\n    pub class: String,\n    pub element_id: u64,\n    pub params: Option<IfcExtrusionParams>,\n    /// Feature edges computed on the worker thread (saves a UI-thread pass).\n    pub edges: (Vec<[f32; 3]>, Vec<[f32; 3]>),\n}"
+},
+{
+  "file": "src/io/ifc.rs",
+  "find": "        Some(IfcMeshOut {\n            mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),\n            guid: item.guid.clone(),\n            class: item.class.clone(),\n            element_id: item.element_id,\n            params,\n        })",
+  "replace": "        let mesh = sink_to_mesh(&sink, &item.name, item.color, reader.len_scale);\n        let edges = crate::io::meshutil::feature_edges(&mesh.verts);\n        Some(IfcMeshOut {\n            mesh,\n            guid: item.guid.clone(),\n            class: item.class.clone(),\n            element_id: item.element_id,\n            params,\n            edges,\n        })"
+},
+{
   "file": "src/app/update/file.rs",
-  "find": "                if undo_worthwhile {\n                    self.push_undo_snapshot(i, \"IMPORTIFC\");\n                }\n                let mut added = 0usize;\n                let records = import.records;",
-  "replace": "                // Snapshotting a six-figure entity import would freeze the UI\n                // thread; skip undo for very large imports.\n                let undo_worthwhile = import.meshes.len() <= 20_000;\n                if undo_worthwhile {\n                    self.push_undo_snapshot(i, \"IMPORTIFC\");\n                }\n                let mut added = 0usize;\n                let records = import.records;"
+  "find": "                    let (entity, mut set) =\n                        Self::build_mesh_import(out.mesh, &out.guid, props);\n                    let handle = self.tabs[i].scene.add_entity(entity);",
+  "replace": "                    let (entity, mut set) =\n                        Self::build_mesh_import(out.mesh, &out.guid, props);\n                    set.edge_verts = out.edges.0;\n                    set.edge_verts_low = out.edges.1;\n                    let handle = self.tabs[i].scene.add_entity(entity);"
 }
 ]

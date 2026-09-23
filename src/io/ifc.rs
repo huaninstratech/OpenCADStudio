@@ -43,6 +43,8 @@ pub struct IfcMeshOut {
     pub class: String,
     pub element_id: u64,
     pub params: Option<IfcExtrusionParams>,
+    /// Feature edges computed on the worker thread (saves a UI-thread pass).
+    pub edges: (Vec<[f32; 3]>, Vec<[f32; 3]>),
 }
 
 /// Semantic shape parameters of an extrusion-based element, stored in
@@ -220,6 +222,12 @@ struct Reader<'a> {
     material_colors: std::collections::HashMap<u64, [f32; 4]>,
     /// Shared so meshing can fan out across threads (rayon) on desktop.
     warnings: std::sync::Mutex<Vec<String>>,
+    /// Tessellation cache for mapped representations: source rep id →
+    /// triangles in the representation's own coordinates. Assembly-heavy
+    /// models instance the same brep tens of thousands of times; without
+    /// this cache every instance re-tessellates from scratch.
+    mapped_cache:
+        std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<Vec<[[f64; 3]; 3]>>>>>,
 }
 
 /// Parse an IFC file into meshes plus extracted element records.
@@ -282,6 +290,7 @@ fn parse_ifc_impl(
         materials: std::collections::HashMap::new(),
         material_colors: std::collections::HashMap::new(),
         warnings: std::sync::Mutex::new(warnings),
+        mapped_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
     reader.build_colors();
     reader.build_materials();
@@ -346,12 +355,15 @@ fn parse_ifc_impl(
             let basis = 4500 + ((n as u64) * 5000 / total_pending.max(1) as u64) as u16;
             p.set(OPEN_PHASE_CACHING, basis, n, total_pending);
         }
+        let mesh = sink_to_mesh(&sink, &item.name, item.color, reader.len_scale);
+        let edges = crate::io::meshutil::feature_edges(&mesh.verts);
         Some(IfcMeshOut {
-            mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),
+            mesh,
             guid: item.guid.clone(),
             class: item.class.clone(),
             element_id: item.element_id,
             params,
+            edges,
         })
     };
 
@@ -1265,8 +1277,36 @@ impl<'a> Reader<'a> {
             .unwrap_or(glam::DMat4::IDENTITY);
         let mapped = *parent * target * origin;
         if let Some(rep_id) = source.ref_id(1) {
-            self.mesh_representation(rep_id, &mapped, depth + 1, sink);
+            if let Some(tris) = self.mapped_source_tris(rep_id, depth + 1) {
+                for tri in tris.iter() {
+                    let t = |p: [f64; 3]| {
+                        let v = mapped.transform_point3(glam::DVec3::new(p[0], p[1], p[2]));
+                        [v.x, v.y, v.z]
+                    };
+                    sink.push(t(tri[0]), t(tri[1]), t(tri[2]));
+                }
+            }
         }
+    }
+
+    /// Triangles of a representation in its own coordinates, cached per id.
+    fn mapped_source_tris(
+        &self,
+        rep_id: u64,
+        depth: usize,
+    ) -> Option<std::sync::Arc<Vec<[[f64; 3]; 3]>>> {
+        if let Ok(cache) = self.mapped_cache.lock() {
+            if let Some(cached) = cache.get(&rep_id) {
+                return cached.clone();
+            }
+        }
+        let mut sink = TriSink::default();
+        self.mesh_representation(rep_id, &glam::DMat4::IDENTITY, depth, &mut sink);
+        let tris = (!sink.tris.is_empty()).then(|| std::sync::Arc::new(sink.tris));
+        if let Ok(mut cache) = self.mapped_cache.lock() {
+            cache.insert(rep_id, tris.clone());
+        }
+        tris
     }
 
     fn transform_operator_matrix(&self, op: &super::spf::Ent) -> glam::DMat4 {
@@ -2333,5 +2373,35 @@ END-ISO-10303-21;
             result.warnings.len(),
         );
         assert!(result.meshes.len() >= 19_000, "expected most walls to mesh");
+    }
+}
+
+#[cfg(test)]
+mod tmp_diag {
+    #[test]
+    #[ignore]
+    fn times_downloads_big_ifc() {
+        let path = "C:/Users/huanld/Downloads/atatd-26.022_Z01_P001_R07.ifc";
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let t0 = std::time::Instant::now();
+        let spf = crate::io::spf::Spf::parse(&bytes).expect("spf parse");
+        let t1 = std::time::Instant::now();
+        let result = super::parse_ifc(&bytes).expect("import");
+        let t2 = std::time::Instant::now();
+        let mapped = spf
+            .of_type("IFCMAPPEDITEM")
+            .count();
+        println!(
+            "size={}MB spf_parse={:.1}s full_import={:.1}s meshes={} elements={} mapped={}",
+            bytes.len() / 1048576,
+            (t1 - t0).as_secs_f32(),
+            (t2 - t0).as_secs_f32(),
+            result.meshes.len(),
+            result.elements.len(),
+            mapped
+        );
     }
 }

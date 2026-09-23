@@ -2404,6 +2404,8 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                         .unwrap_or(&[]);
                     let (entity, mut set) =
                         Self::build_mesh_import(out.mesh, &out.guid, props);
+                    set.edge_verts = out.edges.0;
+                    set.edge_verts_low = out.edges.1;
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
                         // The pick pipeline resolves the owning entity by
