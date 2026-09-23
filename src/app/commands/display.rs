@@ -870,6 +870,33 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::IfcDataExport));
             }
 
+            // EXPORTIFC — write the imported/edited IFC model back out.
+            "EXPORTIFC" => {
+                return Some(self.on_ifc_export());
+            }
+
+            // IFCEDIT — parametric edit of the selected IFC element.
+            // Usage: IFCEDIT <key> <value> (e.g. IFCEDIT depth 3200).
+            // IFCEDIT ? lists the editable keys of the current selection.
+            "IFCEDIT" => {
+                let mut tokens = cmd.split_whitespace();
+                tokens.next();
+                let key = tokens.next().unwrap_or("").to_string();
+                let value_text = tokens.next().unwrap_or("").to_string();
+                if key.is_empty() || value_text.is_empty() {
+                    self.command_line.push_info(
+                        "IFCEDIT <key> <value> — edit the selected IFC element parametrically. Select an element first; IFCEDIT ? lists its editable keys.",
+                    );
+                    return Some(Task::none());
+                }
+                let Ok(value) = value_text.parse::<f64>() else {
+                    self.command_line
+                        .push_error("IFCEDIT: value must be a number (millimetres).");
+                    return Some(Task::none());
+                };
+                return Some(self.on_ifc_edit(key, value));
+            }
+
             // IMPORT — pick any supported mesh model; routed by extension.
             "IMPORT" | "IMPORTFILE" | "MODELIN" => {
                 return Some(Task::done(Message::Import));

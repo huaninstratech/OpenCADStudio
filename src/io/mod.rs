@@ -12,6 +12,7 @@ pub mod ole_embed;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod single_instance;
 pub mod ifc;
+pub mod ifc_write;
 pub mod meshutil;
 pub mod pdf_export;
 pub mod plot_style;

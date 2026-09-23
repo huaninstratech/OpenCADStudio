@@ -1,6 +1,7 @@
 pub mod about;
 pub mod block_palette;
 pub mod browser;
+pub mod ifc_tree;
 pub mod layout_manager;
 pub mod layer_state_manager;
 pub mod drawing_units;

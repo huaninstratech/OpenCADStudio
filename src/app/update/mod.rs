@@ -1694,6 +1694,33 @@ impl OpenCADStudio {
 
             Message::ImportByPath(None) => Task::none(),
 
+            Message::IfcExport => self.on_ifc_export(),
+            Message::IfcExportPath(Some(path)) => self.on_ifc_export_path_some(path),
+            Message::IfcExportPath(None) => Task::none(),
+            Message::IfcExportFinished(path, result) => {
+                match result {
+                    Ok(()) => self.command_line.push_output(
+                        &format!("EXPORTIFC: model written to {}", path.display()),
+                    ),
+                    Err(error) => {
+                        self.command_line.push_error(&format!("EXPORTIFC: {error}"))
+                    }
+                }
+                Task::none()
+            }
+            Message::IfcTreeSelect(guid) => {
+                let i = self.active_tab;
+                let Some(handle) = self.tabs[i].scene.ifc_handle_by_guid.get(&guid).copied()
+                else {
+                    return Task::none();
+                };
+                self.tabs[i].scene.deselect_all();
+                self.tabs[i].scene.select_entity(handle, false);
+                self.tabs[i].dirty = true;
+                self.refresh_properties();
+                Task::none()
+            }
+
             Message::SaveFile => self.on_save_file(),
 
             Message::SaveAs => {

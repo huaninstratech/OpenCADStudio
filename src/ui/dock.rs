@@ -44,6 +44,8 @@ pub enum PanelId {
     ExternalReferences,
     /// Outline of the drawing's origin planes, open sketch and solid bodies.
     Browser,
+    /// IFC model tree (Project → Storey → elements) for imported models.
+    ModelTree,
 }
 
 impl PanelId {
@@ -54,6 +56,7 @@ impl PanelId {
             PanelId::BlockPalette => "Block Palette",
             PanelId::ExternalReferences => "External References",
             PanelId::Browser => "Browser",
+            PanelId::ModelTree => "IFC Model Tree",
         }
     }
 
@@ -64,6 +67,7 @@ impl PanelId {
             PanelId::BlockPalette => 260.0,
             PanelId::ExternalReferences => 460.0,
             PanelId::Browser => 230.0,
+            PanelId::ModelTree => 260.0,
         }
     }
 
@@ -120,7 +124,7 @@ pub struct DockState {
 impl Default for DockState {
     fn default() -> Self {
         Self {
-            left: vec![PanelId::Properties],
+            left: vec![PanelId::Properties, PanelId::ModelTree],
             right: vec![PanelId::BlockPalette],
             panels: BTreeMap::new(),
         }
@@ -152,6 +156,7 @@ impl DockState {
             PanelId::BlockPalette,
             PanelId::ExternalReferences,
             PanelId::Browser,
+            PanelId::ModelTree,
         ] {
             self.panels.entry(id).or_insert_with(|| DockPanel::for_id(id));
         }

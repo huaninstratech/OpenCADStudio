@@ -730,6 +730,7 @@ pub(super) struct OpenCADStudio {
     render_mode_preview: Option<acadrust::entities::ViewportRenderMode>,
     /// Whether the Properties panel is shown on the left (PROPERTIES).
     show_properties: bool,
+    show_ifc_tree: bool,
     /// Docked Insert Block panel visibility.
     pub(crate) show_block_palette: bool,
     /// Docked External References panel visibility (EXTERNALREFERENCES).
@@ -3788,6 +3789,12 @@ pub enum Message {
     // ── Generic mesh import (routes by file extension) ────────────────────
     Import,
     ImportByPath(Option<std::path::PathBuf>),
+    /// Click an element leaf in the IFC Model Tree → select it in the view.
+    IfcTreeSelect(String),
+    // ── IFC export (round-trip) ──────────────────────────────────────────
+    IfcExport,
+    IfcExportPath(Option<std::path::PathBuf>),
+    IfcExportFinished(std::path::PathBuf, Result<(), String>),
 }
 
 #[derive(Debug, Clone)]
@@ -3990,6 +3997,7 @@ impl OpenCADStudio {
             render_mode_menu_open: false,
             render_mode_preview: None,
             show_properties: true,
+            show_ifc_tree: true,
             show_block_palette: false,
             show_external_references: false,
             show_browser: false,

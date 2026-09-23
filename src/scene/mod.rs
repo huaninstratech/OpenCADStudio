@@ -2238,6 +2238,14 @@ pub struct Scene {
     pub block_meshes: HashMap<Handle, MeshLodSet>,
     /// Kernel B-reps used by solid operations and exact-geometry saves.
     pub solid_models: HashMap<Handle, cadkernel::brep::Body>,
+    /// Semantic records for IFC-imported elements (mức 3): entity handle →
+    /// element record with editable shape parameters. Session-scoped, like
+    /// `solid_models` — cleared whenever the drawing is replaced.
+    pub ifc_elements: HashMap<Handle, crate::io::ifc::IfcElementRecord>,
+    /// GUID → handle for IFC elements (model-tree click-to-select).
+    pub ifc_handle_by_guid: HashMap<String, Handle>,
+    /// Spatial model tree from the last IFC import.
+    pub ifc_tree: Vec<crate::io::ifc::IfcTreeNode>,
     /// GPU render data for raster images (RasterImage entities), keyed by handle.
     pub images: HashMap<Handle, ImageModel>,
     /// The viewport that is currently "entered" (MSPACE mode).
@@ -2614,6 +2622,9 @@ impl Scene {
             material_base_dir: None,
             block_meshes: HashMap::default(),
             solid_models: HashMap::default(),
+            ifc_elements: HashMap::default(),
+            ifc_handle_by_guid: HashMap::default(),
+            ifc_tree: Vec::new(),
             images: HashMap::default(),
             active_viewport: None,
             bg_color: [33.0 / 255.0, 40.0 / 255.0, 48.0 / 255.0, 1.0],

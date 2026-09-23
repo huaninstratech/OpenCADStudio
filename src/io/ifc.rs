@@ -40,6 +40,144 @@ pub struct IfcElement {
 pub struct IfcMeshOut {
     pub mesh: MeshModel,
     pub guid: String,
+    pub class: String,
+    pub params: Option<IfcExtrusionParams>,
+}
+
+/// Semantic shape parameters of an extrusion-based element, stored in
+/// MILLIMETRES with world-space placement — the substrate for parametric
+/// BIM editing: change a value, rebuild the mesh, no re-parse needed.
+#[derive(Clone, Debug)]
+pub struct IfcExtrusionParams {
+    /// Element placement × solid position (linear part may rotate).
+    pub world: glam::DMat4,
+    /// Unit extrusion direction in world space.
+    pub dir_world: [f64; 3],
+    /// Extrusion length in millimetres.
+    pub depth: f64,
+    pub profile: IfcProfile,
+    /// Resolved outline for arbitrary profiles (mm, position applied) —
+    /// the rebuild source when dims are not parametric.
+    pub outline: Option<Vec<Vec<[f64; 2]>>>,
+}
+
+/// Profile families whose dimensions are captured (and editable). `Points`
+/// covers arbitrary outlines: only the extrusion depth stays editable.
+#[derive(Clone, Debug)]
+pub enum IfcProfile {
+    Rectangle { x: f64, y: f64 },
+    Circle { radius: f64 },
+    CircleHollow { radius: f64, thickness: f64 },
+    RectangleHollow { x: f64, y: f64, thickness: f64 },
+    Trapezium { bottom: f64, top: f64, height: f64, offset: f64 },
+    IShape { width: f64, depth: f64, web: f64, flange: f64 },
+    LShape { depth: f64, width: f64, thickness: f64 },
+    Points,
+}
+
+impl IfcProfile {
+    /// Editable dimension rows (key, label, current mm value).
+    pub fn editable_rows(&self, rows: &mut Vec<(&'static str, &'static str, f64)>) {
+        match self {
+            IfcProfile::Rectangle { x, y } => {
+                rows.push(("xdim", "Profile width (X)", *x));
+                rows.push(("ydim", "Profile height (Y)", *y));
+            }
+            IfcProfile::Circle { radius } => rows.push(("radius", "Profile radius", *radius)),
+            IfcProfile::CircleHollow { radius, thickness } => {
+                rows.push(("radius", "Profile radius", *radius));
+                rows.push(("thickness", "Wall thickness", *thickness));
+            }
+            IfcProfile::RectangleHollow { x, y, thickness } => {
+                rows.push(("xdim", "Profile width (X)", *x));
+                rows.push(("ydim", "Profile height (Y)", *y));
+                rows.push(("thickness", "Wall thickness", *thickness));
+            }
+            IfcProfile::Trapezium { bottom, top, height, offset } => {
+                rows.push(("bottom", "Bottom width", *bottom));
+                rows.push(("top", "Top width", *top));
+                rows.push(("pheight", "Profile height", *height));
+                rows.push(("poffset", "Top offset", *offset));
+            }
+            IfcProfile::IShape { width, depth, web, flange } => {
+                rows.push(("iwidth", "Flange width", *width));
+                rows.push(("idepth", "Section depth", *depth));
+                rows.push(("web", "Web thickness", *web));
+                rows.push(("flange", "Flange thickness", *flange));
+            }
+            IfcProfile::LShape { depth, width, thickness } => {
+                rows.push(("ldepth", "Leg depth", *depth));
+                rows.push(("lwidth", "Leg width", *width));
+                rows.push(("thickness", "Leg thickness", *thickness));
+            }
+            IfcProfile::Points => {}
+        }
+    }
+
+    /// Apply one edited dimension; returns false for unknown keys.
+    pub fn set(&mut self, key: &str, value: f64) -> bool {
+        let positive = value > 0.0;
+        match (key, self) {
+            ("xdim", IfcProfile::Rectangle { x, .. } | IfcProfile::RectangleHollow { x, .. }) if positive => *x = value,
+            ("ydim", IfcProfile::Rectangle { y, .. } | IfcProfile::RectangleHollow { y, .. }) if positive => *y = value,
+            ("radius", IfcProfile::Circle { radius } | IfcProfile::CircleHollow { radius, .. }) if positive => *radius = value,
+            ("thickness", IfcProfile::CircleHollow { radius, thickness }) if positive && value < *radius => *thickness = value,
+            ("thickness", IfcProfile::RectangleHollow { x, y, thickness }) if positive && value < x.min(*y) => *thickness = value,
+            ("bottom", IfcProfile::Trapezium { bottom, .. }) if positive => *bottom = value,
+            ("top", IfcProfile::Trapezium { top, .. }) if positive => *top = value,
+            ("pheight", IfcProfile::Trapezium { height, .. }) if positive => *height = value,
+            ("poffset", IfcProfile::Trapezium { offset, .. }) => *offset = value,
+            ("iwidth", IfcProfile::IShape { width, .. }) if positive => *width = value,
+            ("idepth", IfcProfile::IShape { depth, .. }) if positive => *depth = value,
+            ("web", IfcProfile::IShape { web, .. }) if positive => *web = value,
+            ("flange", IfcProfile::IShape { flange, .. }) if positive => *flange = value,
+            ("ldepth", IfcProfile::LShape { depth, .. }) if positive => *depth = value,
+            ("lwidth", IfcProfile::LShape { width, .. }) if positive => *width = value,
+            ("thickness", IfcProfile::LShape { thickness, .. }) if positive => *thickness = value,
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl IfcExtrusionParams {
+    /// All editable rows: extrusion depth plus the profile dimensions.
+    pub fn editable_rows(&self) -> Vec<(&'static str, &'static str, f64)> {
+        let mut rows = vec![("depth", "Extrusion depth", self.depth)];
+        self.profile.editable_rows(&mut rows);
+        rows
+    }
+
+    /// Apply one edit; unknown keys or invalid values return false.
+    pub fn set(&mut self, key: &str, value: f64) -> bool {
+        if key == "depth" {
+            if value <= 0.0 {
+                return false;
+            }
+            self.depth = value;
+            return true;
+        }
+        self.profile.set(key, value)
+    }
+}
+
+/// Persisted semantic record of one imported element (mức 3 substrate).
+#[derive(Clone, Debug)]
+pub struct IfcElementRecord {
+    pub guid: String,
+    pub class: String,
+    pub name: String,
+    pub storey: String,
+    pub params: Option<IfcExtrusionParams>,
+}
+
+/// Node of the spatial model tree (Project → … → Storey → elements).
+#[derive(Clone, Debug)]
+pub struct IfcTreeNode {
+    pub label: String,
+    pub children: Vec<IfcTreeNode>,
+    /// Set on element leaves: the IFC GlobalId used for click-to-select.
+    pub leaf_guid: Option<String>,
 }
 
 /// Result of parsing an IFC file.
@@ -49,6 +187,10 @@ pub struct IfcImportResult {
     pub meshes: Vec<IfcMeshOut>,
     pub elements: Vec<IfcElement>,
     pub warnings: Vec<String>,
+    /// Per-mesh semantic records (same order as `meshes`).
+    pub records: Vec<IfcElementRecord>,
+    /// Spatial model tree (root → storeys → elements).
+    pub tree: Vec<IfcTreeNode>,
 }
 
 struct Reader<'a> {
@@ -143,6 +285,7 @@ fn parse_ifc_impl(
     // desktop builds — multi-hundred-megabyte models are the common case.
     struct Pending {
         guid: String,
+        class: String,
         placement_id: u64,
         rep_id: u64,
         name: String,
@@ -165,6 +308,7 @@ fn parse_ifc_impl(
             let color = reader.element_color(ent.id, rep_id);
             Some(Pending {
                 guid: ent.str(0).unwrap_or_default().to_string(),
+                class: ent.ty().to_string(),
                 placement_id,
                 rep_id,
                 name,
@@ -179,6 +323,7 @@ fn parse_ifc_impl(
         let base = reader.placement_matrix(item.placement_id, 0);
         let mut sink = TriSink::default();
         reader.mesh_representation(item.rep_id, &base, 0, &mut sink);
+        let params = reader.capture_extrusion(item.rep_id, item.placement_id);
         if sink.tris.is_empty() {
             if let Some(p) = progress {
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -195,6 +340,8 @@ fn parse_ifc_impl(
         Some(IfcMeshOut {
             mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),
             guid: item.guid.clone(),
+            class: item.class.clone(),
+            params,
         })
     };
 
@@ -209,14 +356,73 @@ fn parse_ifc_impl(
     reader.warn("openings and boolean cuts are not subtracted in this version".into());
 
     let elements = reader.collect_elements();
+    let storey_by_guid: std::collections::HashMap<&str, &str> = elements
+        .iter()
+        .map(|e| (e.guid.as_str(), e.storey.as_str()))
+        .collect();
     let warnings = reader.warnings.into_inner().unwrap_or_default();
     let schema = spf.schema().to_string();
+    let records: Vec<IfcElementRecord> = meshes
+        .iter()
+        .map(|m| IfcElementRecord {
+            guid: m.guid.clone(),
+            class: m.class.clone(),
+            name: m.mesh.name.clone(),
+            storey: storey_by_guid
+                .get(m.guid.as_str())
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+            params: m.params.clone(),
+        })
+        .collect();
+    let tree = build_model_tree(&records);
     Ok(IfcImportResult {
         schema,
         meshes,
         elements,
         warnings,
+        records,
+        tree,
     })
+}
+
+/// Spatial tree: one root, one node per storey (in first-seen order),
+/// element leaves labelled "CLASS · Name" and carrying their GlobalId.
+fn build_model_tree(records: &[IfcElementRecord]) -> Vec<IfcTreeNode> {
+    let mut storeys: Vec<(String, Vec<&IfcElementRecord>)> = Vec::new();
+    for rec in records {
+        let key = if rec.storey.is_empty() {
+            "(no storey)".to_string()
+        } else {
+            rec.storey.clone()
+        };
+        match storeys.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, items)) => items.push(rec),
+            None => storeys.push((key, vec![rec])),
+        }
+    }
+    let mut roots = Vec::new();
+    for (storey, items) in storeys {
+        let children = items
+            .iter()
+            .map(|r| IfcTreeNode {
+                label: format!("{} · {}", r.class, r.name),
+                children: Vec::new(),
+                leaf_guid: Some(r.guid.clone()),
+            })
+            .collect();
+        roots.push(IfcTreeNode {
+            label: storey,
+            children,
+            leaf_guid: None,
+        });
+    }
+    vec![IfcTreeNode {
+        label: "IFC Model".into(),
+        children: roots,
+        leaf_guid: None,
+    }]
 }
 
 /// Build the property/quantity CSV report for an IFC file.
@@ -1088,6 +1294,29 @@ impl<'a> Reader<'a> {
             return;
         }
         let m = *parent * position;
+        let dir_world_vec = m.transform_vector3(dir);
+        let dir_unit = if dir_world_vec.length() < 1e-9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [
+                dir_world_vec.x / dir_world_vec.length(),
+                dir_world_vec.y / dir_world_vec.length(),
+                dir_world_vec.z / dir_world_vec.length(),
+            ]
+        };
+        Self::sweep_rings(&loops, &m, dir_unit, depth, sink);
+    }
+
+    /// Shared extrusion geometry: lift `loops` (profile-space rings) through
+    /// `m`, sweep along `dir` × `depth`, emit sides and both caps. Used by
+    /// the import path and by parametric regeneration so both stay identical.
+    fn sweep_rings(
+        loops: &[Vec<[f64; 2]>],
+        m: &glam::DMat4,
+        dir: [f64; 3],
+        depth: f64,
+        sink: &mut TriSink,
+    ) {
         let lift = |p: [f64; 2]| -> [f64; 3] {
             let v = m.transform_point3(glam::DVec3::new(p[0], p[1], 0.0));
             [v.x, v.y, v.z]
@@ -1096,7 +1325,7 @@ impl<'a> Reader<'a> {
             .iter()
             .map(|l| l.iter().map(|p| lift(*p)).collect())
             .collect();
-        let offset = glam::DVec3::new(dir.x, dir.y, dir.z) * depth;
+        let offset = glam::DVec3::new(dir[0], dir[1], dir[2]) * depth;
         let top: Vec<Vec<[f64; 3]>> = bottom
             .iter()
             .map(|l| {
@@ -1128,7 +1357,7 @@ impl<'a> Reader<'a> {
             let c = lift(tri[2]);
             let n = poly_normal(&[a, b, c]);
             // Bottom cap faces -dir, top cap faces +dir: match windings.
-            let up = [dir.x, dir.y, dir.z];
+            let up = dir;
             if dot3(n, up) >= 0.0 {
                 // Ear-clip winding follows +dir: flip the bottom, keep the top.
                 sink.push(a, c, b);
@@ -1239,6 +1468,132 @@ impl<'a> Reader<'a> {
                 None
             }
         }
+    }
+
+    /// Capture semantic extrusion parameters (world matrix, direction,
+    /// depth, profile dims) from an element's representation — the substrate
+    /// for parametric editing. Everything is scaled to millimetres.
+    fn capture_extrusion(&self, rep_id: u64, placement_id: u64) -> Option<IfcExtrusionParams> {
+        let ent = self.find_first_extrusion(rep_id, 0)?;
+        let position = ent
+            .ref_id(1)
+            .and_then(|id| self.spf.get(id))
+            .map(|axis| self.axis_placement_matrix(axis))
+            .unwrap_or(glam::DMat4::IDENTITY);
+        let world = self.placement_matrix(placement_id, 0) * position;
+        let dir_local = ent
+            .ref_id(2)
+            .and_then(|id| self.direction(id))
+            .map(|d| glam::DVec3::new(d[0], d[1], d[2]))
+            .unwrap_or(glam::DVec3::Z);
+        let dir_world_vec = world.transform_vector3(dir_local);
+        let dir_world = if dir_world_vec.length() < 1e-9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [
+                dir_world_vec.x / dir_world_vec.length(),
+                dir_world_vec.y / dir_world_vec.length(),
+                dir_world_vec.z / dir_world_vec.length(),
+            ]
+        };
+        let profile_ent = ent.ref_id(0).and_then(|id| self.spf.get(id))?;
+        let s = self.len_scale;
+        let mut profile = match profile_ent.ty() {
+            "IFCRECTANGLEPROFILEDEF" => IfcProfile::Rectangle {
+                x: profile_ent.num(3)? * s,
+                y: profile_ent.num(4)? * s,
+            },
+            "IFCRECTANGLEHOLLOWPROFILEDEF" => IfcProfile::RectangleHollow {
+                x: profile_ent.num(3)? * s,
+                y: profile_ent.num(4)? * s,
+                thickness: profile_ent.num(5)? * s,
+            },
+            "IFCCIRCLEPROFILEDEF" => IfcProfile::Circle {
+                radius: profile_ent.num(3)? * s,
+            },
+            "IFCCIRCLEHOLLOWPROFILEDEF" => IfcProfile::CircleHollow {
+                radius: profile_ent.num(3)? * s,
+                thickness: profile_ent.num(4)? * s,
+            },
+            "IFCTRAPEZIUMPROFILEDEF" => IfcProfile::Trapezium {
+                bottom: profile_ent.num(3)? * s,
+                top: profile_ent.num(4)? * s,
+                height: profile_ent.num(5)? * s,
+                offset: profile_ent.num(6)? * s,
+            },
+            "IFCISHAPEPROFILEDEF" => IfcProfile::IShape {
+                width: profile_ent.num(3)? * s,
+                depth: profile_ent.num(4)? * s,
+                web: profile_ent.num(5)? * s,
+                flange: profile_ent.num(6)? * s,
+            },
+            "IFCLSHAPEPROFILEDEF" => IfcProfile::LShape {
+                depth: profile_ent.num(3)? * s,
+                width: profile_ent.num(4)? * s,
+                thickness: profile_ent.num(5)? * s,
+            },
+            // Arbitrary outlines: capture the resolved rings (already in
+            // curve coordinates — these profiles carry no Position) so the
+            // extrusion depth stays editable. Void rings are not preserved
+            // across an edit in this version.
+            "IFCARBITRARYCLOSEDPROFILEDEF" | "IFCARBITRARYPROFILEDEFWITHVOIDS" => {
+                let curve = profile_ent.ref_id(2)?;
+                let mut outline = vec![self.profile_curve_points(curve)?];
+                let s = self.len_scale;
+                for ring in &mut outline {
+                    for p in ring.iter_mut() {
+                        *p = [p[0] * s, p[1] * s];
+                    }
+                }
+                if outline.len() < 2 {
+                    return None;
+                }
+                return Some(IfcExtrusionParams {
+                    world: glam::DMat4::from_scale(glam::DVec3::splat(s)) * world,
+                    dir_world,
+                    depth: ent.num(3)? * s,
+                    profile: IfcProfile::Points,
+                    outline: Some(outline),
+                });
+            }
+            _ => return None,
+        };
+        Some(IfcExtrusionParams {
+            world: glam::DMat4::from_scale(glam::DVec3::splat(self.len_scale)) * world,
+            dir_world,
+            depth: ent.num(3)? * self.len_scale,
+            profile,
+            outline: None,
+        })
+    }
+
+    fn find_first_extrusion(
+        &self,
+        rep_id: u64,
+        depth: usize,
+    ) -> Option<&super::spf::Ent> {
+        if depth > MAX_ITEM_DEPTH {
+            return None;
+        }
+        let rep = self.spf.get(rep_id)?;
+        let items_idx = if rep.is("IFCSHAPEREPRESENTATION") {
+            3
+        } else {
+            rep.args.len().saturating_sub(1)
+        };
+        for item in rep.list(items_idx)? {
+            let Some(id) = item.as_ref() else { continue };
+            let Some(ent) = self.spf.get(id) else { continue };
+            if ent.is("IFCEXTRUDEDAREASOLID") {
+                return Some(ent);
+            }
+            if ent.ty().ends_with("REPRESENTATION") {
+                if let Some(found) = self.find_first_extrusion(id, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
     }
 
     /// A profile boundary curve → 2D polyline.
@@ -1592,6 +1947,72 @@ fn palette_colour(name: &str) -> [f32; 4] {
         _ => (v, v * (1.0 - s), v * (1.0 - s * f)),
     };
     [r, g, b, 1.0]
+}
+
+/// Regenerate an element mesh from (possibly edited) semantic parameters —
+/// the parametric-editing entry point. Returns `None` for arbitrary-outline
+/// profiles stored without rings and for degenerate parameters.
+pub fn rebuild_extrusion(
+    params: &IfcExtrusionParams,
+    name: &str,
+    color: [f32; 4],
+    scale: f64,
+) -> Option<MeshModel> {
+    let loops = match &params.profile {
+        IfcProfile::Rectangle { x, y } => vec![vec![
+            [-x / 2.0, -y / 2.0],
+            [x / 2.0, -y / 2.0],
+            [x / 2.0, y / 2.0],
+            [-x / 2.0, y / 2.0],
+        ]],
+        IfcProfile::RectangleHollow { x, y, thickness } => {
+            let (ix, iy) = ((x - thickness).max(0.0) / 2.0, (y - thickness).max(0.0) / 2.0);
+            vec![
+                vec![
+                    [-x / 2.0, -y / 2.0],
+                    [x / 2.0, -y / 2.0],
+                    [x / 2.0, y / 2.0],
+                    [-x / 2.0, y / 2.0],
+                ],
+                vec![
+                    [-ix, -iy],
+                    [ix, -iy],
+                    [ix, iy],
+                    [-ix, iy],
+                ],
+            ]
+        }
+        IfcProfile::Circle { radius } => vec![sample_circle([0.0, 0.0], *radius, 36)],
+        IfcProfile::CircleHollow { radius, thickness } => vec![
+            sample_circle([0.0, 0.0], *radius, 36),
+            sample_circle([0.0, 0.0], (*radius - thickness).max(0.0), 36),
+        ],
+        IfcProfile::Trapezium { bottom, top, height, offset } => vec![vec![
+            [-bottom / 2.0, -height / 2.0],
+            [bottom / 2.0, -height / 2.0],
+            [offset + top / 2.0, height / 2.0],
+            [offset - top / 2.0, height / 2.0],
+        ]],
+        IfcProfile::IShape { width, depth, web, flange } => {
+            vec![i_shaped(*width, *depth, *web, *flange)]
+        }
+        IfcProfile::LShape { depth, width, thickness } => vec![vec![
+            [-width / 2.0, -depth / 2.0],
+            [width / 2.0, -depth / 2.0],
+            [width / 2.0, -depth / 2.0 + thickness],
+            [-width / 2.0 + thickness, -depth / 2.0 + thickness],
+            [-width / 2.0 + thickness, depth / 2.0],
+            [-width / 2.0, depth / 2.0],
+        ]],
+        // Arbitrary outlines rebuild from the stored rings.
+        IfcProfile::Points => params.outline.clone()?,
+    };
+    let mut sink = TriSink::default();
+    Reader::sweep_rings(&loops, &params.world, params.dir_world, params.depth, &mut sink);
+    if sink.tris.is_empty() {
+        return None;
+    }
+    Some(sink_to_mesh(&sink, name, color, scale))
 }
 
 fn sample_circle(center: [f64; 2], radius: f64, segments: usize) -> Vec<[f64; 2]> {

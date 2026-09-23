@@ -2699,6 +2699,9 @@ impl Scene {
         self.meshes = HashMap::default();
         self.block_meshes = HashMap::default();
         self.solid_models = HashMap::default();
+        self.ifc_elements = HashMap::default();
+        self.ifc_handle_by_guid = HashMap::default();
+        self.ifc_tree = Vec::new();
         *self.camera.borrow_mut() = Camera::default();
         self.camera_generation += 1;
         // A brand-new/replaced document has none of these yet — without
