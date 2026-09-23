@@ -903,8 +903,56 @@ impl OpenCADStudio {
                         use crate::entities::common::ro_prop;
                         let xd = &source_entity.common().extended_data;
                         if !xd.is_empty() {
+                            let xdata_text = |value: &acadrust::xdata::XDataValue| -> String {
+                                match value {
+                                    acadrust::xdata::XDataValue::String(text) => text.clone(),
+                                    other => format!("{other:?}"),
+                                }
+                            };
+                            // IFC properties (imported models): one record per
+                            // property with values (set, name, value), plus a
+                            // GlobalId record — shown in their own section.
+                            let mut ifc_props = Vec::new();
+                            let mut ifc_guid = String::new();
+                            for rec in xd
+                                .records()
+                                .iter()
+                                .filter(|rec| rec.application_name == "IFC")
+                            {
+                                let text = |i: usize| {
+                                    rec.values
+                                        .get(i)
+                                        .map(xdata_text)
+                                        .unwrap_or_default()
+                                };
+                                match rec.values.len() {
+                                    2 if text(0) == "GlobalId" => ifc_guid = text(1),
+                                    3 => {
+                                        let label = format!("{} / {}", text(0), text(1));
+                                        ifc_props.push(ro_prop(
+                                            &label,
+                                            "ifc_property",
+                                            text(2),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !ifc_guid.is_empty() {
+                                ifc_props.push(ro_prop("GlobalId", "ifc_guid", ifc_guid));
+                            }
+                            if !ifc_props.is_empty() {
+                                sections.push(crate::scene::model::object::PropSection {
+                                    title: "IFC Properties".to_string(),
+                                    props: ifc_props,
+                                });
+                            }
+
                             let mut xd_props = Vec::new();
                             for rec in xd.records() {
+                                if rec.application_name == "IFC" {
+                                    continue;
+                                }
                                 let value_text = rec
                                     .values
                                     .iter()
@@ -917,10 +965,12 @@ impl OpenCADStudio {
                                     format!("{}: {value_text}", rec.application_name),
                                 ));
                             }
-                            sections.push(crate::scene::model::object::PropSection {
-                                title: t!("Extended Data").into_owned(),
-                                props: xd_props,
-                            });
+                            if !xd_props.is_empty() {
+                                sections.push(crate::scene::model::object::PropSection {
+                                    title: t!("Extended Data").into_owned(),
+                                    props: xd_props,
+                                });
+                            }
                         }
                     }
 

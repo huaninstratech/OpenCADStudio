@@ -34,11 +34,19 @@ pub struct IfcElement {
     pub props: Vec<(String, String, String)>,
 }
 
+/// One imported mesh plus the GUID that links it to `IfcImportResult::
+/// elements` (whose `props` the host attaches to the entity as XDATA).
+#[derive(Clone, Debug)]
+pub struct IfcMeshOut {
+    pub mesh: MeshModel,
+    pub guid: String,
+}
+
 /// Result of parsing an IFC file.
 #[derive(Clone, Debug)]
 pub struct IfcImportResult {
     pub schema: String,
-    pub meshes: Vec<MeshModel>,
+    pub meshes: Vec<IfcMeshOut>,
     pub elements: Vec<IfcElement>,
     pub warnings: Vec<String>,
 }
@@ -95,6 +103,7 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
     // Elements are independent, so meshing fans out across threads on
     // desktop builds — multi-hundred-megabyte models are the common case.
     struct Pending {
+        guid: String,
         placement_id: u64,
         rep_id: u64,
         name: String,
@@ -116,6 +125,7 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
             let name = element_display_name(ent, &type_name);
             let color = reader.element_color(ent.id, rep_id);
             Some(Pending {
+                guid: ent.str(0).unwrap_or_default().to_string(),
                 placement_id,
                 rep_id,
                 name,
@@ -124,23 +134,26 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
         })
         .collect();
 
-    let mesh_one = |item: &Pending| -> Option<MeshModel> {
+    let mesh_one = |item: &Pending| -> Option<IfcMeshOut> {
         let base = reader.placement_matrix(item.placement_id, 0);
         let mut sink = TriSink::default();
         reader.mesh_representation(item.rep_id, &base, 0, &mut sink);
         if sink.tris.is_empty() {
             return None;
         }
-        Some(sink_to_mesh(&sink, &item.name, item.color, reader.len_scale))
+        Some(IfcMeshOut {
+            mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),
+            guid: item.guid.clone(),
+        })
     };
 
     #[cfg(not(target_arch = "wasm32"))]
-    let meshes: Vec<MeshModel> = {
+    let meshes: Vec<IfcMeshOut> = {
         use rayon::prelude::*;
         pending.par_iter().filter_map(mesh_one).collect()
     };
     #[cfg(target_arch = "wasm32")]
-    let meshes: Vec<MeshModel> = pending.iter().filter_map(mesh_one).collect();
+    let meshes: Vec<IfcMeshOut> = pending.iter().filter_map(mesh_one).collect();
 
     reader.warn("openings and boolean cuts are not subtracted in this version".into());
 
@@ -1742,7 +1755,7 @@ END-ISO-10303-21;
         let result = parse_ifc(SAMPLE.as_bytes()).expect("parse");
         assert_eq!(result.schema, "IFC4");
         // FILE units are millimetres, so no rescaling happens.
-        let mesh = result.meshes.first().expect("wall mesh");
+        let mesh = &result.meshes.first().expect("wall mesh").mesh;
         assert!(!mesh.verts.is_empty());
         // Wall sits at (1000, 2000, 0) and is 400 tall after the profile's
         // 400 Y-dimension gets extruded 3000 along Z… profile XY: 200 wide,

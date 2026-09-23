@@ -2021,8 +2021,14 @@ impl OpenCADStudio {
     /// CAD paths (an empty Solid3D would leave the mesh untransformable).
     /// DXF polyface vertex indices are i16, so shells beyond ~32k vertices
     /// stay display-only Solid3Ds.
+    ///
+    /// IFC properties arrive as XDATA under the "IFC" application — the
+    /// properties panel renders them in a dedicated section and they persist
+    /// with the drawing.
     pub(super) fn build_mesh_import(
         mesh: crate::scene::model::mesh_model::MeshModel,
+        guid: &str,
+        props: &[(String, String, String)],
     ) -> (acadrust::EntityType, crate::scene::MeshLodSet) {
         let [r, g, b, _a] = mesh.color;
         let mut set = crate::scene::MeshLodSet::from_single(mesh.clone());
@@ -2032,6 +2038,22 @@ impl OpenCADStudio {
         set.edge_verts = high;
         set.edge_verts_low = low;
 
+        // XDATA: one record per property (set, name, value) plus GlobalId.
+        let mut extended_data = acadrust::xdata::ExtendedData::new();
+        if !guid.is_empty() {
+            let mut record = acadrust::xdata::ExtendedDataRecord::new("IFC");
+            record.add_value(acadrust::xdata::XDataValue::String("GlobalId".into()));
+            record.add_value(acadrust::xdata::XDataValue::String(guid.to_string()));
+            extended_data.add_record(record);
+        }
+        for (set_name, prop_name, value) in props {
+            let mut record = acadrust::xdata::ExtendedDataRecord::new("IFC");
+            record.add_value(acadrust::xdata::XDataValue::String(set_name.clone()));
+            record.add_value(acadrust::xdata::XDataValue::String(prop_name.clone()));
+            record.add_value(acadrust::xdata::XDataValue::String(value.clone()));
+            extended_data.add_record(record);
+        }
+
         const POLYFACE_VERTEX_LIMIT: usize = 32_000;
         let entity = if mesh.verts.len() <= POLYFACE_VERTEX_LIMIT && !mesh.indices.is_empty() {
             let mut pm = acadrust::entities::PolyfaceMesh::new();
@@ -2040,6 +2062,7 @@ impl OpenCADStudio {
                 (g * 255.0).round().clamp(0.0, 255.0) as u8,
                 (b * 255.0).round().clamp(0.0, 255.0) as u8,
             );
+            pm.common.extended_data = extended_data;
             for vertex in &mesh.verts {
                 pm.add_vertex_xyz(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64);
             }
@@ -2059,6 +2082,7 @@ impl OpenCADStudio {
                 (g * 255.0).round().clamp(0.0, 255.0) as u8,
                 (b * 255.0).round().clamp(0.0, 255.0) as u8,
             );
+            entity.common_mut().extended_data = extended_data;
             entity
         };
         (entity, set)
@@ -2092,8 +2116,21 @@ impl OpenCADStudio {
                 };
                 self.push_undo_snapshot(i, "IMPORTIFC");
                 let mut added = 0usize;
-                for mesh in import.meshes {
-                    let (entity, set) = Self::build_mesh_import(mesh);
+                // GUID → property rows, attached to each entity as XDATA.
+                let props_by_guid: std::collections::HashMap<
+                    &str,
+                    &[(String, String, String)],
+                > = import
+                    .elements
+                    .iter()
+                    .map(|e| (e.guid.as_str(), e.props.as_slice()))
+                    .collect();
+                for out in import.meshes {
+                    let props = props_by_guid
+                        .get(out.guid.as_str())
+                        .copied()
+                        .unwrap_or(&[]);
+                    let (entity, set) = Self::build_mesh_import(out.mesh, &out.guid, props);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
                         self.tabs[i].scene.meshes.insert(handle, set);
@@ -2152,7 +2189,7 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTSTEP");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let (entity, set) = Self::build_mesh_import(mesh);
+                    let (entity, set) = Self::build_mesh_import(mesh, "", &[]);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
                         self.tabs[i].scene.meshes.insert(handle, set);
