@@ -9,6 +9,8 @@ mod content_browser;
 pub(crate) mod create_block;
 mod design_center;
 mod edit_block;
+mod ifc_data;
+mod ifc_import;
 pub(crate) mod insert_block;
 mod landxml;
 pub(crate) mod picker;
@@ -19,6 +21,7 @@ mod pc_attach;
 pub(crate) mod pdf_attach;
 mod snap_underlays;
 pub(crate) mod solid3d_cmds;
+mod step_import;
 mod underlay_layers;
 pub(crate) mod wblock;
 mod xadjust;
@@ -113,8 +116,11 @@ impl CadModule for InsertModule {
                 RibbonGroup {
                     title: "Import",
                     tools: vec![
+                        RibbonItem::LargeTool(ifc_import::tool()),
+                        RibbonItem::LargeTool(step_import::tool()),
                         RibbonItem::LargeTool(open_obj::tool()),
                         RibbonItem::LargeTool(landxml::tool()),
+                        RibbonItem::Tool(ifc_data::tool()),
                     ],
                 },
                 // ── Content ───────────────────────────────────────────────────────

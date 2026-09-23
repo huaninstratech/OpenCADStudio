@@ -2179,6 +2179,11 @@ impl OpenCADStudio {
                 // bring them into view immediately.
                 self.tabs[i].scene.remember_current_view();
                 self.tabs[i].scene.fit_all();
+                // Surface the Properties panel so the IFC Properties section
+                // (XDATA) is visible right after the import.
+                self.show_properties = true;
+                self.ribbon.set_properties(true);
+                self.refresh_properties();
                 self.command_line.push_output(&format!(
                     "IMPORTIFC: imported {added} mesh(es) from {} (schema {}; {} elements)",
                     path.display(),
