@@ -1548,6 +1548,84 @@ impl OpenCADStudio {
                 Task::none()
             }
 
+            // ── IFC import ────────────────────────────────────────────────
+            Message::IfcImport => Task::perform(
+                async {
+                    crate::sys::file_dialog()
+                        .set_title("Import IFC Model")
+                        .add_filter("IFC Files", &["ifc", "IFC"])
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                        .await
+                        .map(|h| crate::sys::handle_path(&h))
+                },
+                Message::IfcImportPath,
+            ),
+
+            Message::IfcImportPath(Some(path)) => self.on_ifc_import_path_some(path),
+
+            Message::IfcImportPath(None) => Task::none(),
+
+            Message::IfcImportFinished(tab_id, path, result) => {
+                self.on_ifc_import_finished(tab_id, path, result)
+            }
+
+            // ── STEP import ───────────────────────────────────────────────
+            Message::StepImport => Task::perform(
+                async {
+                    crate::sys::file_dialog()
+                        .set_title("Import STEP Model")
+                        .add_filter("STEP Files", &["step", "stp", "STEP", "STP"])
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                        .await
+                        .map(|h| crate::sys::handle_path(&h))
+                },
+                Message::StepImportPath,
+            ),
+
+            Message::StepImportPath(Some(path)) => self.on_step_import_path_some(path),
+
+            Message::StepImportPath(None) => Task::none(),
+
+            Message::StepImportFinished(tab_id, path, result) => {
+                self.on_step_import_finished(tab_id, path, result)
+            }
+
+            // ── IFC property extraction ───────────────────────────────────
+            Message::IfcDataExport => Task::perform(
+                async {
+                    crate::sys::file_dialog()
+                        .set_title("Select an IFC file to extract data from")
+                        .add_filter("IFC Files", &["ifc", "IFC"])
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                        .await
+                        .map(|h| crate::sys::handle_path(&h))
+                },
+                Message::IfcDataExportSource,
+            ),
+
+            Message::IfcDataExportSource(Some(path)) => self.on_ifc_data_source_some(path),
+
+            Message::IfcDataExportSource(None) => Task::none(),
+
+            Message::IfcDataExportBuilt(result) => self.on_ifc_data_built(result),
+
+            Message::IfcDataExportSaveResult(csv, picked) => self.on_ifc_data_save(csv, picked),
+
+            Message::IfcDataWriteFinished(path, result) => {
+                match result {
+                    Ok(()) => self.command_line.push_output(
+                        &format!("IFCDATA: report written to {}", path.display()),
+                    ),
+                    Err(error) => {
+                        self.command_line.push_error(&format!("IFCDATA: {error}"))
+                    }
+                }
+                Task::none()
+            }
+
             Message::SaveFile => self.on_save_file(),
 
             Message::SaveAs => {

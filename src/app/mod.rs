@@ -3761,6 +3761,30 @@ pub enum Message {
         std::path::PathBuf,
         Result<crate::scene::model::mesh_model::MeshModel, String>,
     ),
+    // ── IFC import ────────────────────────────────────────────────────────
+    /// Trigger IFC import: show open-file dialog.
+    IfcImport,
+    IfcImportPath(Option<std::path::PathBuf>),
+    IfcImportFinished(
+        u64,
+        std::path::PathBuf,
+        Result<Box<crate::io::ifc::IfcImportResult>, String>,
+    ),
+    // ── STEP import ───────────────────────────────────────────────────────
+    /// Trigger STEP import: show open-file dialog.
+    StepImport,
+    StepImportPath(Option<std::path::PathBuf>),
+    StepImportFinished(
+        u64,
+        std::path::PathBuf,
+        Result<Box<crate::io::step_read::StepImportResult>, String>,
+    ),
+    // ── IFC property extraction (CSV report) ──────────────────────────────
+    IfcDataExport,
+    IfcDataExportSource(Option<std::path::PathBuf>),
+    IfcDataExportBuilt(Result<String, String>),
+    IfcDataExportSaveResult(String, Option<std::path::PathBuf>),
+    IfcDataWriteFinished(std::path::PathBuf, Result<(), String>),
 }
 
 #[derive(Debug, Clone)]

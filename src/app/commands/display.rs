@@ -855,6 +855,21 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::StepExport));
             }
 
+            // ── IFC import ────────────────────────────────────────────────
+            "IMPORTIFC" | "IFCIN" | "IFCIMPORT" => {
+                return Some(Task::done(Message::IfcImport));
+            }
+
+            // ── STEP import ───────────────────────────────────────────────
+            "IMPORTSTEP" | "STEPIN" | "STPIN" => {
+                return Some(Task::done(Message::StepImport));
+            }
+
+            // ── IFC property extraction (CSV report) ──────────────────────
+            "IFCDATA" | "IFCEXTRACT" => {
+                return Some(Task::done(Message::IfcDataExport));
+            }
+
             // ── Plot Style Editor GUI ─────────────────────────────────────
             "PLOTSTYLEPANEL" | "PLOTSTYLEEDITOR" | "STYLESMANAGER" => {
                 return Some(Task::done(Message::PlotStylePanelOpen));

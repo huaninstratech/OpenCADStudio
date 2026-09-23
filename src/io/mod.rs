@@ -11,11 +11,15 @@ pub mod obj;
 pub mod ole_embed;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod single_instance;
+pub mod ifc;
+pub mod meshutil;
 pub mod pdf_export;
 pub mod plot_style;
 pub mod print_to_printer;
 pub mod recovery;
+pub mod spf;
 pub mod step;
+pub mod step_read;
 pub mod stl;
 pub mod xref;
 pub mod xref_model;

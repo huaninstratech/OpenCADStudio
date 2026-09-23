@@ -2014,6 +2014,170 @@ impl OpenCADStudio {
         )
     }
 
+    pub(super) fn on_ifc_import_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        let tab_id = self.tabs[self.active_tab].id;
+        let worker_path = path.clone();
+        background_task(
+            move || {
+                let bytes = std::fs::read(&worker_path).map_err(|e| e.to_string())?;
+                crate::io::ifc::parse_ifc(&bytes).map(Box::new)
+            },
+            move |result| Message::IfcImportFinished(tab_id, path, result),
+        )
+    }
+
+    pub(super) fn on_ifc_import_finished(
+        &mut self,
+        tab_id: u64,
+        path: std::path::PathBuf,
+        result: Result<Box<crate::io::ifc::IfcImportResult>, String>,
+    ) -> Task<Message> {
+        match result {
+            Err(error) => self.command_line.push_error(&format!("IMPORTIFC: {error}")),
+            Ok(import) => {
+                let Some(i) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+                    self.command_line
+                        .push_info("IMPORTIFC: target drawing was closed.");
+                    return Task::none();
+                };
+                self.push_undo_snapshot(i, "IMPORTIFC");
+                let mut added = 0usize;
+                for mesh in import.meshes {
+                    let entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    let handle = self.tabs[i].scene.add_entity(entity);
+                    if !handle.is_null() {
+                        self.tabs[i]
+                            .scene
+                            .meshes
+                            .insert(handle, crate::scene::MeshLodSet::from_single(mesh));
+                        added += 1;
+                    }
+                }
+                self.tabs[i].dirty = true;
+                self.command_line.push_output(&format!(
+                    "IMPORTIFC: imported {added} mesh(es) from {} (schema {}; {} elements)",
+                    path.display(),
+                    import.schema,
+                    import.elements.len(),
+                ));
+                for warning in import.warnings.iter().take(3) {
+                    self.command_line.push_info(&format!("IMPORTIFC: note: {warning}"));
+                }
+                if !import.elements.is_empty() {
+                    self.command_line
+                        .push_info("IFCDATA: run this command to export the property report as CSV.");
+                }
+            }
+        }
+        Task::none()
+    }
+
+    pub(super) fn on_step_import_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        let tab_id = self.tabs[self.active_tab].id;
+        let worker_path = path.clone();
+        background_task(
+            move || {
+                let bytes = std::fs::read(&worker_path).map_err(|e| e.to_string())?;
+                crate::io::step_read::parse_step(&bytes).map(Box::new)
+            },
+            move |result| Message::StepImportFinished(tab_id, path, result),
+        )
+    }
+
+    pub(super) fn on_step_import_finished(
+        &mut self,
+        tab_id: u64,
+        path: std::path::PathBuf,
+        result: Result<Box<crate::io::step_read::StepImportResult>, String>,
+    ) -> Task<Message> {
+        match result {
+            Err(error) => self.command_line.push_error(&format!("IMPORTSTEP: {error}")),
+            Ok(import) => {
+                let Some(i) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+                    self.command_line
+                        .push_info("IMPORTSTEP: target drawing was closed.");
+                    return Task::none();
+                };
+                self.push_undo_snapshot(i, "IMPORTSTEP");
+                let mut added = 0usize;
+                for mesh in import.meshes {
+                    let entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+                    let handle = self.tabs[i].scene.add_entity(entity);
+                    if !handle.is_null() {
+                        self.tabs[i]
+                            .scene
+                            .meshes
+                            .insert(handle, crate::scene::MeshLodSet::from_single(mesh));
+                        added += 1;
+                    }
+                }
+                self.tabs[i].dirty = true;
+                self.command_line.push_output(&format!(
+                    "IMPORTSTEP: imported {added} solid(s) from {} (schema {}; {} products)",
+                    path.display(),
+                    import.schema,
+                    import.products,
+                ));
+                for warning in import.warnings.iter().take(3) {
+                    self.command_line.push_info(&format!("IMPORTSTEP: note: {warning}"));
+                }
+            }
+        }
+        Task::none()
+    }
+
+    pub(super) fn on_ifc_data_source_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        let worker_path = path.clone();
+        background_task(
+            move || {
+                let bytes = std::fs::read(&worker_path).map_err(|e| e.to_string())?;
+                crate::io::ifc::properties_csv_string(&bytes)
+            },
+            Message::IfcDataExportBuilt,
+        )
+    }
+
+    pub(super) fn on_ifc_data_built(&mut self, result: Result<String, String>) -> Task<Message> {
+        match result {
+            Err(error) => {
+                self.command_line.push_error(&format!("IFCDATA: {error}"));
+                Task::none()
+            }
+            Ok(csv) => {
+                let rows = csv.lines().count().saturating_sub(1);
+                self.command_line
+                    .push_output(&format!("IFCDATA: extracted {rows} property rows; choose where to save the CSV."));
+                Task::perform(
+                    async {
+                        crate::sys::file_dialog()
+                            .set_title("Save IFC data report")
+                            .add_filter("CSV Files", &["csv", "CSV"])
+                            .set_file_name("ifc-data.csv")
+                            .save_file()
+                            .await
+                            .map(|h| crate::sys::handle_path(&h))
+                    },
+                    move |picked| Message::IfcDataExportSaveResult(csv, picked),
+                )
+            }
+        }
+    }
+
+    pub(super) fn on_ifc_data_save(
+        &mut self,
+        csv: String,
+        picked: Option<std::path::PathBuf>,
+    ) -> Task<Message> {
+        let Some(path) = picked else {
+            return Task::none();
+        };
+        let worker_path = path.clone();
+        background_task(
+            move || std::fs::write(&worker_path, csv.as_bytes()).map_err(|e| e.to_string()),
+            move |result| Message::IfcDataWriteFinished(path, result),
+        )
+    }
+
     fn sync_view_state_for_save(&mut self, i: usize) {
         self.sync_vport_display(i);
         if self.tabs[i].active_block_edit.is_none() {
