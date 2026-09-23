@@ -2014,6 +2014,56 @@ impl OpenCADStudio {
         )
     }
 
+    /// Build the entity + resident mesh set for an imported mesh model.
+    ///
+    /// The entity is a real `PolyfaceMesh` carrying the triangle shell, so
+    /// MOVE / ROTATE / SCALE / UNDO and DWG/DXF saves run through the normal
+    /// CAD paths (an empty Solid3D would leave the mesh untransformable).
+    /// DXF polyface vertex indices are i16, so shells beyond ~32k vertices
+    /// stay display-only Solid3Ds.
+    pub(super) fn build_mesh_import(
+        mesh: crate::scene::model::mesh_model::MeshModel,
+    ) -> (acadrust::EntityType, crate::scene::MeshLodSet) {
+        let [r, g, b, _a] = mesh.color;
+        let mut set = crate::scene::MeshLodSet::from_single(mesh.clone());
+        // Feature edges make the solid pickable (normal selection tests
+        // B-rep-style feature edges) and give wireframe views real edges.
+        let (high, low) = crate::io::meshutil::feature_edges(&set.lods[0].verts);
+        set.edge_verts = high;
+        set.edge_verts_low = low;
+
+        const POLYFACE_VERTEX_LIMIT: usize = 32_000;
+        let entity = if mesh.verts.len() <= POLYFACE_VERTEX_LIMIT && !mesh.indices.is_empty() {
+            let mut pm = acadrust::entities::PolyfaceMesh::new();
+            pm.common.color = acadrust::types::Color::from_rgb(
+                (r * 255.0).round().clamp(0.0, 255.0) as u8,
+                (g * 255.0).round().clamp(0.0, 255.0) as u8,
+                (b * 255.0).round().clamp(0.0, 255.0) as u8,
+            );
+            for vertex in &mesh.verts {
+                pm.add_vertex_xyz(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64);
+            }
+            for tri in mesh.indices.chunks_exact(3) {
+                // Polyface indices are 1-based.
+                pm.add_triangle(
+                    tri[0] as i16 + 1,
+                    tri[1] as i16 + 1,
+                    tri[2] as i16 + 1,
+                );
+            }
+            acadrust::EntityType::PolyfaceMesh(pm)
+        } else {
+            let mut entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
+            entity.common_mut().color = acadrust::types::Color::from_rgb(
+                (r * 255.0).round().clamp(0.0, 255.0) as u8,
+                (g * 255.0).round().clamp(0.0, 255.0) as u8,
+                (b * 255.0).round().clamp(0.0, 255.0) as u8,
+            );
+            entity
+        };
+        (entity, set)
+    }
+
     pub(super) fn on_ifc_import_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
         let tab_id = self.tabs[self.active_tab].id;
         let worker_path = path.clone();
@@ -2043,25 +2093,9 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTIFC");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let mut entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
-                    // Carry the file's colour on the entity as well —
-                    // wireframe/edge rendering reads entity colour, while the
-                    // shaded pass reads the mesh colour; keep both in step.
-                    let [r, g, b, _a] = mesh.color;
-                    entity.common_mut().color = acadrust::types::Color::from_rgb(
-                        (r * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (g * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (b * 255.0).round().clamp(0.0, 255.0) as u8,
-                    );
+                    let (entity, set) = Self::build_mesh_import(mesh);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
-                        let mut set = crate::scene::MeshLodSet::from_single(mesh);
-                        // Feature edges make the solid pickable (normal
-                        // selection tests B-rep-style feature edges) and give
-                        // wireframe views real edges.
-                        let (high, low) = crate::io::meshutil::feature_edges(&set.lods[0].verts);
-                        set.edge_verts = high;
-                        set.edge_verts_low = low;
                         self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }
@@ -2118,19 +2152,9 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTSTEP");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let mut entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
-                    let [r, g, b, _a] = mesh.color;
-                    entity.common_mut().color = acadrust::types::Color::from_rgb(
-                        (r * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (g * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (b * 255.0).round().clamp(0.0, 255.0) as u8,
-                    );
+                    let (entity, set) = Self::build_mesh_import(mesh);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
-                        let mut set = crate::scene::MeshLodSet::from_single(mesh);
-                        let (high, low) = crate::io::meshutil::feature_edges(&set.lods[0].verts);
-                        set.edge_verts = high;
-                        set.edge_verts_low = low;
                         self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }

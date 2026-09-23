@@ -408,6 +408,23 @@ mod windows_impl {
             "",
         )?;
 
+        // ── Mesh exchange formats (IFC / STEP) ──────────────────────────────
+        // These extensions usually have no other owner, so claiming the
+        // per-user default ProgId makes double-click open here directly;
+        // where Windows already records a UserChoice that wins and we stay
+        // an "Open with" candidate.
+        register_progid(&exe, "OpenCADStudio.IFC", "IFC Model")?;
+        register_progid(&exe, "OpenCADStudio.STEP", "STEP Model")?;
+        set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".ifc"), "")?;
+        set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".step"), "")?;
+        set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".stp"), "")?;
+        set_string(r"Software\Classes\.ifc\OpenWithProgids", Some("OpenCADStudio.IFC"), "")?;
+        set_string(r"Software\Classes\.step\OpenWithProgids", Some("OpenCADStudio.STEP"), "")?;
+        set_string(r"Software\Classes\.stp\OpenWithProgids", Some("OpenCADStudio.STEP"), "")?;
+        set_string(r"Software\Classes\.ifc", None, "OpenCADStudio.IFC")?;
+        set_string(r"Software\Classes\.step", None, "OpenCADStudio.STEP")?;
+        set_string(r"Software\Classes\.stp", None, "OpenCADStudio.STEP")?;
+
         // ── Capabilities + RegisteredApplications ───────────────────────────
         // Mirrors the MSI's DefaultPrograms component, but per-user, so the
         // portable build is a Default-Apps candidate too. The value name in
@@ -423,6 +440,9 @@ mod windows_impl {
         set_string(&format!(r"{CAP}\FileAssociations"), Some(".dwg"), "OpenCADStudio.DWG")?;
         set_string(&format!(r"{CAP}\FileAssociations"), Some(".dxf"), "OpenCADStudio.DXF")?;
         set_string(&format!(r"{CAP}\FileAssociations"), Some(".bak"), "OpenCADStudio.BAK")?;
+        set_string(&format!(r"{CAP}\FileAssociations"), Some(".ifc"), "OpenCADStudio.IFC")?;
+        set_string(&format!(r"{CAP}\FileAssociations"), Some(".step"), "OpenCADStudio.STEP")?;
+        set_string(&format!(r"{CAP}\FileAssociations"), Some(".stp"), "OpenCADStudio.STEP")?;
         set_string(
             r"Software\RegisteredApplications",
             Some("Open CAD Studio"),

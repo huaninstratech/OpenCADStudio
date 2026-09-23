@@ -891,11 +891,19 @@ impl OpenCADStudio {
                             .push_info("Opening a STEP model — importing into the current drawing (IMPORTSTEP).");
                         return self.on_step_import_path_some(path);
                     }
-                    "ifc" | "ifczip" | "stp" | "step" => {
-                        self.command_line.push_info(
-                            "Start a drawing first (NEW), then open the IFC/STEP file to import it.",
-                        );
-                        return Task::none();
+                    // Launch-with / double-click on the Start tab: begin a
+                    // drawing first, then import into it.
+                    "ifc" | "ifczip" => {
+                        return Task::batch([
+                            Task::done(Message::TabNew),
+                            Task::done(Message::IfcImportPath(Some(path))),
+                        ]);
+                    }
+                    "stp" | "step" => {
+                        return Task::batch([
+                            Task::done(Message::TabNew),
+                            Task::done(Message::StepImportPath(Some(path))),
+                        ]);
                     }
                     _ => {}
                 }
