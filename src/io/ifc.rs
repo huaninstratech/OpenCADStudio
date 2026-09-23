@@ -375,20 +375,43 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Surface style list → RGBA, via rendering (with transparency) or
-    /// shading styles.
+    /// Surface style list → RGBA. IFC2X3 wraps surface styles in
+    /// `IfcPresentationStyleAssignment`, so walk entity references
+    /// breadth-first until a surface style (then its rendering/shading
+    /// component) shows up.
     fn styles_colour(&self, styles: Option<&Val>) -> Option<[f32; 4]> {
-        for style_ref in styles?.as_list()? {
-            let Some(style_id) = style_ref.as_ref() else { continue };
-            let Some(style) = self.spf.get(style_id) else { continue };
-            if !style.is("IFCSURFACESTYLE") {
+        let mut queue: Vec<u64> = styles?
+            .as_list()?
+            .iter()
+            .filter_map(Val::as_ref)
+            .collect();
+        let mut steps = 0usize;
+        while let Some(id) = queue.pop() {
+            steps += 1;
+            if steps > 64 {
+                break;
+            }
+            let Some(ent) = self.spf.get(id) else { continue };
+            if ent.is("IFCSURFACESTYLE") {
+                for sub in ent.list(1).unwrap_or(&[]) {
+                    let Some(sub_id) = sub.as_ref() else { continue };
+                    if let Some(colour) = self.style_component_colour(sub_id, 0) {
+                        return Some(colour);
+                    }
+                }
                 continue;
             }
-            let Some(subs) = style.list(1) else { continue };
-            for sub in subs {
-                let Some(sub_id) = sub.as_ref() else { continue };
-                if let Some(colour) = self.style_component_colour(sub_id, 0) {
-                    return Some(colour);
+            // A wrapper (presentation style assignment / by-context): keep
+            // walking every reference it holds.
+            for arg in &ent.args {
+                if let Some(reference) = arg.as_ref() {
+                    queue.push(reference);
+                } else if let Some(list) = arg.as_list() {
+                    for value in list {
+                        if let Some(reference) = value.as_ref() {
+                            queue.push(reference);
+                        }
+                    }
                 }
             }
         }
@@ -404,9 +427,10 @@ impl<'a> Reader<'a> {
             let Some(colour_id) = ent.ref_id(0) else { return None };
             let Some(colour) = self.spf.get(colour_id) else { return None };
             let mut rgba = colour_rgb(colour)?;
-            // Transparency 0 = opaque; alpha = 1 - transparency.
+            // IfcSurfaceStyleRendering attribute 1 is Transparency
+            // (0 = opaque), in both IFC2X3 and IFC4.
             if ent.is("IFCSURFACESTYLERENDERING") {
-                let transparency = ent.num(4).unwrap_or(0.0);
+                let transparency = ent.num(1).unwrap_or(0.0);
                 rgba[3] = (1.0 - transparency.clamp(0.0, 1.0)) as f32;
             }
             return Some(rgba);
