@@ -2055,10 +2055,14 @@ impl OpenCADStudio {
                     );
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
-                        self.tabs[i]
-                            .scene
-                            .meshes
-                            .insert(handle, crate::scene::MeshLodSet::from_single(mesh));
+                        let mut set = crate::scene::MeshLodSet::from_single(mesh);
+                        // Feature edges make the solid pickable (normal
+                        // selection tests B-rep-style feature edges) and give
+                        // wireframe views real edges.
+                        let (high, low) = crate::io::meshutil::feature_edges(&set.lods[0].verts);
+                        set.edge_verts = high;
+                        set.edge_verts_low = low;
+                        self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }
                 }
@@ -2123,10 +2127,11 @@ impl OpenCADStudio {
                     );
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
-                        self.tabs[i]
-                            .scene
-                            .meshes
-                            .insert(handle, crate::scene::MeshLodSet::from_single(mesh));
+                        let mut set = crate::scene::MeshLodSet::from_single(mesh);
+                        let (high, low) = crate::io::meshutil::feature_edges(&set.lods[0].verts);
+                        set.edge_verts = high;
+                        set.edge_verts_low = low;
+                        self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }
                 }

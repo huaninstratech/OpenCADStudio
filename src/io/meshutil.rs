@@ -241,6 +241,130 @@ pub struct TriSink {
     pub tris: Vec<[[f64; 3]; 3]>,
 }
 
+/// Maximum feature-edge segments extracted per mesh — bounds memory and the
+/// pick scan on pathological triangle soups.
+const MAX_FEATURE_EDGES: usize = 300_000;
+
+/// Feature edges of a flat triangle list (`verts` in triangle order):
+/// boundary edges plus shared edges whose two face normals deviate by more
+/// than 30°. Positions are quantised against the mesh diagonal so triangle-
+/// soup vertices merge. Returns (high, low_residual) pair lists ready for
+/// `MeshLodSet::edge_verts` / `edge_verts_low`.
+pub fn feature_edges(verts: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for p in verts {
+        for k in 0..3 {
+            let v = p[k] as f64;
+            min[k] = min[k].min(v);
+            max[k] = max[k].max(v);
+        }
+    }
+    let diag = ((max[0] - min[0]).powi(2)
+        + (max[1] - min[1]).powi(2)
+        + (max[2] - min[2]).powi(2))
+    .sqrt();
+    let cell = (diag / 1e7).max(1e-9);
+    let key = |p: [f32; 3]| -> [i64; 3] {
+        [
+            ((p[0] as f64 - min[0]) / cell).round() as i64,
+            ((p[1] as f64 - min[1]) / cell).round() as i64,
+            ((p[2] as f64 - min[2]) / cell).round() as i64,
+        ]
+    };
+
+    struct EdgeInfo {
+        count: u8,
+        normal_a: [f64; 3],
+        normal_b: [f64; 3],
+        a: [f32; 3],
+        b: [f32; 3],
+    }
+    let mut table: std::collections::HashMap<([i64; 3], [i64; 3]), EdgeInfo> =
+        std::collections::HashMap::new();
+
+    let mut normals: Vec<[f64; 3]> = Vec::with_capacity(verts.len() / 3);
+    for tri in verts.chunks_exact(3) {
+        let ab = [
+            tri[1][0] as f64 - tri[0][0] as f64,
+            tri[1][1] as f64 - tri[0][1] as f64,
+            tri[1][2] as f64 - tri[0][2] as f64,
+        ];
+        let ac = [
+            tri[2][0] as f64 - tri[0][0] as f64,
+            tri[2][1] as f64 - tri[0][1] as f64,
+            tri[2][2] as f64 - tri[0][2] as f64,
+        ];
+        let n = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        normals.push(if len < 1e-12 {
+            [0.0; 3]
+        } else {
+            [n[0] / len, n[1] / len, n[2] / len]
+        });
+    }
+
+    for (t, tri) in verts.chunks_exact(3).enumerate() {
+        let normal = normals[t];
+        for k in 0..3 {
+            let pa = tri[k];
+            let pb = tri[(k + 1) % 3];
+            let (ka, kb) = (key(pa), key(pb));
+            let edge_key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            let entry = table.entry(edge_key).or_insert(EdgeInfo {
+                count: 0,
+                normal_a: [0.0; 3],
+                normal_b: [0.0; 3],
+                a: pa,
+                b: pb,
+            });
+            match entry.count {
+                0 => {
+                    entry.count = 1;
+                    entry.normal_a = normal;
+                    entry.a = pa;
+                    entry.b = pb;
+                }
+                1 => {
+                    entry.count = 2;
+                    entry.normal_b = normal;
+                }
+                _ => entry.count = 3, // non-manifold
+            }
+        }
+    }
+
+    let cos_threshold = 30f64.to_radians().cos();
+    let mut high: Vec<[f32; 3]> = Vec::new();
+    let mut low: Vec<[f32; 3]> = Vec::new();
+    for (_, edge) in table {
+        let feature = match edge.count {
+            1 => true, // boundary
+            2 => dot(edge.normal_a, edge.normal_b) < cos_threshold,
+            _ => true, // non-manifold: show it
+        };
+        if !feature {
+            continue;
+        }
+        if high.len() >= MAX_FEATURE_EDGES * 2 {
+            break;
+        }
+        high.push(edge.a);
+        high.push(edge.b);
+        low.push([0.0; 3]);
+        low.push([0.0; 3]);
+    }
+    (high, low)
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
 impl TriSink {
     pub fn push(&mut self, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
         self.tris.push([a, b, c]);

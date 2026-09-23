@@ -1560,10 +1560,12 @@ impl OpenCADStudio {
                         let entity = crate::modules::insert::solid3d_cmds::empty_solid3d();
                         let handle = self.tabs[i].scene.add_entity(entity);
                         if !handle.is_null() {
-                            self.tabs[i]
-                                .scene
-                                .meshes
-                                .insert(handle, crate::scene::MeshLodSet::from_single(mesh));
+                            let mut set = crate::scene::MeshLodSet::from_single(mesh);
+                            let (high, low) =
+                                crate::io::meshutil::feature_edges(&set.lods[0].verts);
+                            set.edge_verts = high;
+                            set.edge_verts_low = low;
+                            self.tabs[i].scene.meshes.insert(handle, set);
                             self.tabs[i].dirty = true;
                             self.command_line.push_output(
                                 crate::tf!("IMPORTOBJ: imported \"{file_stem}\" as mesh.").as_ref(),
