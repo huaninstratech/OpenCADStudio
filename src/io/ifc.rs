@@ -76,7 +76,46 @@ struct Reader<'a> {
 
 /// Parse an IFC file into meshes plus extracted element records.
 pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
-    let spf = Spf::parse(bytes)?;
+    IfcImportResult::parse_ifc_with_progress(bytes, None)
+}
+
+impl IfcImportResult {
+    /// Same parse, reporting into the shared open-progress overlay: the
+    /// file scan (basis 500–4500) tracks the parser's byte offset, meshing
+    /// (4500–9500) counts completed elements across the rayon pool.
+    pub fn parse_ifc_with_progress(
+        bytes: &[u8],
+        progress: Option<&crate::io::OpenProgressState>,
+    ) -> Result<IfcImportResult, String> {
+        use crate::app::{OPEN_PHASE_FINALIZING, OPEN_PHASE_PARSING, OPEN_PHASE_READING};
+        if let Some(p) = progress {
+            p.set(OPEN_PHASE_READING, 400, 0, 1);
+        }
+        let report_parse = progress.map(|p| {
+            move |pos: usize, total_len: usize| {
+                let basis =
+                    500 + ((pos.min(total_len) as u64) * 4000 / total_len.max(1) as u64) as u16;
+                p.set(OPEN_PHASE_PARSING, basis, pos / 1024, total_len / 1024);
+            }
+        });
+        let spf = match report_parse.as_ref() {
+            Some(report) => Spf::parse_with_progress(bytes, Some(report as &dyn Fn(usize, usize))),
+            None => Spf::parse_with_progress(bytes, None),
+        }?;
+        let result = parse_ifc_impl(spf, progress);
+        if let Some(p) = progress {
+            p.set(OPEN_PHASE_FINALIZING, 9900, 1, 1);
+        }
+        result
+    }
+}
+
+fn parse_ifc_impl(
+    spf: Spf,
+    progress: Option<&crate::io::OpenProgressState>,
+) -> Result<IfcImportResult, String> {
+    use crate::app::OPEN_PHASE_CACHING;
+    use std::sync::atomic::Ordering;
     let warnings = Vec::new();
     if spf.is_empty() {
         return Err("no data entities in file".into());
@@ -133,13 +172,25 @@ pub fn parse_ifc(bytes: &[u8]) -> Result<IfcImportResult, String> {
             })
         })
         .collect();
+    let total_pending = pending.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
 
     let mesh_one = |item: &Pending| -> Option<IfcMeshOut> {
         let base = reader.placement_matrix(item.placement_id, 0);
         let mut sink = TriSink::default();
         reader.mesh_representation(item.rep_id, &base, 0, &mut sink);
         if sink.tris.is_empty() {
+            if let Some(p) = progress {
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                let basis = 4500 + ((n as u64) * 5000 / total_pending.max(1) as u64) as u16;
+                p.set(OPEN_PHASE_CACHING, basis, n, total_pending);
+            }
             return None;
+        }
+        if let Some(p) = progress {
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            let basis = 4500 + ((n as u64) * 5000 / total_pending.max(1) as u64) as u16;
+            p.set(OPEN_PHASE_CACHING, basis, n, total_pending);
         }
         Some(IfcMeshOut {
             mesh: sink_to_mesh(&sink, &item.name, item.color, reader.len_scale),

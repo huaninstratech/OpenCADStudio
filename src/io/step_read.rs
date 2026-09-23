@@ -30,95 +30,132 @@ pub struct StepImportResult {
 }
 
 pub fn parse_step(bytes: &[u8]) -> Result<StepImportResult, String> {
-    let spf = Spf::parse(bytes)?;
-    if spf.is_empty() {
-        return Err("no data entities in file".into());
-    }
-    let scale = length_scale(&spf);
-    let reader = Reader {
-        spf: &spf,
-        scale,
-        names: product_names(&spf),
-        colors: styled_colours(&spf),
-        warnings: std::sync::Mutex::new(Vec::new()),
-    };
-    const SOLID_TYPES: [&str; 4] = [
-        "MANIFOLD_SOLID_BREP",
-        "BREP_WITH_VOIDS",
-        "FACETED_BREP",
-        "SHELL_BASED_SURFACE_MODEL",
-    ];
-    // Solids are independent — mesh them across threads on desktop builds.
-    let pending: Vec<(u64, String, [f32; 4])> = spf
-        .iter()
-        .filter(|ent| SOLID_TYPES.iter().any(|t| ent.is(t)))
-        .map(|ent| {
-            let name = reader
-                .names
-                .get(&ent.id)
-                .cloned()
-                .unwrap_or_else(|| format!("Solid {}", ent.id));
-            let color = reader.colors.get(&ent.id).copied().unwrap_or(DEFAULT_COLOR);
-            (ent.id, name, color)
+    StepImportResult::parse_step_with_progress(bytes, None)
+}
+
+impl StepImportResult {
+    /// Same parse, reporting into the shared open-progress overlay (parse
+    /// scan basis 500–4500, meshing 4500–9500).
+    pub fn parse_step_with_progress(
+        bytes: &[u8],
+        progress: Option<&crate::io::OpenProgressState>,
+    ) -> Result<StepImportResult, String> {
+        use crate::app::{OPEN_PHASE_CACHING, OPEN_PHASE_FINALIZING, OPEN_PHASE_PARSING, OPEN_PHASE_READING};
+        use std::sync::atomic::Ordering;
+        let total = bytes.len();
+        if let Some(p) = progress {
+            p.set(OPEN_PHASE_READING, 400, 0, 1);
+        }
+        let report_parse = progress.map(|p| {
+            move |pos: usize, total_len: usize| {
+                let basis =
+                    500 + ((pos.min(total_len) as u64) * 4000 / total_len.max(1) as u64) as u16;
+                p.set(OPEN_PHASE_PARSING, basis, pos / 1024, total_len / 1024);
+            }
+        });
+        let spf = match report_parse.as_ref() {
+            Some(report) => Spf::parse_with_progress(bytes, Some(report as &dyn Fn(usize, usize))),
+            None => Spf::parse_with_progress(bytes, None),
+        }?;
+        if spf.is_empty() {
+            return Err("no data entities in file".into());
+        }
+        let scale = length_scale(&spf);
+        let reader = Reader {
+            spf: &spf,
+            scale,
+            names: product_names(&spf),
+            colors: styled_colours(&spf),
+            warnings: std::sync::Mutex::new(Vec::new()),
+        };
+        const SOLID_TYPES: [&str; 4] = [
+            "MANIFOLD_SOLID_BREP",
+            "BREP_WITH_VOIDS",
+            "FACETED_BREP",
+            "SHELL_BASED_SURFACE_MODEL",
+        ];
+        // Solids are independent — mesh them across threads on desktop builds.
+        let pending: Vec<(u64, String, [f32; 4])> = spf
+            .iter()
+            .filter(|ent| SOLID_TYPES.iter().any(|t| ent.is(t)))
+            .map(|ent| {
+                let name = reader
+                    .names
+                    .get(&ent.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Solid {}", ent.id));
+                let color = reader.colors.get(&ent.id).copied().unwrap_or(DEFAULT_COLOR);
+                (ent.id, name, color)
+            })
+            .collect();
+        let total_pending = pending.len();
+        let done = std::sync::atomic::AtomicUsize::new(0);
+
+        let mesh_one = |item: &(u64, String, [f32; 4])| -> Option<MeshModel> {
+            let ent = spf.get(item.0)?;
+            let mut sink = TriSink::default();
+            if ent.is("SHELL_BASED_SURFACE_MODEL") {
+                if let Some(shells) = ent.list(1) {
+                    for shell in shells {
+                        if let Some(shell_id) = shell.as_ref() {
+                            reader.mesh_shell(shell_id, &mut sink);
+                        }
+                    }
+                }
+            } else if let Some(shell_id) = ent.ref_id(1) {
+                reader.mesh_shell(shell_id, &mut sink);
+            }
+            if ent.is("BREP_WITH_VOIDS") {
+                if let Some(voids) = ent.list(2) {
+                    for void in voids {
+                        if let Some(void_id) = void.as_ref() {
+                            reader.mesh_shell(void_id, &mut sink);
+                        }
+                    }
+                }
+            }
+            if let Some(p) = progress {
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                let basis = 4500 + ((n as u64) * 5000 / total_pending.max(1) as u64) as u16;
+                p.set(OPEN_PHASE_CACHING, basis, n, total_pending);
+            }
+            if sink.tris.is_empty() {
+                return None;
+            }
+            Some(sink_to_mesh(&sink, &item.1, item.2, reader.scale))
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let meshes: Vec<MeshModel> = {
+            use rayon::prelude::*;
+            pending.par_iter().filter_map(mesh_one).collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let meshes: Vec<MeshModel> = pending.iter().filter_map(mesh_one).collect();
+
+        let products = reader.names.len();
+        let mut warnings = reader.warnings.into_inner().unwrap_or_default();
+        if spf.first_of_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE").is_some() {
+            warnings.push(
+                "assembly placement transforms are ignored; parts import at absolute coordinates"
+                    .into(),
+            );
+        }
+        if meshes.is_empty() {
+            warnings.push(
+                "no importable solid found (only untrimmed curves or unsupported surfaces?)".into(),
+            );
+        }
+        if let Some(p) = progress {
+            p.set(OPEN_PHASE_FINALIZING, 9900, 1, 1);
+        }
+        Ok(StepImportResult {
+            schema: spf.schema().to_string(),
+            meshes,
+            warnings,
+            products,
         })
-        .collect();
-
-    let mesh_one = |item: &(u64, String, [f32; 4])| -> Option<MeshModel> {
-        let ent = spf.get(item.0)?;
-        let mut sink = TriSink::default();
-        if ent.is("SHELL_BASED_SURFACE_MODEL") {
-            if let Some(shells) = ent.list(1) {
-                for shell in shells {
-                    if let Some(shell_id) = shell.as_ref() {
-                        reader.mesh_shell(shell_id, &mut sink);
-                    }
-                }
-            }
-        } else if let Some(shell_id) = ent.ref_id(1) {
-            reader.mesh_shell(shell_id, &mut sink);
-        }
-        if ent.is("BREP_WITH_VOIDS") {
-            if let Some(voids) = ent.list(2) {
-                for void in voids {
-                    if let Some(void_id) = void.as_ref() {
-                        reader.mesh_shell(void_id, &mut sink);
-                    }
-                }
-            }
-        }
-        if sink.tris.is_empty() {
-            return None;
-        }
-        Some(sink_to_mesh(&sink, &item.1, item.2, reader.scale))
-    };
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let meshes: Vec<MeshModel> = {
-        use rayon::prelude::*;
-        pending.par_iter().filter_map(mesh_one).collect()
-    };
-    #[cfg(target_arch = "wasm32")]
-    let meshes: Vec<MeshModel> = pending.iter().filter_map(mesh_one).collect();
-
-    let products = reader.names.len();
-    let mut warnings = reader.warnings.into_inner().unwrap_or_default();
-    if spf.first_of_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE").is_some() {
-        warnings.push(
-            "assembly placement transforms are ignored; parts import at absolute coordinates"
-                .into(),
-        );
     }
-    if meshes.is_empty() {
-        warnings.push(
-            "no importable solid found (only untrimmed curves or unsupported surfaces?)".into(),
-        );
-    }
-    Ok(StepImportResult {
-        schema: spf.schema().to_string(),
-        meshes,
-        warnings,
-        products,
-    })
 }
 
 // ── units and naming ─────────────────────────────────────────────────────

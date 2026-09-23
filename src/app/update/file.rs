@@ -2088,13 +2088,49 @@ impl OpenCADStudio {
         (entity, set)
     }
 
+    /// Show the shared open-progress overlay for a model import.
+    fn begin_model_import_progress(&mut self, path: &std::path::Path, size_bytes: u64) {
+        let progress = std::sync::Arc::new(crate::io::OpenProgressState::new(
+            crate::app::OPEN_PHASE_READING,
+        ));
+        self.opening = Some(crate::app::OpenProgress {
+            id: self.next_open_id(),
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "model".into()),
+            source_path: Some(path.to_path_buf()),
+            size_bytes,
+            state: progress,
+            started: std::time::Instant::now(),
+            recovery_error: None,
+            recovery_read_stats: None,
+            #[cfg(target_arch = "wasm32")]
+            recovery_bytes: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            fingerprint: None,
+        });
+    }
+
     pub(super) fn on_ifc_import_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
         let tab_id = self.tabs[self.active_tab].id;
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.begin_model_import_progress(&path, size);
+        let progress = self
+            .opening
+            .as_ref()
+            .map(|p| p.state.clone())
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(crate::io::OpenProgressState::new(
+                    crate::app::OPEN_PHASE_READING,
+                ))
+            });
         let worker_path = path.clone();
         background_task(
             move || {
                 let bytes = std::fs::read(&worker_path).map_err(|e| e.to_string())?;
-                crate::io::ifc::parse_ifc(&bytes).map(Box::new)
+                crate::io::ifc::IfcImportResult::parse_ifc_with_progress(&bytes, Some(&progress))
+                    .map(Box::new)
             },
             move |result| Message::IfcImportFinished(tab_id, path, result),
         )
@@ -2106,6 +2142,7 @@ impl OpenCADStudio {
         path: std::path::PathBuf,
         result: Result<Box<crate::io::ifc::IfcImportResult>, String>,
     ) -> Task<Message> {
+        self.opening = None;
         match result {
             Err(error) => self.command_line.push_error(&format!("IMPORTIFC: {error}")),
             Ok(import) => {
@@ -2157,16 +2194,31 @@ impl OpenCADStudio {
                 }
             }
         }
-        Task::none()
+        self.drain_pending_open()
     }
 
     pub(super) fn on_step_import_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
         let tab_id = self.tabs[self.active_tab].id;
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.begin_model_import_progress(&path, size);
+        let progress = self
+            .opening
+            .as_ref()
+            .map(|p| p.state.clone())
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(crate::io::OpenProgressState::new(
+                    crate::app::OPEN_PHASE_READING,
+                ))
+            });
         let worker_path = path.clone();
         background_task(
             move || {
                 let bytes = std::fs::read(&worker_path).map_err(|e| e.to_string())?;
-                crate::io::step_read::parse_step(&bytes).map(Box::new)
+                crate::io::step_read::StepImportResult::parse_step_with_progress(
+                    &bytes,
+                    Some(&progress),
+                )
+                .map(Box::new)
             },
             move |result| Message::StepImportFinished(tab_id, path, result),
         )
@@ -2178,6 +2230,7 @@ impl OpenCADStudio {
         path: std::path::PathBuf,
         result: Result<Box<crate::io::step_read::StepImportResult>, String>,
     ) -> Task<Message> {
+        self.opening = None;
         match result {
             Err(error) => self.command_line.push_error(&format!("IMPORTSTEP: {error}")),
             Ok(import) => {
@@ -2212,7 +2265,7 @@ impl OpenCADStudio {
                 }
             }
         }
-        Task::none()
+        self.drain_pending_open()
     }
 
     pub(super) fn on_ifc_data_source_some(&mut self, path: std::path::PathBuf) -> Task<Message> {

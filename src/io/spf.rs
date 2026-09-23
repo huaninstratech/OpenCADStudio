@@ -184,10 +184,22 @@ impl Spf {
     /// real files carry (extra whitespace, comments, multiple DATA sections);
     /// fails only when the file is not an exchange structure at all.
     pub fn parse(bytes: &[u8]) -> Result<Spf, String> {
+        Self::parse_with_progress(bytes, None)
+    }
+
+    /// Same parse with an optional byte-offset progress callback. The
+    /// callback fires at most once per ~1 MiB of input so huge files feed a
+    /// live progress bar without burning time on the reporting itself.
+    pub fn parse_with_progress(
+        bytes: &[u8],
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<Spf, String> {
         let mut parser = Parser {
             b: bytes,
             pos: 0,
             type_cache: std::collections::HashMap::new(),
+            reported: 0,
+            progress,
         };
         parser.parse_file()
     }
@@ -198,6 +210,9 @@ struct Parser<'a> {
     pos: usize,
     /// Interning cache for entity type names (see `Ent::types`).
     type_cache: std::collections::HashMap<String, std::sync::Arc<str>>,
+    /// Byte offset last reported through `progress`.
+    reported: usize,
+    progress: Option<&'a dyn Fn(usize, usize)>,
 }
 
 impl<'a> Parser<'a> {
@@ -381,6 +396,12 @@ impl<'a> Parser<'a> {
                     if let Some(ent) = ent {
                         spf.index.entry(ent.id).or_insert(spf.ents.len());
                         spf.ents.push(ent);
+                    }
+                    if let Some(report) = self.progress {
+                        if self.pos - self.reported >= (1 << 20) {
+                            self.reported = self.pos;
+                            report(self.pos, self.b.len());
+                        }
                     }
                 }
                 _ => {
