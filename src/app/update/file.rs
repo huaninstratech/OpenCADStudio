@@ -2046,6 +2046,13 @@ impl OpenCADStudio {
             record.add_value(acadrust::xdata::XDataValue::String(guid.to_string()));
             extended_data.add_record(record);
         }
+        if !mesh.name.is_empty() {
+            let mut record = acadrust::xdata::ExtendedDataRecord::new("IFC");
+            record.add_value(acadrust::xdata::XDataValue::String("Element".into()));
+            record.add_value(acadrust::xdata::XDataValue::String("Name".into()));
+            record.add_value(acadrust::xdata::XDataValue::String(mesh.name.clone()));
+            extended_data.add_record(record);
+        }
         for (set_name, prop_name, value) in props {
             let mut record = acadrust::xdata::ExtendedDataRecord::new("IFC");
             record.add_value(acadrust::xdata::XDataValue::String(set_name.clone()));
@@ -2167,9 +2174,14 @@ impl OpenCADStudio {
                         .get(out.guid.as_str())
                         .copied()
                         .unwrap_or(&[]);
-                    let (entity, set) = Self::build_mesh_import(out.mesh, &out.guid, props);
+                    let (entity, mut set) =
+                        Self::build_mesh_import(out.mesh, &out.guid, props);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
+                        // The pick pipeline resolves the owning entity by
+                        // parsing the resident mesh's name as a handle —
+                        // element names live in the XDATA section instead.
+                        set.lods[0].name = handle.value().to_string();
                         self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }
@@ -2247,9 +2259,10 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "IMPORTSTEP");
                 let mut added = 0usize;
                 for mesh in import.meshes {
-                    let (entity, set) = Self::build_mesh_import(mesh, "", &[]);
+                    let (entity, mut set) = Self::build_mesh_import(mesh, "", &[]);
                     let handle = self.tabs[i].scene.add_entity(entity);
                     if !handle.is_null() {
+                        set.lods[0].name = handle.value().to_string();
                         self.tabs[i].scene.meshes.insert(handle, set);
                         added += 1;
                     }

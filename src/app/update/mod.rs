@@ -1565,9 +1565,12 @@ impl OpenCADStudio {
                             .unwrap_or_else(|| "obj_mesh".into());
                         mesh.name = file_stem.clone();
                         self.push_undo_snapshot(i, "IMPORTOBJ");
-                        let (entity, set) = Self::build_mesh_import(mesh, "", &[]);
+                        let (entity, mut set) = Self::build_mesh_import(mesh, "", &[]);
                         let handle = self.tabs[i].scene.add_entity(entity);
                         if !handle.is_null() {
+                            // Pick pipeline resolves the entity from the mesh
+                            // name — keep the handle-string contract.
+                            set.lods[0].name = handle.value().to_string();
                             self.tabs[i].scene.meshes.insert(handle, set);
                             self.tabs[i].dirty = true;
                             self.command_line.push_output(
