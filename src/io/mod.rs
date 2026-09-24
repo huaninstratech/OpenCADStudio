@@ -29,6 +29,7 @@ pub mod patterns;
 pub mod update_check;
 pub mod paper_catalog;
 pub mod plot_device;
+pub mod windows_media;
 pub mod thumbnail;
 #[cfg(target_arch = "wasm32")]
 mod web_worker;
@@ -1651,7 +1652,12 @@ mod save_failure_tests {
 // ── Plot Style Table ──────────────────────────────────────────────────────
 
 /// Show a file-open dialog and load the selected CTB or STB file.
-pub async fn pick_plot_style() -> Option<plot_style::PlotStyleTable> {
+/// Pick a plot style table file and load it. `Ok(None)` when the picker was
+/// cancelled; `Err` says why the chosen file could not be read. A table
+/// picked from outside the plot styles folder is copied into it (unless a
+/// file of that name is already there), so the dialog lists it from now on
+/// and page setups naming it resolve after a restart.
+pub async fn pick_plot_style() -> Result<Option<plot_style::PlotStyleTable>, String> {
     let dialog = crate::sys::file_dialog()
         .set_title(crate::t!("Load Plot Style Table").as_ref())
         .add_filter(crate::t!("Plot Style Tables").as_ref(), &["ctb", "CTB"])
@@ -1662,8 +1668,26 @@ pub async fn pick_plot_style() -> Option<plot_style::PlotStyleTable> {
         Ok(dir) => dialog.set_directory(dir),
         Err(_) => dialog,
     };
-    let handle = dialog.pick_file().await?;
-    plot_style::PlotStyleTable::load(&crate::sys::handle_path(&handle)).ok()
+    let Some(handle) = dialog.pick_file().await else {
+        return Ok(None);
+    };
+    let path = crate::sys::handle_path(&handle);
+    let table = plot_style::PlotStyleTable::load(&path)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (Ok(dir), Some(file_name)) = (plot_style::ensure_plot_styles_dir(), path.file_name()) {
+        let destination = dir.join(file_name);
+        let same_place = path.parent().is_some_and(|parent| {
+            parent
+                .canonicalize()
+                .ok()
+                .zip(dir.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b)
+        });
+        if !same_place && !destination.exists() {
+            let _ = std::fs::copy(&path, &destination);
+        }
+    }
+    Ok(Some(table))
 }
 
 // ── Image file picker ─────────────────────────────────────────────────────
@@ -2349,21 +2373,13 @@ fn fix_viewport_status_flags(doc: &mut CadDocument) {
     }
 }
 
-/// The acadrust DXF reader stores several rotation fields directly from DXF
-/// group code 50 in degrees, while DWG and our own creation code store radians.
-/// Apply to_radians() on load so tessellation can call cos/sin uniformly.
+/// The acadrust DXF reader still stores Shape rotation directly from group
+/// code 50 in degrees, while DWG and our own creation code store radians.
+/// Dimension angles and ATTRIB/ATTDEF rotation are converted inside the
+/// reader, so arms for them here would convert twice.
 fn fix_dxf_dimension_rotations(doc: &mut CadDocument) {
     for entity in doc.entities_mut() {
         match entity {
-            // Dimension angles (rotation / text / oblique) are converted
-            // degrees->radians inside the acadrust DXF reader now, so a
-            // dimension arm here would double-convert.
-            EntityType::AttributeDefinition(a) => {
-                a.rotation = a.rotation.to_radians();
-            }
-            EntityType::AttributeEntity(a) => {
-                a.rotation = a.rotation.to_radians();
-            }
             EntityType::Shape(s) => {
                 s.rotation = s.rotation.to_radians();
             }

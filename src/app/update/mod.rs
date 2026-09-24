@@ -1,4 +1,5 @@
 use super::{ArrowKey, Message, OpenCADStudio, TextEntryMode};
+use crate::command::CadCommand;
 use crate::scene::VIEWCUBE_DRAW_PX;
 use crate::ui::PropertiesPanel;
 use iced::time::Instant;
@@ -94,6 +95,7 @@ mod context_menu;
 mod dialog;
 mod dynamic;
 mod file;
+mod page_setup_import;
 mod style;
 pub(in crate::app) mod util;
 mod viewport;
@@ -176,6 +178,10 @@ impl OpenCADStudio {
             self.drafting_settings_state = None;
             self.drafting_settings_saved = None;
         }
+        if self.active_modal == Some(Options) {
+            self.options_saved = None;
+            self.options_close_confirm = false;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.active_modal == Some(FileInUse) {
             self.pending_save_failure = None;
@@ -201,6 +207,7 @@ impl OpenCADStudio {
                 self.attr_editor_tab = crate::ui::window::attribute_editor::AttrTab::Attribute;
             }
             Some(GeometricTolerance) => self.geometric_tolerance = None,
+            Some(BlockDefinition) => self.block_definition = None,
             Some(Hyperlink) => {
                 self.hyperlink_editor_handles.clear();
                 self.hyperlink_editor_url.clear();
@@ -277,7 +284,30 @@ impl OpenCADStudio {
         crate::plugin::v4_support::publish_selection_changed_v4(tab_id, handles);
     }
 
+    /// Refresh the shared V4 document after built-in geometry edits. Plugin
+    /// writes publish through HostSession immediately; the fingerprint avoids
+    /// sending a duplicate notification at this message boundary.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn notify_plugins_document_changed(&mut self) {
+        if self.active_tab >= self.tabs.len() {
+            return;
+        }
+        let tab = &self.tabs[self.active_tab];
+        let key = (tab.id, tab.scene.geometry_epoch);
+        if self.last_plugin_document == Some(key) {
+            return;
+        }
+        self.last_plugin_document = Some(key);
+        crate::plugin::v4_support::publish_drawing_changed(tab.id, tab.scene.geometry_epoch);
+        crate::plugin::v4_support::publish_document_view_v4(tab.id, &tab.scene.document);
+    }
+
     pub fn update(&mut self, msg: Message) -> Task<Message> {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            crate::entities::common::set_unit_context(
+                crate::entities::common::UnitContext::from_header(&tab.scene.document.header),
+            );
+        }
         self.control_observe_user_message(&msg);
         let perf_started = crate::perf::enabled().then(Instant::now);
         let perf_label = perf_message_label(&msg);
@@ -303,7 +333,33 @@ impl OpenCADStudio {
                 {
                     return self.update(Message::AliasEditorDraftCancel);
                 }
+                if self.active_modal == Some(super::ModalKind::BlockDefinition) {
+                    if let Some(ref mut state) = self.block_definition {
+                        if state.confirm_redefine.is_some() {
+                            state.confirm_redefine = None;
+                            return Task::none();
+                        }
+                        if state.error_message.is_some() {
+                            state.error_message = None;
+                            return Task::none();
+                        }
+                    }
+                }
                 return self.update(Message::CloseModal);
+            }
+            if self.active_modal == Some(super::ModalKind::BlockDefinition) {
+                if matches!(msg, Message::CommandFinalize)
+                    || matches!(&msg, Message::ShortcutPressed(key) if key.rsplit('+').next() == Some("ENTER") || key.rsplit('+').next() == Some("RETURN"))
+                {
+                    if let Some(ref state) = self.block_definition {
+                        if state.confirm_redefine.is_some() {
+                            // Default to "No" so an accidental Enter doesn't nuke a definition.
+                            return self.update(Message::BlockDefConfirmRedefine(false));
+                        } else {
+                            return self.update(Message::BlockDefApply);
+                        }
+                    }
+                }
             }
             if is_modal_blocked_key_msg(&msg) {
                 return Task::none();
@@ -317,7 +373,29 @@ impl OpenCADStudio {
                 return task;
             }
         }
+        // A command's name is `&'static str`, so this runs on every message —
+        // a mouse move included — without allocating.
+        #[cfg(not(target_arch = "wasm32"))]
+        let active_command = |app: &Self| -> Option<(u64, Option<&'static str>)> {
+            app.tabs
+                .get(app.active_tab)
+                .map(|tab| (tab.id, tab.active_cmd.as_ref().map(|command| command.name())))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let command_before = active_command(self);
         let task = self.update_inner(msg);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let command_after = active_command(self);
+            if command_before != command_after {
+                if let Some((tab_id, command)) = command_after {
+                    crate::plugin::v4_support::publish_command_state_changed(
+                        tab_id,
+                        command.map(str::to_owned),
+                    );
+                }
+            }
+        }
         self.refresh_gpu_status();
         self.show_next_startup_modal();
         self.sync_open_command_history();
@@ -354,6 +432,8 @@ impl OpenCADStudio {
         // and plugin request draining).
         #[cfg(not(target_arch = "wasm32"))]
         self.notify_plugins_selection_changed();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.notify_plugins_document_changed();
         // OTRACK acquires tracking points only while a command or grip drag is
         // running; drop them once neither is active so the temporary tracking
         // points / vectors disappear when the command ends (issue #64).
@@ -364,6 +444,7 @@ impl OpenCADStudio {
         {
             self.snapper.clear_tracking();
             self.otrack_active = None;
+            self.otrack_cross = None;
             self.otrack_kind = None;
         }
         if let Some((started, tab_id, before)) = perf_edit_before {
@@ -400,12 +481,14 @@ impl OpenCADStudio {
     pub(in crate::app) fn reset_tracking_after_point(&mut self) {
         self.snapper.clear_tracking();
         self.otrack_active = None;
+        self.otrack_cross = None;
         self.otrack_kind = None;
     }
 
     fn update_inner(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::SpaceMouseWake => self.on_spacemouse_wake(),
+            Message::TrackpadPinch(magnification) => self.on_pinch_zoom(magnification),
             Message::SpaceMouseFrame(time) => {
                 self.spacemouse.frame(
                     time.saturating_duration_since(self.start).as_secs_f64() * 1000.,
@@ -4235,6 +4318,7 @@ impl OpenCADStudio {
                 if !self.snapper.otrack_enabled {
                     self.snapper.clear_tracking();
                     self.otrack_active = None;
+                    self.otrack_cross = None;
                     self.otrack_kind = None;
                 }
                 Task::none()
@@ -4465,6 +4549,12 @@ impl OpenCADStudio {
                     return Task::none();
                 }
                 let description = self.hyperlink_editor_description.trim().to_owned();
+                if let Some(block_def) = self.block_definition.as_mut() {
+                    block_def.hyperlink_url = url;
+                    block_def.hyperlink_desc = description;
+                    self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
+                    return Task::none();
+                }
                 let values = if url.is_empty() {
                     None
                 } else {
@@ -4488,6 +4578,12 @@ impl OpenCADStudio {
                 Task::none()
             }
             Message::HyperlinkRemove => {
+                if let Some(block_def) = self.block_definition.as_mut() {
+                    block_def.hyperlink_url.clear();
+                    block_def.hyperlink_desc.clear();
+                    self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
+                    return Task::none();
+                }
                 let i = self.active_tab;
                 let handles = self.hyperlink_editor_handles.clone();
                 self.apply_property_op(i, "HYPERLINK", &handles, |app, handle| {
@@ -4502,6 +4598,10 @@ impl OpenCADStudio {
                 Task::none()
             }
             Message::HyperlinkCancel => {
+                if self.block_definition.is_some() {
+                    self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
+                    return Task::none();
+                }
                 self.close_active_modal();
                 Task::none()
             }
@@ -4853,7 +4953,193 @@ impl OpenCADStudio {
                 self.tabs[i].dirty = true;
                 self.tabs[i].scene.bump_geometry();
                 self.refresh_properties();
+                crate::entities::common::set_unit_context(
+                    crate::entities::common::UnitContext::from_header(&self.tabs[i].scene.document.header),
+                );
                 Task::none()
+            }
+            Message::BlockDefName(name) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.name = name;
+                    state.error_message = None;
+                    state.confirm_redefine = None;
+                }
+                Task::none()
+            }
+            Message::BlockDefNameSelect(chosen) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.name = chosen;
+                    state.error_message = None;
+                    state.confirm_redefine = None;
+                }
+                Task::none()
+            }
+            Message::BlockDefBaseOnScreen(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.base_point_specify_onscreen = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefPickPoint => {
+                self.active_modal = None;
+                let cmd = crate::modules::insert::create_block::BlockPickBasePointCommand;
+                self.command_line.push_info(&cmd.prompt());
+                self.tabs[self.active_tab].active_cmd = Some(Box::new(cmd));
+                Task::none()
+            }
+            Message::BlockDefBaseX(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.base_point_x = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefBaseY(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.base_point_y = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefBaseZ(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.base_point_z = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefObjectsOnScreen(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.objects_specify_onscreen = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefSelectObjects => {
+                self.active_modal = None;
+                use crate::modules::draw::select::SelectObjectsCommand;
+                let cmd = SelectObjectsCommand::plain("BLOCK", "BLOCK_OBJECTS_GATHERED");
+                self.command_line.push_info(&cmd.prompt());
+                self.tabs[self.active_tab].active_cmd = Some(Box::new(cmd));
+                Task::none()
+            }
+            Message::BlockDefQuickSelect => {
+                self.active_modal = None;
+                self.on_qselect_open()
+            }
+            Message::BlockDefObjectMode(mode) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.object_mode = mode;
+                }
+                Task::none()
+            }
+            Message::BlockDefAnnotative(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.annotative = val;
+                    if !val {
+                        state.match_orientation = false;
+                    }
+                }
+                Task::none()
+            }
+            Message::BlockDefMatchOrientation(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.match_orientation = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefScaleUniformly(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.scale_uniformly = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefAllowExploding(val) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.allow_exploding = val;
+                }
+                Task::none()
+            }
+            Message::BlockDefUnit(unit) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.unit = unit;
+                }
+                Task::none()
+            }
+            Message::BlockDefDescription(desc) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.description = desc;
+                }
+                Task::none()
+            }
+            Message::BlockDefDescriptionAction(action) => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.description_content.perform(action);
+                    state.description = state.description_content.text();
+                }
+                Task::none()
+            }
+            Message::BlockDefHyperlink => {
+                if let Some(state) = self.block_definition.as_ref() {
+                    self.hyperlink_editor_url = state.hyperlink_url.clone();
+                    self.hyperlink_editor_description = state.hyperlink_desc.clone();
+                    self.hyperlink_editor_mixed = false;
+                    self.hyperlink_editor_dirty = false;
+                    self.hyperlink_editor_handles.clear();
+                    self.active_modal = Some(crate::app::ModalKind::Hyperlink);
+                }
+                Task::none()
+            }
+            Message::BlockDefDismissError => {
+                if let Some(state) = self.block_definition.as_mut() {
+                    state.error_message = None;
+                }
+                Task::none()
+            }
+            Message::BlockDefHelp => {
+                self.command_line.push_info(
+                    crate::t!("BLOCK creates a block definition from objects you select.").as_ref(),
+                );
+                Task::none()
+            }
+            Message::BlockDefConfirmRedefine(confirmed) => {
+                if !confirmed {
+                    if let Some(state) = self.block_definition.as_mut() {
+                        state.confirm_redefine = None;
+                    }
+                    return Task::none();
+                }
+                self.commit_block_definition(true)
+            }
+            Message::BlockDefApply => {
+                let Some(state) = self.block_definition.as_mut() else {
+                    return Task::none();
+                };
+                let name = state.name.trim().to_string();
+                if name.is_empty() {
+                    state.error_message = Some(crate::t!("Block name cannot be empty.").into_owned());
+                    return Task::none();
+                }
+                if let Some(_ch) = state.invalid_name_char() {
+                    state.error_message = Some(
+                        crate::t!("Block name cannot contain: \\ / : * ? \" < > | = `").into_owned(),
+                    );
+                    return Task::none();
+                }
+                if name.starts_with('*') {
+                    state.error_message =
+                        Some(crate::t!("Block name cannot start with '*'.").into_owned());
+                    return Task::none();
+                }
+                if !state.objects_specify_onscreen && state.selected_handles.is_empty() {
+                    state.error_message = Some(
+                        crate::t!("No objects selected. You must select objects to define a block.")
+                            .into_owned(),
+                    );
+                    return Task::none();
+                }
+                let i = self.active_tab;
+                if self.tabs[i].scene.document.block_records.get(&name).is_some() {
+                    state.confirm_redefine = Some(name);
+                    return Task::none();
+                }
+                self.commit_block_definition(false)
             }
             Message::ToleranceDialogField(field) => {
                 if let Some(state) = self.geometric_tolerance.as_mut() {
@@ -4903,6 +5189,9 @@ impl OpenCADStudio {
                 self.tabs[i].dirty = true;
                 self.tabs[i].scene.bump_geometry();
                 self.refresh_properties();
+                crate::entities::common::set_unit_context(
+                    crate::entities::common::UnitContext::from_header(&self.tabs[i].scene.document.header),
+                );
                 let label = crate::modules::draw::units::linear_format_label(code);
                 self.command_line
                     .push_output(crate::tf!("Length format is now {label}.").as_ref());
@@ -5804,6 +6093,9 @@ impl OpenCADStudio {
                     self.qselect_settings = Some((&state).into());
                 }
                 self.reset_modal_geometry();
+                if self.block_definition.is_some() {
+                    self.active_modal = Some(super::ModalKind::BlockDefinition);
+                }
                 Task::none()
             }
 
@@ -6000,6 +6292,16 @@ impl OpenCADStudio {
                 self.command_line
                     .push_output(crate::tf!("QSELECT: {} object(s) selected.", matched).as_ref());
                 self.refresh_properties();
+                if let Some(ref mut block_def) = self.block_definition {
+                    block_def.selected_handles = self.tabs[i]
+                        .scene
+                        .selected_entities()
+                        .into_iter()
+                        .map(|(h, _)| h)
+                        .collect();
+                    block_def.error_message = None;
+                    self.active_modal = Some(super::ModalKind::BlockDefinition);
+                }
                 Task::none()
             }
 
@@ -6915,7 +7217,7 @@ impl OpenCADStudio {
                     .unwrap_or(1);
                 let name = format!("Layout{n}");
                 self.push_undo_snapshot(i, "LAYOUT NEW");
-                match self.tabs[i].scene.document.add_layout(&name) {
+                match self.tabs[i].scene.add_layout(&name) {
                     Ok(_) => {
                         self.tabs[i].dirty = true;
                         self.layout_manager_selected = name.clone();
@@ -7330,7 +7632,35 @@ impl OpenCADStudio {
             }
             // ── Options / About windows ───────────────────────────────────
             Message::OptionsOpen => {
-                self.active_modal = Some(super::ModalKind::Options);
+                self.options_open();
+                Task::none()
+            }
+            Message::OptionsApply => {
+                self.options_apply();
+                Task::none()
+            }
+            Message::OptionsOk => {
+                self.options_apply();
+                self.options_forget();
+                self.close_active_modal();
+                Task::none()
+            }
+            Message::OptionsClose => {
+                if !self.options_close_confirm && self.options_dirty() {
+                    self.options_close_confirm = true;
+                    return Task::none();
+                }
+                self.options_discard();
+                self.close_active_modal();
+                Task::none()
+            }
+            Message::OptionsCloseDiscard => {
+                self.options_discard();
+                self.close_active_modal();
+                Task::none()
+            }
+            Message::OptionsCloseKeep => {
+                self.options_close_confirm = false;
                 Task::none()
             }
 
@@ -7644,6 +7974,12 @@ impl OpenCADStudio {
                 Task::none()
             }
 
+            Message::PageSetupImportFile(path) => self.on_page_setup_import_file(path),
+            Message::PageSetupOnNewLayoutChanged(enabled) => {
+                self.plot_dialog.page_setup_on_new_layout = enabled;
+                self.persist_settings_if_changed();
+                Task::none()
+            }
             Message::BackupOnSaveChanged(enabled) => {
                 self.backup_on_save = enabled;
                 self.persist_settings_if_changed();
@@ -7940,6 +8276,10 @@ impl OpenCADStudio {
             Message::CloseModal => {
                 if self.active_modal == Some(super::ModalKind::RecoveryPrompt) {
                     return self.update(Message::RecoveryDecline);
+                }
+                // The Options window's × and Esc behave like its Close button.
+                if self.active_modal == Some(super::ModalKind::Options) {
+                    return self.update(Message::OptionsClose);
                 }
                 // Closing the shortcut editor with un-applied rows needs an
                 // explicit discard; a second close attempt (or the overlay's
@@ -9152,7 +9492,7 @@ impl OpenCADStudio {
             Message::PlotStyleLoad => {
                 Task::perform(crate::io::pick_plot_style(), Message::PlotStyleLoaded)
             }
-            Message::PlotStyleLoaded(Some(table)) => {
+            Message::PlotStyleLoaded(Ok(Some(table))) => {
                 if table.is_stb {
                     self.command_line.push_error(
                         crate::t!(
@@ -9164,6 +9504,8 @@ impl OpenCADStudio {
                 }
                 self.plot_dialog.style_name = table.name.clone();
                 self.plot_dialog.style_missing = false;
+                self.plot_dialog.style_error = None;
+                self.report_plot_style_warnings(&table);
                 self.command_line.push_output(
                     crate::tf!(
                         "Plot style '{}' loaded ({} color entries).",
@@ -9180,7 +9522,15 @@ impl OpenCADStudio {
                 self.plot_dialog.plot_styles = crate::io::plot_style::available_ctb_names();
                 Task::none()
             }
-            Message::PlotStyleLoaded(None) => Task::none(),
+            Message::PlotStyleLoaded(Ok(None)) => Task::none(),
+            Message::PlotStyleLoaded(Err(error)) => {
+                // The file the user pointed at could not be read: say why,
+                // in the dialog as well as on the command line.
+                self.command_line.push_error(&error);
+                self.plot_dialog.style_missing = true;
+                self.plot_dialog.style_error = Some(error);
+                Task::none()
+            }
             Message::PlotStyleClear => {
                 self.active_plot_style = None;
                 self.plot_dialog.style_name.clear();
@@ -9207,12 +9557,15 @@ impl OpenCADStudio {
                     if needs_load {
                         match crate::io::plot_style::PlotStyleTable::load_named(&selected_style) {
                             Ok(table) => {
+                                self.report_plot_style_warnings(&table);
                                 self.active_plot_style = Some(table);
                                 self.plot_dialog.style_missing = false;
+                                self.plot_dialog.style_error = None;
                             }
                             Err(error) => {
                                 self.plot_dialog.style_missing = true;
                                 self.command_line.push_error(&error);
+                                self.plot_dialog.style_error = Some(error);
                                 return Task::none();
                             }
                         }

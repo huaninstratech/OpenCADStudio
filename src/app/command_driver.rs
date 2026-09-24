@@ -3,6 +3,28 @@ use crate::command::{CmdResult, SelectionEntity, StepInput};
 use acadrust::Handle;
 use iced::Task;
 
+/// `old` as a whole identifier in `source` becomes `new`.
+fn replace_identifier(source: &str, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if !token.is_empty() {
+            out.push_str(if token == old { new } else { token.as_str() });
+            token.clear();
+        }
+    };
+    for c in source.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
 impl OpenCADStudio {
     pub(super) fn reject_locked_edit(&mut self, i: usize, handle: Handle) -> bool {
         let Some(layer) = self.tabs[i].scene.locked_layer_name(handle) else {
@@ -104,6 +126,7 @@ impl OpenCADStudio {
         self.snapper.from_point = None;
         self.snapper.clear_tracking();
         self.otrack_active = None;
+        self.otrack_cross = None;
         self.otrack_kind = None;
         self.axis_lock_dir = None;
         self.dyn_user_reshaped = false;
@@ -406,12 +429,71 @@ impl OpenCADStudio {
     /// through, so the routing from input → `on_*` method → `apply_cmd_result`
     /// lives in exactly one place. No-op when no command is active.
     pub(super) fn feed_command(&mut self, input: StepInput) -> Task<Message> {
+        self.feed_command_consumed(input).0
+    }
+
+    /// Keeps only associative dimensions in a completed selection when the
+    /// active command asks for that, deselecting the rest and reporting how
+    /// many objects were dropped.
+    fn filter_associative_dimension_selection(&mut self, input: StepInput) -> StepInput {
+        let StepInput::SelectionComplete(handles) = input else {
+            return input;
+        };
+        let i = self.active_tab;
+        if !self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .is_some_and(|command| command.selection_keeps_associative_dimensions())
+        {
+            return StepInput::SelectionComplete(handles);
+        }
+        let (kept, dropped): (Vec<Handle>, Vec<Handle>) = handles.into_iter().partition(|handle| {
+            // A dimension that already drives a constraint is not one to
+            // convert either.
+            crate::scene::parametric_constraints::dynamic_dimension_constraint(
+                &self.tabs[i].scene.parametric_constraints,
+                *handle,
+            )
+            .is_none()
+                && crate::scene::dimension_assoc::constraint_from_associative_dimension(
+                    &self.tabs[i].scene.document,
+                    *handle,
+                )
+                .is_some()
+        });
+        for handle in &dropped {
+            self.tabs[i].scene.deselect_entity(*handle);
+        }
+        if !dropped.is_empty() {
+            let count = dropped.len();
+            self.command_line.push_info(
+                if count == 1 {
+                    crate::t!("1 was filtered out.")
+                } else {
+                    crate::tf!("{count} were filtered out.")
+                }
+                .as_ref(),
+            );
+            self.refresh_properties();
+        }
+        StepInput::SelectionComplete(kept)
+    }
+
+    /// `feed_command`, also reporting whether the step actually took the input.
+    /// Only a `Text` token can come back unclaimed (`on_text_input` returning
+    /// `None`), which is what lets the caller read it as something else — a
+    /// typed distance, say — instead of guessing beforehand.
+    pub(super) fn feed_command_consumed(&mut self, input: StepInput) -> (Task<Message>, bool) {
+        // A command that takes associative dimensions only keeps just those:
+        // the rest leave the selection and the count of what went is reported,
+        // as the reference does while gathering.
+        let input = self.filter_associative_dimension_selection(input);
         // Selection keywords (P / PREVIOUS, L / LAST) consume the token
         // before it reaches the command (#426).
         if let StepInput::Text(s) = &input {
             let kw_input = s.clone();
             if let Some(task) = self.try_selection_keyword(&kw_input) {
-                return task;
+                return (task, true);
             }
         }
         let i = self.active_tab;
@@ -427,14 +509,14 @@ impl OpenCADStudio {
         };
         if let StepInput::Point(point) = &input {
             if !self.command_point_allowed(i, *point) {
-                return Task::none();
+                return (Task::none(), true);
             }
             // Typed / dynamic-input / headless points carry no snap, but the
             // accepted-snap list must stay index-parallel with the points the
             // command collects. Interactive picks record themselves in
             // the click handler and never reach here.
             if !self.record_accepted_snap(i, None, None, *point) {
-                return Task::none();
+                return (Task::none(), true);
             }
         }
         if default_start {
@@ -450,7 +532,7 @@ impl OpenCADStudio {
         }
         if let StepInput::EntityPick(handle, point) = &input {
             if !self.dimension_acquisition_allowed(i, None) {
-                return Task::none();
+                return (Task::none(), true);
             }
             let solid_pick = matches!(
                 self.tabs[i].scene.document.get_entity(*handle),
@@ -529,9 +611,10 @@ impl OpenCADStudio {
         } else {
             None
         };
+        let is_escape = matches!(&input, StepInput::Escape);
         let result: Option<CmdResult> = {
             let Some(cmd) = self.tabs[i].active_cmd.as_mut() else {
-                return Task::none();
+                return (Task::none(), false);
             };
             cmd.set_ctrl(ctrl);
             cmd.set_shift(shift);
@@ -551,10 +634,50 @@ impl OpenCADStudio {
             self.record_dimension_entity_points(i, None, handle, Vec::new());
         }
         self.sync_dimension_snaps(i);
-        match result {
-            Some(r) => self.apply_cmd_result(r),
-            None => Task::none(),
+        if is_escape {
+            self.tabs[i].pending_pause_tokens = None;
         }
+        match result {
+            Some(r) => (self.apply_cmd_result(r), true),
+            None => (Task::none(), false),
+        }
+    }
+
+    /// Process queued tokens buffered after a PAUSE (or `\`) until the queue is
+    /// empty or another PAUSE / cancellation is encountered.
+    pub(super) fn drain_pending_pause_tokens(&mut self, tab_idx: usize) -> Task<Message> {
+        let Some(mut tokens) = self.tabs[tab_idx].pending_pause_tokens.take() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        while !tokens.is_empty() {
+            if self.tabs[tab_idx].active_cmd.is_none() {
+                break;
+            }
+            let token = tokens.remove(0);
+            let trimmed = token.trim();
+            if trimmed.eq_ignore_ascii_case("PAUSE") || trimmed == "\\" {
+                self.tabs[tab_idx].pending_pause_tokens = Some(tokens);
+                break;
+            }
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("ENTER")
+                || trimmed.eq_ignore_ascii_case("RETURN")
+                || trimmed == "\n"
+            {
+                tasks.push(self.feed_command(StepInput::Enter));
+            } else if trimmed.eq_ignore_ascii_case("ESC")
+                || trimmed.eq_ignore_ascii_case("ESCAPE")
+                || trimmed.eq_ignore_ascii_case("CANCEL")
+            {
+                self.tabs[tab_idx].pending_pause_tokens = None;
+                tasks.push(self.feed_command(StepInput::Escape));
+                break;
+            } else {
+                tasks.push(self.feed_active_cmd(&token));
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// Run one whole command-line string. A single word or an inline-argument
@@ -565,7 +688,16 @@ impl OpenCADStudio {
     /// terminated as if Enter were pressed. Shared by the GUI command line and
     /// the headless automation feeder so both behave identically.
     pub(super) fn run_command_line(&mut self, cmd: &str) -> Task<Message> {
+        self.run_command_line_streaming(cmd, true)
+    }
+
+    /// `run_command_line`, with the trailing Enter left off when `finish` is
+    /// false: the line is one instalment and the tool stays at its next prompt
+    /// for the following one. Only a plugin streaming a command feeds it that
+    /// way; the command line and the automation feeder always finish.
+    pub(super) fn run_command_line_streaming(&mut self, cmd: &str, finish: bool) -> Task<Message> {
         let i = self.active_tab;
+        self.command_line.unconsumed.clear();
         let tokens: Vec<&str> = cmd.split_whitespace().collect();
         if tokens.len() <= 1 {
             return self.dispatch_command(cmd);
@@ -575,9 +707,9 @@ impl OpenCADStudio {
         // dispatch first. A built-in interactive tool matches only its bare name
         // (`LINE`), so the full line is not a plugin command and falls through to
         // the first-word + fed-tokens path below. (#162)
-        if crate::plugin::try_dispatch(self, i, cmd) {
+        if !self.suppress_plugin_dispatch && crate::plugin::try_dispatch(self, i, cmd) {
             let toks: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-            return self.finish_active_command(&toks);
+            return self.finish_active_command(&toks, finish);
         }
         if tokens[0].eq_ignore_ascii_case("BACKGROUND")
             || tokens[0].eq_ignore_ascii_case("COLORSCHEME")
@@ -590,27 +722,89 @@ impl OpenCADStudio {
             return self.dispatch_command(cmd);
         }
         let toks: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-        let finish_task = self.finish_active_command(&toks);
+        let finish_task = self.finish_active_command(&toks, finish);
         Task::batch([start_task, finish_task])
     }
 
     /// Feed `tokens[1..]` to the active interactive command as points / option
     /// keywords, then terminate it as if Enter were pressed. No-op when no
     /// command is active.
-    pub(super) fn finish_active_command(&mut self, tokens: &[String]) -> Task<Message> {
+    ///
+    /// Two things happen when the tokens run out mid-way, both needed so a
+    /// headless caller can tell what actually happened:
+    ///
+    /// * If the in-place text editor took over (the `TEXT` content step — the
+    ///   command itself has already ended by then, `active_cmd` is `None`), the
+    ///   remaining tokens are that text: they are typed into the editor and
+    ///   committed, the same messages the control surface's `text_input` /
+    ///   `text_commit` actions dispatch. Without this the tail of the line was
+    ///   silently dropped and `TEXT 0,0 5 0 hi` created nothing at all.
+    /// * Anything still left over was never claimed by any prompt; it is
+    ///   recorded in [`CommandLine::unconsumed`] instead of vanishing.
+    pub(super) fn finish_active_command(&mut self, tokens: &[String], finish: bool) -> Task<Message> {
         let i = self.active_tab;
         if self.tabs[i].active_cmd.is_none() {
             return Task::none();
         }
         self.last_point = None;
+        // An editor that is *already* open belongs to someone else (an earlier
+        // line that stopped at the content step). Only the editor this line
+        // opens by feeding its own tokens may be handed the tail.
+        let editor_was_open = self.text_inline.is_some();
         let mut tasks = Vec::new();
-        for tok in &tokens[1..] {
+        // First token is the command verb itself; prompts start consuming after it.
+        let mut consumed = 1;
+        let mut paused = false;
+        for (idx, tok) in tokens[1..].iter().enumerate() {
             if self.tabs[i].active_cmd.is_none() {
                 break;
             }
+            let trimmed = tok.trim();
+            if trimmed.eq_ignore_ascii_case("PAUSE") || trimmed == "\\" {
+                let mut remainder: Vec<String> = tokens[1 + idx + 1..].to_vec();
+                // The line still ends with an Enter; it waits behind the pause
+                // instead of being dropped with it.
+                if finish {
+                    remainder.push("ENTER".to_string());
+                }
+                self.tabs[i].pending_pause_tokens = Some(remainder);
+                consumed = tokens.len();
+                paused = true;
+                break;
+            }
             tasks.push(self.feed_active_cmd(tok));
+            consumed += 1;
         }
-        tasks.push(self.feed_command(StepInput::Enter));
+        if !editor_was_open && self.text_inline.is_some() && consumed < tokens.len() {
+            // Fill the editor the same way `Message::TextInlineInput` does, then
+            // commit *synchronously* so the outcome is observable: dispatching
+            // `TextInlineOk` as a task would hide whether the entity was really
+            // created, and the tail token would be counted as consumed either
+            // way — the caller would have no way to tell "text created" from
+            // "text silently dropped".
+            if let Some(editor) = self.text_inline.as_mut() {
+                editor.value = tokens[consumed..].join(" ");
+            }
+            let committed = self.text_inline_commit();
+            tasks.push(self.post_editor_closed(committed));
+            if committed {
+                consumed = tokens.len();
+                // `TEXT` repeats by design: on a committed string it re-arms for
+                // the next line (`open_next_line`), which re-opens the editor. A
+                // batch line is a complete unit, and leaving that repeat armed
+                // would make the *next* line get eaten as the next text position,
+                // so end the command here, exactly as Esc does in the GUI.
+                tasks.push(Task::done(Message::CommandEscape));
+            }
+            // On a failed commit the tokens stay unconsumed (assigned below), so
+            // the caller still sees the text it passed in.
+        }
+        if consumed < tokens.len() {
+            self.command_line.unconsumed = tokens[consumed..].to_vec();
+        }
+        if !paused && finish {
+            tasks.push(self.feed_command(StepInput::Enter));
+        }
         Task::batch(tasks)
     }
 
@@ -767,6 +961,21 @@ impl OpenCADStudio {
                     if self.command_point_allowed(i, wcs) {
                         self.last_point = Some(wcs);
                         self.push_ucs_to_cmd(i);
+                        // A typed coordinate at an object prompt is a pick at
+                        // that point, as in the reference.
+                        let picks_entity = self.tabs[i]
+                            .active_cmd
+                            .as_ref()
+                            .is_some_and(|command| command.typed_point_picks_entity());
+                        if picks_entity {
+                            let owner = self.tabs[i]
+                                .current_parametric_scope()
+                                .owner_handle(&self.tabs[i].scene.document);
+                            let handle =
+                                entity_at_typed_point(&self.tabs[i].scene.document, owner, wcs)
+                                    .unwrap_or(Handle::NULL);
+                            return self.feed_command(StepInput::EntityPick(handle, wcs));
+                        }
                         return self.feed_command(StepInput::Point(wcs));
                     }
                     return Task::none();
@@ -844,7 +1053,19 @@ impl OpenCADStudio {
             self.push_ucs_to_cmd(i);
             return self.feed_command(StepInput::Point(wcs));
         } else {
-            return self.feed_command(StepInput::Text(token.to_string()));
+            // The step reads the token first: at a great many point prompts a
+            // bare number is the step's own value, not a distance — ROTATE's
+            // angle, SCALE's factor, CIRCLE's radius. Only a token no step
+            // claims becomes direct distance entry, measured along the cursor
+            // direction from the command's anchor.
+            let (task, consumed) = self.feed_command_consumed(StepInput::Text(token.to_string()));
+            if consumed {
+                return task;
+            }
+            if let Some(distance) = self.try_direct_distance_entry(token) {
+                return distance;
+            }
+            return task;
         }
     }
 
@@ -954,8 +1175,14 @@ impl OpenCADStudio {
             self.tabs[i].scene.set_hover_highlight(None);
             self.command_line.set_step_options(Vec::new());
             self.restore_add_selected_defaults();
+            self.tabs[i].pending_pause_tokens = None;
         }
-        task
+        if self.tabs[i].active_cmd.is_some() && self.tabs[i].pending_pause_tokens.is_some() {
+            let drain_task = self.drain_pending_pause_tokens(i);
+            Task::batch([task, drain_task])
+        } else {
+            task
+        }
     }
 
     /// Resolve the cell under `click` on table `handle` (or any table in the drawing
@@ -1040,6 +1267,257 @@ impl OpenCADStudio {
         TableCellEditStart::Started
     }
 
+    /// Reports a refused command-line value and shows the prompt again.
+    fn reprompt_active_command(&mut self, i: usize, message: &str) {
+        self.command_line.push_error(message);
+        if let Some(prompt) = self.tabs[i].active_cmd.as_ref().map(|command| command.prompt()) {
+            self.command_line.push_info(&prompt);
+        }
+    }
+
+    /// Drops what removed dimensional constraints leave behind: their dynamic
+    /// dimensions, and their parameters when no other constraint reads them.
+    pub(crate) fn purge_dimensional_extras(
+        &mut self,
+        i: usize,
+        dimensions: Vec<Handle>,
+        parameters: Vec<String>,
+    ) {
+        if !dimensions.is_empty() {
+            self.tabs[i].scene.erase_entities(&dimensions);
+        }
+        let unused: Vec<String> = parameters
+            .into_iter()
+            .filter(|name| {
+                !self.tabs[i]
+                    .scene
+                    .parametric_constraints
+                    .iter()
+                    .flat_map(|set| set.constraints.iter())
+                    .any(|constraint| {
+                        matches!(
+                            &constraint.driving_param,
+                            Some(crate::scene::named_parameters::DrivingValue::Named(used))
+                                if used == name
+                        )
+                    })
+            })
+            .collect();
+        if !unused.is_empty() {
+            self.tabs[i].scene.record_undo_named_parameters_before();
+            for name in &unused {
+                self.tabs[i].scene.named_parameters_mut().remove(name);
+            }
+        }
+    }
+
+    /// `Dynamic` or `Annotational`, the DCFORM setting.
+    pub(crate) fn constraint_form_name(&self) -> &'static str {
+        if self.constraint_form_annotational {
+            "Annotational"
+        } else {
+            "Dynamic"
+        }
+    }
+
+    /// The value prompt a double-clicked constraint dimension opens.
+    pub(crate) fn dynamic_dimension_value_command(
+        &self,
+        i: usize,
+        handle: Handle,
+    ) -> Option<crate::modules::parametric::DimensionValueCommand> {
+        use crate::scene::named_parameters::DrivingValue;
+        let scene = &self.tabs[i].scene;
+        for set in &scene.parametric_constraints {
+            let Some((id, _)) = set
+                .dimensions
+                .iter()
+                .find(|(_, dimension)| **dimension == handle)
+            else {
+                continue;
+            };
+            let constraint = set.get(*id)?;
+            let Some(DrivingValue::Named(name)) = &constraint.driving_param else {
+                return None;
+            };
+            let table = if set.local_parameters.is_empty() {
+                scene.named_parameters()
+            } else {
+                &set.local_parameters
+            };
+            let current = table
+                .get(name)
+                .map(|parameter| parameter.source.trim().to_string())
+                .unwrap_or_default();
+            return Some(crate::modules::parametric::DimensionValueCommand::new(
+                name.clone(),
+                current,
+            ));
+        }
+        None
+    }
+
+    /// Applies `expression` or `newname=expression` to parameter `name`:
+    /// the dimension value prompt and -PARAMETERS Edit.
+    pub(crate) fn apply_parameter_input(&mut self, i: usize, name: &str, input: &str) {
+        let input = input.trim();
+        let (target, expression) = match input.split_once('=') {
+            Some((new_name, expression)) => {
+                (new_name.trim().to_string(), expression.trim().to_string())
+            }
+            None => (name.to_string(), input.to_string()),
+        };
+        if expression.is_empty() {
+            return;
+        }
+        if target != name {
+            if let Err(error) = self.rename_parameter(i, name, &target) {
+                self.command_line.push_error(&error);
+                return;
+            }
+        }
+        let mut table = self.tabs[i].scene.named_parameters().clone();
+        if let Err(error) = table.set(&target, &expression) {
+            self.command_line.push_error(&error.to_string());
+            return;
+        }
+        if !table
+            .resolve(&target)
+            .is_ok_and(|value| value.is_finite())
+        {
+            self.command_line.push_error("Invalid expression.");
+            return;
+        }
+        let pending = self.begin_undo(i, "Edit parameter", 0, true);
+        self.tabs[i].scene.record_undo_named_parameters_before();
+        self.tabs[i].scene.named_parameters = table;
+        self.resolve_named_parameter_edit(i, &target);
+        self.tabs[i].scene.refresh_dynamic_dimension_texts();
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+    }
+
+    /// -PARAMETERS New.
+    pub(crate) fn create_parameter(&mut self, i: usize, name: &str, expression: &str) {
+        if self.tabs[i].scene.named_parameters().contains(name) {
+            self.command_line
+                .push_error(&format!("Parameter {name} already exists."));
+            return;
+        }
+        let mut table = self.tabs[i].scene.named_parameters().clone();
+        if let Err(error) = table.set(name, expression) {
+            self.command_line.push_error(&error.to_string());
+            return;
+        }
+        let pending = self.begin_undo(i, "New parameter", 0, true);
+        self.tabs[i].scene.record_undo_named_parameters_before();
+        self.tabs[i].scene.named_parameters = table;
+        self.tabs[i].scene.sync_native_parametric_graph();
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+    }
+
+    /// Renames a parameter everywhere: the table, the expressions that use
+    /// it and the constraints it drives.
+    pub(crate) fn rename_parameter(&mut self, i: usize, old: &str, new: &str) -> Result<(), String> {
+        use crate::scene::named_parameters::{is_reserved_name, is_valid_name, DrivingValue};
+        let table = self.tabs[i].scene.named_parameters().clone();
+        let Some(source) = table.get(old).map(|parameter| parameter.source.clone()) else {
+            return Err(format!("Parameter {old} not found."));
+        };
+        if !is_valid_name(new) || is_reserved_name(new) || table.contains(new) {
+            return Err(format!("Invalid parameter name {new}."));
+        }
+        let mut renamed = table.clone();
+        renamed.set(new, &source).map_err(|error| error.to_string())?;
+        for parameter in table.iter() {
+            if parameter.name == old {
+                continue;
+            }
+            let rewritten = replace_identifier(&parameter.source, old, new);
+            if rewritten != parameter.source {
+                renamed
+                    .set(&parameter.name, &rewritten)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        renamed.remove(old);
+        let pending = self.begin_undo(i, "Rename parameter", 0, true);
+        self.tabs[i].scene.record_undo_named_parameters_before();
+        self.tabs[i].scene.named_parameters = renamed;
+        let scopes: Vec<_> = self.tabs[i]
+            .scene
+            .parametric_constraints
+            .iter()
+            .map(|set| set.scope)
+            .collect();
+        for scope in scopes {
+            let before = self.tabs[i]
+                .scene
+                .parametric_constraint_set(scope)
+                .filter(|set| {
+                    set.constraints.iter().any(|constraint| {
+                        matches!(&constraint.driving_param, Some(DrivingValue::Named(name)) if name == old)
+                    })
+                })
+                .cloned();
+            let Some(before) = before else {
+                continue;
+            };
+            self.tabs[i]
+                .scene
+                .record_undo_parametric_constraints_before(scope, before);
+            let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+            for constraint in &mut set.constraints {
+                if matches!(&constraint.driving_param, Some(DrivingValue::Named(name)) if name == old) {
+                    constraint.driving_param = Some(DrivingValue::Named(new.to_string()));
+                }
+            }
+        }
+        self.tabs[i].scene.refresh_dynamic_dimension_texts();
+        self.tabs[i].scene.sync_native_parametric_graph();
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+        Ok(())
+    }
+
+    /// -PARAMETERS Delete: a parameter no constraint drives with.
+    pub(crate) fn delete_parameter(&mut self, i: usize, name: &str) {
+        use crate::scene::named_parameters::DrivingValue;
+        if !self.tabs[i].scene.named_parameters().contains(name) {
+            self.command_line
+                .push_error(&format!("Parameter {name} not found."));
+            return;
+        }
+        let in_use = self.tabs[i]
+            .scene
+            .parametric_constraints
+            .iter()
+            .flat_map(|set| set.constraints.iter())
+            .any(|constraint| {
+                matches!(&constraint.driving_param, Some(DrivingValue::Named(used)) if used == name)
+            });
+        if in_use {
+            self.command_line
+                .push_error(&format!("Parameter {name} is used by a constraint."));
+            return;
+        }
+        let pending = self.begin_undo(i, "Delete parameter", 0, true);
+        self.tabs[i].scene.record_undo_named_parameters_before();
+        self.tabs[i].scene.named_parameters_mut().remove(name);
+        self.tabs[i].scene.sync_native_parametric_graph();
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+    }
+
     fn remove_parametric_constraint(
         &mut self,
         id: crate::scene::parametric_constraints::ConstraintId,
@@ -1054,8 +1532,13 @@ impl OpenCADStudio {
             return false;
         };
         let touched: Vec<Handle> = constraint.refs.iter().map(|r| r.entity).collect();
+        let dimension = set.dimensions.get(&id).copied();
+        let parameter = match &constraint.driving_param {
+            Some(crate::scene::named_parameters::DrivingValue::Named(name)) => Some(name.clone()),
+            _ => None,
+        };
         let constraints_before = set.clone();
-        let pending = self.begin_undo(i, label, touched.len(), true);
+        let pending = self.begin_undo(i, label, touched.len(), dimension.is_none());
         self.tabs[i]
             .scene
             .record_undo_parametric_constraints_before(scope, constraints_before);
@@ -1063,6 +1546,12 @@ impl OpenCADStudio {
             .scene
             .parametric_constraint_set_mut(scope)
             .remove(id);
+        self.purge_dimensional_extras(
+            i,
+            dimension.into_iter().collect(),
+            parameter.into_iter().collect(),
+        );
+        self.tabs[i].scene.bump_constraints_epoch();
         if self.tabs[i].scene.selected_constraint == Some(id) {
             self.tabs[i].scene.selected_constraint = None;
         }
@@ -1156,6 +1645,27 @@ impl OpenCADStudio {
             .flat_map(|c| c.refs.iter().map(|r| r.entity))
             .collect();
 
+        // A changed value moves a dimensional constraint's second point; its
+        // first point stays, as in the reference.
+        let anchors: Vec<crate::scene::parametric_constraints::ParametricRef> = self.tabs[i]
+            .scene
+            .parametric_constraints
+            .iter()
+            .flat_map(|set| set.constraints.iter())
+            .filter(|c| {
+                c.enabled
+                    && matches!(
+                        c.driving_param,
+                        Some(crate::scene::named_parameters::DrivingValue::Named(_))
+                    )
+            })
+            .flat_map(|c| {
+                crate::scene::parametric_constraints::dimensional_anchor_refs(
+                    &self.tabs[i].scene.document,
+                    &c.refs,
+                )
+            })
+            .collect();
         let pending = self.begin_undo(i, "Apply named parameters", touched.len(), true);
         self.tabs[i].scene.record_undo_named_parameters_before();
         self.tabs[i].scene.named_parameters = table;
@@ -1165,10 +1675,15 @@ impl OpenCADStudio {
                 .into_iter()
                 .map(|h| (h, crate::scene::ChangeKind::Modified))
                 .collect();
-            self.tabs[i].scene.bump_entities(&changes);
+            self.tabs[i].scene.bump_entities_with_parametric_policy(
+                &changes,
+                &anchors,
+                self.constraint_solve_mode,
+            );
         } else {
             self.tabs[i].scene.sync_native_parametric_graph();
         }
+        self.tabs[i].scene.refresh_dynamic_dimension_texts();
         if let Some(pd) = pending {
             self.commit_undo_delta(i, pd);
         }
@@ -1185,7 +1700,8 @@ impl OpenCADStudio {
     /// table, so unlike that whole-table Apply this can cheaply scope the
     /// re-solve to just the entities that actually reference it.
     fn resolve_named_parameter_edit(&mut self, i: usize, name: &str) {
-        let touched: Vec<Handle> = self.tabs[i]
+        let readers: Vec<&crate::scene::parametric_constraints::ParametricConstraint> = self
+            .tabs[i]
             .scene
             .parametric_constraints
             .iter()
@@ -1194,7 +1710,22 @@ impl OpenCADStudio {
                 c.enabled
                     && matches!(&c.driving_param, Some(crate::scene::named_parameters::DrivingValue::Named(n)) if n == name)
             })
+            .collect();
+        let touched: Vec<Handle> = readers
+            .iter()
             .flat_map(|c| c.refs.iter().map(|r| r.entity))
+            .collect();
+        // A changed value moves a dimensional constraint's second point; its
+        // first point (and the line it measures perpendicular to) stays, as
+        // in the reference.
+        let anchors: Vec<crate::scene::parametric_constraints::ParametricRef> = readers
+            .iter()
+            .flat_map(|c| {
+                crate::scene::parametric_constraints::dimensional_anchor_refs(
+                    &self.tabs[i].scene.document,
+                    &c.refs,
+                )
+            })
             .collect();
         self.tabs[i].dirty = true;
         if touched.is_empty() {
@@ -1205,7 +1736,9 @@ impl OpenCADStudio {
             .into_iter()
             .map(|h| (h, crate::scene::ChangeKind::Modified))
             .collect();
-        self.tabs[i].scene.bump_entities(&changes);
+        self.tabs[i]
+            .scene
+            .bump_entities_with_parametric_policy(&changes, &anchors, false);
     }
 
     /// Commits one field of one Parameters-section row (Properties panel) —
@@ -1274,6 +1807,11 @@ impl OpenCADStudio {
                 current.name.clone(),
             ),
             ParamField::Name => {
+                let description = self.tabs[i]
+                    .scene
+                    .named_parameters()
+                    .description(&current.name)
+                    .to_string();
                 self.tabs[i]
                     .scene
                     .named_parameters_mut()
@@ -1282,12 +1820,19 @@ impl OpenCADStudio {
                     .scene
                     .named_parameters_mut()
                     .set(&typed, &current.source);
-                if outcome.is_err() {
+                let kept = if outcome.is_err() {
                     let _ = self.tabs[i]
                         .scene
                         .named_parameters_mut()
                         .set(&current.name, &current.source);
-                }
+                    current.name.as_str()
+                } else {
+                    typed.as_str()
+                };
+                self.tabs[i]
+                    .scene
+                    .named_parameters_mut()
+                    .set_description(kept, &description);
                 (outcome, typed.clone())
             }
         };
@@ -1321,6 +1866,9 @@ impl OpenCADStudio {
                 self.tabs[i]
                     .scene
                     .record_undo_parametric_constraints_before(scope, before);
+                // A parameter rename rewrites the `Named` driving references
+                // pointing at it — the glyph labels change with them.
+                let mut renamed = false;
                 for constraint in
                     &mut self.tabs[i].scene.parametric_constraints[set_index].constraints
                 {
@@ -1329,8 +1877,12 @@ impl OpenCADStudio {
                     {
                         if name == &current.name {
                             *name = typed.clone();
+                            renamed = true;
                         }
                     }
+                }
+                if renamed {
+                    self.tabs[i].scene.bump_constraints_epoch();
                 }
             }
         }
@@ -1340,6 +1892,203 @@ impl OpenCADStudio {
         }
         self.refresh_properties();
         Task::none()
+    }
+
+    /// The dynamic dimension the Properties panel targets: its handle, scope,
+    /// constraint id and parameter name.
+    fn dynamic_dimension_target(
+        &self,
+        i: usize,
+    ) -> Option<(
+        Handle,
+        crate::scene::parametric_constraints::ParametricScope,
+        crate::scene::parametric_constraints::ConstraintId,
+        String,
+    )> {
+        use crate::scene::named_parameters::DrivingValue;
+        use crate::scene::parametric_constraints::dynamic_dimension_constraint;
+        let handle = *self.property_target_handles(i).first()?;
+        let (set, constraint) =
+            dynamic_dimension_constraint(&self.tabs[i].scene.parametric_constraints, handle)?;
+        let Some(DrivingValue::Named(name)) = &constraint.driving_param else {
+            return None;
+        };
+        Some((handle, set.scope, constraint.id, name.clone()))
+    }
+
+    /// Commits a dynamic dimension's Description row into its parameter.
+    pub(super) fn on_dynamic_dimension_description_commit(
+        &mut self,
+        field: &'static str,
+    ) -> Task<Message> {
+        use crate::ui::properties::FieldKey;
+        let i = self.active_tab;
+        self.tabs[i].properties.active_field = None;
+        let Some(typed) = self.tabs[i]
+            .properties
+            .edit_buf
+            .remove(&FieldKey::Geom(field))
+        else {
+            return Task::none();
+        };
+        let Some((_, _, _, name)) = self.dynamic_dimension_target(i) else {
+            self.refresh_properties();
+            return Task::none();
+        };
+        let pending = self.begin_undo(i, "Constraint description", 0, true);
+        self.tabs[i].scene.record_undo_named_parameters_before();
+        self.tabs[i]
+            .scene
+            .named_parameters_mut()
+            .set_description(&name, &typed);
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+        self.refresh_properties();
+        Task::none()
+    }
+
+    /// Applies a dynamic dimension's Constraint Form or Reference choice.
+    pub(super) fn on_dynamic_dimension_choice(
+        &mut self,
+        field: &'static str,
+        value: &str,
+    ) -> Task<Message> {
+        use crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER;
+        let i = self.active_tab;
+        let Some((handle, scope, id, _)) = self.dynamic_dimension_target(i) else {
+            return Task::none();
+        };
+        match field {
+            "dyn_constraint_form" => {
+                // Annotational: an ordinary dimension on the current layer
+                // that plots; Dynamic: the gray one on the constraints layer.
+                let annotational = value.eq_ignore_ascii_case("Annotational");
+                let active_layer = self.tabs[i].active_layer.clone();
+                if !annotational {
+                    self.tabs[i].scene.ensure_dynamic_dimension_layer();
+                }
+                self.apply_property_op(i, "Constraint form", &[handle], |app, handle| {
+                    use crate::entities::dim_override as dov;
+                    let Some(mut entity) = app.tabs[i].scene.document.get_entity(handle).cloned()
+                    else {
+                        return;
+                    };
+                    if annotational {
+                        entity.as_entity_mut().set_layer(active_layer.clone());
+                        entity.common_mut().color = acadrust::types::Color::ByLayer;
+                        // The dynamic form's screen-size and horizontal-text
+                        // overrides go; the style draws it.
+                        for code in [
+                            dov::DIMSCALE,
+                            dov::DIMGAP,
+                            dov::DIMEXO,
+                            dov::DIMEXE,
+                            dov::DIMASZ,
+                            dov::DIMTAD,
+                            dov::DIMTIH,
+                            dov::DIMTOH,
+                        ] {
+                            dov::set_on_entity(&mut entity, code, None);
+                        }
+                    } else {
+                        entity
+                            .as_entity_mut()
+                            .set_layer(DYNAMIC_DIMENSION_LAYER.to_string());
+                        entity.common_mut().color = acadrust::types::Color::Rgb {
+                            r: 103,
+                            g: 109,
+                            b: 118,
+                        };
+                    }
+                    app.tabs[i].scene.update_entity(entity);
+                });
+                // The dynamic form is rescaled to the screen and shows the
+                // trimmed value; the annotational one is never hidden.
+                self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
+                self.tabs[i].scene.refresh_dynamic_dimension_texts();
+                self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+            }
+            "dyn_constraint_reference" => {
+                // A reference constraint reads the geometry instead of
+                // driving it; its text sits in parentheses.
+                let reference =
+                    value.eq_ignore_ascii_case("Yes") || value == crate::t!("Yes").as_ref();
+                let Some(before) = self.tabs[i].scene.parametric_constraint_set(scope).cloned()
+                else {
+                    return Task::none();
+                };
+                let pending = self.begin_undo(i, "Constraint reference", 0, true);
+                self.tabs[i]
+                    .scene
+                    .record_undo_parametric_constraints_before(scope, before);
+                self.tabs[i].scene.record_undo_named_parameters_before();
+                let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+                if let Some(constraint) = set.constraints.iter_mut().find(|c| c.id == id) {
+                    constraint.enabled = !reference;
+                }
+                // Toggling `enabled` changes the glyph placement set (and the
+                // dynamic pills), so the memoised placements must miss next
+                // frame — same guarantee `set_constraint_enabled` gives.
+                self.tabs[i].scene.bump_constraints_epoch();
+                self.tabs[i].scene.refresh_dynamic_dimension_texts();
+                self.tabs[i].scene.sync_native_parametric_graph();
+                self.tabs[i].dirty = true;
+                if let Some(pd) = pending {
+                    self.commit_undo_delta(i, pd);
+                }
+                self.refresh_properties();
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    /// Commits a dynamic dimension's Name or Expression row: the typed text
+    /// goes to the Parameters-section row of the constraint's parameter.
+    pub(super) fn on_dynamic_dimension_field_commit(
+        &mut self,
+        field: &'static str,
+        param_field: crate::ui::window::named_parameters::ParamField,
+    ) -> Task<Message> {
+        use crate::scene::named_parameters::DrivingValue;
+        use crate::scene::parametric_constraints::dynamic_dimension_constraint;
+        use crate::ui::properties::FieldKey;
+        let i = self.active_tab;
+        self.tabs[i].properties.active_field = None;
+        let Some(typed) = self.tabs[i]
+            .properties
+            .edit_buf
+            .remove(&FieldKey::Geom(field))
+        else {
+            return Task::none();
+        };
+        let handles = self.property_target_handles(i);
+        let name = handles.first().and_then(|handle| {
+            let (_, constraint) =
+                dynamic_dimension_constraint(&self.tabs[i].scene.parametric_constraints, *handle)?;
+            match &constraint.driving_param {
+                Some(DrivingValue::Named(name)) => Some(name.clone()),
+                _ => None,
+            }
+        });
+        let index = name.and_then(|name| {
+            self.tabs[i]
+                .scene
+                .named_parameters()
+                .iter()
+                .position(|parameter| parameter.name == name)
+        });
+        let Some(index) = index else {
+            self.refresh_properties();
+            return Task::none();
+        };
+        self.tabs[i]
+            .properties
+            .edit_buf
+            .insert(FieldKey::Param(index, param_field), typed);
+        self.on_prop_param_commit(index, param_field)
     }
 
     /// Removes Parameters-section row `index` immediately. Any
@@ -1834,6 +2583,9 @@ impl OpenCADStudio {
             .active_cmd
             .as_ref()
             .is_some_and(|command| command.preserve_commit_layer());
+        // Task produced by a command the arm dispatches; it must reach the
+        // runtime or messages such as a chosen render mode are dropped.
+        let mut dispatched = Task::none();
         match result {
             CmdResult::OpenAutoConstrainSettings => {
                 self.auto_constrain_saved = Some(self.auto_constrain_settings.clone());
@@ -2953,6 +3705,36 @@ impl OpenCADStudio {
                     }
                 }
             }
+            CmdResult::CreateBlockWithOptions { mut options } => {
+                options.handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+                if options.handles.is_empty() {
+                    self.command_line
+                        .push_info(crate::t!("No editable objects selected.").as_ref());
+                    return Task::none();
+                }
+                self.push_undo_snapshot(i, "BLOCK");
+                let name = options.name.clone();
+                match self.tabs[i].scene.create_block_with_options(*options) {
+                    Ok(insert_handle) => {
+                        self.tabs[i].dirty = true;
+                        self.tabs[i].scene.deselect_all();
+                        if !insert_handle.is_null() {
+                            self.tabs[i].scene.select_entity(insert_handle, false);
+                        }
+                        self.tabs[i].scene.clear_preview_wire();
+                        self.tabs[i].active_cmd = None;
+                        self.tabs[i].snap_result = None;
+                        self.command_line
+                            .push_output(crate::tf!("Block \"{name}\" created.").as_ref());
+                        self.refresh_properties();
+                        self.refresh_block_palette();
+                    }
+                    Err(err) => {
+                        self.discard_last_undo_entry(i);
+                        self.command_line.push_error(&err);
+                    }
+                }
+            }
             CmdResult::CommitHatch(hatch) => {
                 let label = self.history_label_from_active_cmd(i, "HATCH");
                 let pending = self.begin_undo(i, label, 1, true);
@@ -3265,6 +4047,850 @@ impl OpenCADStudio {
                     self.commit_undo_delta(i, pd);
                 }
             }
+            CmdResult::AddEqualConstraint {
+                first,
+                others,
+                multiple,
+                label,
+            } => {
+                use crate::modules::parametric::EqualConstraintCommand;
+                use crate::scene::parametric_constraints::{
+                    equal_size, equal_size_follower, ConstraintKind, EqualSize, ParametricRef,
+                };
+
+                let scope = self.tabs[i].current_parametric_scope();
+                // Enter ends a Multiple flow with the reference's summary line.
+                let finishing = multiple && others.is_empty();
+                let mut followers: Vec<ParametricRef> = Vec::new();
+                for other in others {
+                    let refs = [first, other];
+                    if other == first
+                        || self
+                            .tabs[i]
+                            .scene
+                            .validate_parametric_constraint(ConstraintKind::Equal, &refs, None)
+                            .is_err()
+                        || equal_size_follower(&self.tabs[i].scene.document, first, other)
+                            .is_none()
+                    {
+                        // The reference names the kind the first object
+                        // asks for.
+                        let message = match equal_size(&self.tabs[i].scene.document, first) {
+                            Some(EqualSize::Radius(_)) => EqualConstraintCommand::INVALID_RADIUS_OBJECT,
+                            _ => EqualConstraintCommand::INVALID_LENGTH_OBJECT,
+                        };
+                        self.command_line.push_error(message);
+                        continue;
+                    }
+                    let exists = self.tabs[i]
+                        .scene
+                        .parametric_constraint_set(scope)
+                        .is_some_and(|set| {
+                            set.constraints.iter().any(|existing| {
+                                existing.enabled
+                                    && existing.kind == ConstraintKind::Equal
+                                    && (existing.refs == refs || existing.refs == [other, first])
+                            })
+                        });
+                    if exists {
+                        self.command_line
+                            .push_error("The constraint already exists on the selected objects.");
+                        continue;
+                    }
+                    followers.push(other);
+                }
+                // A refused second object is asked for again, as in the
+                // reference; Multiple keeps asking anyway.
+                let keep = (multiple && !finishing) || (!multiple && followers.is_empty());
+                if keep {
+                    if let Some(prompt) =
+                        self.tabs[i].active_cmd.as_ref().map(|command| command.prompt())
+                    {
+                        self.command_line.push_info(&prompt);
+                    }
+                } else {
+                    self.tabs[i].active_cmd = None;
+                }
+                self.tabs[i].snap_result = None;
+                if finishing {
+                    let summary = match equal_size(&self.tabs[i].scene.document, first) {
+                        Some(EqualSize::Radius(_)) => "Radius of objects made equal",
+                        _ => "Length of objects made equal",
+                    };
+                    self.command_line.push_output(summary);
+                }
+                if followers.is_empty() {
+                    return Task::none();
+                }
+                let constraints_before = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::scene::parametric_constraints::ParametricConstraintSet::new(scope)
+                    });
+                let mut touched = vec![first.entity];
+                for follower in &followers {
+                    if !touched.contains(&follower.entity) {
+                        touched.push(follower.entity);
+                    }
+                }
+                let pending = self.begin_undo(i, label, touched.len(), true);
+                self.tabs[i]
+                    .scene
+                    .record_undo_parametric_constraints_before(scope, constraints_before);
+                // The reference resizes the follower in place — its start (a
+                // circle its center) and direction stay, only its length or
+                // radius takes the first object's — so do that first and let
+                // the relation then hold what already fits.
+                for follower in &followers {
+                    if let Some(resized) =
+                        equal_size_follower(&self.tabs[i].scene.document, first, *follower)
+                    {
+                        self.tabs[i].scene.update_entity(resized);
+                    }
+                    let id = self.tabs[i]
+                        .scene
+                        .parametric_constraint_set_mut(scope)
+                        .add(ConstraintKind::Equal, vec![first, *follower], None);
+                    self.tabs[i].scene.note_parametric_constraint_applied(
+                        scope,
+                        id,
+                        self.constraint_bar_display,
+                    );
+                }
+                let changes = touched
+                    .into_iter()
+                    .map(|handle| (handle, crate::scene::ChangeKind::Modified))
+                    .collect::<Vec<_>>();
+                self.tabs[i].scene.bump_entities_with_parametric_policy(
+                    &changes,
+                    &[],
+                    self.constraint_solve_mode,
+                );
+                self.tabs[i].dirty = true;
+                self.refresh_properties();
+                if let Some(pd) = pending {
+                    self.commit_undo_delta(i, pd);
+                }
+            }
+            CmdResult::CheckConstraintPoint(pick) => {
+                use crate::scene::parametric_constraints::{
+                    nearest_parametric_point, nearest_parametric_point_on_entity, resolve_point,
+                };
+                let scope = self.tabs[i].current_parametric_scope();
+                let resolved = {
+                    let document = &self.tabs[i].scene.document;
+                    let world =
+                        acadrust::types::Vector3::new(pick.point.x, pick.point.y, pick.point.z);
+                    let reference = match pick.handle {
+                        Some(handle) => {
+                            nearest_parametric_point_on_entity(document, scope, handle, world)
+                        }
+                        None => nearest_parametric_point(document, scope, world, None),
+                    };
+                    reference.map(|reference| {
+                        let point = document
+                            .get_entity(reference.entity)
+                            .zip(reference.marker)
+                            .and_then(|(entity, marker)| resolve_point(entity, marker))
+                            .map_or(pick.point, |p| glam::DVec3::new(p.x, p.y, p.z));
+                        (reference, point)
+                    })
+                };
+                let Some((reference, point)) = resolved else {
+                    return self.apply_cmd_result(CmdResult::ReportError(
+                        crate::modules::parametric::DimConstraintCommand::NO_POINT.to_string(),
+                    ));
+                };
+                let result = self.tabs[i]
+                    .active_cmd
+                    .as_mut()
+                    .map(|command| command.accept_constraint_point(reference, point));
+                return match result {
+                    Some(result) => self.apply_cmd_result(result),
+                    None => Task::none(),
+                };
+            }
+            CmdResult::AddDimensionalConstraint {
+                kind,
+                first,
+                second,
+                first_point,
+                second_point,
+                location,
+                axis,
+                direction,
+                name,
+                expression,
+                renamed,
+                label,
+            } => {
+                use crate::modules::annotate::{aligned_dim, linear_dim};
+                use crate::scene::named_parameters::{is_valid_name, DrivingValue};
+                use crate::scene::parametric_constraints::{
+                    distance_direction_type, dynamic_dimension_text, ConstraintKind,
+                };
+
+                let scope = self.tabs[i].current_parametric_scope();
+                let mut refs = vec![first, second];
+                refs.extend(direction);
+                // The same measurement between the same references is
+                // refused after the value, and the command ends.
+                let duplicate = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .is_some_and(|set| {
+                        set.constraints.iter().any(|c| {
+                            c.enabled
+                                && c.kind == kind
+                                && c.refs.len() == refs.len()
+                                && c.refs[..2].contains(&first)
+                                && c.refs[..2].contains(&second)
+                                && c.refs.get(2) == refs.get(2)
+                        })
+                    });
+                if duplicate {
+                    self.command_line
+                        .push_output("The constraint already exists on the selected objects.");
+                    self.tabs[i].active_cmd = None;
+                    self.tabs[i].snap_result = None;
+                    return Task::none();
+                }
+                // A refused value keeps the prompt open, as the reference's
+                // editor does. A directed distance validates as the plain
+                // two-point distance it also is.
+                let (validate_kind, validate_refs) = if kind == ConstraintKind::DistanceDirected {
+                    (ConstraintKind::Distance, &refs[..2])
+                } else {
+                    (kind, &refs[..])
+                };
+                if let Err(message) = self.tabs[i].scene.validate_parametric_constraint(
+                    validate_kind,
+                    validate_refs,
+                    Some(&DrivingValue::Literal(1.0)),
+                ) {
+                    self.reprompt_active_command(i, message);
+                    return Task::none();
+                }
+                let anchors = crate::scene::parametric_constraints::dimensional_anchor_refs(
+                    &self.tabs[i].scene.document,
+                    &refs,
+                );
+                let name = name.trim().to_string();
+                if !is_valid_name(&name) {
+                    self.command_line.push_error(
+                        "Only alphanumeric names, starting with alpha characters, are allowed.",
+                    );
+                    self.reprompt_active_command(i, &format!("Invalid parameter name: {name}."));
+                    return Task::none();
+                }
+                if renamed && self.tabs[i].scene.named_parameters().contains(&name) {
+                    self.reprompt_active_command(i, "Parameter with this name already exists.");
+                    return Task::none();
+                }
+                let mut table = self.tabs[i].scene.named_parameters().clone();
+                if let Err(error) = table.set(&name, &expression) {
+                    self.reprompt_active_command(i, &error.to_string());
+                    return Task::none();
+                }
+                let value = match table.resolve(&name) {
+                    Ok(value) if value.is_finite() => value,
+                    _ => {
+                        self.command_line.push_error("Invalid expression.");
+                        self.reprompt_active_command(
+                            i,
+                            "The parameter is used in an expression which results in an invalid value for a dimensional constraint.",
+                        );
+                        return Task::none();
+                    }
+                };
+                // DCFORM Annotational: an ordinary plotted dimension on the
+                // current layer that shows the value at dimension precision.
+                let annotational = self.constraint_form_annotational;
+                let text = dynamic_dimension_text(
+                    &name,
+                    value,
+                    self.tabs[i].scene.constraint_name_format,
+                    false,
+                    Some(&expression),
+                    annotational,
+                    None,
+                );
+                let mut entity = if kind == ConstraintKind::Distance {
+                    aligned_dim::aligned_dimension_entity(
+                        first_point,
+                        second_point,
+                        location,
+                        Some(text),
+                    )
+                } else {
+                    linear_dim::linear_dimension_entity(
+                        first_point,
+                        second_point,
+                        location,
+                        axis,
+                        Some(text),
+                    )
+                };
+                crate::scene::creation_style::apply_current_creation_styles(
+                    &self.tabs[i].scene.document,
+                    &mut entity,
+                );
+                if annotational {
+                    entity
+                        .as_entity_mut()
+                        .set_layer(self.tabs[i].active_layer.clone());
+                } else {
+                    // A dynamic dimension lives on the reference's constraints
+                    // layer, hidden from the layer lists and never plotted, and
+                    // draws in the constraint gray, not the current color.
+                    self.tabs[i].scene.ensure_dynamic_dimension_layer();
+                    entity.as_entity_mut().set_layer(
+                        crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER.to_string(),
+                    );
+                    entity.common_mut().color = acadrust::types::Color::Rgb {
+                        r: 103,
+                        g: 109,
+                        b: 118,
+                    };
+                }
+                let constraints_before = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::scene::parametric_constraints::ParametricConstraintSet::new(scope)
+                    });
+                let mut touched = vec![first.entity];
+                for reference in [Some(second), direction].into_iter().flatten() {
+                    if !touched.contains(&reference.entity) {
+                        touched.push(reference.entity);
+                    }
+                }
+                let pending = self.begin_undo(i, label, touched.len() + 1, false);
+                self.tabs[i]
+                    .scene
+                    .record_undo_parametric_constraints_before(scope, constraints_before);
+                self.tabs[i].scene.record_undo_named_parameters_before();
+                self.tabs[i].scene.named_parameters = table;
+                let dimension = self.tabs[i].scene.add_entity(entity);
+                let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+                let id = set.add(kind, refs, Some(DrivingValue::Named(name)));
+                if direction.is_some() {
+                    if let Some(constraint) = set.constraints.iter_mut().find(|c| c.id == id) {
+                        constraint.distance_direction_type =
+                            distance_direction_type::PERPENDICULAR_TO_LINE;
+                    }
+                }
+                set.dimensions.insert(id, dimension);
+                self.tabs[i].scene.note_parametric_constraint_applied(
+                    scope,
+                    id,
+                    self.constraint_bar_display,
+                );
+                self.tabs[i].scene.attach_dimension_association(
+                    dimension,
+                    vec![Some(first.entity), Some(second.entity)],
+                );
+                let changes: Vec<(Handle, crate::scene::ChangeKind)> = touched
+                    .into_iter()
+                    .map(|handle| (handle, crate::scene::ChangeKind::Modified))
+                    .collect();
+                // The first point (and a line it belongs to that the distance
+                // runs perpendicular to) stays; a value other than the
+                // measured one moves the second, as in the reference. Not
+                // `retain_size`: the typed value is the new length.
+                self.tabs[i]
+                    .scene
+                    .bump_entities_with_parametric_policy(&changes, &anchors, false);
+                // DYNCONSTRAINTDISPLAY 0 also keeps a new dynamic dimension off screen.
+                self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+                self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
+                self.tabs[i].dirty = true;
+                self.tabs[i].active_cmd = None;
+                self.tabs[i].snap_result = None;
+                self.refresh_properties();
+                if let Some(pd) = pending {
+                    self.commit_undo_delta(i, pd);
+                }
+            }
+            CmdResult::CancelWithMessage(message) => {
+                self.command_line.push_error(&message);
+                return self.apply_cmd_result(CmdResult::Cancel);
+            }
+            CmdResult::AddRadialConstraint {
+                circle,
+                center,
+                radius,
+                location,
+                diameter,
+                name,
+                expression,
+                renamed,
+            } => {
+                use crate::modules::annotate::{diameter_dim, radius_dim};
+                use crate::scene::named_parameters::{is_valid_name, DrivingValue};
+                use crate::scene::parametric_constraints::{
+                    dynamic_dimension_text, ConstraintKind, ParametricRef,
+                };
+
+                let scope = self.tabs[i].current_parametric_scope();
+                let kind = if diameter {
+                    ConstraintKind::Diameter
+                } else {
+                    ConstraintKind::Radius
+                };
+                let refs = vec![circle];
+                // A circle already carrying a radius or diameter constraint
+                // is refused after the value, as the reference does.
+                let duplicate = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .is_some_and(|set| {
+                        set.constraints.iter().any(|c| {
+                            c.enabled
+                                && matches!(
+                                    c.kind,
+                                    ConstraintKind::Radius | ConstraintKind::Diameter
+                                )
+                                && c.refs.iter().any(|r| r.entity == circle.entity)
+                        })
+                    });
+                if duplicate {
+                    self.command_line
+                        .push_output("The constraint already exists on the selected objects.");
+                    self.tabs[i].active_cmd = None;
+                    self.tabs[i].snap_result = None;
+                    return Task::none();
+                }
+                if let Err(message) = self.tabs[i].scene.validate_parametric_constraint(
+                    kind,
+                    &refs,
+                    Some(&DrivingValue::Literal(1.0)),
+                ) {
+                    self.reprompt_active_command(i, message);
+                    return Task::none();
+                }
+                let name = name.trim().to_string();
+                if !is_valid_name(&name) {
+                    self.command_line.push_error(
+                        "Only alphanumeric names, starting with alpha characters, are allowed.",
+                    );
+                    self.reprompt_active_command(i, &format!("Invalid parameter name: {name}."));
+                    return Task::none();
+                }
+                if renamed && self.tabs[i].scene.named_parameters().contains(&name) {
+                    self.reprompt_active_command(i, "Parameter with this name already exists.");
+                    return Task::none();
+                }
+                let mut table = self.tabs[i].scene.named_parameters().clone();
+                if let Err(error) = table.set(&name, &expression) {
+                    self.reprompt_active_command(i, &error.to_string());
+                    return Task::none();
+                }
+                // A circle has no zero or negative size: the value is
+                // refused and the prompt comes back.
+                let value = match table.resolve(&name) {
+                    Ok(value) if value.is_finite() && value > 0.0 => value,
+                    _ => {
+                        self.command_line.push_error("Invalid expression.");
+                        self.reprompt_active_command(
+                            i,
+                            "The parameter is used in an expression which results in an invalid value for a dimensional constraint.",
+                        );
+                        return Task::none();
+                    }
+                };
+                let annotational = self.constraint_form_annotational;
+                let text = dynamic_dimension_text(
+                    &name,
+                    value,
+                    self.tabs[i].scene.constraint_name_format,
+                    false,
+                    Some(&expression),
+                    annotational,
+                    None,
+                );
+                let entity = if diameter {
+                    diameter_dim::diameter_constraint_entity(center, radius, location, Some(text))
+                } else {
+                    radius_dim::radius_constraint_entity(center, radius, location, Some(text))
+                };
+                let Some(mut entity) = entity else {
+                    self.reprompt_active_command(i, "No valid constraint point found.");
+                    return Task::none();
+                };
+                crate::scene::creation_style::apply_current_creation_styles(
+                    &self.tabs[i].scene.document,
+                    &mut entity,
+                );
+                if annotational {
+                    entity
+                        .as_entity_mut()
+                        .set_layer(self.tabs[i].active_layer.clone());
+                } else {
+                    self.tabs[i].scene.ensure_dynamic_dimension_layer();
+                    entity.as_entity_mut().set_layer(
+                        crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER.to_string(),
+                    );
+                    entity.common_mut().color = acadrust::types::Color::Rgb {
+                        r: 103,
+                        g: 109,
+                        b: 118,
+                    };
+                }
+                let constraints_before = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::scene::parametric_constraints::ParametricConstraintSet::new(scope)
+                    });
+                // The centre stays where it is; the value moves the rim.
+                let anchors = vec![ParametricRef::center(circle.entity)];
+                let pending = self.begin_undo(
+                    i,
+                    if diameter {
+                        "Diameter constraint"
+                    } else {
+                        "Radius constraint"
+                    },
+                    2,
+                    false,
+                );
+                self.tabs[i]
+                    .scene
+                    .record_undo_parametric_constraints_before(scope, constraints_before);
+                self.tabs[i].scene.record_undo_named_parameters_before();
+                self.tabs[i].scene.named_parameters = table;
+                let dimension = self.tabs[i].scene.add_entity(entity);
+                let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+                let id = set.add(kind, refs, Some(DrivingValue::Named(name)));
+                set.dimensions.insert(id, dimension);
+                self.tabs[i].scene.note_parametric_constraint_applied(
+                    scope,
+                    id,
+                    self.constraint_bar_display,
+                );
+                self.tabs[i]
+                    .scene
+                    .attach_dimension_association(dimension, vec![Some(circle.entity)]);
+                let changes = vec![(circle.entity, crate::scene::ChangeKind::Modified)];
+                self.tabs[i]
+                    .scene
+                    .bump_entities_with_parametric_policy(&changes, &anchors, false);
+                self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+                self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
+                self.tabs[i].dirty = true;
+                self.tabs[i].active_cmd = None;
+                self.tabs[i].snap_result = None;
+                self.refresh_properties();
+                if let Some(pd) = pending {
+                    self.commit_undo_delta(i, pd);
+                }
+            }
+            CmdResult::AddAngularConstraint {
+                refs,
+                points,
+                location,
+                sector,
+                name,
+                expression,
+                renamed,
+            } => {
+                use crate::modules::annotate::angular_dim;
+                use crate::scene::named_parameters::{is_valid_name, DrivingValue};
+                use crate::scene::parametric_constraints::{
+                    angle_decimals, dynamic_dimension_text, ConstraintKind, ParametricRef,
+                };
+
+                let scope = self.tabs[i].current_parametric_scope();
+                let kind = if refs.len() == 2 {
+                    ConstraintKind::Angle
+                } else {
+                    ConstraintKind::Angle3Point
+                };
+                // The same angle between the same sides is refused after the
+                // value (whichever sector), and the command ends.
+                let duplicate = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .is_some_and(|set| {
+                        set.constraints.iter().any(|c| {
+                            c.enabled
+                                && c.kind == kind
+                                && c.refs.len() == refs.len()
+                                && if kind == ConstraintKind::Angle {
+                                    c.refs.contains(&refs[0]) && c.refs.contains(&refs[1])
+                                } else {
+                                    c.refs == refs
+                                }
+                        })
+                    });
+                if duplicate {
+                    self.command_line
+                        .push_output("The constraint already exists on the selected objects.");
+                    self.tabs[i].active_cmd = None;
+                    self.tabs[i].snap_result = None;
+                    return Task::none();
+                }
+                if let Err(message) = self.tabs[i].scene.validate_parametric_constraint(
+                    kind,
+                    &refs,
+                    Some(&DrivingValue::Literal(1.0)),
+                ) {
+                    self.reprompt_active_command(i, message);
+                    return Task::none();
+                }
+                let name = name.trim().to_string();
+                if !is_valid_name(&name) {
+                    self.command_line.push_error(
+                        "Only alphanumeric names, starting with alpha characters, are allowed.",
+                    );
+                    self.reprompt_active_command(i, &format!("Invalid parameter name: {name}."));
+                    return Task::none();
+                }
+                if renamed && self.tabs[i].scene.named_parameters().contains(&name) {
+                    self.reprompt_active_command(i, "Parameter with this name already exists.");
+                    return Task::none();
+                }
+                let mut table = self.tabs[i].scene.named_parameters().clone();
+                if let Err(error) = table.set(&name, &expression) {
+                    self.reprompt_active_command(i, &error.to_string());
+                    return Task::none();
+                }
+                let value = match table.resolve(&name) {
+                    Ok(value) if value.is_finite() => value,
+                    _ => {
+                        self.command_line.push_error("Invalid expression.");
+                        self.reprompt_active_command(
+                            i,
+                            "The parameter is used in an expression which results in an invalid value for a dimensional constraint.",
+                        );
+                        return Task::none();
+                    }
+                };
+                let annotational = self.constraint_form_annotational;
+                let decimals = angle_decimals(&self.tabs[i].scene.document, None);
+                let text = dynamic_dimension_text(
+                    &name,
+                    value,
+                    self.tabs[i].scene.constraint_name_format,
+                    false,
+                    Some(&expression),
+                    annotational,
+                    Some(decimals),
+                );
+                let entity = if kind == ConstraintKind::Angle {
+                    angular_dim::angular_two_line_entity(
+                        points[0], points[1], points[2], points[3], location, Some(text),
+                    )
+                } else {
+                    angular_dim::angular_three_point_entity(
+                        points[0], points[1], points[2], location, Some(text),
+                    )
+                };
+                let Some(mut entity) = entity else {
+                    self.reprompt_active_command(i, "No valid constraint point found.");
+                    return Task::none();
+                };
+                crate::scene::creation_style::apply_current_creation_styles(
+                    &self.tabs[i].scene.document,
+                    &mut entity,
+                );
+                if annotational {
+                    entity
+                        .as_entity_mut()
+                        .set_layer(self.tabs[i].active_layer.clone());
+                } else {
+                    self.tabs[i].scene.ensure_dynamic_dimension_layer();
+                    entity.as_entity_mut().set_layer(
+                        crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER.to_string(),
+                    );
+                    entity.common_mut().color = acadrust::types::Color::Rgb {
+                        r: 103,
+                        g: 109,
+                        b: 118,
+                    };
+                }
+                let constraints_before = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::scene::parametric_constraints::ParametricConstraintSet::new(scope)
+                    });
+                let mut touched: Vec<Handle> = Vec::new();
+                for reference in &refs {
+                    if !touched.contains(&reference.entity) {
+                        touched.push(reference.entity);
+                    }
+                }
+                // The first side (or the vertex and first point) stays; a
+                // value other than the measured one turns the other side.
+                let anchors: Vec<ParametricRef> =
+                    crate::scene::parametric_constraints::dimensional_anchor_refs(
+                        &self.tabs[i].scene.document,
+                        &refs,
+                    );
+                let association = if kind == ConstraintKind::Angle {
+                    vec![
+                        Some(refs[0].entity),
+                        Some(refs[0].entity),
+                        Some(refs[1].entity),
+                        Some(refs[1].entity),
+                    ]
+                } else {
+                    vec![
+                        Some(refs[1].entity),
+                        Some(refs[0].entity),
+                        Some(refs[2].entity),
+                    ]
+                };
+                let pending = self.begin_undo(i, "Angular constraint", touched.len() + 1, false);
+                self.tabs[i]
+                    .scene
+                    .record_undo_parametric_constraints_before(scope, constraints_before);
+                self.tabs[i].scene.record_undo_named_parameters_before();
+                self.tabs[i].scene.named_parameters = table;
+                let dimension = self.tabs[i].scene.add_entity(entity);
+                let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+                let id = set.add(kind, refs, Some(DrivingValue::Named(name)));
+                if let Some(constraint) = set.constraints.iter_mut().find(|c| c.id == id) {
+                    constraint.angle_sector = sector;
+                }
+                set.dimensions.insert(id, dimension);
+                self.tabs[i].scene.note_parametric_constraint_applied(
+                    scope,
+                    id,
+                    self.constraint_bar_display,
+                );
+                self.tabs[i]
+                    .scene
+                    .attach_dimension_association(dimension, association);
+                let changes: Vec<(Handle, crate::scene::ChangeKind)> = touched
+                    .into_iter()
+                    .map(|handle| (handle, crate::scene::ChangeKind::Modified))
+                    .collect();
+                self.tabs[i]
+                    .scene
+                    .bump_entities_with_parametric_policy(&changes, &anchors, false);
+                self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+                self.tabs[i].scene.refresh_dynamic_dimension_scales(true);
+                self.tabs[i].dirty = true;
+                self.tabs[i].active_cmd = None;
+                self.tabs[i].snap_result = None;
+                self.refresh_properties();
+                if let Some(pd) = pending {
+                    self.commit_undo_delta(i, pd);
+                }
+            }
+            CmdResult::MakeParallel {
+                first_line,
+                first_ends,
+                first_pick,
+                second_line,
+                second_ends,
+            } => {
+                use crate::scene::parametric_constraints::{
+                    resolve_point, two_lines_placed_entity, ConstraintKind,
+                };
+                let scope = self.tabs[i].current_parametric_scope();
+                let refs = [first_line, second_line];
+                if let Err(message) =
+                    self.tabs[i]
+                        .scene
+                        .validate_parametric_constraint(ConstraintKind::Parallel, &refs, None)
+                {
+                    return self.apply_cmd_result(CmdResult::ReportError(message.to_string()));
+                }
+                // The reference's placement of the second line, written
+                // before the Parallel constraint holds it there. Built out of
+                // line and boxed: this arm's locals would otherwise sit in
+                // `apply_cmd_result`'s frame, which is on every click's stack.
+                let placed_entity = two_lines_placed_entity(
+                    &self.tabs[i].scene.document,
+                    first_ends,
+                    first_pick,
+                    second_line,
+                    second_ends,
+                );
+                let already = self.tabs[i]
+                    .scene
+                    .parametric_constraint_set(scope)
+                    .is_some_and(|set| {
+                        set.constraints.iter().any(|c| {
+                            c.enabled
+                                && c.kind == ConstraintKind::Parallel
+                                && c.refs.contains(&first_line)
+                                && c.refs.contains(&second_line)
+                        })
+                    });
+                if !already || placed_entity.is_some() {
+                    let constraints_before = self.tabs[i]
+                        .scene
+                        .parametric_constraint_set(scope)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            crate::scene::parametric_constraints::ParametricConstraintSet::new(
+                                scope,
+                            )
+                        });
+                    let pending = self.begin_undo(i, "Parallel constraint", 1, true);
+                    if let Some(entity) = placed_entity {
+                        self.tabs[i].scene.replace_entity_recorded(entity);
+                    }
+                    self.tabs[i]
+                        .scene
+                        .record_undo_parametric_constraints_before(scope, constraints_before);
+                    if !already {
+                        let set = self.tabs[i].scene.parametric_constraint_set_mut(scope);
+                        let id = set.add(ConstraintKind::Parallel, refs.to_vec(), None);
+                        self.tabs[i].scene.note_parametric_constraint_applied(
+                            scope,
+                            id,
+                            self.constraint_bar_display,
+                        );
+                    }
+                    // Both lines' ends hold the placement; the solve only
+                    // settles whatever else is tied to them.
+                    let mut pins = first_ends.to_vec();
+                    pins.extend(second_ends);
+                    self.tabs[i].scene.bump_entities_with_parametric_policy(
+                        &[(second_line.entity, crate::scene::ChangeKind::Modified)],
+                        &pins,
+                        self.constraint_solve_mode,
+                    );
+                    self.tabs[i].dirty = true;
+                    if let Some(pd) = pending {
+                        self.commit_undo_delta(i, pd);
+                    }
+                }
+                let ends = {
+                    let document = &self.tabs[i].scene.document;
+                    document.get_entity(second_line.entity).and_then(|entity| {
+                        let world = |reference: crate::scene::parametric_constraints::ParametricRef| {
+                            let point = resolve_point(entity, reference.marker?)?;
+                            Some((reference, glam::DVec3::new(point.x, point.y, point.z)))
+                        };
+                        Some([world(second_ends[0])?, world(second_ends[1])?])
+                    })
+                };
+                let Some(ends) = ends else {
+                    return self.apply_cmd_result(CmdResult::ReportError(
+                        crate::modules::parametric::DimConstraintCommand::NO_OBJECT.to_string(),
+                    ));
+                };
+                let result = self.tabs[i]
+                    .active_cmd
+                    .as_mut()
+                    .map(|command| command.accept_parallel_line(ends));
+                return match result {
+                    Some(result) => self.apply_cmd_result(result),
+                    None => Task::none(),
+                };
+            }
             CmdResult::AddFixedConstraint(pick) => {
                 use crate::modules::parametric::FixConstraintCommand;
                 use crate::scene::parametric_constraints::{
@@ -3414,7 +5040,7 @@ impl OpenCADStudio {
                                     ("No valid constraint point found.", Some(first))
                                 } else {
                                     (
-                                        "The object or point is already selected. Select a different object or constraint point.",
+                                        "The object or point is already selected.  Select a different object or constraint point.",
                                         Some(first),
                                     )
                                 };
@@ -3508,6 +5134,53 @@ impl OpenCADStudio {
                                     )),
                                 );
                             }
+                        }
+                    }
+                }
+                // The solver cannot start from an axis lying exactly across
+                // the datum (its equations are singular there), so turn the
+                // object onto the axis about its anchor first — the
+                // reference turns it about that anchor too — and let the
+                // constraint hold what already fits.
+                if let Some((handle, anchor, end, vertex)) =
+                    crate::scene::parametric_constraints::axis_alignment_target(
+                        &self.tabs[i].scene.document,
+                        &refs,
+                    )
+                {
+                    let axis = (end.x - anchor.x, end.y - anchor.y);
+                    let length = axis.0.hypot(axis.1);
+                    let target = if axis.0 * direction.x + axis.1 * direction.y >= 0.0 {
+                        (direction.x, direction.y)
+                    } else {
+                        (-direction.x, -direction.y)
+                    };
+                    let angle = (axis.0 * target.1 - axis.1 * target.0)
+                        .atan2(axis.0 * target.0 + axis.1 * target.1);
+                    if length > 1.0e-9 && angle.abs() > 1.0e-9 {
+                        match vertex {
+                            Some(index) => {
+                                let moved =
+                                    self.tabs[i].scene.document.get_entity(handle).cloned();
+                                if let Some(mut entity) = moved {
+                                    if crate::scene::parametric_constraints::set_polyline_vertex(
+                                        &mut entity,
+                                        index,
+                                        anchor.x + length * target.0,
+                                        anchor.y + length * target.1,
+                                    ) {
+                                        self.tabs[i].scene.update_entity(entity);
+                                    }
+                                }
+                            }
+                            None => self.tabs[i].scene.transform_entities(
+                                &[handle],
+                                &EntityTransform::Rotate {
+                                    center: glam::DVec3::new(anchor.x, anchor.y, anchor.z),
+                                    axis: glam::DVec3::Z,
+                                    angle_rad: angle,
+                                },
+                            ),
                         }
                     }
                 }
@@ -4573,16 +6246,30 @@ impl OpenCADStudio {
                 self.tabs[i].snap_result = None;
                 self.tabs[i].scene.clear_preview_wire();
                 self.restore_pre_cmd_tangent();
-                let _ = self.dispatch_command(&cmd);
+                dispatched = self.dispatch_command(&cmd);
             }
             CmdResult::Dispatch(cmd) => {
                 // End this interactive front-end, then run the assembled command
                 // through the normal dispatcher. Selection is left untouched.
+                // The option picked in DIMCONSTRAINT becomes its next default;
+                // the same command run on its own leaves the default alone.
+                let from_menu = self.tabs[i]
+                    .active_cmd
+                    .as_ref()
+                    .is_some_and(|command| command.name() == "DIMCONSTRAINT");
+                if from_menu {
+                    match cmd.as_str() {
+                        "DCRADIUS" => self.dim_constraint_last = "Radius",
+                        "DCDIAMETER" => self.dim_constraint_last = "Diameter",
+                        "DCCONVERT" => self.dim_constraint_last = "Convert",
+                        _ => {}
+                    }
+                }
                 self.tabs[i].active_cmd = None;
                 self.tabs[i].snap_result = None;
                 self.tabs[i].scene.clear_preview_wire();
                 self.restore_pre_cmd_tangent();
-                let _ = self.dispatch_command(&cmd);
+                dispatched = self.dispatch_command(&cmd);
             }
             CmdResult::EditTableCell { handle, point } => {
                 // TABLEDIT's pick: end the pick phase and hand (table, point)
@@ -7313,16 +9000,15 @@ impl OpenCADStudio {
         // The rich text canvas owns keyboard editing itself. Leaving the
         // hidden command input focused would make it consume Left/Right before
         // the editor can handle them.
-        if self.mtext_editor.is_some() {
-            return self.unfocus_widgets();
-        }
-        // The in-place TEXT editor needs keyboard focus on its own field.
-        if self.text_inline.is_some() {
-            return iced::widget::operation::focus(iced::widget::Id::new(
-                super::view::TEXT_INLINE_ID,
-            ));
-        }
-        self.focus_cmd_input()
+        let focus = if self.mtext_editor.is_some() {
+            self.unfocus_widgets()
+        } else if self.text_inline.is_some() {
+            // The in-place TEXT editor needs keyboard focus on its own field.
+            iced::widget::operation::focus(iced::widget::Id::new(super::view::TEXT_INLINE_ID))
+        } else {
+            self.focus_cmd_input()
+        };
+        Task::batch([dispatched, focus])
     }
 
     /// Restore the tangent-snap / ortho state that was in effect before the command started.
@@ -7607,6 +9293,52 @@ impl OpenCADStudio {
 /// returning the new root handle. `allocate_handle` advances the document's
 /// handle counter — `next_handle()` only peeks, so reusing it would hand every
 /// object the same handle and collapse the dictionary chain.
+/// The entity a typed coordinate lands on while an object is asked for:
+/// the nearest planar curve of the edited space within a small share of
+/// that space's extent, the way a pick box takes the object under a click.
+fn entity_at_typed_point(
+    document: &acadrust::CadDocument,
+    owner: Handle,
+    point: glam::DVec3,
+) -> Option<Handle> {
+    let mut extent = 0.0f64;
+    let mut nearest: Option<(f64, Handle)> = None;
+    for entity in document.entities() {
+        let common = entity.common();
+        if common.owner_handle != owner {
+            continue;
+        }
+        let bounds = entity.as_entity().bounding_box();
+        extent = extent
+            .max((bounds.max.x - bounds.min.x).abs())
+            .max((bounds.max.y - bounds.min.y).abs());
+        let distance = match crate::scene::viewport_dimension_pick::planar_pick_distance(entity, point) {
+            Some(distance) => distance,
+            // A text or an ellipse answers by its extent, the way a click
+            // inside it picks it.
+            None if matches!(
+                entity,
+                acadrust::EntityType::Text(_)
+                    | acadrust::EntityType::MText(_)
+                    | acadrust::EntityType::Ellipse(_)
+            ) =>
+            {
+                let dx = (bounds.min.x - point.x).max(point.x - bounds.max.x).max(0.0);
+                let dy = (bounds.min.y - point.y).max(point.y - bounds.max.y).max(0.0);
+                dx.hypot(dy)
+            }
+            None => continue,
+        };
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, common.handle));
+        }
+    }
+    let tolerance = (extent * 0.002).max(1.0e-9);
+    nearest
+        .filter(|(distance, _)| *distance <= tolerance)
+        .map(|(_, handle)| handle)
+}
+
 fn recreate_ext_subtree(
     doc: &mut acadrust::CadDocument,
     cap: &crate::app::ClipExtObjects,
@@ -9884,5 +11616,44 @@ mod thicken_tests {
             .solid_history_operation(solids[0])
             .is_some());
         assert!(app.tabs[i].scene.document.get_entity(source).is_some());
+    }
+}
+
+#[cfg(test)]
+mod dispatched_command_task_tests {
+    use super::*;
+    use crate::command::CmdResult;
+    use acadrust::entities::ViewportRenderMode as Mode;
+
+    /// `CmdResult::Dispatch` and `CmdResult::Relaunch` run the assembled line
+    /// through `dispatch_command`, and the Task it returns must reach the
+    /// runtime: the render mode a VSCURRENT keyword picker chooses is applied
+    /// by a message that Task carries.
+    #[test]
+    fn dispatch_and_relaunch_keep_the_task_the_command_returns() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+
+        app.tabs[i].render_mode = Mode::Wireframe2D;
+        let task = app.apply_cmd_result(CmdResult::Dispatch("VSCURRENT GOURAUDSHADED".into()));
+        app.drive_headless_task(task).unwrap();
+        assert_eq!(
+            app.tabs[i].render_mode,
+            Mode::GouraudShaded,
+            "Dispatch dropped the dispatched command's task"
+        );
+
+        app.tabs[i].render_mode = Mode::Wireframe2D;
+        let task = app.apply_cmd_result(CmdResult::Relaunch(
+            "VSCURRENT GOURAUDSHADED".into(),
+            Vec::new(),
+        ));
+        app.drive_headless_task(task).unwrap();
+        assert_eq!(
+            app.tabs[i].render_mode,
+            Mode::GouraudShaded,
+            "Relaunch dropped the dispatched command's task"
+        );
     }
 }

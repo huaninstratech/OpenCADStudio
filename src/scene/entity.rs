@@ -1,5 +1,23 @@
-// Auto-split from scene/mod.rs. Pure text-move; behaviour unchanged.
 use super::*;
+
+#[derive(Debug, Clone)]
+pub struct CreateBlockOptions {
+    pub name: String,
+    pub handles: Vec<Handle>,
+    pub base_point: glam::DVec3,
+    pub world_to_block: acadrust::types::Transform,
+    pub block_to_world: acadrust::types::Transform,
+    pub mode: crate::ui::window::block_definition::BlockObjectMode,
+    pub annotative: bool,
+    pub match_orientation: bool,
+    pub scale_uniformly: bool,
+    pub allow_exploding: bool,
+    pub unit: i16,
+    pub description: String,
+    pub hyperlink_url: String,
+    pub hyperlink_desc: String,
+    pub redefine: bool,
+}
 
 /// Order sampled boundary edges into one tip-to-tail loop.
 pub(super) fn chain_path_edges(polys: Vec<Vec<[f64; 2]>>) -> Vec<[f64; 2]> {
@@ -525,6 +543,9 @@ impl Scene {
         let Some(existing) = self.document.get_entity(handle) else {
             return false;
         };
+        // IPC snapshots omit storage-only payloads (notably Unknown/Extended
+        // entities). Preserve them when replacing a clone from a plugin.
+        entity.preserve_storage_data_from(existing);
         // The caller edited a snapshot copy; keep the live entity in its block.
         entity.common_mut().owner_handle = existing.common().owner_handle;
 
@@ -845,18 +866,151 @@ impl Scene {
         world_to_block: &acadrust::types::Transform,
         block_to_world: &acadrust::types::Transform,
     ) -> Result<Handle, String> {
-        let name = name.trim();
+        self.create_block_with_options(CreateBlockOptions {
+            name: name.to_string(),
+            handles: handles.to_vec(),
+            base_point: glam::DVec3::ZERO,
+            world_to_block: *world_to_block,
+            block_to_world: *block_to_world,
+            mode: crate::ui::window::block_definition::BlockObjectMode::Convert,
+            annotative: false,
+            match_orientation: false,
+            scale_uniformly: false,
+            allow_exploding: true,
+            unit: 0,
+            description: String::new(),
+            hyperlink_url: String::new(),
+            hyperlink_desc: String::new(),
+            redefine: false,
+        })
+    }
+
+    pub fn create_block_with_options(
+        &mut self,
+        options: CreateBlockOptions,
+    ) -> Result<Handle, String> {
+        let name = options.name.trim();
         if name.is_empty() {
             return Err("Block name cannot be empty.".into());
         }
         if name.starts_with('*') {
             return Err("Block name cannot start with '*'.".into());
         }
-        if self.document.block_records.get(name).is_some() {
-            return Err(format!("Block \"{name}\" already exists."));
-        }
 
-        let source_entities: Vec<_> = handles
+        let existing = self
+            .document
+            .block_records
+            .get(name)
+            .map(|br| (br.handle, br.block_entity_handle));
+
+        let (br_handle, _block_handle) = if let Some((existing_br_h, existing_blk_h)) = existing {
+            if !options.redefine {
+                return Err(format!("Block \"{name}\" already exists."));
+            }
+            // Redefining: remove all existing entities owned by this block record (except Block/BlockEnd)
+            let owned: Vec<Handle> = self
+                .document
+                .entities()
+                .filter(|e| {
+                    e.common().owner_handle == existing_br_h
+                        && !matches!(e, EntityType::Block(_) | EntityType::BlockEnd(_))
+                })
+                .map(|e| e.common().handle)
+                .collect();
+            for h in owned {
+                self.document.remove_entity(h);
+            }
+            // Update existing BlockRecord fields
+            if let Some(br) = self.document.block_records.get_mut(name) {
+                br.units = options.unit;
+                br.description = options.description.clone();
+                br.explodable = options.allow_exploding;
+                br.scale_uniformly = options.scale_uniformly;
+            }
+            // Update existing Block entity fields
+            if let Some(EntityType::Block(b)) = self.document.get_entity_mut(existing_blk_h) {
+                b.description = options.description.clone();
+            }
+            if options.annotative {
+                let annotative_vals = vec![acadrust::xdata::XDataValue::Integer16(1)];
+                view::dispatch::set_entity_xdata(
+                    &mut self.document,
+                    existing_blk_h,
+                    "AcadAnnotative",
+                    Some(annotative_vals),
+                );
+            }
+            if !options.hyperlink_url.is_empty() {
+                let link_vals = vec![acadrust::xdata::XDataValue::String(
+                    options.hyperlink_url.clone(),
+                )];
+                view::dispatch::set_entity_xdata(
+                    &mut self.document,
+                    existing_blk_h,
+                    "PE_URL",
+                    Some(link_vals),
+                );
+            }
+            (existing_br_h, existing_blk_h)
+        } else {
+            let next = self.document.next_handle();
+            let br_handle = Handle::new(next);
+            let block_handle = Handle::new(next + 1);
+            let end_handle = Handle::new(next + 2);
+
+            let mut block_record = acadrust::tables::BlockRecord::new(name);
+            block_record.handle = br_handle;
+            block_record.block_entity_handle = block_handle;
+            block_record.block_end_handle = end_handle;
+            block_record.units = options.unit;
+            block_record.description = options.description.clone();
+            block_record.explodable = options.allow_exploding;
+            block_record.scale_uniformly = options.scale_uniformly;
+            self.document
+                .block_records
+                .add(block_record)
+                .map_err(|e| e.to_string())?;
+
+            let mut block = Block::new(name, acadrust::types::Vector3::ZERO);
+            block.common.handle = block_handle;
+            block.common.owner_handle = br_handle;
+            block.description = options.description.clone();
+            self.document
+                .add_entity(EntityType::Block(block))
+                .map_err(|e| e.to_string())?;
+
+            let mut block_end = BlockEnd::new();
+            block_end.common.handle = end_handle;
+            block_end.common.owner_handle = br_handle;
+            self.document
+                .add_entity(EntityType::BlockEnd(block_end))
+                .map_err(|e| e.to_string())?;
+
+            if options.annotative {
+                let annotative_vals = vec![acadrust::xdata::XDataValue::Integer16(1)];
+                view::dispatch::set_entity_xdata(
+                    &mut self.document,
+                    block_handle,
+                    "AcadAnnotative",
+                    Some(annotative_vals),
+                );
+            }
+            if !options.hyperlink_url.is_empty() {
+                let link_vals = vec![acadrust::xdata::XDataValue::String(
+                    options.hyperlink_url.clone(),
+                )];
+                view::dispatch::set_entity_xdata(
+                    &mut self.document,
+                    block_handle,
+                    "PE_URL",
+                    Some(link_vals),
+                );
+            }
+            (br_handle, block_handle)
+        };
+
+        let source_entities: Vec<_> = options
+            .handles
             .iter()
             .filter_map(|&h| self.document.get_entity(h).cloned().map(|e| (h, e)))
             .collect();
@@ -864,35 +1018,7 @@ impl Scene {
             return Err("No valid entities selected for block creation.".into());
         }
 
-        let next = self.document.next_handle();
-        let br_handle = Handle::new(next);
-        let block_handle = Handle::new(next + 1);
-        let end_handle = Handle::new(next + 2);
-
-        let mut block_record = acadrust::tables::BlockRecord::new(name);
-        block_record.handle = br_handle;
-        block_record.block_entity_handle = block_handle;
-        block_record.block_end_handle = end_handle;
-        self.document
-            .block_records
-            .add(block_record)
-            .map_err(|e| e.to_string())?;
-
-        let mut block = Block::new(name, acadrust::types::Vector3::ZERO);
-        block.common.handle = block_handle;
-        block.common.owner_handle = br_handle;
-        self.document
-            .add_entity(EntityType::Block(block))
-            .map_err(|e| e.to_string())?;
-
-        let mut block_end = BlockEnd::new();
-        block_end.common.handle = end_handle;
-        block_end.common.owner_handle = br_handle;
-        self.document
-            .add_entity(EntityType::BlockEnd(block_end))
-            .map_err(|e| e.to_string())?;
-
-        let local = EntityTransform::Affine(*world_to_block);
+        let local = EntityTransform::Affine(options.world_to_block);
         for (old_handle, mut entity) in source_entities {
             view::dispatch::apply_transform(&mut entity, &local);
             entity = crate::modules::draw::modify::explode::normalize_entity_for_block(entity);
@@ -901,15 +1027,19 @@ impl Scene {
             self.document
                 .add_entity(entity)
                 .map_err(|e| e.to_string())?;
-            self.erase_entities(&[old_handle]);
+            if options.mode != crate::ui::window::block_definition::BlockObjectMode::Retain {
+                self.erase_entities(&[old_handle]);
+            }
         }
 
-        let mut insert = DxfInsert::new(name, acadrust::types::Vector3::ZERO);
-        acadrust::Entity::apply_transform(&mut insert, block_to_world);
-        let insert_handle = self.add_entity(EntityType::Insert(insert));
-        // A new block definition landed in the document; advance the block
-        // epoch so consumers (the block palette stale check) notice it even
-        // when the panel stays open. Mirrors `define_block_from_owned_entities`.
+        let mut insert_handle = Handle::NULL;
+        if options.mode == crate::ui::window::block_definition::BlockObjectMode::Convert {
+            let mut insert = DxfInsert::new(name, acadrust::types::Vector3::ZERO);
+            acadrust::Entity::apply_transform(&mut insert, &options.block_to_world);
+            insert_handle = self.add_entity(EntityType::Insert(insert));
+        }
+
+        // Advance the block epoch so all consumers and viewport renderers re-tessellate
         self.bump_geometry();
         Ok(insert_handle)
     }
@@ -1402,6 +1532,9 @@ impl Scene {
                 }
                 if self.object_isolation.hides(common.handle)
                     || (!include_preview_hidden && self.preview_hidden.contains(&common.handle))
+                    || self.hidden_dynamic_dimensions.contains(&common.handle)
+                    // A dynamic dimension never plots.
+                    || (plot_only && self.is_dynamic_dimension(common.handle))
                 {
                     return false;
                 }
@@ -2710,7 +2843,10 @@ impl Scene {
         // and named parameters into the fresh one.
         self.parametric_constraints.clear();
         self.named_parameters = crate::scene::named_parameters::ParameterTable::new();
+        self.bump_constraints_epoch();
         self.bump_geometry();
+        self.bump_layout_epoch();
+        self.bump_scale_epoch();
     }
 
     /// Reset to the drawing File → New produces. Every path that starts a
@@ -2725,6 +2861,16 @@ impl Scene {
     /// standard linetypes and a compatible page setup on every paper layout.
     pub fn populate_new_drawing_defaults(&mut self) {
         crate::io::linetypes::populate_document(&mut self.document);
+        // A new drawing is metric, as the reference's ISO template: millimetre
+        // insertion units, metric measurement, and the ISO-25 dimension style
+        // current. Standard stays available for imperial work.
+        self.document.header.measurement = 1;
+        self.document.header.insertion_units = 4;
+        let iso = crate::scene::creation_style::ensure_iso_dim_style(&mut self.document);
+        self.document.header.current_dimstyle_name = "ISO-25".to_string();
+        // The name alone leaves the header pointing at the previous style, and
+        // a DWG writes the current style by handle only.
+        self.document.header.current_dimstyle_handle = iso;
         for obj in self.document.objects.values_mut() {
             if let acadrust::objects::ObjectType::Layout(l) = obj {
                 if l.name != "Model" {

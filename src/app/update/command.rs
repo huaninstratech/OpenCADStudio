@@ -798,25 +798,9 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
 
                     // OTRACK and Extension both allow a bare scalar to act as a
                     // distance measured along the active reference ray.
-                    if let Some((base, dir)) = self.active_distance_ray(i) {
-                        if let Some(dist) = crate::app::expr_eval::eval_number(text.trim()) {
-                            let pt = base + dir * dist;
-                            if !self.command_point_allowed(i, pt) {
-                                return Task::none();
-                            }
-                            self.last_point = Some(pt);
-                            self.dyn_user_reshaped = false;
-                            self.dyn_coord_absolute = false;
-                            self.sync_dyn_fields();
-                            self.reset_tracking_after_point();
-                            self.push_ucs_to_cmd(i);
-                            let result = self.tabs[i].active_cmd.as_mut().map(|c| c.on_point(pt));
-                            if let Some(r) = result {
-                                let task = self.apply_cmd_result(r);
-                                self.refresh_active_cmd_preview(i);
-                                return task;
-                            }
-                            return Task::none();
+                    if self.active_distance_ray(i).is_some() {
+                        if let Some(task) = self.try_direct_distance_entry(&text) {
+                            return task;
                         }
                     }
 
@@ -881,6 +865,13 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
                         return self.apply_cmd_result(result);
                     }
 
+                    // Direct distance entry: if an anchor exists and a scalar distance was entered,
+                    // project along the active reference ray (if any) or the current cursor direction
+                    // in the active UCS plane.
+                    if let Some(task) = self.try_direct_distance_entry(&text) {
+                        return task;
+                    }
+
                     self.command_line.push_error(crate::tf!(
                         "Expected Cartesian, polar, cylindrical or spherical coordinates, or a number; got: \"{text}\""
                     ).as_ref());
@@ -904,6 +895,67 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
                     return self.dispatch_command(&cmd);
                 }
                 Task::none()
+    }
+
+    /// Attempt direct distance entry: if an active command is expecting a point,
+    /// has an established anchor, and `text` parses as a scalar distance,
+    /// project along the active reference ray (if any) or the current cursor
+    /// direction in the active UCS plane.
+    pub(in crate::app) fn try_direct_distance_entry(&mut self, text: &str) -> Option<Task<Message>> {
+        let i = self.active_tab;
+        if self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .is_some_and(|c| c.needs_entity_pick())
+        {
+            return None;
+        }
+
+        let dist = crate::entities::common::parse_length(text.trim())
+            .or_else(|| crate::app::expr_eval::eval_number(text.trim()))?;
+
+        // A tracking ray carries its own base, so it needs no anchor: that is
+        // how OTRACK and Extension accepted a bare distance for the *first*
+        // point of a command, before any anchor exists.
+        let pt = if let Some((base, dir)) = self.active_distance_ray(i) {
+            base + dir * dist
+        } else {
+            let anchor = self.tabs[i]
+                .active_cmd
+                .as_ref()
+                .and_then(|c| c.resolved_anchor())
+                .or(self.tabs[i].dyn_anchor)
+                .or(self.last_point)?;
+            let w = self.tabs[i].last_cursor_world;
+            let xf = self.tabs[i].ucs_xform();
+            let d_ucs = xf.vec_to_ucs(w - anchor);
+            let dx = d_ucs.x;
+            let dy = d_ucs.y;
+            let dir_ucs = if (dx * dx + dy * dy) > 1e-12 {
+                glam::DVec3::new(dx, dy, 0.0).normalize()
+            } else if d_ucs.length_squared() > 1e-12 {
+                d_ucs.normalize()
+            } else {
+                glam::DVec3::X
+            };
+            anchor + xf.vec_to_wcs(dir_ucs * dist)
+        };
+
+        if !self.command_point_allowed(i, pt) {
+            return Some(Task::none());
+        }
+
+        self.last_point = Some(pt);
+        self.dyn_user_reshaped = false;
+        self.dyn_coord_absolute = false;
+        self.sync_dyn_fields();
+        self.reset_tracking_after_point();
+        self.push_ucs_to_cmd(i);
+
+        let result = self.tabs[i].active_cmd.as_mut().map(|c| c.on_point(pt))?;
+        let task = self.apply_cmd_result(result);
+        self.refresh_active_cmd_preview(i);
+        Some(task)
     }
 
     /// The active command's current step collects free-form prose from the
@@ -1109,6 +1161,9 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
                 if let Some(state) = self.qselect.take() {
                     self.qselect_settings = Some((&state).into());
                     self.reset_modal_geometry();
+                    if self.block_definition.is_some() {
+                        self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
+                    }
                     return Task::none();
                 }
                 {
@@ -2232,8 +2287,42 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
         field: &'static str,
         value: String,
     ) -> Task<Message> {
+        if matches!(field, "dyn_constraint_form" | "dyn_constraint_reference") {
+            return self.on_dynamic_dimension_choice(field, &value);
+        }
         let i = self.active_tab;
         let handles = self.property_target_handles(i);
+        // The Annotative Yes/No list drives the per-object annotative toggle
+        // (MTEXT's own flag, the annotation context for the rest).
+        if field == "annotative" {
+            let wanted =
+                value == crate::t!("Yes").as_ref() || value.eq_ignore_ascii_case("yes");
+            let Some(handle) = handles.first().copied() else {
+                return Task::none();
+            };
+            let document = &self.tabs[i].scene.document;
+            let (toggle, current) = match document.get_entity(handle) {
+                Some(acadrust::EntityType::MText(text)) => ("is_annotative", text.is_annotative),
+                Some(entity) => (
+                    "annotative_ctx",
+                    crate::scene::annotative::is_annotative(document, entity)
+                        || match entity {
+                            acadrust::EntityType::Dimension(dimension) => {
+                                crate::scene::annotative::dim_style_is_annotative(
+                                    document,
+                                    &dimension.base().style_name,
+                                )
+                            }
+                            _ => false,
+                        },
+                ),
+                None => return Task::none(),
+            };
+            if wanted != current {
+                return self.update(Message::PropBoolToggle(toggle));
+            }
+            return Task::none();
+        }
 
         if !handles.is_empty() {
             if matches!(
@@ -3372,6 +3461,19 @@ pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
     }
 
     pub(super) fn on_prop_geom_commit(&mut self, field: &'static str) -> Task<Message> {
+                use crate::ui::window::named_parameters::ParamField;
+                // A dynamic dimension's Name/Expression rows edit its parameter.
+                let dynamic_field = match field {
+                    "dyn_constraint_name" => Some(ParamField::Name),
+                    "dyn_constraint_expression" => Some(ParamField::Formula),
+                    _ => None,
+                };
+                if let Some(param_field) = dynamic_field {
+                    return self.on_dynamic_dimension_field_commit(field, param_field);
+                }
+                if field == "dyn_constraint_description" {
+                    return self.on_dynamic_dimension_description_commit(field);
+                }
                 let i = self.active_tab;
                 self.tabs[i].properties.active_field = None;
                 let handles = self.property_target_handles(i);

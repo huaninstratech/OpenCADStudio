@@ -1052,6 +1052,9 @@ impl OpenCADStudio {
                     | "CONSTRAINTINFER"
                     | "CONSTRAINTBARDISPLAY"
                     | "CONSTRAINTBARMODE"
+                    | "CONSTRAINTNAMEFORMAT"
+                    | "DYNCONSTRAINTDISPLAY"
+                    | "CCONSTRAINTFORM"
             ) =>
             {
                 return self.dispatch_styleprops(&format!("SETVAR {cmd}"), i);
@@ -1073,8 +1076,9 @@ impl OpenCADStudio {
                 let name = it.next().unwrap_or("").to_uppercase();
                 let value = it.next().map(|s| s.trim().to_string());
                 if name.is_empty() || name == "?" {
+                    self.command_line.push_info(&super::plotvars::setvar_listing());
                     self.command_line.push_info(
-                        crate::t!("SETVAR: CETRANSPARENCY LTSCALE CELTSCALE PDMODE PDSIZE TEXTSIZE ORTHOMODE FILLMODE MIRRTEXT FRAME IMAGEFRAME PDFFRAME WIPEOUTFRAME XCLIPFRAME POINTCLOUDCLIPFRAME ZOOMWHEEL ZOOMFACTOR SHORTCUTMENU SHORTCUTMENUDURATION CURSORSIZE PICKBOX CURSORTYPE SNAPANG TEXTFILL CLIPROMPTLINES COMMANDLINEFADETIME ATTREQ ATTDIA DIMASSOC DIMCONTINUEMODE CONSTRAINTSOLVEMODE CONSTRAINTINFER CONSTRAINTBARDISPLAY CONSTRAINTBARMODE ANGBASE ANGDIR SKETCHINC SKPOLY SKTOLERANCE DONUTID DONUTOD CENTEREXE CENTERLAYER CENTERLTYPE CENTERLTSCALE CENTERLTYPEFILE CENTERCROSSSIZE CENTERCROSSGAP CENTERMARKEXE COLORTHEME SELECTIONAREA SELECTIONAREAOPACITY SELECTIONEFFECT SELECTIONEFFECTCOLOR WINDOWSAREACOLOR CROSSINGAREACOLOR SELECTIONPREVIEW GRIPSIZE GRIPCOLOR GRIPHOT GRIPHOVER GRIPOBJLIMIT | CLAYER CELTYPE TEXTSTYLE (read-only)").as_ref(),
+                        crate::t!("SETVAR: CETRANSPARENCY LTSCALE CELTSCALE PDMODE PDSIZE TEXTSIZE ORTHOMODE FILLMODE MIRRTEXT FRAME IMAGEFRAME PDFFRAME WIPEOUTFRAME XCLIPFRAME POINTCLOUDCLIPFRAME ZOOMWHEEL ZOOMFACTOR SHORTCUTMENU SHORTCUTMENUDURATION CURSORSIZE PICKBOX CURSORTYPE SNAPANG TEXTFILL CLIPROMPTLINES COMMANDLINEFADETIME ATTREQ ATTDIA DIMASSOC DIMCONTINUEMODE CONSTRAINTSOLVEMODE CONSTRAINTINFER CONSTRAINTBARDISPLAY CONSTRAINTBARMODE CONSTRAINTNAMEFORMAT DYNCONSTRAINTDISPLAY ANGBASE ANGDIR SKETCHINC SKPOLY SKTOLERANCE DONUTID DONUTOD CENTEREXE CENTERLAYER CENTERLTYPE CENTERLTSCALE CENTERLTYPEFILE CENTERCROSSSIZE CENTERCROSSGAP CENTERMARKEXE COLORTHEME SELECTIONAREA SELECTIONAREAOPACITY SELECTIONEFFECT SELECTIONEFFECTCOLOR WINDOWSAREACOLOR CROSSINGAREACOLOR SELECTIONPREVIEW GRIPSIZE GRIPCOLOR GRIPHOT GRIPHOVER GRIPOBJLIMIT | CLAYER CELTYPE TEXTSTYLE (read-only)").as_ref(),
                     );
                 } else {
                     if name == "CETRANSPARENCY" {
@@ -1274,17 +1278,28 @@ impl OpenCADStudio {
                             | "CONSTRAINTINFER"
                             | "CONSTRAINTBARDISPLAY"
                             | "CONSTRAINTBARMODE"
+                            | "CONSTRAINTNAMEFORMAT"
+                            | "DYNCONSTRAINTDISPLAY"
+                            | "CCONSTRAINTFORM"
                     ) {
                         let current = match name.as_str() {
                             "CONSTRAINTSOLVEMODE" => i16::from(self.constraint_solve_mode),
                             "CONSTRAINTINFER" => i16::from(self.constraint_infer),
                             "CONSTRAINTBARDISPLAY" => self.constraint_bar_display,
                             "CONSTRAINTBARMODE" => self.constraint_bar_mode,
+                            "CONSTRAINTNAMEFORMAT" => {
+                                i16::from(self.tabs[i].scene.constraint_name_format)
+                            }
+                            "DYNCONSTRAINTDISPLAY" => {
+                                i16::from(self.tabs[i].scene.dynamic_constraint_display)
+                            }
+                            "CCONSTRAINTFORM" => i16::from(self.constraint_form_annotational),
                             _ => unreachable!(),
                         };
                         let maximum = match name.as_str() {
                             "CONSTRAINTBARDISPLAY" => 3,
                             "CONSTRAINTBARMODE" => 4095,
+                            "CONSTRAINTNAMEFORMAT" => 2,
                             _ => 1,
                         };
                         if let Some(value) = &value {
@@ -1303,6 +1318,21 @@ impl OpenCADStudio {
                                             self.constraint_bar_display = mode
                                         }
                                         "CONSTRAINTBARMODE" => self.constraint_bar_mode = mode,
+                                        "CONSTRAINTNAMEFORMAT" => {
+                                            self.tabs[i].scene.constraint_name_format = mode as u8;
+                                            self.tabs[i].scene.refresh_dynamic_dimension_texts();
+                                            self.tabs[i].dirty = true;
+                                        }
+                                        "DYNCONSTRAINTDISPLAY" => {
+                                            self.tabs[i].scene.dynamic_constraint_display =
+                                                mode != 0;
+                                            self.tabs[i].scene.refresh_hidden_dynamic_dimensions();
+                                        }
+                                        // The form new dimensional constraints take
+                                        // (0 dynamic, 1 annotational), as DCFORM sets.
+                                        "CCONSTRAINTFORM" => {
+                                            self.constraint_form_annotational = mode != 0
+                                        }
                                         _ => unreachable!(),
                                     }
                                     self.persist_settings_if_changed();
@@ -2475,6 +2505,13 @@ impl OpenCADStudio {
                     if name == "PDMODE" || name == "PDSIZE" {
                         self.tabs[i].scene.invalidate_point_dependencies();
                     }
+                    if matches!(name.as_str(), "LUNITS" | "LUPREC" | "AUNITS" | "AUPREC") {
+                        crate::entities::common::set_unit_context(
+                            crate::entities::common::UnitContext::from_header(
+                                &self.tabs[i].scene.document.header,
+                            ),
+                        );
+                    }
                     // ORTHOMODE / OSMODE set the header directly; mirror them into
                     // the live Ortho / running OSNAP so the constraint + status
                     // bar follow and the save-time stamp doesn't revert them.
@@ -2708,10 +2745,7 @@ impl OpenCADStudio {
                     self.command_line
                         .push_output(crate::tf!("CLAYER = \"{cur}\"").as_ref());
                 } else {
-                    if self.tabs[i].scene.document.layers.contains(name_arg) {
-                        self.tabs[i].scene.document.header.current_layer_name =
-                            name_arg.to_string();
-                        self.tabs[i].dirty = true;
+                    if self.set_current_layer_name(i, name_arg).is_ok() {
                         self.command_line
                             .push_output(crate::tf!("CLAYER set to \"{name_arg}\"").as_ref());
                     } else {
@@ -2895,6 +2929,29 @@ impl OpenCADStudio {
                     }
                     _ => self.command_line.push_error(crate::t!("Requires 0 or 1").as_ref()),
                 }
+            }
+            cmd if cmd == "SCRIPTCOMMANDS" || cmd.starts_with("SCRIPTCOMMANDS ") => {
+                // A user setting, deliberately outside the script's reach: it is refused by
+                // the script command runner, so only the command line can change it.
+                let arg = cmd.trim_start_matches("SCRIPTCOMMANDS").trim();
+                match arg {
+                    "" => {}
+                    "1" | "ON" | "YES" => self.script_commands = true,
+                    "0" | "OFF" | "NO" => self.script_commands = false,
+                    _ => {
+                        self.command_line.push_error(
+                            crate::t!("SCRIPTCOMMANDS takes 1 (scripts may run commands) or 0 (they may not)")
+                                .as_ref(),
+                        );
+                        return Some(Task::none());
+                    }
+                }
+                if !arg.is_empty() {
+                    self.persist_settings_if_changed();
+                }
+                let state = if self.script_commands { 1 } else { 0 };
+                self.command_line
+                    .push_output(crate::tf!("SCRIPTCOMMANDS = {state}").as_ref());
             }
             "SAVETIME" => {
                 use crate::command::ValuePromptCommand;

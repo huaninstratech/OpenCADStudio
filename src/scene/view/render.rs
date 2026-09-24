@@ -48,6 +48,13 @@ struct ViewportDisplaySettings {
     background: ViewportBackgroundSettings,
 }
 
+#[derive(Clone, Default, Debug)]
+pub(crate) struct CachedDocumentRenderEnvironment {
+    pub(crate) fog: Option<([f32; 4], [f32; 4], [f32; 4])>,
+    pub(crate) environment: Option<([f32; 4], crate::scene::model::image_model::DecodedImage)>,
+    pub(crate) preset_environment: Option<([f32; 4], crate::scene::model::image_model::DecodedImage)>,
+}
+
 #[derive(Clone, Debug)]
 struct ViewportBackgroundSettings {
     base: [f32; 4],
@@ -1326,10 +1333,6 @@ retained_contributors={}",
             if surface_clip.width == 0 || surface_clip.height == 0 {
                 continue;
             }
-            let vp_full_x = surface_dest.x as i32;
-            let vp_full_y = surface_dest.y as i32;
-            let vp_full_w = surface_dest.width as i32;
-            let vp_full_h = surface_dest.height as i32;
             // `mesh_fill` is false for Wireframe 2D / Wireframe 3D — flip
             // the draw path so meshes use the wireframe pipeline + the
             // pre-built triangle-edge index buffer.
@@ -1345,26 +1348,11 @@ retained_contributors={}",
                 vp.hidden_line,
                 vp.show_3d_edges,
             );
-            // The ViewCube renders directly to the surface at the full
-            // viewport rect. Skip it when the viewport's top-right corner
-            // (where the cube sits) is off-canvas — wgpu's `set_viewport`
-            // rejects negative origins, and a clamped cube would scale
-            // distortedly. The active viewport is normally fully visible.
-            if vp.show_viewcube
-                && surface_dest.width == placement.size.width
-                && surface_dest.height == placement.size.height
-                && vp_full_x >= clip.x as i32
-                && vp_full_y >= clip.y as i32
-                && vp_full_x + vp_full_w <= clip_right as i32
-                && vp_full_y + vp_full_h <= clip_bottom as i32
-            {
-                let vp_clip = Rectangle {
-                    x: vp_full_x as u32,
-                    y: vp_full_y as u32,
-                    width: vp_full_w as u32,
-                    height: vp_full_h as u32,
-                };
-                inner.viewcube.render(encoder, target, vp_clip);
+            // The ViewCube renders directly to the surface in the top-right corner
+            // of the viewport. Skip it only when the top-right corner is off-canvas
+            // or the visible area cannot fit the cube.
+            if vp.show_viewcube && inner.viewcube.should_render(surface_dest, surface_clip, clip) {
+                inner.viewcube.render(encoder, target, surface_clip);
             }
         }
         let render_ms = nav_render_started.elapsed().as_secs_f64() * 1000.0;
@@ -1632,6 +1620,108 @@ mod pixel_placement_tests {
         assert_eq!(first.size, moved.size);
         assert_eq!(first.uv_scale, moved.uv_scale);
         assert_eq!(moved.surface.x, first.surface.x + 20);
+    }
+
+    #[test]
+    fn viewcube_visibility_across_display_scales_and_bounds() {
+        use crate::scene::pipeline::viewcube::viewcube_should_render;
+
+        // Model space viewports across standard UI display scales and fractional layouts
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let window = Size::new((1920.0 * scale) as u32, (1080.0 * scale) as u32);
+            let bounds = Rectangle {
+                x: 0.0,
+                y: 154.5,
+                width: 1920.0,
+                height: 800.3,
+            };
+            let rect = Rectangle {
+                x: bounds.x * scale,
+                y: bounds.y * scale,
+                width: bounds.width * scale,
+                height: bounds.height * scale,
+            };
+            let placement = physical_viewport(rect, window);
+            let clip = Rectangle {
+                x: (bounds.x * scale).round() as u32,
+                y: (bounds.y * scale).round() as u32,
+                width: (bounds.width * scale).round() as u32,
+                height: (bounds.height * scale).round() as u32,
+            };
+            let clip_right = clip.x + clip.width;
+            let clip_bottom = clip.y + clip.height;
+            let left = placement.surface.x.max(clip.x);
+            let top = placement.surface.y.max(clip.y);
+            let surface_clip = Rectangle {
+                x: left,
+                y: top,
+                width: (placement.surface.x + placement.surface.width)
+                    .min(clip_right)
+                    .saturating_sub(left),
+                height: (placement.surface.y + placement.surface.height)
+                    .min(clip_bottom)
+                    .saturating_sub(top),
+            };
+            let viewcube_side = (crate::scene::VIEWCUBE_RENDER_PX.ceil() * scale).ceil() as u32;
+            assert!(
+                viewcube_should_render(placement.surface, surface_clip, &clip, viewcube_side),
+                "ViewCube must be visible in model space at scale {scale}"
+            );
+        }
+
+        // Paper space viewport scrolled off the top edge: should not render
+        let clip: Rectangle<u32> = Rectangle {
+            x: 0,
+            y: 100,
+            width: 1000,
+            height: 800,
+        };
+        let scrolled_off_top: Rectangle<u32> = Rectangle {
+            x: 50,
+            y: 50,
+            width: 400,
+            height: 300,
+        }; // y is above clip.y (100)
+        let left = scrolled_off_top.x.max(clip.x);
+        let top = scrolled_off_top.y.max(clip.y);
+        let surface_clip = Rectangle {
+            x: left,
+            y: top,
+            width: (scrolled_off_top.x + scrolled_off_top.width)
+                .min(clip.x + clip.width)
+                .saturating_sub(left),
+            height: (scrolled_off_top.y + scrolled_off_top.height)
+                .min(clip.y + clip.height)
+                .saturating_sub(top),
+        };
+        assert!(
+            !viewcube_should_render(scrolled_off_top, surface_clip, &clip, 120),
+            "ViewCube must hide when top-right corner is off top of canvas"
+        );
+
+        // Paper space viewport scrolled off the right edge: should not render
+        let scrolled_off_right: Rectangle<u32> = Rectangle {
+            x: 800,
+            y: 150,
+            width: 400,
+            height: 300,
+        }; // x + w (1200) exceeds clip right (1000)
+        let left = scrolled_off_right.x.max(clip.x);
+        let top = scrolled_off_right.y.max(clip.y);
+        let surface_clip = Rectangle {
+            x: left,
+            y: top,
+            width: (scrolled_off_right.x + scrolled_off_right.width)
+                .min(clip.x + clip.width)
+                .saturating_sub(left),
+            height: (scrolled_off_right.y + scrolled_off_right.height)
+                .min(clip.y + clip.height)
+                .saturating_sub(top),
+        };
+        assert!(
+            !viewcube_should_render(scrolled_off_right, surface_clip, &clip, 120),
+            "ViewCube must hide when top-right corner is off right of canvas"
+        );
     }
 
     #[test]
@@ -2544,6 +2634,20 @@ impl Scene {
         if reference.is_empty() {
             return None;
         }
+        if let Some(cached) = self.background_image_cache.borrow().get(reference) {
+            return cached.clone();
+        }
+        let image = self.resolve_background_image_uncached(reference);
+        self.background_image_cache
+            .borrow_mut()
+            .insert(reference.to_string(), image.clone());
+        image
+    }
+
+    fn resolve_background_image_uncached(
+        &self,
+        reference: &str,
+    ) -> Option<crate::scene::model::image_model::DecodedImage> {
         if reference.starts_with("http://") || reference.starts_with("https://") {
             return crate::scene::model::image_model::resolve_image(reference);
         }
@@ -2679,31 +2783,44 @@ impl Scene {
         }
     }
 
-    fn apply_document_render_environment(
-        &self,
-        background: &mut ViewportBackgroundSettings,
-    ) {
+    fn resolve_document_render_environment(&self) -> CachedDocumentRenderEnvironment {
         use acadrust::objects::{ClassObjectData, ObjectType};
 
-        let environment = self
-            .document
-            .objects
-            .iter()
-            .filter_map(|(handle, object)| match object {
-                ObjectType::ClassObject(value) => match &value.data {
-                    ClassObjectData::RenderEnvironment(environment) => {
-                        Some((*handle, environment))
-                    }
+        let mut result = CachedDocumentRenderEnvironment::default();
+
+        let environment = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
+            crate::entities::object_data::render_environments(&self.object_data_cache)
+                .iter()
+                .find_map(|handle| match self.document.objects.get(handle) {
+                    Some(ObjectType::ClassObject(value)) => match &value.data {
+                        ClassObjectData::RenderEnvironment(environment) => {
+                            Some((*handle, environment))
+                        }
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            })
-            .min_by_key(|(handle, _)| handle.value())
-            .map(|(_, environment)| environment);
+                })
+                .map(|(_, environment)| environment)
+        } else {
+            self.document
+                .objects
+                .iter()
+                .filter_map(|(handle, object)| match object {
+                    ObjectType::ClassObject(value) => match &value.data {
+                        ClassObjectData::RenderEnvironment(environment) => {
+                            Some((*handle, environment))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .min_by_key(|(handle, _)| handle.value())
+                .map(|(_, environment)| environment)
+        };
 
         if let Some(environment) = environment {
             if environment.fog_enabled {
-                background.fog_color = [
+                let fog_color = [
                     environment.fog_color[0] as f32 / 255.0,
                     environment.fog_color[1] as f32 / 255.0,
                     environment.fog_color[2] as f32 / 255.0,
@@ -2717,7 +2834,7 @@ impl Scene {
                         density.clamp(0.0, 1.0)
                     }
                 };
-                background.fog_params = [
+                let fog_params = [
                     1.0,
                     environment.fog_background_enabled as u8 as f32,
                     normalized_density(environment.fog_density_near),
@@ -2725,43 +2842,96 @@ impl Scene {
                 ];
                 let near = environment.fog_distance_near.max(0.0) as f32;
                 let far = environment.fog_distance_far.max(near as f64 + 1e-6) as f32;
-                background.fog_distances = [near, far, 0.0, 0.0];
+                let fog_distances = [near, far, 0.0, 0.0];
+                result.fog = Some((fog_color, fog_params, fog_distances));
             }
-            if background.environment.is_none() && environment.environment_image_enabled {
+            if environment.environment_image_enabled {
                 if let Some(image) = self.background_image(&environment.environment_image_filename) {
-                    background.environment_params = [1.0, 0.0, 0.25, 0.35];
-                    background.environment = Some(image);
+                    result.environment = Some(([1.0, 0.0, 0.25, 0.35], image));
                 }
             }
         }
 
-        if background.environment.is_some() {
-            return;
-        }
-        let preset = self
-            .document
-            .objects
-            .iter()
-            .filter_map(|(handle, object)| match object {
-                ObjectType::ClassObject(value) => {
-                    let settings = match &value.data {
-                        ClassObjectData::RenderSettings(settings) => settings,
-                        ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
-                        ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
-                        _ => return None,
-                    };
-                    (settings.environment_image_enabled
-                        && !settings.environment_image_filename.is_empty())
-                        .then_some((*handle, settings))
-                }
-                _ => None,
-            })
-            .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
-            .map(|(_, settings)| settings);
+        let preset = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
+            crate::entities::object_data::render_settings(&self.object_data_cache)
+                .iter()
+                .filter_map(|handle| match self.document.objects.get(handle) {
+                    Some(ObjectType::ClassObject(value)) => {
+                        let settings = match &value.data {
+                            ClassObjectData::RenderSettings(settings) => settings,
+                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
+                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
+                            _ => return None,
+                        };
+                        (settings.environment_image_enabled
+                            && !settings.environment_image_filename.is_empty())
+                            .then_some((*handle, settings))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
+                .map(|(_, settings)| settings)
+        } else {
+            self.document
+                .objects
+                .iter()
+                .filter_map(|(handle, object)| match object {
+                    ObjectType::ClassObject(value) => {
+                        let settings = match &value.data {
+                            ClassObjectData::RenderSettings(settings) => settings,
+                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
+                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
+                            _ => return None,
+                        };
+                        (settings.environment_image_enabled
+                            && !settings.environment_image_filename.is_empty())
+                            .then_some((*handle, settings))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
+                .map(|(_, settings)| settings)
+        };
+
         if let Some(settings) = preset {
             if let Some(image) = self.background_image(&settings.environment_image_filename) {
-                background.environment_params = [1.0, 0.0, 0.25, 0.35];
-                background.environment = Some(image);
+                result.preset_environment = Some(([1.0, 0.0, 0.25, 0.35], image));
+            }
+        }
+
+        result
+    }
+
+    fn apply_document_render_environment(
+        &self,
+        background: &mut ViewportBackgroundSettings,
+    ) {
+        let key = (self.geometry_epoch, self.document.objects.len());
+        let needs_build = match self.document_render_env_cache.borrow().as_ref() {
+            Some((epoch, len, _)) => *epoch != key.0 || *len != key.1,
+            None => true,
+        };
+        if needs_build {
+            let env = self.resolve_document_render_environment();
+            *self.document_render_env_cache.borrow_mut() = Some((key.0, key.1, env));
+        }
+
+        let cache = self.document_render_env_cache.borrow();
+        let (_, _, env) = cache.as_ref().unwrap();
+
+        if let Some((color, params, distances)) = env.fog {
+            background.fog_color = color;
+            background.fog_params = params;
+            background.fog_distances = distances;
+        }
+
+        if background.environment.is_none() {
+            if let Some((params, image)) = &env.environment {
+                background.environment_params = *params;
+                background.environment = Some(image.clone());
+            } else if let Some((params, image)) = &env.preset_environment {
+                background.environment_params = *params;
+                background.environment = Some(image.clone());
             }
         }
     }
@@ -3956,7 +4126,7 @@ impl Scene {
     /// Model layout → one full-window viewport (more once tiled); paper
     /// layout → one viewport per floating content viewport. Each entry is
     /// rendered into its own screen rectangle by its own inner pipeline.
-    pub(in crate::scene) fn build_viewports(
+    pub fn build_viewports(
         &self,
         bounds: Rectangle,
         model_render_mode: acadrust::entities::ViewportRenderMode,
@@ -4209,11 +4379,30 @@ impl Scene {
                 // mark it `None` and use the base set directly instead of
                 // duplicating it (#358). The base Arc itself must not be
                 // stored in the cache (see the `split_cache` field docs).
-                let (fa, oa) = if base_arc.iter().any(|w| is_face3d_wire(w, &self.document)) {
-                    let (f, o) = split_face3d_wires(&base_arc, &self.document);
-                    (Arc::new(f), Some(Arc::new(o)))
-                } else {
+                let (fa, oa) = if !self.has_face3d() {
                     (Arc::new(Vec::new()), None)
+                } else {
+                    let face3d_handles: rustc_hash::FxHashSet<u64> = self
+                        .document
+                        .entities()
+                        .filter_map(|e| match e {
+                            EntityType::Face3D(f) => Some(f.common.handle.value()),
+                            _ => None,
+                        })
+                        .collect();
+                    if face3d_handles.is_empty() {
+                        (Arc::new(Vec::new()), None)
+                    } else if base_arc.iter().any(|w| {
+                        w.name
+                            .parse::<u64>()
+                            .ok()
+                            .is_some_and(|v| face3d_handles.contains(&v))
+                    }) {
+                        let (f, o) = split_face3d_wires_with_handles(&base_arc, &face3d_handles);
+                        (Arc::new(f), Some(Arc::new(o)))
+                    } else {
+                        (Arc::new(Vec::new()), None)
+                    }
                 };
                 let mut c = self.split_cache.borrow_mut();
                 // Ids change on rebuild, so old keys die naturally; the cap
@@ -4720,6 +4909,7 @@ pub(crate) fn resolve_pattern(
 
 /// Whether a wire belongs to a Face3D entity, by document handle lookup —
 /// so no changes to WireModel are needed.
+#[allow(dead_code)]
 fn is_face3d_wire(w: &WireModel, document: &acadrust::CadDocument) -> bool {
     w.name
         .parse::<u64>()
@@ -4732,14 +4922,38 @@ fn is_face3d_wire(w: &WireModel, document: &acadrust::CadDocument) -> bool {
 /// Partition a wire list into (face3d_wires, other_wires).
 ///
 /// O(N) per geometry epoch — acceptable since it runs once per epoch.
+#[allow(dead_code)]
 fn split_face3d_wires(
     wires: &[WireModel],
     document: &acadrust::CadDocument,
 ) -> (Vec<WireModel>, Vec<WireModel>) {
+    let face3d_handles: rustc_hash::FxHashSet<u64> = document
+        .entities()
+        .filter_map(|e| match e {
+            EntityType::Face3D(f) => Some(f.common.handle.value()),
+            _ => None,
+        })
+        .collect();
+    split_face3d_wires_with_handles(wires, &face3d_handles)
+}
+
+/// Partition a wire list into (face3d_wires, other_wires) using pre-indexed Face3D handle values.
+fn split_face3d_wires_with_handles(
+    wires: &[WireModel],
+    face3d_handles: &rustc_hash::FxHashSet<u64>,
+) -> (Vec<WireModel>, Vec<WireModel>) {
     let mut face3d = Vec::new();
     let mut others = Vec::new();
     for w in wires {
-        if is_face3d_wire(w, document) {
+        let is_face = if face3d_handles.is_empty() {
+            false
+        } else {
+            w.name
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|v| face3d_handles.contains(&v))
+        };
+        if is_face {
             face3d.push(w.clone());
         } else {
             others.push(w.clone());
@@ -4870,5 +5084,199 @@ mod layer0_inherit_tests {
         entity.common_mut().transparency = Transparency::OPAQUE;
         let color = resolve(&d, &entity, [0.2, 0.4, 0.6, 0.25]);
         assert_eq!(color[3], 1.0);
+    }
+
+    #[test]
+    fn render_environment_caching_and_face3d_fast_path() {
+        let mut scene = Scene::new();
+        assert!(!scene.has_face3d());
+
+        scene.add_entity(EntityType::Line(acadrust::entities::Line::from_points(
+            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+        )));
+        assert!(!scene.has_face3d());
+
+        let mut bg = ViewportBackgroundSettings::canvas([0.1, 0.1, 0.1, 1.0]);
+        scene.apply_document_render_environment(&mut bg);
+        assert!(scene.document_render_env_cache.borrow().is_some());
+
+        let (epoch, len, _) = scene.document_render_env_cache.borrow().clone().unwrap();
+        assert_eq!(epoch, scene.geometry_epoch);
+        assert_eq!(len, scene.document.objects.len());
+
+        let mut bg2 = ViewportBackgroundSettings::canvas([0.2, 0.2, 0.2, 1.0]);
+        scene.apply_document_render_environment(&mut bg2);
+        assert_eq!(bg.fog_params, bg2.fog_params);
+
+        // Test multiple Face3D additions and removals
+        let face1 = acadrust::entities::Face3D::new(
+            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+            acadrust::types::Vector3::new(0.0, 10.0, 0.0),
+        );
+        let face2 = acadrust::entities::Face3D::new(
+            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(20.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(20.0, 10.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+        );
+        let fh1 = scene.add_entity(EntityType::Face3D(face1));
+        assert!(scene.has_face3d());
+        let fh2 = scene.add_entity(EntityType::Face3D(face2));
+        assert!(scene.has_face3d());
+
+        // Removing 1 of 2 faces must leave has_face3d() true!
+        scene.document.remove_entity(fh1);
+        scene.bump_entities(&[(fh1, crate::scene::ChangeKind::Removed)]);
+        assert!(scene.has_face3d(), "has_face3d must remain true while fh2 still exists");
+
+        // Removing the 2nd face must update has_face3d() to false.
+        scene.document.remove_entity(fh2);
+        scene.bump_entities(&[(fh2, crate::scene::ChangeKind::Removed)]);
+        assert!(!scene.has_face3d(), "has_face3d must become false when all Face3Ds are removed");
+
+        // bump_geometry_no_blocks must also invalidate has_face3d
+        let fh3 = scene.add_entity(EntityType::Face3D(acadrust::entities::Face3D::new(
+            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(1.0, 1.0, 1.0),
+            acadrust::types::Vector3::new(2.0, 2.0, 2.0),
+            acadrust::types::Vector3::new(3.0, 3.0, 3.0),
+        )));
+        assert!(scene.has_face3d());
+        scene.document.remove_entity(fh3);
+        scene.bump_geometry_no_blocks();
+        assert!(!scene.has_face3d(), "bump_geometry_no_blocks must invalidate has_face3d");
+    }
+
+    #[test]
+    fn split_face3d_wires_correctness_and_parity() {
+        let mut doc = acadrust::CadDocument::new();
+        let face = acadrust::entities::Face3D::new(
+            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+            acadrust::types::Vector3::new(0.0, 10.0, 0.0),
+        );
+        let face_h = doc.add_entity(EntityType::Face3D(face)).unwrap();
+
+        let line = acadrust::entities::Line::from_points(
+            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+            acadrust::types::Vector3::new(5.0, 5.0, 0.0),
+        );
+        let line_h = doc.add_entity(EntityType::Line(line)).unwrap();
+
+        let mut w_face = WireModel::default();
+        w_face.name = face_h.value().to_string();
+
+        let mut w_line = WireModel::default();
+        w_line.name = line_h.value().to_string();
+
+        let mut w_other = WireModel::default();
+        w_other.name = "grid_wire".to_string();
+
+        let wires = vec![w_face.clone(), w_line.clone(), w_other.clone()];
+
+        // Compare legacy split_face3d_wires with optimized split_face3d_wires_with_handles
+        let (f1, o1) = split_face3d_wires(&wires, &doc);
+
+        let face3d_handles: rustc_hash::FxHashSet<u64> = doc
+            .entities()
+            .filter_map(|e| match e {
+                EntityType::Face3D(f) => Some(f.common.handle.value()),
+                _ => None,
+            })
+            .collect();
+        let (f2, o2) = split_face3d_wires_with_handles(&wires, &face3d_handles);
+
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f1[0].name, face_h.value().to_string());
+        assert_eq!(f2[0].name, face_h.value().to_string());
+
+        assert_eq!(o1.len(), 2);
+        assert_eq!(o2.len(), 2);
+        assert_eq!(o1[0].name, line_h.value().to_string());
+        assert_eq!(o2[0].name, line_h.value().to_string());
+        assert_eq!(o1[1].name, "grid_wire");
+        assert_eq!(o2[1].name, "grid_wire");
+
+        // When no Face3D handles exist, split_face3d_wires_with_handles returns empty face3d
+        let empty_set = rustc_hash::FxHashSet::default();
+        let (f_empty, o_empty) = split_face3d_wires_with_handles(&wires, &empty_set);
+        assert!(f_empty.is_empty());
+        assert_eq!(o_empty.len(), wires.len());
+    }
+
+    #[test]
+    fn background_image_cache_correctness() {
+        let scene = Scene::new();
+        // Empty reference returns None immediately without caching
+        assert!(scene.background_image("").is_none());
+        assert!(scene.background_image("   ").is_none());
+        assert!(scene.background_image_cache.borrow().is_empty());
+
+        // Non-existent file returns None and is cached to avoid repeated disk checks
+        let missing = "non_existent_background_image_test_file.png";
+        assert!(scene.background_image(missing).is_none());
+        assert!(scene.background_image_cache.borrow().contains_key(missing));
+        assert!(scene.background_image_cache.borrow().get(missing).unwrap().is_none());
+
+        // Second call hits cache
+        assert!(scene.background_image(missing).is_none());
+
+        // Invalidation clears background image cache
+        scene.invalidate_render_environment_cache();
+        assert!(scene.background_image_cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn render_environment_objects_cache_and_apply() {
+        let mut scene = Scene::new();
+
+        let mut renv = acadrust::objects::RenderEnvironment::default();
+        renv.fog_enabled = true;
+        renv.fog_color = [100, 150, 200];
+        renv.fog_background_enabled = true;
+        renv.fog_density_near = 25.0;
+        renv.fog_density_far = 75.0;
+        renv.fog_distance_near = 10.0;
+        renv.fog_distance_far = 100.0;
+
+        let handle = Handle::new(42);
+        scene.document.objects.insert(
+            handle,
+            acadrust::objects::ObjectType::ClassObject(acadrust::objects::ClassObject::new(
+                acadrust::objects::ClassObjectData::RenderEnvironment(renv),
+            )),
+        );
+        scene.object_data_cache = crate::entities::object_data::build_cache(&scene.document);
+        assert_eq!(
+            crate::entities::object_data::render_environments(&scene.object_data_cache),
+            &[handle]
+        );
+
+        let mut bg = ViewportBackgroundSettings::canvas([0.0, 0.0, 0.0, 1.0]);
+        scene.apply_document_render_environment(&mut bg);
+
+        // Fog color correctly converted to 0..1
+        assert!((bg.fog_color[0] - 100.0 / 255.0).abs() < 1e-5);
+        assert!((bg.fog_color[1] - 150.0 / 255.0).abs() < 1e-5);
+        assert!((bg.fog_color[2] - 200.0 / 255.0).abs() < 1e-5);
+        assert_eq!(bg.fog_color[3], 1.0);
+
+        // Fog params
+        assert_eq!(bg.fog_params[0], 1.0); // fog enabled
+        assert_eq!(bg.fog_params[1], 1.0); // fog background enabled
+        assert!((bg.fog_params[2] - 0.25).abs() < 1e-5); // near density 25% -> 0.25
+        assert!((bg.fog_params[3] - 0.75).abs() < 1e-5); // far density 75% -> 0.75
+
+        // Fog distances
+        assert_eq!(bg.fog_distances[0], 10.0);
+        assert_eq!(bg.fog_distances[1], 100.0);
+
+        // Cache must be populated
+        assert!(scene.document_render_env_cache.borrow().is_some());
     }
 }

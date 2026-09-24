@@ -22,6 +22,7 @@ impl OpenCADStudio {
             Some(K::LayerStateManager) => crate::tr!("modal", "layer-state-manager"),
             Some(K::LayerTranslator) => crate::t!("Layer Translator").into_owned(),
             Some(K::DrawingUnits) => crate::t!("Drawing Units").into_owned(),
+            Some(K::BlockDefinition) => crate::t!("Block Definition").into_owned(),
             Some(K::GeometricTolerance) => crate::t!("Geometric Tolerance").into_owned(),
             Some(K::DraftingSettings) => crate::t!("Drafting Settings").into_owned(),
             Some(K::AutoConstrainSettings) => crate::t!("Constraint Settings").into_owned(),
@@ -67,7 +68,7 @@ impl OpenCADStudio {
         sized_flow(
             extra,
             940,
-            620,
+            690,
             |flow| {
                 crate::ui::window::plot::view_window(
                     &self.plot_dialog,
@@ -264,7 +265,10 @@ impl OpenCADStudio {
                     },
                 )
             }
-            super::super::ModalKind::Options => sized_flow(
+            super::super::ModalKind::Options => {
+                let dirty = self.options_dirty();
+                let close_confirm = self.options_close_confirm;
+                sized_flow(
                 ex,
                 880,
                 620,
@@ -288,6 +292,7 @@ impl OpenCADStudio {
                         crate::ui::window::options::AppPrefs {
                             savetime_min: self.savetime_min,
                             backup_on_save: self.backup_on_save,
+                            page_setup_on_new_layout: self.plot_dialog.page_setup_on_new_layout,
                             textfill: crate::scene::text::sdf_atlas::textfill(),
                             cliprompt_lines: self.cliprompt_lines,
                             commandline_fade_ms: self.commandline_fade_ms,
@@ -360,10 +365,13 @@ impl OpenCADStudio {
                         &self.paper_bg_input,
                         &self.desk_bg_input,
                         self.bg_picker,
+                        dirty,
+                        close_confirm,
                         flow,
                     )
                 },
-            ),
+                )
+            }
             super::super::ModalKind::DraftingSettings => {
                 let state = self.drafting_settings_state.as_ref();
                 let dirty = self.drafting_settings_dirty();
@@ -490,6 +498,12 @@ impl OpenCADStudio {
                 let state = self.drawing_units.as_ref()?;
                 sized_flow(ex, 560, 420, |flow| {
                     crate::ui::window::drawing_units::view_window(state, flow)
+                })
+            }
+            super::super::ModalKind::BlockDefinition => {
+                let state = self.block_definition.as_ref()?;
+                sized_flow(ex, 580, 390, |flow| {
+                    crate::ui::window::block_definition::view_window(state, flow)
                 })
             }
             super::super::ModalKind::GeometricTolerance => {

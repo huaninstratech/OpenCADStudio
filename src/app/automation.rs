@@ -337,6 +337,8 @@ impl OpenCADStudio {
         // selection check has to run on this path too.
         #[cfg(not(target_arch = "wasm32"))]
         self.notify_plugins_selection_changed();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.notify_plugins_document_changed();
         res
     }
 
@@ -383,6 +385,8 @@ impl OpenCADStudio {
                         let i = self.active_tab;
                         self.tabs[i].scene.clear();
                         self.tabs[i].scene.document = doc;
+                        self.tabs[i].scene.bump_layout_epoch();
+                        self.tabs[i].scene.bump_scale_epoch();
                         self.tabs[i].scene.load_named_parameters_from_document();
                         self.tabs[i]
                             .scene
@@ -416,6 +420,14 @@ impl OpenCADStudio {
                 let i = self.active_tab;
                 let before = self.tabs[i].scene.document.entities().count();
                 let error_revision = self.command_line.error_revision;
+                // Surfaces that are already open belong to an earlier line (or
+                // another tab, or startup). Only what *this* line left open is
+                // reported as a blocker, otherwise a finished command would keep
+                // answering `waiting_input` because of someone else's editor and
+                // a caller polling for `completed` would never get there.
+                let editor_before = self.text_inline.is_some();
+                let mtext_before = self.mtext_editor.is_some();
+                let modal_before = self.active_modal.is_some();
                 if let Err(error) = self.run_headless(&cmd) {
                     return err(error);
                 }
@@ -423,12 +435,32 @@ impl OpenCADStudio {
                     return err(self.command_line.last_error.clone().unwrap_or_default());
                 }
                 let after = self.tabs[i].scene.document.entities().count();
+                // A command can finish with an interactive surface still open:
+                // the in-place text editor (the `TEXT` content step), the MTEXT
+                // editor, or a modal. Reporting `completed` there hides the fact
+                // that nothing was committed, so reuse the `waiting_input`
+                // vocabulary and name the blocker.
+                let blocked_by: Option<String> = if self.tabs[i].active_cmd.is_some() {
+                    Some("command".to_string())
+                } else if let (false, Some(modal)) = (modal_before, self.active_modal.as_ref()) {
+                    Some(format!("modal:{modal:?}"))
+                } else if !editor_before && self.text_inline.is_some() {
+                    Some("text_editor".to_string())
+                } else if !mtext_before && self.mtext_editor.is_some() {
+                    Some("mtext_editor".to_string())
+                } else {
+                    None
+                };
                 json!({
                     "ok": true,
                     "cmd": cmd,
-                    "status": if self.tabs[i].active_cmd.is_some() { "waiting_input" } else { "completed" },
+                    "status": if blocked_by.is_some() { "waiting_input" } else { "completed" },
+                    "blocked_by": blocked_by,
                     "entities": after,
                     "added": after as i64 - before as i64,
+                    // Tokens no prompt ever asked for: leftover input is
+                    // reported rather than dropped on the floor.
+                    "unconsumed": self.command_line.unconsumed.clone(),
                 })
             }
             "entities" => self.entity_summary(),
@@ -873,6 +905,46 @@ impl OpenCADStudio {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clayer_command_sets_layer_used_by_new_geometry() {
+        let mut app = super::OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LAYER NEW Annotations"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"CLAYER Annotations"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        let lines = app.automation_op(r#"{"op":"query","type":"Line"}"#);
+        assert_eq!(lines["entities"][0]["layer"], "Annotations");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn built_in_edits_advance_plugin_document_fingerprint_once() {
+        let mut app = super::OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let before = app.last_plugin_document.expect("new drawing published");
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        let after = app.last_plugin_document.expect("line edit published");
+        assert_eq!(after.0, app.tabs[app.active_tab].id);
+        assert_ne!(after, before);
+        assert_eq!(after.1, app.tabs[app.active_tab].scene.geometry_epoch);
+        app.automation_op(r#"{"op":"query","type":"Line"}"#);
+        assert_eq!(app.last_plugin_document, Some(after));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plugin_edit_publication_is_not_repeated_at_message_boundary() {
+        use acadrust::entities::Point;
+        use acadrust::EntityType;
+
+        let mut app = super::OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let tab = app.active_tab;
+        let mut host = super::super::plugin_host::HostSession::new(&mut app, tab);
+        host.add_entity(EntityType::Point(Point::new()));
+        let published = app.last_plugin_document.expect("plugin write published");
+        app.notify_plugins_document_changed();
+        assert_eq!(app.last_plugin_document, Some(published));
+    }
     use crate::app::OpenCADStudio;
     use serde_json::{json, Value};
 
@@ -907,6 +979,128 @@ mod tests {
         assert!(!app.layout_settling);
         drop(app.view_main());
         assert!(app.tabs[i].scene.last_tess_wires.get() > before);
+    }
+
+    #[test]
+    fn batch_text_line_creates_text_and_consumes_every_token() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        // Regression: the content token used to be dropped once the in-place
+        // editor took over, so this line created nothing while reporting ok.
+        let r = app.automation_op(r#"{"op":"run","cmd":"TEXT 0,0 5 0 hello"}"#);
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["status"], "completed", "{r}");
+        assert_eq!(r["added"], 1, "{r}");
+        assert_eq!(r["unconsumed"].as_array().map(|v| v.len()), Some(0), "{r}");
+
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert_eq!(counts["by_type"]["Text"], 1, "{counts}");
+        assert_eq!(counts["total"], 1, "no phantom entity: {counts}");
+        assert_eq!(assert_one_text(&app), "hello");
+    }
+
+    #[test]
+    fn multi_word_text_keeps_the_spaces() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        let r = app.automation_op(r#"{"op":"run","cmd":"TEXT 0,0 5 0 hello world"}"#);
+        assert_eq!(r["status"], "completed", "{r}");
+        assert_eq!(r["added"], 1, "{r}");
+        assert_eq!(r["unconsumed"].as_array().map(|v| v.len()), Some(0), "{r}");
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert_eq!(counts["by_type"]["Text"], 1, "{counts}");
+
+        // The spaces between the words have to survive the token split, and the
+        // whole tail (not just its first token) has to land in the entity — an
+        // off-by-one in the consumed index would still pass the checks above.
+        assert_eq!(assert_one_text(&app), "hello world");
+    }
+
+    #[test]
+    fn a_stray_editor_is_not_hijacked_by_the_next_line() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        // Line 1 stops at the content step and leaves the editor open.
+        let r = app.automation_op(r#"{"op":"run","cmd":"TEXT 30,0 5 0"}"#);
+        assert_eq!(r["blocked_by"], "text_editor", "{r}");
+
+        // Line 2 must not type its leftover token into that unrelated editor,
+        // and — since line 2 did not open anything itself — it must not inherit
+        // line 1's blocker either: a caller that polls for `completed` would
+        // otherwise never get there.
+        let r = app.automation_op(r#"{"op":"run","cmd":"CIRCLE 0,0 5 9"}"#);
+        assert_eq!(r["added"], 1, "{r}");
+        assert_eq!(r["unconsumed"][0], "9", "{r}");
+        assert_eq!(r["blocked_by"], serde_json::Value::Null, "{r}");
+        assert_eq!(r["status"], "completed", "{r}");
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert_eq!(counts["by_type"]["Circle"], 1, "{counts}");
+        assert!(
+            counts["by_type"].get("Text").is_none(),
+            "phantom text from stray editor: {counts}"
+        );
+    }
+
+    #[test]
+    fn run_reports_leftover_tokens_instead_of_dropping_them() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        // The radius step ends the command, so the extra token is never asked for.
+        let r = app.automation_op(r#"{"op":"run","cmd":"CIRCLE 0,0 5 9"}"#);
+        assert_eq!(r["added"], 1, "{r}");
+        assert_eq!(r["unconsumed"][0], "9", "{r}");
+
+        // A fully consumed line reports nothing left over.
+        let r = app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,10"}"#);
+        assert_eq!(r["unconsumed"].as_array().map(|v| v.len()), Some(0), "{r}");
+    }
+
+    #[test]
+    fn text_without_content_reports_the_open_editor() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        let r = app.automation_op(r#"{"op":"run","cmd":"TEXT 0,0 5 0"}"#);
+        assert_eq!(r["status"], "waiting_input", "{r}");
+        assert_eq!(r["blocked_by"], "text_editor", "{r}");
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert_eq!(counts["total"], 0, "{counts}");
+
+        // The same editor can be finished through the control-surface messages.
+        let _ = app.update(crate::app::Message::TextInlineInput("hello".into()));
+        let _ = app.update(crate::app::Message::TextInlineOk);
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert_eq!(counts["by_type"]["Text"], 1, "{counts}");
+    }
+
+    #[test]
+    fn a_command_still_waiting_is_named_as_the_blocker() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        let r = app.automation_op(r#"{"op":"run","cmd":"LINE"}"#);
+        assert_eq!(r["status"], "waiting_input", "{r}");
+        assert_eq!(r["blocked_by"], "command", "{r}");
+    }
+
+    /// The text of the single `Text` entity in the drawing (panics otherwise).
+    fn assert_one_text(app: &OpenCADStudio) -> String {
+        let i = app.active_tab;
+        let texts: Vec<String> = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .filter_map(|e| match e {
+                acadrust::EntityType::Text(t) => Some(t.value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "expected exactly one Text entity, got {texts:?}");
+        texts.into_iter().next().unwrap()
     }
 
     #[test]

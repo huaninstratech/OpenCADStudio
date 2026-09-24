@@ -35,6 +35,47 @@ fn pt_pt_d2(a: Point, b: Point) -> f32 {
     (a.x - b.x).powi(2) + (a.y - b.y).powi(2)
 }
 
+/// What one scroll delta asks the viewport to do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScrollIntent {
+    /// Wheel notches to zoom by; positive zooms in.
+    Zoom { notches: f32 },
+    /// Trackpad movement to pan by, in screen pixels.
+    ///
+    /// Built only where a pixel delta can only mean a trackpad, so it has no
+    /// constructor on the other targets.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Pan { dx: f32, dy: f32 },
+}
+
+/// A wheel notch zooms; a trackpad's two fingers pan.
+///
+/// A wheel reports notches, a precise-scrolling device reports pixels, and that
+/// is the whole distinction — there is no modifier to check and no setting to
+/// read. The pixels only mean "trackpad" on macOS: the browser build reports
+/// every wheel notch as pixels too, so everywhere else they keep zooming.
+fn scroll_intent(delta: mouse::ScrollDelta) -> ScrollIntent {
+    match delta {
+        // Both axes go straight through: the two-finger gesture moves the
+        // drawing the same way the middle-button drag moves it. If a pan ever
+        // comes out mirrored, this is the line.
+        #[cfg(target_os = "macos")]
+        mouse::ScrollDelta::Pixels { x, y } => ScrollIntent::Pan { dx: x, dy: y },
+        #[cfg(not(target_os = "macos"))]
+        mouse::ScrollDelta::Pixels { y, .. } => ScrollIntent::Zoom { notches: y * 0.01 },
+        mouse::ScrollDelta::Lines { y, .. } => ScrollIntent::Zoom { notches: y },
+    }
+}
+
+/// The camera step that pinches the view 1:1 with the fingers, from AppKit's
+/// magnification delta (0.05 = the fingers moved 5% further apart).
+///
+/// AppKit reports the increment of a scale factor, and a 5% wider pinch has to
+/// leave the view 5% closer, so the step solves `1 - step / 10 = 1 / (1 + m)`.
+fn pinch_zoom_steps(magnification: f32) -> f32 {
+    10.0 * magnification / (1.0 + magnification)
+}
+
 /// Whether a command point keeps the elevation of its snap instead of being
 /// clamped to the world XY plane.
 ///
@@ -785,6 +826,8 @@ impl OpenCADStudio {
     pub(super) fn on_tick(&mut self, t: Instant) -> Task<Message> {
         let i = self.active_tab;
         self.tabs[i].scene.update(t - self.start);
+        // Dynamic dimensions keep their screen size across zoom bands.
+        self.tabs[i].scene.refresh_dynamic_dimension_scales(false);
 
         // If the camera moved since we last synced, write it back to
         // the document and mark the file dirty.
@@ -1158,36 +1201,9 @@ impl OpenCADStudio {
                         return Task::none();
                     }
                 }
-                // Pan scale uses the active tile's size (ortho size
-                // is relative to viewport height), so a tiled pane
-                // pans at the correct rate.
-                let bounds = self.tabs[i]
-                    .scene
-                    .active_model_tile_bounds(vp_size.0, vp_size.1);
                 // Drop `sel` before calling mutable scene methods.
                 drop(sel);
-                if self.tabs[i].scene.active_viewport.is_some() {
-                    self.tabs[i].scene.pan_active_viewport(dx, dy, bounds);
-                    // Bump so the GPU re-uploads the viewport's re-culled
-                    // wire set — otherwise newly-revealed lines stay
-                    // invisible until MSPACE is exited.
-                    self.tabs[i].scene.camera_generation += 1;
-                } else {
-                    // `bounds` is the active tile; pan by its height so
-                    // the point under the cursor tracks correctly.
-                    self.tabs[i]
-                        .scene
-                        .camera
-                        .borrow_mut()
-                        .pan_screen(dx, dy, bounds.height);
-                    self.tabs[i].scene.camera_generation += 1;
-                    // Keep an in-progress box selection pinned to the
-                    // drawing as the view pans under it (#234).
-                    self.reproject_box_anchor(i, vp_size.0, vp_size.1);
-                }
-                self.tabs[i]
-                    .scene
-                    .record_nav_perf(crate::scene::NavPerfOp::Pan, move_started);
+                self.pan_active_view(i, dx, dy, move_started);
                 self.tabs[i].scene.selection.borrow_mut().middle_last_pos = Some(p);
                 return Task::none();
             }
@@ -1494,6 +1510,7 @@ impl OpenCADStudio {
                 Some((base, dir))
             });
             self.otrack_active = otrack_hit.map(|hit| (hit.base, hit.dir)).or(drafting_guide);
+            self.otrack_cross = otrack_hit.and_then(|hit| hit.cross);
 
             self.otrack_kind = otrack_hit.map(|hit| hit.kind);
 
@@ -2275,6 +2292,7 @@ impl OpenCADStudio {
                 None
             };
             self.otrack_active = otrack_hit.map(|h| (h.base, h.dir));
+            self.otrack_cross = otrack_hit.and_then(|h| h.cross);
             self.otrack_kind = otrack_hit.map(|h| h.kind);
 
             // Parallel snap: with nothing else snapped or tracked, lock
@@ -2293,6 +2311,7 @@ impl OpenCADStudio {
                         (self.last_point, self.snapper.parallel_ref)
                     {
                         self.otrack_active = Some((base, dir.as_dvec3()));
+                        self.otrack_cross = None;
                     }
                     self.tabs[i].snap_result = Some(par);
                 }
@@ -5175,6 +5194,15 @@ properties={:.1}ms picked={}",
                     {
                         return Task::none();
                     }
+                    // A constraint dimension edits its parameter from the
+                    // command line, standing in for the reference's in-place
+                    // value editor.
+                    if let Some(prompt) = self.dynamic_dimension_value_command(i, handle) {
+                        use crate::command::CadCommand;
+                        self.command_line.push_info(&prompt.prompt());
+                        self.tabs[i].active_cmd = Some(Box::new(prompt));
+                        return Task::none();
+                    }
                     // Any text-bearing entity opens its in-place editor
                     // (plain box or rich MText editor, per type). A
                     // Leader resolves to the entity it annotates.
@@ -5445,16 +5473,74 @@ properties={:.1}ms picked={}",
         Task::none()
     }
 
+    /// A wheel notch zooms; a trackpad's two fingers pan. Which one a delta
+    /// means is `scroll_intent`'s call.
     pub(super) fn on_viewport_scroll(&mut self, delta: mouse::ScrollDelta) -> Task<Message> {
-        let nav_started = Instant::now();
-        let mut s = match delta {
-            mouse::ScrollDelta::Lines { y, .. } => y,
-            mouse::ScrollDelta::Pixels { y, .. } => y * 0.01,
-        };
-        s *= self.zoom_factor as f32 / 60.0;
-        if self.zoom_wheel_reversed {
-            s = -s;
+        match scroll_intent(delta) {
+            ScrollIntent::Zoom { notches } => {
+                let mut s = notches * self.zoom_factor as f32 / 60.0;
+                if self.zoom_wheel_reversed {
+                    s = -s;
+                }
+                self.zoom_view_at_cursor(s)
+            }
+            ScrollIntent::Pan { dx, dy } => {
+                let i = self.active_tab;
+                self.tabs[i].scene.remember_current_view();
+                self.clear_navigation_hover(i);
+                self.pan_active_view(i, dx, dy, Instant::now());
+                self.arm_hover_after_navigation(i);
+                Task::none()
+            }
         }
+    }
+
+    /// Pinch the active view to zoom, as reported by the trackpad monitor
+    /// (`src/input/trackpad.rs`). The pivot is the cursor, like the wheel, and
+    /// the direction is the fingers' own, so ZOOMWHEEL does not apply to it.
+    pub(super) fn on_pinch_zoom(&mut self, magnification: f32) -> Task<Message> {
+        if magnification == 0.0 {
+            return Task::none();
+        }
+        self.zoom_view_at_cursor(pinch_zoom_steps(magnification))
+    }
+
+    /// Pan the active view by `dx`/`dy` screen pixels: the body shared by the
+    /// middle-button drag and the two-finger gesture.
+    fn pan_active_view(&mut self, i: usize, dx: f32, dy: f32, started: Instant) {
+        // Pan scale uses the active tile's size (ortho size is relative to
+        // viewport height), so a tiled pane pans at the correct rate.
+        let (vw, vh) = self.tabs[i].scene.selection.borrow().vp_size;
+        let bounds = self.tabs[i].scene.active_model_tile_bounds(vw, vh);
+        if self.tabs[i].scene.active_viewport.is_some() {
+            self.tabs[i].scene.pan_active_viewport(dx, dy, bounds);
+            // Bump so the GPU re-uploads the viewport's re-culled wire set —
+            // otherwise newly-revealed lines stay invisible until MSPACE is
+            // exited.
+            self.tabs[i].scene.camera_generation += 1;
+        } else {
+            // `bounds` is the active tile; pan by its height so the point
+            // under the cursor tracks correctly.
+            self.tabs[i]
+                .scene
+                .camera
+                .borrow_mut()
+                .pan_screen(dx, dy, bounds.height);
+            self.tabs[i].scene.camera_generation += 1;
+            // Keep an in-progress box selection pinned to the drawing as the
+            // view pans under it (#234).
+            self.reproject_box_anchor(i, vw, vh);
+        }
+        self.tabs[i]
+            .scene
+            .record_nav_perf(crate::scene::NavPerfOp::Pan, started);
+    }
+
+    /// Zoom the active view by `s`, in the camera's own units
+    /// (`Camera::zoom`: `distance *= 1 - s / 10`). Shared by the wheel and
+    /// the pinch.
+    fn zoom_view_at_cursor(&mut self, s: f32) -> Task<Message> {
+        let nav_started = Instant::now();
         let i = self.active_tab;
         self.tabs[i].scene.remember_current_view();
         self.clear_navigation_hover(i);
@@ -5631,9 +5717,10 @@ properties={:.1}ms picked={}",
         }
         let eye_dir = r_ucs.transform_vector3(region.snap_direction());
 
-        // Faces snap to a canonical upright orientation (never upside
-        // down); edges/corners keep the current up-sense so they spin
-        // smoothly around the clicked feature.
+        // Faces and edges/corners all snap deterministically (world +Z
+        // horizon, north +Y for top/bottom) so a cube click is repeatable
+        // and matches the turntable orbit; snap_to_direction preserves an
+        // intentional upside-down sense by sign-flipping only.
         let is_face = matches!(region, scene::CubeRegion::Face(_));
         if self.tabs[i].scene.active_viewport.is_some() {
             if is_face {
@@ -6133,7 +6220,7 @@ properties={:.1}ms picked={}",
             idx += 1;
         };
         self.push_undo_snapshot(i, "LAYOUT");
-        match self.tabs[i].scene.document.add_layout(&new_name) {
+        match self.tabs[i].scene.add_layout(&new_name) {
             Ok(_) => {
                 let layout_flags = i16::from(
                     self.tabs[i]
@@ -6167,6 +6254,12 @@ properties={:.1}ms picked={}",
                     crate::tf!("Layout \"{new_name}\" created — use MVIEW to add a viewport")
                         .as_ref(),
                 );
+                // The option that greets every new layout with its page setup.
+                let switch_task = if self.plot_dialog.page_setup_on_new_layout {
+                    Task::batch([switch_task, self.on_plot_dialog_open()])
+                } else {
+                    switch_task
+                };
                 self.tabs[i].dirty = true;
                 return Task::batch([cancel_task, switch_task]);
             }
@@ -6401,6 +6494,42 @@ properties={:.1}ms picked={}",
         Task::none()
     }
 
+}
+
+#[cfg(test)]
+mod scroll_intent_tests {
+    use super::{pinch_zoom_steps, scroll_intent, ScrollIntent};
+    use iced::mouse::ScrollDelta;
+
+    #[test]
+    fn wheel_notches_zoom() {
+        assert_eq!(
+            scroll_intent(ScrollDelta::Lines { x: 0.0, y: 1.0 }),
+            ScrollIntent::Zoom { notches: 1.0 }
+        );
+    }
+
+    /// Both axes of the gesture have to reach the pan, and the drawing has to
+    /// follow the fingers rather than run away from them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_finger_scroll_pans() {
+        assert_eq!(
+            scroll_intent(ScrollDelta::Pixels { x: 4.0, y: 6.0 }),
+            ScrollIntent::Pan { dx: 4.0, dy: 6.0 }
+        );
+    }
+
+    /// A pinch is a scale factor, so the view has to end up exactly that much
+    /// closer: fingers 5% apart divide the camera distance by 1.05.
+    #[test]
+    fn pinch_is_one_to_one() {
+        let zoom_after = 1.0 - pinch_zoom_steps(0.05) / 10.0;
+        assert!((zoom_after - 1.0 / 1.05).abs() < 1e-6, "{zoom_after}");
+        assert!(pinch_zoom_steps(-0.05) < 0.0, "pinching in zooms out");
+        // No pinch, no step: a zero delta must not divide the view away.
+        assert_eq!(pinch_zoom_steps(0.0), 0.0);
+    }
 }
 
 #[cfg(test)]
@@ -6761,6 +6890,48 @@ mod selection_preview_tests {
                 assert!((line.end - opposite).length() < 1e-5, "{line:?}");
             }
         }
+    }
+
+    #[test]
+    fn xline_direction_grip_drag_changes_direction() {
+        use acadrust::{types::Vector3, EntityType};
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().vp_size = (800.0, 600.0);
+        // Base away from the model origin so the UCS icon cannot swallow
+        // the press (it sits at the origin in a fresh drawing).
+        let handle = app.tabs[i].scene.add_entity(EntityType::XLine(
+            acadrust::entities::XLine::new(
+                Vector3::new(100.0, 50.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+        ));
+        app.tabs[i].scene.selected.insert(handle);
+        app.refresh_selected_grips();
+        assert_eq!(app.tabs[i].selected_grips.len(), 2);
+        // Press on grip 1 (direction handle) and drag it to point along +X.
+        let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let g1world = app.tabs[i].selected_grips[1].world;
+        let g1cursor = app.tabs[i].scene.camera.borrow().project(g1world, bounds).unwrap();
+        app.tabs[i].scene.selection.borrow_mut().last_move_pos =
+            Some(iced::Point::new(g1cursor.x, g1cursor.y));
+        let _ = app.on_viewport_left_press();
+        assert_eq!(
+            app.tabs[i].active_grip.as_ref().map(|g| g.grip_id),
+            Some(1),
+            "press on the direction grip must engage grip 1"
+        );
+        let dir_target = glam::DVec3::new(200.0, 50.0, 0.0);
+        let dir_cursor = app.tabs[i].scene.camera.borrow().project(dir_target, bounds).unwrap();
+        let _ = app.on_viewport_move(iced::Point::new(dir_cursor.x, dir_cursor.y));
+        let EntityType::XLine(moved) = app.tabs[i].scene.document.get_entity(handle).unwrap()
+        else { panic!("expected xline") };
+        assert!(
+            (moved.direction.x - 1.0).abs() < 1e-6 && moved.direction.y.abs() < 1e-6,
+            "direction grip drag must point the xline along +X, got {:?}",
+            moved.direction
+        );
     }
 
     #[test]

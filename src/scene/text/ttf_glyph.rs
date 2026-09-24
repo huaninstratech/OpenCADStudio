@@ -176,6 +176,42 @@ pub fn glyph(family: &str, ch: char) -> Option<Arc<Glyph>> {
     built
 }
 
+/// Font-unit → 9-unit-em-box factor: the whole em square maps onto the text
+/// height. This is how an SHX big font (`chineset.shx`, `hztxt.shx`, …)
+/// sizes its ideographs — a CJK glyph is as tall as the text height and one
+/// text height wide — so a TrueType glyph standing in for a missing big-font
+/// glyph must use the same box, not the Latin cap height. Cap-height scaling
+/// makes ideographs ~1.3–1.5× too big (1 em ≈ 1.3–1.5 cap heights in CJK
+/// fonts), so every line of substituted Chinese text ran past its frame.
+fn em_scale(face: &ttf_parser::Face) -> f32 {
+    CAP_UNITS / face.units_per_em().max(1) as f32
+}
+
+/// Ideographic / full-width characters: the ones a big font would supply and
+/// that sit on an em box rather than the Latin cap height.
+pub(crate) fn is_full_width(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11FF       // Hangul Jamo
+        | 0x2E80..=0x2FDF     // CJK / Kangxi radicals
+        | 0x2FF0..=0x303F     // ideographic description, CJK symbols & punctuation
+        | 0x3040..=0x30FF     // Hiragana, Katakana
+        | 0x3100..=0x312F     // Bopomofo
+        | 0x3130..=0x318F     // Hangul compatibility Jamo
+        | 0x3190..=0x31FF     // Kanbun, Bopomofo ext., CJK strokes, Katakana ext.
+        | 0x3200..=0x33FF     // enclosed CJK, CJK compatibility
+        | 0x3400..=0x4DBF     // CJK ext. A
+        | 0x4E00..=0x9FFF     // CJK unified ideographs
+        | 0xA960..=0xA97F     // Hangul Jamo ext. A
+        | 0xAC00..=0xD7FF     // Hangul syllables, Jamo ext. B
+        | 0xF900..=0xFAFF     // CJK compatibility ideographs
+        | 0xFE30..=0xFE4F     // CJK compatibility forms
+        | 0xFF01..=0xFF60     // full-width ASCII variants
+        | 0xFFE0..=0xFFE6     // full-width symbols
+        | 0x20000..=0x3FFFF   // CJK ext. B–H
+    )
+}
+
 /// Font-unit → 9-unit-cap-height factor for a parsed face. Cap height comes
 /// from the OS/2 table; absent, we approximate it as 0.7 × units-per-em.
 fn cap_scale(face: &ttf_parser::Face) -> f32 {
@@ -330,6 +366,125 @@ pub fn clear_fallback_cache() {
     crate::scene::text::sdf_atlas::reset_font_entries();
 }
 
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// A fallback that comes back with an id but no outline draws nothing while
+    /// believing it drew something: the stroke fonts hand every letter they
+    /// lack to this path, so on macOS a Cyrillic drawing came out blank.
+    #[test]
+    fn a_fallback_glyph_is_never_empty() {
+        for ch in ['Ğ', 'ş', 'б', 'Я', 'Ω', '中', 'A'] {
+            let Some(glyph) = fallback_glyph(ch) else {
+                continue; // no font on this host covers it at all
+            };
+            assert!(
+                !glyph.strokes.is_empty() || !glyph.fill_tris.is_empty(),
+                "'{ch}' resolved to a glyph with no outline"
+            );
+        }
+    }
+}
+
+/// Last-resort glyph for a character missing from a stroke (LFF) font: whatever
+/// this machine can draw it with, normalized to 9-unit cap height, or `None`
+/// when nothing installed has the character. Cached per character.
+///
+/// The result is a filled-outline glyph, so it visually differs from the
+/// surrounding single-stroke text — accepted as the price of covering scripts
+/// no stroke font provides.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
+    outline_from_fallback_face(ch).or_else(|| installed_family_glyph(ch))
+}
+
+/// Outline `ch` from a parsed face, in the 9-unit text space.
+///
+/// A fallback glyph stands in for a stroke / SHX font that lacks the character.
+/// For an ideograph that font would have been a big font, whose glyphs fill the
+/// text height — so size the substitute by its em box. Everything else keeps the
+/// cap-height normalisation that lines it up with the Latin stroke glyphs.
+#[cfg(not(target_arch = "wasm32"))]
+fn outline_char(face: &ttf_parser::Face, ch: char) -> Option<Glyph> {
+    let gid = face.glyph_index(ch)?;
+    let k = if is_full_width(ch) {
+        em_scale(face)
+    } else {
+        cap_scale(face)
+    };
+    let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f32 * k;
+    let mut fl = OutlineFlattener::new(k);
+    face.outline_glyph(gid, &mut fl);
+    fl.flush();
+    let fill_tris = triangulate_contours(&fl.contours);
+    Some(Glyph {
+        strokes: fl.contours,
+        advance,
+        fill_tris,
+    })
+}
+
+/// Outline `ch` from the face cosmic-text picks for it: it knows the platform's
+/// fallback order and shapes its way through ligatures and joining.
+///
+/// A face can answer with a glyph id and no outline at all — macOS's system font
+/// does, for every character, because ttf-parser reads no contours out of it —
+/// so an empty outline is not an answer and the caller has to keep looking.
+#[cfg(not(target_arch = "wasm32"))]
+fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
+    use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
+    let mut fs = font_system().lock().unwrap();
+    // Default family → cosmic's own fallback search chooses a covering font.
+    let attrs = Attrs::new();
+    let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
+    buf.set_size(&mut fs, None, None);
+    let s = ch.to_string();
+    buf.set_text(&mut fs, &s, &attrs, Shaping::Advanced, None);
+    buf.shape_until_scroll(&mut fs, false);
+
+    for run in buf.layout_runs() {
+        for g in run.glyphs.iter() {
+            if g.glyph_id == 0 {
+                continue; // .notdef — this font doesn't really cover it
+            }
+            let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
+            let font = fs.get_font(g.font_id, g.font_weight)?;
+            let face = ttf_parser::Face::parse(font.data(), face_index).ok()?;
+            let Some(glyph) = outline_char(&face, ch) else {
+                continue;
+            };
+            if glyph.strokes.is_empty() && glyph.fill_tris.is_empty() {
+                continue;
+            }
+            return Some(Arc::new(glyph));
+        }
+    }
+    None
+}
+
+/// The first installed family that actually draws `ch` — the net under
+/// cosmic-text, whose fallback list is the platform's own handful of names (on
+/// macOS: `.SF NS`, `Menlo`, `Apple Color Emoji`, `Geneva`, `Arial Unicode MS`)
+/// and covers neither Cyrillic nor Greek, however many fonts the machine has
+/// that do.
+#[cfg(not(target_arch = "wasm32"))]
+fn installed_family_glyph(ch: char) -> Option<Arc<Glyph>> {
+    crate::scene::text::sysfont::families()
+        .iter()
+        .find_map(|family| {
+            let glyph = sysfont::with_face_data(family, |data, index| {
+                let face = ttf_parser::Face::parse(data, index).ok()?;
+                outline_char(&face, ch)
+            })
+            .flatten()?;
+            // A face that yields no outline (the system font, a space) is not a
+            // font that draws this character.
+            (!glyph.strokes.is_empty() || !glyph.fill_tris.is_empty())
+                .then(|| Arc::new(glyph))
+        })
+}
+
 /// Web: outline the glyph from the lazily-fetched per-script Noto subset that
 /// covers it. Returns `None` while that font is still loading (the char renders
 /// once it arrives and the fallback cache is cleared). (#141)
@@ -357,43 +512,6 @@ fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
         advance,
         fill_tris,
     }))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
-    use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
-    let mut fs = font_system().lock().unwrap();
-    // Default family → cosmic's own fallback search chooses a covering font.
-    let attrs = Attrs::new();
-    let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
-    buf.set_size(&mut fs, None, None);
-    let s = ch.to_string();
-    buf.set_text(&mut fs, &s, &attrs, Shaping::Advanced, None);
-    buf.shape_until_scroll(&mut fs, false);
-
-    for run in buf.layout_runs() {
-        for g in run.glyphs.iter() {
-            if g.glyph_id == 0 {
-                continue; // .notdef — this font doesn't really cover it
-            }
-            let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
-            let font = fs.get_font(g.font_id, g.font_weight)?;
-            let face = ttf_parser::Face::parse(font.data(), face_index).ok()?;
-            let k = cap_scale(&face);
-            let gid = ttf_parser::GlyphId(g.glyph_id);
-            let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f32 * k;
-            let mut fl = OutlineFlattener::new(k);
-            face.outline_glyph(gid, &mut fl);
-            fl.flush();
-            let fill_tris = triangulate_contours(&fl.contours);
-            return Some(Arc::new(Glyph {
-                strokes: fl.contours,
-                advance,
-                fill_tris,
-            }));
-        }
-    }
-    None
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -607,6 +725,39 @@ mod tests {
         let run = shape_run(fam, "A中").expect("shaped");
         eprintln!("fallback run glyphs={}", run.glyphs.len());
         assert!(!run.glyphs.is_empty());
+    }
+
+    #[test]
+    fn fallback_ideograph_fills_the_text_height_like_a_big_font() {
+        // An SHX big font draws an ideograph one text height tall and one
+        // text height wide. The TrueType stand-in must match that box (9
+        // units), not the ~12–14 units the Latin cap-height normalisation
+        // gives a CJK em square — that overrun pushed every substituted
+        // Chinese line past its frame. Tolerated when the machine has no
+        // CJK font at all.
+        let Some(g) = fallback_glyph('中') else {
+            eprintln!("no CJK system font; skipping");
+            return;
+        };
+        assert!(
+            (g.advance - CAP_UNITS).abs() < 0.6,
+            "ideograph advance must be about one text height: got {}",
+            g.advance
+        );
+        let ink_h = g
+            .strokes
+            .iter()
+            .flatten()
+            .map(|p| p[1])
+            .fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        assert!(
+            ink_h.1 - ink_h.0 <= CAP_UNITS * 1.05,
+            "ideograph ink must fit the text height: {:?}",
+            ink_h
+        );
+        // Latin fallback keeps the cap-height convention (shares a baseline
+        // with the stroke glyphs around it).
+        assert!(!is_full_width('A') && is_full_width('中') && is_full_width('，'));
     }
 
     #[test]

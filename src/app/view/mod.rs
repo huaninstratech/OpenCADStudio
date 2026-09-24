@@ -15,6 +15,7 @@ use iced::widget::{
 use iced::window;
 use iced::{keyboard, Background, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
 use iced_aw::ContextMenu;
+use std::sync::Arc;
 
 mod controls;
 mod modal;
@@ -766,15 +767,26 @@ bg={bg_ms:.1}ms n={view_count}"
             // The active alignment vector: a dashed guide from the acquired
             // tracking point through the locked cursor, so the user sees the
             // extension / tracking line they are snapped to (#219).
-            let otrack_line: Option<(iced::Point, iced::Point)> =
-                match (otrack_proj, self.otrack_active) {
-                    (Some((view_rot, eye, ob)), Some((base, _dir))) => {
-                        let b = ost_project(base, view_rot, eye, ob);
-                        let a = ost_project(tab.last_cursor_world, view_rot, eye, ob);
-                        (b.x.is_finite() && a.x.is_finite()).then_some((b, a))
-                    }
-                    _ => None,
-                };
+            // An intersection lock is the meeting of two tracking vectors, so
+            // both are drawn — one guide alone hides what the point is (#1313).
+            let otrack_lines: Vec<(iced::Point, iced::Point)> = match otrack_proj {
+                Some((view_rot, eye, ob)) => {
+                    let a = ost_project(tab.last_cursor_world, view_rot, eye, ob);
+                    self.otrack_active
+                        .into_iter()
+                        .chain(self.otrack_cross)
+                        .filter_map(|(base, _dir)| {
+                            let b = ost_project(base, view_rot, eye, ob);
+                            (b.x.is_finite()
+                                && b.y.is_finite()
+                                && a.x.is_finite()
+                                && a.y.is_finite())
+                                .then_some((b, a))
+                        })
+                        .collect()
+                }
+                None => vec![],
+            };
             // The acquired Parallel-snap reference, marked on its line (#277).
             let parallel_ref_marker: Option<iced::Point> =
                 match (otrack_proj, self.snapper.parallel_ref) {
@@ -847,39 +859,26 @@ bg={bg_ms:.1}ms n={view_count}"
                         .map(|constraint| constraint.kind.glyph_symbol().to_string())
                 })
             };
-            let constraint_glyphs: Vec<(
-                iced::Point,
-                [f32; 2],
-                String,
-                bool,
-                bool,
-                Vec<iced::Point>,
-            )> = if is_paper {
-                Vec::new()
+            let constraint_glyphs: std::sync::Arc<
+                [crate::scene::parametric_constraints::GlyphEntry],
+            > = if is_paper {
+                std::sync::Arc::from([])
             } else {
                 let scope = tab.current_parametric_scope();
-                tab.scene
-                    .constraint_glyph_placements_screen(
-                        scope,
-                        sel_ref.vp_size,
-                        self.show_constraint_values,
-                        self.constraint_bar_display,
-                        self.constraint_bar_mode,
-                    )
-                    .into_iter()
-                    .map(|(id, point, direction, label, is_conflicting, hover_points)| {
-                        let selected = tab.scene.selected_constraint == Some(id);
-                        (
-                            point,
-                            direction,
-                            label,
-                            is_conflicting,
-                            selected,
-                            hover_points,
-                        )
-                    })
-                    .collect()
+                tab.scene.cached_glyph_placements(
+                    scope,
+                    sel_ref.vp_size,
+                    self.show_constraint_values,
+                    self.constraint_bar_display,
+                    self.constraint_bar_mode,
+                )
             };
+            // Selection stays OUTSIDE the cache (applied post-hoc): a selection
+            // change must not invalidate the placement memo.
+            let constraint_glyph_selected: std::sync::Arc<[bool]> = constraint_glyphs
+                .iter()
+                .map(|entry| tab.scene.selected_constraint == Some(entry.id))
+                .collect();
             crate::ui::overlay::selection_overlay(
                 std::sync::Arc::clone(&tab.scene.selection),
                 snap_info,
@@ -890,7 +889,7 @@ bg={bg_ms:.1}ms n={view_count}"
                 grip_clip,
                 ucs_icons,
                 ost_points,
-                otrack_line,
+                otrack_lines,
                 parallel_ref_marker,
                 // ViewCube hover region matches the drawn cube — gone when hidden.
                 !is_paper && viewcube_visible,
@@ -924,6 +923,7 @@ bg={bg_ms:.1}ms n={view_count}"
                     grip_hover: self.model_space.grip_hover,
                 },
                 constraint_glyphs,
+                constraint_glyph_selected,
                 self.constraint_glyph_tooltip
                     .map(|kind| crate::t!(kind.label()).into_owned()),
                 constraint_cursor_badge,
@@ -2120,6 +2120,10 @@ bg={bg_ms:.1}ms n={view_count}"
                     self.show_block_palette,
                 ));
             }
+            // Split the `chrome` bucket so live `view-detail` traces show
+            // ribbon vs status-bar construction separately (both gated on
+            // PERF; zero cost otherwise).
+            mark("ribbon");
             if self.show_file_tabs {
                 col = col.push(doc_tab_bar(
                     &self.tabs,
@@ -2153,8 +2157,17 @@ bg={bg_ms:.1}ms n={view_count}"
                     let last_coord = self.last_point.map(to_readout);
                     let coords_mode = tab.scene.document.header.coords_mode;
                     let picking = tab.active_cmd.is_some();
-                    let layout_names = tab.scene.layout_names();
-                    let block_tabs = tab
+                    // Cached Arcs are moved (refcount bump only), never deep-cloned:
+                    // `StatusBar::view` / `StatusMenuData` take ownership of the
+                    // `Arc`s and borrow them internally. `current_layout` is the
+                    // one true borrow — it anchors to `tab`, which outlives the
+                    // call — because a call-site slice over an `Arc` temporary
+                    // cannot outlive this block (E0515).
+                    let layout_names = tab.scene.cached_layout_names();
+                    let scale_list = tab.scene.cached_scale_picker_list();
+                    let selection_types = tab.scene.entity_type_names_in_layout();
+                    let current_scale_name = tab.scene.displayed_annotation_scale_name();
+                    let block_tabs: Vec<String> = tab
                         .block_edits
                         .iter()
                         .map(|session| session.block_name.clone())
@@ -2173,13 +2186,13 @@ bg={bg_ms:.1}ms n={view_count}"
                         ),
                     );
                     let status_menu_data = crate::ui::statusbar::StatusMenuData {
-                        layout_names: layout_names.clone(),
+                        layout_names: Arc::clone(&layout_names),
                         polar_custom_input: &self.polar_custom_input,
                         scale_is_model: is_model,
-                        current_scale_name: tab.scene.displayed_annotation_scale_name(),
-                        scale_list: tab.scene.scale_picker_list(),
+                        current_scale_name,
+                        scale_list,
                         has_selection: !tab.scene.selected.is_empty(),
-                        selection_types: tab.scene.entity_type_names_in_layout().as_ref().clone(),
+                        selection_types,
                         selection_filter: &tab.scene.selection_filter,
                         tooltip_hidden: self.status_menu_tooltip_hidden,
                     };
@@ -2192,10 +2205,9 @@ bg={bg_ms:.1}ms n={view_count}"
                         self.snapper.otrack_enabled,
                         self.isometric_drafting,
                         self.iso_plane,
-                        layout_names.clone(),
+                        layout_names,
                         block_tabs,
-                        layout_names.into_iter().skip(1).collect(),
-                        tab.scene.current_layout.clone(),
+                        &tab.scene.current_layout,
                         active_block,
                         tab.is_start,
                         self.layout_rename_state.as_ref(),
@@ -2255,12 +2267,29 @@ bg={bg_ms:.1}ms n={view_count}"
         })
         .width(Fill)
         .height(Fill);
+        mark("statusbar");
 
+        // History labels are built only when their dropdown is actually open;
+        // otherwise an empty slice short-circuits the overlay gate
+        // (`dropdown_overlay` returns `None` for empty labels anyway).
+        let open_dropdown = self.ribbon.open_dropdown.as_deref();
+        let undo_labels: Vec<String> =
+            if open_dropdown == Some(crate::ui::ribbon::UNDO_HISTORY_ID) {
+                history_dropdown_labels(&self.tabs[self.active_tab].history.undo_stack)
+            } else {
+                Vec::new()
+            };
+        let redo_labels: Vec<String> =
+            if open_dropdown == Some(crate::ui::ribbon::REDO_HISTORY_ID) {
+                history_dropdown_labels(&self.tabs[self.active_tab].history.redo_stack)
+            } else {
+                Vec::new()
+            };
         let dropdown_layer: Element<'_, Message> = self
             .ribbon
             .dropdown_overlay(
-                &history_dropdown_labels(&self.tabs[self.active_tab].history.undo_stack),
-                &history_dropdown_labels(&self.tabs[self.active_tab].history.redo_stack),
+                &undo_labels,
+                &redo_labels,
                 self.win_size,
                 self.tabs[self.active_tab].is_start,
                 &self.recent_colors,
@@ -2713,6 +2742,7 @@ impl OpenCADStudio {
                 Subscription::none()
             },
             self.spacemouse.subscription().map(|_| Message::SpaceMouseWake),
+            crate::input::trackpad::subscription().map(Message::TrackpadPinch),
             event::listen_with(|event, _, id| match event {
                 iced::Event::Window(window::Event::Focused) => {
                     Some(Message::SpaceMouseFocus(id, true))

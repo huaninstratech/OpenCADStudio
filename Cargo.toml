@@ -33,9 +33,9 @@ rfd = "0.17"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-acadrust = { git = "https://github.com/HakanSeven12/cadcodec.git", rev = "7ea4247", features = ["serde"] }
-cadkernel = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "a0b962a", features = ["acis", "offset"] }
-cadkernel-constraints = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "a0b962a" }
+acadrust = { git = "https://github.com/HakanSeven12/cadcodec.git", rev = "dd1d7bf", features = ["serde"] }
+cadkernel = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "6eae7c9", features = ["acis", "offset"] }
+cadkernel-constraints = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "6eae7c9" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
@@ -74,7 +74,10 @@ ashpd = { version = "0.13.13", default-features = false, features = ["async-io",
 # here to the same versions Cargo already resolves for it.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder", "NSRunningApplication"] }
+# The `NSEvent`/`block2` features are for the trackpad pinch monitor in
+# `src/input/trackpad.rs` — see that file for why the gesture is read there.
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder", "NSRunningApplication", "NSEvent", "block2"] }
+block2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString", "NSObject", "NSNotification", "NSThread", "NSEnumerator"] }
 
 [patch.crates-io]

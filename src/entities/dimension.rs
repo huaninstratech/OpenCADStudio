@@ -25,6 +25,14 @@ pub(crate) fn set_dimension_text_override(base: &mut DimensionBase, text: Option
     base.user_text = text;
 }
 
+/// Recompute the fields a script cannot set: the base definition point and
+/// the stored measurement, exactly as grip edits do.
+pub(crate) fn normalize_scripted_dimension(dim: &mut Dimension) {
+    let definition_point = dimension_definition_point(dim);
+    dim.base_mut().definition_point = definition_point;
+    dim.base_mut().actual_measurement = dim.measurement();
+}
+
 fn dimension_definition_point(dim: &Dimension) -> acadrust::types::Vector3 {
     match dim {
         Dimension::Aligned(d) => d.definition_point,
@@ -2143,7 +2151,7 @@ pub fn style_sections(
                 choice(
                     t!("Text outside align").as_ref(),
                     "dim_text_outside_align",
-                    on(int(ov::DIMTOH, s.dimtoh as i16) != 0),
+                    on(int(ov::DIMTOH, s.dimtoh as i16) == 0),
                     &["On", "Off"],
                     true,
                 ),
@@ -2178,9 +2186,15 @@ pub fn style_sections(
                 choice(
                     t!("Text inside align").as_ref(),
                     "dim_text_inside_align",
-                    on(int(ov::DIMTIH, s.dimtih as i16) != 0),
+                    on(int(ov::DIMTIH, s.dimtih as i16) == 0),
                     &["On", "Off"],
-                    dimtix || matches!(dimension, Dimension::LargeRadial(_)),
+                    dimtix
+                        || matches!(
+                            dimension,
+                            Dimension::LargeRadial(_)
+                                | Dimension::Angular2Ln(_)
+                                | Dimension::Angular3Pt(_)
+                        ),
                 ),
                 property(
                     t!("Text position X").as_ref(),
@@ -2283,7 +2297,7 @@ pub fn style_sections(
                 choice(
                     t!("Dim line inside").as_ref(),
                     "dim_line_inside",
-                    on(int(ov::DIMSOXD, s.dimsoxd as i16) != 0),
+                    on(int(ov::DIMSOXD, s.dimsoxd as i16) == 0),
                     &["On", "Off"],
                     true,
                 ),
@@ -2999,13 +3013,105 @@ pub fn style_sections(
             ];
         }
         sections.retain(|section| section.title != t!("Alternate Units").as_ref());
+        let by_order = |order: &'static [&'static str]| {
+            move |property: &Property| {
+                order
+                    .iter()
+                    .position(|field| *field == property.field)
+                    .unwrap_or(order.len())
+            }
+        };
         if let Some(tolerances) = sections
             .iter_mut()
             .find(|section| section.title == t!("Tolerances").as_ref())
         {
-            tolerances
-                .props
-                .retain(|property| !property.field.starts_with("dim_alt_tolerance_"));
+            tolerances.props.retain(|property| {
+                !property.field.starts_with("dim_alt_tolerance_")
+                    && !matches!(
+                        property.field,
+                        "dim_tolerance_suppress_zero_feet" | "dim_tolerance_suppress_zero_inches"
+                    )
+            });
+            tolerances.props.sort_by_key(by_order(&[
+                "dim_tolerance_alignment",
+                "dim_tolerance_display",
+                "dim_tolerance_limit_lower",
+                "dim_tolerance_limit_upper",
+                "dim_tolerance_pos_vert",
+                "dim_tolerance_precision",
+                "dim_tolerance_suppress_leading_zeros",
+                "dim_tolerance_suppress_trailing_zeros",
+                "dim_tolerance_text_height",
+            ]));
+        }
+        // An arc has no dimension line extension.
+        if let Some(lines) = sections
+            .iter_mut()
+            .find(|section| section.title == t!("Lines & Arrows").as_ref())
+        {
+            lines.props.retain(|property| property.field != "dim_line_ext");
+        }
+        if let Some(fit) = sections
+            .iter_mut()
+            .find(|section| section.title == t!("Fit").as_ref())
+        {
+            fit.props.sort_by_key(by_order(&[
+                "dim_line_forced",
+                "dim_line_inside",
+                "dim_scale_overall",
+                "dim_fit",
+                "dim_text_inside",
+                "dim_text_movement",
+            ]));
+        }
+        if let Some(units) = sections
+            .iter_mut()
+            .find(|section| section.title == t!("Primary Units").as_ref())
+        {
+            units.props.sort_by_key(by_order(&[
+                "dim_decimal_separator",
+                "dim_prefix",
+                "dim_suffix",
+                "dim_angle_suppress_leading_zeros",
+                "dim_angle_suppress_trailing_zeros",
+                "dim_angle_precision",
+                "dim_angle_units",
+            ]));
+        }
+        // The measurement reads at the angular precision, and automatic text
+        // reports where it is drawn rather than an unset point.
+        if let Some(text_section) = sections
+            .iter_mut()
+            .find(|section| section.title == t!("Text").as_ref())
+        {
+            let automatic = stored_text_point(dimension)
+                .is_none()
+                .then(|| styled_dimension_text_position(dimension, s, 1.0));
+            for property in &mut text_section.props {
+                match property.field {
+                    "measurement" => {
+                        // The row shows the number at the angular precision,
+                        // without the text's degree sign.
+                        let value = format_angular_value(
+                            displayed_measurement(dimension, Some(s)),
+                            Some(s),
+                        );
+                        property.value =
+                            PropValue::ReadOnly(value.trim_end_matches('°').to_string());
+                    }
+                    "text_x" => {
+                        if let Some(position) = automatic {
+                            property.value = PropValue::EditText(format!("{:.4}", position.x));
+                        }
+                    }
+                    "text_y" => {
+                        if let Some(position) = automatic {
+                            property.value = PropValue::EditText(format!("{:.4}", position.y));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -3762,6 +3868,8 @@ fn tessellate_dimension_inner(
             ticks: dimtsz_raw > 1e-9,
             arrow_len: dimasz,
             text_width: text_layout.width,
+            text_height: dim_txt as f32,
+            constraint: dynamic_constraint_dimension(dim),
             dimatfit: style.map(|s| s.dimatfit).unwrap_or(3),
             dimtix: style.is_some_and(|s| s.dimtix),
             dimtofl: style.map(|s| s.dimtofl).unwrap_or(false),
@@ -4593,6 +4701,11 @@ struct DimLineParams {
     /// Arrowhead length (DIMASZ, scaled) — used to decide arrow-outside fit.
     arrow_len: f32,
     text_width: f32,
+    /// Text height (DIMTXT, scaled) — a radial leader is sized by it.
+    text_height: f32,
+    /// This dimension is a dimensional constraint's dynamic dimension, which
+    /// the reference draws by its own radial rules.
+    constraint: bool,
     dimatfit: i16,
     dimtix: bool,
     dimtofl: bool,
@@ -4678,22 +4791,46 @@ fn dimension_geometry(
             }
             let radius = (point - center).length();
             let text_is_outside = text.distance(center) > radius + 1e-5;
-            // Text inside the arc: the dimension line runs from the arc point
-            // to the centre. Text outside: only a leader from the arc point to
-            // the text, unless DIMTOFL asks for the inside line as well.
-            if !jogged && !suppress.dim2 && (!text_is_outside || params.dimtofl) {
-                add_segment(&mut g.dim_lines, center, point);
-            }
-            if text_is_outside && !suppress.dim2 {
-                append_radial_leader(&mut g, point, text, &params);
-            }
-            if !suppress.dim2 {
-                // The arrowhead sits on the arc with its body toward the text.
-                let body = if text_is_outside { point - center } else { center - point };
-                append_arrow(&mut g, point, normalized_or(body, Vec3::X), arrow1);
-            }
-            if text_is_outside {
-                append_center_mark(&mut g, center, params.dimcen, radius);
+            if params.constraint {
+                // A dimensional constraint reads on its own dimension line,
+                // which runs from the centre to the arc point and breaks
+                // where the text sits on it. Text that no longer fits inside
+                // is reached by a leader from the arc point, and the
+                // arrowhead stays on the arc either way.
+                if !jogged && !suppress.dim2 {
+                    add_segment_with_text_break(&mut g.dim_lines, center, point, params.text_break);
+                }
+                if text_is_outside && !suppress.dim2 {
+                    append_radial_leader(&mut g, point, point - center, text, &params);
+                }
+                if !suppress.dim2 {
+                    // The arrowhead's tip is on the arc, its body inside.
+                    append_arrow(&mut g, point, normalized_or(center - point, Vec3::X), arrow1);
+                }
+                // The centre mark belongs to a radius drawn without its
+                // inside line; the line itself already marks the centre.
+                if jogged || suppress.dim2 {
+                    append_center_mark(&mut g, center, params.dimcen, radius);
+                }
+            } else {
+                // Text inside the arc: the dimension line runs from the arc
+                // point to the centre. Text outside: only a leader from the
+                // arc point to the text, unless DIMTOFL asks for the inside
+                // line as well.
+                if !jogged && !suppress.dim2 && (!text_is_outside || params.dimtofl) {
+                    add_segment(&mut g.dim_lines, center, point);
+                }
+                if text_is_outside && !suppress.dim2 {
+                    append_radial_leader(&mut g, point, point - center, text, &params);
+                }
+                if !suppress.dim2 {
+                    // The arrowhead sits on the arc with its body toward the text.
+                    let body = if text_is_outside { point - center } else { center - point };
+                    append_arrow(&mut g, point, normalized_or(body, Vec3::X), arrow1);
+                }
+                if text_is_outside {
+                    append_center_mark(&mut g, center, params.dimcen, radius);
+                }
             }
         }
         Dimension::Diameter(d) => {
@@ -4709,9 +4846,11 @@ fn dimension_geometry(
                 params,
                 suppress,
             );
-            let center = (chord + far_chord) * 0.5;
-            let radius = chord.distance(far_chord) * 0.5;
-            append_center_mark(&mut g, center, params.dimcen, radius);
+            if !params.constraint {
+                let center = (chord + far_chord) * 0.5;
+                let radius = chord.distance(far_chord) * 0.5;
+                append_center_mark(&mut g, center, params.dimcen, radius);
+            }
         }
         Dimension::Angular2Ln(d) => {
             // A two-line angular dimension stores two LINES, not two rays:
@@ -4724,18 +4863,51 @@ fn dimension_geometry(
             let (p3, p4) = (lv(d.angle_vertex), lv(d.definition_point));
             let arc_point = lv(d.dimension_arc);
             match two_line_angle_frame(p1, p2, p3, p4, arc_point) {
-                Some((vertex, start, end)) => append_angular_dimension(
-                    &mut g,
-                    vertex,
-                    vertex,
-                    vertex,
-                    arc_point,
-                    arrow1,
-                    arrow2,
-                    Some((start, end)),
-                    params,
-                    suppress,
-                ),
+                Some((vertex, start, end)) => {
+                    // An extension line runs from a side's nearer end out to
+                    // the arc only where the arc lies beyond that side; where
+                    // the arc crosses the side itself there is nothing to add.
+                    let radius = vertex.distance(arc_point);
+                    let side = |angle: f32| -> (Vec3, bool) {
+                        let dir = Vec3::new(angle.cos(), angle.sin(), 0.0);
+                        let deviation =
+                            |a: Vec3, b: Vec3| normalized_or(b - a, dir).cross(dir).length();
+                        let (a, b) = if deviation(p1, p2) <= deviation(p3, p4) {
+                            (p1, p2)
+                        } else {
+                            (p3, p4)
+                        };
+                        let along = |p: Vec3| (p - vertex).dot(dir);
+                        let (lo, hi) = (along(a).min(along(b)), along(a).max(along(b)));
+                        let arc_end = vertex + dir * radius;
+                        let near = if a.distance(arc_end) <= b.distance(arc_end) {
+                            a
+                        } else {
+                            b
+                        };
+                        (near, radius >= lo - 1e-6 && radius <= hi + 1e-6)
+                    };
+                    let (first, first_covered) = side(start);
+                    let (second, second_covered) = side(end);
+                    let suppress = SuppressFlags {
+                        ext1: suppress.ext1 || first_covered,
+                        ext2: suppress.ext2 || second_covered,
+                        dim1: suppress.dim1,
+                        dim2: suppress.dim2,
+                    };
+                    append_angular_dimension(
+                        &mut g,
+                        vertex,
+                        first,
+                        second,
+                        arc_point,
+                        arrow1,
+                        arrow2,
+                        Some((start, end)),
+                        params,
+                        suppress,
+                    )
+                }
                 // Parallel lines have no vertex and so no angle to draw; the
                 // extension lines alone say where the dimension was.
                 None => {
@@ -4749,14 +4921,14 @@ fn dimension_geometry(
             let first = lv(d.first_point);
             let second = lv(d.second_point);
             let arc_point = lv(d.definition_point);
-            let explicit_sweep = two_line_angle_frame(
-                vertex,
-                first,
-                vertex,
-                second,
-                arc_point,
-            )
-            .map(|(_, start, end)| (start, end));
+            // The sweep starts at whichever ray the arc point says; the
+            // extension lines swap with it, or they would cross the angle.
+            let (first, second, explicit_sweep) =
+                match three_point_frame(vertex, first, second, arc_point) {
+                    Some((start, end, true)) => (second, first, Some((start, end))),
+                    Some((start, end, false)) => (first, second, Some((start, end))),
+                    None => (first, second, None),
+                };
             append_angular_dimension(
                 &mut g,
                 vertex,
@@ -5147,11 +5319,36 @@ fn append_linear_dimension(
     }
 }
 
-/// Leader from a point on the circle to text outside it. Horizontal text gets a
-/// hook one arrow long that the text sits against; aligned text is reached by a
-/// straight leader that stops a gap short of it. `text_width` already carries
-/// a gap on each side.
-fn append_radial_leader(g: &mut DimGeom, tip: Vec3, text: Vec3, params: &DimLineParams) {
+/// Leader from a point on the circle to text outside it.
+///
+/// A dimensional constraint's dimension leaves the rim along its dimension
+/// line, elbows level with the text and hooks under it. An ordinary radial
+/// dimension keeps its measured layout: horizontal text gets a hook one arrow
+/// long that the text sits against, and aligned text is reached by a straight
+/// leader that stops a gap short of it. `text_width` already carries a gap on
+/// each side.
+fn append_radial_leader(
+    g: &mut DimGeom,
+    tip: Vec3,
+    direction: Vec3,
+    text: Vec3,
+    params: &DimLineParams,
+) {
+    if params.constraint {
+        let side = if text.x >= tip.x { 1.0 } else { -1.0 };
+        let edge = match params.leader_anchor {
+            Some(anchor) => anchor,
+            None => Vec3::new(text.x - side * params.text_width * 0.5, text.y, text.z),
+        };
+        let elbow = tip
+            + normalized_or(direction, Vec3::X)
+                * radial_leader_run(params.text_height as f64) as f32;
+        // The hook is horizontal at the text's height; the run reaches it.
+        let elbow = Vec3::new(elbow.x, edge.y, edge.z);
+        add_segment(&mut g.dim_lines, tip, elbow);
+        add_segment(&mut g.dim_lines, elbow, edge);
+        return;
+    }
     if params.horizontal_text {
         let side = if text.x >= tip.x { 1.0 } else { -1.0 };
         let (hook_start, text_edge) = match params.leader_anchor {
@@ -5193,11 +5390,13 @@ fn append_diameter_dimension(
     }
     let center = (chord + far_chord) * 0.5;
     let text_is_outside = params.text_position.distance(center) > diameter * 0.5 + 1e-5;
-    if text_is_outside && !params.dimtofl {
-        // Outside text without DIMTOFL: no line across the circle, just a
-        // leader from the near side with the arrowhead on the circle and its
-        // body toward the text. DIMTMOVE 2 keeps the arrowhead and drops the
-        // leader.
+    if text_is_outside && (params.constraint || !params.dimtofl) {
+        // A dimensional constraint carries its text on a leader from the
+        // nearer end of the dimension line, and the line and both arrowheads
+        // stay inside the circle. An ordinary diameter draws no line across
+        // the circle at all: just that leader, with one arrowhead on the
+        // circle and its body toward the text. DIMTMOVE 2 keeps the arrowhead
+        // and drops the leader.
         let (tip, suppressed) = if params.text_position.distance_squared(chord)
             <= params.text_position.distance_squared(far_chord)
         {
@@ -5205,19 +5404,24 @@ fn append_diameter_dimension(
         } else {
             (far_chord, suppress.dim2)
         };
-        if !suppressed {
-            if params.text_movement != 2 {
-                append_radial_leader(g, tip, params.text_position, &params);
-            }
-            append_arrow(g, tip, normalized_or(tip - center, axis), arrow1);
+        if !suppressed && params.text_movement != 2 {
+            append_radial_leader(g, tip, tip - center, params.text_position, &params);
         }
-        return;
+        if !params.constraint {
+            if !suppressed {
+                append_arrow(g, tip, normalized_or(tip - center, axis), arrow1);
+            }
+            return;
+        }
     }
     // Text projected outside the diameter requires inward-pointing arrowheads.
     let text_along = (params.text_position - chord).dot(axis);
     let text_outside = text_along < 0.0 || text_along > diameter;
 
     let arrows_outside = if params.ticks || params.arrow_len <= 1e-6 {
+        false
+    } else if text_is_outside {
+        // The leader carries the text; the arrowheads keep the circle.
         false
     } else if text_outside {
         true
@@ -5261,6 +5465,10 @@ fn append_diameter_dimension(
         }
     }
 
+    if params.constraint && !draw_inside_line {
+        let center = (chord + far_chord) * 0.5;
+        append_center_mark(g, center, params.dimcen, diameter * 0.5);
+    }
     if arrows_outside {
         append_arrow(g, chord, -axis, arrow1);
         append_arrow(g, far_chord, axis, arrow2);
@@ -5396,6 +5604,35 @@ fn two_line_angle_frame(
     }
     let (start, end, _) = best?;
     Some((vertex, start, end))
+}
+
+/// The sweep of a three-point angular dimension: counter-clockwise from the
+/// first ray to the second when the arc point lies in that sweep, otherwise
+/// the other way round (`swapped`). Rays need no crossing, so a straight
+/// angle draws, and a reflex one is kept as picked.
+fn three_point_frame(
+    vertex: Vec3,
+    first: Vec3,
+    second: Vec3,
+    arc_point: Vec3,
+) -> Option<(f32, f32, bool)> {
+    let angle_of = |d: Vec3| d.y.atan2(d.x);
+    let (r1, r2, at) = (first - vertex, second - vertex, arc_point - vertex);
+    if r1.length_squared() <= 1e-12 || r2.length_squared() <= 1e-12 || at.length_squared() <= 1e-12
+    {
+        return None;
+    }
+    let tau = std::f32::consts::TAU;
+    let (a1, a2) = (angle_of(r1), angle_of(r2));
+    let sweep = (a2 - a1).rem_euclid(tau);
+    if sweep <= 1e-6 {
+        return None;
+    }
+    if (angle_of(at) - a1).rem_euclid(tau) <= sweep {
+        Some((a1, a1 + sweep, false))
+    } else {
+        Some((a2, a2 + (tau - sweep), true))
+    }
 }
 
 pub(crate) fn arc_dimension_angles(dimension: &DimensionArc) -> Option<(f32, f32)> {
@@ -5668,8 +5905,7 @@ fn angular_dimension_frame(dim: &Dimension) -> Option<(Vec3, f32, f32, f32)> {
             let first = vec3_local(value.first_point);
             let second = vec3_local(value.second_point);
             let arc_point = vec3_local(value.definition_point);
-            let (vertex, start, end) =
-                two_line_angle_frame(vertex, first, vertex, second, arc_point)?;
+            let (start, end, _) = three_point_frame(vertex, first, second, arc_point)?;
             (vertex, start, end, arc_point)
         }
         Dimension::Arc(value) => {
@@ -6293,6 +6529,58 @@ fn dimension_text_is_outside(dim: &Dimension, style: Option<&DimStyle>) -> bool 
             1 | 3 => text_width > span,
             _ => text_width > span,
         }
+}
+
+/// Where a dynamic dimension's lock mark sits: just after the text on its
+/// baseline, with the direction that points away from the text.
+pub(crate) fn dynamic_dimension_lock_anchor(
+    document: &CadDocument,
+    dim: &Dimension,
+    anno_scale: f64,
+) -> Option<(Vector3, Vector3)> {
+    let style_name = &dim.base().style_name;
+    let source_style = document.dim_styles.iter().find(|s| {
+        s.name.eq_ignore_ascii_case(style_name)
+            || (style_name.trim().is_empty() && s.name.eq_ignore_ascii_case("Standard"))
+    });
+    let effective_style = source_style.map(|style| resolved_dimension_style(style, dim, document));
+    let style = effective_style.as_ref();
+    let dim_scale = style
+        .map(|s| if s.dimscale > 1e-6 { s.dimscale } else { anno_scale })
+        .unwrap_or(1.0);
+    let text_height = style.map(|s| s.dimtxt * dim_scale).unwrap_or(2.5);
+    let value = dimension_text_value(dim, style)?;
+    let stack_scale = style.map(dimtfac_or_one).unwrap_or(1.0);
+    let half_width = text_cells(&value, stack_scale) * text_height * CELL_WIDTH * 0.5;
+    let pos = dimension_text_pos_f64(dim, style, text_height, dim_scale);
+    // The text angle the renderer draws (DIMTIH/DIMTOH overrides make a
+    // dynamic dimension's text horizontal).
+    let (sr, cr) = dimension_text_rotation(dim, style).sin_cos();
+    let outward = Vector3::new(cr, sr, 0.0);
+    // A glyph-sized gap keeps the lock clear of the last digit.
+    let reach = half_width + text_height * 0.9;
+    Some((
+        Vector3::new(pos.x + outward.x * reach, pos.y + outward.y * reach, pos.z),
+        outward,
+    ))
+}
+
+/// The two ends of an angular dimension's arc, each with the direction
+/// pointing away from the arc: where a dynamic angle's triangle grips sit.
+pub(crate) fn angular_arc_ends(dim: &Dimension) -> Option<[(glam::DVec3, glam::DVec3); 2]> {
+    let (vertex, start, end, radius) = angular_dimension_frame(dim)?;
+    let point = |angle: f32| {
+        let p = vertex + Vec3::new(angle.cos(), angle.sin(), 0.0) * radius;
+        glam::DVec3::new(p.x as f64, p.y as f64, p.z as f64)
+    };
+    let away = |angle: f32, sign: f32| {
+        glam::DVec3::new(
+            (-angle.sin() * sign) as f64,
+            (angle.cos() * sign) as f64,
+            0.0,
+        )
+    };
+    Some([(point(start), away(start, -1.0)), (point(end), away(end, 1.0))])
 }
 
 fn dimension_text_natural_rotation(dim: &Dimension) -> f64 {
@@ -7347,6 +7635,42 @@ fn radial_leader_tip(dim: &Dimension, text: Vector3) -> Vector3 {
     }
 }
 
+/// A dimensional constraint's dynamic dimension: the reference keeps it on
+/// its own hidden layer and draws it by its own rules.
+fn dynamic_constraint_dimension(dim: &Dimension) -> bool {
+    dim.base()
+        .common
+        .layer
+        .eq_ignore_ascii_case(crate::scene::parametric_constraints::DYNAMIC_DIMENSION_LAYER)
+}
+
+/// How far a radial leader runs out from the rim before its hook, and how
+/// long that hook is: about one text height, so the text always clears the
+/// circle.
+fn radial_leader_run(text_height: f64) -> f64 {
+    text_height
+}
+
+/// Where a radius or diameter dimension's text sits once it no longer fits
+/// inside: beside the circle, level with the end of the leader's run, its
+/// near edge one arrow away so the hook has room.
+fn radial_outside_text(
+    tip: Vector3,
+    ux: f64,
+    uy: f64,
+    text_height: f64,
+    text_width: f64,
+) -> Vector3 {
+    let run = radial_leader_run(text_height);
+    let elbow = Vector3::new(tip.x + ux * run, tip.y + uy * run, tip.z);
+    let side = if ux >= 0.0 { 1.0 } else { -1.0 };
+    Vector3::new(
+        elbow.x + side * (run + text_width * 0.5),
+        elbow.y,
+        elbow.z,
+    )
+}
+
 fn dimension_text_pos_f64(
     dim: &Dimension,
     style: Option<&DimStyle>,
@@ -7495,6 +7819,11 @@ fn dimension_text_pos_f64(
             let ux = dx / radius;
             let uy = dy / radius;
             let outside = dimension_text_is_outside(dim, style);
+            if outside && dynamic_constraint_dimension(dim) {
+                // A constraint's text moves beside the circle at the end of
+                // its leader; an ordinary radius keeps its measured offset.
+                return radial_outside_text(d.definition_point, ux, uy, text_height, text_w);
+            }
             let (mut x, mut y) = if outside {
                 let distance = arrow + text_w * 0.5 + dimgap;
                 (
@@ -7536,6 +7865,16 @@ fn dimension_text_pos_f64(
             let dx = d.definition_point.x - d.angle_vertex.x;
             let dy = d.definition_point.y - d.angle_vertex.y;
             let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+            if dimension_text_is_outside(dim, style) && dynamic_constraint_dimension(dim) {
+                // Beyond the end the dimension line was placed towards.
+                return radial_outside_text(
+                    d.angle_vertex,
+                    -dx / len,
+                    -dy / len,
+                    text_height,
+                    text_w,
+                );
+            }
             text_on_dim_line(
                 d.angle_vertex,
                 d.definition_point,
@@ -7643,6 +7982,9 @@ pub(crate) fn baked_large_radial_geometry(
             ticks: tick_size > 1.0e-9,
             arrow_len: arrow_size,
             text_width: text.width,
+            text_height: text_height as f32,
+            // A LargeRadial is never a dimensional constraint's dimension.
+            constraint: false,
             dimatfit: style.map(|style| style.dimatfit).unwrap_or(3),
             dimtix: style.is_some_and(|style| style.dimtix),
             dimtofl: style.is_some_and(|style| style.dimtofl),

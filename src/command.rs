@@ -1520,6 +1520,10 @@ pub enum CmdResult {
         name: String,
         base: DVec3,
     },
+    /// Create a block definition with full dialog options (Retain/Convert/Delete, units, annotative, etc.).
+    CreateBlockWithOptions {
+        options: Box<crate::scene::CreateBlockOptions>,
+    },
     /// Apply a transform to selected entities and end the command.
     TransformSelected(Vec<Handle>, EntityTransform),
     /// Copy selected entities with a transform; command stays active for more copies.
@@ -1598,6 +1602,85 @@ pub enum CmdResult {
     CheckHorizontalPoint {
         kind: crate::scene::parametric_constraints::ConstraintKind,
         pick: CoincidentPick,
+    },
+    /// Adds an Equal relation from `first` to each of `others` (the second
+    /// object, or a Multiple set). The host resizes every follower to the
+    /// first object's length or radius before the relation holds it there.
+    AddEqualConstraint {
+        first: crate::scene::parametric_constraints::ParametricRef,
+        others: Vec<crate::scene::parametric_constraints::ParametricRef>,
+        /// A Multiple flow: the command stays for more picks; an empty
+        /// `others` is its Enter and prints the summary line.
+        multiple: bool,
+        label: &'static str,
+    },
+    /// Resolves a constraint-point pick against the live document and hands
+    /// it back through `CadCommand::accept_constraint_point`; a miss reports
+    /// `No valid constraint point found.` and asks again.
+    CheckConstraintPoint(CoincidentPick),
+    /// Adds a dimensional constraint between two constraint points together
+    /// with the dynamic dimension that shows it and the parameter
+    /// (`name` = `expression`) that drives it.
+    AddDimensionalConstraint {
+        kind: crate::scene::parametric_constraints::ConstraintKind,
+        first: crate::scene::parametric_constraints::ParametricRef,
+        second: crate::scene::parametric_constraints::ParametricRef,
+        first_point: DVec3,
+        second_point: DVec3,
+        location: DVec3,
+        axis: DVec3,
+        /// Aligned's Point & line / 2Lines: the line the distance is
+        /// measured perpendicular to.
+        direction: Option<crate::scene::parametric_constraints::ParametricRef>,
+        name: String,
+        expression: String,
+        /// The user named the parameter (`name=expression`); an existing
+        /// name is then refused.
+        renamed: bool,
+        label: &'static str,
+    },
+    /// Adds a radius or diameter constraint with its dynamic radial
+    /// dimension and the `radN`/`diaN` parameter that drives it.
+    AddRadialConstraint {
+        circle: crate::scene::parametric_constraints::ParametricRef,
+        center: DVec3,
+        radius: f64,
+        /// Where the dimension line was picked; its direction from the
+        /// centre places the dimension.
+        location: DVec3,
+        diameter: bool,
+        name: String,
+        expression: String,
+        /// The user named the parameter (`name=expression`); an existing
+        /// name is then refused.
+        renamed: bool,
+    },
+    /// Adds an angular constraint with its dynamic angular dimension and
+    /// the `angN` parameter that drives it. Two lines: `refs` =
+    /// `[first_line, second_line]`, `points` = both lines' ends; three
+    /// points: `refs` = `[first, vertex, second]`, `points` =
+    /// `[vertex, first, second]`.
+    AddAngularConstraint {
+        refs: Vec<crate::scene::parametric_constraints::ParametricRef>,
+        points: Vec<DVec3>,
+        location: DVec3,
+        /// Which of the four angles the dimension line location picked.
+        sector: u8,
+        name: String,
+        expression: String,
+        renamed: bool,
+    },
+    /// Aligned's 2Lines: makes `second_line` parallel to `first_line` (whose
+    /// ends stay put), then hands the second line's solved ends back through
+    /// `CadCommand::accept_parallel_line`.
+    MakeParallel {
+        first_line: crate::scene::parametric_constraints::ParametricRef,
+        first_ends: [crate::scene::parametric_constraints::ParametricRef; 2],
+        /// Where the first line was picked: the second line settles at the
+        /// distance this point had from it.
+        first_pick: DVec3,
+        second_line: crate::scene::parametric_constraints::ParametricRef,
+        second_ends: [crate::scene::parametric_constraints::ParametricRef; 2],
     },
     /// Adds a point or object symmetry relation around a picked line. The
     /// first reference and axis remain fixed during initial placement.
@@ -1770,6 +1853,8 @@ pub enum CmdResult {
     ReportMeasurement(String),
     /// Print an input error and keep the command active.
     ReportError(String),
+    /// Reports an error and ends the command (`Lines are parallel.`).
+    CancelWithMessage(String),
     /// Print a measurement result, clear the current selection, and keep the command active.
     ReportMeasurementAndDeselect(String),
     /// Clear the current selection and keep the command active at its updated step.
@@ -2437,6 +2522,29 @@ pub trait CadCommand: Send {
         false
     }
 
+    /// Take a typed coordinate at an object prompt as a pick at that point.
+    fn typed_point_picks_entity(&self) -> bool {
+        false
+    }
+
+    /// A constraint point the host resolved for a `CheckConstraintPoint`
+    /// pick, with its world position.
+    fn accept_constraint_point(
+        &mut self,
+        _reference: crate::scene::parametric_constraints::ParametricRef,
+        _point: DVec3,
+    ) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    /// The second line's ends after a `MakeParallel` solve.
+    fn accept_parallel_line(
+        &mut self,
+        _ends: [(crate::scene::parametric_constraints::ParametricRef, DVec3); 2],
+    ) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
     /// Include filled hatch / DXF SOLID regions in the entity hit-test.
     ///
     /// Most entity-pick commands operate on curve geometry and intentionally
@@ -2677,6 +2785,13 @@ pub trait CadCommand: Send {
         false
     }
 
+    /// The command takes associative dimensions only. The host drops every
+    /// other object from a completed selection, says how many it dropped, and
+    /// hands the command what is left.
+    fn selection_keeps_associative_dimensions(&self) -> bool {
+        false
+    }
+
     /// Called after a selection action completes while `is_selection_gathering` is true.
     /// `handles` is the full set of currently selected entities.
     /// Return `Relaunch` to fire the pending command, or `NeedPoint` to keep gathering.
@@ -2901,6 +3016,7 @@ mod constraint_registry_tests {
             "QCONSTRAINT",
             "GCPERPENDICULAR",
             "ECONSTRAINT",
+            "GCEQUAL",
             "TCONSTRAINT",
             "GCCONCENTRIC",
             "NRCONSTRAINT",

@@ -170,6 +170,7 @@ pub(crate) fn wire_source(wire: &WireModel) -> Option<DimensionAssociationSource
 /// Object-snap-tracking alignment: the cursor projected onto a ray from an
 /// acquired tracking point.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct OtrackHit {
     /// Cursor projected onto the tracking ray.
     pub aligned: DVec3,
@@ -177,6 +178,12 @@ pub struct OtrackHit {
     pub dir: DVec3,
     /// The tracking point the ray emanates from.
     pub base: DVec3,
+    /// The second ray of an intersection lock, as `(base, outward direction)`.
+    /// A crossing is the meeting of two tracking vectors, and the user has to
+    /// see both of them to read what the lock means; `base`/`dir` above carry
+    /// only the one a typed distance is measured along. `None` for a
+    /// single-ray alignment, which has no second vector. (#1313)
+    pub cross: Option<(DVec3, DVec3)>,
 
     pub kind: TrackingKind,
 }
@@ -917,19 +924,35 @@ impl Snapper {
                 if sd < r && best_x.as_ref().map_or(true, |(bd, _)| sd < *bd) {
                     // Report an acquired tracking ray (not an auxiliary
                     // last_point ray) as base/dir for typed-distance entry.
-                    let ot = if rays[i].group != POLAR_GROUP && rays[i].group != ORTHO_GROUP {
-                        &rays[i]
+                    let (ot, other) = if rays[i].group != POLAR_GROUP
+                        && rays[i].group != ORTHO_GROUP
+                    {
+                        (&rays[i], &rays[j])
                     } else {
-                        &rays[j]
+                        (&rays[j], &rays[i])
                     };
-                    let t = (x.x - ot.origin.x) * ot.dir.x + (x.y - ot.origin.y) * ot.dir.y;
-                    let dir_out = if t >= 0.0 { ot.dir } else { -ot.dir };
+                    // Point each ray the way the crossing lies from its own
+                    // origin, so the guide drawn for it runs through the lock
+                    // rather than away from it.
+                    let outward = |ray: &Ray| {
+                        let t = (x.x - ray.origin.x) * ray.dir.x
+                            + (x.y - ray.origin.y) * ray.dir.y;
+                        if t >= 0.0 {
+                            ray.dir
+                        } else {
+                            -ray.dir
+                        }
+                    };
+                    let dir_out = outward(ot);
                     best_x = Some((
                         sd,
                         OtrackHit {
                             aligned: x,
                             dir: dir_out,
                             base: ot.origin,
+                            // The vector the reported one crosses. Both are
+                            // drawn, so the intersection reads as one. (#1313)
+                            cross: Some((other.origin, outward(other))),
                             kind: ot.kind,
                         }
                     ));
@@ -970,6 +993,8 @@ impl Snapper {
                         aligned,
                         dir: dir_out,
                         base: ray.origin,
+                        // A single-ray alignment has no second vector.
+                        cross: None,
                         kind: ray.kind,
                     },
                 ));
@@ -2797,10 +2822,20 @@ fn wire_plane(wire: &WireModel) -> Option<WirePlane> {
     None
 }
 
+/// Resolve a `TangentGeom::Line`'s f32 endpoints to the wire's f64
+/// `key_vertices`. The two lists are not index-aligned in general — a split
+/// polyline keeps every vertex but only its straight geoms, a center mark
+/// stores two vertices per segment, a block entry appends per entity — so the
+/// vertices are found by value. `cursor` carries the slot of the previous
+/// match: the geoms come in vertex order, so the next pair sits at or just
+/// after it and the scan is amortised linear over the wire rather than
+/// quadratic (a dense contour polyline is checked against every curved wire
+/// in the aperture on each cursor move).
 fn tangent_line_endpoints(
     wire: &WireModel,
     p1: [f32; 3],
     p2: [f32; 3],
+    cursor: &mut usize,
 ) -> (DVec3, DVec3) {
     if wire.points.len() == 2 && wire.tangent_geoms.len() == 1 {
         return (wp_f64(wire, 0), wp_f64(wire, 1));
@@ -2813,9 +2848,11 @@ fn tangent_line_endpoints(
     };
     let count = wire.key_vertices.len();
     if count >= 2 {
-        for start in 0..count {
+        for step in 0..count {
+            let start = (*cursor + step) % count;
             let end = (start + 1) % count;
             if matches(wire.key_vertices[start], p1) && matches(wire.key_vertices[end], p2) {
+                *cursor = end;
                 return (
                     DVec3::from_array(wire.key_vertices[start]),
                     DVec3::from_array(wire.key_vertices[end]),
@@ -2854,10 +2891,11 @@ fn curves_in_frame(wire: &WireModel, frame: &WirePlane, tol: f64) -> Option<Vec<
         (p2[1] - c2[1]).atan2(p2[0] - c2[0])
     };
 
+    let mut vertex_cursor = 0usize;
     for geom in &wire.tangent_geoms {
         match geom {
             TangentGeom::Line { p1, p2 } => {
-                let (p1, p2) = tangent_line_endpoints(wire, *p1, *p2);
+                let (p1, p2) = tangent_line_endpoints(wire, *p1, *p2, &mut vertex_cursor);
                 if !frame.contains(p1, tol) || !frame.contains(p2, tol) {
                     return None;
                 }
@@ -3647,6 +3685,121 @@ mod ext_tests {
         assert!(none.is_none(), "no base point → no base→corner alignment");
     }
 
+    /// #1313: an intersection lock must report both of the vectors it is the
+    /// crossing of, so the overlay can draw both. Reporting only the one a
+    /// typed distance runs along leaves the user with a single guide and no
+    /// sign of what the point actually is.
+    #[test]
+    fn intersection_lock_reports_both_crossing_vectors() {
+        let mut s = Snapper::default();
+        s.otrack_enabled = true;
+        s.osnap_radius_px = 10.0;
+        // Two acquired corners. With no polar step each offers a horizontal and
+        // a vertical ray, so their rays cross at (10, 0) and at (0, 5).
+        let first = DVec3::new(0.0, 0.0, 0.0);
+        let second = DVec3::new(10.0, 5.0, 0.0);
+        for corner in [first, second] {
+            s.tracking_points.push(corner);
+            s.tracking_dirs.push(Vec::new());
+        }
+
+        let view_rot = Mat4::from_scale(Vec3::splat(0.0001));
+        let eye = glam::DVec3::ZERO;
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+
+        // Cursor a hair off the crossing of the first corner's horizontal ray
+        // and the second corner's vertical one.
+        let crossing = DVec3::new(10.0, 0.0, 0.0);
+        let hit = s
+            .otrack_snap(
+                crossing + DVec3::new(0.02, 0.02, 0.0),
+                view_rot,
+                eye,
+                bounds,
+                None,
+                None,
+                None,
+                false,
+                DVec3::X,
+                DVec3::Y,
+            )
+            .expect("the two rays cross inside the aperture");
+        assert!(
+            (hit.aligned - crossing).length() < 1e-9,
+            "locked off the crossing: {:?}",
+            hit.aligned
+        );
+
+        let (cross_base, cross_dir) = hit.cross.expect("a crossing reports its second vector");
+        let bases = [hit.base, cross_base];
+        for corner in [first, second] {
+            assert!(
+                bases.iter().any(|b| (*b - corner).length() < 1e-9),
+                "{corner:?} is not one of the two reported vectors: {bases:?}"
+            );
+        }
+
+        // Each vector runs from its own corner through the crossing, pointing
+        // at it — the guides are drawn along these.
+        for (base, dir) in [(hit.base, hit.dir), (cross_base, cross_dir)] {
+            let off = crossing - base;
+            assert!(
+                (off.x * dir.y - off.y * dir.x).abs() < 1e-9,
+                "the crossing is off the vector from {base:?} along {dir:?}"
+            );
+            assert!(
+                off.dot(dir) > 0.0,
+                "vector from {base:?} points away from the crossing"
+            );
+        }
+    }
+
+    /// The second vector belongs to a crossing alone: a plain single-ray
+    /// alignment has nothing to cross, and must not draw a second guide.
+    #[test]
+    fn single_ray_alignment_reports_no_crossing_vector() {
+        let mut s = Snapper::default();
+        s.otrack_enabled = true;
+        s.osnap_radius_px = 10.0;
+        let corner = DVec3::new(10.0, 5.0, 0.0);
+        s.tracking_points.push(corner);
+        s.tracking_dirs.push(Vec::new());
+
+        let view_rot = Mat4::from_scale(Vec3::splat(0.0001));
+        let eye = glam::DVec3::ZERO;
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+
+        let hit = s
+            .otrack_snap(
+                DVec3::new(60.0, 5.02, 0.0),
+                view_rot,
+                eye,
+                bounds,
+                None,
+                None,
+                None,
+                false,
+                DVec3::X,
+                DVec3::Y,
+            )
+            .expect("the corner's horizontal ray catches the cursor");
+        assert!(
+            hit.cross.is_none(),
+            "a single-ray alignment reported a crossing vector: {:?}",
+            hit.cross
+        );
+    }
+
     #[test]
     fn tangent_points_are_perpendicular_to_the_radius() {
         let c = Vec3::new(0.0, 0.0, 0.0);
@@ -4317,4 +4470,127 @@ mod ext_tests {
         assert!(line_pt.is_some(), "expected line crossing at (-5, 0, 0), got {pts:?}");
     }
 
+    fn xy_circle(cx: f64, cy: f64, radius: f64) -> WireModel {
+        WireModel {
+            tangent_geoms: vec![TangentGeom::PlanarCircle {
+                center: [cx, cy, 0.0],
+                axis_x: [1.0, 0.0, 0.0],
+                axis_y: [0.0, 1.0, 0.0],
+                radius,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn line_geom(a: [f64; 3], b: [f64; 3]) -> TangentGeom {
+        TangentGeom::Line {
+            p1: [a[0] as f32, a[1] as f32, a[2] as f32],
+            p2: [b[0] as f32, b[1] as f32, b[2] as f32],
+        }
+    }
+
+    /// A center mark (`entities/line.rs`) stores two `key_vertices` per
+    /// segment plus the centre, so index `i` of `tangent_geoms` does not name
+    /// vertex `i`; the endpoints must be found by value.
+    #[test]
+    fn exact_curve_intersections_handles_center_mark_vertex_layout() {
+        let segments: [([f64; 3], [f64; 3]); 4] = [
+            ([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ([0.0, -1.0, 0.0], [0.0, 1.0, 0.0]),
+            ([2.0, 0.0, 0.0], [7.0, 0.0, 0.0]),
+            ([0.0, 2.0, 0.0], [0.0, 7.0, 0.0]),
+        ];
+        let mut mark = WireModel::default();
+        for (a, b) in segments {
+            mark.key_vertices.push(a);
+            mark.key_vertices.push(b);
+            mark.tangent_geoms.push(line_geom(a, b));
+        }
+        mark.key_vertices.push([0.0, 0.0, 0.0]);
+
+        let mut pts = exact_curve_intersections(&mark, &xy_circle(0.0, 0.0, 5.0))
+            .expect("the extension lines cross the circle");
+        pts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(pts.len(), 2, "only the two extension lines reach r=5: {pts:?}");
+        assert!((pts[0] - DVec3::new(0.0, 5.0, 0.0)).length() < 1e-9, "{pts:?}");
+        assert!((pts[1] - DVec3::new(5.0, 0.0, 0.0)).length() < 1e-9, "{pts:?}");
+    }
+
+    /// A block entry (`cache/block_cache.rs`) appends each entity's
+    /// `key_vertices` and `tangent_geoms` in turn; the seam between two
+    /// entities must not be read as a segment.
+    #[test]
+    fn exact_curve_intersections_handles_block_entry_vertex_layout() {
+        let (a0, a1) = ([-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
+        let (b0, b1) = ([20.0, -10.0, 0.0], [20.0, 10.0, 0.0]);
+        let block = WireModel {
+            key_vertices: vec![a0, a1, b0, b1],
+            tangent_geoms: vec![
+                line_geom(a0, a1),
+                line_geom(b0, b1),
+                TangentGeom::PlanarCircle {
+                    center: [30.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 1.0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut pts = exact_curve_intersections(&block, &xy_circle(0.0, 0.0, 5.0))
+            .expect("the first line crosses the circle");
+        pts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(pts.len(), 2, "the seam a1->b0 is not a segment: {pts:?}");
+        assert!((pts[0] - DVec3::new(-5.0, 0.0, 0.0)).length() < 1e-9, "{pts:?}");
+        assert!((pts[1] - DVec3::new(5.0, 0.0, 0.0)).length() < 1e-9, "{pts:?}");
+    }
+
+    /// The closing segment of a closed polyline runs from the last vertex
+    /// back to the first; it must still resolve to f64 vertices rather than
+    /// the f32 geom endpoints, which drift by centimetres at UTM scale.
+    #[test]
+    fn exact_curve_intersections_closing_segment_keeps_f64_vertices() {
+        let (ox, oy) = (500_000.123456, 4_000_000.654321);
+        let v = [
+            [ox + 10.0, oy, 0.0],
+            [ox + 10.0, oy + 10.0, 0.0],
+            [ox, oy + 10.0, 0.0],
+            [ox, oy, 0.0],
+        ];
+        let square = WireModel {
+            key_vertices: v.to_vec(),
+            tangent_geoms: (0..4).map(|i| line_geom(v[i], v[(i + 1) % 4])).collect(),
+            ..Default::default()
+        };
+
+        // Centred on the closing edge x = ox, so both crossings sit on it.
+        let pts = exact_curve_intersections(&square, &xy_circle(ox, oy + 5.0, 1.0))
+            .expect("the circle crosses the closing edge");
+        assert_eq!(pts.len(), 2, "{pts:?}");
+        for p in &pts {
+            assert!((p.x - ox).abs() < 1e-9, "closing edge fell back to f32 endpoints: {p:?}");
+        }
+    }
+
+    /// The by-value vertex lookup must stay linear over the wire: each geom's
+    /// pair is expected at the cursor left by the previous match.
+    #[test]
+    fn tangent_line_endpoints_cursor_walks_the_wire_once() {
+        let n = 64;
+        let verts: Vec<[f64; 3]> = (0..=n).map(|i| [i as f64, (i % 3) as f64, 0.0]).collect();
+        let wire = WireModel {
+            key_vertices: verts.clone(),
+            tangent_geoms: (0..n).map(|i| line_geom(verts[i], verts[i + 1])).collect(),
+            ..Default::default()
+        };
+        let mut cursor = 0usize;
+        for (i, geom) in wire.tangent_geoms.iter().enumerate() {
+            let TangentGeom::Line { p1, p2 } = geom else { unreachable!() };
+            let (a, b) = tangent_line_endpoints(&wire, *p1, *p2, &mut cursor);
+            assert_eq!(a, DVec3::from_array(verts[i]));
+            assert_eq!(b, DVec3::from_array(verts[i + 1]));
+            assert_eq!(cursor, i + 1, "cursor must land on the segment's end vertex");
+        }
+    }
 }

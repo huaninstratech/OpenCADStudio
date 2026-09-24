@@ -11,7 +11,7 @@ use acadrust::{CadDocument, EntityType, Handle};
 use interprocess::local_socket::traits::Stream as StreamTrait;
 use interprocess::local_socket::{GenericNamespaced, Stream, ToNsName};
 
-use crate::host::{DocumentReader, HostApi, InteractiveCommand, ReaderEntity};
+use crate::host::{DocumentReader, HostApi, HostSettingValue, InteractiveCommand, ReaderEntity};
 use crate::ipc::protocol::{
     HostResponse, HostToPlugin, PluginRequest, PluginResponse, PluginToHost, RunnerHandshake,
 };
@@ -413,6 +413,156 @@ impl HostApi for PluginHostApi {
             Err(e) => {
                 eprintln!("[plugin] DocumentPath request failed: {e}");
                 None
+            }
+        }
+    }
+
+    fn system_variable(&self, name: &str) -> Option<HostSettingValue> {
+        match self.client.request(PluginRequest::GetSystemVariable { name: name.to_owned() }) {
+            Ok(PluginResponse::SystemVariable(value)) => value,
+            _ => None,
+        }
+    }
+
+    fn set_system_variable(
+        &mut self,
+        name: &str,
+        value: HostSettingValue,
+    ) -> Result<HostSettingValue, String> {
+        match self.client.request(PluginRequest::SetSystemVariable {
+            name: name.to_owned(),
+            value,
+        }) {
+            Ok(PluginResponse::SystemVariableResult(result)) => {
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected system variable response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn update_entities_transaction(
+        &mut self,
+        label: &str,
+        entities: Vec<EntityType>,
+    ) -> Result<(), String> {
+        match self.client.request(PluginRequest::UpdateEntitiesTransaction {
+            label: label.to_owned(), entities,
+        }) {
+            Ok(PluginResponse::EntityTransactionResult(result)) => {
+                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected entity transaction response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn selection(&self) -> Vec<Handle> {
+        match self.client.request(PluginRequest::GetSelection) {
+            Ok(PluginResponse::Selection(handles)) => handles,
+            _ => Vec::new(),
+        }
+    }
+
+    fn solid_operation(&mut self, operation: crate::host::SolidOperation) -> Result<Handle, String> {
+        match self.client.request(PluginRequest::SolidOperation { operation }) {
+            Ok(PluginResponse::SolidResult(result)) => {
+                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected solid operation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn run_command(&mut self, request: crate::host::CommandRequest) -> Result<crate::host::CommandOutcome, String> {
+        match self.client.request(PluginRequest::RunCommand { request }) {
+            Ok(PluginResponse::CommandResult(result)) => {
+                self.document_cache = OnceCell::new();
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected command response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn table_operation(&mut self, operation: crate::host::TableOperation) -> Result<Handle, String> {
+        match self.client.request(PluginRequest::TableOperation { operation }) {
+            Ok(PluginResponse::TableResult(result)) => {
+                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected table operation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn set_selection(&mut self, handles: &[Handle]) -> Result<(), String> {
+        match self.client.request(PluginRequest::SetSelection { handles: handles.to_vec() }) {
+            Ok(PluginResponse::SelectionResult(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected selection response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn add_layer(&mut self, config: crate::host::LayerConfig) -> Option<Handle> {
+        match self.client.request(PluginRequest::AddLayer(config)) {
+            Ok(PluginResponse::OptHandle(h)) => {
+                if h.is_some() {
+                    self.document_cache = OnceCell::new();
+                }
+                h
+            }
+            Ok(other) => {
+                eprintln!("[plugin] unexpected AddLayer response: {other:?}");
+                None
+            }
+            Err(e) => {
+                eprintln!("[plugin] AddLayer request failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn modify_layer(&mut self, config: crate::host::LayerConfig) -> bool {
+        match self.client.request(PluginRequest::ModifyLayer(config)) {
+            Ok(PluginResponse::Bool(b)) => {
+                if b {
+                    self.document_cache = OnceCell::new();
+                }
+                b
+            }
+            Ok(other) => {
+                eprintln!("[plugin] unexpected ModifyLayer response: {other:?}");
+                false
+            }
+            Err(e) => {
+                eprintln!("[plugin] ModifyLayer request failed: {e}");
+                false
+            }
+        }
+    }
+
+    fn execute_command(&mut self, cmd: &str) -> bool {
+        match self.client.request(PluginRequest::ExecuteCommand(cmd.to_string())) {
+            Ok(PluginResponse::Bool(b)) => b,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected ExecuteCommand response: {other:?}");
+                false
+            }
+            Err(e) => {
+                eprintln!("[plugin] ExecuteCommand request failed: {e}");
+                false
             }
         }
     }

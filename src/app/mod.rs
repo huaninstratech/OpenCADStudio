@@ -18,6 +18,7 @@ mod dimension_preview_tests;
 mod document;
 mod drafting_settings;
 pub(crate) mod expr_eval;
+mod options_session;
 mod find_replace;
 pub(crate) mod helpers;
 mod history;
@@ -34,7 +35,7 @@ mod record_api;
 pub(crate) mod settings;
 mod shortcuts;
 mod startup;
-mod style_ops;
+pub(crate) mod style_ops;
 mod text_inline;
 mod tolerance_dialog;
 mod update;
@@ -42,6 +43,17 @@ mod view;
 mod visibility;
 
 pub use style_ops::StyleKind;
+
+/// Re-exported `pub` (not `pub(crate)`) so the `cargo bench` harness
+/// (`benches/`, an external crate) can measure the real grip-budget helper as
+/// `ui_grip_budget`. The `properties` / `settings` modules themselves stay
+/// private / `pub(crate)`; only these two names are reachable externally.
+pub use properties::apply_grip_budget;
+pub use settings::MAX_SELECTED_GRIPS;
+/// Re-exported for the `cargo bench` harness (`ui_selection_overlay`
+/// constructs `CrosshairOptions`, which names these types). Modules stay
+/// as they are; only these two names are reachable externally.
+pub use settings::{CursorType, IsoPlane};
 
 use document::DocumentTab;
 
@@ -489,6 +501,8 @@ pub(super) struct OpenCADStudio {
     layer_translator: Option<crate::ui::window::layer_translator::State>,
     /// Working copy of the Drawing Units dialog; `None` while it is closed.
     drawing_units: Option<crate::ui::window::drawing_units::State>,
+    /// Working copy of the Block Definition dialog; `None` while it is closed.
+    block_definition: Option<crate::ui::window::block_definition::BlockDefinitionState>,
     /// Working copy of the structured feature-control-frame editor.
     geometric_tolerance: Option<crate::ui::window::geometric_tolerance::State>,
     /// PICKDRAG (#226): false (default) = press-drag lassoes; true =
@@ -514,6 +528,11 @@ pub(super) struct OpenCADStudio {
     /// cursor is on a tracking ray. Lets a typed distance place a point along
     /// the ray from the tracking point (issue #69). `None` when not aligned.
     otrack_active: Option<(glam::DVec3, glam::DVec3)>,
+    /// The vector `otrack_active` crosses, when the lock is the meeting of two
+    /// tracking vectors. Drawn beside the first so the user can see that the
+    /// point is their intersection; a typed distance still runs along
+    /// `otrack_active` alone. `None` for a single-ray alignment. (#1313)
+    otrack_cross: Option<(glam::DVec3, glam::DVec3)>,
     /// Active OTRACK ray kind, separate from typed-distance geometry.
     otrack_kind: Option<crate::snap::TrackingKind>,
     /// Whether Tangent snap was enabled before a tangent-pick command started.
@@ -583,6 +602,10 @@ pub(super) struct OpenCADStudio {
     dyn_input: bool,
     /// Currently visible page in the application Options dialog.
     options_tab: crate::ui::window::options::OptionsTab,
+    /// The Options window's commit point (see `options_session`).
+    options_saved: Option<options_session::OptionsSnapshot>,
+    /// Close was pressed with unapplied changes; the discard guard is up.
+    options_close_confirm: bool,
     spacemouse: crate::input::spacemouse::Service,
     spacemouse_preferences: crate::input::spacemouse::Preferences,
     spacemouse_paused: bool,
@@ -615,10 +638,21 @@ pub(super) struct OpenCADStudio {
     pub constraint_solve_mode: bool,
     pub constraint_infer: bool,
     pub constraint_bar_display: i16,
+    /// DCFORM: new dimensional constraints use the annotational form.
+    pub constraint_form_annotational: bool,
+    /// The dimensional constraint DIMCONSTRAINT offers by default: the last one used.
+    pub dim_constraint_last: &'static str,
+    /// Set while a plugin drives the command line (`HostApi::execute_command`).
+    /// Dispatching a plugin command from there would call back into the plugin
+    /// that is still blocked waiting for this request, so plugin dispatch is
+    /// skipped for the length of the call.
+    pub(crate) suppress_plugin_dispatch: bool,
     pub constraint_bar_mode: i16,
     /// Minutes between autosaves to a `.sv$` recovery file (SAVETIME command);
     /// 0 disables autosave.
     pub savetime_min: i32,
+    /// SCRIPTCOMMANDS: scripts may run OCS commands (see `UserSettings`).
+    pub script_commands: bool,
     /// Persisted default viewport background, restored from settings and applied
     /// to every drawing tab (new and opened) so a chosen background survives
     /// restarts (#188). `None` = the built-in dark-grey / off-white defaults.
@@ -891,6 +925,11 @@ pub(super) struct OpenCADStudio {
     /// `SelectionChangedV4` fires once per real change rather than per message.
     #[cfg(not(target_arch = "wasm32"))]
     last_plugin_selection: Option<(u64, u64)>,
+    /// `(tab id, geometry epoch)` last published to the V4 document view.
+    /// Built-in edits bypass HostSession, so this is checked at message
+    /// boundaries as well as after plugin-initiated writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    last_plugin_document: Option<(u64, u64)>,
     /// External add-on packages found in the plugins folder, refreshed when the
     /// Plugin Manager opens.
     external_plugins: Vec<crate::plugin::external::ExternalPlugin>,
@@ -1844,6 +1883,7 @@ pub enum ModalKind {
     LayerStateManager,
     LayerTranslator,
     DrawingUnits,
+    BlockDefinition,
     GeometricTolerance,
     DraftingSettings,
     AutoConstrainSettings,
@@ -2015,6 +2055,8 @@ pub enum Message {
     SpaceMousePreferences,
     SpaceMouseDriverSettings,
     SpaceMouseDetails,
+    /// One magnification delta from a trackpad pinch, positive zooming in.
+    TrackpadPinch(f32),
     ControlRequest(control::Envelope),
     PollWebControl,
     ControlStep(String, Box<Message>),
@@ -2209,6 +2251,10 @@ pub enum Message {
     SaveTimeChanged(i32),
     /// Toggle keeping a `.bak` copy when overwriting a drawing (ISAVEBAK).
     BackupOnSaveChanged(bool),
+    /// A drawing was picked to import page setups from (`PSETUPIN`).
+    PageSetupImportFile(std::path::PathBuf),
+    /// Options: open the Plot / Page Setup dialog for every new layout.
+    PageSetupOnNewLayoutChanged(bool),
     /// Toggle filled TrueType glyphs (TEXTFILL).
     TextFillChanged(bool),
     /// Change how many prompt lines sit above the command window (CLIPROMPTLINES).
@@ -2815,6 +2861,30 @@ pub enum Message {
     DrawingUnitsField(crate::ui::window::drawing_units::Field),
     /// Drawing Units OK — write the working copy into the drawing.
     DrawingUnitsApply,
+    /// Block Definition dialog field updates
+    BlockDefName(String),
+    BlockDefNameSelect(String),
+    BlockDefBaseOnScreen(bool),
+    BlockDefPickPoint,
+    BlockDefBaseX(String),
+    BlockDefBaseY(String),
+    BlockDefBaseZ(String),
+    BlockDefObjectsOnScreen(bool),
+    BlockDefSelectObjects,
+    BlockDefQuickSelect,
+    BlockDefObjectMode(crate::ui::window::block_definition::BlockObjectMode),
+    BlockDefAnnotative(bool),
+    BlockDefMatchOrientation(bool),
+    BlockDefScaleUniformly(bool),
+    BlockDefAllowExploding(bool),
+    BlockDefUnit(i16),
+    BlockDefDescription(String),
+    BlockDefDescriptionAction(iced::widget::text_editor::Action),
+    BlockDefHyperlink,
+    BlockDefApply,
+    BlockDefConfirmRedefine(bool),
+    BlockDefDismissError,
+    BlockDefHelp,
     /// One structured feature-control-frame field changed.
     ToleranceDialogField(crate::ui::window::geometric_tolerance::Field),
     /// One structured feature-control-frame option changed.
@@ -2873,6 +2943,14 @@ pub enum Message {
     DraftingSettingsClose,
     DraftingSettingsCloseDiscard,
     DraftingSettingsCloseKeep,
+    /// Options window: commit the changes made so far.
+    OptionsApply,
+    /// Options window: commit and close.
+    OptionsOk,
+    /// Options window: close, asking first when changes would be lost.
+    OptionsClose,
+    OptionsCloseDiscard,
+    OptionsCloseKeep,
     AutoConstrainSelectRow(usize),
     AutoConstrainToggleKind(settings::AutoConstraintKind),
     AutoConstrainMoveUp,
@@ -3471,7 +3549,9 @@ pub enum Message {
     /// Open file dialog to load a CTB/STB plot style table.
     PlotStyleLoad,
     /// Callback when the user picks (or cancels) a CTB/STB file.
-    PlotStyleLoaded(Option<crate::io::plot_style::PlotStyleTable>),
+    /// The Load… picker finished: a table, nothing (cancelled), or why the
+    /// file could not be read.
+    PlotStyleLoaded(Result<Option<crate::io::plot_style::PlotStyleTable>, String>),
     /// Clear the active plot style table.
     PlotStyleClear,
     /// Open/close the Plot Style panel.
@@ -3898,6 +3978,7 @@ impl OpenCADStudio {
             annotation_scale_modelspace: false,
             last_saved_config: None,
             otrack_active: None,
+            otrack_cross: None,
             otrack_kind: None,
             clean_screen: false,
             quick_properties: false,
@@ -3908,6 +3989,7 @@ impl OpenCADStudio {
             last_layer_translation: None,
             layer_translator: None,
             drawing_units: None,
+            block_definition: None,
             geometric_tolerance: None,
             pick_drag_rect: false,
             perf_hud: false,
@@ -3945,6 +4027,8 @@ impl OpenCADStudio {
             grid_beyond_limits: true,
             dyn_input: true,
             options_tab: crate::ui::window::options::OptionsTab::General,
+            options_saved: None,
+            options_close_confirm: false,
             spacemouse: {
                 let service = crate::input::spacemouse::Service::default();
                 service.set_actions(navigation::actions());
@@ -3971,8 +4055,12 @@ impl OpenCADStudio {
             constraint_solve_mode: true,
             constraint_infer: false,
             constraint_bar_display: 3,
+            constraint_form_annotational: false,
+            dim_constraint_last: "Aligned",
+            suppress_plugin_dispatch: false,
             constraint_bar_mode: 4095,
             savetime_min: 10,
+            script_commands: true,
             default_bg_color: None,
             default_paper_bg_color: None,
             cliprompt_lines: 3,
@@ -4076,6 +4164,8 @@ impl OpenCADStudio {
             disabled_plugins: rustc_hash::FxHashSet::default(),
             #[cfg(not(target_arch = "wasm32"))]
             last_plugin_selection: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_plugin_document: None,
             external_plugins: Vec::new(),
             loaded_plugin_ids: rustc_hash::FxHashSet::default(),
             plugin_load_errors: rustc_hash::FxHashMap::default(),

@@ -48,3 +48,9 @@ __pycache__/
 # Large-file benchmark fixtures and generator binaries
 scripts/testdata/
 scripts/*.exe
+
+# Single-instance lock files the app writes next to an open drawing
+*.ocs.lock
+
+# macOS Finder metadata
+.DS_Store

@@ -12,6 +12,7 @@ mod fileops;
 mod inquiry;
 mod layerprops;
 mod layers;
+mod plotvars;
 mod styleprops;
 mod view;
 
@@ -185,7 +186,7 @@ impl OpenCADStudio {
             return Task::none();
         }
 
-        if crate::plugin::try_dispatch(self, i, cmd) {
+        if !self.suppress_plugin_dispatch && crate::plugin::try_dispatch(self, i, cmd) {
             // try_dispatch returns true for both finished commands and interactive
             // commands that it just installed. If no command is now active, the
             // tool was a one-shot and we must turn the ribbon highlight off here —
@@ -261,6 +262,9 @@ impl OpenCADStudio {
             return Some(t);
         }
         if let Some(t) = self.dispatch_layerprops(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_plotvars(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_styleprops(cmd, i) {
@@ -555,6 +559,16 @@ inventory::submit!(crate::command::CommandRegistration {
         "DELOBJ",
         "PLINEGEN",
         "PSLTSCALE",
+        // Plot preferences and the current-layout variables (commands/plotvars.rs).
+        "PLOTOFFSET",
+        "PAPERUPDATE",
+        "PLOTROTMODE",
+        "PLOTTRANSPARENCYOVERRIDE",
+        "BACKGROUNDPLOT",
+        "CTAB",
+        "TILEMODE",
+        "PSETUPIN",
+        "-PSETUPIN",
         "DISPSILH",
         "WORLDVIEW",
         "LIMCHECK",
@@ -719,6 +733,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "PERF",
         "PERSP",
         "PLOT",
+        "PRINTERS",
         "PLOTSTYLE",
         "PLOTSTYLEEDITOR",
         "PLOTSTYLEPANEL",
