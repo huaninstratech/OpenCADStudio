@@ -18,6 +18,7 @@ impl OpenCADStudio {
             Some(K::FindReplace) => crate::tr!("modal", "find-replace"),
             Some(K::PluginManager) => crate::tr!("modal", "plugin-manager"),
             Some(K::UpdateNotice) => crate::tr!("modal", "update-available"),
+            Some(K::DonationPrompt) => crate::tr!("donation", "title"),
             Some(K::Layers) => crate::tr!("modal", "layer-manager"),
             Some(K::LayerStateManager) => crate::tr!("modal", "layer-state-manager"),
             Some(K::LayerTranslator) => crate::t!("Layer Translator").into_owned(),
@@ -460,6 +461,9 @@ impl OpenCADStudio {
                             .into()
                     })
                 }
+            }
+            super::super::ModalKind::DonationPrompt => {
+                sized_flow(ex, 540, 360, donation_dialog_window)
             }
             super::super::ModalKind::UpdateNotice => {
                 let latest = self.update_notice_version.as_deref().unwrap_or("?");
@@ -2160,6 +2164,42 @@ fn layer_delete_warning_window(
 /// platform. "OK" closes it for this session; the status-bar pill brings it
 /// back. "Don't show again" silences this verdict only, so a different
 /// failure on the same machine still prompts.
+fn donation_dialog_window(sizing: crate::ui::modal::ModalSizing) -> Element<'static, Message> {
+    container(
+        column![
+            text(crate::tr!("donation", "heading")).size(18),
+            row![
+                text(crate::tr!("donation", "body"))
+                    .size(14)
+                    .width(Fill),
+                crate::ui::icons::themed(crate::ui::icons::HEART, 52.0),
+            ]
+            .spacing(20)
+            .align_y(iced::Center),
+            row![
+                Space::new().width(Fill),
+                dialog_button(
+                    crate::tr!("start", "donate"),
+                    Message::DonationPromptDonate,
+                    button::primary,
+                ),
+                dialog_button(
+                    crate::tr!("donation", "decline"),
+                    Message::CloseModal,
+                    button::secondary,
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        ]
+        .spacing(18)
+        .width(sizing.width),
+    )
+    .style(dialog_body_style)
+    .padding([24, 28])
+    .into()
+}
+
 fn gpu_warning_window(
     status: &crate::scene::pipeline::GpuStatus,
     sizing: crate::ui::modal::ModalSizing,

@@ -9276,6 +9276,11 @@ impl OpenCADStudio {
                     .push_back(super::ModalKind::UpdateNotice);
                 Task::none()
             }
+            Message::DonationPromptDonate => {
+                self.close_active_modal();
+                self.dispatch_view("DONATE", self.active_tab)
+                    .unwrap_or_else(Task::none)
+            }
             Message::UpdateNoticeClose => {
                 self.close_active_modal();
                 Task::none()

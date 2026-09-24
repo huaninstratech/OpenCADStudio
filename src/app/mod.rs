@@ -982,6 +982,7 @@ pub(super) struct OpenCADStudio {
     font_source_url: String,
     /// Editable copy of `font_source_url` shown in the missing-fonts prompt.
     font_source_input: String,
+    donation_prompt_version: String,
     /// Read-only session (`--read-only`): editing is allowed but every save
     /// path is refused. Set once at boot from the CLI config.
     read_only: bool,
@@ -1879,6 +1880,7 @@ pub enum ModalKind {
     Shortcuts,
     PluginManager,
     UpdateNotice,
+    DonationPrompt,
     Layers,
     LayerStateManager,
     LayerTranslator,
@@ -3493,6 +3495,7 @@ pub enum Message {
     UpdateCheckResult(Option<crate::io::update_check::UpdateInfo>),
     /// User dismissed the update-notice window.
     UpdateNoticeClose,
+    DonationPromptDonate,
     /// First-launch default-association prompt: user accepted — register this
     /// app as the default handler for .dwg / .dxf.
     AssocPromptYes,
@@ -4188,6 +4191,7 @@ impl OpenCADStudio {
             check_missing_fonts: true,
             font_source_url: String::new(),
             font_source_input: String::new(),
+            donation_prompt_version: String::new(),
             read_only: false,
             update_notice_version: None,
             update_notice_body: None,

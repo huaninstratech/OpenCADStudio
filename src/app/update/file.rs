@@ -625,6 +625,7 @@ impl OpenCADStudio {
             default_assoc_prompted: self.default_assoc_prompted,
             check_missing_fonts: self.check_missing_fonts,
             font_source_url: self.font_source_url.clone(),
+            donation_prompt_version: self.donation_prompt_version.clone(),
             gpu_warning_silenced: self.gpu_warning_silenced.clone(),
             disabled_plugins: {
                 let mut v: Vec<String> = self.disabled_plugins.iter().cloned().collect();
@@ -722,6 +723,7 @@ impl OpenCADStudio {
         self.check_missing_fonts = s.check_missing_fonts;
         self.font_source_url = s.font_source_url.clone();
         self.font_source_input = s.font_source_url.clone();
+        self.donation_prompt_version = s.donation_prompt_version.clone();
         self.gpu_warning_silenced = s.gpu_warning_silenced.clone();
         self.disabled_plugins = s.disabled_plugins.iter().cloned().collect();
         self.plugin_repos = s.plugin_repos.clone();
