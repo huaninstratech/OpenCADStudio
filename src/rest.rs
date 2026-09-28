@@ -104,6 +104,13 @@ impl HttpRequest {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Query params arrive as strings; the ops read them with `as_u64()`,
+    /// which silently fails on a JSON string — so `?offset=1000` used to be
+    /// dropped and pagination looped on page one. Parse to a number here.
+    fn numeric_param(&self, key: &str) -> Option<u64> {
+        self.param(key).and_then(|v| v.parse::<u64>().ok())
+    }
+
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
@@ -407,8 +414,8 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             if let Some(v) = request.param("type") { request_json["type"] = json!(v); }
             if let Some(v) = request.param("layer") { request_json["layer"] = json!(v); }
             if let Some(v) = request.param("detail") { request_json["detail"] = json!(v); }
-            if let Some(v) = request.param("offset") { request_json["offset"] = json!(v); }
-            if let Some(v) = request.param("limit") { request_json["limit"] = json!(v); }
+            if let Some(v) = request.numeric_param("offset") { request_json["offset"] = json!(v); }
+            if let Some(v) = request.numeric_param("limit") { request_json["limit"] = json!(v); }
             if let Some(v) = request.param("fields") {
                 request_json["fields"] = json!(v.split(',').collect::<Vec<_>>());
             }
@@ -510,8 +517,8 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             let mut request_json = json!({"op":"records"});
             if let Some(v) = request.param("collection") { request_json["collection"] = json!(v); }
             if let Some(v) = request.param("type") { request_json["type"] = json!(v); }
-            if let Some(v) = request.param("offset") { request_json["offset"] = json!(v); }
-            if let Some(v) = request.param("limit") { request_json["limit"] = json!(v); }
+            if let Some(v) = request.numeric_param("offset") { request_json["offset"] = json!(v); }
+            if let Some(v) = request.numeric_param("limit") { request_json["limit"] = json!(v); }
             Plan::Run { request: request_json, created: 200 }
         }
         ("GET", ["openapi"]) => Plan::Local(
