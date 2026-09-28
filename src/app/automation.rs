@@ -1779,6 +1779,261 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// PROBE (bug report: block_define via automation loses its definition
+    /// after save/reload): the round trip must keep the BlockTableRecord, its
+    /// owned children and the Block/BlockEnd markers — for DXF and DWG alike,
+    /// including cloned refs (entities_create INSERT) and a nested define.
+    #[test]
+    fn probe_block_definition_survives_round_trip_per_format() {
+        for ext in ["dxf", "dwg"] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.automation_op(r#"{"op":"new"}"#);
+            app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+            app.automation_op(r#"{"op":"run","cmd":"CIRCLE 5,0 2"}"#);
+            let q = app.automation_op(r#"{"op":"query","detail":"summary"}"#);
+            let handles: Vec<String> = q["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| format!("\"{}\"", e["handle"].as_str().unwrap()))
+                .collect();
+            let r = mutate(
+                &mut app,
+                &format!(
+                    r#"{{"protocol":1,"op":"block_define","request_id":"b1","document_id":{{doc}},"name":"MARK","base":[0,0,0],"handles":[{}]}}"#,
+                    handles.join(",")
+                ),
+            );
+            assert_eq!(r["ok"], true, "{ext}: {}", r["error"]);
+            let first_insert = r["result"]["insert"].as_str().unwrap().to_owned();
+
+            let i = app.active_tab;
+            let before = &app.tabs[i].scene.document;
+            let br_before = before
+                .block_records
+                .get("MARK")
+                .unwrap_or_else(|| panic!("{ext}: MARK record missing before save"));
+            let children_before = br_before.entity_handles.len();
+            assert_eq!(children_before, 2, "{ext}: owned children before save");
+            assert!(!br_before.is_layout(), "{ext}: layout flag before save");
+
+            // Clone the block ref into two more entities via the API
+            // (entities_create INSERT — how automation stamps extra refs).
+            let c = mutate(
+                &mut app,
+                r#"{"protocol":1,"op":"entities_create","request_id":"c1","document_id":{doc},"entities":[
+                    {"type":"Insert","block":"MARK","position":[40,0]},
+                    {"type":"Insert","block":"MARK","position":[80,0]}
+                ]}"#,
+            );
+            assert_eq!(c["ok"], true, "{ext}: clone refs: {}", c["error"]);
+            assert_eq!(count_type(&mut app, "Insert"), 3, "{ext}: refs before save");
+
+            // Round trip 1.
+            let path =
+                std::env::temp_dir().join(format!("ocs_probe_{}.{}", std::process::id(), ext));
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_string_lossy().replace('\\', "\\\\");
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: save"
+            );
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"open","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: open"
+            );
+            let check = |app: &mut OpenCADStudio, ctx: &str, inserts: u64| {
+                let i = app.active_tab;
+                let after = &app.tabs[i].scene.document;
+                let Some(br) = after.block_records.get("MARK") else {
+                    panic!(
+                        "{ctx}: DEFINITION LOST; records present: {:?}",
+                        after
+                            .block_records
+                            .iter()
+                            .map(|b| b.name.clone())
+                            .collect::<Vec<_>>()
+                    );
+                };
+                assert_eq!(br.entity_handles.len(), 2, "{ctx}: owned children");
+                assert!(!br.is_layout(), "{ctx}: layout flag after reload");
+                // Document-level queries count definition-owned inserts too.
+                assert_eq!(count_type(app, "Insert"), inserts, "{ctx}: refs after reload");
+            };
+            check(&mut app, &format!("{ext}: round trip 1"), 3);
+
+            // Round trip 2: save the reloaded document again.
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: save 2"
+            );
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"open","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: open 2"
+            );
+            check(&mut app, &format!("{ext}: round trip 2"), 3);
+
+            // Nested define: turn one MARK ref into a new definition NESTED.
+            let n = mutate(
+                &mut app,
+                &format!(
+                    r#"{{"protocol":1,"op":"block_define","request_id":"b2","document_id":{{doc}},"name":"NESTED","base":[0,0,0],"handles":["{first_insert}"]}}"#
+                ),
+            );
+            assert_eq!(n["ok"], true, "{ext}: nested define: {}", n["error"]);
+            let i = app.active_tab;
+            let nested = &app.tabs[i].scene.document;
+            let nbr = nested
+                .block_records
+                .get("NESTED")
+                .unwrap_or_else(|| panic!("{ext}: NESTED record missing before save"));
+            assert_eq!(nbr.entity_handles.len(), 1, "{ext}: nested child count");
+            let nested_child_is_insert = matches!(
+                nested.get_entity(nbr.entity_handles[0]),
+                Some(acadrust::EntityType::Insert(_))
+            );
+            assert!(nested_child_is_insert, "{ext}: nested child is an Insert");
+            assert_eq!(count_type(&mut app, "Insert"), 4, "{ext}: NESTED ref + 2 MARK refs + NESTED child");
+
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: save 3"
+            );
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"open","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: open 3"
+            );
+            check(&mut app, &format!("{ext}: after nested round trip"), 4);
+            let i = app.active_tab;
+            let final_doc = &app.tabs[i].scene.document;
+            assert!(
+                final_doc.block_records.get("NESTED").is_some(),
+                "{ext}: NESTED definition lost after round trip"
+            );
+            drop(app);
+            let sidecar = path.with_file_name(format!(
+                ".{}.ocs.lock",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(sidecar);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// PROBE 2 (user workflow: "clone 1 block ref into multiple NEW blocks
+    /// via the API"): stamp extra refs of MARK with entities_create, turn each
+    /// clone into its own block with block_define, then round trip — MARK, B1
+    /// and B2 definitions must all survive, DXF and DWG alike.
+    #[test]
+    fn probe_clone_ref_into_multiple_new_blocks_round_trips() {
+        for ext in ["dxf", "dwg"] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.automation_op(r#"{"op":"new"}"#);
+            app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+            let q = app.automation_op(r#"{"op":"query","type":"Line","detail":"summary"}"#);
+            let handle = q["entities"][0]["handle"].as_str().unwrap();
+            let r = mutate(
+                &mut app,
+                &format!(
+                    r#"{{"protocol":1,"op":"block_define","request_id":"b1","document_id":{{doc}},"name":"MARK","base":[0,0,0],"handles":["{handle}"]}}"#
+                ),
+            );
+            assert_eq!(r["ok"], true, "{ext}: define MARK: {}", r["error"]);
+            let mark_ref = r["result"]["insert"].as_str().unwrap().to_owned();
+
+            // Clone the ref into two more entities via the API …
+            let c = mutate(
+                &mut app,
+                r#"{"protocol":1,"op":"entities_create","request_id":"c1","document_id":{doc},"entities":[
+                    {"type":"Insert","block":"MARK","position":[40,0]},
+                    {"type":"Insert","block":"MARK","position":[80,0]}
+                ]}"#,
+            );
+            assert_eq!(c["ok"], true, "{ext}: clone refs: {}", c["error"]);
+            let clones: Vec<String> = c["result"]["handles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| format!("\"{}\"", h.as_str().unwrap()))
+                .collect();
+
+            // … and turn each clone into its own NEW block definition.
+            let mut new_blocks = Vec::new();
+            for (n, clone) in clones.iter().enumerate() {
+                let d = mutate(
+                    &mut app,
+                    &format!(
+                        r#"{{"protocol":1,"op":"block_define","request_id":"d{n}","document_id":{{doc}},"name":"B{n}","base":[0,0,0],"handles":[{clone}]}}"#
+                    ),
+                );
+                assert_eq!(d["ok"], true, "{ext}: define B{n}: {}", d["error"]);
+                new_blocks.push(format!("B{n}"));
+            }
+
+            let check = |app: &mut OpenCADStudio, ctx: &str| {
+                let i = app.active_tab;
+                let doc = &app.tabs[i].scene.document;
+                for name in ["MARK"] {
+                    assert!(
+                        doc.block_records.get(name).is_some(),
+                        "{ctx}: {name} definition LOST"
+                    );
+                }
+                for name in &new_blocks {
+                    let Some(br) = doc.block_records.get(name) else {
+                        panic!("{ctx}: new block {name} LOST");
+                    };
+                    assert_eq!(br.entity_handles.len(), 1, "{ctx}: {name} child count");
+                    assert!(
+                        matches!(
+                            doc.get_entity(br.entity_handles[0]),
+                            Some(acadrust::EntityType::Insert(ins)) if ins.block_name.eq_ignore_ascii_case("MARK")
+                        ),
+                        "{ctx}: {name} child is a MARK insert"
+                    );
+                }
+                // Model-space refs: the original MARK ref + one ref per new
+                // block = 3; document-level inserts also count the nested
+                // MARK children inside B0/B1 → 5 total.
+                let inserts = doc
+                    .entities()
+                    .filter(|e| matches!(e, acadrust::EntityType::Insert(_)))
+                    .count();
+                assert_eq!(inserts, 5, "{ctx}: insert census");
+            };
+            check(&mut app, &format!("{ext}: before save"));
+
+            let path = std::env::temp_dir()
+                .join(format!("ocs_probe_clone_{}.{}", std::process::id(), ext));
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_string_lossy().replace('\\', "\\\\");
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: save"
+            );
+            assert_eq!(
+                app.automation_op(&format!(r#"{{"op":"open","path":"{p}"}}"#))["ok"],
+                true,
+                "{ext}: open"
+            );
+            check(&mut app, &format!("{ext}: after round trip"));
+            drop(app);
+            let sidecar = path.with_file_name(format!(
+                ".{}.ocs.lock",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(sidecar);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     #[test]
     fn view_focus_requires_the_editor_window() {
         let mut app = OpenCADStudio::new_for_test();
