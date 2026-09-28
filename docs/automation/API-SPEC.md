@@ -1,7 +1,11 @@
 # OpenCADStudio Automation API — Specification
 
-Specification version **1.1** · API protocol **1** · applies to fork builds
+Specification version **1.2** · API protocol **1** · applies to fork builds
 `2026.41` and later (`2026.40` for everything except §3.5 and §6.12).
+Build `2026.46` fixes REST numeric query params (`limit`/`offset` were
+silently dropped before, pinning every `GET /entities` / `GET /records`
+response to its first 1000 rows); §6.4 "Pagination" documents the fixed
+behaviour.
 
 This document is the complete, self-contained reference for the OpenCADStudio
 automation API. Everything a client needs — conventions, transports, the
@@ -275,7 +279,7 @@ Parameters (all optional, combine freely — AND semantics):
 | `type`, `layer` | Entity type name / layer name |
 | `handles` | Exact handle list |
 | `detail` | `summary` (identity + common), `geometry` (+ shape fields), `full` (+ complete serialized properties incl. bounds) |
-| `offset`, `limit` | Paging (limit ≤ 10000) |
+| `offset`, `limit` | Paging — default `limit` 1000, max 10000; see [Pagination] below |
 | `fields` | Projection (property paths) |
 | `bounds` | `[x0,y0,x1,y1]` world-window filter (entities intersecting the box) — for a "fully inside" test, compare each entity's own `bounds` client-side |
 | `near` | `[x,y(,z)]` — rank by kernel-computed distance |
@@ -294,6 +298,40 @@ Text entities return the raw string in `value` plus a formatting-free
 rendering in `text`; degenerate-width text bounds are widened with a
 documented estimate (height × 0.8 × character count) so region filters stay
 usable.
+
+#### Pagination
+
+Every paged read — `query` and `records` alike — answers with
+`count` (total matches), `returned` (rows in this page) and
+`next_offset`:
+
+| Field | Meaning |
+|---|---|
+| `count` | Total matches for the filters, independent of paging |
+| `returned` | Rows in this response (≤ `limit`) |
+| `next_offset` | Offset of the next page, or **`null` when exhausted** |
+
+Defaults and bounds: `offset` starts at 0; `limit` defaults to **1000** and
+is clamped to **10000**. Rows are ordered by handle, ascending — handles
+beyond the first 1000 are reachable **only** through paging, so a client
+that never follows `next_offset` silently sees a prefix of the drawing.
+
+Loop pattern (transport-neutral):
+
+```json
+{"op":"query","type":"Line","offset":0,"limit":1000}   → next_offset:1000
+{"op":"query","type":"Line","offset":1000,"limit":1000} → next_offset:2000
+…                                                       → next_offset:null
+```
+
+Over REST the same ride is `GET /entities?type=Line&offset=…&limit=…`.
+Numeric query params are parsed as numbers by build `2026.46` and later;
+earlier builds dropped them (always page one) — detect by checking that
+`returned` matches the requested `limit`. A page whose `returned` is less
+than `limit` with a non-null `next_offset` cannot occur.
+
+`records` takes the same `offset`/`limit` pair plus `collection` (one
+collection name, or omit for the manifest — §6.1) and `type`.
 
 Companion reads: `entities` (alias), `layers`, `header`, `records`
 (paged, filterable database records), `record_schema` (generated type
