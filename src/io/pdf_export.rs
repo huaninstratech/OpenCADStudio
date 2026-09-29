@@ -242,8 +242,10 @@ fn emit_image(
     {
         return Err("Cannot plot bitmap: invalid coordinates, clip boundary, or opacity.".into());
     }
+    // The low bit (free: the pixel buffer is aligned) keeps the opaque copy
+    // of a picture apart from its transparent one.
     let key = (
-        std::sync::Arc::as_ptr(&image.pixels) as usize,
+        std::sync::Arc::as_ptr(&image.pixels) as usize | usize::from(!image.use_alpha),
         image.width,
         image.height,
     );
@@ -255,7 +257,14 @@ fn emit_image(
             doc.resources.xobjects.map.insert(
                 id.clone(),
                 printpdf::XObject::Image(printpdf::RawImage {
-                    pixels: printpdf::RawImageData::U8(image.pixels.as_ref().clone()),
+                    pixels: printpdf::RawImageData::U8(if image.use_alpha {
+                        image.pixels.as_ref().clone()
+                    } else {
+                        // Transparency off: every pixel opaque in its colour.
+                        let mut opaque = image.pixels.as_ref().clone();
+                        opaque.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+                        opaque
+                    }),
                     width: image.width as usize,
                     height: image.height as usize,
                     data_format: printpdf::RawImageFormat::RGBA8,
@@ -710,7 +719,11 @@ fn append_pdf_page(
         // Near-white and near-yellow (viewport active border) → dark grey for print
         // (only when no CTB override was applied).
         if !color_overridden {
-            let is_light = r > 0.80 && g > 0.80 && b > 0.80;
+            // An authored white (not colour 7) plots as drawn, like on screen.
+            let is_light = r > 0.80
+                && g > 0.80
+                && b > 0.80
+                && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
             let is_yellow = r > 0.80 && g > 0.70 && b < 0.30;
             let is_cyan = r < 0.30 && g > 0.70 && b > 0.70;
             if is_light || is_yellow {
@@ -1093,7 +1106,7 @@ fn emit_wire_fills(
                     boundary_exterior: None,
                     boundary_sources: None,
                     boundary_paths: None,
-                    style: acadrust::entities::HatchStyleType::Normal,
+                    style: codec::entities::HatchStyleType::Normal,
                     pattern: pattern.clone(),
                     name: "PLOTSTYLE".to_string(),
                     color: wire.color,
@@ -1124,21 +1137,26 @@ fn emit_wire_fills(
         if a < 0.01 {
             continue;
         }
-        let mut screening = 1.0;
-        let mut color_overridden = false;
-        if let Some(table) = plot_style {
-            if wire.aci > 0 {
-                if let Some(color) = table.resolve_color(wire.aci) {
-                    [r, g, b] = color;
-                    color_overridden = true;
+        if wire.bg_adapt.as_deref().is_some_and(|adapt| adapt.canvas_color) {
+            // A background mask: it covers with the paper itself.
+            [r, g, b] = [1.0, 1.0, 1.0];
+        } else {
+            let mut screening = 1.0;
+            let mut color_overridden = false;
+            if let Some(table) = plot_style {
+                if wire.aci > 0 {
+                    if let Some(color) = table.resolve_color(wire.aci) {
+                        [r, g, b] = color;
+                        color_overridden = true;
+                    }
+                    screening = table.resolve_screening(wire.aci);
                 }
-                screening = table.resolve_screening(wire.aci);
             }
+            if !color_overridden {
+                [r, g, b] = adapt_text_color([r, g, b]);
+            }
+            [r, g, b] = plotted_color([r, g, b], a, screening, options);
         }
-        if !color_overridden {
-            [r, g, b] = adapt_text_color([r, g, b]);
-        }
-        [r, g, b] = plotted_color([r, g, b], a, screening, options);
         ops.push(Op::SetFillColor {
             col: Color::Rgb(Rgb {
                 r,
@@ -1282,9 +1300,16 @@ fn emit_hatch(
         g = 1.0;
         b = 1.0;
     } else if !color_overridden
+        // `aci == 0` is an explicit true colour: it plots as drawn, only
+        // indexed colours meant for the dark screen are adapted. (#1417)
+        && hatch.aci != 0
         && !(hatch.aci == 7 && matches!(hatch.pattern, HatchPattern::Solid))
     {
-        let is_light = r > 0.80 && g > 0.80 && b > 0.80;
+        // An authored white (not colour 7) plots as drawn, like on screen.
+        let is_light = r > 0.80
+            && g > 0.80
+            && b > 0.80
+            && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
         let is_yellow = r > 0.80 && g > 0.70 && b < 0.30;
         let is_cyan = r < 0.30 && g > 0.70 && b > 0.70;
         if is_light || is_yellow {
@@ -1465,7 +1490,11 @@ fn glyph_world_xy(v: &crate::scene::pipeline::text_gpu::TextVertex) -> [f64; 2] 
 /// near-white / near-yellow (colour-7-on-white) → black, near-cyan → dark blue.
 #[cfg(not(target_arch = "wasm32"))]
 fn adapt_text_color([r, g, b]: [f32; 3]) -> [f32; 3] {
-    let is_light = r > 0.80 && g > 0.80 && b > 0.80;
+    // An authored white (not colour 7) plots as drawn, like on screen.
+    let is_light = r > 0.80
+        && g > 0.80
+        && b > 0.80
+        && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
     let is_yellow = r > 0.80 && g > 0.70 && b < 0.30;
     let is_cyan = r < 0.30 && g > 0.70 && b > 0.70;
     if is_light || is_yellow {
@@ -1671,6 +1700,37 @@ fn emit_text(
             }
         }
     }
+}
+
+/// Everything searchable in an exported file: the raw bytes (printpdf
+/// leaves small content streams uncompressed) plus any zlib streams that
+/// decode to mostly-printable text, so the assertions hold either way.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn pdf_stream_text(bytes: &[u8]) -> String {
+    use std::io::Read as _;
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    for start in 0..bytes.len().saturating_sub(2) {
+        // zlib streams start with a 2-byte header: deflate method, valid check.
+        let (cmf, flg) = (bytes[start], bytes[start + 1]);
+        if cmf & 0x0f != 8 || ((cmf as u16) << 8 | flg as u16) % 31 != 0 {
+            continue;
+        }
+        let mut decoded = Vec::new();
+        if flate2::read::ZlibDecoder::new(&bytes[start..])
+            .read_to_end(&mut decoded)
+            .is_ok()
+            && decoded.len() > 32
+        {
+            let printable = decoded
+                .iter()
+                .filter(|&&b| matches!(b, b'\n' | b'\r' | b'\t' | 32..=126))
+                .count();
+            if printable * 10 >= decoded.len() * 9 {
+                text.push_str(&String::from_utf8_lossy(&decoded));
+            }
+        }
+    }
+    text
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

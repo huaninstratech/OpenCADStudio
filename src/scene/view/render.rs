@@ -1,9 +1,9 @@
 // GPU rendering primitives, shader::Program / shader::Primitive impls,
 // and entity render-style helpers for the Scene.
 
-use acadrust::tables::LineType;
-use acadrust::types::{Color as AcadColor, LineWeight};
-use acadrust::{CadDocument, EntityType, Handle};
+use codec::tables::LineType;
+use codec::types::{Color as AcadColor, LineWeight};
+use codec::{CadDocument, EntityType, Handle};
 use glam::Mat4;
 use iced::mouse;
 use iced::widget::shader::{self, Viewport};
@@ -239,9 +239,9 @@ pub struct ViewportData {
     /// so `prepare` can patch just those entities' slabs. `None` ⇒ full build.
     pub(in crate::scene) wire_patch: Option<(u64, Arc<crate::scene::WireGpuPatch>)>,
     /// Selected handles only (no hover) — solid meshes tint these blue.
-    pub(in crate::scene) selected_handles: Arc<rustc_hash::FxHashSet<acadrust::Handle>>,
+    pub(in crate::scene) selected_handles: Arc<rustc_hash::FxHashSet<codec::Handle>>,
     /// Currently hovered selectable unit — solid meshes tint it orange.
-    pub(in crate::scene) hover_handles: Arc<rustc_hash::FxHashSet<acadrust::Handle>>,
+    pub(in crate::scene) hover_handles: Arc<rustc_hash::FxHashSet<codec::Handle>>,
     /// Bumped on selection / hover change. Paired with `wire_content_id` to
     /// decide when the xray overlay batch needs rebuilding.
     pub(in crate::scene) selection_generation: u64,
@@ -274,7 +274,7 @@ pub struct Primitive {
 }
 
 /// Flags the render pipeline consumes, derived from
-/// [`acadrust::entities::ViewportRenderMode`]. Each shaded variant fills
+/// [`codec::entities::ViewportRenderMode`]. Each shaded variant fills
 /// 3D faces and meshes; the pure wireframes drop the fill and keep only
 /// edges. The optimized 2-D wireframe retains planar SOLID interiors and
 /// entity draw order; the 3-D wireframe uses true depth and outlines them.
@@ -297,9 +297,9 @@ pub struct RenderModeFlags {
 }
 
 pub fn render_mode_flags(
-    mode: acadrust::entities::ViewportRenderMode,
+    mode: codec::entities::ViewportRenderMode,
 ) -> RenderModeFlags {
-    use acadrust::entities::ViewportRenderMode as M;
+    use codec::entities::ViewportRenderMode as M;
     match mode {
         M::Wireframe2D => RenderModeFlags {
             face3d_fill: false,
@@ -672,11 +672,11 @@ impl shader::Primitive for Primitive {
                     // scanned/parses all resident wires repeatedly here even
                     // though WireArena emits just one changed entity.
                     let mut regular_changed: rustc_hash::FxHashMap<
-                        acadrust::Handle,
+                        codec::Handle,
                         Vec<&crate::scene::WireModel>,
                     > = rustc_hash::FxHashMap::default();
                     let mut mesh_changed: rustc_hash::FxHashMap<
-                        acadrust::Handle,
+                        codec::Handle,
                         Vec<&crate::scene::WireModel>,
                     > = rustc_hash::FxHashMap::default();
                     if let Some(patch) = patch {
@@ -767,7 +767,7 @@ impl shader::Primitive for Primitive {
                                         wire.name
                                             .parse::<u64>()
                                             .ok()
-                                            .map(acadrust::Handle::new)
+                                            .map(codec::Handle::new)
                                     })
                                     .collect();
                             } else if inner.wire_arena_fallback_kind == Some(false) {
@@ -804,7 +804,7 @@ impl shader::Primitive for Primitive {
                                         wire.name
                                             .parse::<u64>()
                                             .ok()
-                                            .map(acadrust::Handle::new)
+                                            .map(codec::Handle::new)
                                     })
                                     .collect();
                             } else if inner.wire_arena_fallback_kind == Some(true) {
@@ -1936,8 +1936,8 @@ fn normalized_direction(value: [f64; 3], fallback: [f32; 3]) -> [f32; 3] {
 }
 
 fn solar_direction(
-    sun: &acadrust::objects::Sun,
-    geo: &acadrust::objects::GeoData,
+    sun: &codec::objects::Sun,
+    geo: &codec::objects::GeoData,
 ) -> Option<[f32; 3]> {
     if sun.julian_day < 1_000_000 {
         return None;
@@ -2036,7 +2036,7 @@ text_atlas={:.1} wire_arena={:.1} block_geometry={:.1}",
 }
 
 impl Scene {
-    fn model_tile_vport(&self, index: usize) -> Option<&acadrust::tables::VPort> {
+    fn model_tile_vport(&self, index: usize) -> Option<&codec::tables::VPort> {
         let rect = self.model_tiles.borrow().get(index)?.rect;
         let lower_left = [rect.x as f64, (1.0 - rect.y - rect.height) as f64];
         let upper_right = [
@@ -2084,8 +2084,8 @@ impl Scene {
         })
     }
 
-    fn geolocation(&self) -> Option<&acadrust::objects::GeoData> {
-        use acadrust::objects::ObjectType;
+    fn geolocation(&self) -> Option<&codec::objects::GeoData> {
+        use codec::objects::ObjectType;
 
         crate::entities::object_data::geo_objects(&self.object_data_cache)
             .iter()
@@ -2105,9 +2105,9 @@ impl Scene {
         target_block: Handle,
         frozen: &rustc_hash::FxHashSet<Handle>,
     ) -> Vec<SceneLight> {
-        use acadrust::objects::{ClassObjectData, ObjectType};
+        use codec::objects::{ClassObjectData, ObjectType};
 
-        fn converted(scene: &Scene, light: &acadrust::entities::Light) -> Option<SceneLight> {
+        fn converted(scene: &Scene, light: &codec::entities::Light) -> Option<SceneLight> {
             if !light.status {
                 return None;
             }
@@ -2353,8 +2353,8 @@ impl Scene {
                 None => self.document.objects.get(&light.handle).is_some_and(|object| {
                     matches!(
                         object,
-                        acadrust::objects::ObjectType::ClassObject(value)
-                            if matches!(&value.data, acadrust::objects::ClassObjectData::Sun(_))
+                        codec::objects::ObjectType::ClassObject(value)
+                            if matches!(&value.data, codec::objects::ClassObjectData::Sun(_))
                     ) && (!settings.sun_handle.is_valid()
                         || settings.sun_handle == light.handle)
                 }),
@@ -2507,13 +2507,13 @@ impl Scene {
                 [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
             })
         };
-        let from_entity = |value: &acadrust::entities::Viewport| ViewportLightingSettings {
+        let from_entity = |value: &codec::entities::Viewport| ViewportLightingSettings {
             force_default: value.default_lighting,
             default_type: value.default_lighting_type,
             ambient: ambient(&value.ambient_color),
             sun_handle: value.sun_handle,
         };
-        let from_table = |value: &acadrust::tables::VPort| ViewportLightingSettings {
+        let from_table = |value: &codec::tables::VPort| ViewportLightingSettings {
             force_default: value.use_default_lights,
             default_type: value.default_lighting_type,
             ambient: ambient(&value.ambient_color),
@@ -2784,12 +2784,12 @@ impl Scene {
     }
 
     fn resolve_document_render_environment(&self) -> CachedDocumentRenderEnvironment {
-        use acadrust::objects::{ClassObjectData, ObjectType};
+        use codec::objects::{ClassObjectData, ObjectType};
 
         let mut result = CachedDocumentRenderEnvironment::default();
 
-        let environment = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
-            crate::entities::object_data::render_environments(&self.object_data_cache)
+        let (environment, preset) = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
+            let env = crate::entities::object_data::render_environments(&self.object_data_cache)
                 .iter()
                 .find_map(|handle| match self.document.objects.get(handle) {
                     Some(ObjectType::ClassObject(value)) => match &value.data {
@@ -2800,22 +2800,71 @@ impl Scene {
                     },
                     _ => None,
                 })
-                .map(|(_, environment)| environment)
-        } else {
-            self.document
-                .objects
+                .map(|(_, environment)| environment);
+
+            let pre = crate::entities::object_data::render_settings(&self.object_data_cache)
                 .iter()
-                .filter_map(|(handle, object)| match object {
-                    ObjectType::ClassObject(value) => match &value.data {
-                        ClassObjectData::RenderEnvironment(environment) => {
-                            Some((*handle, environment))
-                        }
-                        _ => None,
-                    },
+                .filter_map(|handle| match self.document.objects.get(handle) {
+                    Some(ObjectType::ClassObject(value)) => {
+                        let settings = match &value.data {
+                            ClassObjectData::RenderSettings(settings) => settings,
+                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
+                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
+                            _ => return None,
+                        };
+                        (settings.environment_image_enabled
+                            && !settings.environment_image_filename.is_empty())
+                            .then_some((*handle, settings))
+                    }
                     _ => None,
                 })
-                .min_by_key(|(handle, _)| handle.value())
-                .map(|(_, environment)| environment)
+                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
+                .map(|(_, settings)| settings);
+
+            (env, pre)
+        } else {
+            let mut best_env: Option<(codec::Handle, &codec::objects::RenderEnvironment)> = None;
+            let mut best_preset: Option<(codec::Handle, &codec::objects::RenderSettings)> = None;
+
+            for (handle, object) in &self.document.objects {
+                if let ObjectType::ClassObject(value) = object {
+                    match &value.data {
+                        ClassObjectData::RenderEnvironment(env) => {
+                            if best_env.as_ref().map_or(true, |(best_h, _)| handle.value() < best_h.value()) {
+                                best_env = Some((*handle, env));
+                            }
+                        }
+                        ClassObjectData::RenderSettings(settings) => {
+                            if settings.environment_image_enabled && !settings.environment_image_filename.is_empty() {
+                                let key = (!settings.has_predefined, handle.value());
+                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
+                                    best_preset = Some((*handle, settings));
+                                }
+                            }
+                        }
+                        ClassObjectData::MentalRayRenderSettings(settings) => {
+                            let base = &settings.base;
+                            if base.environment_image_enabled && !base.environment_image_filename.is_empty() {
+                                let key = (!base.has_predefined, handle.value());
+                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
+                                    best_preset = Some((*handle, base));
+                                }
+                            }
+                        }
+                        ClassObjectData::RapidRtRenderSettings(settings) => {
+                            let base = &settings.base;
+                            if base.environment_image_enabled && !base.environment_image_filename.is_empty() {
+                                let key = (!base.has_predefined, handle.value());
+                                if best_preset.as_ref().map_or(true, |(best_h, best_s)| key < (!best_s.has_predefined, best_h.value())) {
+                                    best_preset = Some((*handle, base));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (best_env.map(|(_, env)| env), best_preset.map(|(_, pre)| pre))
         };
 
         if let Some(environment) = environment {
@@ -2851,47 +2900,6 @@ impl Scene {
                 }
             }
         }
-
-        let preset = if crate::entities::object_data::cache_is_prepared(&self.object_data_cache) {
-            crate::entities::object_data::render_settings(&self.object_data_cache)
-                .iter()
-                .filter_map(|handle| match self.document.objects.get(handle) {
-                    Some(ObjectType::ClassObject(value)) => {
-                        let settings = match &value.data {
-                            ClassObjectData::RenderSettings(settings) => settings,
-                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
-                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
-                            _ => return None,
-                        };
-                        (settings.environment_image_enabled
-                            && !settings.environment_image_filename.is_empty())
-                            .then_some((*handle, settings))
-                    }
-                    _ => None,
-                })
-                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
-                .map(|(_, settings)| settings)
-        } else {
-            self.document
-                .objects
-                .iter()
-                .filter_map(|(handle, object)| match object {
-                    ObjectType::ClassObject(value) => {
-                        let settings = match &value.data {
-                            ClassObjectData::RenderSettings(settings) => settings,
-                            ClassObjectData::MentalRayRenderSettings(settings) => &settings.base,
-                            ClassObjectData::RapidRtRenderSettings(settings) => &settings.base,
-                            _ => return None,
-                        };
-                        (settings.environment_image_enabled
-                            && !settings.environment_image_filename.is_empty())
-                            .then_some((*handle, settings))
-                    }
-                    _ => None,
-                })
-                .min_by_key(|(handle, settings)| (!settings.has_predefined, handle.value()))
-                .map(|(_, settings)| settings)
-        };
 
         if let Some(settings) = preset {
             if let Some(image) = self.background_image(&settings.environment_image_filename) {
@@ -2942,7 +2950,7 @@ impl Scene {
         canvas: [f32; 4],
         depth: usize,
     ) -> ViewportBackgroundSettings {
-        use acadrust::objects::{ClassObjectData, ObjectType};
+        use codec::objects::{ClassObjectData, ObjectType};
 
         if depth > 4 || !handle.is_valid() {
             return ViewportBackgroundSettings::canvas(canvas);
@@ -3328,7 +3336,7 @@ impl Scene {
                     boundary_exterior: None,
                     boundary_sources: None,
                     boundary_paths: None,
-                    style: acadrust::entities::HatchStyleType::Normal,
+                    style: codec::entities::HatchStyleType::Normal,
                     pattern: pattern.clone(),
                     name: "PLOTSTYLE".to_string(),
                     color,
@@ -3375,33 +3383,43 @@ pub(in crate::scene) fn linetype_name_for<'a>(document: &'a CadDocument, e: &'a 
     linetype_name_for_viewport(document, e, None)
 }
 
-pub(in crate::scene) fn linetype_name_for_viewport<'a>(
+pub(in crate::scene) fn linetype_name_for_common_viewport<'a>(
     document: &'a CadDocument,
-    e: &'a EntityType,
+    common: &'a codec::entities::EntityCommon,
     viewport: Option<Handle>,
 ) -> &'a str {
-    let elt = &e.common().linetype;
+    let elt = &common.linetype;
     if elt.is_empty() || elt.eq_ignore_ascii_case("bylayer") {
-        if let Some(handle) = viewport_override(
-            document,
-            &e.common().layer,
-            viewport,
-            acadrust::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
-        )
-        .and_then(|value| value.as_handle())
-        {
-            if let Some(line_type) = document.line_types.iter().find(|line_type| line_type.handle == handle) {
-                return line_type.name.as_str();
+        if viewport.is_some() {
+            if let Some(handle) = viewport_override(
+                document,
+                &common.layer,
+                viewport,
+                codec::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
+            )
+            .and_then(|value| value.as_handle())
+            {
+                if let Some(line_type) = document.line_types.iter().find(|line_type| line_type.handle == handle) {
+                    return line_type.name.as_str();
+                }
             }
         }
         document
             .layers
-            .get(&e.common().layer)
+            .get(&common.layer)
             .map(|l| l.line_type.as_str())
             .unwrap_or("Continuous")
     } else {
         elt.as_str()
     }
+}
+
+pub(in crate::scene) fn linetype_name_for_viewport<'a>(
+    document: &'a CadDocument,
+    e: &'a EntityType,
+    viewport: Option<Handle>,
+) -> &'a str {
+    linetype_name_for_common_viewport(document, e.common(), viewport)
 }
 
 /// Returns `(entity_color, pattern_length, pattern, line_weight_px, aci)` for
@@ -3417,8 +3435,8 @@ fn viewport_override(
     document: &CadDocument,
     layer_name: &str,
     viewport: Option<Handle>,
-    kind: acadrust::objects::KnownXRecordKind,
-) -> Option<acadrust::objects::XRecordValue> {
+    kind: codec::objects::KnownXRecordKind,
+) -> Option<codec::objects::XRecordValue> {
     let viewport = viewport.filter(|handle| handle.is_valid())?;
     let layer = document.layers.get(layer_name)?;
     document
@@ -3427,30 +3445,29 @@ fn viewport_override(
         .find_map(|(handle, value)| (handle == viewport).then_some(value))
 }
 
-pub(crate) fn render_style_for_viewport(
+pub(crate) fn render_style_for_common_viewport(
     document: &CadDocument,
-    e: &EntityType,
+    common: &codec::entities::EntityCommon,
     viewport: Option<Handle>,
 ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
-    let layer_name = &e.common().layer;
+    let layer_name = &common.layer;
     let (entity_color, aci) = {
-        let common = e.common();
         let book_color = common
             .color_book_handle
             .filter(|handle| handle.is_valid())
             .and_then(|handle| document.objects.get(&handle))
             .and_then(|object| match object {
-                acadrust::objects::ObjectType::BookColor(book) => Some(&book.color),
+                codec::objects::ObjectType::BookColor(book) => Some(&book.color),
                 _ => None,
             });
         let ec = book_color.unwrap_or(&common.color);
-        let viewport_color = (!book_color.is_some() && *ec == AcadColor::ByLayer)
+        let viewport_color = (book_color.is_none() && *ec == AcadColor::ByLayer && viewport.is_some())
             .then(|| {
                 viewport_override(
                     document,
                     layer_name,
                     viewport,
-                    acadrust::objects::KnownXRecordKind::LayerViewportColorOverride,
+                    codec::objects::KnownXRecordKind::LayerViewportColorOverride,
                 )
                 .and_then(|value| value.as_i32())
                 .map(AcadColor::from_true_color_value)
@@ -3473,16 +3490,21 @@ pub(crate) fn render_style_for_viewport(
         };
         let [r, g, b, _] = tess_util::aci_to_rgba(resolved);
         let transparency = if common.transparency.is_by_layer() {
-            viewport_override(
-                document,
-                layer_name,
-                viewport,
-                acadrust::objects::KnownXRecordKind::LayerViewportAlphaOverride,
-            )
-            .and_then(|value| value.as_i32())
-            .map(|value| acadrust::types::Transparency::from_alpha_value(value as u32))
-            .or_else(|| document.layers.get(layer_name).map(|layer| layer.transparency))
-            .unwrap_or(common.transparency)
+            let vp_trans = if viewport.is_some() {
+                viewport_override(
+                    document,
+                    layer_name,
+                    viewport,
+                    codec::objects::KnownXRecordKind::LayerViewportAlphaOverride,
+                )
+                .and_then(|value| value.as_i32())
+                .map(|value| codec::types::Transparency::from_alpha_value(value as u32))
+            } else {
+                None
+            };
+            vp_trans
+                .or_else(|| document.layers.get(layer_name).map(|layer| layer.transparency))
+                .unwrap_or(common.transparency)
         } else {
             common.transparency
         };
@@ -3490,24 +3512,20 @@ pub(crate) fn render_style_for_viewport(
         ([r, g, b, alpha], aci)
     };
 
-    let lt_name = linetype_name_for_viewport(document, e, viewport);
+    let lt_name = linetype_name_for_common_viewport(document, common, viewport);
     // Effective scale = global LTSCALE × per-entity scale (both default to 1.0).
-    let lt_scale = document.header.linetype_scale as f32 * e.common().linetype_scale as f32;
+    let lt_scale = document.header.linetype_scale as f32 * common.linetype_scale as f32;
     let (pattern_length, pattern) = resolve_pattern(&document.line_types, lt_name, lt_scale);
 
     let line_weight_px = {
-        // LWDISPLAY is no longer evaluated here — the toggle is now applied in
-        // the wire shader via `Uniforms.lwdisplay_enable`, so we always bake the
-        // entity's resolved (layer-inherited) weight. Toggling lineweight
-        // visibility costs only a uniform write, not a retessellate.
-        let ew = &e.common().line_weight;
-        let viewport_lineweight = matches!(ew, LineWeight::ByLayer | LineWeight::Default)
+        let ew = &common.line_weight;
+        let viewport_lineweight = (viewport.is_some() && matches!(ew, LineWeight::ByLayer | LineWeight::Default))
             .then(|| {
                 viewport_override(
                     document,
                     layer_name,
                     viewport,
-                    acadrust::objects::KnownXRecordKind::LayerViewportLineweightOverride,
+                    codec::objects::KnownXRecordKind::LayerViewportLineweightOverride,
                 )
                 .and_then(|value| value.as_i32())
                 .map(|value| LineWeight::from_value(value as i16))
@@ -3526,12 +3544,27 @@ pub(crate) fn render_style_for_viewport(
     (entity_color, pattern_length, pattern, line_weight_px, aci)
 }
 
-pub(crate) fn has_resolved_book_color(document: &CadDocument, e: &EntityType) -> bool {
-    e.common()
+pub(crate) fn render_style_for_viewport(
+    document: &CadDocument,
+    e: &EntityType,
+    viewport: Option<Handle>,
+) -> ([f32; 4], f32, [f32; 8], f32, u8) {
+    render_style_for_common_viewport(document, e.common(), viewport)
+}
+
+pub(crate) fn has_resolved_book_color_common(
+    document: &CadDocument,
+    common: &codec::entities::EntityCommon,
+) -> bool {
+    common
         .color_book_handle
         .filter(|handle| handle.is_valid())
         .and_then(|handle| document.objects.get(&handle))
-        .is_some_and(|object| matches!(object, acadrust::objects::ObjectType::BookColor(_)))
+        .is_some_and(|object| matches!(object, codec::objects::ObjectType::BookColor(_)))
+}
+
+pub(crate) fn has_resolved_book_color(document: &CadDocument, e: &EntityType) -> bool {
+    has_resolved_book_color_common(document, e.common())
 }
 
 /// Resolved render style used as the inheritance source for a block child's
@@ -3569,51 +3602,71 @@ pub(crate) fn layer_render_style_viewport(
     viewport: Option<Handle>,
 ) -> InheritStyle {
     let layer = document.layers.get(layer_name);
-    let viewport_color = viewport_override(
-        document,
-        layer_name,
-        viewport,
-        acadrust::objects::KnownXRecordKind::LayerViewportColorOverride,
-    )
-    .and_then(|value| value.as_i32())
-    .map(AcadColor::from_true_color_value);
+    let has_vp = viewport.is_some();
+    let viewport_color = if has_vp {
+        viewport_override(
+            document,
+            layer_name,
+            viewport,
+            codec::objects::KnownXRecordKind::LayerViewportColorOverride,
+        )
+        .and_then(|value| value.as_i32())
+        .map(AcadColor::from_true_color_value)
+    } else {
+        None
+    };
     let color = viewport_color
         .as_ref()
         .or_else(|| layer.map(|layer| &layer.color))
         .unwrap_or(&AcadColor::WHITE);
     let [r, g, b, _] = tess_util::aci_to_rgba(color);
-    let alpha = viewport_override(
-        document,
-        layer_name,
-        viewport,
-        acadrust::objects::KnownXRecordKind::LayerViewportAlphaOverride,
-    )
-    .and_then(|value| value.as_i32())
-    .map(|value| acadrust::types::Transparency::from_alpha_value(value as u32))
-    .or_else(|| layer.map(|layer| layer.transparency))
+    let alpha = if has_vp {
+        viewport_override(
+            document,
+            layer_name,
+            viewport,
+            codec::objects::KnownXRecordKind::LayerViewportAlphaOverride,
+        )
+        .and_then(|value| value.as_i32())
+        .map(|value| codec::types::Transparency::from_alpha_value(value as u32))
+        .or_else(|| layer.map(|layer| layer.transparency))
         .map(|transparency| 1.0 - transparency.as_percent() as f32)
-        .unwrap_or(1.0);
-    let lt_name = viewport_override(
-        document,
-        layer_name,
-        viewport,
-        acadrust::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
-    )
-    .and_then(|value| value.as_handle())
-    .and_then(|handle| document.line_types.iter().find(|line_type| line_type.handle == handle))
-    .map(|line_type| line_type.name.as_str())
-    .or_else(|| layer.map(|layer| layer.line_type.as_str()))
-    .unwrap_or("Continuous");
+        .unwrap_or(1.0)
+    } else {
+        layer
+            .map(|layer| layer.transparency)
+            .map(|transparency| 1.0 - transparency.as_percent() as f32)
+            .unwrap_or(1.0)
+    };
+    let lt_name = if has_vp {
+        viewport_override(
+            document,
+            layer_name,
+            viewport,
+            codec::objects::KnownXRecordKind::LayerViewportLinetypeOverride,
+        )
+        .and_then(|value| value.as_handle())
+        .and_then(|handle| document.line_types.iter().find(|line_type| line_type.handle == handle))
+        .map(|line_type| line_type.name.as_str())
+        .or_else(|| layer.map(|layer| layer.line_type.as_str()))
+        .unwrap_or("Continuous")
+    } else {
+        layer.map(|layer| layer.line_type.as_str()).unwrap_or("Continuous")
+    };
     let lt_scale = document.header.linetype_scale as f32;
     let (pat_len, pat) = resolve_pattern(&document.line_types, lt_name, lt_scale);
-    let viewport_lineweight = viewport_override(
-        document,
-        layer_name,
-        viewport,
-        acadrust::objects::KnownXRecordKind::LayerViewportLineweightOverride,
-    )
-    .and_then(|value| value.as_i32())
-    .map(|value| LineWeight::from_value(value as i16));
+    let viewport_lineweight = if has_vp {
+        viewport_override(
+            document,
+            layer_name,
+            viewport,
+            codec::objects::KnownXRecordKind::LayerViewportLineweightOverride,
+        )
+        .and_then(|value| value.as_i32())
+        .map(|value| LineWeight::from_value(value as i16))
+    } else {
+        None
+    };
     let lw = viewport_lineweight
         .as_ref()
         .or_else(|| layer.map(|layer| &layer.line_weight))
@@ -3721,8 +3774,11 @@ pub(crate) fn render_style_for_block_sub_viewport(
 /// backgrounds become white. All other colors pass through unchanged.
 pub(crate) fn adapt_to_bg(color: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
     let lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
-    let is_white = color[0] > 0.95 && color[1] > 0.95 && color[2] > 0.95;
-    let is_black = color[0] < 0.05 && color[1] < 0.05 && color[2] < 0.05;
+    // Only exact white / black swap: that is colour 7 (and interface colours).
+    // Authored colours reach here nudged off both, so they stay as drawn —
+    // a true-colour white mask on a light sheet remains white. (#1500)
+    let is_white = color[..3] == [1.0; 3];
+    let is_black = color[..3] == [0.0; 3];
     if is_white && lum > 0.5 {
         [0.0, 0.0, 0.0, color[3]]
     } else if is_black && lum <= 0.5 {
@@ -4005,7 +4061,7 @@ impl Scene {
                     for index in [pair_start, pair_start + 1] {
                         let high = edges[index];
                         let low = edges_low.get(index).copied().unwrap_or([0.0; 3]);
-                        let local = acadrust::types::Vector3::new(
+                        let local = codec::types::Vector3::new(
                             high[0] as f64 + low[0] as f64,
                             high[1] as f64 + low[1] as f64,
                             high[2] as f64 + low[2] as f64,
@@ -4083,7 +4139,7 @@ impl Scene {
                     continue;
                 }
                 let context_scale = match self.document.objects.get(&scale) {
-                    Some(acadrust::objects::ObjectType::Scale(value)) => {
+                    Some(codec::objects::ObjectType::Scale(value)) => {
                         (value.inverse_factor() / self.annotation_scale_unit_factor()) as f32
                     }
                     _ => annotation_scale,
@@ -4129,7 +4185,7 @@ impl Scene {
     pub fn build_viewports(
         &self,
         bounds: Rectangle,
-        model_render_mode: acadrust::entities::ViewportRenderMode,
+        model_render_mode: codec::entities::ViewportRenderMode,
         _hover_region: Option<usize>,
         show_viewcube: bool,
         show_interaction: bool,
@@ -4192,7 +4248,7 @@ impl Scene {
         &self,
         bounds: Rectangle,
         tile_idx: usize,
-        model_render_mode: acadrust::entities::ViewportRenderMode,
+        model_render_mode: codec::entities::ViewportRenderMode,
         show_viewcube: bool,
         show_interaction: bool,
         viewcube_text_color: [f32; 4],
@@ -4339,7 +4395,7 @@ impl Scene {
             // borders — NOT the projected viewport content (the GPU content
             // viewports draw that themselves).
             self.paper_sheet_wires_arc()
-        } else if inst.handle == acadrust::Handle::NULL {
+        } else if inst.handle == codec::Handle::NULL {
             self.entity_wires_arc()
         } else {
             self.model_wires_for_viewport_arc(inst.handle, full.height)
@@ -4431,7 +4487,7 @@ impl Scene {
         // incremental patch's base id receives the same tag, preserving the
         // arena fast path after the first mode switch.
         let wire_mode_tag = u64::from(
-            inst.render_mode == acadrust::entities::ViewportRenderMode::Wireframe3D,
+            inst.render_mode == codec::entities::ViewportRenderMode::Wireframe3D,
         );
         let wire_content_id = base_wire_content_id
             .wrapping_mul(2)
@@ -4487,12 +4543,9 @@ impl Scene {
         // layers too, matching the already-filtered resident wire set.
         let vp_frozen: rustc_hash::FxHashSet<Handle> = if !inst.paper_sheet
             && inst.tile_idx.is_none()
-            && inst.handle != acadrust::Handle::NULL
+            && inst.handle != codec::Handle::NULL
         {
-            match self.document.get_entity(inst.handle) {
-                Some(EntityType::Viewport(vp)) => vp.frozen_layers.iter().cloned().collect(),
-                _ => rustc_hash::FxHashSet::default(),
-            }
+            self.viewport_hidden_handles(inst.handle)
         } else {
             rustc_hash::FxHashSet::default()
         };
@@ -4693,13 +4746,13 @@ impl Scene {
             0x1000_0000_0000_0000
         } else if inst.paper_sheet {
             0x2000_0000_0000_0000 | self.current_layout_block_handle().value()
-        } else if inst.handle == acadrust::Handle::NULL {
+        } else if inst.handle == codec::Handle::NULL {
             0x4000_0000_0000_0000 | self.current_layout_block_handle().value()
         } else {
             0x3000_0000_0000_0000 | inst.handle.value()
         };
         let draw_depths = if inst.render_mode
-            == acadrust::entities::ViewportRenderMode::Wireframe3D
+            == codec::entities::ViewportRenderMode::Wireframe3D
         {
             Arc::clone(&self.no_draw_depths)
         } else {
@@ -4747,7 +4800,7 @@ impl Scene {
         // rectangle and need no stencil boundary.
         let clip_boundary_ndc = if !inst.paper_sheet
             && inst.tile_idx.is_none()
-            && inst.handle != acadrust::Handle::NULL
+            && inst.handle != codec::Handle::NULL
             && self.current_layout != "Model"
         {
             Arc::new(self.viewport_clip_boundary_ndc(inst.handle, uo, vo, us, vs))
@@ -4864,7 +4917,7 @@ impl Scene {
 // ── Linetype pattern helper ───────────────────────────────────────────────
 
 pub(crate) fn resolve_pattern(
-    table: &acadrust::tables::Table<LineType>,
+    table: &codec::tables::Table<LineType>,
     name: &str,
     scale: f32,
 ) -> (f32, [f32; 8]) {
@@ -4910,7 +4963,7 @@ pub(crate) fn resolve_pattern(
 /// Whether a wire belongs to a Face3D entity, by document handle lookup —
 /// so no changes to WireModel are needed.
 #[allow(dead_code)]
-fn is_face3d_wire(w: &WireModel, document: &acadrust::CadDocument) -> bool {
+fn is_face3d_wire(w: &WireModel, document: &codec::CadDocument) -> bool {
     w.name
         .parse::<u64>()
         .ok()
@@ -4925,7 +4978,7 @@ fn is_face3d_wire(w: &WireModel, document: &acadrust::CadDocument) -> bool {
 #[allow(dead_code)]
 fn split_face3d_wires(
     wires: &[WireModel],
-    document: &acadrust::CadDocument,
+    document: &codec::CadDocument,
 ) -> (Vec<WireModel>, Vec<WireModel>) {
     let face3d_handles: rustc_hash::FxHashSet<u64> = document
         .entities()
@@ -4969,9 +5022,9 @@ fn split_face3d_wires_with_handles(
 #[cfg(test)]
 mod layer0_inherit_tests {
     use super::*;
-    use acadrust::entities::Line;
-    use acadrust::tables::Layer;
-    use acadrust::types::{Color, Transparency};
+    use codec::entities::Line;
+    use codec::tables::Layer;
+    use codec::types::{Color, Transparency};
 
     // ACI: 1 = red, 3 = green, 7 = white. Distinct, so the assertions below
     // can tell "inherited the insert layer" from "kept layer 0".
@@ -5091,9 +5144,9 @@ mod layer0_inherit_tests {
         let mut scene = Scene::new();
         assert!(!scene.has_face3d());
 
-        scene.add_entity(EntityType::Line(acadrust::entities::Line::from_points(
-            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+        scene.add_entity(EntityType::Line(codec::entities::Line::from_points(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 10.0, 0.0),
         )));
         assert!(!scene.has_face3d());
 
@@ -5110,17 +5163,17 @@ mod layer0_inherit_tests {
         assert_eq!(bg.fog_params, bg2.fog_params);
 
         // Test multiple Face3D additions and removals
-        let face1 = acadrust::entities::Face3D::new(
-            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
-            acadrust::types::Vector3::new(0.0, 10.0, 0.0),
+        let face1 = codec::entities::Face3D::new(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 10.0, 0.0),
+            codec::types::Vector3::new(0.0, 10.0, 0.0),
         );
-        let face2 = acadrust::entities::Face3D::new(
-            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(20.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(20.0, 10.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
+        let face2 = codec::entities::Face3D::new(
+            codec::types::Vector3::new(10.0, 0.0, 0.0),
+            codec::types::Vector3::new(20.0, 0.0, 0.0),
+            codec::types::Vector3::new(20.0, 10.0, 0.0),
+            codec::types::Vector3::new(10.0, 10.0, 0.0),
         );
         let fh1 = scene.add_entity(EntityType::Face3D(face1));
         assert!(scene.has_face3d());
@@ -5138,11 +5191,11 @@ mod layer0_inherit_tests {
         assert!(!scene.has_face3d(), "has_face3d must become false when all Face3Ds are removed");
 
         // bump_geometry_no_blocks must also invalidate has_face3d
-        let fh3 = scene.add_entity(EntityType::Face3D(acadrust::entities::Face3D::new(
-            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(1.0, 1.0, 1.0),
-            acadrust::types::Vector3::new(2.0, 2.0, 2.0),
-            acadrust::types::Vector3::new(3.0, 3.0, 3.0),
+        let fh3 = scene.add_entity(EntityType::Face3D(codec::entities::Face3D::new(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(1.0, 1.0, 1.0),
+            codec::types::Vector3::new(2.0, 2.0, 2.0),
+            codec::types::Vector3::new(3.0, 3.0, 3.0),
         )));
         assert!(scene.has_face3d());
         scene.document.remove_entity(fh3);
@@ -5152,18 +5205,18 @@ mod layer0_inherit_tests {
 
     #[test]
     fn split_face3d_wires_correctness_and_parity() {
-        let mut doc = acadrust::CadDocument::new();
-        let face = acadrust::entities::Face3D::new(
-            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(10.0, 10.0, 0.0),
-            acadrust::types::Vector3::new(0.0, 10.0, 0.0),
+        let mut doc = codec::CadDocument::new();
+        let face = codec::entities::Face3D::new(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 10.0, 0.0),
+            codec::types::Vector3::new(0.0, 10.0, 0.0),
         );
         let face_h = doc.add_entity(EntityType::Face3D(face)).unwrap();
 
-        let line = acadrust::entities::Line::from_points(
-            acadrust::types::Vector3::new(0.0, 0.0, 0.0),
-            acadrust::types::Vector3::new(5.0, 5.0, 0.0),
+        let line = codec::entities::Line::from_points(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(5.0, 5.0, 0.0),
         );
         let line_h = doc.add_entity(EntityType::Line(line)).unwrap();
 
@@ -5235,7 +5288,7 @@ mod layer0_inherit_tests {
     fn render_environment_objects_cache_and_apply() {
         let mut scene = Scene::new();
 
-        let mut renv = acadrust::objects::RenderEnvironment::default();
+        let mut renv = codec::objects::RenderEnvironment::default();
         renv.fog_enabled = true;
         renv.fog_color = [100, 150, 200];
         renv.fog_background_enabled = true;
@@ -5247,8 +5300,8 @@ mod layer0_inherit_tests {
         let handle = Handle::new(42);
         scene.document.objects.insert(
             handle,
-            acadrust::objects::ObjectType::ClassObject(acadrust::objects::ClassObject::new(
-                acadrust::objects::ClassObjectData::RenderEnvironment(renv),
+            codec::objects::ObjectType::ClassObject(codec::objects::ClassObject::new(
+                codec::objects::ClassObjectData::RenderEnvironment(renv),
             )),
         );
         scene.object_data_cache = crate::entities::object_data::build_cache(&scene.document);

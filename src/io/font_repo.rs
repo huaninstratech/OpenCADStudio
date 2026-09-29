@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use acadrust::CadDocument;
+use codec::CadDocument;
 
 /// The community folder's GitHub contents API (lists name + download URL).
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,6 +40,15 @@ pub fn fonts_dir() -> Option<PathBuf> {
 pub enum FontSource {
     Community,
     Custom(String),
+}
+
+/// Stable key for comparing bare font names without path or case differences.
+pub fn font_key(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 impl FontSource {
@@ -304,6 +313,12 @@ mod tests {
     }
 
     #[test]
+    fn font_keys_are_bare_trimmed_and_case_insensitive() {
+        assert_eq!(font_key(r#" C:\Fonts\ROMANS.SHX "#), "romans.shx");
+        assert_eq!(font_key("folder/simplex.shx"), "simplex.shx");
+    }
+
+    #[test]
     fn rejects_a_non_listing_response() {
         assert!(parse_contents("{\"message\":\"Not Found\"}").is_err());
     }
@@ -317,7 +332,7 @@ mod tests {
         std::fs::write(dir.join("exists.shx"), b"stub").unwrap();
         let mut doc = CadDocument::new();
         let mk = |name: &str, file: &str| {
-            let mut style = acadrust::TextStyle::new(name);
+            let mut style = codec::TextStyle::new(name);
             style.font_file = file.into();
             style
         };
@@ -339,20 +354,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vntime.shx"), b"stub").unwrap();
         let mut doc = CadDocument::new();
-        let mut style = acadrust::TextStyle::new("A");
+        let mut style = codec::TextStyle::new("A");
         style.font_file = "CRO_ROM.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = acadrust::TextStyle::new("B");
+        let mut style = codec::TextStyle::new("B");
         style.font_file = "cro_rom.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = acadrust::TextStyle::new("C");
+        let mut style = codec::TextStyle::new("C");
         style.font_file = "vntime.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = acadrust::TextStyle::new("D");
+        let mut style = codec::TextStyle::new("D");
         style.font_file = "also_gone.shx".into();
         style.xref_dependent = true;
         let _ = doc.text_styles.add(style);
-        let mut style = acadrust::TextStyle::new("E");
+        let mut style = codec::TextStyle::new("E");
         style.font_file = String::new();
         style.true_type_font = "Arial".into();
         let _ = doc.text_styles.add(style);

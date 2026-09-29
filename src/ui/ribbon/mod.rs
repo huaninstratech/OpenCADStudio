@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 
-use acadrust::types::{Color as AcadColor, LineWeight};
+use codec::types::{Color as AcadColor, LineWeight};
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text};
 use iced::{Background, Border, Color, Element, Fill, Length, Padding, Theme};
 
@@ -22,8 +22,11 @@ use crate::ui::properties::{linetype_display_name, lw_options, LinetypeItem};
 
 mod widgets;
 mod draw_panel;
+pub(crate) use draw_panel::tools as panel_tools;
 mod modify_panel;
 mod color_dropdown;
+mod context_tools;
+pub use context_tools::{pdf_underlay_tools, xref_tools, UnderlayContext};
 use widgets::{StyleContext, *};
 pub(crate) use widgets::{REDO_HISTORY_ID, UNDO_HISTORY_ID};
 mod collapse;
@@ -102,6 +105,12 @@ pub struct Ribbon {
     /// Set by `CollapsePanels` when the tool row is in its tight state; the mode
     /// selector hides itself then to give the cramped tab row its space back.
     collapse_tight: Arc<AtomicBool>,
+    /// The selected PDF underlay's switches while only underlays are selected.
+    underlay_ctx: Option<UnderlayContext>,
+    /// Only xrefs are selected.
+    xref_ctx: bool,
+    /// XDWGFADECTL as the Reference slide-out shows it (negative = off).
+    pub xref_fade: i32,
 }
 
 /// Per-layer display data shown in the ribbon layer dropdown.
@@ -195,6 +204,9 @@ impl Ribbon {
             tool_bar_h: Arc::new(AtomicU32::new(TOOL_BAR_H.to_bits())),
             collapse_mode: CollapseMode::default(),
             collapse_tight: Arc::new(AtomicBool::new(false)),
+            underlay_ctx: None,
+            xref_ctx: false,
+            xref_fade: 50,
         }
     }
 
@@ -338,6 +350,55 @@ impl Ribbon {
         }
     }
 
+    /// One panel in its four densities; `lead` adds controls before the
+    /// group's own tools.
+    fn panel<'a>(
+        &'a self,
+        g: &'a RibbonGroup,
+        ts: widgets::ToggleState,
+        style_ctx: &StyleContext<'_>,
+        lead: &dyn Fn(bool) -> Vec<Element<'a, Message>>,
+    ) -> Panel<'a> {
+        let group = |compact: bool| {
+            render_group(
+                compact,
+                g,
+                lead(compact),
+                &self.active_tool,
+                &self.open_dropdown,
+                &self.last_cmd,
+                ts,
+                &self.layer_infos,
+                &self.active_layer,
+                self.active_color,
+                &self.active_linetype,
+                self.active_lineweight,
+                style_ctx,
+            )
+        };
+        let button = |tight: bool| {
+            collapse_button(
+                g,
+                self.last_panel_tool.get(g.title).copied(),
+                &self.active_tool,
+                &self.open_dropdown,
+                &self.last_cmd,
+                ts,
+                &self.layer_infos,
+                &self.active_layer,
+                self.active_color,
+                &self.active_linetype,
+                self.active_lineweight,
+                style_ctx,
+                tight,
+            )
+        };
+        Panel {
+            id: g.title.to_string(),
+            elements: [group(false), group(true), button(false), button(true)],
+        }
+    }
+
     pub fn toggle_dropdown(&mut self, id: &str) {
         if self.open_dropdown.as_deref() == Some(id) {
             self.open_dropdown = None;
@@ -414,6 +475,14 @@ impl Ribbon {
     pub fn select_dropdown_item(&mut self, dropdown_id: &'static str, cmd: &'static str) {
         self.last_cmd.insert(dropdown_id, cmd);
         self.close_dropdown();
+    }
+
+    /// Show `cmd` as the current item of a dropdown that mirrors a drawing
+    /// setting, without running it.
+    pub fn set_dropdown_current(&mut self, dropdown_id: &'static str, cmd: &'static str) {
+        if self.last_cmd.get(dropdown_id) != Some(&cmd) {
+            self.last_cmd.insert(dropdown_id, cmd);
+        }
     }
 
     // ── View ──────────────────────────────────────────────────────────────
@@ -523,6 +592,7 @@ impl Ribbon {
             },
         );
 
+
         // Tabs may squeeze their gaps to fit before wrapping: from the normal 6px
         // down to -12px on a narrow (e.g. phone) tab row, tucking neighbours into
         // each other's 14px side padding without overlapping the labels. When the
@@ -602,73 +672,10 @@ impl Ribbon {
                 // fit they degrade from the right — a panel's large buttons first
                 // shrink to compact icon columns, then it collapses to a ▾ flyout
                 // button. See `CollapsePanels`.
+                let ts = self.toggle_state(show_block_palette);
                 let panels: Vec<Panel<'_>> = groups
                     .iter()
-                    .map(|g| {
-                        let ts = self.toggle_state(show_block_palette);
-                        Panel {
-                        id: g.title.to_string(),
-                        elements: [render_group(
-                            false,
-                            g,
-                            &self.active_tool,
-                            &self.open_dropdown,
-                            &self.last_cmd,
-                            ts,
-                            &self.layer_infos,
-                            &self.active_layer,
-                            self.active_color,
-                            &self.active_linetype,
-                            self.active_lineweight,
-                            &style_ctx,
-                        ),
-                        render_group(
-                            true,
-                            g,
-                            &self.active_tool,
-                            &self.open_dropdown,
-                            &self.last_cmd,
-                            ts,
-                            &self.layer_infos,
-                            &self.active_layer,
-                            self.active_color,
-                            &self.active_linetype,
-                            self.active_lineweight,
-                            &style_ctx,
-                        ),
-                        collapse_button(
-                            g,
-                            self.last_panel_tool.get(g.title).copied(),
-                            &self.active_tool,
-                            &self.open_dropdown,
-                            &self.last_cmd,
-                            ts,
-                            &self.layer_infos,
-                            &self.active_layer,
-                            self.active_color,
-                            &self.active_linetype,
-                            self.active_lineweight,
-                            &style_ctx,
-                            false,
-                        ),
-                        collapse_button(
-                            g,
-                            self.last_panel_tool.get(g.title).copied(),
-                            &self.active_tool,
-                            &self.open_dropdown,
-                            &self.last_cmd,
-                            ts,
-                            &self.layer_infos,
-                            &self.active_layer,
-                            self.active_color,
-                            &self.active_linetype,
-                            self.active_lineweight,
-                            &style_ctx,
-                            true,
-                        ),
-                        ],
-                    }
-                    })
+                    .map(|g| self.panel(g, ts, &style_ctx, &|_| Vec::new()))
                     .collect();
                 CollapsePanels::new(panels, self.collapsed_open.clone(), TOOL_BAR_H)
                     .report_height(self.tool_bar_h.clone())
@@ -874,6 +881,7 @@ impl Ribbon {
             .iter()
             .map(|(cmd, label, item_icon)| {
                 let is_current = *cmd == last_cmd;
+                let disabled = widgets::is_disabled_item(cmd);
                 let checkmark: Element<'_, Message> =
                     crate::ui::icons::themed_check_cell(is_current);
                 let icon_el: Element<Message> =
@@ -885,7 +893,7 @@ impl Ribbon {
                         .size(11)
                         .wrapping(iced::advanced::text::Wrapping::None)
                         .style(move |theme: &Theme| iced::widget::text::Style {
-                            color: (!is_current).then_some(
+                            color: (!is_current || disabled).then_some(
                                 theme
                                     .palette()
                                     .background
@@ -900,10 +908,10 @@ impl Ribbon {
                         .spacing(4)
                         .align_y(iced::Center),
                 )
-                .on_press(Message::DropdownSelectItem {
+                .on_press_maybe((!disabled).then_some(Message::DropdownSelectItem {
                     dropdown_id: dd_id,
                     cmd: *cmd,
-                })
+                }))
                 .style(popup_row_style)
                 .width(Fill)
                 .padding([4, 10])
@@ -1321,6 +1329,7 @@ impl Ribbon {
 fn render_group<'a>(
     compact: bool,
     group: &RibbonGroup,
+    lead: Vec<Element<'a, Message>>,
     active_tool: &Option<String>,
     open_dd: &Option<String>,
     last_cmd: &HashMap<&'static str, &'static str>,
@@ -1332,7 +1341,7 @@ fn render_group<'a>(
     active_lineweight: LineWeight,
     style_ctx: &StyleContext<'_>,
 ) -> Element<'a, Message> {
-    let mut items_row: Vec<Element<Message>> = Vec::new();
+    let mut items_row: Vec<Element<Message>> = lead;
     let mut small_buf: Vec<Element<Message>> = Vec::new();
 
     let ctx = widgets::RenderCtx {
@@ -1614,3 +1623,4 @@ mod tests {
         assert_eq!(ribbon.open_dropdown, None);
     }
 }
+

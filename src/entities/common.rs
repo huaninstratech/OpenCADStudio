@@ -34,7 +34,7 @@ impl UnitContext {
     /// The settings as this drawing holds them. Every place that formats or
     /// reads a number seeds the context from here, so none of them can be
     /// working from a different idea of the drawing's conventions.
-    pub fn from_header(header: &acadrust::document::HeaderVariables) -> Self {
+    pub fn from_header(header: &codec::document::HeaderVariables) -> Self {
         Self {
             lunits: header.linear_unit_format,
             luprec: header.linear_unit_precision,
@@ -71,7 +71,7 @@ thread_local! {
 }
 
 /// Record which text styles fix their height, from the drawing's style table.
-pub fn set_fixed_text_heights(document: &acadrust::CadDocument) {
+pub fn set_fixed_text_heights(document: &codec::CadDocument) {
     FIXED_TEXT_HEIGHTS.with(|cell| {
         let mut map = cell.borrow_mut();
         map.clear();
@@ -754,7 +754,7 @@ fn parse_angle_deg_unbounded(value: &str) -> Option<f64> {
 /// Re-exported rather than imported at each call site so the twelve modules
 /// that already reach for `entities::common::BulgeArc` keep working, and so
 /// there is one obvious place to see that the maths moved out.
-pub use cadkernel::geom2d::BulgeArc;
+pub use kernel::geom2d::BulgeArc;
 
 /// Convert a 2D BulgeArc into a 3D TangentGeom::Arc with its world center,
 /// plane axes, radius, and counter-clockwise start/end sweep angles.
@@ -818,6 +818,9 @@ pub(crate) fn triangulate_band_ring(ring: &[[f64; 3]]) -> Vec<[f64; 3]> {
 }
 
 pub(crate) fn wide_band_tris(origin: [f64; 2], fills: &[Vec<[f32; 2]>]) -> Vec<[f64; 3]> {
+    if fills.is_empty() {
+        return Vec::new();
+    }
     let mut total_verts = 0;
     for poly in fills {
         let n = poly.len();
@@ -925,8 +928,8 @@ pub(crate) fn tapered_band_points(
 ) -> (Vec<[f64; 3]>, Vec<f32>) {
     let n = verts.len();
     let seg_count = if is_closed { n } else { n.saturating_sub(1) };
-    let mut pts: Vec<[f64; 3]> = Vec::new();
-    let mut widths: Vec<f32> = Vec::new();
+    let mut pts: Vec<[f64; 3]> = Vec::with_capacity(seg_count + 1);
+    let mut widths: Vec<f32> = Vec::with_capacity(seg_count + 1);
     let mut push = |x: f64, y: f64, w: f32| {
         let (wx, wy, wz) = to_wcs(x, y);
         pts.push([wx, wy, wz]);
@@ -941,7 +944,7 @@ pub(crate) fn tapered_band_points(
         if bulge.abs() < 1e-9 {
             push(p1[0], p1[1], ew0 as f32);
         } else if let Some(arc) = BulgeArc::from_bulge(p0, p1, bulge) {
-            let samples = arc.tessellate_angle(cadkernel::tessellation::DEFAULT_ANGLE);
+            let samples = arc.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
             let segments = samples.len().saturating_sub(1).max(1);
             for (index, s) in samples.into_iter().enumerate().skip(1) {
                 let t = index as f64 / segments as f64;
@@ -967,10 +970,10 @@ pub(crate) fn wide_band_outline(
     restart_per_segment: bool,
     to_wcs: &dyn Fn(f64, f64) -> (f64, f64, f64),
 ) -> WideBandOutline {
-    let source = cadkernel::geom2d::Polyline {
+    let source = kernel::geom2d::Polyline {
         vertices: verts
             .iter()
-            .map(|(position, bulge, _, _)| cadkernel::geom2d::PolylineVertex {
+            .map(|(position, bulge, _, _)| kernel::geom2d::PolylineVertex {
                 position: *position,
                 bulge: *bulge,
             })
@@ -987,10 +990,10 @@ pub(crate) fn wide_band_outline(
         .take(segment_count)
         .map(|(_, _, start, end)| [*start, *end])
         .collect();
-    let boundary = cadkernel::geom2d::polyline_band_boundary(
+    let boundary = kernel::geom2d::polyline_band_boundary(
         &source,
         &widths,
-        cadkernel::tessellation::DEFAULT_ANGLE,
+        kernel::tessellation::DEFAULT_ANGLE,
     );
     let mut points = Vec::new();
     let mut stations = Vec::new();

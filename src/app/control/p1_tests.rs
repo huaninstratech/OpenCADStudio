@@ -28,7 +28,7 @@ fn query_where_filters_on_entity_properties() {
     app.automation_op(r#"{"op":"new"}"#);
     app.automation_op(r#"{"op":"run","cmd":"CIRCLE 0,0 1"}"#);
     app.automation_op(r#"{"op":"run","cmd":"CIRCLE 20,0 5"}"#);
-    // radius > 2 keeps only the big circle (SelectionFilter parity over
+    // radius > 2 keeps only the big circle (the filter runs over
     // RFC 6901 property paths, same operators as records).
     let q = app.automation_op(
         r#"{"op":"query","type":"Circle","detail":"geometry","where":[{"path":"/radius","op":"gt","value":2}]}"#,
@@ -321,7 +321,7 @@ fn group_create_and_selection_sets() {
     let objects = &app.tabs[app.active_tab].scene.document.objects;
     assert!(objects.values().any(|o| matches!(
         o,
-        acadrust::objects::ObjectType::Group(group) if group.name == "FRAME"
+        codec::objects::ObjectType::Group(group) if group.name == "FRAME"
     )));
 
     let r = app.automation_op(&format!(
@@ -405,7 +405,7 @@ fn diagnostic_layer_survives_plain_io_round_trip() {
 
     // Direct io round trip on a clone of the document.
     let doc = app.tabs[app.active_tab].scene.document.clone();
-    let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032)
+    let bytes = crate::io::save_to_bytes(&doc, "dxf", codec::DxfVersion::AC1032)
         .expect("save to bytes");
     let path = std::env::temp_dir().join(format!("ocs_diag_{}.dxf", std::process::id()));
     std::fs::write(&path, &bytes).unwrap();

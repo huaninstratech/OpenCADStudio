@@ -36,12 +36,6 @@ pub(in crate::app) use overlay::{MTEXT_TEXT_ID, TEXT_INLINE_ID};
 pub(in crate::app) const VIEWPORT_CAPTURE_BOUNDS_ID: &str = "viewport-capture-bounds";
 
 const VIEWCUBE_HIT_SIZE: f32 = VIEWCUBE_REGION_PX;
-static MOBILE_SPONSOR_IMAGE: std::sync::LazyLock<iced::widget::image::Handle> =
-    std::sync::LazyLock::new(|| {
-        iced::widget::image::Handle::from_bytes(
-            include_bytes!("../../../assets/sponsors/cad-editor-mobile-dwg-viewer.png").as_slice(),
-        )
-    });
 
 /// Background used by drafting overlays in model or paper space.
 fn crosshair_background(tab: &DocumentTab, is_paper: bool) -> [f32; 4] {
@@ -163,7 +157,7 @@ fn shortcut_key_name(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Opt
 /// `ViewportRenderMode` enum carries the raw DXF integers, not a label,
 /// so wrap it locally with a friendly name renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RenderModeChoice(pub acadrust::entities::ViewportRenderMode);
+pub(super) struct RenderModeChoice(pub codec::entities::ViewportRenderMode);
 
 impl std::fmt::Display for RenderModeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -533,12 +527,12 @@ bg={bg_ms:.1}ms n={view_count}"
                     .flatten()
                     .and_then(|h| {
                         let indexed = match tab.scene.document.get_entity(h) {
-                            Some(acadrust::EntityType::LwPolyline(_))
-                            | Some(acadrust::EntityType::Polyline2D(_))
-                            | Some(acadrust::EntityType::Polyline3D(_))
-                            | Some(acadrust::EntityType::Spline(_))
-                            | Some(acadrust::EntityType::Face3D(_))
-                            | Some(acadrust::EntityType::PolygonMesh(_)) => true,
+                            Some(codec::EntityType::LwPolyline(_))
+                            | Some(codec::EntityType::Polyline2D(_))
+                            | Some(codec::EntityType::Polyline3D(_))
+                            | Some(codec::EntityType::Spline(_))
+                            | Some(codec::EntityType::Face3D(_))
+                            | Some(codec::EntityType::PolygonMesh(_)) => true,
                             _ => false,
                         };
                         indexed.then_some(tab.properties.prop_vertex)
@@ -608,7 +602,7 @@ bg={bg_ms:.1}ms n={view_count}"
             };
             let control_polygon = tab.selected_handle.and_then(|handle| {
                 let spline = match tab.scene.document.get_entity(handle) {
-                    Some(acadrust::EntityType::Spline(spline))
+                    Some(codec::EntityType::Spline(spline))
                         if crate::entities::spline::shows_control_vertices(spline) => spline,
                     _ => return None,
                 };
@@ -791,7 +785,7 @@ bg={bg_ms:.1}ms n={view_count}"
             let parallel_ref_marker: Option<iced::Point> =
                 match (otrack_proj, self.snapper.parallel_ref) {
                     (Some((view_rot, eye, ob)), Some((_, pt))) => {
-                        let s = ost_project(pt.as_dvec3(), view_rot, eye, ob);
+                        let s = ost_project(pt, view_rot, eye, ob);
                         (s.x.is_finite() && s.y.is_finite()).then_some(s)
                     }
                     _ => None,
@@ -1303,7 +1297,7 @@ bg={bg_ms:.1}ms n={view_count}"
             // clicks (the shader viewport sits below it). Positioned with
             // leading Spaces sized to the viewport's screen rectangle.
             mark("active_vp_rect");
-            let active_vp_rect: Option<(acadrust::Handle, iced::Rectangle)> =
+            let active_vp_rect: Option<(codec::Handle, iced::Rectangle)> =
                 if is_paper && !tab.is_start {
                     tab.scene.active_viewport.and_then(|h| {
                         let (cw, ch) = tab.scene.selection.borrow().vp_size;
@@ -1352,7 +1346,7 @@ bg={bg_ms:.1}ms n={view_count}"
                 let vp_mode = tab
                     .scene
                     .active_viewport_render_mode()
-                    .unwrap_or(acadrust::entities::ViewportRenderMode::Wireframe2D);
+                    .unwrap_or(codec::entities::ViewportRenderMode::Wireframe2D);
                 // Adaptive (same as model): the picker measures its real width into
                 // `render_bar_w` and swaps to an empty spacer only when the viewport
                 // can't hold it; the ViewCube reads that width to decide overlap.
@@ -1597,9 +1591,32 @@ bg={bg_ms:.1}ms n={view_count}"
                 }
             }
 
-            // Paper-space context actions: a right-edge vertical toolbar
-            // (viewport / page setup / plot) instead of a contextual ribbon tab.
-            if is_paper && !tab.is_start {
+            // Selection actions: with only PDF underlays or only xrefs
+            // selected, their tools take the right edge (over the paper-space
+            // tools, which come back when the selection changes).
+            // ponytail: one right-edge toolbar at a time; stack them if both
+            // are ever needed together.
+            let selection_tools = if tab.is_start {
+                None
+            } else if self.ribbon.xref_context() {
+                crate::ui::side_toolbar::view(&crate::ui::ribbon::xref_tools())
+            } else if let Some(ctx) = self.ribbon.underlay_context() {
+                let ctx = ctx.clone();
+                crate::ui::side_toolbar::view_with_active(
+                    &crate::ui::ribbon::pdf_underlay_tools(ctx.kind),
+                    &move |id| match id {
+                        "_PDFULMONO" => ctx.monochrome,
+                        "_PDFULSHOW" => ctx.shown,
+                        "_PDFULSNAP" => ctx.snap,
+                        _ => false,
+                    },
+                )
+            } else {
+                None
+            };
+            if let Some(tb) = selection_tools {
+                viewport_stack = viewport_stack.push(tb);
+            } else if is_paper && !tab.is_start {
                 if let Some(tb) =
                     crate::ui::side_toolbar::view(&crate::modules::layout::paper_space_tools())
                 {
@@ -1824,6 +1841,11 @@ bg={bg_ms:.1}ms n={view_count}"
             }
         }
 
+        if self.show_node_graph && !tab.is_start {
+            let sections = self.graph_all_sections(self.active_tab);
+            viewport_stack = viewport_stack.push(tab.graph.view(sections));
+        }
+
         // Docked side panels (Properties, block palette, future palettes) live
         // in an ordered vertical stack on the left/right edge of the drawing
         // view. Auto-collapsing (pinned) panels that aren't being hovered
@@ -1839,6 +1861,7 @@ bg={bg_ms:.1}ms n={view_count}"
                 crate::ui::dock::PanelId::ExternalReferences => self.show_external_references,
                 crate::ui::dock::PanelId::Browser => self.show_browser,
                 crate::ui::dock::PanelId::ModelTree => self.show_ifc_tree,
+                crate::ui::dock::PanelId::NodeGraph => self.show_node_graph,
             }
         };
         let edge_stack = |side: crate::app::config::DockSide| -> Option<Element<'_, Message>> {
@@ -2060,6 +2083,7 @@ bg={bg_ms:.1}ms n={view_count}"
             self.control.enabled,
             self.control_busy(),
             self.pending_pick_label().is_some(),
+            self.show_node_graph,
         );
         let center_stack: Element<'_, Message> = if thumbnail_capture_clean {
             workspace
@@ -2513,7 +2537,10 @@ impl OpenCADStudio {
         // driven by input events, but once the cursor stops no event would fire
         // the one full-quality frame that re-renders hatches — this tick does,
         // then the scene-render cache holds it and the subscription auto-stops.
-        let nav_settle = if self.tabs[self.active_tab].scene.is_settling() {
+        // Underlay rasters follow the zoom once it settles; tick until then.
+        let nav_settle = if self.tabs[self.active_tab].scene.is_settling()
+            || self.tabs[self.active_tab].scene.underlay_resolution_stale()
+        {
             window::frames().map(Message::Tick)
         } else {
             Subscription::none()
@@ -2630,8 +2657,25 @@ impl OpenCADStudio {
                     }) => {
                         #[cfg(target_arch = "wasm32")]
                         let accel = modifiers.command();
-                        let shortcut_modifier =
-                            modifiers.control() || modifiers.alt() || modifiers.logo();
+                        // AltGr reaches Windows apps as Ctrl+Alt, and a macOS
+                        // layout types some characters with Option: when such a
+                        // chord produces a printable glyph (`@`, `<`, `{` on many
+                        // European layouts) it is typing, not a shortcut. (#1236)
+                        let types_glyph = text.as_deref().is_some_and(|value| {
+                            !value.is_empty()
+                                && value
+                                    .chars()
+                                    .all(|ch| !ch.is_control() && !ch.is_whitespace())
+                        });
+                        let altgr = modifiers.control() && modifiers.alt();
+                        let mac_option = cfg!(target_os = "macos")
+                            && modifiers.alt()
+                            && !modifiers.control()
+                            && !modifiers.logo();
+                        let shortcut_modifier = (modifiers.control()
+                            || modifiers.alt()
+                            || modifiers.logo())
+                            && !(types_glyph && (altgr || mac_option));
                         // Any key that produces a printable glyph types it,
                         // even when its logical key resolves to navigation
                         // (NumLock-on Numpad8 / Numpad2 arrive as
@@ -2946,6 +2990,7 @@ impl OpenCADStudio {
             crate::ui::dock::PanelId::ModelTree => {
                 crate::ui::window::ifc_tree::view(&tab.scene.ifc_tree, width, auto_collapse)
             }
+            crate::ui::dock::PanelId::NodeGraph => tab.graph.panel(width, auto_collapse),
         };
         let divider = dock_divider(id);
         match side {
@@ -3524,18 +3569,6 @@ fn start_page_content<'a>(
         )
         .interaction(iced::mouse::Interaction::Pointer)
         .on_press(Message::OpenUrl("https://open-aec.com/".to_string())),
-        mouse_area(
-            container(
-                iced::widget::image(MOBILE_SPONSOR_IMAGE.clone())
-                    .width(Fill)
-                    .content_fit(iced::ContentFit::Contain),
-            )
-            .width(Fill),
-        )
-        .interaction(iced::mouse::Interaction::Pointer)
-        .on_press(Message::OpenUrl(
-            "https://play.google.com/store/apps/details?id=net.cadeditor.app".to_string(),
-        )),
     ]
     .spacing(10)
     .align_x(iced::alignment::Horizontal::Center)

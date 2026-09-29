@@ -5,6 +5,7 @@ use iced::Task;
 use std::path::PathBuf;
 
 mod blocks;
+mod xref_attach;
 mod dim;
 pub(crate) mod display;
 mod draw;
@@ -12,6 +13,10 @@ mod fileops;
 mod inquiry;
 mod layerprops;
 mod layers;
+pub(crate) mod pdf_import;
+mod pdf_underlay;
+mod pdf_dialogs;
+mod xclip;
 mod plotvars;
 mod styleprops;
 mod view;
@@ -40,6 +45,44 @@ impl OpenCADStudio {
             }
             n += 1;
         }
+    }
+
+    /// Per-command start state every new command begins from — also used by
+    /// entry points that install a command without going through dispatch
+    /// (the block palette), so they don't inherit the previous command's last
+    /// point, snaps or dynamic-input values. (#1525)
+    pub(in crate::app) fn reset_command_start_state(&mut self, i: usize) {
+        // A command parked behind a transparent zoom / MTP goes with it.
+        self.tabs[i].suspended_cmd = None;
+        self.tabs[i].transparent_resume = false;
+        // Starting any command leaves interactive navigation modes (their own
+        // command arms below re-enable the selected one).
+        self.tabs[i].pan_mode = false;
+        self.tabs[i].orbit_mode = false;
+        self.tabs[i].zoom_dynamic_mode = false;
+        // Reset the last committed point so the first click of the new command
+        // is not constrained by ortho/polar relative to a previous command's endpoint.
+        self.last_point = None;
+        // A new command collects its own points, so the previous command's
+        // accepted snaps must not leak into it.
+        self.clear_accepted_snaps();
+        // Starting a command restarts the right-click cycle, so its first
+        // right-click acts as Enter rather than opening the context menu.
+        self.tabs[i]
+            .scene
+            .selection
+            .borrow_mut()
+            .right_click_entered = false;
+        // A fresh command starts at the polar/cartesian default — clear
+        // any `,`-driven reshape and locked dynamic-input values from a
+        // previous command. Otherwise a bare Enter on the first point prompt
+        // can commit that stale coordinate instead of accepting the command's
+        // default (LIMITS then compares an unintended lower-left point with
+        // the displayed default upper-right).
+        self.dyn_user_reshaped = false;
+        self.dyn_coord_absolute = false;
+        self.tabs[i].dyn_fields.clear();
+        self.tabs[i].dyn_active = 0;
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: &str) -> Task<Message> {
@@ -133,37 +176,7 @@ impl OpenCADStudio {
             // template-property override too (#239).
             self.restore_add_selected_defaults();
         }
-        // A command parked behind a transparent zoom / MTP goes with it.
-        self.tabs[i].suspended_cmd = None;
-        self.tabs[i].transparent_resume = false;
-        // Starting any command leaves interactive navigation modes (their own
-        // command arms below re-enable the selected one).
-        self.tabs[i].pan_mode = false;
-        self.tabs[i].orbit_mode = false;
-        self.tabs[i].zoom_dynamic_mode = false;
-        // Reset the last committed point so the first click of the new command
-        // is not constrained by ortho/polar relative to a previous command's endpoint.
-        self.last_point = None;
-        // A new command collects its own points, so the previous command's
-        // accepted snaps must not leak into it.
-        self.clear_accepted_snaps();
-        // Starting a command restarts the right-click cycle, so its first
-        // right-click acts as Enter rather than opening the context menu.
-        self.tabs[i]
-            .scene
-            .selection
-            .borrow_mut()
-            .right_click_entered = false;
-        // A fresh command starts at the polar/cartesian default — clear
-        // any `,`-driven reshape and locked dynamic-input values from a
-        // previous command. Otherwise a bare Enter on the first point prompt
-        // can commit that stale coordinate instead of accepting the command's
-        // default (LIMITS then compares an unintended lower-left point with
-        // the displayed default upper-right).
-        self.dyn_user_reshaped = false;
-        self.dyn_coord_absolute = false;
-        self.tabs[i].dyn_fields.clear();
-        self.tabs[i].dyn_active = 0;
+        self.reset_command_start_state(i);
 
         if let Some(path_str) = cmd.strip_prefix("OPEN_RECENT:") {
             let path = PathBuf::from(path_str);
@@ -192,11 +205,12 @@ impl OpenCADStudio {
             // tool was a one-shot and we must turn the ribbon highlight off here —
             // normally apply_cmd_result does that, but plugin dispatch can return
             // without producing a CmdResult.
+            self.tabs[i].last_cmd = Some(cmd.to_string());
             self.command_line.record_recent(cmd);
             if self.tabs[i].active_cmd.is_none() {
                 self.ribbon.deactivate_tool();
             }
-            return Task::none();
+            return self.finish_dispatch(cmd);
         }
 
         // Command families are dispatched in source order (see
@@ -246,7 +260,13 @@ impl OpenCADStudio {
         if let Some(t) = self.dispatch_layers(cmd, i) {
             return Some(t);
         }
+        if let Some(t) = self.dispatch_xref_attach(cmd, i) {
+            return Some(t);
+        }
         if let Some(t) = self.dispatch_blocks(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_pdf_underlay(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_draw(cmd, i) {
@@ -606,12 +626,24 @@ inventory::submit!(crate::command::CommandRegistration {
         "FRAME",
         "IMAGEFRAME",
         "PDFFRAME",
+        "DWFFRAME",
+        "DGNFRAME",
+        "PDFOSNAP",
+        "UOSNAP",
+        "PDFIMPORTMODE",
+        "PDFIMPORTFILTER",
+        "PDFIMPORTLAYERS",
+        "PDFIMPORTIMAGEPATH",
+        "XDWGFADECTL",
         "POINTCLOUDCLIPFRAME",
         "XCLIPFRAME",
         "WIPEOUTFRAME",
         "FRAMES0",
         "FRAMES1",
+        "FRAMES3",
         "FRAMES2",
+        "UOSNAP0",
+        "UOSNAP1",
         "HALOGAP",
         "TRACEWID",
         "SKETCHINC",
@@ -652,6 +684,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "3DORBIT",
         "3O",
         "ABOUT",
+        "ATTACH",
         "ATTDISP",
         "ATTEXT",
         "BACKGROUND",
@@ -694,6 +727,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "IM",
         "IMAGE",
         "IMAGEATTACH",
+        "TRANSPARENCY",
         "IMAGEEMBED",
         "IMPORT",
         "IFCEDIT",
@@ -808,10 +842,10 @@ inventory::submit!(crate::command::CommandRegistration {
 
 #[cfg(test)]
 mod marquee_cancel_tests {
-    use crate::app::{GripPendingValue, OpenCADStudio};
+    use crate::app::{GripPendingValue, Message, OpenCADStudio};
     use crate::scene::model::object::GripMenuAction;
     use crate::scene::pick::grip::GripEdit;
-    use acadrust::Handle;
+    use codec::Handle;
     use iced::time::Instant;
 
     fn fresh() -> OpenCADStudio {
@@ -949,6 +983,29 @@ mod marquee_cancel_tests {
         assert!(app.tabs[i].active_grip.is_none());
         assert!(app.grip_pending.is_none());
         assert!(app.command_line.input.is_empty());
+        assert_eq!(
+            app.tabs[i].active_cmd.as_deref().map(|cmd| cmd.name()),
+            Some("LINE")
+        );
+    }
+
+    #[test]
+    fn command_finalize_repeats_last_cmd() {
+        let mut app = fresh();
+        let i = app.active_tab;
+        assert_eq!(app.tabs[i].last_cmd, None);
+
+        // Run LINE command
+        let _ = app.dispatch_command("LINE");
+        assert_eq!(app.tabs[i].last_cmd.as_deref(), Some("LINE"));
+
+        // Cancel LINE with Escape
+        let _ = app.update(Message::CommandEscape);
+        assert!(app.tabs[i].active_cmd.is_none());
+        assert_eq!(app.tabs[i].last_cmd.as_deref(), Some("LINE"));
+
+        // Press Enter (CommandFinalize) on empty command line repeats LINE
+        let _ = app.update(Message::CommandFinalize);
         assert_eq!(
             app.tabs[i].active_cmd.as_deref().map(|cmd| cmd.name()),
             Some("LINE")

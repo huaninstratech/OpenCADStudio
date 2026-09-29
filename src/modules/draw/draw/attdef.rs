@@ -6,9 +6,9 @@
 //   3. Text: Enter default value    (optional — press Enter for blank)
 //   4. Point: Click insertion point
 
-use acadrust::entities::AttributeDefinition;
-use acadrust::types::Vector3;
-use acadrust::EntityType;
+use codec::entities::AttributeDefinition;
+use codec::types::Vector3;
+use codec::EntityType;
 use glam::DVec3;
 use crate::t;
 
@@ -206,6 +206,7 @@ impl CadCommand for AttdefCommand {
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
+            snap_only: false,
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,

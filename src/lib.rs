@@ -21,6 +21,7 @@ pub(crate) mod network;
 pub mod par;
 pub mod perf;
 pub mod plugin;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod rest;
 pub mod scene;
 pub mod snap;

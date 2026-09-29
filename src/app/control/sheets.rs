@@ -1,11 +1,10 @@
-//! Sheet-level and environment automation operations — the LayoutManager /
-//! PlotSettingsValidator / system-variable / document-lifecycle /
-//! selection-set counterparts of the AutoCAD .NET API.
+//! Sheet-level and environment automation operations — layouts, page setups,
+//! system variables, the document lifecycle and saved selection sets.
 
 use super::*;
 
 impl OpenCADStudio {
-    /// `close` — close a document tab (Document.Close parity). A dirty
+    /// `close` — close a document tab. A dirty
     /// document is refused unless `"discard":true`; discarding clears the
     /// dirty flag so the close path skips the unsaved-changes dialog.
     pub(super) fn control_close(&mut self, req: &Value) -> Result<Task<Message>, Value> {
@@ -43,7 +42,7 @@ impl OpenCADStudio {
     }
 
     /// `sysvar` — read/write the curated system-variable registry
-    /// (`Application.GetSystemVariable`/`SetSystemVariable` parity).
+    /// (read and write).
     /// `{"op":"sysvar","get":["LTSCALE","EXTMIN"]}` reads; `{"op":"sysvar",
     /// "set":{"MIRRTEXT":0}}` writes (one undo step, validated per name).
     pub(super) fn control_sysvar(&mut self, req: &Value) -> Result<Task<Message>, Value> {
@@ -89,8 +88,7 @@ impl OpenCADStudio {
         Ok(Task::none())
     }
 
-    /// `layout_create` — add a layout with the default A4 page setup
-    /// (LayoutManager.Add parity).
+    /// `layout_create` — add a layout with the default A4 page setup.
     pub(super) fn control_layout_create(
         &mut self,
         req: &Value,
@@ -121,7 +119,7 @@ impl OpenCADStudio {
             self.tabs[i].scene.document.header.paper_space_linetype_scaling,
         ) | (i16::from(self.tabs[i].scene.document.header.paper_space_limit_check) << 1);
         for obj in self.tabs[i].scene.document.objects.values_mut() {
-            if let acadrust::objects::ObjectType::Layout(layout) = obj {
+            if let codec::objects::ObjectType::Layout(layout) = obj {
                 if layout.name == name {
                     layout.flags = layout_flags;
                     crate::scene::apply_default_page_setup(layout, &plot_style);
@@ -137,7 +135,7 @@ impl OpenCADStudio {
     }
 
     /// `page_setup_set` — write a layout's plot configuration
-    /// (PlotSettingsValidator parity). Explicit fields win; everything else
+    /// Explicit fields win; everything else
     /// keeps the layout's stored setup. Paper names resolve through the
     /// catalog; scales are `"fit"` or `"paper:drawing"` like `"1:100"`.
     pub(super) fn control_page_setup_set(
@@ -156,7 +154,7 @@ impl OpenCADStudio {
             .tabs[i]
             .scene
             .plot_settings_for(&layout)
-            .unwrap_or_else(|| acadrust::objects::PlotSettings::new(String::new()));
+            .unwrap_or_else(|| codec::objects::PlotSettings::new(String::new()));
         if let Some(paper) = req["paper"].as_str().filter(|p| !p.is_empty()) {
             let resolved = crate::io::paper_catalog::resolve(paper)
                 .ok_or_else(|| failure("invalid_paper", format!("Unknown paper '{paper}'")))?;
@@ -165,9 +163,9 @@ impl OpenCADStudio {
             ps.paper_width = width;
             ps.paper_height = height;
             ps.rotation = if req["orientation"].as_str().is_some_and(|o| o.eq_ignore_ascii_case("portrait")) {
-                acadrust::objects::PlotRotation::None
+                codec::objects::PlotRotation::None
             } else {
-                acadrust::objects::PlotRotation::Degrees90
+                codec::objects::PlotRotation::Degrees90
             };
         }
         if let Some(fit) = req["fit"].as_bool() {
@@ -205,7 +203,7 @@ impl OpenCADStudio {
         if let Some(window) = req["window"].as_array().filter(|v| v.len() == 4) {
             let coord = |k: usize| window[k].as_f64().unwrap_or(0.0);
             ps.set_plot_window(coord(0), coord(1), coord(2), coord(3));
-            ps.plot_type = acadrust::objects::PlotType::Window;
+            ps.plot_type = codec::objects::PlotType::Window;
         }
         self.push_undo_snapshot(i, "PAGESETUP");
         if !self.tabs[i].scene.set_layout_plot_settings(&layout, &ps) {
@@ -226,7 +224,7 @@ impl OpenCADStudio {
     }
 
     /// `entities_copy_to` — copy entities into another open document
-    /// (CopyObjects parity). Referenced layer definitions travel along;
+    /// Referenced layer definitions travel along;
     /// the new handles are returned.
     pub(super) fn control_entities_copy_to(
         &mut self,
@@ -248,7 +246,7 @@ impl OpenCADStudio {
         )?;
 
         // Clone out of the source first so the two tabs never borrow together.
-        let cloned: Vec<acadrust::EntityType> = handles
+        let cloned: Vec<codec::EntityType> = handles
             .iter()
             .filter_map(|handle| self.tabs[source_index].scene.document.get_entity(*handle))
             .map(|entity| entity.clone())
@@ -256,7 +254,7 @@ impl OpenCADStudio {
 
         // Copy the referenced layer definitions out of the source before the
         // target borrow starts (the two tabs never borrow together).
-        let mut missing_layers: Vec<acadrust::tables::Layer> = Vec::new();
+        let mut missing_layers: Vec<codec::tables::Layer> = Vec::new();
         {
             let source_document = &self.tabs[source_index].scene.document;
             for entity in &cloned {
@@ -302,7 +300,7 @@ impl OpenCADStudio {
     }
 
     /// `group_create` — attach a named group to the listed entities
-    /// (Group dictionary parity).
+    /// (stored in the drawing's group dictionary).
     pub(super) fn control_group_create(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let name = string(req, "name")?.to_owned();
         if name.is_empty() {
@@ -322,7 +320,7 @@ impl OpenCADStudio {
     }
 
     /// `selection_set_save` — remember a named handle set for this session
-    /// (SelectionSet parity; session-scoped by design).
+    /// (session-scoped by design).
     pub(super) fn control_selection_set_save(
         &mut self,
         req: &Value,
@@ -387,9 +385,20 @@ impl OpenCADStudio {
         Ok(Task::none())
     }
 
+    /// `new` with `"template"` — the web build reads no files from a path, so
+    /// a template is refused there rather than silently ignored.
+    #[cfg(target_arch = "wasm32")]
+    pub(in crate::app) fn apply_template(&mut self, _template: &str) -> Result<usize, Value> {
+        Err(failure(
+            "invalid_request",
+            "starting from a template needs the desktop build",
+        ))
+    }
+
     /// `new` with `"template"` — start an untitled drawing from a DWG/DXF/DWT
-    /// file (DocumentManager.Add(template) parity). Tables and styles come
-    /// from the template; the document keeps no source path.
+    /// file. Tables and styles come from the template; the document keeps no
+    /// source path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(in crate::app) fn apply_template(&mut self, template: &str) -> Result<usize, Value> {
         let path = std::path::PathBuf::from(template);
         let bytes = self
@@ -427,7 +436,7 @@ impl OpenCADStudio {
         Ok(purged)
     }
 
-    /// `file_identity` — stable per-document GUID (SPMDOCUNIQUE parity,
+    /// `file_identity` — stable per-document GUID (the drawing's SPMDOCUNIQUE value,
     /// Catalog §1.6). The identity lives on a single invisible marker text
     /// at the origin carrying the XData application "SPMDOCUNIQUE" — the
     /// same marker SPM.ACAD writes — so it survives save/open round trips.
@@ -453,22 +462,22 @@ impl OpenCADStudio {
                     &mut self.tabs[i].scene.document,
                     handle,
                     FILE_IDENTITY_APP,
-                    Some(vec![acadrust::xdata::XDataValue::String(identity.clone())]),
+                    Some(vec![codec::xdata::XDataValue::String(identity.clone())]),
                 );
             }
             None => {
-                let mut text = acadrust::entities::Text::with_value(
+                let mut text = codec::entities::Text::with_value(
                     FILE_IDENTITY_APP,
-                    acadrust::types::Vector3::ZERO,
+                    codec::types::Vector3::ZERO,
                 )
                 .with_height(0.0001);
                 text.common.invisible = true;
-                let handle = self.tabs[i].scene.add_entity(acadrust::EntityType::Text(text));
+                let handle = self.tabs[i].scene.add_entity(codec::EntityType::Text(text));
                 crate::scene::view::dispatch::set_entity_xdata(
                     &mut self.tabs[i].scene.document,
                     handle,
                     FILE_IDENTITY_APP,
-                    Some(vec![acadrust::xdata::XDataValue::String(identity.clone())]),
+                    Some(vec![codec::xdata::XDataValue::String(identity.clone())]),
                 );
             }
         }
@@ -483,7 +492,7 @@ impl OpenCADStudio {
 const FILE_IDENTITY_APP: &str = "SPMDOCUNIQUE";
 
 /// The handle of the entity carrying the file identity, if present.
-fn find_file_identity_marker(document: &acadrust::CadDocument) -> Option<acadrust::Handle> {
+fn find_file_identity_marker(document: &codec::CadDocument) -> Option<codec::Handle> {
     document
         .entities()
         .find(|entity| {
@@ -497,20 +506,20 @@ fn find_file_identity_marker(document: &acadrust::CadDocument) -> Option<acadrus
 }
 
 /// The identity GUID from the marker entity's XData.
-fn marker_identity(document: &acadrust::CadDocument, handle: acadrust::Handle) -> Option<String> {
+fn marker_identity(document: &codec::CadDocument, handle: codec::Handle) -> Option<String> {
     let record = document
         .get_entity(handle)?
         .common()
         .extended_data
         .get_record(FILE_IDENTITY_APP)?;
     match record.values.first() {
-        Some(acadrust::xdata::XDataValue::String(text)) => Some(text.clone()),
+        Some(codec::xdata::XDataValue::String(text)) => Some(text.clone()),
         _ => None,
     }
 }
 
 /// A random RFC 4122 version-4 GUID string, from the OS entropy pool.
-fn new_guid_v4() -> String {
+pub(crate) fn new_guid_v4() -> String {
     use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS entropy unavailable");
@@ -560,7 +569,7 @@ fn read_sysvar(scene: &crate::scene::Scene, name: &str) -> Option<Value> {
     Some(value)
 }
 
-fn set_sysvar(document: &mut acadrust::CadDocument, name: &str, value: &Value) -> Result<(), Value> {
+fn set_sysvar(document: &mut codec::CadDocument, name: &str, value: &Value) -> Result<(), Value> {
     let failure = |message: &str| crate::app::control::failure("invalid_sysvar_value", message);
     let header = &mut document.header;
     match name.to_ascii_lowercase().as_str() {

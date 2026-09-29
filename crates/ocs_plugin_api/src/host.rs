@@ -1,6 +1,6 @@
 //! Runtime host surface (`host` feature).
 //!
-//! [`HostApi`] is the `acadrust`-typed adapter a plugin uses at *dispatch* time
+//! [`HostApi`] is the `opencadcodec`-typed adapter a plugin uses at *dispatch* time
 //! — document access, entity creation, XDATA, undo, and the command line. It is
 //! the stable counterpart to the dependency-free manifest/ribbon contract: a
 //! plugin's `dispatch` receives `&mut dyn HostApi` rather than the host's
@@ -19,16 +19,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::manifest::PluginManifest;
 use crate::ribbon::CadModule;
 
-// Re-export the acadrust crate and the types that appear in the HostApi trait
-// so out-of-tree plugins can use them without adding their own acadrust
+// Re-export the opencadcodec crate and the types that appear in the HostApi trait
+// so out-of-tree plugins can use them without adding their own opencadcodec
 // dependency (which would risk an ABI-mismatching version).
-pub use acadrust;
-pub use acadrust::objects::{
+pub use codec;
+pub use codec::objects::{
     DictionaryCloningFlags, KnownXRecordKind, ProxyObjectReference, ProxyReferenceKind, XRecord,
     XRecordEntry, XRecordSection, XRecordValue, XRecordValueType,
 };
-pub use acadrust::xdata::{ExtendedDataRecord, XDataValue};
-pub use acadrust::{CadDocument, EntityType, Handle};
+pub use codec::xdata::{ExtendedDataRecord, XDataValue};
+pub use codec::{CadDocument, EntityType, Handle};
 
 use crate::ipc::protocol::{PluginRequest, PluginResponse};
 
@@ -603,6 +603,103 @@ pub trait InteractiveCommand: Send {
     fn on_object_pick(&mut self, _handle: Handle, _pt: [f64; 3]) -> CommandStep {
         CommandStep::Cancel
     }
+
+    /// Real-time preview geometry (lines, arcs, polylines) to render as the cursor moves.
+    /// Each wire can specify custom vertices and an optional color (defaults to host cyan).
+    fn on_cursor_move(&mut self, _pt: [f64; 3]) -> Vec<PreviewWire> {
+        Vec::new()
+    }
+}
+
+/// A preview wire rendered in real-time during interactive commands.
+/// Supports straight polylines as well as analytical circles and arcs
+/// that render via GPU shaders with infinite smoothness.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "host", derive(serde::Serialize, serde::Deserialize))]
+pub enum PreviewWire {
+    /// A connected sequence of straight line segments in world space.
+    Polyline {
+        points: Vec<[f64; 3]>,
+        color: Option<[f32; 4]>,
+    },
+    /// An analytical circle rendered with sub-pixel GPU anti-aliasing.
+    Circle {
+        center: [f64; 3],
+        radius: f64,
+        color: Option<[f32; 4]>,
+    },
+    /// An analytical circular arc swept counter-clockwise from `start_angle_rad` to `end_angle_rad`.
+    Arc {
+        center: [f64; 3],
+        radius: f64,
+        start_angle_rad: f64,
+        end_angle_rad: f64,
+        color: Option<[f32; 4]>,
+    },
+}
+
+impl PreviewWire {
+    /// Create a polyline preview wire with default host cyan color.
+    pub fn new(points: Vec<[f64; 3]>) -> Self {
+        Self::Polyline { points, color: None }
+    }
+
+    /// Optional RGBA color (0.0 to 1.0) specified for this preview wire.
+    pub fn color(&self) -> Option<[f32; 4]> {
+        match self {
+            Self::Polyline { color, .. } => *color,
+            Self::Circle { color, .. } => *color,
+            Self::Arc { color, .. } => *color,
+        }
+    }
+
+    /// Create a polyline preview wire with a custom RGBA color.
+    pub fn with_color(points: Vec<[f64; 3]>, color: [f32; 4]) -> Self {
+        Self::Polyline {
+            points,
+            color: Some(color),
+        }
+    }
+
+    /// Create a straight line segment preview between two points.
+    pub fn line(from: [f64; 3], to: [f64; 3], color: Option<[f32; 4]>) -> Self {
+        Self::Polyline {
+            points: vec![from, to],
+            color,
+        }
+    }
+
+    /// Create an analytical circle preview.
+    pub fn circle(center: [f64; 3], radius: f64, color: Option<[f32; 4]>) -> Self {
+        Self::Circle {
+            center,
+            radius,
+            color,
+        }
+    }
+
+    /// Create an analytical circular arc preview.
+    pub fn arc(
+        center: [f64; 3],
+        radius: f64,
+        start_angle_rad: f64,
+        end_angle_rad: f64,
+        color: Option<[f32; 4]>,
+    ) -> Self {
+        Self::Arc {
+            center,
+            radius,
+            start_angle_rad,
+            end_angle_rad,
+            color,
+        }
+    }
+}
+
+impl From<Vec<[f64; 3]>> for PreviewWire {
+    fn from(points: Vec<[f64; 3]>) -> Self {
+        Self::new(points)
+    }
 }
 
 /// The outcome of an [`InteractiveCommand`] step.
@@ -619,6 +716,14 @@ pub enum CommandStep {
     Done,
     /// Cancel the command.
     Cancel,
+    // New variants go after the existing ones: the step crosses the plugin
+    // IPC, which encodes a variant by its position, so inserting one earlier
+    // would make a plugin built against the previous API send `Done` and
+    // have the host read it as something else.
+    /// Commit multiple entities to the document and keep collecting points.
+    CommitMany(Vec<EntityType>),
+    /// Commit multiple entities to the document and end the command.
+    CommitManyAndEnd(Vec<EntityType>),
 }
 
 /// Export a `BuiltinPlugin` from a `cdylib` so the host can load it at runtime.
@@ -911,14 +1016,14 @@ pub trait HostApi {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LayerConfig {
     pub name: String,
-    pub color: Option<acadrust::types::Color>,
+    pub color: Option<codec::types::Color>,
     pub linetype: Option<String>,
-    pub lineweight: Option<acadrust::types::LineWeight>,
+    pub lineweight: Option<codec::types::LineWeight>,
     pub off: Option<bool>,
     pub frozen: Option<bool>,
     pub locked: Option<bool>,
     pub plottable: Option<bool>,
-    pub transparency: Option<acadrust::types::Transparency>,
+    pub transparency: Option<codec::types::Transparency>,
     pub description: Option<String>,
 }
 

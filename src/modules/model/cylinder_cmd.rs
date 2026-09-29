@@ -1,7 +1,7 @@
-use acadrust::entities::Solid3D;
-use acadrust::objects::SolidHistoryOperation;
-use acadrust::EntityType;
-use cadkernel::brep::Body;
+use codec::entities::Solid3D;
+use codec::objects::SolidHistoryOperation;
+use codec::EntityType;
+use kernel::brep::Body;
 use glam::DVec3;
 
 use crate::command::{
@@ -134,7 +134,7 @@ impl CylinderCommand {
         let plane = WorkingPlane::new(a, first_axis, second_axis);
         let local_b = plane.to_local(b);
         let local_c = plane.to_local(c);
-        let circle = cadkernel::geom2d::arc_through_points(
+        let circle = kernel::geom2d::arc_through_points(
             [0.0, 0.0],
             [local_b.x, local_b.y],
             [local_c.x, local_c.y],
@@ -248,10 +248,13 @@ impl CylinderCommand {
         else {
             return None;
         };
-        let candidates = crate::modules::draw::draw::circle::ttr_candidates(first, second, radius);
-        let local = crate::modules::draw::draw::circle::best_of(
-            &candidates,
-            (first_hit + second_hit) * 0.5,
+        let local = crate::modules::draw::draw::circle::pick_best_ttr_candidate(
+            first,
+            second,
+            radius,
+            first_hit,
+            second_hit,
+            None,
         )?;
         Some(self.plane.to_world(local))
     }
@@ -460,6 +463,16 @@ impl CylinderCommand {
 impl CadCommand for CylinderCommand {
     fn set_working_plane(&mut self, plane: WorkingPlane) {
         self.plane = plane;
+    }
+
+    /// The radius step reads the cursor on the base plane through the
+    /// centre, so a base started on a raised face follows the mouse.
+    fn cursor_plane(&self) -> Option<(DVec3, DVec3)> {
+        if !matches!(self.step, Step::BaseRadius | Step::BaseDiameter) {
+            return None;
+        }
+        let frame = self.frame?;
+        Some((frame.z.normalize_or_zero(), frame.origin))
     }
 
     fn cursor_axis(&self) -> Option<(DVec3, DVec3)> {

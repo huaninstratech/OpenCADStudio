@@ -34,18 +34,12 @@ impl OpenCADStudio {
     pub(in crate::app) fn copy_entities_to_clipboard(
         &mut self,
         i: usize,
-        handles: &[acadrust::Handle],
+        handles: &[codec::Handle],
         base: glam::DVec3,
     ) -> usize {
-        let (entities, deps) = {
-            let document = &self.tabs[i].scene.document;
-            let entities: Vec<_> = handles
-                .iter()
-                .filter_map(|&handle| document.get_entity(handle).cloned())
-                .collect();
-            let deps = super::super::ClipboardDeps::capture(document, &entities);
-            (entities, deps)
-        };
+        // Clone + dep-capture live in the shared kernel; storage stays here.
+        let (entities, deps) =
+            super::super::command_driver::copy_to_clipboard_kernel(&self.tabs[i].scene.document, handles);
         let count = entities.len();
         self.clipboard_base = base;
         self.clipboard = entities;
@@ -119,7 +113,7 @@ impl OpenCADStudio {
                         .collect();
                     if nums.len() >= 2 {
                         let z = nums.get(2).copied().unwrap_or(0.0);
-                        let pt = acadrust::types::Vector3::new(nums[0], nums[1], z);
+                        let pt = codec::types::Vector3::new(nums[0], nums[1], z);
                         let is_paper = self.tabs[i].scene.current_layout != "Model";
                         self.push_undo_snapshot(i, "BASE");
                         if is_paper {
@@ -460,6 +454,41 @@ impl OpenCADStudio {
                 self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
             }
 
+            cmd if cmd.starts_with("WBLOCK_POINT_PICKED ") => {
+                let parts: Vec<f64> = cmd["WBLOCK_POINT_PICKED ".len()..]
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if parts.len() == 3 {
+                    if let Some(state) = self.wblock.as_mut() {
+                        state.base_point_x = format!("{:.4}", parts[0]);
+                        state.base_point_y = format!("{:.4}", parts[1]);
+                        state.base_point_z = format!("{:.4}", parts[2]);
+                    }
+                }
+                self.tabs[i].active_cmd = None;
+                self.active_modal = Some(crate::app::ModalKind::WriteBlock);
+            }
+
+            "WBLOCK_POINT_CANCELLED" => {
+                self.tabs[i].active_cmd = None;
+                self.active_modal = Some(crate::app::ModalKind::WriteBlock);
+            }
+
+            "WBLOCK_OBJECTS_GATHERED" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .collect();
+                if let Some(state) = self.wblock.as_mut() {
+                    state.selected_handles = handles;
+                }
+                self.tabs[i].active_cmd = None;
+                self.active_modal = Some(crate::app::ModalKind::WriteBlock);
+            }
+
             "INSERT" => {
                 let blocks = self.tabs[i].scene.custom_block_names();
                 if blocks.is_empty() {
@@ -547,7 +576,7 @@ impl OpenCADStudio {
                             .iter()
                             .filter_map(|h| doc.get_entity(*h))
                             .filter_map(|e| match e {
-                                acadrust::EntityType::AttributeDefinition(a) => {
+                                codec::EntityType::AttributeDefinition(a) => {
                                     Some((a.tag.clone(), a.default_value.clone()))
                                 }
                                 _ => None,
@@ -560,7 +589,7 @@ impl OpenCADStudio {
                     .document
                     .entities()
                     .filter_map(|entity| match entity {
-                        acadrust::EntityType::Insert(insert)
+                        codec::EntityType::Insert(insert)
                             if insert.block_name.eq_ignore_ascii_case(&block)
                                 && !self.tabs[i].scene.is_layer_locked(insert.common.handle) =>
                         {
@@ -578,7 +607,7 @@ impl OpenCADStudio {
                 let mut synced = 0usize;
                 let mut changes = Vec::new();
                 for handle in inserts {
-                    let Some(acadrust::EntityType::Insert(ins)) =
+                    let Some(codec::EntityType::Insert(ins)) =
                         self.tabs[i].scene.document.get_entity_mut(handle)
                     else {
                         continue;
@@ -592,7 +621,7 @@ impl OpenCADStudio {
                             .any(|a| a.tag.eq_ignore_ascii_case(tag))
                         {
                             ins.attributes
-                                .push(acadrust::entities::AttributeEntity::new(
+                                .push(codec::entities::AttributeEntity::new(
                                     tag.clone(),
                                     default.clone(),
                                 ));
@@ -660,16 +689,161 @@ impl OpenCADStudio {
                 self.open_attedit_dialog();
             }
 
-            "PDFATTACH" => {
-                return Some(Task::done(Message::PdfAttachPick));
+            "PDFIMPORT" => {
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::pdf_import::PdfImportCommand::new();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            "_PDFIMPORTFILE" => {
+                return Some(Task::done(Message::PdfImportPick));
+            }
+            // A file named after it skips the picker.
+            cmd if cmd.starts_with("_PDFIMPORTFILE ") => {
+                let path = cmd["_PDFIMPORTFILE ".len()..].trim().trim_matches('"').to_string();
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        crate::scene::model::pdf_raster::register_source(&path, std::sync::Arc::new(bytes));
+                        self.open_pdf_import_file(&path);
+                    }
+                    Err(_) => self.command_line.push_error(&format!("{path} not found.")),
+                }
+            }
+            "PDFCLIP" | "DWFCLIP" | "DGNCLIP" => {
+                use crate::command::CadCommand;
+                let kind = match cmd {
+                    "DWFCLIP" => codec::entities::UnderlayType::Dwf,
+                    "DGNCLIP" => codec::entities::UnderlayType::Dgn,
+                    _ => codec::entities::UnderlayType::Pdf,
+                };
+                let command = crate::modules::insert::pdf_clip::PdfClipCommand::for_kind(kind);
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            "IMAGECLIP" => {
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::pdf_clip::PdfClipCommand::image();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            "VPCLIP" => {
+                use crate::command::CadCommand;
+                let command = crate::modules::layout::mview::MviewCommand::vpclip_select();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            "CLIP" => {
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::xclip::ClipCommand::new();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            // XCLIP takes block references chosen beforehand; others are
+            // left out.
+            "XCLIP" => {
+                use crate::command::CadCommand;
+                use crate::modules::insert::xclip::XclipCommand;
+                let inserts: Vec<codec::Handle> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .iter()
+                    .filter(|(_, e)| matches!(e, codec::EntityType::Insert(_)))
+                    .map(|(h, _)| *h)
+                    .collect();
+                let command = if inserts.is_empty() {
+                    XclipCommand::new()
+                } else {
+                    let clipped = inserts.iter().any(|h| {
+                        crate::scene::pick::xclip::filter_handle(&self.tabs[i].scene.document, *h)
+                            .is_some()
+                    });
+                    XclipCommand::for_inserts(inserts, clipped)
+                };
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            // PDFATTACH picks the file; -PDFATTACH asks for it on the command
+            // line. A path after either names the file at once.
+            cmd if matches!(
+                cmd.split_whitespace().next().map(|v| v.to_ascii_uppercase()).as_deref(),
+                Some("PDFATTACH") | Some("-PDFATTACH")
+            ) =>
+            {
+                use crate::command::CadCommand;
+                let (verb, rest) = cmd
+                    .split_once(char::is_whitespace)
+                    .map(|(verb, rest)| (verb.to_ascii_uppercase(), rest.trim()))
+                    .unwrap_or_else(|| (cmd.to_ascii_uppercase(), ""));
+                if verb == "PDFATTACH" && rest.is_empty() {
+                    return Some(Task::done(Message::PdfAttachPick));
+                }
+                let insunits = self.tabs[i].scene.document.header.insertion_units;
+                let mut command =
+                    crate::modules::insert::pdf_attach::PdfAttachCommand::new(insunits);
+                if !rest.is_empty() {
+                    if let Some(crate::command::CmdResult::ReportError(message)) =
+                        command.on_text_input(rest)
+                    {
+                        self.command_line.push_error(&message);
+                    }
+                }
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
             }
             "XATTACH" => {
                 // Launch the file picker; XAttachPickResult will start the command.
                 return Some(Task::done(Message::XAttachPick));
             }
-            cmd if cmd == "WBLOCK" || cmd == "WB" || cmd.starts_with("WBLOCK ") => {
-                let arg = cmd.splitn(2, ' ').nth(1).unwrap_or("").trim();
-                if arg.is_empty() {
+            "WBLOCK" | "WB" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .collect();
+                let existing_blocks = self.tabs[i].scene.custom_block_names();
+                let default_unit = self.tabs[i].scene.document.header.insertion_units;
+                let default_folder = self.tabs[i]
+                    .current_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let default_path = if default_folder.is_empty() {
+                    "new_block.dwg".to_string()
+                } else {
+                    format!("{}/new_block.dwg", default_folder.replace('\\', "/"))
+                };
+                self.wblock = Some(
+                    crate::ui::window::wblock::WblockState::new(
+                        existing_blocks,
+                        handles,
+                        default_unit,
+                        default_path,
+                    ),
+                );
+                self.active_modal = Some(crate::app::ModalKind::WriteBlock);
+            }
+
+            cmd if cmd == "-WBLOCK"
+                || cmd == "-WB"
+                || cmd.starts_with("-WBLOCK ")
+                || cmd.starts_with("-WB ")
+                || cmd.starts_with("WBLOCK ")
+                || cmd.starts_with("WB ") =>
+            {
+                let rest = if let Some(r) = cmd.strip_prefix("-WBLOCK") {
+                    r.trim()
+                } else if let Some(r) = cmd.strip_prefix("-WB") {
+                    r.trim()
+                } else if let Some(r) = cmd.strip_prefix("WBLOCK") {
+                    r.trim()
+                } else if let Some(r) = cmd.strip_prefix("WB") {
+                    r.trim()
+                } else {
+                    ""
+                };
+                if rest.is_empty() {
                     // No argument: use selected entities (*) if any, else ask.
                     let sel: Vec<_> = self.tabs[i].scene.selected.iter().copied().collect();
                     if sel.is_empty() {
@@ -680,7 +854,7 @@ impl OpenCADStudio {
                         return Some(Task::done(Message::WblockSave("*".to_string())));
                     }
                 } else {
-                    return Some(Task::done(Message::WblockSave(arg.to_string())));
+                    return Some(Task::done(Message::WblockSave(rest.to_string())));
                 }
             }
 
@@ -860,7 +1034,7 @@ impl OpenCADStudio {
                                 self.tabs[i].xref_unloaded.remove(key);
                                 self.tabs[i].xref_stat_cache.remove(key);
                             }
-                            let handles: rustc_hash::FxHashSet<acadrust::types::Handle> = self.tabs
+                            let handles: rustc_hash::FxHashSet<codec::types::Handle> = self.tabs
                                 [i]
                                 .scene
                                 .document
@@ -1366,11 +1540,16 @@ impl OpenCADStudio {
                     if after.is_empty() {
                         return Some(Task::done(Message::XAttachPick));
                     }
-                    let cmd = crate::modules::insert::xattach::XAttachCommand::with_path(
-                        after.to_string(),
+                    self.start_xref_attach(
+                        i,
+                        crate::modules::insert::xattach::XrefAttachRequest {
+                            path: after.trim_matches('"').to_string(),
+                            overlay: false,
+                            path_type: crate::io::xref_model::Pathtype::Full,
+                        },
+                        crate::modules::insert::xattach::XrefPlacement::on_screen(),
+                        "-XREF",
                     );
-                    self.command_line.push_info(&cmd.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(cmd));
                 } else {
                     self.command_line.push_error(crate::tf!(
                         "XREF: unknown option '{}'. Options: ? Reload Unload Detach Path Pathtype Bind Overlay Attach",
@@ -1442,7 +1621,7 @@ impl OpenCADStudio {
                     .selected_entities()
                     .iter()
                     .filter_map(|(_, e)| match e {
-                        acadrust::EntityType::Insert(ins) => Some(ins.block_name.clone()),
+                        codec::EntityType::Insert(ins) => Some(ins.block_name.clone()),
                         _ => None,
                     })
                     .collect();
@@ -1555,13 +1734,13 @@ mod tests {
         let mut app = fresh_app();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut line = acadrust::entities::Line::new();
-        line.start = acadrust::types::Vector3::ZERO;
-        line.end = acadrust::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.start = codec::types::Vector3::ZERO;
+        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![acadrust::EntityType::Line(line)],
+                vec![codec::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -1580,13 +1759,13 @@ mod tests {
         app.refresh_block_palette();
         assert!(app.block_palette.blocks.is_empty());
         let i = app.active_tab;
-        let mut line = acadrust::entities::Line::new();
-        line.start = acadrust::types::Vector3::ZERO;
-        line.end = acadrust::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.start = codec::types::Vector3::ZERO;
+        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![acadrust::EntityType::Line(line)],
+                vec![codec::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -1597,11 +1776,11 @@ mod tests {
 
     #[test]
     fn xref_dash_alias_lists_like_xref() {
-        // `-XREF` is accepted as an alias for industry muscle memory; bare
-        // `XREF` keeps the legacy list output for compatibility.
+        // `-XREF` asks on the command line: `?` then Enter prints the
+        // reference table; `XREF ?` keeps the legacy list output for scripts.
         let mut app = fresh_app();
         let out = run_capture(&mut app, "-XREF ?");
-        assert!(out.contains("No external references") || out.contains("External references"));
+        assert!(out.contains("Total Xref(s): 0"), "got: {out:?}");
     }
 
     #[test]
@@ -1651,7 +1830,7 @@ mod tests {
 
     fn add_dwg_xref(app: &mut OpenCADStudio, name: &str, saved: &str) {
         let i = app.active_tab;
-        let mut br = acadrust::tables::BlockRecord::new(name);
+        let mut br = codec::tables::BlockRecord::new(name);
         br.flags.is_xref = true;
         br.xref_path = saved.to_string();
         br.handle = app.tabs[i].scene.document.allocate_handle();
@@ -1689,7 +1868,7 @@ mod tests {
 
     #[test]
     fn xref_overlay_on_image_errors() {
-        use acadrust::objects::{ImageDefinition, ObjectType};
+        use codec::objects::{ImageDefinition, ObjectType};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -1701,9 +1880,9 @@ mod tests {
             .objects
             .insert(h, ObjectType::ImageDefinition(def));
         // Reference it so collect_entries lists it.
-        let mut img = acadrust::entities::RasterImage::new(
+        let mut img = codec::entities::RasterImage::new(
             "img.png",
-            acadrust::types::Vector3::ZERO,
+            codec::types::Vector3::ZERO,
             8.0,
             8.0,
         );
@@ -1711,7 +1890,7 @@ mod tests {
         app.tabs[i]
             .scene
             .document
-            .add_entity(acadrust::EntityType::RasterImage(img))
+            .add_entity(codec::EntityType::RasterImage(img))
             .unwrap();
         let out = run_capture(&mut app, "XREF Overlay img.png");
         assert!(
@@ -1725,7 +1904,7 @@ mod tests {
         // CLI mirror of the palette F7 guard: reloading an image row reports
         // the drawing-only error, leaves its unloaded flag untouched, and
         // does not follow with a spurious no-match error.
-        use acadrust::objects::{ImageDefinition, ObjectType};
+        use codec::objects::{ImageDefinition, ObjectType};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -1736,9 +1915,9 @@ mod tests {
             .document
             .objects
             .insert(h, ObjectType::ImageDefinition(def));
-        let mut img = acadrust::entities::RasterImage::new(
+        let mut img = codec::entities::RasterImage::new(
             "img.png",
-            acadrust::types::Vector3::ZERO,
+            codec::types::Vector3::ZERO,
             8.0,
             8.0,
         );
@@ -1746,7 +1925,7 @@ mod tests {
         app.tabs[i]
             .scene
             .document
-            .add_entity(acadrust::EntityType::RasterImage(img))
+            .add_entity(codec::EntityType::RasterImage(img))
             .unwrap();
         app.tabs[i].current_path = Some(std::path::PathBuf::from("C:/Drawings/host.dwg"));
         app.tabs[i].xref_unloaded.add(h.value());
@@ -1794,7 +1973,7 @@ mod tests {
 
     #[test]
     fn xref_detach_nested_guard_errors() {
-        use acadrust::tables::BlockRecord;
+        use codec::tables::BlockRecord;
         // Host file on disk containing its own xref "INNER".
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_nested_{}_{}",
@@ -1805,7 +1984,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = acadrust::CadDocument::new();
+        let mut host_doc = codec::CadDocument::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -1835,15 +2014,15 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = acadrust::CadDocument::new();
+        let mut xref_doc = codec::CadDocument::new();
         xref_doc
             .layers
-            .add(acadrust::tables::Layer::new("WALLS"))
+            .add(codec::tables::Layer::new("WALLS"))
             .unwrap();
-        let mut line = acadrust::entities::Line::new();
+        let mut line = codec::entities::Line::new();
         line.common.layer = "WALLS".to_string();
         xref_doc
-            .add_entity(acadrust::EntityType::Line(line))
+            .add_entity(codec::EntityType::Line(line))
             .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
@@ -1873,12 +2052,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = acadrust::CadDocument::new();
-        let mut line = acadrust::entities::Line::new();
+        let mut xref_doc = codec::CadDocument::new();
+        let mut line = codec::entities::Line::new();
         line.common.plotstyle_flags = 0b11;
         line.common.plotstyle_handle = Some(xref_doc.allocate_handle());
         xref_doc
-            .add_entity(acadrust::EntityType::Line(line))
+            .add_entity(codec::EntityType::Line(line))
             .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
@@ -1898,7 +2077,7 @@ mod tests {
 
     #[test]
     fn xref_bind_pdf_errors() {
-        use acadrust::objects::{ObjectType, UnderlayDefinition};
+        use codec::objects::{ObjectType, UnderlayDefinition};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -1919,7 +2098,7 @@ mod tests {
 
     #[test]
     fn xref_bind_nested_guard_errors() {
-        use acadrust::tables::BlockRecord;
+        use codec::tables::BlockRecord;
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_bind_nested_{}_{}",
             std::process::id(),
@@ -1929,7 +2108,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = acadrust::CadDocument::new();
+        let mut host_doc = codec::CadDocument::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -2014,9 +2193,15 @@ mod tests {
     #[test]
     fn xref_attach_with_file_starts_placement() {
         // F10: `XREF Attach <file>` threads the file into the XATTACH
-        // placement command (same flow as the picker result).
+        // placement command (same flow as the picker result). A missing file
+        // is rejected up front, so the reference has to exist.
+        let dir = std::env::temp_dir().join(format!("ocs_xref_attach_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plan.dwg");
+        std::fs::write(&file, b"fake").unwrap();
         let mut app = fresh_app();
-        let out = run_capture(&mut app, "XREF Attach C:/refs/plan.dwg");
+        let out = run_capture(&mut app, &format!("XREF Attach {}", file.to_string_lossy()));
+        std::fs::remove_dir_all(&dir).ok();
         assert!(
             !out.contains("ships with reference operations"),
             "dead-end text must be gone, got: {out:?}"
@@ -2107,15 +2292,15 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = acadrust::CadDocument::new();
+        let mut xref_doc = codec::CadDocument::new();
         xref_doc
             .layers
-            .add(acadrust::tables::Layer::new("WALLS"))
+            .add(codec::tables::Layer::new("WALLS"))
             .unwrap();
-        let mut line = acadrust::entities::Line::new();
+        let mut line = codec::entities::Line::new();
         line.common.layer = "WALLS".to_string();
         xref_doc
-            .add_entity(acadrust::EntityType::Line(line))
+            .add_entity(codec::EntityType::Line(line))
             .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
@@ -2165,12 +2350,12 @@ mod tests {
         let mut app = fresh_app();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut line = acadrust::entities::Line::new();
-        line.end = acadrust::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![acadrust::EntityType::Line(line)],
+                vec![codec::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -2182,12 +2367,12 @@ mod tests {
         app.tabs
             .push(crate::app::document::DocumentTab::new_drawing(99));
         let other = app.tabs.len() - 1;
-        let mut line = acadrust::entities::Line::new();
-        line.end = acadrust::types::Vector3::new(50.0, 0.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.end = codec::types::Vector3::new(50.0, 0.0, 0.0);
         app.tabs[other]
             .scene
             .define_block_from_owned_entities(
-                vec![acadrust::EntityType::Line(line)],
+                vec![codec::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )

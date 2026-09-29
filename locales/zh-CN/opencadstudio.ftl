@@ -1125,6 +1125,10 @@ common =
     .opened-drawing-but-recent-copy-could-not-be-stored = 已打开图形，但无法保存最近副本：__ocs_fmt_0__
     .select-pdf-underlay = { draw.select }: PDF · { properties.underlay }
     .pdf-files = { common.files } (PDF)
+    .dwf-files = DWF Files
+    .dgn-files = DGN Files
+    .select-dwf-file = Select DWF File
+    .select-dgn-file = Select DGN File
     .pdfattach = PDFATTACH: __ocs_fmt_0__
     .select-external-reference-file = { draw.select } · { properties.external-reference } · { common.files }
     .cad-files = { common.files } (CAD)
@@ -1486,6 +1490,8 @@ common =
     .value-1-layout-selected = 已选择 1 个布局
     .layouts-selected = 个布局已选择
     .pdf = PDF
+    .dwf = DWF
+    .dgn = DGN
     .select-the-layouts-to-output-each-page-is-printed-in-layout-mode = 选择要输出的布局。每页均以布局模式打印。
     .select-all-1fc9a3 = { common.select-all }
     .select-none = { draw.select }: { common.none-title-case }
@@ -2250,6 +2256,64 @@ common =
     .row-s-skipped-duplicate-parameter-name = __ocs_fmt_0__ row(s) skipped: duplicate parameter name.
     .surface-s-cannot-be-thickened-because-the-offset-intersects-itself = __ocs_fmt_0__ surface(s) cannot be thickened because the offset intersects itself.
     .conflicting = ⚠ __ocs_fmt_0__ conflicting
+    .allow-exploding = 允许分解
+    .angstroms = 埃
+    .astronomical-units = 天文单位
+    .behavior = 行为
+    .block-already-exists-will-redefine-upon-ok = 块“__ocs_fmt_0__”已存在 — 单击确定后将重新定义
+    .block-creates-a-block-definition-from-objects-you-select = BLOCK 从选定的对象创建块定义。
+    .block-definition = 块定义
+    .block-name = 块名称
+    .block-name-already-exists-do-you-want-to-redefine-it =
+        块“__ocs_fmt_0__”已存在。
+        是否要重新定义?
+    .block-name-cannot-be-empty = 块名称不能为空。
+    .block-name-cannot-contain-invalid-chars = 块名称不能包含: \ / : * ? " < > | = `
+    .block-name-cannot-start-with-star = 块名称不能以“*”开头。
+    .block-unit-label = 块单位:
+    .convert-to-block = 转换为块
+    .count-objects-selected = 已选择 __ocs_fmt_0__ 个对象
+    .decameters = 十米
+    .decimeters = 分米
+    .enter-block-description = 输入块说明...
+    .gigameters = 吉米
+    .hectometers = 百米
+    .hyperlink-ellipsis = 超链接...
+    .hyperlink-star = 超链接*
+    .invalid-character-in-block-name = 块名称中包含无效字符“__ocs_fmt_0__”（不允许包含 \ / : * ? " < > | = `）
+    .light-years = 光年
+    .match-block-orientation = 使块方向与布局匹配
+    .microinches = 微英寸
+    .microns = 微米
+    .mils = 密尔
+    .nanometers = 纳米
+    .no-objects-selected = 未选择对象
+    .no-objects-selected-you-must-select-objects-to-define-a-block = 未选择对象。必须选择对象才能定义块。
+    .objects-title-case = 对象
+    .parsecs = 秒差距
+    .pick-point = 拾取点
+    .retain = 保留
+    .scale-uniformly = 按比例缩放
+    .specify-on-screen = 在屏幕上指定
+    .to-layout = 匹配到布局
+    .us-survey-feet = 美国测量英尺
+    .entire-drawing = 整个图形
+    .delete-from-drawing = 从图形中删除
+    .destination = 目标
+    .file-name-and-path = 文件名和路径:
+    .insert-units-label = 插入单位:
+    .wblock-err-no-block-name = 请选择或输入块名称。
+    .wblock-err-block-not-found = 图形中不存在块“__ocs_fmt_0__”。
+    .wblock-err-no-path = 请指定文件名和路径。
+    .wblock-err-current-drawing = 无法写入当前图形文件。
+    .wblock-help-info = WBLOCK 将对象、块或整个图形写入新的图形文件。
+    .apply-the-annotation-scale-in-model-space = Apply the annotation scale in model space (annotative objects scale as drawn)
+    .download = Download
+    .font-source-leave-empty-for-the-community-repository-or-point-at-any-folder-e-g-your-company-s-font-server = Font source — leave empty for the community repository, or point at any folder (e.g. your company's font server):
+    .https-server-fonts-or-a-github-raw-folder = https://server/fonts or a GitHub raw folder
+    .missing-fonts = Missing fonts
+    .skip = Skip
+    .this-drawing-uses-fonts-that-are-not-installed-on-this-machine-download-them-from-the-open-cad-studio-community-font-repository = This drawing uses fonts that are not installed on this machine. Download them from the OpenCADStudio community font repository?
 errors =
     .save-warning = 保存警告
     .unable-to-save-drawing = 无法保存图形
@@ -2444,6 +2508,7 @@ inquiry =
     .x-x-y-y-z-z = X = __ocs_arg_x__，  Y = __ocs_arg_y__，  Z = __ocs_arg_z__
     .type-name-handle-x-layer-color-lt = __ocs_fmt_0__ 处理 :__ocs_fmt_1__ 层:__ocs_fmt_2__ 颜色:__ocs_fmt_3__LT:__ocs_fmt_4____ocs_fmt_5__
     .area-4-perimeter-4-centroid-4-4 = __ocs_fmt_0__  面积=__ocs_fmt_1__  周边=__ocs_fmt_2__  中心=(单位:千兆克;__ocs_fmt_3__,__ocs_fmt_4__)
+    .qselect-annotative-enter-yes-or-no = QSELECT ANNOTATIVE: enter YES or NO.
 
 draw =
     .loaded-multiline-styles = 已加载的多线样式：__ocs_fmt_0__
@@ -3444,6 +3509,128 @@ annotate =
     .tolerance-specify-insertion-point = TOLERANCE  指定插入点：
 
 insert =
+    .pdfui-pdf-scale = PDF scale: __ocs_fmt_0__:1
+    .pdfui-specify-insertion-point = Specify insertion point:
+    .pdfui-no-pdf-underlays = No PDF underlays found.
+    .pdfui-imports-the-geometry-fills-raster-images-and-text-of-a-pdf-f = Imports the geometry, fills, raster images and text of a PDF file as drawing objects.
+    .pdfui-turns-the-layers-of-a-pdf-underlay-on-or-off = Turns the layers of a PDF underlay on or off.
+    .pdfui-attaches-a-pdf-file-as-an-underlay = Attaches a PDF file as an underlay.
+    .pdfui-rotation = Rotation:
+    .pdfui-scale = Scale:
+    .pdfui-specify-insertion-point-on-screen = Specify insertion point on-screen
+    .pdfui-page-size-size = Page size: __ocs_fmt_0__
+    .pdfui-total-count = Total: __ocs_fmt_0__
+    .pdfui-pages = Pages
+    .pdfui-placement = Placement
+    .pdfui-on-screen = On screen
+    .pdfui-file-details = File details
+    .pdfui-page-count = __ocs_fmt_0__ pages
+    .pdfui-selected-pages = Selected pages: __ocs_fmt_0__
+    .pdfui-layer-summary = __ocs_fmt_0__ layers, __ocs_fmt_1__ hidden
+    .pdfui-page = Page:
+    .pdfui-page-to-import = Page to import
+    .pdfui-infer-linetypes-from-collinear-dashes = Infer linetypes from collinear dashes
+    .pdfui-apply-lineweight-properties = Apply lineweight properties
+    .pdfui-convert-solid-fills-to-hatches = Convert solid fills to hatches
+    .pdfui-join-line-and-arc-segments = Join line and arc segments
+    .pdfui-import-as-block = Import as block
+    .pdfui-import-options = Import options
+    .pdfui-create-object-layers = Create object layers
+    .pdfui-use-pdf-layers = Use PDF layers
+    .pdfui-raster-images = Raster images
+    .pdfui-truetype-text = TrueType text
+    .pdfui-solid-fills = Solid fills
+    .pdfui-vector-geometry = Vector geometry
+    .pdfui-pdf-data-to-import = PDF data to import
+    .pdfui-select-an-underlay-to-view-its-layers = Select an underlay to view its layers.
+    .pdfui-this-file-does-not-contain-any-layers = This file does not contain any layers
+    .pdfui-search-for-layer = Search for layer
+    .pdfui-reference-name = Reference name:
+    .pdfui-page-size = Page size:
+    .ul-attach-underlay = Attach Underlay
+    .ul-attach-dwf = Attach DWF
+    .ul-attach-dgn = Attach DGN
+    .ul-attach-dwf-underlay = Attach DWF Underlay
+    .ul-attach-dgn-underlay = Attach DGN Underlay
+    .ul-sheet-count = __ocs_fmt_0__ sheets
+    .ul-model-count = __ocs_fmt_0__ models
+    .ul-sheets = Sheets
+    .ul-models = Models
+    .ul-selected-sheet = Selected sheet: __ocs_fmt_0__
+    .ul-selected-model = Selected model: __ocs_fmt_0__
+    .ul-sheet-size = Sheet size:
+    .ul-model-size = Model size:
+    .ul-conversion-units = Conversion units
+    .ul-master-units = Master units
+    .ul-sub-units = Sub units
+    .ul-sub-units-scale = Sub units make the default scale __ocs_fmt_0__
+    .ul-attaches-dwf = Attaches a DWF or DWFx file as an underlay.
+    .ul-attaches-dgn = Attaches a DGN file as an underlay.
+    .pdfui-select-one-or-more-pages-from-the-pdf-file = Select one or more pages from the PDF file:
+    .pdfui-import-pdf = Import PDF
+    .pdfui-pdf-import-settings = PDF Import Settings
+    .pdfui-underlay-layers = Underlay Layers
+    .pdfui-attach-pdf-underlay = Attach PDF Underlay
+    .pdfui-pdf-import = PDF Import
+    .pdfui-pdf-layers = PDF Layers
+    .pdfui-import-as-objects =
+        Import As
+        Objects
+    .pdfui-edit-layers =
+        Edit
+        Layers
+    .pdfui-external-references =
+        External
+        References
+    .pdfui-enable-snap =
+        Enable
+        Snap
+    .pdfui-show-underlay =
+        Show
+        Underlay
+    .pdfui-remove-clipping =
+        Remove
+        Clipping
+    .pdfui-create-clipping-boundary =
+        Create Clipping
+        Boundary
+    .pdfui-display-in-monochrome =
+        Display in
+        Monochrome
+    .select-pdf-file = Select PDF File
+    .refui-requires-int-90 = Requires an integer between -90 and 90.
+    .refui-xref-fading = Xref fading
+    .refui-edit-reference = Edit Reference
+    .refui-edit-reference-in-place =
+        Edit Reference
+        In-Place
+    .refui-open-reference =
+        Open
+        Reference
+    .refui-snap-to-underlays-off = Snap to Underlays OFF
+    .refui-snap-to-underlays-on = Snap to Underlays ON
+    .refui-snap-to-underlays = Snap to Underlays
+    .xref-attach-dialog-title = Attach External Reference
+    .xref-attach-browse = Browse...
+    .xref-attach-reference-type = Reference Type
+    .xref-attach-uniform-scale = Uniform Scale
+    .xref-attach-insertion-point = Insertion point
+    .xref-attach-angle = Angle:
+    .xref-attach-block-unit = Block Unit
+    .xref-attach-unit = Unit:
+    .xref-attach-factor = Factor:
+    .xref-attach-found-in = Found in:
+    .xref-attach-saved-path = Saved path:
+    .xref-attach-show-details = Show Details
+    .xref-attach-hide-details = Hide Details
+    .xref-attach-select-file = Select Reference File
+    .xref-attach-all-files = All Reference Files
+    .xref-attach-help = Inserts references to external files such as other drawings, raster images, and underlays.
+    .xref-attach-invalid-input = Invalid input.
+    .xref-insertion-point-x = Insertion point X
+    .xref-insertion-point-y = Insertion point Y
+    .xref-insertion-point-z = Insertion point Z
+    .xref-layer-property-overrides = Layer property overrides
     .point-clouds = 点云
     .attsync-block-name-to-sync = ATTSYNC  要同步的块名 :
     .attsync-no-block-named-arg = ATTSYNC:没有块名“__ocs_fmt_0__”。
@@ -3486,6 +3673,12 @@ insert =
     .frames-print = 边框与打印
     .frames-off = 边框关
     .frames-on = 边框开
+    .hide-frames = Hide frames
+    .display-and-plot-frames = Display and plot frames
+    .display-not-plot-frames = Display but don't plot frames
+    .frames-vary = *Frames vary*
+    .regenerating-model = Regenerating model.
+    .requires-int-0-2 = Requires an integer between 0 and 2.
     .insert-prompt-hint = INSERT  __ocs_arg_prompt____ocs_arg_hint__:
     .insert-enter-block-name-hint = INSERT  输入块名：__ocs_arg_hint__
     .insert-filling-attributes = INSERT  正在填充属性...
@@ -3620,6 +3813,9 @@ insert =
     .xref-old-path-prefix = 旧路径前缀
     .xref-attach-dwg = Attach DWG
     .xref-attach-image = Attach Image
+    .select-images = Select image(s):
+    .transparency-mode-on = Enter transparency mode [ON/OFF] <ON>:
+    .transparency-mode-off = Enter transparency mode [ON/OFF] <OFF>:
     .xref-attach-menu = Attach...
     .xref-change-path-type = Change Path Type
     .xref-find-and-replace-menu = Find and Replace...
@@ -3731,6 +3927,17 @@ insert =
     .xattach-specify-scale-factor-1-0-x-y-z-or-pick-corner = XATTACH  Specify scale factor <1.0> (X,Y,Z or pick Corner):
     .xopen-opening = XOPEN: opening "__ocs_fmt_0__".
     .xref = XREF: __ocs_fmt_0__
+    .block-select-objects = BLOCK  选择对象:
+    .block-specify-insertion-base-point = BLOCK  指定插入基点:
+    .wblock-specify-insertion-base-point = WBLOCK  指定插入基点:
+    .embed-image-in-drawing = Embed Image (in drawing)
+    .font-download-failed-e = Font download failed: __ocs_fmt_0__
+    .font-downloaded-name-path = FONT  Downloaded __ocs_fmt_0__ → __ocs_fmt_1__
+    .font-old-txt-style-style = FONT  __ocs_fmt_0__ → txt (style '__ocs_fmt_1__')
+    .imageembed-e = IMAGEEMBED: __ocs_fmt_0__
+    .imageembed-name-w-h-px-embedded = IMAGEEMBED  "__ocs_fmt_0__": __ocs_fmt_1__×__ocs_fmt_2__ px (embedded)
+    .none-of-the-missing-fonts-are-in-the-community-repository-yet = None of the missing fonts are in the community repository yet. Contribute them at github.com/huaninstratech/OpenCADStudio/tree/main/fonts.
+    .save-and-reopen-the-drawing-to-apply-the-new-fonts = Save and reopen the drawing to apply the new fonts.
 model =
     .create = 创建
     .boolean = 布尔运算
@@ -4184,8 +4391,19 @@ view =
     .ucs-specify-new-origin = UCS  { common.specify }: { common.new-origin }:
     .ucs-specify-point-on-positive-x-axis = UCS  { common.specify }: X · { common.positive-direction } · { common.point }:
     .ucs-specify-point-in-positive-xy-plane = UCS  { common.specify }: XY · { common.positive-direction } · { common.point }:
+    .annoscalemodel-enter-on-or-off = ANNOSCALEMODEL: enter ON or OFF.
+    .annoscalemodel-new-value-on-off = ANNOSCALEMODEL  new value [ON/OFF]:
+    .annotation-scale-in-model-space = Annotation Scale in Model Space
+    .annotation-scale-in-model-space-off = Annotation scale in model space: __ocs_fmt_0__
+    .annotation-scale-in-model-space-on = Annotation scale in model space: __ocs_fmt_0__
 
 properties =
+    .applied = Applied
+    .pdf-underlay = PDF Underlay
+    .dwf-underlay = DWF Underlay
+    .dgn-underlay = DGN Underlay
+    .page-number = Page number
+    .layer-display-overrides = Layer display overrides
     .arrowhead-size = 箭头大小
     .attachment = 附着
     .chord = 弦
@@ -5051,8 +5269,6 @@ plot =
     .this-printer-reports-no-driver-options = This printer reports no driver options.
     .could-not-read-the-printer-s-options-error = Could not read the printer's options: __ocs_fmt_0__
     .reading-the-printer-s-options = Reading the printer's options…
-    .printing-preferences-saved-for-printer = Printing preferences saved for __ocs_fmt_0__.
-    .printing-preferences-unchanged = Printing preferences unchanged.
     .printer-properties = Printer properties
     .merge-overlapping-lines = 合并重叠线
     .object-lineweights = 对象线宽

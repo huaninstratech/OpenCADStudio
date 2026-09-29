@@ -18,9 +18,9 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
-use acadrust::types::{Color as AcadColor, LineWeight, Transform, Vector3};
-use acadrust::{CadDocument, EntityType, Handle};
-use cadkernel::space::{Plane as KernelPlane, Vec3 as KernelVec3};
+use codec::types::{Color as AcadColor, LineWeight, Transform, Vector3};
+use codec::{CadDocument, EntityType, Handle};
+use kernel::space::{Plane as KernelPlane, Vec3 as KernelVec3};
 
 use crate::scene::convert::tessellate;
 use crate::scene::model::wire_model::{
@@ -653,7 +653,7 @@ fn inline_wire_point_cost(wire: &LocalWire) -> Option<usize> {
 }
 
 fn build_nested_ref(
-    nested_ins: &acadrust::entities::Insert,
+    nested_ins: &codec::entities::Insert,
     scale_policy: crate::scene::BlockScalePolicy,
     doc: &CadDocument,
     anno_scale: f32,
@@ -1001,7 +1001,7 @@ pub fn aabb_disjoint_xy(a: [f32; 4], b: [f32; 4]) -> bool {
 pub fn expand_insert(
     doc: &CadDocument,
     cache: &BlockCache,
-    ins: &acadrust::entities::Insert,
+    ins: &codec::entities::Insert,
     ins_handle: Handle,
     ins_resolved_color: [f32; 4],
     ins_aci: u8,
@@ -1238,7 +1238,7 @@ fn transform_translation(transform: &Transform) -> [f64; 3] {
 
 #[allow(clippy::too_many_arguments)]
 fn expansion_prototype_key(
-    ins: &acadrust::entities::Insert,
+    ins: &codec::entities::Insert,
     transform: &Transform,
     ins_color: [f32; 4],
     ins_pat_len: f32,
@@ -1463,6 +1463,29 @@ pub(crate) fn fade_toward_bg(color: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
         color[0] * (1.0 - T) + bg[0] * T,
         color[1] * (1.0 - T) + bg[1] * T,
         color[2] * (1.0 - T) + bg[2] * T,
+        color[3],
+    ]
+}
+
+/// XDWGFADECTL: how far referenced drawings fade toward the background, in
+/// percent (0–90); zero or negative shows them unfaded.
+static XREF_FADE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(50);
+
+pub fn xref_fade_ctl() -> i32 {
+    XREF_FADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_xref_fade_ctl(value: i32) {
+    XREF_FADE.store(value.clamp(-90, 90), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A referenced drawing's colour faded by XDWGFADECTL.
+pub(crate) fn xref_fade(color: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
+    let t = xref_fade_ctl().clamp(0, 90) as f32 / 100.0;
+    [
+        color[0] * (1.0 - t) + bg[0] * t,
+        color[1] * (1.0 - t) + bg[1] * t,
+        color[2] * (1.0 - t) + bg[2] * t,
         color[3],
     ]
 }
@@ -1727,6 +1750,7 @@ impl Batches {
                     world_width: b.world_width,
                     depth_override: b.local_depth,
                     display_visible: !b.hide_unselected || selected,
+                    snap_only: false,
                     plot_visible: b.plot_visible,
                     fill_is_3d: b.fill_is_3d,
                     fill_is_2d_solid: b.fill_is_2d_solid,
@@ -2135,7 +2159,7 @@ fn resolve_wire_color(lw: &LocalWire, ctx: &ExpandCtx) -> [f32; 4] {
         };
     }
     if ctx.is_xref && !ctx.selected {
-        fade_toward_bg(color, ctx.bg_color)
+        xref_fade(color, ctx.bg_color)
     } else {
         color
     }
@@ -2493,6 +2517,7 @@ fn emit_wire(
                     world_width: 0.0,
                     depth_override: local_depth,
                     display_visible: !lw.hide_unselected || ctx.selected,
+                    snap_only: false,
                     plot_visible: lw.plot_visible,
                     fill_is_3d: false,
                     fill_is_2d_solid: false,
@@ -3111,19 +3136,22 @@ mod bg_resolution_tests {
         assert_eq!(colors(&once), colors(&twice));
     }
 
-    /// Why the raw colour is stored instead of re-adapting the resolved one.
-    /// If this ever starts passing, `raw_color` could be dropped — and if it
-    /// is removed while this still fails, near-white geometry loses its tint
-    /// on the first layout switch.
+    /// Only colour 7's exact white / black swap with the background; a colour
+    /// drawn as authored — near-white, or a true-colour white mask — keeps its
+    /// value on any background. (#1500)
     #[test]
-    fn adapt_to_bg_cannot_be_reapplied() {
-        let once = adapt_to_bg(NEAR_WHITE, LIGHT);
-        assert_eq!(once, [0.0, 0.0, 0.0, 1.0], "near-white snaps to pure black");
-        assert_ne!(
-            adapt_to_bg(once, DARK),
-            adapt_to_bg(NEAR_WHITE, DARK),
-            "re-adapting the resolved colour must not equal adapting the raw one",
-        );
+    fn only_colour_seven_swaps_with_the_background() {
+        assert_eq!(adapt_to_bg([1.0, 1.0, 1.0, 1.0], LIGHT), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(adapt_to_bg([0.0, 0.0, 0.0, 1.0], DARK), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(adapt_to_bg(NEAR_WHITE, LIGHT), NEAR_WHITE);
+        let mask = crate::scene::convert::tess_util::aci_to_rgba(&codec::types::Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
+        assert_eq!(adapt_to_bg(mask, LIGHT), mask);
+        let seven = crate::scene::convert::tess_util::aci_to_rgba(&codec::types::Color::Index(7));
+        assert_eq!(adapt_to_bg(seven, LIGHT), [0.0, 0.0, 0.0, 1.0]);
     }
 }
 
@@ -3131,8 +3159,8 @@ mod bg_resolution_tests {
 mod compact_nested_tests {
     use super::*;
     use crate::scene::view::render::InheritStyle;
-    use acadrust::entities::{Insert, Line};
-    use acadrust::tables::BlockRecord;
+    use codec::entities::{Insert, Line};
+    use codec::tables::BlockRecord;
 
     fn add_block(document: &mut CadDocument, name: &str) -> Handle {
         let mut block = BlockRecord::new(name);

@@ -33,13 +33,19 @@ rfd = "0.17"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-acadrust = { git = "https://github.com/HakanSeven12/cadcodec.git", rev = "dd1d7bf", features = ["serde"] }
-cadkernel = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "6eae7c9", features = ["acis", "offset"] }
-cadkernel-constraints = { git = "https://github.com/HakanSeven12/cadkernel.git", rev = "6eae7c9" }
+codec = { package = "opencadcodec", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "cdf2277", features = ["serde"] }
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "52a9ebe", features = ["acis", "offset"] }
+kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "52a9ebe" }
+graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "597c8b8" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
 hayro = "0.7.1"
+kurbo = "0.13"
+# DWF/DWFx packages, their XPS pages and DWF/DGN underlay rasters.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+tiny-skia = "0.11"
 # Rasterises assets/logo.svg into the window icon at startup, so the taskbar
 # icon comes from the same file every other build target does. Already in the
 # tree behind iced's svg feature; named here only to use it directly.
@@ -52,6 +58,9 @@ rustc-hash = "2"
 sha2 = "0.10"
 fontdb = "0.23"
 ttf-parser = "0.25"
+# TrueType interpreter for hint-reliant ("tricky") fonts such as DFKai-SB and
+# MingLiU, whose raw outlines are missing strokes. Already in the tree (hayro).
+skrifa = "0.42.1"
 cosmic-text = "0.15"
 unicode-bidi = "0.3"
 lyon_tessellation = "1.0.20"
@@ -148,4 +157,8 @@ strip = true
 
 [[bench]]
 name = "performance_benchmarks"
+harness = false
+
+[[bench]]
+name = "command_benchmarks"
 harness = false

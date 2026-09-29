@@ -367,7 +367,7 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             } else if let Some(path) = body["path"].as_str() {
                 Plan::Run { request: json!({"op":"open","path":path}), created: 201 }
             } else {
-                // DocumentManager.Add() parity: a fresh untitled document in
+                // A fresh untitled document in
                 // its own tab, so cross-document operations have a target.
                 Plan::Mutate { op: "new".into(), fields: json!({}), created: 201 }
             }
@@ -1143,7 +1143,7 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["result"]["identity"].as_str().unwrap().len(), 36);
 
-        // An empty POST /documents is DocumentManager.Add(): a fresh
+        // An empty POST /documents opens a fresh
         // untitled document in its own tab — a copy-to target.
         let (status, body) = route(
             &mut app,

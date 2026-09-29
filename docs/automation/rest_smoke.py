@@ -120,7 +120,7 @@ def main() -> None:
         status, xdata = call(port, "GET", f"/entities/{handles[2]}/xdata?app=SPM")
         expect(xdata["items"][0]["xdata"]["SPM"][0] == "PAGE-01", "xdata read")
 
-        # 5. Define a block from the two frame lines, AutoCAD BLOCK style.
+        # 5. Define a block from the two frame lines, BLOCK-command style.
         status, block = call(port, "POST", "/blocks", {
             "name": "FRAME-MARK", "base": [0, 0, 0], "handles": [handles[0], copied["result"]["created"][0]],
         })
@@ -207,7 +207,7 @@ def main() -> None:
         expect(xdata["items"][0]["xdata"]["SPM"][0] == "PAGE-01", "xdata survived the template")
 
         # 12. Cross-document copy: an empty POST /documents is
-        # DocumentManager.Add() — a fresh second document in its own tab.
+        # A fresh second document in its own tab.
         status, state = call(port, "GET", "/state")
         source_doc = state["document_id"]
         status, fresh = call(port, "POST", "/documents", {})

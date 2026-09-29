@@ -403,7 +403,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[app.active_tab]
             .scene
-            .select_entity(acadrust::Handle::new(value), false);
+            .select_entity(codec::Handle::new(value), false);
 
         let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
         let bound = Arc::new(AtomicU16::new(0));
@@ -475,7 +475,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[app.active_tab]
             .scene
-            .select_entity(acadrust::Handle::new(value), false);
+            .select_entity(codec::Handle::new(value), false);
 
         let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
         let bound = Arc::new(AtomicU16::new(0));
@@ -544,7 +544,7 @@ mod tests {
         let port = wait_for_bridge(&bound);
 
         // The client parks a pick…
-        let mut point_conn = post(port, "/api/v1/getpoint", r#"{"request_id":"gp-drop"}"#);
+        let point_conn = post(port, "/api/v1/getpoint", r#"{"request_id":"gp-drop"}"#);
         let envelope = iced::futures::executor::block_on(receiver.next()).unwrap();
         assert_eq!(envelope.request["op"], "getpoint");
         let reply = app.control_request(envelope.request.clone()).0;
@@ -642,7 +642,7 @@ mod tests {
                     envelope.reply.send(reply);
                     app.tabs[app.active_tab]
                         .scene
-                        .select_entity(acadrust::Handle::new(handle_value), false);
+                        .select_entity(codec::Handle::new(handle_value), false);
                     let _ = app.update(if confirm {
                         crate::app::Message::CommandFinalize
                     } else {

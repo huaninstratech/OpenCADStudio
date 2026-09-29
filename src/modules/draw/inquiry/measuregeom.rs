@@ -14,7 +14,7 @@
 // All arithmetic is kept in f64 (picked points stay full precision; downcasting
 // to f32 loses several hundredths of a unit at survey-scale coordinates).
 
-use acadrust::{EntityType, Handle};
+use codec::{EntityType, Handle};
 use glam::DVec3;
 use crate::t;
 
@@ -77,6 +77,7 @@ impl MeasureGeomCommand {
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
+            snap_only: false,
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,

@@ -1,5 +1,5 @@
-//! Interactive user-request operations — the Editor.GetSelection /
-//! GetUserSelection counterpart of the AutoCAD .NET API. A client asks the
+//! Interactive user-request operations — selection and point requests
+//! answered by the person at the screen. A client asks the
 //! person at the screen to pick entities; the operation stays pending
 //! (`running` for pollers) until that person answers with Enter or Escape,
 //! then resolves with the picked entities' full data.
@@ -54,7 +54,7 @@ impl OpenCADStudio {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
-        // AutoCAD ssget semantics: the request starts a fresh pick unless the
+        // Selection-set semantics: the request starts a fresh pick unless the
         // caller asks to keep what is already selected.
         if req["clear"].as_bool().unwrap_or(true) {
             self.tabs[i].scene.deselect_all();
@@ -148,7 +148,7 @@ impl OpenCADStudio {
         // The filter only gates the answer, not the user's gestures: anything
         // that does not match is deselected (and reported) at confirm time.
         let picked = self.tabs[i].scene.selected_handles_in_order();
-        let mut handles: Vec<acadrust::Handle> = Vec::new();
+        let mut handles: Vec<codec::Handle> = Vec::new();
         let mut ignored = 0usize;
         for handle in picked {
             let matches = self.tabs[i]

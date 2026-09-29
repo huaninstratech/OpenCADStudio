@@ -69,7 +69,7 @@ struct SilhouetteChunk {
 
 struct SilhouetteSourceGroup {
     color: [f32; 4],
-    sources: Vec<cadkernel::brep::mesh::SilhouetteSource>,
+    sources: Vec<kernel::brep::mesh::SilhouetteSource>,
     instance_buffers: Vec<(wgpu::Buffer, u32)>,
 }
 use device_capabilities::DeviceCapabilities;
@@ -273,11 +273,11 @@ pub struct Pipeline {
     /// GPU buffer. `Some(false)` = regular wires, `Some(true)` = mesh edges.
     pub(crate) wire_arena_fallback: std::sync::Arc<Vec<WireGpu>>,
     pub(crate) wire_arena_fallback_kind: Option<bool>,
-    pub(crate) wire_arena_fallback_handles: rustc_hash::FxHashSet<acadrust::Handle>,
+    pub(crate) wire_arena_fallback_handles: rustc_hash::FxHashSet<codec::Handle>,
     /// The Model content id both arenas currently mirror (`u64::MAX` = none).
     pub(crate) wire_arena_id: u64,
     /// Handles that contributed to this slot's retained analytical uploads.
-    pub(crate) partition_contributors: rustc_hash::FxHashSet<acadrust::Handle>,
+    pub(crate) partition_contributors: rustc_hash::FxHashSet<codec::Handle>,
     /// The draw-depth generation those uploads baked. A full depth rebuild
     /// reassigns every label, so they stop being reusable when it moves.
     pub(crate) partition_depth_generation: u64,
@@ -322,14 +322,14 @@ pub struct Pipeline {
     /// repacked here, keeping the rest of a multi-million-triangle scene resident.
     gpu_mesh_dynamic: Vec<mesh_gpu::MeshBatchChunk>,
     mesh_disabled_chunks: rustc_hash::FxHashSet<usize>,
-    mesh_dynamic_handles: rustc_hash::FxHashSet<acadrust::Handle>,
+    mesh_dynamic_handles: rustc_hash::FxHashSet<codec::Handle>,
     /// Wire content generation whose geometry the static+dynamic mesh state
     /// mirrors. It gates replay of the same per-entity journal handoff.
     pub cached_mesh_content_id: u64,
     /// Draw ranges for each entity inside the resident mesh chunks. Highlight
     /// overlays reuse these buffers instead of uploading duplicate geometry.
     mesh_ranges_by_handle:
-        rustc_hash::FxHashMap<acadrust::Handle, Vec<MeshResidentRange>>,
+        rustc_hash::FxHashMap<codec::Handle, Vec<MeshResidentRange>>,
     mesh_highlight_draws: Vec<MeshHighlightDraw>,
     /// `(geometry_epoch, selection_generation)` the highlight overlay was built for.
     pub cached_highlight_key: (u64, u64),
@@ -2623,7 +2623,7 @@ impl Pipeline {
             wires
                 .par_iter()
                 .enumerate()
-                .filter_map(|(idx, w)| w.name.parse::<u64>().ok().map(|h| (h, idx as u32)))
+                .filter_map(|(idx, w)| wire_gpu::fast_parse_u64(&w.name).map(|h| (h, idx as u32)))
                 .collect()
         };
         let mut index: rustc_hash::FxHashMap<u64, Vec<u32>> = rustc_hash::FxHashMap::default();
@@ -2683,7 +2683,11 @@ impl Pipeline {
                     }
                     let depth = wire_gpu::wire_draw_depth(wire, depth_map);
                     let mut circles = circle_gpu::extract_circle_instances(wire, depth);
-                    let mut ellipses = ellipse_gpu::extract_ellipse_instances(wire, depth);
+                    let mut ellipses = if circles.is_none() {
+                        ellipse_gpu::extract_ellipse_instances(wire, depth)
+                    } else {
+                        None
+                    };
                     if let Some(color) = color {
                         if let Some(instances) = circles.as_mut() {
                             for instance in instances {
@@ -2728,8 +2732,8 @@ impl Pipeline {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         wires: &[WireModel],
-        selected: &rustc_hash::FxHashSet<acadrust::Handle>,
-        hovered: &rustc_hash::FxHashSet<acadrust::Handle>,
+        selected: &rustc_hash::FxHashSet<codec::Handle>,
+        hovered: &rustc_hash::FxHashSet<codec::Handle>,
         annotation_context_wires: &[WireModel],
         depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
         selected_tint: Option<[f32; 4]>,
@@ -2911,8 +2915,8 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         wires: &[WireModel],
-        selected: &rustc_hash::FxHashSet<acadrust::Handle>,
-        hovered: &rustc_hash::FxHashSet<acadrust::Handle>,
+        selected: &rustc_hash::FxHashSet<codec::Handle>,
+        hovered: &rustc_hash::FxHashSet<codec::Handle>,
         annotation_context_wires: &[WireModel],
         depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
         selected_tint: Option<[f32; 4]>,
@@ -3214,20 +3218,20 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                     for generator in generators {
                         if let Some(transform) = source.instance_transform {
                             let origin =
-                                transform.apply(acadrust::types::Vector3::ZERO);
+                                transform.apply(codec::types::Vector3::ZERO);
                             let vectors = [
                                 transform.apply_rotation(
-                                    acadrust::types::Vector3::UNIT_X,
+                                    codec::types::Vector3::UNIT_X,
                                 ),
                                 transform.apply_rotation(
-                                    acadrust::types::Vector3::UNIT_Y,
+                                    codec::types::Vector3::UNIT_Y,
                                 ),
                                 transform.apply_rotation(
-                                    acadrust::types::Vector3::UNIT_Z,
+                                    codec::types::Vector3::UNIT_Z,
                                 ),
                             ];
                             if let Some(transformed) =
-                                cadkernel::brep::mesh::transform_silhouette_affine(
+                                kernel::brep::mesh::transform_silhouette_affine(
                                     &generator.source,
                                     vectors.map(|vector| [vector.x, vector.y, vector.z]),
                                     [origin.x, origin.y, origin.z],
@@ -3256,7 +3260,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         let compute_group = |group: &SilhouetteSourceGroup| {
             let mut points = Vec::new();
             for source in &group.sources {
-                points.extend(cadkernel::brep::mesh::silhouette(
+                points.extend(kernel::brep::mesh::silhouette(
                     source,
                     [view.x, view.y, view.z],
                 ));
@@ -3603,7 +3607,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         meshes: &[MeshLodSet],
-        changes: &[(acadrust::Handle, crate::scene::ChangeKind)],
+        changes: &[(codec::Handle, crate::scene::ChangeKind)],
     ) -> bool {
         let started = iced::time::Instant::now();
         if self.gpu_mesh_batch.is_empty() || changes.is_empty() {
@@ -3673,15 +3677,15 @@ analytic={:.1} regular={:.1} blocks={:.1}",
     /// chunk buffers; changing hover never allocates or uploads mesh geometry.
     pub fn update_mesh_highlight(
         &mut self,
-        selected: &rustc_hash::FxHashSet<acadrust::Handle>,
-        hovered: &rustc_hash::FxHashSet<acadrust::Handle>,
+        selected: &rustc_hash::FxHashSet<codec::Handle>,
+        hovered: &rustc_hash::FxHashSet<codec::Handle>,
         edge_wires: &[WireModel],
     ) {
-        let edge_handles: rustc_hash::FxHashSet<acadrust::Handle> = edge_wires
+        let edge_handles: rustc_hash::FxHashSet<codec::Handle> = edge_wires
             .iter()
             .filter_map(|wire| wire.name.strip_prefix("mesh-edge:"))
             .filter_map(|value| value.parse::<u64>().ok())
-            .map(acadrust::Handle::new)
+            .map(codec::Handle::new)
             .collect();
         let mut out = Vec::new();
         for handle in selected
@@ -5953,7 +5957,7 @@ mod highlight_classification_tests {
 
     #[test]
     fn each_wire_lands_in_the_bucket_the_old_predicate_chose() {
-        let wires = vec![plain("1"), circle("2"), ellipse("3"), plain("4")];
+        let wires = [plain("1"), circle("2"), ellipse("3"), plain("4")];
         let refs: Vec<&WireModel> = wires.iter().collect();
         let depth_map = rustc_hash::FxHashMap::default();
 
@@ -5983,7 +5987,7 @@ mod highlight_classification_tests {
     // reach the instances.
     #[test]
     fn the_colour_override_reaches_the_instances() {
-        let wires = vec![circle("2"), ellipse("3")];
+        let wires = [circle("2"), ellipse("3")];
         let refs: Vec<&WireModel> = wires.iter().collect();
         let depth_map = rustc_hash::FxHashMap::default();
 

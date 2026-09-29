@@ -98,14 +98,14 @@ impl Scene {
     pub fn set_current_drawing_limits(&mut self, min: glam::DVec2, max: glam::DVec2) {
         if self.input_uses_model_space() {
             self.document.header.model_space_limits_min =
-                acadrust::types::Vector2::new(min.x, min.y);
+                codec::types::Vector2::new(min.x, min.y);
             self.document.header.model_space_limits_max =
-                acadrust::types::Vector2::new(max.x, max.y);
+                codec::types::Vector2::new(max.x, max.y);
         } else {
             self.document.header.paper_space_limits_min =
-                acadrust::types::Vector2::new(min.x, min.y);
+                codec::types::Vector2::new(min.x, min.y);
             self.document.header.paper_space_limits_max =
-                acadrust::types::Vector2::new(max.x, max.y);
+                codec::types::Vector2::new(max.x, max.y);
         }
 
         // Keep the current Layout object synchronized with the header values.
@@ -185,18 +185,18 @@ mod tests {
         // Template-default limits in inches while the geometry sits at
         // millimetre nesting coordinates: the frame centres on the union of
         // limits and extents, not on the 12×9 limits rectangle.
-        let mut line = acadrust::entities::Line::new();
-        line.start = acadrust::types::Vector3::new(1000.0, 1000.0, 0.0);
-        line.end = acadrust::types::Vector3::new(2000.0, 2000.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.start = codec::types::Vector3::new(1000.0, 1000.0, 0.0);
+        line.end = codec::types::Vector3::new(2000.0, 2000.0, 0.0);
         let target = frame(EntityType::Line(line));
         assert!((target.x - 1000.0).abs() < 1.0, "target: {target:?}");
         assert!((target.y - 1000.0).abs() < 1.0, "target: {target:?}");
 
         // A drawing fully inside the limits still frames the whole limits
         // rectangle (AutoCAD keeps the limits as the frame).
-        let mut line = acadrust::entities::Line::new();
-        line.start = acadrust::types::Vector3::new(3.0, 3.0, 0.0);
-        line.end = acadrust::types::Vector3::new(5.0, 5.0, 0.0);
+        let mut line = codec::entities::Line::new();
+        line.start = codec::types::Vector3::new(3.0, 3.0, 0.0);
+        line.end = codec::types::Vector3::new(5.0, 5.0, 0.0);
         let target = frame(EntityType::Line(line));
         assert!((target.x - 6.0).abs() < 1.0, "target: {target:?}");
         assert!((target.y - 4.5).abs() < 1.0, "target: {target:?}");

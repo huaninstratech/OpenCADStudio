@@ -75,6 +75,13 @@ fn main() -> iced::Result {
             return Ok(());
         }
 
+        // Crash log. A release build hides the console, so before this a
+        // panic ended the process with nothing on screen and nothing on disk
+        // (#635, #845). Installed after the child-process handoffs above: a
+        // GPU probe aborting is how an unusable backend is detected, not a
+        // crash worth filing.
+        OpenCADStudio::sys::crash_log::install();
+
         // Opt-in logging. `--log LEVEL` seeds RUST_LOG; the subscriber then
         // surfaces wgpu / iced / winit diagnostics that are otherwise silent.
         if let Some(level) = &args.log {
@@ -119,7 +126,7 @@ fn main() -> iced::Result {
         }
         if let Some(io) = &args.export {
             // clap enforces exactly two values for --export.
-            let code = app::export_headless(&io[0], &io[1]);
+            let code = app::export_headless(&io[0], &io[1], args.target_version.as_deref());
             std::process::exit(code);
         }
 
@@ -203,6 +210,14 @@ fn main() -> iced::Result {
             OpenCADStudio::gpu_backend::arm_sentinel(
                 gpu.backend_value.as_deref().unwrap_or("auto"),
             );
+            // The backend is only a suspect while it is young: a run that
+            // keeps drawing past this mark has proved it works, so a later
+            // end — Task Manager, an OOM kill, a power cut — must not cost
+            // the user that backend at the next launch.
+            std::thread::spawn(|| {
+                std::thread::sleep(OpenCADStudio::gpu_backend::SENTINEL_PROOF_DELAY);
+                OpenCADStudio::gpu_backend::mark_sentinel_survived();
+            });
             let result = app::run();
             OpenCADStudio::gpu_backend::disarm_sentinel();
             result
