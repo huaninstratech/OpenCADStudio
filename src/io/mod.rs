@@ -1058,12 +1058,13 @@ fn read_dwg_path(
     {
         // The memory-mapped read is the fast path, but a mapped file is read
         // through the page-fault handler: a file that shrinks while mapped
-        // (a writer saving over it) or a cloud placeholder that cannot page
-        // in raises an in-page exception the process cannot catch. Both are
-        // ordinary I/O errors through plain reads, so anything that can
-        // fault — or refuses to open under a third-party lock — falls back
-        // to one in-memory snapshot read below.
-        if !cloud_placeholder(path) {
+        // (a writer saving over it), a cloud placeholder, or a file on a
+        // network share whose bytes page in over SMB raises an in-page
+        // exception the process cannot catch when a page fails to arrive.
+        // All three are ordinary I/O errors through plain reads, so anything
+        // that can fault — or refuses to open under a third-party lock —
+        // falls back to one in-memory snapshot read below.
+        if !cloud_placeholder(path) && !network_path(path) {
             match DwgReader::from_mmap(path) {
                 Ok(mut reader) => {
                     reader.options = options.clone();
@@ -1136,6 +1137,38 @@ fn cloud_placeholder(path: &Path) -> bool {
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn cloud_placeholder(_path: &Path) -> bool {
+    false
+}
+
+/// Files on network shares (UNC paths and mapped drives) page their bytes in
+/// over SMB just like cloud placeholders: a dropped session, a stale
+/// server-side lock or a failed oplock break surfaces as an in-page
+/// exception (`0xC0000006`) that kills the process mid-parse. Snapshot reads
+/// turn the same failures into ordinary catchable I/O errors.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn network_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    const DRIVE_REMOTE: u32 = 4;
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let mut root: Vec<u16> = format!("{}:\\", letter as char)
+                .encode_utf16()
+                .collect();
+            root.push(0);
+            unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+fn network_path(_path: &Path) -> bool {
     false
 }
 
@@ -1646,6 +1679,34 @@ mod save_failure_tests {
         assert!(error.externally_modified);
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), target_os = "windows"))]
+mod network_path_tests {
+    use super::network_path;
+    use std::path::Path;
+
+    #[test]
+    fn unc_paths_never_mmap() {
+        assert!(network_path(Path::new(r"\\hd159\usbshare1\Cutting Plan Sample\u.dwg")));
+        assert!(network_path(Path::new(r"\\?\UNC\server\share\u.dwg")));
+        assert!(network_path(Path::new(r"\\localhost\C$\data\u.dwg")));
+    }
+
+    #[test]
+    fn local_fixed_drive_mmaps_and_relative_paths_are_left_alone() {
+        let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let local_path = format!(r"{system_drive}\Users\demo\u.dwg");
+        let local = Path::new(&local_path);
+        if network_path(local) {
+            // A mapped or substituted system drive legitimately reports
+            // DRIVE_REMOTE; the snapshot read is correct for it too.
+            return;
+        }
+        assert!(!network_path(local));
+        assert!(!network_path(Path::new("relative.dwg")));
+        assert!(!network_path(Path::new("")));
     }
 }
 
