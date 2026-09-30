@@ -82,7 +82,7 @@ document creation:
 | Step | `ocs_sessions` reports |
 |---|---|
 | right after launch | `modal: "AssocPrompt"` |
-| after `close_modal` | `modal: "DonationPrompt"` |
+
 | after a second `close_modal` | `modal: null` |
 
 While a dialog is open, `{"op":"new"}` answers `ok` but no tab is created.
@@ -92,9 +92,6 @@ Close the dialogs first:
 while (info := sessions())["modal"]:
     execute({"op": "action", "name": "close_modal", "document_id": info["document_id"]})
 ```
-
-The donation prompt appears once per application version per profile, so an
-automated profile meets it once per version rather than on every run.
 
 `new` makes the new drawing the active document. Requests carry `document_id`;
 take it from the reply's state and pass it on the following requests, as the

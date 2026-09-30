@@ -1002,7 +1002,6 @@ pub(super) struct OpenCADStudio {
     font_source_url: String,
     /// Editable copy of `font_source_url` shown in the missing-fonts prompt.
     font_source_input: String,
-    donation_prompt_version: String,
     /// Read-only session (`--read-only`): editing is allowed but every save
     /// path is refused. Set once at boot from the CLI config.
     read_only: bool,
@@ -4285,7 +4284,6 @@ impl OpenCADStudio {
             check_missing_fonts: true,
             font_source_url: String::new(),
             font_source_input: String::new(),
-            donation_prompt_version: String::new(),
             read_only: false,
             update_notice_version: None,
             update_notice_body: None,

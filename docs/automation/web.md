@@ -53,9 +53,7 @@ rather than a disk, so use `data_base64` for a file the page has not seen.
 
 ## Startup dialogs
 
-A dialog can be open when the page is ready. The donation prompt appears once per
-application version in each browser profile, so a fresh or disposable profile always
-sees it. While a modal is open `state.modal` is set, and `{"op":"new"}` returns `ok`
+A dialog can be open when the page is ready. While a modal is open `state.modal` is set, and `{"op":"new"}` returns `ok`
 without creating a tab until the modal is closed. Close it first:
 
 ```js
