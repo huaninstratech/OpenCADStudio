@@ -1,10 +1,12 @@
-// Check for a newer published native release.
+// Check for a newer published native release. This fork ships from its own
+// repository, so the update notice tracks `huaninstratech` — not upstream,
+// whose releases this fork does not follow.
 
 #[cfg(not(target_arch = "wasm32"))]
 const RELEASES_API: &str =
-    "https://api.github.com/repos/HakanSeven12/OpenCADStudio/releases/latest";
+    "https://api.github.com/repos/huaninstratech/OpenCADStudio/releases/latest";
 pub const RELEASES_PAGE: &str =
-    "https://github.com/HakanSeven12/OpenCADStudio/releases/latest";
+    "https://github.com/huaninstratech/OpenCADStudio/releases/latest";
 
 /// Give release assets time to propagate before offering an update.
 #[cfg(not(target_arch = "wasm32"))]
