@@ -373,6 +373,60 @@ pub(super) fn drafting_constrain(
     xf.to_wcs(c)
 }
 
+/// Ortho constraint for orbit (3D) views: lock the pick onto whichever of the
+/// three UCS axes — the plane axes plus the plane normal — best matches the
+/// cursor's screen-space displacement from `base`. `None` means "stay 2D",
+/// which happens exactly when the normal is seen end-on (a plan view), so the
+/// caller falls back to the classic in-plane [`drafting_constrain`].
+///
+/// The dominance test and the slide parameter are both measured on screen
+/// because in an orbit view world-space deltas no longer track what the user
+/// sees: a mostly-vertical mouse drag should pin Z when Z points up-ish on
+/// screen, regardless of pitch.
+pub(super) fn drafting_constrain_3d(
+    cursor_screen: glam::Vec2,
+    base: glam::DVec3,
+    axes: (glam::DVec3, glam::DVec3, glam::DVec3),
+    view_rot: glam::Mat4,
+    eye: glam::DVec3,
+    bounds: iced::Rectangle,
+) -> Option<glam::DVec3> {
+    let to_screen = |world: glam::DVec3| {
+        let s = crate::scene::pick::hit_test::world_to_screen(world, view_rot, eye, bounds);
+        glam::Vec2::new(s.x, s.y)
+    };
+    let origin_px = to_screen(base);
+    // Screen length of a unit axis scales with zoom, so "edge-on" is judged
+    // relative to the plane axes, never against the canvas: the normal seen
+    // end-on (a plan view) projects to a fraction of what X and Y project.
+    let d = [
+        to_screen(base + axes.0) - origin_px,
+        to_screen(base + axes.1) - origin_px,
+        to_screen(base + axes.2) - origin_px,
+    ];
+    let min_axis_px = 0.02 * d[0].length().max(d[1].length());
+    if d[2].length() < min_axis_px {
+        return None;
+    }
+    let v = cursor_screen - origin_px;
+    let mut best: Option<(f32, f32, glam::DVec3)> = None;
+    for (axis, d) in [(axes.0, d[0]), (axes.1, d[1]), (axes.2, d[2])] {
+        let len2 = d.length_squared();
+        if len2 < min_axis_px * min_axis_px {
+            continue;
+        }
+        // How far the cursor slides along this axis in world units, and how
+        // many pixels of the cursor's travel the axis explains (dominance).
+        let along = v.dot(d) / len2;
+        let score = v.dot(d) / len2.sqrt();
+        if best.is_none_or(|b| score.abs() > b.1.abs()) {
+            best = Some((along, score, axis));
+        }
+    }
+    let (along, _, axis) = best?;
+    Some(base + axis * along as f64)
+}
+
 /// Constrain `pt` to the nearest polar angle multiple from `base`, measured in
 /// the active UCS plane (identity `xf` = world XY, Z-up).
 pub(super) fn polar_constrain(
@@ -757,5 +811,147 @@ mod ucs_from_normal_tests {
     #[test]
     fn a_degenerate_normal_is_rejected() {
         assert!(ucs_from_normal(DVec3::ZERO, DVec3::ZERO).is_none());
+    }
+}
+
+#[cfg(test)]
+mod drafting_constrain_3d_tests {
+    use super::drafting_constrain_3d;
+    use glam::{DVec3, Mat4, Vec3};
+    use iced::Rectangle;
+
+    /// A full view-projection for a camera at `eye` looking at `target`, built
+    /// the RTE way `world_to_screen` expects: the matrix consumes eye-relative
+    /// coordinates, so the view half carries no translation.
+    fn rte_view_proj(eye: DVec3, target: DVec3) -> Mat4 {
+        // A straight-down camera keeps world Y up on screen, as the app's
+        // top view does; Z-up would make the look-at basis degenerate.
+        let up = if (target - eye).normalize_or_zero().cross(DVec3::Z).length() < 1.0e-6 {
+            Vec3::Y
+        } else {
+            Vec3::Z
+        };
+        let view = Mat4::look_at_rh(
+            Vec3::ZERO,
+            (target - eye).as_vec3(),
+            up,
+        );
+        let proj = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 10_000.0);
+        proj * view
+    }
+
+    const BOUNDS: Rectangle = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    fn screen_of(world: DVec3, vp: Mat4, eye: DVec3) -> Vec3 {
+        let ndc = vp.project_point3((world - eye).as_vec3());
+        Vec3::new(
+            (ndc.x + 1.0) * 0.5 * BOUNDS.width,
+            (1.0 - ndc.y) * 0.5 * BOUNDS.height,
+            0.0,
+        )
+    }
+
+    /// A mostly-vertical drag in an orbit view must pin the world Z axis
+    /// through the base point: x and y stay on the base, z takes the slide.
+    #[test]
+    fn a_vertical_drag_locks_onto_z_in_an_orbit_view() {
+        let eye = DVec3::new(300.0, 300.0, 250.0);
+        let vp = rte_view_proj(eye, DVec3::ZERO);
+        let base = DVec3::ZERO;
+        let origin = screen_of(base, vp, eye);
+        let cursor = Vec3::new(origin.x, origin.y - 200.0, 0.0);
+        let locked = drafting_constrain_3d(
+            glam::Vec2::new(cursor.x, cursor.y),
+            base,
+            (DVec3::X, DVec3::Y, DVec3::Z),
+            vp,
+            eye,
+            BOUNDS,
+        )
+        .expect("an orbit view offers three axes");
+        assert!(locked.x.abs() < 1e-9, "x moved: {locked:?}");
+        assert!(locked.y.abs() < 1e-9, "y moved: {locked:?}");
+        assert!(locked.z > 0.0, "dragging up must raise z: {locked:?}");
+    }
+
+    /// The same view must still offer the plane axes: a drag along X's screen
+    /// direction locks X and keeps the point on the z = 0 plane.
+    #[test]
+    fn a_horizontal_drag_still_locks_onto_a_plane_axis() {
+        let eye = DVec3::new(300.0, 300.0, 250.0);
+        let vp = rte_view_proj(eye, DVec3::ZERO);
+        let base = DVec3::ZERO;
+        let x_tip = screen_of(DVec3::X * 100.0, vp, eye);
+        let origin = screen_of(base, vp, eye);
+        let dir = (x_tip - origin).normalize();
+        let cursor = origin + dir * 150.0;
+        let locked = drafting_constrain_3d(
+            glam::Vec2::new(cursor.x, cursor.y),
+            base,
+            (DVec3::X, DVec3::Y, DVec3::Z),
+            vp,
+            eye,
+            BOUNDS,
+        )
+        .expect("an orbit view offers three axes");
+        assert!(locked.y.abs() < 1e-9, "y moved: {locked:?}");
+        assert!(locked.z.abs() < 1e-9, "z moved: {locked:?}");
+        assert!(locked.x > 0.0, "dragging toward X must raise x: {locked:?}");
+    }
+
+    /// In a plan view the normal projects to a point: the 3D constraint must
+    /// abstain so the classic SNAPANG-aware in-plane constraint still runs.
+    #[test]
+    fn a_plan_view_defers_to_the_2d_constraint() {
+        let eye = DVec3::new(0.0, 0.0, 400.0);
+        let vp = rte_view_proj(eye, DVec3::ZERO);
+        let base = DVec3::ZERO;
+        let origin = screen_of(base, vp, eye);
+        let cursor = origin + Vec3::new(30.0, -220.0, 0.0);
+        assert!(
+            drafting_constrain_3d(
+                glam::Vec2::new(cursor.x, cursor.y),
+                base,
+                (DVec3::X, DVec3::Y, DVec3::Z),
+                vp,
+                eye,
+                BOUNDS,
+            )
+            .is_none(),
+            "a plan view must defer to the 2D constraint"
+        );
+    }
+
+    /// The slide is proportional: twice the cursor travel along the locked
+    /// axis doubles the world-space offset, so the ghost tracks the cursor.
+    #[test]
+    fn the_slide_tracks_cursor_travel() {
+        let eye = DVec3::new(300.0, 300.0, 250.0);
+        let vp = rte_view_proj(eye, DVec3::ZERO);
+        let base = DVec3::ZERO;
+        let origin = screen_of(base, vp, eye);
+        let locked = |travel: f32| {
+            drafting_constrain_3d(
+                glam::Vec2::new(origin.x, origin.y - travel),
+                base,
+                (DVec3::X, DVec3::Y, DVec3::Z),
+                vp,
+                eye,
+                BOUNDS,
+            )
+            .expect("orbit view")
+            .z
+        };
+        let one = locked(100.0);
+        let two = locked(200.0);
+        assert!(
+            (two / one - 2.0).abs() < 1.0e-3,
+            "slide must scale with travel: {one} vs {two}"
+        );
     }
 }

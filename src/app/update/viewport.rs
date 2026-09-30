@@ -4,9 +4,9 @@
 use super::util::*;
 use super::{format_size, VIEWCUBE_HIT_SIZE};
 use crate::app::helpers::{
-    axis_lock_apply, axis_lock_capture, drafting_axes, drafting_constrain, parse_coord,
-    polar_constrain_if_near, polar_constrain_near, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis,
-    CoordKind,
+    axis_lock_apply, axis_lock_capture, drafting_axes, drafting_constrain,
+    drafting_constrain_3d, parse_coord, polar_constrain_if_near, polar_constrain_near,
+    ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind,
 };
 use crate::app::{Message, OpenCADStudio, POLY_START_DELAY_MS};
 use crate::modules::ModuleEvent;
@@ -248,6 +248,48 @@ fn over_ucs_icon(p: Point, h: &crate::ui::overlay::UcsIconHit) -> bool {
 }
 
 impl OpenCADStudio {
+    /// Ortho constraint shared by the cursor-move, click, grip and
+    /// construction-ray paths. In a plan view this is the classic in-plane
+    /// constrain; in an orbit view the three UCS axes compete on screen and
+    /// the plane normal (world Z without a UCS) is a full lock partner, so
+    /// F8 pins picks along Z as well. The bool reports whether the 3D lock
+    /// engaged — its elevation is deliberate, and callers must not flatten
+    /// the point back onto the pick plane.
+    fn ortho_constrain_point(
+        &self,
+        tab: usize,
+        cursor_px: glam::Vec2,
+        pt: glam::DVec3,
+        base: glam::DVec3,
+        view_rot: glam::Mat4,
+        eye: glam::DVec3,
+        bounds: iced::Rectangle,
+    ) -> (glam::DVec3, bool) {
+        let ucs = self.tabs[tab].ucs_xform();
+        if !self.isometric_drafting {
+            let axes = {
+                let (_, x, y, z) = ucs.axes();
+                (x, y, z)
+            };
+            if let Some(locked) =
+                drafting_constrain_3d(cursor_px, base, axes, view_rot, eye, bounds)
+            {
+                return (locked, true);
+            }
+        }
+        (
+            drafting_constrain(
+                pt,
+                base,
+                &ucs,
+                self.isometric_drafting,
+                self.iso_plane,
+                self.snap_angle_deg,
+            ),
+            false,
+        )
+    }
+
     fn active_construction_ray(
         &self,
         tab: usize,
@@ -258,14 +300,19 @@ impl OpenCADStudio {
         bounds: iced::Rectangle,
     ) -> Option<(glam::DVec3, glam::DVec3)> {
         let ucs = self.tabs[tab].ucs_xform();
-        let mut target = if self.ortho_mode {
-            drafting_constrain(
+        let (target, locked_3d) = if self.ortho_mode {
+            // `cursor` came from the mouse through the pick plane, so it
+            // projects back onto the exact cursor pixel the constraint
+            // is measured from.
+            let px = crate::scene::pick::hit_test::world_to_screen(cursor, view_rot, eye, bounds);
+            self.ortho_constrain_point(
+                tab,
+                glam::Vec2::new(px.x, px.y),
                 cursor,
                 base,
-                &ucs,
-                self.isometric_drafting,
-                self.iso_plane,
-                self.snap_angle_deg,
+                view_rot,
+                eye,
+                bounds,
             )
         } else if self.polar_mode {
             polar_constrain_if_near(
@@ -277,11 +324,15 @@ impl OpenCADStudio {
                 bounds,
                 self.snapper.osnap_radius_px,
                 &ucs,
-            )?
+            )
+            .map(|target| (target, false))?
         } else {
             return None;
         };
-        if self.tabs[tab].active_ucs.is_none() {
+        let mut target = target;
+        // A 3D lock lifts the pick off the plane on purpose; every other
+        // constraint keeps the elevation pinned to the base point.
+        if !locked_3d && self.tabs[tab].active_ucs.is_none() {
             target.z = base.z;
         }
         Some((base, target))
@@ -1558,14 +1609,21 @@ impl OpenCADStudio {
                 let base = grip.origin_world;
                 let ucs_xf = self.tabs[i].ucs_xform();
                 if self.ortho_mode {
-                    snapped = drafting_constrain(
-                        snapped,
-                        base,
-                        &ucs_xf,
-                        self.isometric_drafting,
-                        self.iso_plane,
-                        self.snap_angle_deg,
-                    );
+                    let px =
+                        crate::scene::pick::hit_test::world_to_screen(raw, view_rot, eye, bounds);
+                    // A 3D Z lock may lift the dragged grip off the plane —
+                    // that elevation is the point of the lock.
+                    snapped = self
+                        .ortho_constrain_point(
+                            i,
+                            glam::Vec2::new(px.x, px.y),
+                            snapped,
+                            base,
+                            view_rot,
+                            eye,
+                            bounds,
+                        )
+                        .0;
                 } else if self.polar_mode {
                     snapped = polar_constrain_near(
                         snapped,
@@ -2352,6 +2410,7 @@ impl OpenCADStudio {
                 }
             }
 
+            let mut ortho_locked_3d = false;
             let effective = {
                 let mut pt: glam::DVec3 =
                     if let (Some(dir), Some(base)) = (axis_lock, self.last_point) {
@@ -2374,17 +2433,23 @@ impl OpenCADStudio {
                             .is_some_and(|s| s.snap_type != crate::snap::SnapType::Grid);
                         if !osnap_locked && !is_window_corner && !uses_command_cursor_plane {
                             if let Some(base) = self.last_point {
-                                let ucs_xf = self.tabs[i].ucs_xform();
                                 if self.ortho_mode {
-                                    pt = drafting_constrain(
+                                    let px = crate::scene::pick::hit_test::world_to_screen(
+                                        cursor_world, view_rot, eye, bounds,
+                                    );
+                                    let (locked, locked_3d) = self.ortho_constrain_point(
+                                        i,
+                                        glam::Vec2::new(px.x, px.y),
                                         pt,
                                         base,
-                                        &ucs_xf,
-                                        self.isometric_drafting,
-                                        self.iso_plane,
-                                        self.snap_angle_deg,
+                                        view_rot,
+                                        eye,
+                                        bounds,
                                     );
+                                    pt = locked;
+                                    ortho_locked_3d = locked_3d;
                                 } else if self.polar_mode {
+                                    let ucs_xf = self.tabs[i].ucs_xform();
                                     pt = polar_constrain_near(
                                         pt,
                                         base,
@@ -2403,10 +2468,12 @@ impl OpenCADStudio {
                 // Clamp to world XY only when no UCS is active; with a
                 // UCS the point already lies on the UCS XY plane. A genuine
                 // 3D object snap keeps its elevation — only grid snaps and
-                // misses are flattened.
+                // misses are flattened. A 3D ortho Z lock keeps it too: the
+                // lift is the whole point of the lock.
                 if self.tabs[i].active_cmd.is_some()
                     && self.tabs[i].active_ucs.is_none()
                     && !uses_command_cursor_plane
+                    && !ortho_locked_3d
                     && !snap_keeps_elevation(
                         self.tabs[i].snap_result.map(|s| s.snap_type),
                     )
@@ -3991,17 +4058,30 @@ impl OpenCADStudio {
                     // Object snap wins over ortho/polar — a snapped point
                     // commits as-is. Grid snap still combines. (#132)
                     if let Some(base) = self.last_point {
-                        let ucs_xf = self.tabs[i].ucs_xform();
                         if self.ortho_mode {
-                            pt = drafting_constrain(
-                                pt,
-                                base,
-                                &ucs_xf,
-                                self.isometric_drafting,
-                                self.iso_plane,
-                                self.snap_angle_deg,
+                            // The cursor pixel, recovered from its pick-plane
+                            // point, is what the 3D axis dominance measures.
+                            let px = crate::scene::pick::hit_test::world_to_screen(
+                                raw,
+                                view_rot,
+                                eye,
+                                bounds,
                             );
+                            // A 3D Z lock commits off the plane on purpose;
+                            // the clamp above only governs un-constrained picks.
+                            pt = self
+                                .ortho_constrain_point(
+                                    i,
+                                    glam::Vec2::new(px.x, px.y),
+                                    pt,
+                                    base,
+                                    view_rot,
+                                    eye,
+                                    bounds,
+                                )
+                                .0;
                         } else if self.polar_mode {
+                            let ucs_xf = self.tabs[i].ucs_xform();
                             pt = polar_constrain_near(
                                 pt,
                                 base,
