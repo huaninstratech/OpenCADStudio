@@ -496,20 +496,28 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         ("POST", ["plot"]) => Plan::Mutate { op: "plot".into(), fields: body, created: 200 },
         ("POST", ["wblock"]) => Plan::Mutate { op: "wblock".into(), fields: body, created: 200 },
         ("POST", ["images"]) => Plan::Mutate { op: "embed_image".into(), fields: body, created: 201 },
-        ("POST", ["commands"]) => Plan::Run {
-            request: json!({"op":"run","cmd":body["cmd"]}),
-            created: 200,
+        ("POST", ["commands"]) => {
+            // Mutate: the "run" op requires a document_id; the Run path never stamps
+            // one and would always answer "document_required".
+            Plan::Mutate { op: "run".into(), fields: json!({"cmd": body["cmd"]}), created: 200 }
         },
         ("POST", ["undo"]) | ("POST", ["redo"]) => {
             let op = if rest == ["undo"] { "undo" } else { "redo" };
-            Plan::Run { request: json!({"op":op}), created: 200 }
+            // Mutate (not Run): the undo/redo ops require a document_id and the Run
+            // path never stamps one — Run would always answer "document_required" no
+            // matter what the caller sends. Mutate stamps the cached id and
+            // refresh-retries, exactly like every other mutation route.
+            Plan::Mutate { op: op.into(), fields: json!({}), created: 200 }
         }
         ("POST", ["save"]) => {
-            let mut request_json = json!({"op":"save"});
+            // Same as undo/redo: route through Mutate so the cached document_id is
+            // stamped and a caller-supplied document_id in the body is honoured
+            // (mutate_request lays body fields on top of the cached one).
+            let mut fields = json!({});
             if let Some(path) = body["path"].as_str() {
-                request_json["path"] = json!(path);
+                fields["path"] = json!(path);
             }
-            Plan::Run { request: request_json, created: 200 }
+            Plan::Mutate { op: "save".into(), fields, created: 200 }
         }
         ("GET", ["layers"]) => Plan::Run { request: json!({"op":"layers"}), created: 200 },
         ("GET", ["header"]) => Plan::Run { request: json!({"op":"header"}), created: 200 },
