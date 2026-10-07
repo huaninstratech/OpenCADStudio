@@ -58,17 +58,17 @@ fn bs33_block_text_normal_path_diag() {
     for (spread, handle, glyphs, distinct_x) in worst.iter().take(10) {
         let entity = scene
             .document
-            .get_entity(acadrust::Handle::new(
+            .get_entity(codec::Handle::new(
                 handle.parse::<u64>().unwrap_or(0),
             ))
             .map(|e| match e {
-                acadrust::EntityType::Text(t) => format!(
+                codec::EntityType::Text(t) => format!(
                     "Text style={:?} h={:?} value={:?}",
                     t.style,
                     t.height,
                     t.value.chars().take(40).collect::<String>()
                 ),
-                acadrust::EntityType::MText(t) => format!(
+                codec::EntityType::MText(t) => format!(
                     "MText style={:?} h={:?} value={:?}",
                     t.style,
                     t.height,

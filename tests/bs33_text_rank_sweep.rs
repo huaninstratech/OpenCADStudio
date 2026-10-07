@@ -3,7 +3,7 @@
 // draw rank than that text — otherwise the fill still masks text that the
 // drawing places above it. Flags texts whose rank is missing (0 while the
 // block's other children are ranked) or outranked by an earlier fill.
-use acadrust::EntityType;
+use codec::EntityType;
 use OpenCADStudio::io::load_bytes_finalized;
 use OpenCADStudio::scene::Scene;
 

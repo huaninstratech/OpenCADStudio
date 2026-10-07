@@ -1,7 +1,7 @@
 // Diag: expand the Mark-8776 INSERT (2349) offline and find every wipeout
 // whose draw rank is >= the text's rank and whose boundary overlaps the
 // text area — those are the fills that still mask "G-3".
-use acadrust::EntityType;
+use codec::EntityType;
 use OpenCADStudio::io::load_bytes_finalized;
 use OpenCADStudio::scene::cache::block_cache::{expand_insert, BlockCache};
 use OpenCADStudio::scene::view::render::InheritStyle;
@@ -21,7 +21,7 @@ fn bs33_mark_8776_covering_wipeouts() {
     let mut scene = Scene::new();
     scene.document = doc;
 
-    let handle = acadrust::Handle::new(0x2349);
+    let handle = codec::Handle::new(0x2349);
     let ins = match scene.document.get_entity(handle).expect("2349") {
         EntityType::Insert(ins) => ins.clone(),
         other => panic!("not an insert: {other:?}"),
@@ -36,7 +36,7 @@ fn bs33_mark_8776_covering_wipeouts() {
     );
 
     for h in [0x234Du64, 0x7D9, 0x7DA, 0x7DB] {
-        if let Some(EntityType::Text(t)) = scene.document.get_entity(acadrust::Handle::new(h)) {
+        if let Some(EntityType::Text(t)) = scene.document.get_entity(codec::Handle::new(h)) {
             eprintln!(
                 "text {h:#X}: value={:?} style={:?} height={:?} font_size_ok",
                 t.value.chars().take(20).collect::<String>(),

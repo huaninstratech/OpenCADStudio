@@ -2,7 +2,7 @@
 // own wipeout masks, using the same composition the live paths use:
 //   mask  = depths[insert].0 + depths[child].0 * depths[insert].1  (scene graph)
 //   text  = per-vertex draw_depth from the block expansion          (block cache)
-use acadrust::EntityType;
+use codec::EntityType;
 use OpenCADStudio::io::load_bytes_finalized;
 use OpenCADStudio::scene::cache::block_cache::{expand_insert, BlockCache};
 use OpenCADStudio::scene::view::render::InheritStyle;
@@ -43,7 +43,7 @@ fn bs33_mark8776_final_depths() {
         eprintln!("mask {h:#X} final = {:?}", composed(h));
     }
 
-    let handle = acadrust::Handle::new(0x2349);
+    let handle = codec::Handle::new(0x2349);
     let ins = match scene.document.get_entity(handle).expect("2349") {
         EntityType::Insert(ins) => ins.clone(),
         other => panic!("not an insert: {other:?}"),
@@ -90,7 +90,7 @@ fn bs33_mark8776_bogus_instance_depth() {
 
     // The wire name "9033" parses as a handle and hits this entry.
     eprintln!("depths[9033] = {:?}", depths.get(&9033));
-    match scene.document.get_entity(acadrust::Handle::new(9033)) {
+    match scene.document.get_entity(codec::Handle::new(9033)) {
         Some(e) => eprintln!("entity with handle-value 9033 (0x2339): {:?}", e.common().handle),
         None => eprintln!("no entity with handle-value 9033"),
     }
@@ -110,12 +110,12 @@ fn bs33_mark8776_bogus_instance_depth() {
     eprintln!("masks sit at 0.62452656 / 0.62473315");
 
     // Contrast: 7D2's wire names (non-numeric -> instance depth 0).
-    let handle = acadrust::Handle::new(0x7D2);
+    let handle = codec::Handle::new(0x7D2);
     if let Some(EntityType::Insert(ins)) = scene.document.get_entity(handle) {
         eprintln!("7D2 block name = {:?}", ins.block_name);
     }
     eprintln!("mark block name = {:?}", 
-        if let Some(EntityType::Insert(i)) = scene.document.get_entity(acadrust::Handle::new(0x2349)) {
+        if let Some(EntityType::Insert(i)) = scene.document.get_entity(codec::Handle::new(0x2349)) {
             i.block_name.clone()
         } else { String::new() });
 }
