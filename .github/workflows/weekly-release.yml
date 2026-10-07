@@ -1,10 +1,10 @@
 name: Weekly release
 
 on:
-  # Releases are hand-published with sequential v2026.N tags. prepare() now
-  # numbers weekly builds as v2026.N.1, .2, ... alongside the newest line, so
-  # a schedule would no longer collide or roll the app version back. Left
-  # dispatch-only until weekly automation is wanted again.
+  # Weekly builds ride the newest hand-published release line as
+  # v2026.N.1, .2, ... — they never consume the next v2026.N number.
+  schedule:
+    - cron: '0 12 * * 0'
   workflow_dispatch:
     inputs:
       publish:
