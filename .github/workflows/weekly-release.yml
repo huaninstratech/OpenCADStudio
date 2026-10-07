@@ -1,8 +1,10 @@
 name: Weekly release
 
 on:
-  schedule:
-    - cron: '0 12 * * 0'
+  # Weekly ISO-week tags (v%G.%V) collide with the sequentially numbered
+  # releases this fork publishes by hand, and re-running a collided week
+  # would roll Cargo.toml back to the old week number. Releases are cut
+  # manually instead; the workflow stays dispatchable for occasional use.
   workflow_dispatch:
     inputs:
       publish:
