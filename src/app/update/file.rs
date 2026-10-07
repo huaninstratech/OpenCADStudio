@@ -2279,7 +2279,7 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
             source_path: Some(path.to_path_buf()),
             size_bytes,
             state: progress,
-            started: std::time::Instant::now(),
+            started: Instant::now(),
             recovery_error: None,
             recovery_read_stats: None,
             #[cfg(target_arch = "wasm32")]
