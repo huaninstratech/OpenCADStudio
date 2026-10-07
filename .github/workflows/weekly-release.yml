@@ -1,10 +1,10 @@
 name: Weekly release
 
 on:
-  # Weekly ISO-week tags (v%G.%V) collide with the sequentially numbered
-  # releases this fork publishes by hand, and re-running a collided week
-  # would roll Cargo.toml back to the old week number. Releases are cut
-  # manually instead; the workflow stays dispatchable for occasional use.
+  # Releases are hand-published with sequential v2026.N tags. prepare() now
+  # numbers weekly builds as v2026.N.1, .2, ... alongside the newest line, so
+  # a schedule would no longer collide or roll the app version back. Left
+  # dispatch-only until weekly automation is wanted again.
   workflow_dispatch:
     inputs:
       publish:

@@ -1,7 +1,6 @@
 """Run with python3 scripts/test_release.py; uses only local temporary repositories."""
 
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
 import io
 import json
 import os
@@ -59,21 +58,29 @@ class ReleaseTests(unittest.TestCase):
             "version": "2026.35", "cargo": "2026.35.0", "msi": "26.35.0", "tag": "v2026.35",
         })
         self.assertEqual(release.versions("2026.09")["cargo"], "2026.9.0")
+        self.assertEqual(release.versions("v2026.49.1"), {
+            "version": "2026.49.1", "cargo": "2026.49.1", "msi": "26.49.1", "tag": "v2026.49.1",
+        })
+        self.assertEqual(release.versions("2026.54")["cargo"], "2026.54.0")
         self.assertEqual(release.display_version("2026.9.0"), "2026.09")
+        self.assertEqual(release.display_version("2026.49.1"), "2026.49.1")
         self.assertEqual(release.display_version("0.9.8"), "0.9.8")
-        self.assertEqual(datetime(2027, 1, 3, tzinfo=timezone.utc).strftime("v%G.%V"), "v2026.53")
-        for value in ("2026.00", "2026.54", "2027.53", "2026.9", "2026.35.0", "bad", "0.09.8"):
+        for value in ("2026.00", "2026.9", "2026.49.0", "2026.49.65536", "bad", "0.09.8"):
             with self.assertRaises(ValueError, msg=value):
                 release.versions(value)
 
     def test_release_commit_push_and_retry(self):
         original_run = release.run
-        releases = {"v0.9.8": {"name": "v0.9.8", "body": "Previous notes", "isDraft": False}}
-        latest = "v0.9.8"
+        releases = {
+            "v2026.34": {
+                "name": "2026.34", "body": "Previous notes", "isDraft": False,
+                "assets": [{"name": "OpenCADStudio-v2026.34-windows-x86_64-installer.msi"}],
+            },
+        }
         fail_create = False
 
         def run(*args):
-            nonlocal latest, fail_create
+            nonlocal fail_create
             if args[0] != "gh":
                 return original_run(*args)
             if args[1:3] == ("release", "list"):
@@ -82,17 +89,18 @@ class ReleaseTests(unittest.TestCase):
                 if fail_create:
                     fail_create = False
                     raise RuntimeError("Temporary release API failure")
-                latest = args[3]
-                releases[latest] = {
+                tag = args[3]
+                releases[tag] = {
                     "name": args[args.index("--title") + 1],
                     "body": Path(args[args.index("--notes-file") + 1]).read_text(encoding="utf-8"),
                     "isDraft": False,
+                    "assets": [{"name": "placeholder"}],
                 }
                 return ""
-            self.assertEqual(args[1:3], ("release", "view"))
-            if args[3] == "--json":
-                return json.dumps({"tagName": latest})
-            return json.dumps(releases[args[3]])
+            if args[1:3] == ("release", "view"):
+                tag, fields = args[3], args[5].split(",")
+                return json.dumps({field: releases[tag][field] for field in fields})
+            raise AssertionError(f"unexpected gh call: {args}")
 
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
@@ -106,18 +114,16 @@ class ReleaseTests(unittest.TestCase):
                 original_run("git", "config", "user.email", "test@example.invalid")
                 original_run("git", "init", "--bare", "-b", "main", str(temp / "origin.git"))
                 original_run("git", "remote", "add", "origin", str(temp / "origin.git"))
-                Path("Cargo.toml").write_text('[package]\nname = "OpenCADStudio"\nversion = "0.9.8"\n')
-                Path("Cargo.lock").write_text('version = 4\n[[package]]\nname = "OpenCADStudio"\nversion = "0.9.8"\n')
+                Path("Cargo.toml").write_text('[package]\nname = "OpenCADStudio"\nversion = "2026.34.0"\n')
+                Path("Cargo.lock").write_text('version = 4\n[[package]]\nname = "OpenCADStudio"\nversion = "2026.34.0"\n')
                 original_run("git", "add", ".")
                 original_run("git", "commit", "-m", "Initial release")
-                original_run("git", "tag", "v0.9.8")
+                original_run("git", "tag", "v2026.34")
                 original_run("git", "push", "origin", "main", "--tags")
 
-                with patch.object(release, "run", run), patch.object(release, "datetime") as clock, patch.dict(os.environ, {
+                with patch.object(release, "run", run), patch.dict(os.environ, {
                     "GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main", "GITHUB_OUTPUT": str(temp / "output"),
                 }):
-                    clock.now.return_value = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
-
                     def prepare(publish):
                         result = io.StringIO()
                         with redirect_stdout(result):
@@ -130,31 +136,43 @@ class ReleaseTests(unittest.TestCase):
                     original_run("git", "commit", "-m", "Add web release synchronization")
                     preview = prepare(False)
                     self.assertIn("Add web release synchronization", preview)
-                    self.assertEqual(release.cargo_version(), "0.9.8")
-                    self.assertEqual(original_run("git", "tag", "--list", "v2026.35"), "")
+                    self.assertEqual(release.cargo_version(), "2026.34.0")
+                    self.assertEqual(original_run("git", "tag", "--list", "v2026.34.1"), "")
 
+                    # The weekly build rides the newest line as v2026.34.1 and
+                    # never consumes the next hand-published number (v2026.35).
                     self.assertIn("ready=true", prepare(True))
                     sha = original_run("git", "rev-parse", "HEAD")
-                    self.assertEqual(release.cargo_version(), "2026.35.0")
-                    self.assertIn('version = "2026.35.0"', Path("Cargo.lock").read_text())
-                    self.assertEqual(original_run("git", "log", "-1", "--format=%s"), "Release v2026.35")
+                    self.assertEqual(release.cargo_version(), "2026.34.1")
+                    self.assertIn('version = "2026.34.1"', Path("Cargo.lock").read_text())
+                    self.assertEqual(original_run("git", "log", "-1", "--format=%s"), "Release v2026.34.1")
                     self.assertEqual(original_run("git", "rev-parse", "origin/main"), sha)
-                    self.assertEqual(original_run("git", "rev-parse", "v2026.35^{commit}"), sha)
+                    self.assertEqual(original_run("git", "rev-parse", "v2026.34.1^{commit}"), sha)
                     self.assertEqual(original_run("git", "status", "--porcelain"), "")
-                    self.assertIn(f"commit={sha}", prepare(True))
-
-                    clock.now.return_value = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+                    # Nothing new since the release: a rerun stands down
+                    # instead of rebuilding the same tag.
                     self.assertIn("ready=false", prepare(True))
+
+                    # A newest release whose builds never landed is retried on
+                    # the same tag instead of opening another number.
+                    releases["v2026.34.1"]["assets"] = []
+                    retried = prepare(True)
+                    self.assertIn("tag=v2026.34.1", retried)
+                    self.assertIn(f"commit={sha}", retried)
+                    releases["v2026.34.1"]["assets"] = [{"name": "placeholder"}]
+
                     Path("feature").write_text("next change")
                     original_run("git", "add", "feature")
                     original_run("git", "commit", "-m", "Fix release retry")
                     fail_create = True
                     with self.assertRaises(RuntimeError):
                         prepare(True)
+                    # The tag and version commit survive; a rerun finishes the
+                    # interrupted release on the same tag.
                     sha = original_run("git", "rev-parse", "HEAD")
                     self.assertIn(f"commit={sha}", prepare(True))
                     self.assertEqual(original_run("git", "rev-parse", "HEAD"), sha)
-                    self.assertEqual(releases["v2026.36"]["name"], "2026.36")
+                    self.assertEqual(releases["v2026.34.2"]["name"], "2026.34.2")
             finally:
                 os.chdir(previous_directory)
 
