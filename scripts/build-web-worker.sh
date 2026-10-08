@@ -2,7 +2,14 @@
 set -eu
 
 cargo build --locked --release --target wasm32-unknown-unknown --package ocs_web_worker
-worker_out="${TRUNK_STAGING_DIR:?}/worker_pkg"
+stage="$TRUNK_STAGING_DIR"
+# Trunk hands Windows hooks verbatim paths (\\?\C:\...) that POSIX sh cannot
+# mkdir; strip the prefix and convert to a POSIX path first. No-op elsewhere.
+case "$stage" in
+  '\\?\'*) stage="${stage#"\\?\\"}" ;;
+esac
+command -v cygpath >/dev/null 2>&1 && stage=$(cygpath -u "$stage")
+worker_out="$stage/worker_pkg"
 mkdir -p "$worker_out"
 wasm-bindgen \
   --target web \
