@@ -10,5 +10,6 @@
   <String Id="DowngradeError">A newer version of [ProductName] is already installed. Setup will now exit.</String>
   <String Id="Open">Open</String>
   <String Id="Desktop">Desktop</String>
+  <String Id="ConvertToPdf">Convert to PDF</String>
   <String Id="ApplicationDescription">2D/3D CAD application for DWG and DXF drawings</String>
 </WixLocalization>

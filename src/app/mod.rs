@@ -6,7 +6,7 @@ pub(crate) fn automation_action_names() -> &'static [&'static str] {
 }
 pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
-pub use automation::{export_headless, serve};
+pub use automation::{export_headless, export_pdf_headless, serve};
 mod annotation_data;
 mod command_driver;
 pub(crate) use command_driver::{copy_to_clipboard_kernel, paste_entities_kernel};

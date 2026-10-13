@@ -75,6 +75,84 @@ pub fn export_headless(
     }
 }
 
+/// Headless right-click PDF conversion (`--export-pdf FILES...`). Each
+/// drawing is plotted the way the user plots by hand — Zoom Extents in model
+/// space, then print — into `<stem>.pdf` beside the file. Returns a process
+/// exit code (0 only when every file converted).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
+    let mut failures: Vec<String> = Vec::new();
+    for input in inputs {
+        let output = input.with_extension("pdf");
+        match export_pdf_one(input, &output) {
+            Ok(()) => println!("Exported {} → {}", input.display(), output.display()),
+            Err(e) => {
+                eprintln!("export-pdf: {}: {e}", input.display());
+                failures.push(format!("{}: {e}", input.display()));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        // Explorer launches the verb with no console, so a failed
+        // right-click convert must surface through a message box.
+        crate::sys::show_error_message_box(
+            &crate::t!("Convert to PDF failed").into_owned(),
+            &failures.join("\n\n"),
+        );
+    }
+    i32::from(!failures.is_empty())
+}
+
+/// Plot one drawing to one PDF: Zoom Extents in model space, then print.
+/// The page comes from the GUI's own extents pipeline (`extents_plot_job`)
+/// running on a windowless app instance, with an in-memory grayscale table
+/// applied so the output plots in gray like a grayscale.ctb would.
+#[cfg(not(target_arch = "wasm32"))]
+fn export_pdf_one(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    let mut app = OpenCADStudio::new();
+    let opened =
+        app.automation_op(&json!({"op":"open","path": input.to_string_lossy()}).to_string());
+    if opened["ok"] != true {
+        return Err(opened["error"]
+            .as_str()
+            .unwrap_or("cannot open drawing")
+            .to_owned());
+    }
+    let i = app.active_tab;
+    {
+        let scene = &mut app.tabs[i].scene;
+        scene.current_layout = "Model".to_owned();
+        scene.active_viewport = None;
+        scene.load_current_layout_state();
+    }
+    let style = grayscale_plot_style();
+    app.plot_dialog.style_name = style.name.clone();
+    app.plot_dialog.apply_plot_styles = true;
+    app.plot_dialog.area = "Extents".into();
+    app.active_plot_style = Some(style);
+    let page = app
+        .extents_plot_job()
+        .ok_or_else(|| "Model space contains no printable geometry.".to_owned())?;
+    crate::io::pdf_export::export_pdf_pages(
+        std::slice::from_ref(&page),
+        output,
+        app.active_plot_style.as_ref(),
+    )
+}
+
+/// An identity CTB table with the convert-to-grayscale policy bit set for
+/// every ACI, so right-click converts print in gray without shipping or
+/// locating a grayscale.ctb file (`resolve_color` folds each colour through
+/// 0.299/0.587/0.114 luminance when that bit is on).
+#[cfg(not(target_arch = "wasm32"))]
+fn grayscale_plot_style() -> crate::io::plot_style::PlotStyleTable {
+    let mut table = crate::io::plot_style::PlotStyleTable::identity("grayscale.ctb");
+    for entry in table.aci_entries.iter_mut().skip(1) {
+        entry.color_policy = 2;
+    }
+    table
+}
+
 /// `--port <N>` if present on the command line.
 #[cfg(not(target_arch = "wasm32"))]
 fn port_arg() -> Option<u16> {

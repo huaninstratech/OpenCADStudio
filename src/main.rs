@@ -91,6 +91,14 @@ fn main() -> iced::Result {
             let _ = env_logger::try_init();
         }
 
+        // Right-click convert: `--export-pdf <file>...` plots every layout of
+        // each drawing to <stem>.pdf beside it and exits. Headless like the
+        // handoffs above, so it also skips the GPU probe below — plotting
+        // renders through the CPU tessellation, never a window surface.
+        if !args.export_pdf.is_empty() {
+            std::process::exit(app::export_pdf_headless(&args.export_pdf));
+        }
+
         // GPU backend selection. Explicit `--backend` wins; `--safe-mode`
         // forces GL for flaky drivers. On Windows the preference order starts
         // with DX12/Vulkan so the AMD OpenGL ICD (atio6axx.dll) is never

@@ -88,6 +88,58 @@
               </Extension>
             </ProgId>
           </Component>
+          <Component Id='ConvertToPdfVerbs' Guid='71c2e69b-f8f0-47fc-beb8-826d1e38f6ff' Win64='yes'>
+            <!-- Extension-root shell verbs: unlike the ProgId verbs above,
+                 these show in every .dwg/.dxf context menu regardless of
+                 which application is the default association. One launch
+                 receives all selected files (MultiSelectModel=Document) and
+                 converts each to <stem>.pdf beside the drawing. -->
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dwg\shell\OCS.ConvertToPdf'
+              Type='string'
+              Value='!(loc.ConvertToPdf)'
+              KeyPath='yes' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dwg\shell\OCS.ConvertToPdf'
+              Name='Icon'
+              Type='string'
+              Value='[#OpenCADStudioEXE],0' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dwg\shell\OCS.ConvertToPdf'
+              Name='MultiSelectModel'
+              Type='string'
+              Value='Document' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dwg\shell\OCS.ConvertToPdf\command'
+              Type='string'
+              Value='"[#OpenCADStudioEXE]" --export-pdf "%*"' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf'
+              Type='string'
+              Value='!(loc.ConvertToPdf)' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf'
+              Name='Icon'
+              Type='string'
+              Value='[#OpenCADStudioEXE],0' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf'
+              Name='MultiSelectModel'
+              Type='string'
+              Value='Document' />
+            <RegistryValue
+              Root='HKMU'
+              Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf\command'
+              Type='string'
+              Value='"[#OpenCADStudioEXE]" --export-pdf "%*"' />
+          </Component>
           <Component Id='DefaultPrograms' Guid='6f3e9b2a-1c4d-4f8a-9b7e-2d5a8c1f0e63' Win64='yes'>
             <RegistryValue
               Root='HKLM'
@@ -190,6 +242,7 @@
 
     <Feature Id='Complete' Title='Open CAD Studio' Level='1' Display='expand'>
       <ComponentRef Id='MainExecutable' />
+      <ComponentRef Id='ConvertToPdfVerbs' />
       <ComponentRef Id='DefaultPrograms' />
       <ComponentRef Id='ProgramMenuDirComp' />
       <Feature

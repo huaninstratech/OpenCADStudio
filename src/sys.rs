@@ -340,6 +340,23 @@ pub fn blocking_file_dialog() -> rfd::FileDialog {
     }
 }
 
+/// Blocking error box for the headless PDF converter: Explorer launches the
+/// context-menu verb with no console, so a failed convert must surface
+/// visually instead of dying silently with a non-zero exit code.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn show_error_message_box(title: &str, body: &str) {
+    rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(body)
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// Web: no headless converter, nothing to report.
+#[cfg(target_arch = "wasm32")]
+pub fn show_error_message_box(_title: &str, _body: &str) {}
+
 /// Web: no filesystem paths, nothing to remember.
 #[cfg(target_arch = "wasm32")]
 pub fn file_dialog() -> rfd::AsyncFileDialog {
