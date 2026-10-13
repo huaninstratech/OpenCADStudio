@@ -27,6 +27,10 @@ on:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  # CI runners size rustc's threads below what the main crate's deep
+  # generics need on Windows/macOS — v2026.48.1 died with
+  # "thread 'rustc' has overflowed its stack" mid-build.
+  RUST_MIN_STACK: "33554432"
 
 jobs:
   build-appimage:
@@ -240,6 +244,7 @@ jobs:
           OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         run: |
           cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release -p dwg-thumbnailer-win
 
       # Forks do not inherit repository secrets, so every signing step is
@@ -410,6 +415,7 @@ jobs:
           OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         run: |
           cargo build --locked --release --target aarch64-apple-darwin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release --target aarch64-apple-darwin -p dwg-thumbnailer
           # The launcher shim is the .app's actual CFBundleExecutable (#1039)
           # — see src/bin/ocs_launcher.rs for why.
