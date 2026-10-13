@@ -79,36 +79,76 @@ pub fn export_headless(
 /// drawing is plotted the way the user plots by hand — Zoom Extents in model
 /// space, then print — into `<stem>.pdf` beside the file. Returns a process
 /// exit code (0 only when every file converted).
+///
+/// The conversions run on a worker thread while the main thread pumps
+/// messages for the shell progress dialog (its UI marshals part of itself
+/// through the thread that started it) and relays per-file updates.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
-    let mut failures: Vec<String> = Vec::new();
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
     let progress = crate::sys::ConvertProgress::start(
         &crate::t!("Convert to PDF").into_owned(),
         inputs.len() as u32,
     );
-    for (index, input) in inputs.iter().enumerate() {
-        if let Some(progress) = &progress {
-            if progress.cancelled() {
+    enum Event {
+        File(u32, String),
+        Done(Vec<String>),
+    }
+    let (tx, rx) = mpsc::channel::<Event>();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let total = inputs.len() as u32;
+    // Owned so the borrow can cross into the worker thread.
+    let inputs = inputs.to_vec();
+    let worker = std::thread::spawn(move || {
+        let mut failures: Vec<String> = Vec::new();
+        for (index, input) in inputs.iter().enumerate() {
+            if worker_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            progress.file(
-                &input.file_name().unwrap_or_default().to_string_lossy(),
+            let _ = tx.send(Event::File(
                 index as u32 + 1,
-                inputs.len() as u32,
-            );
-        }
-        let output = input.with_extension("pdf");
-        match export_pdf_one(input, &output) {
-            Ok(()) => println!("Exported {} → {}", input.display(), output.display()),
-            Err(e) => {
-                eprintln!("export-pdf: {}: {e}", input.display());
-                failures.push(format!("{}: {e}", input.display()));
+                input.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            ));
+            let output = input.with_extension("pdf");
+            match export_pdf_one(input, &output) {
+                Ok(()) => println!("Exported {} → {}", input.display(), output.display()),
+                Err(e) => {
+                    eprintln!("export-pdf: {}: {e}", input.display());
+                    failures.push(format!("{}: {e}", input.display()));
+                }
             }
         }
+        let _ = tx.send(Event::Done(failures));
+    });
+
+    let failures = Mutex::new(Vec::new());
+    loop {
+        crate::sys::pump_waiting_messages();
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Event::File(current, name)) => {
+                if let Some(progress) = &progress {
+                    if progress.cancelled() {
+                        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    progress.file(&name, current, total);
+                }
+            }
+            Ok(Event::Done(done)) => {
+                *failures.lock().unwrap() = done;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
+    worker.join().ok();
     if let Some(progress) = &progress {
         progress.finish();
     }
+    let failures = failures.into_inner().unwrap();
     if !failures.is_empty() {
         // Explorer launches the verb with no console, so a failed
         // right-click convert must surface through a message box.
@@ -122,8 +162,8 @@ pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
 
 /// Plot one drawing to one PDF: Zoom Extents in model space, then print.
 /// The page comes from the GUI's own extents pipeline (`extents_plot_job`)
-/// running on a windowless app instance, with an in-memory grayscale table
-/// applied so the output plots in gray like a grayscale.ctb would.
+/// running on a windowless app instance, with an in-memory monochrome
+/// table applied so the output plots pure black and white.
 #[cfg(not(target_arch = "wasm32"))]
 fn export_pdf_one(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
     let mut app = OpenCADStudio::new();
@@ -142,7 +182,7 @@ fn export_pdf_one(input: &std::path::Path, output: &std::path::Path) -> Result<(
         scene.active_viewport = None;
         scene.load_current_layout_state();
     }
-    let style = grayscale_plot_style();
+    let style = monochrome_plot_style();
     app.plot_dialog.style_name = style.name.clone();
     app.plot_dialog.apply_plot_styles = true;
     app.plot_dialog.area = "Extents".into();
@@ -157,15 +197,16 @@ fn export_pdf_one(input: &std::path::Path, output: &std::path::Path) -> Result<(
     )
 }
 
-/// An identity CTB table with the convert-to-grayscale policy bit set for
-/// every ACI, so right-click converts print in gray without shipping or
-/// locating a grayscale.ctb file (`resolve_color` folds each colour through
-/// 0.299/0.587/0.114 luminance when that bit is on).
+/// An identity CTB table with every ACI overridden to solid black, so
+/// right-click converts print pure monochrome without shipping or locating a
+/// monochrome.ctb file. Colour 7 stays black too — on white paper a
+/// monochrome plot draws every stroke black regardless of the on-screen
+/// white/black swap.
 #[cfg(not(target_arch = "wasm32"))]
-fn grayscale_plot_style() -> crate::io::plot_style::PlotStyleTable {
-    let mut table = crate::io::plot_style::PlotStyleTable::identity("grayscale.ctb");
+fn monochrome_plot_style() -> crate::io::plot_style::PlotStyleTable {
+    let mut table = crate::io::plot_style::PlotStyleTable::identity("monochrome.ctb");
     for entry in table.aci_entries.iter_mut().skip(1) {
-        entry.color_policy = 2;
+        entry.color = Some([0, 0, 0]);
     }
     table
 }

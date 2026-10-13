@@ -362,9 +362,11 @@ pub struct ConvertProgress {
 }
 
 /// Raw vtable of IProgressDialog (windows-sys exposes only the CLSID, not the
-/// interface). Order after IUnknown: StartProgressDialog, StopProgressDialog,
-/// SetTitle, SetAnimation, HasUserCancelled, GetHourglass, Message,
-/// SetCancelMsg, Timer, EndDialog.
+/// interface). Ten methods after IUnknown, exactly as the official windows
+/// crate metadata declares them: StartProgressDialog, StopProgressDialog,
+/// SetTitle, SetAnimation, HasUserCancelled, SetProgress, SetProgress64,
+/// SetLine, SetCancelMsg, Timer. There is no Message method — guessing one
+/// into slot 9 actually calls SetCancelMsg and every update silently no-ops.
 #[cfg(all(windows, not(target_arch = "wasm32")))]
 #[repr(C)]
 struct ProgressVtbl {
@@ -374,29 +376,32 @@ struct ProgressVtbl {
     StartProgressDialog: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_sys::Win32::Foundation::HWND,
-        *const core::ffi::c_void,
+        *mut core::ffi::c_void,
         u32,
         *const core::ffi::c_void,
     ) -> windows_sys::core::HRESULT,
-    StopProgressDialog: unsafe extern "system" fn(*mut core::ffi::c_void),
+    StopProgressDialog: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_sys::core::HRESULT,
     SetTitle: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_sys::core::PCWSTR,
     ) -> windows_sys::core::HRESULT,
     SetAnimation: usize,
     HasUserCancelled: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
-    GetHourglass: usize,
-    Message: unsafe extern "system" fn(
+    SetProgress: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        windows_sys::Win32::Foundation::HWND,
-        windows_sys::core::PCWSTR,
-        windows_sys::core::PCWSTR,
         u32,
         u32,
     ) -> windows_sys::core::HRESULT,
+    SetProgress64: usize,
+    SetLine: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        windows_sys::core::PCWSTR,
+        i32,
+        *const core::ffi::c_void,
+    ) -> windows_sys::core::HRESULT,
     SetCancelMsg: usize,
     Timer: usize,
-    EndDialog: usize,
 }
 
 #[cfg(all(windows, not(target_arch = "wasm32")))]
@@ -409,37 +414,52 @@ impl ConvertProgress {
             CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
         };
         unsafe {
-            let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
-            // IID_IProgressDialog {EBBC7C04-6E77-4FC0-A30C-3E57CFCD2C27}
+            let coinit = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
+            if coinit < 0 && coinit != 1 {
+                // 1 = S_FALSE (already initialized) — both are fine to keep
+                // going on; a changed-mode error still lets COM objects work
+                // on this thread for our purposes.
+                eprintln!("convert-progress: CoInitializeEx failed: {coinit:#x}");
+            }
+            // IID_IProgressDialog {EBBC7C04-315E-11D2-B62F-006097DF5BD4}
             let iid = windows_sys::core::GUID {
                 data1: 0xEBBC7C04,
-                data2: 0x6E77,
-                data3: 0x4FC0,
-                data4: [0xA3, 0x0C, 0x3E, 0x57, 0xCF, 0xCD, 0x2C, 0x27],
+                data2: 0x315E,
+                data3: 0x11D2,
+                data4: [0xB6, 0x2F, 0x00, 0x60, 0x97, 0xDF, 0x5B, 0xD4],
             };
             let mut dialog: *mut core::ffi::c_void = std::ptr::null_mut();
-            if CoCreateInstance(
+            let hr = CoCreateInstance(
                 &windows_sys::Win32::UI::Shell::CLSID_ProgressDialog,
                 std::ptr::null_mut(),
                 CLSCTX_INPROC_SERVER as u32,
                 &iid,
                 &mut dialog,
-            ) < 0
-            {
+            );
+            if hr < 0 {
+                eprintln!("convert-progress: CoCreateInstance failed: {hr:#x}");
                 return None;
             }
             let vtbl = *(dialog as *mut *mut ProgressVtbl);
             let title_w = wide_string(title);
-            ((*vtbl).SetTitle)(dialog, title_w.as_ptr());
+            let hr = ((*vtbl).SetTitle)(dialog, title_w.as_ptr());
+            if hr < 0 {
+                eprintln!("convert-progress: SetTitle failed: {hr:#x}");
+            }
             // PROGDLG_AUTOTIME (0x2) adds elapsed/remaining estimates;
             // PROGDLG_NOMINIMIZE (0x8) keeps the small task-dialog shape.
-            ((*vtbl).StartProgressDialog)(
+            let hr = ((*vtbl).StartProgressDialog)(
                 dialog,
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 0x2 | 0x8,
                 std::ptr::null(),
             );
+            if hr < 0 {
+                eprintln!("convert-progress: StartProgressDialog failed: {hr:#x}");
+                ((*vtbl).Release)(dialog);
+                return None;
+            }
             Some(Self { dialog })
         }
     }
@@ -450,14 +470,14 @@ impl ConvertProgress {
         let vtbl = unsafe { *(self.dialog as *mut *mut ProgressVtbl) };
         let name_w = wide_string(name);
         unsafe {
-            ((*vtbl).Message)(
-                self.dialog,
-                std::ptr::null_mut(),
-                name_w.as_ptr(),
-                std::ptr::null(),
-                total,
-                current,
-            );
+            let hr = ((*vtbl).SetProgress)(self.dialog, current, total);
+            if hr < 0 {
+                eprintln!("convert-progress: SetProgress failed: {hr:#x}");
+            }
+            let hr = ((*vtbl).SetLine)(self.dialog, 1, name_w.as_ptr(), 1, std::ptr::null());
+            if hr < 0 {
+                eprintln!("convert-progress: SetLine failed: {hr:#x}");
+            }
         }
     }
 
@@ -485,6 +505,27 @@ fn wide_string(text: &str) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
+
+/// Dispatch whatever messages are waiting on this thread without blocking.
+/// The shell progress dialog marshals some of its UI through the thread that
+/// started it, so a headless converter must pump while its worker converts.
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+pub fn pump_waiting_messages() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Non-Windows: nothing pumps.
+#[cfg(any(not(windows), target_arch = "wasm32"))]
+pub fn pump_waiting_messages() {}
 
 /// Non-Windows: no shell progress dialog; the convert runs silent.
 #[cfg(any(not(windows), target_arch = "wasm32"))]

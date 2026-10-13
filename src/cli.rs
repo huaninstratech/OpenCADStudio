@@ -101,11 +101,11 @@ pub struct Cli {
     pub target_version: Option<String>,
 
     /// Headless PDF plot: print the Zoom Extents of model space to
-    /// <stem>.pdf (grayscale) beside each FILE and exit. This is what the
+    /// <stem>.pdf (monochrome) beside each FILE and exit. This is what the
     /// Windows right-click "Convert to PDF" verb runs — selecting several
     /// drawings hands them all to one launch.
     #[arg(long, num_args = 1.., value_name = "FILE")]
-    #[arg(help = crate::t!("Plot each drawing's model space to a grayscale PDF beside it, then exit.").into_owned(), long_help = None)]
+    #[arg(help = crate::t!("Plot each drawing's model space to a monochrome PDF beside it, then exit.").into_owned(), long_help = None)]
     pub export_pdf: Vec<PathBuf>,
 
     /// Run a command script at startup: one command line per line of FILE.
