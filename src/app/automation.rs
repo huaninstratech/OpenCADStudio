@@ -82,7 +82,21 @@ pub fn export_headless(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
     let mut failures: Vec<String> = Vec::new();
-    for input in inputs {
+    let progress = crate::sys::ConvertProgress::start(
+        &crate::t!("Convert to PDF").into_owned(),
+        inputs.len() as u32,
+    );
+    for (index, input) in inputs.iter().enumerate() {
+        if let Some(progress) = &progress {
+            if progress.cancelled() {
+                break;
+            }
+            progress.file(
+                &input.file_name().unwrap_or_default().to_string_lossy(),
+                index as u32 + 1,
+                inputs.len() as u32,
+            );
+        }
         let output = input.with_extension("pdf");
         match export_pdf_one(input, &output) {
             Ok(()) => println!("Exported {} → {}", input.display(), output.display()),
@@ -91,6 +105,9 @@ pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
                 failures.push(format!("{}: {e}", input.display()));
             }
         }
+    }
+    if let Some(progress) = &progress {
+        progress.finish();
     }
     if !failures.is_empty() {
         // Explorer launches the verb with no console, so a failed

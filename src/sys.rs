@@ -341,7 +341,7 @@ pub fn blocking_file_dialog() -> rfd::FileDialog {
 }
 
 /// Blocking error box for the headless PDF converter: Explorer launches the
-/// context-menu verb with no console, so a failed convert must surface
+/// verb with no console, so a failed convert must surface
 /// visually instead of dying silently with a non-zero exit code.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn show_error_message_box(title: &str, body: &str) {
@@ -351,6 +351,155 @@ pub fn show_error_message_box(title: &str, body: &str) {
         .set_level(rfd::MessageLevel::Error)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
+}
+
+/// The shell's own progress dialog (IProgressDialog) for the headless PDF
+/// converter. Explorer launches the verb with no console, so without this a
+/// convert is invisible until the PDF quietly appears — the click looks dead.
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+pub struct ConvertProgress {
+    dialog: *mut core::ffi::c_void,
+}
+
+/// Raw vtable of IProgressDialog (windows-sys exposes only the CLSID, not the
+/// interface). Order after IUnknown: StartProgressDialog, StopProgressDialog,
+/// SetTitle, SetAnimation, HasUserCancelled, GetHourglass, Message,
+/// SetCancelMsg, Timer, EndDialog.
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+#[repr(C)]
+struct ProgressVtbl {
+    QueryInterface: usize,
+    AddRef: usize,
+    Release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    StartProgressDialog: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_sys::Win32::Foundation::HWND,
+        *const core::ffi::c_void,
+        u32,
+        *const core::ffi::c_void,
+    ) -> windows_sys::core::HRESULT,
+    StopProgressDialog: unsafe extern "system" fn(*mut core::ffi::c_void),
+    SetTitle: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_sys::core::PCWSTR,
+    ) -> windows_sys::core::HRESULT,
+    SetAnimation: usize,
+    HasUserCancelled: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+    GetHourglass: usize,
+    Message: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_sys::Win32::Foundation::HWND,
+        windows_sys::core::PCWSTR,
+        windows_sys::core::PCWSTR,
+        u32,
+        u32,
+    ) -> windows_sys::core::HRESULT,
+    SetCancelMsg: usize,
+    Timer: usize,
+    EndDialog: usize,
+}
+
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+impl ConvertProgress {
+    /// Show the dialog. `total` feeds the dialog's own estimates once the
+    /// per-file updates start. Returns None when COM cannot provide the
+    /// dialog, and the convert then runs silent as before.
+    pub fn start(title: &str, _total: u32) -> Option<Self> {
+        use windows_sys::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        };
+        unsafe {
+            let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
+            // IID_IProgressDialog {EBBC7C04-6E77-4FC0-A30C-3E57CFCD2C27}
+            let iid = windows_sys::core::GUID {
+                data1: 0xEBBC7C04,
+                data2: 0x6E77,
+                data3: 0x4FC0,
+                data4: [0xA3, 0x0C, 0x3E, 0x57, 0xCF, 0xCD, 0x2C, 0x27],
+            };
+            let mut dialog: *mut core::ffi::c_void = std::ptr::null_mut();
+            if CoCreateInstance(
+                &windows_sys::Win32::UI::Shell::CLSID_ProgressDialog,
+                std::ptr::null_mut(),
+                CLSCTX_INPROC_SERVER as u32,
+                &iid,
+                &mut dialog,
+            ) < 0
+            {
+                return None;
+            }
+            let vtbl = *(dialog as *mut *mut ProgressVtbl);
+            let title_w = wide_string(title);
+            ((*vtbl).SetTitle)(dialog, title_w.as_ptr());
+            // PROGDLG_AUTOTIME (0x2) adds elapsed/remaining estimates;
+            // PROGDLG_NOMINIMIZE (0x8) keeps the small task-dialog shape.
+            ((*vtbl).StartProgressDialog)(
+                dialog,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0x2 | 0x8,
+                std::ptr::null(),
+            );
+            Some(Self { dialog })
+        }
+    }
+
+    /// Announce `name` as the file now converting; the bar sits at
+    /// `current` of `total` (call with the 1-based index before converting).
+    pub fn file(&self, name: &str, current: u32, total: u32) {
+        let vtbl = unsafe { *(self.dialog as *mut *mut ProgressVtbl) };
+        let name_w = wide_string(name);
+        unsafe {
+            ((*vtbl).Message)(
+                self.dialog,
+                std::ptr::null_mut(),
+                name_w.as_ptr(),
+                std::ptr::null(),
+                total,
+                current,
+            );
+        }
+    }
+
+    /// True when the user pressed the dialog's Cancel button.
+    pub fn cancelled(&self) -> bool {
+        let vtbl = unsafe { *(self.dialog as *mut *mut ProgressVtbl) };
+        unsafe { ((*vtbl).HasUserCancelled)(self.dialog) != 0 }
+    }
+
+    /// Close the dialog and release the COM object.
+    pub fn finish(&self) {
+        let vtbl = unsafe { *(self.dialog as *mut *mut ProgressVtbl) };
+        unsafe {
+            ((*vtbl).StopProgressDialog)(self.dialog);
+            ((*vtbl).Release)(self.dialog);
+        }
+    }
+}
+
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+fn wide_string(text: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Non-Windows: no shell progress dialog; the convert runs silent.
+#[cfg(any(not(windows), target_arch = "wasm32"))]
+pub struct ConvertProgress;
+
+#[cfg(any(not(windows), target_arch = "wasm32"))]
+impl ConvertProgress {
+    pub fn start(_title: &str, _total: u32) -> Option<Self> {
+        None
+    }
+    pub fn file(&self, _name: &str, _current: u32, _total: u32) {}
+    pub fn cancelled(&self) -> bool {
+        false
+    }
+    pub fn finish(&self) {}
 }
 
 /// Web: no headless converter, nothing to report.

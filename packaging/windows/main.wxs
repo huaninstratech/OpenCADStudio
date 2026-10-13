@@ -116,7 +116,7 @@
               Root='HKMU'
               Key='SOFTWARE\Classes\.dwg\shell\OCS.ConvertToPdf\command'
               Type='string'
-              Value='"[#OpenCADStudioEXE]" --export-pdf "%*"' />
+              Value='"[#OpenCADStudioEXE]" --export-pdf "%1"' />
             <RegistryValue
               Root='HKMU'
               Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf'
@@ -138,7 +138,7 @@
               Root='HKMU'
               Key='SOFTWARE\Classes\.dxf\shell\OCS.ConvertToPdf\command'
               Type='string'
-              Value='"[#OpenCADStudioEXE]" --export-pdf "%*"' />
+              Value='"[#OpenCADStudioEXE]" --export-pdf "%1"' />
           </Component>
           <Component Id='DefaultPrograms' Guid='6f3e9b2a-1c4d-4f8a-9b7e-2d5a8c1f0e63' Win64='yes'>
             <RegistryValue
