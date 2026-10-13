@@ -141,6 +141,10 @@ jobs:
 
       # Publish separate light/dark charts for stars and release downloads.
       - name: Generate project growth charts
+        # The chart queries GitHub's API for star history; a transient 403
+        # must not block the whole deploy — the site ships with the
+        # checked-in chart snapshot instead.
+        continue-on-error: true
         env:
           # Forks do not carry OCS_GITHUB_TOKEN; fall back to the built-in
           # token so the chart queries stay authenticated instead of tripping
