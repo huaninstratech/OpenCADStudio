@@ -8,7 +8,7 @@ use acadrust::xdata::{ExtendedDataRecord, XDataValue};
 use acadrust::{EntityType, Handle};
 use ocs_plugin_api::export_plugin;
 use ocs_plugin_api::host::{BuiltinPlugin, HostApi, ReaderEntityKind};
-use ocs_plugin_api::manifest::{ApiVersion, PluginManifest};
+use ocs_plugin_api::manifest::{ApiVersion, EntityClasses, PluginManifest};
 use ocs_plugin_api::ribbon::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
 
 static MANIFEST: PluginManifest = PluginManifest {
@@ -27,11 +27,29 @@ static MANIFEST: PluginManifest = PluginManifest {
     ],
 };
 
+/// Entity-class display labels (API v10): entities carrying a
+/// `SURVEY-CLASS:<key>` string in their SURVEYMARK XDATA display the mapped
+/// label (e.g. "Survey Point (Point)") in the host's Properties panel and
+/// `display_type` — *while this plugin is loaded*. The key is the only thing
+/// stored in the drawing; the label text lives here, so it can be reworded or
+/// localized without rewriting drawings.
+static ENTITY_CLASSES: EntityClasses = EntityClasses {
+    app_id: "SURVEYMARK",
+    class_prefix: "SURVEY-CLASS:",
+    labels: &[("POINT", "Survey Point")],
+};
+
 struct PluginTemplateV2;
 
 impl BuiltinPlugin for PluginTemplateV2 {
     fn manifest(&self) -> &'static PluginManifest {
         &MANIFEST
+    }
+
+    // API v10: expose the entity-class labels declared above. The default
+    // (not overriding this) declares none.
+    fn entity_classes(&self) -> Option<&'static EntityClasses> {
+        Some(&ENTITY_CLASSES)
     }
 
     fn ribbon(&self) -> Box<dyn CadModule> {
@@ -106,6 +124,11 @@ fn first_survey_point_handle(host: &mut dyn HostApi) -> Option<Handle> {
 fn mark_point(host: &mut dyn HostApi, handle: Handle) {
     let mut record = ExtendedDataRecord::new("SURVEYMARK");
     record.add_value(XDataValue::Integer32(1));
+    // Class-identity key for the entity-class labels declared above: the
+    // host shows marked points as "Survey Point (Point)" while this plugin is
+    // loaded, and as plain "Point" when it is not. Keys are stable identity —
+    // display text never goes into the drawing.
+    record.add_value(XDataValue::String("SURVEY-CLASS:POINT".to_string()));
     if host.write_record(handle, record) {
         host.push_info(&format!("Marked SURVEY point {handle}"));
     } else {

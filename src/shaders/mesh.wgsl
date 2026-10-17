@@ -153,17 +153,27 @@ fn relative_position(
     position_low: vec3<f32>,
     instance: MeshInstance,
 ) -> vec3<f32> {
-    let world_high = vec3<f32>(
-        dot(instance.model_row_0.xyz, position) + instance.model_row_0.w,
-        dot(instance.model_row_1.xyz, position) + instance.model_row_1.w,
-        dot(instance.model_row_2.xyz, position) + instance.model_row_2.w,
+    // Large terms cancel before small ones join: the translation against the
+    // eye first, then the rotated point, so neither a survey-placed instance
+    // nor a block drawn at survey coordinates loses its low bits to an f32
+    // sum (it cost up to half a metre).
+    let translation_high = vec3<f32>(
+        instance.model_row_0.w,
+        instance.model_row_1.w,
+        instance.model_row_2.w,
     );
-    let world_low = vec3<f32>(
+    let rotated_high = vec3<f32>(
+        dot(instance.model_row_0.xyz, position),
+        dot(instance.model_row_1.xyz, position),
+        dot(instance.model_row_2.xyz, position),
+    );
+    let rotated_low = vec3<f32>(
         dot(instance.model_row_0.xyz, position_low),
         dot(instance.model_row_1.xyz, position_low),
         dot(instance.model_row_2.xyz, position_low),
-    ) + instance.translation_low.xyz;
-    return (world_high - u.eye_high) + (world_low - u.eye_low);
+    );
+    return ((translation_high - u.eye_high) + rotated_high)
+        + (rotated_low + instance.translation_low.xyz - u.eye_low);
 }
 
 fn mesh_instance(input: InstanceIn) -> MeshInstance {
@@ -594,7 +604,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // wireframe and hidden-line edge passes so lines read at their true colour.
 @fragment
 fn fs_edge(in: EdgeVertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(surface.face_color.rgb, 1.0);
+    // The edge buffers carry their own colour (keyed by it, so instances
+    // share a buffer only with the same colour): a visual style's edge
+    // colour, or colour 7 turned against the background (#1446).
+    return vec4<f32>(in.color.rgb, 1.0);
 }
 
 // Edge fragment for filled render modes: force black so edges frame the shaded

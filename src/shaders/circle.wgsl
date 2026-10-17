@@ -20,7 +20,7 @@ struct Uniforms {
     // Relative-to-eye (double-single)
     view_rot:            mat4x4<f32>,
     eye_high:            vec3<f32>,
-    _pad_eh:             f32,
+    highlight_widen:             f32,
     eye_low:             vec3<f32>,
     _pad_el:             f32,
 }
@@ -56,7 +56,13 @@ struct VertexOut {
     @location(10) @interpolate(flat) is_world:     f32,
 }
 
+// The selection pass widens highlighted lines by `highlight_widen` pixels;
+// every other pass uploads zero.
 fn resolve_px_hw(px_hw: f32) -> f32 {
+    return resolve_px_hw_base(px_hw) + u.highlight_widen * 0.5;
+}
+
+fn resolve_px_hw_base(px_hw: f32) -> f32 {
     var display_hw = max(px_hw * u.lineweight_scale, 0.5);
     if u.lineweight_scale < 0.0 {
         let scale = -u.lineweight_scale;
@@ -278,7 +284,10 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
     if in.pattern_length > 0.0 {
         let pat_len = in.pattern_length * u.linetype_scale;
         if in.min_elem * u.linetype_scale >= u.world_per_pixel && pat_len > 0.0 {
-            if !in_dash(arc_dist, pat_len, in.pat0, in.pat1) {
+            // The elements scale with the pattern length (PSLTSCALE,
+            // annotation scale), or the dashes fall out of step with it.
+            let lt = u.linetype_scale;
+            if !in_dash(arc_dist, pat_len, in.pat0 * lt, in.pat1 * lt) {
                 discard;
             }
         }

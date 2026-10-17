@@ -1,17 +1,16 @@
-use kernel::space::polygon;
 use codec::{EntityType, Handle};
 use glam::DVec3;
+use kernel::space::polygon;
 
 use crate::command::{
     AreaPreviewRegion, AreaPreviewSource, CadCommand, CmdOption, CmdResult, SelectionEntity,
 };
 use crate::entities::curve::entity_curve;
 use crate::entities::traits::EntityTypeOps;
-use crate::scene::model::wire_model::WireModel;
 use crate::modules::IconKind;
+use crate::scene::model::wire_model::WireModel;
 
-pub const ICON: IconKind =
-    IconKind::Svg(include_bytes!("../../../../assets/icons/area.svg"));
+pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../../assets/icons/area.svg"));
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AreaMode {
     Single,
@@ -30,6 +29,9 @@ pub struct AreaCommand {
     points: Vec<DVec3>,
     objects_gathering: bool,
     selected_entities: Vec<SelectionEntity>,
+    // Recompute exact curve measurements only when the selection changes,
+    // not on every UI frame while showing the live readout.
+    selection_preview: Option<AreaMeasurement>,
     preview_regions: Vec<AreaPreviewRegion>,
     total_area: f64,
     total_perimeter: f64,
@@ -42,6 +44,7 @@ impl AreaCommand {
             points: Vec::new(),
             objects_gathering: false,
             selected_entities: Vec::new(),
+            selection_preview: None,
             preview_regions: Vec::new(),
             total_area: 0.0,
             total_perimeter: 0.0,
@@ -49,7 +52,10 @@ impl AreaCommand {
     }
 
     fn option(label: String, keyword: &str) -> CmdOption {
-        CmdOption { label, keyword: keyword.to_string() }
+        CmdOption {
+            label,
+            keyword: keyword.to_string(),
+        }
     }
 
     /// Area and perimeter of a ring of picked points.
@@ -59,7 +65,10 @@ impl AreaCommand {
     /// report its shadow.
     fn point_measurement(points: &[DVec3], close_perimeter: bool) -> AreaMeasurement {
         if points.len() < 2 {
-            return AreaMeasurement { area: 0.0, perimeter: Some(0.0) };
+            return AreaMeasurement {
+                area: 0.0,
+                perimeter: Some(0.0),
+            };
         }
         let ring: Vec<[f64; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
         let perimeter = if close_perimeter {
@@ -155,7 +164,10 @@ impl AreaCommand {
             return None;
         }
 
-        let area = measured.iter().map(|(_, measurement)| measurement.area).sum();
+        let area = measured
+            .iter()
+            .map(|(_, measurement)| measurement.area)
+            .sum();
         let perimeter = measured
             .iter()
             .map(|(_, measurement)| measurement.perimeter)
@@ -168,12 +180,14 @@ impl AreaCommand {
     fn result_message(measurement: AreaMeasurement) -> String {
         match measurement.perimeter {
             Some(perimeter) => crate::tr!(
-                "area", "result",
+                "area",
+                "result",
                 area = crate::entities::common::format_area(measurement.area),
                 perimeter = crate::entities::common::format_length(perimeter),
             ),
             None => crate::tr!(
-                "area", "result-area-only",
+                "area",
+                "result-area-only",
                 area = crate::entities::common::format_area(measurement.area),
             ),
         }
@@ -182,30 +196,32 @@ impl AreaCommand {
     fn running_result_message(&self, measurement: AreaMeasurement) -> String {
         match measurement.perimeter {
             Some(perimeter) => crate::tr!(
-                "area", "running-result",
+                "area",
+                "running-result",
                 area = crate::entities::common::format_area(measurement.area),
                 perimeter = crate::entities::common::format_length(perimeter),
                 total_area = crate::entities::common::format_area(self.total_area),
                 total_perimeter = crate::entities::common::format_length(self.total_perimeter),
             ),
             None => crate::tr!(
-                "area", "running-result-area-only",
+                "area",
+                "running-result-area-only",
                 area = crate::entities::common::format_area(measurement.area),
                 total_area = crate::entities::common::format_area(self.total_area),
             ),
         }
     }
 
-    fn finish_measurement(
-        &mut self,
-        measurement: AreaMeasurement,
-        deselect: bool,
-    ) -> CmdResult {
+    fn finish_measurement(&mut self, measurement: AreaMeasurement, deselect: bool) -> CmdResult {
         if self.mode == AreaMode::Single {
             return CmdResult::Measurement(Self::result_message(measurement));
         }
 
-        let sign = if self.mode == AreaMode::Add { 1.0 } else { -1.0 };
+        let sign = if self.mode == AreaMode::Add {
+            1.0
+        } else {
+            -1.0
+        };
         self.total_area += sign * measurement.area;
         if let Some(perimeter) = measurement.perimeter {
             self.total_perimeter += sign * perimeter;
@@ -213,6 +229,7 @@ impl AreaCommand {
         self.points.clear();
         self.objects_gathering = false;
         self.selected_entities.clear();
+        self.selection_preview = None;
         let message = self.running_result_message(measurement);
         if deselect {
             CmdResult::ReportMeasurementAndDeselect(message)
@@ -230,7 +247,8 @@ impl CadCommand for AreaCommand {
     fn prompt(&self) -> String {
         if self.objects_gathering {
             return crate::tr!(
-                "area", "prompt-objects",
+                "area",
+                "prompt-objects",
                 count = self.selected_entities.len()
             );
         }
@@ -284,6 +302,7 @@ impl CadCommand for AreaCommand {
                 }
                 self.objects_gathering = false;
                 self.selected_entities.clear();
+                self.selection_preview = None;
                 return Some(CmdResult::DeselectAndContinue);
             }
             return Some(CmdResult::NeedPoint);
@@ -310,6 +329,7 @@ impl CadCommand for AreaCommand {
 
     fn inject_selection_entities(&mut self, entities: Vec<SelectionEntity>) {
         self.selected_entities = entities;
+        self.selection_preview = self.selection_measurement().map(|(value, _)| value);
     }
 
     fn on_selection_complete(&mut self, _handles: Vec<Handle>) -> CmdResult {
@@ -328,8 +348,10 @@ impl CadCommand for AreaCommand {
         if self.objects_gathering {
             let Some((measurement, handles)) = self.selection_measurement() else {
                 self.selected_entities.clear();
+                self.selection_preview = None;
                 return CmdResult::ReportMeasurementAndDeselect(crate::tr!(
-                    "area", "objects-not-measurable"
+                    "area",
+                    "objects-not-measurable"
                 ));
             };
             if self.mode != AreaMode::Single {
@@ -359,12 +381,49 @@ impl CadCommand for AreaCommand {
         self.finish_measurement(measurement, false)
     }
 
+    fn has_measurement_readout(&self) -> bool {
+        true
+    }
+
+    fn measurement_readout(&self, cursor: DVec3) -> Option<String> {
+        let measurement = if self.objects_gathering {
+            self.selection_preview?
+        } else {
+            if self.points.len() < 2 || !cursor.is_finite() {
+                return None;
+            }
+            let mut points = self.points.clone();
+            points.push(cursor);
+            Self::point_measurement(&points, true)
+        };
+        if self.mode == AreaMode::Single {
+            Some(Self::result_message(measurement))
+        } else {
+            let sign = if self.mode == AreaMode::Add {
+                1.0
+            } else {
+                -1.0
+            };
+            Some(crate::tr!(
+                "measurement",
+                "area-preview",
+                current = Self::result_message(measurement),
+                total =
+                    crate::entities::common::format_area(self.total_area + sign * measurement.area)
+            ))
+        }
+    }
+
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
         if self.objects_gathering || self.points.is_empty() {
             return None;
         }
         let to_render = |p: DVec3| [p.x as f32, p.y as f32, p.z as f32];
-        let mut points = self.points.iter().map(|point| to_render(*point)).collect::<Vec<_>>();
+        let mut points = self
+            .points
+            .iter()
+            .map(|point| to_render(*point))
+            .collect::<Vec<_>>();
         points.push(to_render(point));
         points.push(to_render(self.points[0]));
         Some(WireModel {
@@ -401,6 +460,8 @@ impl CadCommand for AreaCommand {
             plinegen: true,
             fill_tris: Vec::new(),
             fill_tris_low: Vec::new(),
+
+            ..Default::default()
         })
     }
 
@@ -431,3 +492,65 @@ impl CadCommand for AreaCommand {
 }
 
 inventory::submit!(crate::command::CommandRegistration { names: &["AREA"] });
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    #[test]
+    fn live_area_matches_final_result_without_changing_points() {
+        let mut command = AreaCommand::new();
+        command.on_point(DVec3::ZERO);
+        assert!(command.measurement_readout(DVec3::Y).is_none());
+        command.on_point(DVec3::X * 4.0);
+        let cursor = DVec3::Y * 3.0;
+        let preview = command.measurement_readout(cursor).unwrap();
+        assert_eq!(command.points.len(), 2);
+        command.on_point(cursor);
+        let CmdResult::Measurement(text) = command.on_enter() else {
+            panic!("result");
+        };
+        assert_eq!(preview, text);
+    }
+    #[test]
+    fn add_subtract_preview_does_not_change_total() {
+        let mut command = AreaCommand::new();
+        command.on_text_input("ADD");
+        for p in [DVec3::ZERO, DVec3::X * 4.0, DVec3::Y * 3.0] {
+            command.on_point(p);
+        }
+        assert!(matches!(
+            command.on_enter(),
+            CmdResult::ReportMeasurement(_)
+        ));
+        command.on_text_input("SUBTRACT");
+        command.on_point(DVec3::ZERO);
+        command.on_point(DVec3::X * 2.0);
+        assert!(command
+            .measurement_readout(DVec3::Y * 2.0)
+            .unwrap()
+            .contains(&crate::entities::common::format_area(4.0)));
+        assert_eq!(command.total_area, 6.0);
+    }
+    #[test]
+    fn object_readout_refreshes_with_selection_and_clears_when_empty() {
+        let mut command = AreaCommand::new();
+        command.on_text_input("OBJECTS");
+        let circle = |radius| SelectionEntity {
+            handle: Handle::new(1),
+            entity: EntityType::Circle(codec::Circle::from_coords(0.0, 0.0, 0.0, radius)),
+            surface_area: None,
+        };
+        command.inject_selection_entities(vec![circle(2.0)]);
+        let first = command.measurement_readout(DVec3::ZERO).unwrap();
+        command.inject_selection_entities(vec![circle(3.0)]);
+        let preview = command.measurement_readout(DVec3::X).unwrap();
+        assert_ne!(first, preview);
+        let CmdResult::Measurement(result) = command.on_enter() else {
+            panic!("result")
+        };
+        assert_eq!(preview, result);
+        command.on_text_input("OBJECTS");
+        command.inject_selection_entities(Vec::new());
+        assert!(command.measurement_readout(DVec3::ZERO).is_none());
+    }
+}

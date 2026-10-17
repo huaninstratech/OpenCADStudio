@@ -68,8 +68,16 @@ fn rendered_wire_bounds(
                 && x0 <= x1
                 && y0 <= y1
             {
-                include_bound!(glam::DVec3::new(x0 as f64 - hw, y0 as f64 - hw, fallback_z - hw));
-                include_bound!(glam::DVec3::new(x1 as f64 + hw, y1 as f64 + hw, fallback_z + hw));
+                include_bound!(glam::DVec3::new(
+                    x0 as f64 - hw,
+                    y0 as f64 - hw,
+                    fallback_z - hw
+                ));
+                include_bound!(glam::DVec3::new(
+                    x1 as f64 + hw,
+                    y1 as f64 + hw,
+                    fallback_z + hw
+                ));
             }
         }
     }
@@ -79,6 +87,26 @@ fn rendered_wire_bounds(
     } else {
         None
     }
+}
+
+/// Merge `pair` into `bounds`, dropping coordinates that are parser junk
+/// rather than geometry: DXF writes ±1e20 as its "no extents" sentinel, and
+/// past 1e16 an f32 has no resolution left to place a point with.
+fn fold_sane_bounds(
+    bounds: &mut Option<(glam::DVec3, glam::DVec3)>,
+    pair: Option<(glam::DVec3, glam::DVec3)>,
+) {
+    const SANE_EXTENT: f64 = 1.0e16;
+    let Some((lo, hi)) = pair else {
+        return;
+    };
+    if lo.abs().max_element() >= SANE_EXTENT || hi.abs().max_element() >= SANE_EXTENT {
+        return;
+    }
+    *bounds = Some(match *bounds {
+        Some((min, max)) => (min.min(lo), max.max(hi)),
+        None => (lo, hi),
+    });
 }
 
 fn rendered_wire_center(wires: &[WireModel], fallback_z: f64) -> Option<glam::DVec3> {
@@ -109,28 +137,26 @@ fn block_entity_transform(
     visited.push(record.name.clone());
     let transform = record.entity_handles.iter().find_map(|handle| {
         let entity = document.get_entity(*handle)?;
-        crate::scene::render_graph::entity_render_block_uses(
-            document,
-            entity,
-            annotation_scale,
-        )
-        .into_iter()
-        .filter(|block_use| block_use.active)
-        .find_map(|block_use| {
-            let inner = block_entity_transform(
-                document,
-                &block_use.insert.block_name,
-                target,
-                visited,
-                annotation_scale,
-            )?;
-            Some(inner.then(&crate::scene::render_graph::insert_transform_with_policy(
-                document,
-                &block_use.insert,
-                annotation_scale,
-                block_use.scale_policy,
-            )))
-        })
+        crate::scene::render_graph::entity_render_block_uses(document, entity, annotation_scale)
+            .into_iter()
+            .filter(|block_use| block_use.active)
+            .find_map(|block_use| {
+                let inner = block_entity_transform(
+                    document,
+                    &block_use.insert.block_name,
+                    target,
+                    visited,
+                    annotation_scale,
+                )?;
+                Some(
+                    inner.then(&crate::scene::render_graph::insert_transform_with_policy(
+                        document,
+                        &block_use.insert,
+                        annotation_scale,
+                        block_use.scale_policy,
+                    )),
+                )
+            })
     });
     visited.pop();
     transform
@@ -144,6 +170,28 @@ fn block_entity_transform(
 /// that render "one on top of the other". (#319)
 fn is_active_vport_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("*Active")
+}
+
+/// The world point a named view is centred on. The VIEW record's centre is
+/// in view (DCS) coordinates, an offset from its target in the view plane.
+/// Views saved by earlier versions of this application stored the target
+/// itself as the centre; that centre (equal to a non-zero target) is taken
+/// as the target, not as an offset from it.
+pub fn named_view_center(view: &codec::tables::View) -> glam::DVec3 {
+    use glam::{DQuat, DVec3};
+    let target = DVec3::new(view.target.x, view.target.y, view.target.z);
+    let (cx, cy) = (view.center.x, view.center.y);
+    let tol = 1e-9 * target.length().max(1.0);
+    let legacy = (target.x != 0.0 || target.y != 0.0)
+        && (cx - target.x).abs() <= tol
+        && (cy - target.y).abs() <= tol;
+    if legacy {
+        return target;
+    }
+    let eye = DVec3::new(view.direction.x, view.direction.y, view.direction.z)
+        .try_normalize()
+        .unwrap_or(DVec3::Z);
+    target + DQuat::from_rotation_arc(DVec3::Z, eye) * DVec3::new(cx, cy, 0.0)
 }
 
 impl Scene {
@@ -166,10 +214,87 @@ impl Scene {
 
     /// Restore camera to a named view from the document view table.
     pub fn restore_named_view(&mut self, view: &codec::tables::View) {
-        use glam::Vec3;
-        let cam = &mut *self.camera.borrow_mut();
+        let before = {
+            let cam = self.camera.borrow();
+            (cam.rotation, cam.target, cam.distance)
+        };
+        self.restore_named_view_camera(view);
+        let unchanged = {
+            let cam = self.camera.borrow();
+            cam.rotation.abs_diff_eq(before.0, 1e-6)
+                && cam
+                    .target
+                    .abs_diff_eq(before.1, 1e-6 * before.1.length().max(1.0))
+                && (cam.distance - before.2).abs() <= 1e-6 * before.2.abs().max(1.0)
+        };
+        // The model viewport takes a copy of the view's background; a view
+        // without one clears it, unless the view is what the viewport already
+        // shows (the reference leaves the viewport as it is then).
+        if self.current_layout != "Model" && self.active_viewport.is_none() && view.paper_space {
+            self.set_sheet_background(view);
+        }
+        if self.current_layout == "Model" {
+            if view.background_handle.is_valid() || !unchanged {
+                let background = copy_background(&mut self.document, view.background_handle);
+                self.set_active_background(background);
+            }
+            if view.visual_style_handle.is_valid() {
+                if let Some(handle) = self.active_tile_vport_handle() {
+                    if let Some(value) =
+                        self.document.vports.iter_mut().find(|v| v.handle == handle)
+                    {
+                        value.visual_style_handle = view.visual_style_handle;
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_named_view_camera(&mut self, view: &codec::tables::View) {
+        named_view_camera(view, &mut self.camera.borrow_mut());
+        self.camera_generation += 1;
+    }
+
+    /// Restores a model-space view into a paper-space viewport: its camera,
+    /// a copy of the view's background (or none) and the view's visual style.
+    pub fn restore_named_view_in_viewport(&mut self, view: &codec::tables::View, viewport: Handle) {
+        let mut camera = self.navigation_camera();
+        named_view_camera(view, &mut camera);
+        self.apply_navigation_camera(camera);
+        let background = copy_background(&mut self.document, view.background_handle);
+        let mut old = Handle::NULL;
+        if let Some(EntityType::Viewport(value)) = self.document.get_entity_mut(viewport) {
+            old = std::mem::replace(&mut value.background_handle, background);
+            if view.visual_style_handle.is_valid() {
+                value.visual_style_handle = view.visual_style_handle;
+            }
+        }
+        erase_background(&mut self.document, old);
+        self.notify_viewport_changed(viewport);
+        self.camera_generation += 1;
+    }
+
+    /// The paper-space viewport of the current layout takes a copy of a
+    /// paper-space view's background (kept with the layout; the sheet itself
+    /// is not drawn over).
+    fn set_sheet_background(&mut self, view: &codec::tables::View) {
+        let sheet = self.current_layout_sheet_viewport_handle();
+        let background = copy_background(&mut self.document, view.background_handle);
+        let old = match self.document.get_entity_mut(sheet) {
+            Some(EntityType::Viewport(value)) => {
+                std::mem::replace(&mut value.background_handle, background)
+            }
+            _ => background,
+        };
+        erase_background(&mut self.document, old);
+    }
+}
+
+/// Points a camera along a named view: direction, target and height.
+fn named_view_camera(view: &codec::tables::View, cam: &mut view::camera::Camera) {
+    use glam::Vec3;
+    {
         // The stored direction points from the target toward the eye.
-        cam.target = glam::DVec3::new(view.target.x, view.target.y, view.target.z);
         let eye_dir = Vec3::new(
             view.direction.x as f32,
             view.direction.y as f32,
@@ -182,6 +307,7 @@ impl Scene {
         };
         // Build rotation: canonical eye is +Z, rotate to eye_dir.
         cam.rotation = glam::Quat::from_rotation_arc(Vec3::Z, eye_dir);
+        cam.target = named_view_center(view);
         // Sync yaw/pitch from new rotation (for ViewCube).
         let pitch = eye_dir.z.clamp(-1.0, 1.0).asin();
         let yaw = eye_dir.x.atan2(eye_dir.y);
@@ -194,7 +320,107 @@ impl Scene {
         } else {
             cam.distance
         };
+    }
+}
+
+impl Scene {
+    /// The background the active model-space viewport shows (null for the
+    /// drawing area colour).
+    pub fn active_background(&self) -> Handle {
+        if self.current_layout != "Model" {
+            // Inside a viewport, that viewport's; the sheet's is not saved
+            // with a paper-space view.
+            return match self
+                .active_viewport
+                .and_then(|handle| self.document.get_entity(handle))
+            {
+                Some(EntityType::Viewport(value)) => value.background_handle,
+                _ => Handle::NULL,
+            };
+        }
+        self.active_tile_vport_handle()
+            .and_then(|handle| {
+                self.document
+                    .vports
+                    .iter()
+                    .find(|value| value.handle == handle)
+            })
+            .map_or(Handle::NULL, |value| value.background_handle)
+    }
+
+    /// The visual style of the active Model tile's viewport record.
+    pub fn active_visual_style(&self) -> Handle {
+        if self.current_layout != "Model" {
+            return match self
+                .active_viewport
+                .and_then(|handle| self.document.get_entity(handle))
+            {
+                Some(EntityType::Viewport(value)) => value.visual_style_handle,
+                _ => Handle::NULL,
+            };
+        }
+        self.active_tile_vport_handle()
+            .and_then(|handle| {
+                self.document
+                    .vports
+                    .iter()
+                    .find(|value| value.handle == handle)
+            })
+            .map_or(Handle::NULL, |value| value.visual_style_handle)
+    }
+
+    /// Records the visual style named `name` on the active Model tile's
+    /// viewport record, when the drawing has it.
+    pub fn set_active_visual_style_named(&mut self, name: &str) {
+        let style = self
+            .document
+            .objects
+            .iter()
+            .find_map(|(handle, object)| match object {
+                codec::objects::ObjectType::VisualStyle(style) if style.description == name => {
+                    Some(*handle)
+                }
+                _ => None,
+            });
+        let Some(style) = style else { return };
+        if self.current_layout != "Model" {
+            if let Some(handle) = self.active_viewport {
+                if let Some(EntityType::Viewport(value)) = self.document.get_entity_mut(handle) {
+                    value.visual_style_handle = style;
+                }
+            }
+            return;
+        }
+        let Some(handle) = self.active_tile_vport_handle() else {
+            return;
+        };
+        if let Some(value) = self
+            .document
+            .vports
+            .iter_mut()
+            .find(|value| value.handle == handle)
+        {
+            value.visual_style_handle = style;
+        }
+    }
+
+    fn set_active_background(&mut self, background: Handle) {
+        let Some(handle) = self.active_tile_vport_handle() else {
+            return;
+        };
+        let Some(value) = self
+            .document
+            .vports
+            .iter_mut()
+            .find(|value| value.handle == handle)
+        else {
+            return;
+        };
+        let old = std::mem::replace(&mut value.background_handle, background);
         self.camera_generation += 1;
+        if old != background {
+            erase_background(&mut self.document, old);
+        }
     }
 
     /// Save the current camera state into a new named view entry.
@@ -204,11 +430,13 @@ impl Scene {
         let cam = self.camera.borrow();
         let eye_dir = cam.rotation * glam::Vec3::Z;
         let height = cam.ortho_size() * 2.0;
-        let width = height; // caller can adjust; rough square
+        // The window's shape: the last rendered aspect ratio.
+        let width = height * self.active_camera_aspect();
         let mut view = codec::tables::View::new(name);
+        // The centre is in view (DCS) coordinates, relative to the target.
         view.center = Vector3 {
-            x: cam.target.x as f64,
-            y: cam.target.y as f64,
+            x: 0.0,
+            y: 0.0,
             z: 0.0,
         };
         view.target = Vector3 {
@@ -361,9 +589,7 @@ impl Scene {
         self.camera_generation = saved_generation;
 
         if let Some((min, max)) = refreshed {
-            self.camera
-                .borrow_mut()
-                .fit_depth_to_bounds_f64(min, max);
+            self.camera.borrow_mut().fit_depth_to_bounds_f64(min, max);
             self.projection_bounds_epoch.set(self.geometry_epoch);
         }
     }
@@ -394,9 +620,12 @@ impl Scene {
     /// wrong whenever a tiled viewport is active.
     pub(super) fn active_camera_aspect(&self) -> f32 {
         if self.current_layout == "Model" {
-            let (canvas_w, canvas_h) = self.selection.borrow().vp_size;
+            let (canvas_w, canvas_h) = self.selection.borrow().view.vp_size;
             let tiles = self.model_tiles.borrow();
-            let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+            let active = self
+                .active_model_tile
+                .get()
+                .min(tiles.len().saturating_sub(1));
             if let Some(tile) = tiles.get(active) {
                 let width = tile.rect.width * canvas_w;
                 let height = tile.rect.height * canvas_h;
@@ -416,9 +645,7 @@ impl Scene {
             return;
         }
         let aspect = self.active_camera_aspect();
-        self.camera
-            .borrow_mut()
-            .fit_to_bounds(min, max, aspect);
+        self.camera.borrow_mut().fit_to_bounds(min, max, aspect);
         self.projection_bounds_epoch.set(self.geometry_epoch);
         self.camera_generation += 1;
     }
@@ -609,11 +836,19 @@ impl Scene {
     fn apply_active_vport_camera(&mut self) -> bool {
         // Restore the single tile's visual style + grid/snap from the *Active
         // entry, independent of where the camera itself comes from below.
-        if let Some(vp) = self.document.vports.iter().find(|v| is_active_vport_name(&v.name)) {
+        if let Some(vp) = self
+            .document
+            .vports
+            .iter()
+            .find(|v| is_active_vport_name(&v.name))
+        {
             let mode = vp.render_mode;
             let (grid_on, snap_on) = (vp.grid_on, vp.snap_on);
             let mut tiles = self.model_tiles.borrow_mut();
-            let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+            let active = self
+                .active_model_tile
+                .get()
+                .min(tiles.len().saturating_sub(1));
             if let Some(t) = tiles.get_mut(active) {
                 t.render_mode = mode;
                 t.grid_on = grid_on;
@@ -624,7 +859,12 @@ impl Scene {
         // wrote an app-specific "OpenCADStudio_Camera_Model" View record and
         // preferred it here — that polluted the file for other CAD programs and
         // is no longer written or read; the view round-trips fine via VPORT.)
-        let vp = match self.document.vports.iter().find(|v| is_active_vport_name(&v.name)) {
+        let vp = match self
+            .document
+            .vports
+            .iter()
+            .find(|v| is_active_vport_name(&v.name))
+        {
             Some(v) => v.clone(),
             None => return false,
         };
@@ -689,14 +929,9 @@ impl Scene {
         // (which nudges view_target by sub-metre f64 steps) made the content
         // jump on the f32 grid. The axis directions stay f32 (orientation only);
         // only the position must stay precise — matching the model camera.
-        let base = glam::DVec3::new(
-            view_target.x,
-            view_target.y,
-            view_target.z,
-        );
-        let target = base
-            + view_right.as_dvec3() * view_center.x
-            + view_up.as_dvec3() * view_center.y;
+        let base = glam::DVec3::new(view_target.x, view_target.y, view_target.z);
+        let target =
+            base + view_right.as_dvec3() * view_center.x + view_up.as_dvec3() * view_center.y;
         let lens_length = lens_length.max(1.0) as f32;
         // The saved-view convention uses a 24 mm vertical aperture. This is
         // the inverse of the projection path's documented
@@ -767,7 +1002,7 @@ impl Scene {
             z: view_dir.z as f64,
         };
         entry.view_height = view_height as f64;
-        let (canvas_width, canvas_height) = self.selection.borrow().vp_size;
+        let (canvas_width, canvas_height) = self.selection.borrow().view.vp_size;
         let viewport_width = (upper_right.x - lower_left.x).abs() * canvas_width as f64;
         let viewport_height = (upper_right.y - lower_left.y).abs() * canvas_height as f64;
         if viewport_width > 1e-9 && viewport_height > 1e-9 {
@@ -822,7 +1057,10 @@ impl Scene {
     }
 
     /// Inverse of `tile_rect_to_vport`.
-    fn vport_to_tile_rect(lower_left: codec::types::Vector2, upper_right: codec::types::Vector2) -> iced::Rectangle {
+    fn vport_to_tile_rect(
+        lower_left: codec::types::Vector2,
+        upper_right: codec::types::Vector2,
+    ) -> iced::Rectangle {
         iced::Rectangle {
             x: lower_left.x as f32,
             y: (1.0 - upper_right.y) as f32,
@@ -877,6 +1115,61 @@ impl Scene {
         true
     }
 
+    /// Index of the current model pane's record, independent of record ordering.
+    fn ucs_follow_vport_index(&self) -> Option<usize> {
+        let rect = self
+            .model_tiles
+            .borrow()
+            .get(self.active_model_tile.get())
+            .map(|t| t.rect);
+        let bounds = rect.map(Self::tile_rect_to_vport);
+        self.document
+            .vports
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                (is_active_vport_name(&entry.name)
+                    && bounds.map_or(true, |(ll, ur)| Self::vport_rect_matches(entry, ll, ur)))
+                .then_some(index)
+            })
+    }
+
+    /// Read the persisted per-viewport UCSFOLLOW bit. Paper space itself never follows.
+    pub(crate) fn ucs_follow(&self) -> bool {
+        if let Some(handle) = self.active_viewport {
+            return matches!(self.document.get_entity(handle),
+                Some(codec::EntityType::Viewport(vp)) if vp.status.ucs_follow);
+        }
+        if self.current_layout != "Model" {
+            return false;
+        }
+        self.ucs_follow_vport_index()
+            .and_then(|index| self.document.vports.iter().nth(index))
+            .is_some_and(|vp| vp.ucsfollow)
+    }
+
+    pub(crate) fn set_ucs_follow(&mut self, enabled: bool) {
+        if let Some(handle) = self.active_viewport {
+            if let Some(codec::EntityType::Viewport(vp)) = self.document.get_entity_mut(handle) {
+                vp.status.ucs_follow = enabled;
+            }
+        } else if self.current_layout == "Model" {
+            // Materialize current panes first; saving them preserves the bit by
+            // matching their rectangles, even when the active pane is reordered.
+            self.save_model_tiles_to_vports();
+            if self.ucs_follow_vport_index().is_none() {
+                self.document
+                    .vports
+                    .add_or_replace(codec::tables::VPort::new("*Active"));
+            }
+            if let Some(index) = self.ucs_follow_vport_index() {
+                if let Some(vp) = self.document.vports.iter_mut().nth(index) {
+                    vp.ucsfollow = enabled;
+                }
+            }
+        }
+    }
+
     /// Persist model tiles as duplicate `*Active` VPort entries.
     fn save_model_tiles_to_vports(&mut self) {
         // Stash the live camera into the active tile so the about-to-write
@@ -884,7 +1177,10 @@ impl Scene {
         {
             let live_cam = self.camera.borrow().clone();
             let mut tiles = self.model_tiles.borrow_mut();
-            let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+            let active = self
+                .active_model_tile
+                .get()
+                .min(tiles.len().saturating_sub(1));
             if let Some(t) = tiles.get_mut(active) {
                 t.camera = live_cam;
             }
@@ -918,7 +1214,10 @@ impl Scene {
             return;
         }
 
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         let mut ordered_tiles = Vec::with_capacity(tiles.len());
         ordered_tiles.push(tiles[active].clone());
         for (i, tile) in tiles.iter().enumerate() {
@@ -978,26 +1277,27 @@ impl Scene {
                 entry.handle = self.document.allocate_handle();
             }
             if cloned && entry.sun_handle.is_valid() {
-                let source_sun = self.document.objects.get(&entry.sun_handle).and_then(|object| {
-                    match object {
+                let source_sun = self
+                    .document
+                    .objects
+                    .get(&entry.sun_handle)
+                    .and_then(|object| match object {
                         codec::objects::ObjectType::ClassObject(value)
-                            if matches!(
-                                &value.data,
-                                codec::objects::ClassObjectData::Sun(_)
-                            ) => Some(value.clone()),
+                            if matches!(&value.data, codec::objects::ClassObjectData::Sun(_)) =>
+                        {
+                            Some(value.clone())
+                        }
                         _ => None,
-                    }
-                });
+                    });
                 if let Some(mut sun) = source_sun {
                     let handle = self.document.allocate_handle();
                     sun.handle = handle;
                     sun.owner = entry.handle;
                     sun.reactors.clear();
                     sun.xdictionary_handle = None;
-                    self.document.objects.insert(
-                        handle,
-                        codec::objects::ObjectType::ClassObject(sun),
-                    );
+                    self.document
+                        .objects
+                        .insert(handle, codec::objects::ObjectType::ClassObject(sun));
                     entry.sun_handle = handle;
                     scene_objects_changed = true;
                 }
@@ -1005,8 +1305,7 @@ impl Scene {
             self.document.vports.add_allow_duplicate(entry);
         }
         if scene_objects_changed {
-            self.object_data_cache =
-                crate::entities::object_data::build_cache(&self.document);
+            self.object_data_cache = crate::entities::object_data::build_cache(&self.document);
             self.lighting_cache.borrow_mut().clear();
         }
     }
@@ -1032,7 +1331,10 @@ impl Scene {
             return;
         }
         let mut tiles = self.model_tiles.borrow_mut();
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         if let Some(t) = tiles.get_mut(active) {
             t.grid_on = grid_on;
             t.snap_on = snap_on;
@@ -1056,7 +1358,10 @@ impl Scene {
             return Some((false, false));
         }
         let tiles = self.model_tiles.borrow();
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         tiles.get(active).map(|t| (t.grid_on, t.snap_on))
     }
 
@@ -1083,8 +1388,12 @@ impl Scene {
             _ => {
                 // Back-compat: files OCS saved with the named-View side-channel.
                 let view_name = format!("OpenCADStudio_Camera_{}", self.current_layout);
-                let fallback =
-                    self.document.views.iter().find(|v| v.name == view_name).cloned();
+                let fallback = self
+                    .document
+                    .views
+                    .iter()
+                    .find(|v| v.name == view_name)
+                    .cloned();
                 if let Some(view) = fallback {
                     return self.apply_camera_from_view_entry(&view, false);
                 }
@@ -1141,24 +1450,19 @@ impl Scene {
             // The sheet viewport entity is the authoritative paper-space view;
             // it round-trips natively, so no named-View side-channel is needed.
             let sheet_handle = self.current_layout_sheet_viewport_handle();
-            if let Some(EntityType::Viewport(vp)) =
-                self.document.get_entity_mut(sheet_handle)
-            {
+            if let Some(EntityType::Viewport(vp)) = self.document.get_entity_mut(sheet_handle) {
                 // Paper-space position is stored in view_center (DCS).
-                vp.view_center =
-                    codec::types::Vector3::new(target_wcs.x, target_wcs.y, 0.0);
+                vp.view_center = codec::types::Vector3::new(target_wcs.x, target_wcs.y, 0.0);
                 vp.view_target = codec::types::Vector3::ZERO;
                 vp.view_direction = vd3;
                 vp.view_height = view_height as f64;
                 vp.twist_angle = twist;
-                vp.status.perspective =
-                    cam.projection == view::camera::Projection::Perspective;
+                vp.status.perspective = cam.projection == view::camera::Projection::Perspective;
                 vp.lens_length = (12.0 / (cam.fov_y * 0.5).tan().max(1e-6)) as f64;
             }
             true
         }
     }
-
 
     /// Restore the camera from the file's saved view (called once on open).
     /// Falls back to fit_all() if no saved view is available.
@@ -1171,7 +1475,20 @@ impl Scene {
             // Every paper layout has a full-screen sheet viewport that holds
             // its view; create one if a loaded file lacks it.
             let layout = self.current_layout.clone();
+            // A layout opening for the first time, as the reference tells
+            // it: its page setup was never initialized (a file's layout
+            // with no paper), or it was created in this session and not
+            // opened yet. Its page setup is initialized and, with
+            // LAYOUTCREATEVIEWPORT, it gets its first viewport.
+            let unopened = self.unopened_layouts.remove(&layout);
+            let initialized = self.initialize_layout_page_setup(&layout);
+            if unopened && !initialized {
+                self.fit_layout_sheet(&layout);
+            }
             self.ensure_sheet_viewport(&layout);
+            if unopened || initialized {
+                self.add_layout_default_viewport(&layout);
+            }
             self.apply_sheet_viewport_camera()
         };
         if restored {
@@ -1213,9 +1530,7 @@ impl Scene {
         }
         let min = glam::DVec3::new(lo.x, lo.y, lo.z);
         let max = glam::DVec3::new(hi.x, hi.y, hi.z);
-        self.camera
-            .borrow_mut()
-            .fit_depth_to_bounds_f64(min, max);
+        self.camera.borrow_mut().fit_depth_to_bounds_f64(min, max);
     }
 
     fn fit_paper_space_extents(&mut self) {
@@ -1321,6 +1636,211 @@ impl Scene {
         self.camera_generation += 1;
     }
 
+    /// Absolute-WCS bounds of everything visible in `block` — the one extents
+    /// walk behind ZOOM EXTENTS and the drawing-extents readers.
+    ///
+    /// Nothing is rejected here on a guess. An earlier version dropped any wire
+    /// whose centroid fell outside the inter-quartile consensus of the others,
+    /// to stop one junk wire from a bad parse poisoning the box. It also
+    /// dropped legitimately remote geometry — an outlying detail, a survey
+    /// point, a block placed far from the rest — so ZOOM EXTENTS quietly
+    /// refused to reach it. `SANE_EXTENT` and the finite test are the only
+    /// filters now; the ±1e6 display segments that motivated the old heuristic
+    /// come from XLine / Ray, which are handled explicitly below.
+    pub(super) fn visible_block_bounds(&self, block: Handle) -> Option<(glam::DVec3, glam::DVec3)> {
+        if block.is_null() {
+            return None;
+        }
+        let mut bounds: Option<(glam::DVec3, glam::DVec3)> = None;
+        macro_rules! fold {
+            ($pair:expr) => {
+                fold_sane_bounds(&mut bounds, $pair)
+            };
+        }
+
+        // Drawing extents must not depend on where the camera happens to be
+        // looking: the result is cached per geometry epoch, and a floating
+        // viewport's own camera is derived FROM the extents
+        // (`camera_for_viewport`), so reading the camera here recurses. A wire
+        // with no precise position falls back to the z = 0 plane.
+        let fallback_z = 0.0;
+        // Authoring graphics belong to the editor view, never INSERT geometry.
+        // Include them when framing/reopening an edited definition, even if
+        // the block contains parameters only.
+        if self.block_edit_block == Some(block) {
+            for (_, parameter) in super::block_point_parameter::parameters(&self.document, block) {
+                for point in [
+                    parameter.parameter.definition_point,
+                    parameter.definition_label_point,
+                ] {
+                    let point = glam::DVec3::new(point.x, point.y, point.z);
+                    fold!(Some((point, point)));
+                }
+            }
+            for parameter in super::block_distance_parameter::parameters(&self.document, block) {
+                let graphic = super::block_distance_parameter::graphic(&parameter);
+                for point in graphic.lines.into_iter().flatten().chain([
+                    parameter.native.definition_base_point,
+                    parameter.native.definition_end_point,
+                ]) {
+                    let point = glam::DVec3::new(point.x, point.y, point.z);
+                    fold!(Some((point, point)));
+                }
+            }
+            for parameter in super::block_orientation_parameter::parameters(&self.document, block) {
+                let graphic = super::block_orientation_parameter::graphic(&parameter);
+                for point in graphic
+                    .lines
+                    .into_iter()
+                    .flatten()
+                    .chain(graphic.labels.into_iter().map(|(p, _)| p))
+                    .chain([
+                        parameter.native.definition_base_point,
+                        parameter.native.definition_end_point,
+                    ])
+                {
+                    let point = glam::DVec3::new(point.x, point.y, point.z);
+                    fold!(Some((point, point)));
+                }
+            }
+            if let Some(parameter) = super::block_visibility::parameter(&self.document, block) {
+                let point = parameter.def_point;
+                let point = glam::DVec3::new(point.x, point.y, point.z);
+                fold!(Some((point, point)));
+            }
+        }
+        let scale = crate::scene::annotative::scale_handle_by_name(
+            &self.document,
+            &self.document.header.current_annotation_scale,
+        );
+        // The resident set is the full, un-culled, LOD-free tessellation the
+        // block actually renders from. Culled input would fit only what is
+        // already on screen, so each ZOOM EXTENTS would zoom out a little and
+        // reveal more, converging on the true extent after several uses (#51).
+        let wires = self.resident_wires_for(block, None, scale, None, None);
+        // Infinite display segments do not contribute to drawing extents.
+        // Keep their base points as a fallback for otherwise empty drawings.
+        let mut infinite_base: Vec<glam::DVec3> = Vec::new();
+        for wire in wires.iter() {
+            let entity = Self::handle_from_wire_name(&wire.name)
+                .and_then(|handle| self.document.get_entity(handle));
+            // A block whose content draws no wire (3D solids only) leaves a
+            // marker carrying just its insertion snap. The content counts
+            // through its meshes; the insertion point is no geometry, and a
+            // georeferenced block's sits far from what it draws (#1829).
+            if matches!(entity, Some(EntityType::Insert(_)))
+                && wire.points.is_empty()
+                && wire.text_verts.is_empty()
+            {
+                continue;
+            }
+            let is_infinite =
+                entity.is_some_and(|entity| matches!(entity, EntityType::XLine(_) | EntityType::Ray(_)));
+            if is_infinite {
+                infinite_base.extend(
+                    wire.key_vertices
+                        .iter()
+                        .map(|&[x, y, z]| glam::DVec3::new(x, y, z))
+                        .filter(|point| point.is_finite()),
+                );
+                continue;
+            }
+            fold!(rendered_wire_bounds(std::slice::from_ref(wire), fallback_z));
+        }
+
+        // 3D solids render as meshes, not wires: a drawing of only solids has
+        // no wire to fit.
+        for (&handle, set) in &self.meshes {
+            let Some(entity) = self.document.get_entity(handle) else {
+                continue;
+            };
+            if !self.mesh_entity_visible(handle)
+                || !self.belongs_to_visible_block(handle, entity.common().owner_handle, block)
+            {
+                continue;
+            }
+            let [x0, y0, x1, y1] = set.world_aabb;
+            let [z0, z1] = set.z_aabb;
+            let lo = glam::DVec3::new(x0 as f64, y0 as f64, z0 as f64);
+            let hi = glam::DVec3::new(x1 as f64, y1 as f64, z1 as f64);
+            if lo.is_finite() && hi.is_finite() {
+                fold!(Some((lo.min(hi), lo.max(hi))));
+            }
+        }
+
+        // Raster images, OLE frames and underlays draw as GPU quads; with
+        // their frames hidden they carry no wire outline at all.
+        for (&handle, image) in &self.images {
+            let Some(entity) = self.document.get_entity(handle) else {
+                continue;
+            };
+            if !self.mesh_entity_visible(handle)
+                || !self.belongs_to_visible_block(handle, entity.common().owner_handle, block)
+            {
+                continue;
+            }
+            for (corner, low) in image.corners.iter().zip(image.corners_low.iter()) {
+                let point = glam::DVec3::new(
+                    corner[0] as f64 + low[0] as f64,
+                    corner[1] as f64 + low[1] as f64,
+                    corner[2] as f64 + low[2] as f64,
+                );
+                if point.is_finite() {
+                    fold!(Some((point, point)));
+                }
+            }
+        }
+
+        // HATCH tessellates to no wires at all (#131), so a drawing whose
+        // outermost geometry is a fill — or which is nothing but fills — has
+        // to pick its bounds up from the fill models themselves. The paper
+        // sheet already does this; model space did not.
+        // The renderer already holds the fill models for the block it is
+        // drawing, keyed by geometry epoch — reuse that rather than exploding
+        // every INSERT again on each ZOOM EXTENTS. Only a block that is not
+        // the one on screen (model space while a BEDIT is open) has to build
+        // its own set.
+        let hatches = if block == self.content_render_block_handle() {
+            // Tinted, matching the renderer's own call: the two then share one
+            // cache entry. Asking for an untinted set would key the same slot
+            // with a different selection signature and the two would evict
+            // each other on every frame. Tint is colour; it moves no vertex.
+            self.hatch_models_arc_for_view(true)
+        } else {
+            std::sync::Arc::new(self.synced_hatch_models(
+                block,
+                None,
+                scale,
+                self.annotation_all_visible(),
+                None,
+                false,
+            ))
+        };
+        for hatch in hatches.iter() {
+            for &[x, y] in hatch.boundary.iter() {
+                // NaN-NaN separators between disconnected paths fall out on
+                // the finite test — they must not be treated as vertices.
+                let point = glam::DVec3::new(
+                    hatch.world_origin[0] + x as f64,
+                    hatch.world_origin[1] + y as f64,
+                    0.0,
+                );
+                if point.is_finite() {
+                    fold!(Some((point, point)));
+                }
+            }
+        }
+
+        // Drawing holds only infinite construction geometry: fall back to its
+        // base points rather than reporting nothing.
+        if bounds.is_none() {
+            for point in infinite_base {
+                fold!(Some((point, point)));
+            }
+        }
+        bounds
+    }
+
     pub fn fit_all(&mut self) {
         if self.active_viewport.is_some() {
             if let Some((mut min, mut max)) = self.model_space_extents() {
@@ -1337,225 +1857,19 @@ impl Scene {
             return;
         }
 
-        // Use the FULL, un-culled wire set — not `entity_wires()`, which is
-        // frustum-culled to the current view. Culled input would fit only the
-        // entities already on screen, so each call would zoom out a little and
-        // reveal more, converging on the true extent only after several uses
-        // (issue #51). `wpp = None` also tessellates at a fixed tolerance so
-        // the bounds don't drift with zoom-adaptive curve sampling.
-        let layout_block = self.current_layout_block_handle();
-        let scale = if self.current_layout == "Model" {
-            crate::scene::annotative::scale_handle_by_name(
-                &self.document,
-                &self.document.header.current_annotation_scale,
-            )
-        } else {
-            self.paper_annotation_scale_handle()
+        let Some((min, mut max)) = self.visible_block_bounds(self.current_layout_block_handle())
+        else {
+            // Nothing usable to fit: leave the camera where it is.
+            return;
         };
-        let mut wires = self.wires_for_block_culled(
-            layout_block,
-            None,
-            None,
-            None,
-            None,
-            scale,
-            self.annotation_all_visible(),
-            None,
-        );
-        // Infinite display segments do not contribute to drawing extents.
-        // Preserve their base points as a fallback for otherwise empty drawings.
-        let mut infinite_base_pts: Vec<glam::Vec3> = Vec::new();
-        wires.retain(|w| {
-            let is_infinite = Self::handle_from_wire_name(&w.name)
-                .and_then(|h| self.document.get_entity(h))
-                .map(|e| matches!(e, EntityType::XLine(_) | EntityType::Ray(_)))
-                .unwrap_or(false);
-            if is_infinite {
-                infinite_base_pts.extend(
-                    w.key_vertices
-                        .iter()
-                        .map(|v| glam::Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32)),
-                );
-            }
-            !is_infinite
-        });
-        // 3D solids render as meshes, not wires, so collect their complete
-        // world boxes separately — a drawing of only solids has no wires to fit.
-        let mesh_aabbs: Vec<([f32; 4], [f32; 2])> = self
-            .meshes
-            .iter()
-            .filter(|(h, _)| {
-                let handle = **h;
-                self.mesh_entity_visible(handle)
-                    && self.document.get_entity(handle).is_some_and(|entity| {
-                        self.belongs_to_visible_block(
-                            handle,
-                            entity.common().owner_handle,
-                            layout_block,
-                        )
-                    })
-            })
-            .map(|(_, set)| (set.world_aabb, set.z_aabb))
-            .filter(|(xy, z)| {
-                xy[0].is_finite()
-                    && xy[1].is_finite()
-                    && xy[2].is_finite()
-                    && xy[3].is_finite()
-                    && z[0].is_finite()
-                    && z[1].is_finite()
-            })
-            .collect();
-        // Raster images and underlays draw as GPU quads; with their frames
-        // hidden they carry no wire outline, so fold their corners in too.
-        let image_corners: Vec<glam::Vec3> = self
-            .images
-            .iter()
-            .filter(|(h, _)| {
-                let handle = **h;
-                self.mesh_entity_visible(handle)
-                    && self.document.get_entity(handle).is_some_and(|entity| {
-                        self.belongs_to_visible_block(handle, entity.common().owner_handle, layout_block)
-                    })
-            })
-            .flat_map(|(_, image)| {
-                image.corners.iter().zip(image.corners_low.iter()).map(|(c, low)| {
-                    glam::Vec3::new(c[0] + low[0], c[1] + low[1], c[2] + low[2])
-                })
-            })
-            .filter(|p| p.is_finite())
-            .collect();
-        if wires.is_empty() && mesh_aabbs.is_empty() && infinite_base_pts.is_empty() && image_corners.is_empty() {
-            return;
-        }
-
-        // Collect wire centroids for robust outlier rejection.
-        struct WireCent {
-            idx: usize,
-            cx: f32,
-            cy: f32,
-        }
-        let mut cents: Vec<WireCent> = Vec::with_capacity(wires.len());
-        for (idx, wire) in wires.iter().enumerate() {
-            let mut sx = 0.0_f64;
-            let mut sy = 0.0_f64;
-            let mut n = 0_usize;
-            for &[x, y, _] in &wire.points {
-                if !x.is_finite() || !y.is_finite() {
-                    continue;
-                }
-                sx += x as f64;
-                sy += y as f64;
-                n += 1;
-            }
-            // SDF text is carried as textured glyph quads, not ordinary wire
-            // points. Include those vertices so a text-only wire participates
-            // in the robust-centre filter used by ZOOM EXTENTS.
-            for vertex in &wire.text_verts {
-                let x = vertex.pos[0] as f64 + vertex.pos_low[0] as f64;
-                let y = vertex.pos[1] as f64 + vertex.pos_low[1] as f64;
-                if !x.is_finite() || !y.is_finite() {
-                    continue;
-                }
-                sx += x;
-                sy += y;
-                n += 1;
-            }
-            if n > 0 {
-                cents.push(WireCent {
-                    idx,
-                    cx: (sx / n as f64) as f32,
-                    cy: (sy / n as f64) as f32,
-                });
-            }
-        }
-        if cents.is_empty() && mesh_aabbs.is_empty() && infinite_base_pts.is_empty() && image_corners.is_empty() {
-            return;
-        }
-
-        // Quartile rejection needs enough samples to be meaningful. With fewer
-        // wires, every finite visible point belongs to the drawing extents.
-        let (rx_lo, rx_hi, ry_lo, ry_hi) = if cents.len() >= 8 {
-            let mut xs: Vec<f32> = cents.iter().map(|c| c.cx).collect();
-            let mut ys: Vec<f32> = cents.iter().map(|c| c.cy).collect();
-            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let q = |v: &[f32], frac: f32| v[((v.len() as f32 - 1.0) * frac) as usize];
-            let q1x = q(&xs, 0.25);
-            let q3x = q(&xs, 0.75);
-            let q1y = q(&ys, 0.25);
-            let q3y = q(&ys, 0.75);
-            // Keep sparse annotations while rejecting isolated corrupt wires.
-            const K: f32 = 10.0;
-            let dx = (q3x - q1x).max(1.0) * K;
-            let dy = (q3y - q1y).max(1.0) * K;
-            (q1x - dx, q3x + dx, q1y - dy, q3y + dy)
-        } else {
-            (
-                f32::NEG_INFINITY,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-                f32::INFINITY,
-            )
-        };
-
-        let mut min = glam::Vec3::splat(f32::MAX);
-        let mut max = glam::Vec3::splat(f32::MIN);
-        for c in &cents {
-            if c.cx < rx_lo || c.cx > rx_hi || c.cy < ry_lo || c.cy > ry_hi {
-                continue;
-            }
-            let wire = &wires[c.idx];
-            let hw = (wire.world_width * 0.5) as f32;
-            for &[x, y, z] in &wire.points {
-                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
-                    continue;
-                }
-                if hw > 0.0 {
-                    min = min.min(glam::Vec3::new(x - hw, y - hw, z - hw));
-                    max = max.max(glam::Vec3::new(x + hw, y + hw, z + hw));
-                } else {
-                    min = min.min(glam::Vec3::new(x, y, z));
-                    max = max.max(glam::Vec3::new(x, y, z));
-                }
-            }
-            for vertex in &wire.text_verts {
-                let point = glam::Vec3::new(
-                    vertex.pos[0] + vertex.pos_low[0],
-                    vertex.pos[1] + vertex.pos_low[1],
-                    vertex.pos[2] + vertex.pos_low[2],
-                );
-                if point.is_finite() {
-                    min = min.min(point);
-                    max = max.max(point);
-                }
-            }
-        }
-        // Fold in 3D-solid mesh AABBs (not subject to the wire IQR reject).
-        for ([ax, ay, bx, by], [az, bz]) in &mesh_aabbs {
-            min = min.min(glam::Vec3::new(*ax, *ay, *az));
-            max = max.max(glam::Vec3::new(*bx, *by, *bz));
-        }
-        for p in &image_corners {
-            min = min.min(*p);
-            max = max.max(*p);
-        }
-        // Drawing holds only infinite construction geometry: fit the view to
-        // its base points rather than leaving the camera unchanged.
-        if min.x > max.x {
-            for p in &infinite_base_pts {
-                min = min.min(*p);
-                max = max.max(*p);
-            }
-        }
-        // If no usable points found, leave the camera unchanged.
-        if min.x > max.x {
-            return;
-        }
         if min == max {
-            max += glam::Vec3::splat(1.0);
+            max += glam::DVec3::splat(1.0);
         }
         let aspect = self.active_camera_aspect();
-        self.camera.borrow_mut().fit_to_bounds(min, max, aspect);
+        // f64 all the way into the camera: a UTM-scale drawing loses whole
+        // metres to an f32 round-trip, which shows up as a fit that sits
+        // slightly off the geometry it was asked to frame.
+        self.camera.borrow_mut().fit_to_bounds_f64(min, max, aspect);
         self.projection_bounds_epoch.set(self.geometry_epoch);
         self.camera_generation += 1;
     }
@@ -1577,7 +1891,7 @@ impl Scene {
             return;
         };
 
-        let (canvas_w, canvas_h) = self.selection.borrow().vp_size;
+        let (canvas_w, canvas_h) = self.selection.borrow().view.vp_size;
         let fallback = self.last_render_aspect.get().max(0.01);
         let aspects: Vec<f32> = self
             .model_tiles
@@ -1624,5 +1938,117 @@ impl Scene {
             self.last_atlas_generation.set(atlas_gen);
             self.bump_geometry();
         }
+    }
+}
+
+/// The drawing's ACAD_BACKGROUND dictionary, made when it has none.
+fn background_dictionary(document: &mut codec::CadDocument) -> Option<Handle> {
+    use codec::objects::{Dictionary, ObjectType};
+    let root = document.header.named_objects_dict_handle;
+    let Some(ObjectType::Dictionary(root_dictionary)) = document.objects.get(&root) else {
+        return None;
+    };
+    if let Some(existing) = root_dictionary.get("ACAD_BACKGROUND") {
+        if matches!(
+            document.objects.get(&existing),
+            Some(ObjectType::Dictionary(_))
+        ) {
+            return Some(existing);
+        }
+    }
+    let handle = document.allocate_handle();
+    let mut dictionary = Dictionary::new();
+    dictionary.handle = handle;
+    dictionary.owner = root;
+    dictionary.reactors.push(root);
+    document
+        .objects
+        .insert(handle, ObjectType::Dictionary(dictionary));
+    if let Some(ObjectType::Dictionary(root_dictionary)) = document.objects.get_mut(&root) {
+        root_dictionary.add_entry("ACAD_BACKGROUND", handle);
+    }
+    Some(handle)
+}
+
+/// A new background object in ACAD_BACKGROUND, keyed by its own handle as
+/// the reference keys it. Null when the drawing has no named-objects root.
+pub fn add_background(
+    document: &mut codec::CadDocument,
+    data: codec::objects::ClassObjectData,
+) -> Handle {
+    use codec::objects::{ClassObject, ObjectType};
+    let Some(dictionary) = background_dictionary(document) else {
+        return Handle::NULL;
+    };
+    let handle = document.allocate_handle();
+    let mut object = ClassObject::new(data);
+    object.handle = handle;
+    object.owner = dictionary;
+    object.reactors = vec![dictionary];
+    document
+        .objects
+        .insert(handle, ObjectType::ClassObject(object));
+    if let Some(ObjectType::Dictionary(entries)) = document.objects.get_mut(&dictionary) {
+        entries.add_entry(format!("{:X}", handle.value()), handle);
+    }
+    handle
+}
+
+/// Erases a background object once no view or viewport refers to it (the
+/// reference erases a view's background when it is replaced, cleared or the
+/// view deleted, and a viewport's when the viewport takes another).
+pub fn erase_background(document: &mut codec::CadDocument, handle: Handle) {
+    use codec::objects::{ClassObjectData as D, ObjectType};
+    if !handle.is_valid()
+        || document.views.iter().any(|view| view.background_handle == handle)
+        || document.vports.iter().any(|vport| vport.background_handle == handle)
+        || document.entities().any(|entity| {
+            matches!(entity, codec::EntityType::Viewport(viewport) if viewport.background_handle == handle)
+        })
+    {
+        return;
+    }
+    let owner = match document.objects.get(&handle) {
+        Some(ObjectType::ClassObject(object))
+            if matches!(
+                object.data,
+                D::SolidBackground(_)
+                    | D::GradientBackground(_)
+                    | D::ImageBackground(_)
+                    | D::GroundPlaneBackground(_)
+                    | D::SkyLightBackground(_)
+                    | D::IblBackground(_)
+            ) =>
+        {
+            object.owner
+        }
+        _ => return,
+    };
+    document.objects.remove(&handle);
+    if let Some(ObjectType::Dictionary(entries)) = document.objects.get_mut(&owner) {
+        entries.entries.retain(|(_, entry)| *entry != handle);
+    }
+}
+
+/// A copy of a background object (the reference gives each view and
+/// viewport its own); null for none.
+pub fn copy_background(document: &mut codec::CadDocument, handle: Handle) -> Handle {
+    use codec::objects::{ClassObjectData as D, ObjectType};
+    match document.objects.get(&handle) {
+        Some(ObjectType::ClassObject(object))
+            if matches!(
+                object.data,
+                D::SolidBackground(_)
+                    | D::GradientBackground(_)
+                    | D::ImageBackground(_)
+                    | D::GroundPlaneBackground(_)
+                    | D::SkyLightBackground(_)
+                    | D::IblBackground(_)
+            ) =>
+        {
+            let data = object.data.clone();
+            add_background(document, data)
+        }
+        _ => Handle::NULL,
     }
 }

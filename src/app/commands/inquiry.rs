@@ -4,12 +4,15 @@ impl OpenCADStudio {
     /// Align every selected object or complete group by one edge or center.
     fn align_selected_bounds(&mut self, i: usize, command: &str) {
         use crate::command::EntityTransform;
-        use kernel::space::BoundsAlignment;
         use glam::DVec3;
+        use kernel::space::BoundsAlignment;
 
         let (alignment, label) = match command {
             "ALIGNLEFT" => (BoundsAlignment::Left, "Align Left"),
-            "ALIGNHCENTER" => (BoundsAlignment::HorizontalCenter, "Align Horizontal Centers"),
+            "ALIGNHCENTER" => (
+                BoundsAlignment::HorizontalCenter,
+                "Align Horizontal Centers",
+            ),
             "ALIGNRIGHT" => (BoundsAlignment::Right, "Align Right"),
             "ALIGNTOP" => (BoundsAlignment::Top, "Align Top"),
             "ALIGNVCENTER" => (BoundsAlignment::VerticalCenter, "Align Vertical Centers"),
@@ -62,19 +65,17 @@ impl OpenCADStudio {
             .expect("validated at least two finite bounds");
         let pending = self.begin_undo(i, label, handles.len(), true);
         for ((unit, _), [dx, dy]) in bounds.iter().zip(offsets) {
-            self.tabs[i].scene.transform_entities(
-                unit,
-                &EntityTransform::Translate(DVec3::new(dx, dy, 0.0)),
-            );
+            self.tabs[i]
+                .scene
+                .transform_entities(unit, &EntityTransform::Translate(DVec3::new(dx, dy, 0.0)));
         }
         self.tabs[i].dirty = true;
         self.refresh_properties();
         if let Some(pending) = pending {
             self.commit_undo_delta(i, pending);
         }
-        self.command_line.push_output(
-            crate::tf!("{command}: aligned {} object(s).", bounds.len()).as_ref(),
-        );
+        self.command_line
+            .push_output(crate::tf!("{command}: aligned {} object(s).", bounds.len()).as_ref());
     }
 
     pub(super) fn dispatch_inquiry(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
@@ -94,7 +95,8 @@ impl OpenCADStudio {
 
             "DESELECT" | "DESELALL" => {
                 self.tabs[i].scene.deselect_all();
-                self.command_line.push_output(crate::t!("Deselected.").as_ref());
+                self.command_line
+                    .push_output(crate::t!("Deselected.").as_ref());
                 self.refresh_properties();
             }
 
@@ -129,14 +131,21 @@ impl OpenCADStudio {
                 || cmd.starts_with("QUICKCALC ")
                 || cmd.starts_with("QC ") =>
             {
-                let expr = cmd.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                let expr = cmd
+                    .splitn(2, char::is_whitespace)
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim();
                 if expr.is_empty() {
-                    self.command_line
-                        .push_info(crate::t!("Usage: CAL <expression>   e.g. CAL (2+3)*4").as_ref());
+                    self.command_line.push_info(
+                        crate::t!("Usage: CAL <expression>   e.g. CAL (2+3)*4").as_ref(),
+                    );
                 } else {
                     match arith_eval(expr) {
                         Ok(v) => self.command_line.push_output(crate::tf!("= {v}").as_ref()),
-                        Err(e) => self.command_line.push_error(crate::tf!("CAL: {e}").as_ref()),
+                        Err(e) => self
+                            .command_line
+                            .push_error(crate::tf!("CAL: {e}").as_ref()),
                     }
                 }
             }
@@ -145,8 +154,9 @@ impl OpenCADStudio {
             "LIST" => {
                 let selected: Vec<_> = self.tabs[i].scene.selected_entities();
                 if selected.is_empty() {
-                    self.command_line
-                        .push_error(crate::t!("LIST: no entities selected. Select entities first.").as_ref());
+                    self.command_line.push_error(
+                        crate::t!("LIST: no entities selected. Select entities first.").as_ref(),
+                    );
                 } else {
                     for (handle, _) in &selected {
                         if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle) {
@@ -165,18 +175,21 @@ impl OpenCADStudio {
                                 };
                             // Entity-specific details
                             let details = entity_list_details(entity);
-                            self.command_line.push_output(crate::tf!(
-                                "{type_name}  Handle:{:X}  Layer:{}  Color:{}  LT:{}{}",
-                                handle.value(),
-                                common.layer,
-                                color_str,
-                                linetype,
-                                if details.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("\n    {details}")
-                                }
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "{type_name}  Handle:{:X}  Layer:{}  Color:{}  LT:{}{}",
+                                    handle.value(),
+                                    common.layer,
+                                    color_str,
+                                    linetype,
+                                    if details.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("\n    {details}")
+                                    }
+                                )
+                                .as_ref(),
+                            );
                         }
                     }
                 }
@@ -190,8 +203,10 @@ impl OpenCADStudio {
                 let scene = &self.tabs[i].scene;
                 let selected = scene.selected_entities();
                 if selected.is_empty() {
-                    self.command_line
-                        .push_error(crate::t!("SELHANDLES: no entities selected. Select entities first.").as_ref());
+                    self.command_line.push_error(
+                        crate::t!("SELHANDLES: no entities selected. Select entities first.")
+                            .as_ref(),
+                    );
                 } else {
                     use std::collections::BTreeMap;
                     let space = if scene.current_layout == "Model" {
@@ -212,18 +227,23 @@ impl OpenCADStudio {
                         }
                     }
                     handles.sort_unstable();
-                    let types: Vec<String> =
-                        type_counts.iter().map(|(t, n)| format!("{t}×{n}")).collect();
+                    let types: Vec<String> = type_counts
+                        .iter()
+                        .map(|(t, n)| format!("{t}×{n}"))
+                        .collect();
                     let list: Vec<String> = handles.iter().map(|h| format!("{:X}", h)).collect();
                     let mut msg = crate::tf!(
                         "SELHANDLES: {} selected in {}\n  Types: {}",
                         handles.len(),
                         space,
                         types.join(", ")
-                    ).into_owned();
+                    )
+                    .into_owned();
                     if !block_counts.is_empty() {
-                        let blocks: Vec<String> =
-                            block_counts.iter().map(|(b, n)| format!("{b}×{n}")).collect();
+                        let blocks: Vec<String> = block_counts
+                            .iter()
+                            .map(|(b, n)| format!("{b}×{n}"))
+                            .collect();
                         msg.push_str(&crate::tf!("\n  Blocks: {}", blocks.join(", ")).into_owned());
                     }
                     msg.push_str(&crate::tf!("\n  Handles: {}", list.join(",")).into_owned());
@@ -257,9 +277,12 @@ impl OpenCADStudio {
                         let details = entity_list_details(entity);
                         format!(
                             "{type_name}  {}:{:X}  {}:{}  {}:{}  LT:{}{}",
-                            crate::t!("Handle"), common.handle.value(),
-                            crate::t!("Layer"), common.layer,
-                            crate::t!("Color"), color_str,
+                            crate::t!("Handle"),
+                            common.handle.value(),
+                            crate::t!("Layer"),
+                            common.layer,
+                            crate::t!("Color"),
+                            color_str,
                             linetype,
                             if details.is_empty() {
                                 String::new()
@@ -296,7 +319,9 @@ impl OpenCADStudio {
                 }
                 let mut cmd = JoinCommand::new();
                 if let Some(handle) = selected.first() {
-                    if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle).cloned() { cmd = cmd.with_source(*handle, entity); }
+                    if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle).cloned() {
+                        cmd = cmd.with_source(*handle, entity);
+                    }
                 }
                 self.command_line.push_info(&cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
@@ -325,27 +350,26 @@ impl OpenCADStudio {
                     .filter_map(|e| {
                         let h = e.common().handle.value();
                         match e {
-                            codec::EntityType::LwPolyline(_)
-                            | codec::EntityType::Polyline2D(_) => Some((
-                                h,
-                                PeditTarget {
-                                    is_poly: true,
-                                    convertible: false,
-                                    mesh_size: None,
-                                    mesh_closed: None,
-                                },
-                            )),
-                            codec::EntityType::Line(_) | codec::EntityType::Arc(_) => {
+                            codec::EntityType::LwPolyline(_) | codec::EntityType::Polyline2D(_) => {
                                 Some((
                                     h,
                                     PeditTarget {
-                                        is_poly: false,
-                                        convertible: true,
+                                        is_poly: true,
+                                        convertible: false,
                                         mesh_size: None,
                                         mesh_closed: None,
                                     },
                                 ))
                             }
+                            codec::EntityType::Line(_) | codec::EntityType::Arc(_) => Some((
+                                h,
+                                PeditTarget {
+                                    is_poly: false,
+                                    convertible: true,
+                                    mesh_size: None,
+                                    mesh_closed: None,
+                                },
+                            )),
                             codec::EntityType::PolygonMesh(mesh) => Some((
                                 h,
                                 PeditTarget {
@@ -380,9 +404,7 @@ impl OpenCADStudio {
             }
 
             "MLEDIT" => {
-                use crate::modules::draw::modify::mledit::{
-                    MlineEditCommand, MlineEditTarget,
-                };
+                use crate::modules::draw::modify::mledit::{MlineEditCommand, MlineEditTarget};
                 let document = &self.tabs[i].scene.document;
                 let targets = document
                     .entities()
@@ -409,13 +431,16 @@ impl OpenCADStudio {
 
             "SPLINEDIT" => {
                 use crate::modules::draw::modify::splinedit::SplineditCommand;
-                let mut cmd_obj = SplineditCommand::new().with_delete_source(self.delete_objects != 0);
+                let mut cmd_obj =
+                    SplineditCommand::new().with_delete_source(self.delete_objects != 0);
                 let selected: Vec<_> = self.tabs[i].scene.selected.iter().copied().collect();
                 if let [handle] = selected.as_slice() {
                     if let Some(entity @ codec::EntityType::Spline(_)) =
                         self.tabs[i].scene.document.get_entity(*handle).cloned()
                     {
-                        if self.reject_locked_edit(i, *handle) { return Some(Task::none()); }
+                        if self.reject_locked_edit(i, *handle) {
+                            return Some(Task::none());
+                        }
                         cmd_obj.inject_picked_entity(entity);
                         cmd_obj.on_entity_pick(*handle, glam::DVec3::ZERO);
                     }
@@ -432,46 +457,17 @@ impl OpenCADStudio {
                 self.open_attedit_dialog();
             }
 
-            // ── REFEDIT — in-place block editing ─────────────────────────────
-            "REFEDIT" => {
-                use crate::modules::draw::modify::refedit::RefEditPickCommand;
-                // If a session is already active, tell the user.
-                if self.tabs[i].refedit_session.is_some() {
-                    self.command_line
-                        .push_error(crate::t!("REFEDIT: a session is already active. Use REFCLOSE first.").as_ref());
-                } else {
-                    // Check if a single INSERT is already selected.
-                    let selected: Vec<_> =
-                        self.tabs[i].scene.selected_entities().into_iter().collect();
-                    if selected.len() == 1 {
-                        if let Some(codec::EntityType::Insert(_)) =
-                            selected.first().map(|(_, e)| e)
-                        {
-                            let handle = selected[0].0;
-                            // Skip pick phase — jump straight to begin.
-                            let _ =
-                                self.dispatch_command(&format!("REFEDIT_BEGIN:{}", handle.value()));
-                            return Some(Task::none());
-                        }
-                    }
-                    let cmd_obj = RefEditPickCommand::new();
-                    self.command_line.push_info(&cmd_obj.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
-                }
-            }
-
             "BEDIT" => {
-                use crate::modules::draw::modify::block_edit::BlockEditPickCommand;
                 if self.tabs[i].refedit_session.is_some() {
-                    self.command_line
-                        .push_error(crate::t!("BEDIT: finish the active REFEDIT (REFCLOSE) first.").as_ref());
+                    self.command_line.push_error(
+                        crate::t!("BEDIT: finish the active REFEDIT (REFCLOSE) first.").as_ref(),
+                    );
                 } else {
                     // Jump straight to begin when a single INSERT is preselected.
                     let selected: Vec<_> =
                         self.tabs[i].scene.selected_entities().into_iter().collect();
                     if selected.len() == 1 {
-                        if let Some(codec::EntityType::Insert(_)) =
-                            selected.first().map(|(_, e)| e)
+                        if let Some(codec::EntityType::Insert(_)) = selected.first().map(|(_, e)| e)
                         {
                             let handle = selected[0].0;
                             let _ =
@@ -479,569 +475,142 @@ impl OpenCADStudio {
                             return Some(Task::none());
                         }
                     }
-                    let cmd_obj = BlockEditPickCommand::new();
-                    self.command_line.push_info(&cmd_obj.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
+                    self.open_bedit_dialog(i);
                 }
             }
 
-            cmd if cmd.starts_with("BEDIT_BEGIN:") => {
-                use crate::modules::draw::modify::block_edit::BlockEditSession;
-                use codec::Handle;
-
-                let handle_u64: u64 = cmd["BEDIT_BEGIN:".len()..].parse().unwrap_or(0);
-                let insert_handle = Handle::new(handle_u64);
-                if self.reject_locked_edit(i, insert_handle) {
+            cmd if cmd.starts_with("BEDIT_NEW:") => {
+                if self.tabs[i].refedit_session.is_some() {
+                    self.command_line.push_error(
+                        crate::t!("BEDIT: finish the active REFEDIT (REFCLOSE) first.").as_ref(),
+                    );
                     return Some(Task::none());
                 }
-
-                let block_name = match self.tabs[i].scene.document.get_entity(insert_handle) {
-                    Some(codec::EntityType::Insert(ins)) => ins.block_name.clone(),
-                    _ => {
-                        self.command_line
-                            .push_error(crate::t!("BEDIT: selected object is not a block reference.").as_ref());
+                let raw_name = &cmd["BEDIT_NEW:".len()..];
+                let block_name = match crate::scene::block_service::validate_block_name(raw_name) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.command_line.push_error(&e.to_string());
                         return Some(Task::none());
+                    }
+                };
+                if let Some(br) = self.tabs[i].scene.document.block_records.get(&block_name) {
+                    let real_name = br.name.clone();
+                    return Some(self.dispatch_command(&format!("BEDIT_OPEN:{real_name}")));
+                }
+                if self.tabs[i].active_block_edit_session().is_some() {
+                    return Some(self.request_block_edit_close(
+                        i,
+                        crate::app::block_editor::BlockEditContinuation::Create(block_name),
+                    ));
+                }
+                let pre_doc = self.tabs[i].scene.document.clone();
+                self.tabs[i].scene.define_block_raw(
+                    &block_name,
+                    codec::types::Vector3::ZERO,
+                    vec![],
+                );
+                let Some(record) = self.tabs[i].scene.document.block_records.get(&block_name)
+                else {
+                    return Some(Task::none());
+                };
+                let br_handle = record.handle;
+                self.start_block_edit_session(i, block_name, br_handle, Some(pre_doc));
+            }
+
+            cmd if cmd.starts_with("BEDIT_BEGIN:") || cmd.starts_with("BEDIT_OPEN:") => {
+                if self.tabs[i].refedit_session.is_some() {
+                    self.command_line.push_error(
+                        crate::t!("BEDIT: finish the active REFEDIT (REFCLOSE) first.").as_ref(),
+                    );
+                    return Some(Task::none());
+                }
+                use codec::Handle;
+
+                let block_name = if let Some(name) = cmd.strip_prefix("BEDIT_OPEN:") {
+                    name.to_string()
+                } else {
+                    let handle_u64: u64 = cmd["BEDIT_BEGIN:".len()..].parse().unwrap_or(0);
+                    let insert_handle = Handle::new(handle_u64);
+                    if self.reject_locked_edit(i, insert_handle) {
+                        return Some(Task::none());
+                    }
+                    match self.tabs[i].scene.document.get_entity(insert_handle) {
+                        Some(codec::EntityType::Insert(ins)) => ins.block_name.clone(),
+                        _ => {
+                            self.command_line.push_error(
+                                crate::t!("BEDIT: selected object is not a block reference.")
+                                    .as_ref(),
+                            );
+                            return Some(Task::none());
+                        }
                     }
                 };
 
                 // Resolve the block record; reject external references (xrefs).
-                let (br_handle, is_xref) = match self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get(&block_name)
-                {
-                    Some(br) => (br.handle, br.flags.is_xref),
-                    None => {
-                        self.command_line.push_error(crate::tf!(
-                            "BEDIT: block \"{}\" not found.",
-                            block_name
-                        ).as_ref());
-                        return Some(Task::none());
-                    }
-                };
-                if is_xref {
-                    self.command_line
-                        .push_error(crate::t!("BEDIT: cannot edit an external reference (xref).").as_ref());
-                    return Some(Task::none());
-                }
-                if self.tabs[i]
-                    .block_edits
-                    .iter()
-                    .any(|session| session.br_handle == br_handle)
-                {
-                    self.tabs[i].active_cmd = None;
-                    return Some(Task::done(Message::BlockEditSwitch(
-                        block_name.clone(),
-                    )));
-                }
-
-                // Snapshot the complete block definition so Discard can restore
-                // structural markers, ATTDEFs and geometry with exact handles.
-                let snapshot: Vec<_> = {
-                    let br = self.tabs[i]
-                        .scene
-                        .document
-                        .block_records
-                        .get(&block_name)
-                        .unwrap();
-                    br.entity_handles
-                        .iter()
-                        .filter_map(|h| self.tabs[i].scene.document.get_entity(*h).cloned())
-                        .collect()
-                };
-                let dependent_snapshot: Vec<_> = self.tabs[i]
-                    .scene
-                    .block_definition_dependent_handles(br_handle)
-                    .into_iter()
-                    .filter_map(|handle| {
-                        self.tabs[i].scene.document.get_entity_arc(handle)
-                    })
-                    .collect();
-                let reference_attributes: Vec<_> = self.tabs[i]
-                    .scene
-                    .document
-                    .entities()
-                    .filter_map(|entity| match entity {
-                        codec::EntityType::Insert(reference)
-                            if reference.block_name.eq_ignore_ascii_case(&block_name)
-                                && !reference.attributes.is_empty() =>
-                        {
-                            Some((
-                                reference.common.handle,
-                                reference.attributes.clone(),
-                            ))
+                let (br_handle, is_xref) =
+                    match self.tabs[i].scene.document.block_records.get(&block_name) {
+                        Some(br) => (br.handle, br.flags.is_xref || br.flags.is_xref_overlay),
+                        None => {
+                            self.command_line.push_error(
+                                crate::tf!("BEDIT: block \"{}\" not found.", block_name).as_ref(),
+                            );
+                            return Some(Task::none());
                         }
-                        _ => None,
-                    })
-                    .collect();
-
-                self.push_undo_snapshot(i, "BEDIT");
-
-                // Capture the camera before the editor reframes it, so leaving
-                // the block editor returns the view exactly where it was (#425).
-                let current_camera = self.tabs[i].scene.camera.borrow().clone();
-                let current_ucs = self.tabs[i].active_ucs.clone();
-                let (return_layout, return_block, return_camera) =
-                    if let Some(parent_index) = self.tabs[i].active_block_edit {
-                        let parent = &mut self.tabs[i].block_edits[parent_index];
-                        parent.editor_camera = current_camera.clone();
-                        parent.editor_ucs = current_ucs;
-                        (
-                            parent.return_layout.clone(),
-                            Some(parent.block_name.clone()),
-                            parent.return_camera.clone(),
-                        )
-                    } else {
-                        self.tabs[i].scene.sync_camera_to_document();
-                        (
-                            self.tabs[i].scene.current_layout.clone(),
-                            None,
-                            current_camera.clone(),
-                        )
                     };
-                // A block editor renders in model style; switch to Model first so
-                // the paper-space code paths stay off, then scope to the block.
-                if self.tabs[i].scene.current_layout != "Model" {
-                    self.tabs[i].scene.set_current_layout("Model".to_string());
-                }
-                self.tabs[i].scene.block_edit_block = Some(br_handle);
-                self.tabs[i].block_edits.push(BlockEditSession {
-                    block_name: block_name.clone(),
-                    br_handle,
-                    return_layout,
-                    return_block,
-                    snapshot,
-                    dependent_snapshot,
-                    reference_attributes,
-                    return_camera,
-                    editor_camera: current_camera,
-                    editor_ucs: None,
-                });
-                self.tabs[i].active_block_edit = Some(self.tabs[i].block_edits.len() - 1);
-                // Every BEDIT tab owns an isolated local UCS. Never inherit or
-                // overwrite the drawing's model-space UCS.
-                self.tabs[i].refresh_active_ucs();
-
-                self.tabs[i].scene.deselect_all();
-                // The first click of a double-click selects the model-space
-                // INSERT and populates the cached grip overlay. Clearing only
-                // Scene::selected leaves that INSERT's grips active inside the
-                // block editor, where dragging one moves the outer reference
-                // instead of block-local geometry (#517).
-                self.tabs[i].active_grip = None;
-                self.grip_hover = None;
-                self.grip_popup = None;
-                self.visibility_popup = None;
-                // Entering BEDIT changes which block is assembled, not the
-                // cached geometry of that block's entities.
-                self.tabs[i].scene.bump_geometry_no_blocks();
-                // Frame the camera on the block's own geometry (block-local, near
-                // origin) — fit_all() goes through current_layout_block_handle so
-                // it already scopes to the edited block. Without this the view
-                // stays wherever model/paper space was. (#261)
-                self.tabs[i].scene.fit_all();
-                let editor_camera = self.tabs[i].scene.camera.borrow().clone();
-                if let Some(session) = self.tabs[i].active_block_edit_session_mut() {
-                    session.editor_camera = editor_camera;
-                }
-                self.tabs[i].last_synced_camera_gen = self.tabs[i].scene.camera_generation;
-                self.refresh_properties();
-                self.tabs[i].active_cmd = None;
-                self.tabs[i].dirty = true;
-                self.command_line.push_info(crate::tf!(
-                    "BEDIT: Editing block \"{}\". Use Save Block or Discard to finish.",
-                    block_name
-                ).as_ref());
-            }
-
-            "BEDIT_SAVE" => {
-                let session = match self.tabs[i].active_block_edit.take() {
-                    Some(index) if index < self.tabs[i].block_edits.len() => {
-                        self.tabs[i].block_edits.remove(index)
-                    }
-                    None => {
-                        self.command_line
-                            .push_error(crate::t!("BEDIT_SAVE: no block editor is open.").as_ref());
-                        return Some(Task::none());
-                    }
-                    Some(_) => {
-                        self.command_line
-                            .push_error(crate::t!("BEDIT_SAVE: invalid block editor state.").as_ref());
-                        return Some(Task::none());
-                    }
-                };
-                // Edits are live on the block record — just leave the block space.
-                self.restore_after_block_edit_close(
-                    i,
-                    session.return_block.as_deref(),
-                    &session.return_layout,
-                    &session.return_camera,
-                );
-                self.tabs[i].dirty = true;
-                self.command_line.push_output(crate::tf!(
-                    "BEDIT: Block \"{}\" saved. All references updated.",
-                    session.block_name
-                ).as_ref());
-            }
-
-            "BEDIT_DISCARD" => {
-                let session = match self.tabs[i].active_block_edit.take() {
-                    Some(index) if index < self.tabs[i].block_edits.len() => {
-                        self.tabs[i].block_edits.remove(index)
-                    }
-                    None => {
-                        self.command_line
-                            .push_error(crate::t!("BEDIT_DISCARD: no block editor is open.").as_ref());
-                        return Some(Task::none());
-                    }
-                    Some(_) => {
-                        self.command_line
-                            .push_error(crate::t!("BEDIT_DISCARD: invalid block editor state.").as_ref());
-                        return Some(Task::none());
-                    }
-                };
-                // Restore the block definition to its on-entry snapshot: remove the
-                // block's current entities, then re-add the snapshot ones (mirrors
-                // the REFCLOSE_SAVE write-back).
-                let old_handles: Vec<_> = match self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get(&session.block_name)
-                {
-                    Some(br) => br.entity_handles.clone(),
-                    None => vec![],
-                };
-                for h in &old_handles {
-                    self.tabs[i].scene.document.remove_entity(*h);
-                }
-                if let Some(br) = self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get_mut(&session.block_name)
-                {
-                    br.entity_handles.clear();
-                }
-                let block_name = session.block_name.clone();
-                let return_block = session.return_block.clone();
-                let return_layout = session.return_layout.clone();
-                let return_camera = session.return_camera.clone();
-                for mut entity in session.snapshot {
-                    // Preserve the original handle so ATTDEF references and
-                    // other handle-based relationships survive Discard.
-                    entity.common_mut().owner_handle = session.br_handle;
-                    let _ = self.tabs[i].scene.document.add_entity(entity);
-                }
-                for (handle, attributes) in session.reference_attributes {
-                    if let Some(codec::EntityType::Insert(reference)) =
-                        self.tabs[i].scene.document.get_entity_mut(handle)
-                    {
-                        reference.attributes = attributes;
-                    }
-                }
-                for entity in session.dependent_snapshot {
-                    let handle = entity.common().handle;
-                    let _ = self.tabs[i]
-                        .scene
-                        .document
-                        .replace_entity_arc(handle, entity);
-                }
-                self.restore_after_block_edit_close(
-                    i,
-                    return_block.as_deref(),
-                    &return_layout,
-                    &return_camera,
-                );
-                self.tabs[i].dirty = true;
-                self.command_line.push_output(crate::tf!(
-                    "BEDIT: Block \"{}\" edit discarded.",
-                    block_name
-                ).as_ref());
-            }
-
-            cmd if cmd.starts_with("REFEDIT_BEGIN:") => {
-                use crate::modules::draw::modify::refedit::{
-                    apply_insert_transform, RefEditSession,
-                };
-                use codec::Handle;
-
-                let handle_u64: u64 = cmd["REFEDIT_BEGIN:".len()..].parse().unwrap_or(0);
-                let insert_handle = Handle::new(handle_u64);
-                if self.reject_locked_edit(i, insert_handle) {
-                    return Some(Task::none());
-                }
-
-                // Get INSERT entity.
-                let insert = match self.tabs[i].scene.document.get_entity(insert_handle) {
-                    Some(codec::EntityType::Insert(ins)) => ins.clone(),
-                    _ => {
-                        self.command_line
-                            .push_error(crate::t!("REFEDIT: selected object is not an INSERT.").as_ref());
-                        return Some(Task::none());
-                    }
-                };
-
-                // Build the INSERT's full placement transform (OCS + rotation +
-                // scale, including non-uniform / mirrored) and its inverse, so
-                // edits round-trip back to block-local coordinates on SAVE.
-                let sx = insert.x_scale();
-                let sy = insert.y_scale();
-                let sz = insert.z_scale();
-                let forward = insert.get_transform();
-                let inverse = {
-                    use codec::types::{Matrix3, Matrix4, Transform};
-                    let ocs_t =
-                        Matrix4::from_matrix3(Matrix3::arbitrary_axis(insert.normal).transpose());
-                    let t_inv = Matrix4::translation(
-                        -insert.insert_point.x,
-                        -insert.insert_point.y,
-                        -insert.insert_point.z,
+                if is_xref {
+                    self.command_line.push_error(
+                        crate::t!("BEDIT: cannot edit an external reference (xref).").as_ref(),
                     );
-                    let r_inv = Matrix4::rotation_z(-insert.rotation);
-                    let s_inv = Matrix4::scaling(1.0 / sx, 1.0 / sy, 1.0 / sz);
-                    // inverse(OCS·T·R·S) = S⁻¹·R⁻¹·T⁻¹·OCSᵀ
-                    Transform::from_matrix(s_inv * r_inv * t_inv * ocs_t)
-                };
-
-                // Find the block record.
-                let br_handle = match self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get(&insert.block_name)
-                {
-                    Some(br) => br.handle,
-                    None => {
-                        self.command_line.push_error(crate::tf!(
-                            "REFEDIT: block \"{}\" not found.",
-                            insert.block_name
-                        ).as_ref());
-                        return Some(Task::none());
-                    }
-                };
-
-                // Collect block-local entities (skip structural Block/BlockEnd/AttDef).
-                let block_entities: Vec<_> = {
-                    let br = self.tabs[i]
-                        .scene
-                        .document
-                        .block_records
-                        .get(&insert.block_name)
-                        .unwrap();
-                    br.entity_handles
-                        .iter()
-                        .filter_map(|h| self.tabs[i].scene.document.get_entity(*h).cloned())
-                        .filter(|e| {
-                            !matches!(
-                                e,
-                                codec::EntityType::Block(_)
-                                    | codec::EntityType::BlockEnd(_)
-                                    | codec::EntityType::AttributeDefinition(_)
-                            )
-                        })
-                        .collect()
-                };
-
-                if block_entities.is_empty() {
-                    self.command_line.push_error(crate::t!("REFEDIT: block is empty.").as_ref());
                     return Some(Task::none());
                 }
-
-                let session = RefEditSession {
-                    block_name: insert.block_name.clone(),
-                    br_handle,
-                    temp_handles: vec![],
-                    forward,
-                    inverse,
-                    // Everything allocated from here on is part of the session.
-                    handle_watermark: self
-                        .tabs[i]
-                        .scene
-                        .document
-                        .next_handle()
-                        .max(self.tabs[i].scene.document.header.handle_seed),
-                };
-
-                self.push_undo_snapshot(i, "REFEDIT");
-                self.tabs[i].refedit_session = Some(session.clone());
-
-                // Add block entities to model space with INSERT transform applied.
-                let mut temp_handles = Vec::new();
-                for mut entity in block_entities {
-                    apply_insert_transform(&mut entity, &session);
-                    entity.common_mut().handle = codec::Handle::NULL;
-                    entity.common_mut().owner_handle = codec::Handle::NULL;
-                    let h = self.tabs[i].scene.add_entity(entity);
-                    temp_handles.push(h);
+                if let Some(session) = self.tabs[i].active_block_edit_session() {
+                    if session.br_handle == br_handle {
+                        return Some(Task::none());
+                    }
+                    return Some(self.request_block_edit_close(
+                        i,
+                        crate::app::block_editor::BlockEditContinuation::Switch(block_name),
+                    ));
                 }
-                self.tabs[i].refedit_session.as_mut().unwrap().temp_handles = temp_handles.clone();
 
-                // Fade everything except the entities being edited, so the
-                // surrounding drawing stays visible for context but the block's
-                // geometry stands out. (#136)
-                self.tabs[i]
-                    .scene
-                    .set_refedit_keep(Some(temp_handles.iter().copied().collect()));
-
-                // Select the temp entities so user can see what they're editing.
-                self.tabs[i].scene.deselect_all();
-                for h in &temp_handles {
-                    self.tabs[i].scene.select_entity(*h, false);
-                }
-                self.tabs[i].dirty = true;
-
-                // No active command — the user edits the block's geometry freely
-                // (move, grips, draw, erase…) and runs REFCLOSE when done. (#136)
-                self.tabs[i].active_cmd = None;
-                self.command_line.push_info(crate::tf!(
-                    "REFEDIT: Editing block \"{}\". Run REFCLOSE to save, REFCLOSE_DISCARD to cancel.",
-                    insert.block_name
-                ).as_ref());
+                self.start_block_edit_session(i, block_name, br_handle, None);
             }
 
-            "REFCLOSE" => {
-                if self.tabs[i].refedit_session.is_some() {
-                    use crate::modules::draw::modify::refedit::RefCloseCommand;
-                    let cmd_obj = RefCloseCommand::new();
-                    self.command_line.push_info(&cmd_obj.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
-                } else {
+            "BSAVE" => {
+                self.save_block_edit(i);
+            }
+            "BTESTBLOCK" => return Some(self.open_block_test(i)),
+            "BCLOSETESTBLOCK" => return Some(self.close_block_test(i)),
+            "BSAVEAS" => {
+                self.open_block_save_as_dialog(i);
+            }
+            cmd if cmd.starts_with("BSAVEAS:") => {
+                self.save_block_edit_as(i, &cmd["BSAVEAS:".len()..]);
+            }
+            "BCLOSE" => {
+                if self.tabs[i].active_block_edit.is_none() {
                     self.command_line
-                        .push_error(crate::t!("REFCLOSE: no REFEDIT session active.").as_ref());
+                        .push_error(crate::t!("No block editor is open.").as_ref());
+                } else {
+                    return Some(self.request_block_edit_close(
+                        i,
+                        crate::app::block_editor::BlockEditContinuation::Close,
+                    ));
                 }
             }
-
-            "REFCLOSE_SAVE" => {
-                use crate::modules::draw::modify::explode::normalize_entity_for_block;
-                use crate::modules::draw::modify::refedit::apply_insert_inverse_transform;
-
-                let session = match self.tabs[i].refedit_session.take() {
-                    Some(s) => s,
-                    None => {
-                        self.command_line
-                            .push_error(crate::t!("REFCLOSE: no REFEDIT session active.").as_ref());
-                        return Some(Task::none());
-                    }
-                };
-
-                self.push_undo_snapshot(i, "REFCLOSE");
-
-                // The working set: the temp copies PLUS everything the user
-                // created in this space during the session (drawn / pasted /
-                // offset entities carry handles at or above the watermark) —
-                // those must fold into the block too, not stay behind in
-                // model space (#423).
-                let working: Vec<codec::Handle> = {
-                    let space = self.tabs[i].scene.current_layout_block_handle_pub();
-                    let drawn = self.tabs[i].scene.document.entities().filter(|e| {
-                        let c = e.common();
-                        c.owner_handle == space
-                            && c.handle.value() >= session.handle_watermark
-                            && !session.temp_handles.contains(&c.handle)
-                    });
-                    session
-                        .temp_handles
-                        .iter()
-                        .copied()
-                        .chain(drawn.map(|e| e.common().handle))
-                        .collect()
-                };
-
-                // Collect the edited temp entities.
-                let new_entities: Vec<codec::EntityType> = working
-                    .iter()
-                    .filter_map(|h| self.tabs[i].scene.document.get_entity(*h).cloned())
-                    .collect();
-
-                // Remove temp entities from model space.
-                self.tabs[i].scene.erase_entities(&working);
-
-                // Apply inverse INSERT transform → block-local coordinates.
-                let new_entities: Vec<_> = new_entities
-                    .into_iter()
-                    .map(|mut entity| {
-                        apply_insert_inverse_transform(&mut entity, &session);
-                        let mut entity = normalize_entity_for_block(entity);
-                        entity.common_mut().handle = codec::Handle::NULL;
-                        entity.common_mut().owner_handle = session.br_handle;
-                        entity
-                    })
-                    .collect();
-
-                // Remove old block entities from the document.
-                let old_handles: Vec<_> = match self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get(&session.block_name)
-                {
-                    Some(br) => br.entity_handles.clone(),
-                    None => vec![],
-                };
-                for h in &old_handles {
-                    self.tabs[i].scene.document.remove_entity(*h);
+            "BEDIT_SAVE" => {
+                if self.save_block_edit(i) {
+                    self.close_block_edit(i, false);
                 }
-                // Flush the entity_handles list from the block record.
-                if let Some(br) = self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .get_mut(&session.block_name)
-                {
-                    br.entity_handles.clear();
-                }
-
-                // Add the new block entities.
-                for entity in new_entities {
-                    let _ = self.tabs[i].scene.document.add_entity(entity);
-                }
-
-                self.tabs[i].dirty = true;
-                self.command_line.push_output(crate::tf!(
-                    "REFCLOSE: Block \"{}\" saved. All references updated.",
-                    session.block_name
-                ).as_ref());
-                // End the edit fade before rebuilding, so the restored geometry
-                // recolours bright. (#136)
-                self.tabs[i].scene.set_refedit_keep(None);
-                // Rebuild hatch/image/mesh caches since block content changed.
-                self.tabs[i].scene.rebuild_derived_caches();
             }
-
-            "REFCLOSE_DISCARD" => {
-                let session = match self.tabs[i].refedit_session.take() {
-                    Some(s) => s,
-                    None => {
-                        self.command_line
-                            .push_error(crate::t!("REFCLOSE: no REFEDIT session active.").as_ref());
-                        return Some(Task::none());
-                    }
-                };
-                // Remove the working set without modifying the block — the
-                // temp copies plus anything created during the session (#423).
-                let working: Vec<codec::Handle> = {
-                    let space = self.tabs[i].scene.current_layout_block_handle_pub();
-                    let drawn = self.tabs[i].scene.document.entities().filter(|e| {
-                        let c = e.common();
-                        c.owner_handle == space
-                            && c.handle.value() >= session.handle_watermark
-                            && !session.temp_handles.contains(&c.handle)
-                    });
-                    session
-                        .temp_handles
-                        .iter()
-                        .copied()
-                        .chain(drawn.map(|e| e.common().handle))
-                        .collect()
-                };
-                self.tabs[i].scene.erase_entities(&working);
-                self.tabs[i].scene.deselect_all();
-                // End the edit fade — restore the drawing to full brightness.
-                self.tabs[i].scene.set_refedit_keep(None);
-                self.command_line
-                    .push_output(crate::t!("REFCLOSE: Changes discarded.").as_ref());
+            "BEDIT_DISCARD" => {
+                if self.tabs[i].active_block_edit.is_none() {
+                    self.command_line
+                        .push_error(crate::t!("No block editor is open.").as_ref());
+                } else {
+                    self.close_block_edit(i, true);
+                }
             }
 
             "ALIGN" => {
@@ -1077,7 +646,8 @@ impl OpenCADStudio {
 
             "MEASURE" => {
                 use crate::modules::draw::inquiry::divide::MeasureCommand;
-                let cmd = MeasureCommand::new().with_blocks(self.tabs[i].scene.custom_block_names());
+                let cmd =
+                    MeasureCommand::new().with_blocks(self.tabs[i].scene.custom_block_names());
                 self.command_line.push_info(&cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
             }
@@ -1108,21 +678,102 @@ impl OpenCADStudio {
             "MASSPROP" => {
                 let selected = self.tabs[i].scene.selected_entities();
                 if selected.is_empty() {
-                    self.command_line
-                        .push_error(crate::t!("MASSPROP: no entities selected. Select entities first.").as_ref());
+                    self.command_line.push_error(
+                        crate::t!("MASSPROP: no entities selected. Select entities first.")
+                            .as_ref(),
+                    );
                 } else {
                     for (handle, _) in &selected {
                         if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle) {
                             use crate::entities::traits::EntityTypeOps;
+                            // A solid's properties come from its B-rep: exact
+                            // where the kernel knows the shape, a fine mesh
+                            // otherwise — not the display mesh.
+                            let acis = match entity {
+                                codec::EntityType::Solid3D(solid) => Some(&solid.acis_data),
+                                codec::EntityType::Body(body) => Some(&body.acis_data),
+                                _ => None,
+                            };
+                            if let Some(acis) = acis {
+                                let properties =
+                                    crate::scene::convert::solid3d_tess::kernel_acis_body(acis)
+                                        .and_then(|body| kernel::brep::mass_properties(&body));
+                                let Some(p) = properties else {
+                                    self.command_line.push_error(
+                                        crate::tf!(
+                                            "MASSPROP: {} has no closed body to measure.",
+                                            crate::entities::names::dxf_name(entity),
+                                        )
+                                        .as_ref(),
+                                    );
+                                    continue;
+                                };
+                                let [x, y, z] = p.centroid;
+                                let [ix, iy, iz] = p.moment_of_inertia;
+                                let [pxy, pyz, pzx] = p.product_of_inertia;
+                                let [rx, ry, rz] = p.radii_of_gyration;
+                                let [i1, i2, i3] = p.principal_moments;
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "{}  Volume={:.4}  Centroid=({:.4},{:.4},{:.4})",
+                                        crate::entities::names::dxf_name(entity),
+                                        p.volume,
+                                        x,
+                                        y,
+                                        z,
+                                    )
+                                    .as_ref(),
+                                );
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "Moments of inertia  X={:.4}  Y={:.4}  Z={:.4}",
+                                        ix,
+                                        iy,
+                                        iz,
+                                    )
+                                    .as_ref(),
+                                );
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "Products of inertia  XY={:.4}  YZ={:.4}  ZX={:.4}",
+                                        pxy,
+                                        pyz,
+                                        pzx,
+                                    )
+                                    .as_ref(),
+                                );
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "Radii of gyration  X={:.4}  Y={:.4}  Z={:.4}",
+                                        rx,
+                                        ry,
+                                        rz,
+                                    )
+                                    .as_ref(),
+                                );
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                    "Principal moments about centroid  I={:.4}  J={:.4}  K={:.4}",
+                                    i1,
+                                    i2,
+                                    i3,
+                                )
+                                    .as_ref(),
+                                );
+                                continue;
+                            }
                             if let Some(props) = entity.mass_props() {
-                                self.command_line.push_output(crate::tf!(
-                                    "{}  Area={:.4}  Perimeter={:.4}  Centroid=({:.4},{:.4})",
-                                    crate::entities::names::dxf_name(entity),
-                                    props.area,
-                                    props.perimeter,
-                                    props.cx,
-                                    props.cy,
-                                ).as_ref());
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "{}  Area={:.4}  Perimeter={:.4}  Centroid=({:.4},{:.4})",
+                                        crate::entities::names::dxf_name(entity),
+                                        props.area,
+                                        props.perimeter,
+                                        props.cx,
+                                        props.cy,
+                                    )
+                                    .as_ref(),
+                                );
                             }
                         }
                     }
@@ -1132,10 +783,10 @@ impl OpenCADStudio {
             // ── FLATTEN — move selected (or all) entities to Z=0 ─────────────
             "FLATTEN" => {
                 let scene = &self.tabs[i].scene;
-                let handles =
-                    crate::modules::draw::modify::flatten::collect_flatten_handles(scene);
+                let handles = crate::modules::draw::modify::flatten::collect_flatten_handles(scene);
                 if handles.is_empty() {
-                    self.command_line.push_error(crate::t!("FLATTEN: no entities.").as_ref());
+                    self.command_line
+                        .push_error(crate::t!("FLATTEN: no entities.").as_ref());
                 } else {
                     let candidate_count = handles.len();
                     let updates = crate::modules::draw::modify::flatten::plan_flatten(
@@ -1159,11 +810,14 @@ impl OpenCADStudio {
                         self.tabs[i].dirty = true;
                         self.refresh_properties();
                     }
-                    self.command_line.push_output(crate::tf!(
-                        "FLATTEN: {} entity(ies) moved to Z=0; {} unchanged or unsupported.",
-                        moved,
-                        candidate_count.saturating_sub(moved)
-                    ).as_ref());
+                    self.command_line.push_output(
+                        crate::tf!(
+                            "FLATTEN: {} entity(ies) moved to Z=0; {} unchanged or unsupported.",
+                            moved,
+                            candidate_count.saturating_sub(moved)
+                        )
+                        .as_ref(),
+                    );
                 }
             }
 
@@ -1225,49 +879,11 @@ impl OpenCADStudio {
                     for h in &matched {
                         self.tabs[i].scene.select_entity(*h, false);
                     }
-                    self.command_line
-                        .push_output(crate::tf!("QSELECT: {} entity(ies) selected.", matched.len()).as_ref());
+                    self.command_line.push_output(
+                        crate::tf!("QSELECT: {} entity(ies) selected.", matched.len()).as_ref(),
+                    );
                     self.refresh_properties();
                 }
-            }
-
-            // ── COUNT — entity statistics ─────────────────────────────────────
-            "COUNT" => {
-                use crate::command::KeywordCommand;
-                let c = KeywordCommand::new(
-                    "COUNT",
-                    "COUNT  tally  [All (by type) / by Layer]:",
-                    vec![("All", "TYPE", None), ("By layer", "LAYER", None)],
-                );
-                self.command_line.push_info(&c.prompt());
-                self.tabs[self.active_tab].active_cmd = Some(Box::new(c));
-            }
-            cmd if cmd.starts_with("COUNT ") => {
-                let filter = cmd.split_once(' ').map(|(_, r)| r.trim().to_uppercase());
-                let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-                for e in self.tabs[i].scene.document.entities() {
-                    let layer = &e.common().layer;
-                    let type_name = crate::entities::names::dxf_name(e);
-                    let key = match &filter {
-                        Some(f) if f == "LAYER" => layer.clone(),
-                        Some(f) if f == "TYPE" => type_name.to_string(),
-                        Some(f) => {
-                            // Filter by layer name
-                            if layer.to_uppercase() != *f {
-                                continue;
-                            }
-                            type_name.to_string()
-                        }
-                        None => type_name.to_string(),
-                    };
-                    *counts.entry(key).or_default() += 1;
-                }
-                let total: usize = counts.values().sum();
-                for (k, n) in &counts {
-                    self.command_line.push_output(crate::tf!("  {k}: {n}").as_ref());
-                }
-                self.command_line
-                    .push_output(crate::tf!("COUNT: {total} entity(ies) total.").as_ref());
             }
 
             "DATAEXTRACTION" | "EATTEXT" | "ATTEXT" => {
@@ -1296,15 +912,16 @@ impl OpenCADStudio {
 
                 // Split at " REPLACE " keyword (case-insensitive). ASCII case
                 // mapping keeps byte offsets valid for slicing `rest`.
-                let (search, replacement) = if let Some(pos) = rest.to_ascii_uppercase().find(" REPLACE ")
-                {
-                    (&rest[..pos], Some(rest[pos + 9..].trim()))
-                } else {
-                    (rest, None)
-                };
+                let (search, replacement) =
+                    if let Some(pos) = rest.to_ascii_uppercase().find(" REPLACE ") {
+                        (&rest[..pos], Some(rest[pos + 9..].trim()))
+                    } else {
+                        (rest, None)
+                    };
 
                 if search.is_empty() {
-                    self.command_line.push_error(crate::t!("FIND: specify search text.").as_ref());
+                    self.command_line
+                        .push_error(crate::t!("FIND: specify search text.").as_ref());
                 } else {
                     let search_lc = search.to_lowercase();
                     let mut count = 0usize;
@@ -1334,8 +951,9 @@ impl OpenCADStudio {
                         .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
                         .collect();
                         if targets.is_empty() {
-                            self.command_line
-                                .push_output(crate::tf!("FIND: \"{}\" not found.", search).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("FIND: \"{}\" not found.", search).as_ref(),
+                            );
                         } else {
                             self.push_undo_snapshot(i, "FIND/REPLACE");
                             for h in &targets {
@@ -1347,34 +965,38 @@ impl OpenCADStudio {
                                 }
                             }
                             self.tabs[i].dirty = true;
-                            self.command_line.push_output(crate::tf!(
-                                "FIND/REPLACE: replaced {} occurrence(s) of \"{}\" → \"{}\".",
-                                count, search, rep
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "FIND/REPLACE: replaced {} occurrence(s) of \"{}\" → \"{}\".",
+                                    count,
+                                    search,
+                                    rep
+                                )
+                                .as_ref(),
+                            );
                             self.refresh_properties();
                         }
                     } else {
                         // List mode
                         if handles.is_empty() {
-                            self.command_line
-                                .push_output(crate::tf!("FIND: \"{}\" not found.", search).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("FIND: \"{}\" not found.", search).as_ref(),
+                            );
                         } else {
                             for h in &handles {
                                 if let Some(e) = self.tabs[i].scene.document.get_entity(*h) {
                                     use crate::entities::traits::EntityTypeOps;
                                     let txt = e.text_content().unwrap_or_default();
-                                    self.command_line.push_output(crate::tf!(
-                                        "  Handle {:X}: \"{}\"",
-                                        h.value(),
-                                        txt
-                                    ).as_ref());
+                                    self.command_line.push_output(
+                                        crate::tf!("  Handle {:X}: \"{}\"", h.value(), txt)
+                                            .as_ref(),
+                                    );
                                 }
                             }
-                            self.command_line.push_output(crate::tf!(
-                                "FIND: {} match(es) for \"{}\".",
-                                handles.len(),
-                                search
-                            ).as_ref());
+                            self.command_line.push_output(
+                                crate::tf!("FIND: {} match(es) for \"{}\".", handles.len(), search)
+                                    .as_ref(),
+                            );
                         }
                     }
                 }
@@ -1385,12 +1007,94 @@ impl OpenCADStudio {
         Some(self.finish_dispatch(cmd))
     }
 
-    fn restore_after_block_edit_close(
+    pub(in crate::app) fn start_block_edit_session(
+        &mut self,
+        i: usize,
+        block_name: String,
+        br_handle: codec::Handle,
+        unpersisted_pre_document: Option<codec::CadDocument>,
+    ) {
+        use crate::modules::draw::modify::block_edit::BlockEditSession;
+        // Capture the camera before the editor reframes it, so leaving
+        // the block editor returns the view exactly where it was (#425).
+        let current_camera = self.tabs[i].scene.camera.borrow().clone();
+        let current_ucs = self.tabs[i].active_ucs.clone();
+        let (return_layout, return_block, return_camera) =
+            if let Some(parent_index) = self.tabs[i].active_block_edit {
+                let parent = &mut self.tabs[i].block_edits[parent_index];
+                parent.editor_camera = current_camera.clone();
+                parent.editor_ucs = current_ucs;
+                (
+                    parent.return_layout.clone(),
+                    Some(parent.block_name.clone()),
+                    parent.return_camera.clone(),
+                )
+            } else {
+                self.tabs[i].scene.sync_camera_to_document();
+                (
+                    self.tabs[i].scene.current_layout.clone(),
+                    None,
+                    current_camera.clone(),
+                )
+            };
+        // A block editor renders in model style; switch to Model first so
+        // the paper-space code paths stay off, then scope to the block.
+        if self.tabs[i].scene.current_layout != "Model" {
+            self.tabs[i].scene.set_current_layout("Model".to_string());
+        }
+        self.tabs[i].scene.block_edit_block = Some(br_handle);
+        self.tabs[i].block_edits.push(BlockEditSession {
+            block_name: block_name.clone(),
+            br_handle,
+            return_layout,
+            return_block,
+            return_camera,
+            editor_camera: current_camera,
+            editor_ucs: None,
+            unpersisted_pre_document,
+        });
+        self.tabs[i].active_block_edit = Some(self.tabs[i].block_edits.len() - 1);
+        // Every BEDIT tab owns an isolated local UCS. Never inherit or
+        // overwrite the drawing's model-space UCS.
+        self.tabs[i].refresh_active_ucs();
+
+        self.tabs[i].scene.deselect_all();
+        // The first click of a double-click selects the model-space
+        // INSERT and populates the cached grip overlay. Clearing only
+        // Scene::selected leaves that INSERT's grips active inside the
+        // block editor, where dragging one moves the outer reference
+        // instead of block-local geometry (#517).
+        self.tabs[i].active_grip = None;
+        self.grip_hover = None;
+        self.grip_popup = None;
+        self.visibility_popup = None;
+        // Entering BEDIT changes which block is assembled, not the
+        // cached geometry of that block's entities.
+        self.tabs[i].scene.bump_geometry_no_blocks();
+        // Frame the camera on the block's own geometry (block-local, near
+        // origin) — fit_all() goes through current_layout_block_handle so
+        // it already scopes to the edited block. Without this the view
+        // stays wherever model/paper space was. (#261)
+        self.tabs[i].scene.fit_all();
+        let editor_camera = self.tabs[i].scene.camera.borrow().clone();
+        if let Some(session) = self.tabs[i].active_block_edit_session_mut() {
+            session.editor_camera = editor_camera;
+        }
+        self.tabs[i].last_synced_camera_gen = self.tabs[i].scene.camera_generation;
+        self.refresh_properties();
+        self.tabs[i].active_cmd = None;
+        self.begin_block_edit_history(i);
+        self.command_line
+            .push_info(crate::tf!("Block Editor: editing {}", block_name).as_ref());
+    }
+
+    pub(in crate::app) fn restore_after_block_edit_close(
         &mut self,
         i: usize,
         return_block: Option<&str>,
         return_layout: &str,
         return_camera: &crate::scene::view::camera::Camera,
+        saved: bool,
     ) {
         self.tabs[i].scene.block_edit_block = None;
         self.tabs[i].scene.deselect_all();
@@ -1432,7 +1136,13 @@ impl OpenCADStudio {
 
         self.tabs[i].scene.camera_generation += 1;
         self.tabs[i].last_synced_camera_gen = self.tabs[i].scene.camera_generation;
-        self.tabs[i].scene.rebuild_derived_caches();
+        if !saved {
+            self.tabs[i].scene.bump_geometry_no_blocks();
+        }
+        let layers = self.tabs[i].scene.document.layers.clone();
+        let viewports = self.tabs[i].scene.viewport_list();
+        self.tabs[i].layers.sync_with_viewports(&layers, viewports);
+        self.sync_ribbon_layers();
         self.tabs[i].refresh_active_ucs();
         self.refresh_properties();
         self.adopt_view_display(i);
@@ -1472,15 +1182,26 @@ impl OpenCADStudio {
                 },
             )
         });
-        let Some((verb, kind, layer, color, transparency, linetype, lt_scale, lw, template_dimstyle)) = info
+        let Some((
+            verb,
+            kind,
+            layer,
+            color,
+            transparency,
+            linetype,
+            lt_scale,
+            lw,
+            template_dimstyle,
+        )) = info
         else {
             self.command_line
                 .push_error(crate::t!("ADDSELECTED: selected object not found.").as_ref());
             return Task::none();
         };
         let Some(verb) = verb else {
-            self.command_line
-                .push_error(crate::tf!("ADDSELECTED: creating a new {kind} is not supported.").as_ref());
+            self.command_line.push_error(
+                crate::tf!("ADDSELECTED: creating a new {kind} is not supported.").as_ref(),
+            );
             return Task::none();
         };
 
@@ -1493,15 +1214,34 @@ impl OpenCADStudio {
         // template's properties for the new object without permanently changing
         // CLAYER / CECOLOR / CELTYPE / CELWEIGHT (issue #239).
         let restore = crate::app::AddSelectedRestore {
-            layer_name: self.tabs[i].scene.document.header.current_layer_name.clone(),
+            layer_name: self.tabs[i]
+                .scene
+                .document
+                .header
+                .current_layer_name
+                .clone(),
             layer_handle: self.tabs[i].scene.document.header.current_layer_handle,
             color: self.tabs[i].scene.document.header.current_entity_color,
             transparency: self.tabs[i].scene.document.current_entity_transparency(),
-            linetype_name: self.tabs[i].scene.document.header.current_linetype_name.clone(),
+            linetype_name: self.tabs[i]
+                .scene
+                .document
+                .header
+                .current_linetype_name
+                .clone(),
             linetype_handle: self.tabs[i].scene.document.header.current_linetype_handle,
             line_weight: self.tabs[i].scene.document.header.current_line_weight,
-            lt_scale: self.tabs[i].scene.document.header.current_entity_linetype_scale,
-            dimstyle_name: self.tabs[i].scene.document.header.current_dimstyle_name.clone(),
+            lt_scale: self.tabs[i]
+                .scene
+                .document
+                .header
+                .current_entity_linetype_scale,
+            dimstyle_name: self.tabs[i]
+                .scene
+                .document
+                .header
+                .current_dimstyle_name
+                .clone(),
             dimstyle_handle: self.tabs[i].scene.document.header.current_dimstyle_handle,
             tab_active_layer: self.tabs[i].active_layer.clone(),
             tab_layers_current: self.tabs[i].layers.current_layer.clone(),
@@ -1511,9 +1251,14 @@ impl OpenCADStudio {
             ribbon_lineweight: self.ribbon.active_lineweight,
         };
         self.add_selected_restore = Some(restore);
-        if !self.tabs[i].scene.document.set_current_entity_transparency(transparency) {
+        if !self.tabs[i]
+            .scene
+            .document
+            .set_current_entity_transparency(transparency)
+        {
             self.add_selected_restore = None;
-            self.command_line.push_error("ADDSELECTED: template transparency cannot be adopted.");
+            self.command_line
+                .push_error("ADDSELECTED: template transparency cannot be adopted.");
             return Task::none();
         }
 
@@ -1571,9 +1316,9 @@ impl OpenCADStudio {
         self.ribbon.active_lineweight = lw;
         self.refresh_properties();
 
-        self.command_line.push_output(crate::tf!(
-            "Add Selected: drawing a new {kind} on layer \"{layer}\"."
-        ).as_ref());
+        self.command_line.push_output(
+            crate::tf!("Add Selected: drawing a new {kind} on layer \"{layer}\".").as_ref(),
+        );
         // Launch the matching draw command (installs its interactive step).
         self.dispatch_command(verb)
     }
@@ -1598,8 +1343,13 @@ impl OpenCADStudio {
             h.current_dimstyle_name = r.dimstyle_name;
             h.current_dimstyle_handle = r.dimstyle_handle;
         }
-        if !self.tabs[i].scene.document.set_current_entity_transparency(r.transparency) {
-            self.command_line.push_error("ADDSELECTED: current transparency could not be restored.");
+        if !self.tabs[i]
+            .scene
+            .document
+            .set_current_entity_transparency(r.transparency)
+        {
+            self.command_line
+                .push_error("ADDSELECTED: current transparency could not be restored.");
         }
         self.tabs[i].active_layer = r.tab_active_layer;
         self.tabs[i].layers.current_layer = r.tab_layers_current;
@@ -1667,7 +1417,8 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
                 + (l.end.y - l.start.y).powi(2)
                 + (l.end.z - l.start.z).powi(2))
             .sqrt()
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Circle(c) => crate::tf!(
             "center ({:.4},{:.4},{:.4})  r={:.4}  area={:.4}",
             c.center.x,
@@ -1675,7 +1426,8 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
             c.center.z,
             c.radius,
             PI * c.radius * c.radius
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Arc(a) => crate::tf!(
             "center ({:.4},{:.4},{:.4})  r={:.4}  start={:.2}° end={:.2}°",
             a.center.x,
@@ -1684,24 +1436,31 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
             a.radius,
             a.start_angle.to_degrees(),
             a.end_angle.to_degrees()
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::LwPolyline(p) => crate::tf!(
             "{} vertices  closed={}  elevation={:.4}",
             p.vertices.len(),
             p.is_closed,
             p.elevation
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Text(t) => crate::tf!(
             "\"{}\"  h={:.4}  at ({:.4},{:.4})",
-            t.value, t.height, t.insertion_point.x, t.insertion_point.y
-        ).into_owned(),
+            t.value,
+            t.height,
+            t.insertion_point.x,
+            t.insertion_point.y
+        )
+        .into_owned(),
         codec::EntityType::MText(t) => crate::tf!(
             "\"{}\"  h={:.4}  at ({:.4},{:.4})",
             t.value.chars().take(40).collect::<String>(),
             t.height,
             t.insertion_point.x,
             t.insertion_point.y
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Insert(ins) => crate::tf!(
             "block=\"{}\"  at ({:.4},{:.4},{:.4})  scale=({:.4},{:.4},{:.4})  rot={:.2}°",
             ins.block_name,
@@ -1712,24 +1471,26 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
             ins.y_scale(),
             ins.z_scale(),
             ins.rotation.to_degrees()
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Spline(s) => crate::tf!(
             "{} ctrl pts  degree={}  closed={}",
             s.control_points.len(),
             s.degree,
             s.flags.closed
-        ).into_owned(),
+        )
+        .into_owned(),
         codec::EntityType::Ellipse(e) => crate::tf!(
             "center ({:.4},{:.4})  major_len={:.4}  ratio={:.4}",
             e.center.x,
             e.center.y,
             e.major_axis_length(),
             e.minor_axis_ratio
-        ).into_owned(),
+        )
+        .into_owned(),
         _ => String::new(),
     }
 }
-
 
 // ── CAL — arithmetic expression evaluator ──────────────────────────────────
 // A small recursive-descent parser for `+ - * /`, parentheses, unary signs and
@@ -1860,10 +1621,10 @@ impl ArithParser {
             }
         }
         let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>().map_err(|_| crate::tf!("bad number '{s}'").into_owned())
+        s.parse::<f64>()
+            .map_err(|_| crate::tf!("bad number '{s}'").into_owned())
     }
 }
-
 
 #[cfg(test)]
 mod align_selected_bounds_tests {
@@ -1918,21 +1679,47 @@ mod align_selected_bounds_tests {
         let _ = app.automation_op(r#"{"op":"new"}"#);
         let left = add_line(&mut app, 0.0, 0.0, 1.0, 1.0); // leftmost & topmost already
         let right = add_line(&mut app, 5.0, -3.0, 8.0, -2.0); // further right and lower
-        app.tabs[app.active_tab].scene.select_entities(&[left, right]);
+        app.tabs[app.active_tab]
+            .scene
+            .select_entities(&[left, right]);
         let i = app.active_tab;
 
         app.dispatch_inquiry("ALIGNLEFT", i);
-        assert_eq!(line_start_x(&app, left), 0.0, "the already-leftmost object must not move");
-        assert_eq!(line_start_x(&app, right), 0.0, "the other object's left edge should meet it");
+        assert_eq!(
+            line_start_x(&app, left),
+            0.0,
+            "the already-leftmost object must not move"
+        );
+        assert_eq!(
+            line_start_x(&app, right),
+            0.0,
+            "the other object's left edge should meet it"
+        );
 
         app.dispatch_inquiry("ALIGNTOP", i);
-        assert_eq!(line_max_y(&app, left), 1.0, "the already-topmost object must not move");
-        assert_eq!(line_max_y(&app, right), 1.0, "the other object's top edge should meet it");
+        assert_eq!(
+            line_max_y(&app, left),
+            1.0,
+            "the already-topmost object must not move"
+        );
+        assert_eq!(
+            line_max_y(&app, right),
+            1.0,
+            "the other object's top edge should meet it"
+        );
 
         app.undo_steps(1); // undo ALIGNTOP
-        assert_eq!(line_max_y(&app, right), -2.0, "undo should restore the pre-ALIGNTOP position");
+        assert_eq!(
+            line_max_y(&app, right),
+            -2.0,
+            "undo should restore the pre-ALIGNTOP position"
+        );
         app.undo_steps(1); // undo ALIGNLEFT
-        assert_eq!(line_start_x(&app, right), 5.0, "undo should restore the original geometry");
+        assert_eq!(
+            line_start_x(&app, right),
+            5.0,
+            "undo should restore the original geometry"
+        );
     }
 
     /// A complete, fully-selected group (`Scene::selected_object_units`)
@@ -1945,8 +1732,12 @@ mod align_selected_bounds_tests {
         let a = add_line(&mut app, 5.0, 0.0, 6.0, 1.0);
         let b = add_line(&mut app, 7.0, 0.0, 8.0, 1.0);
         let other = add_line(&mut app, 0.0, 0.0, 1.0, 1.0);
-        app.tabs[app.active_tab].scene.create_group("pair".to_string(), vec![a, b]);
-        app.tabs[app.active_tab].scene.select_entities(&[a, b, other]);
+        app.tabs[app.active_tab]
+            .scene
+            .create_group("pair".to_string(), vec![a, b]);
+        app.tabs[app.active_tab]
+            .scene
+            .select_entities(&[a, b, other]);
         let i = app.active_tab;
 
         app.dispatch_inquiry("ALIGNLEFT", i);
@@ -1955,7 +1746,11 @@ mod align_selected_bounds_tests {
         // transform — must shift by exactly the same amount, not collapse
         // onto `a`.
         assert_eq!(line_start_x(&app, a), 0.0);
-        assert_eq!(line_start_x(&app, b), 2.0, "b must keep its offset from a, not collapse onto it");
+        assert_eq!(
+            line_start_x(&app, b),
+            2.0,
+            "b must keep its offset from a, not collapse onto it"
+        );
     }
 }
 
@@ -1968,7 +1763,11 @@ mod find_replace_command_tests {
     /// taken from a case-mapped copy.
     #[test]
     fn find_replace_accepts_search_text_whose_case_mapping_changes_length() {
-        for cmd in ["FIND ı REPLACE x", "FINDALL ﬁ REPLACE fi", "FIND ŉ replace n"] {
+        for cmd in [
+            "FIND ı REPLACE x",
+            "FINDALL ﬁ REPLACE fi",
+            "FIND ŉ replace n",
+        ] {
             let mut app = OpenCADStudio::new_for_test();
             let i = app.active_tab;
             let _ = app.dispatch_inquiry(cmd, i);
@@ -1996,18 +1795,37 @@ mod find_replace_command_tests {
         assert!(app.tabs[i].active_cmd.is_some());
 
         // First point
-        let _ = app.tabs[i].active_cmd.as_mut().unwrap().on_point(glam::DVec3::new(0.0, 0.0, 0.0));
+        let _ = app.tabs[i]
+            .active_cmd
+            .as_mut()
+            .unwrap()
+            .on_point(glam::DVec3::new(0.0, 0.0, 0.0));
         // Second point
-        let res = app.tabs[i].active_cmd.as_mut().unwrap().on_point(glam::DVec3::new(10.0, 0.0, 0.0));
+        let res = app.tabs[i]
+            .active_cmd
+            .as_mut()
+            .unwrap()
+            .on_point(glam::DVec3::new(10.0, 0.0, 0.0));
         match res {
             crate::command::CmdResult::Measurement(msg) => {
-                assert!(msg.contains("Distance = 10"), "Expected 'Distance = 10', got: {msg}");
-                assert!(msg.contains("Delta X = 10"), "Expected 'Delta X = 10', got: {msg}");
-                assert!(msg.contains("Delta Y = 0"), "Expected 'Delta Y = 0', got: {msg}");
-                assert!(msg.contains("Delta Z = 0"), "Expected 'Delta Z = 0', got: {msg}");
+                assert!(
+                    msg.contains("Distance = 10"),
+                    "Expected 'Distance = 10', got: {msg}"
+                );
+                assert!(
+                    msg.contains("Delta X = 10"),
+                    "Expected 'Delta X = 10', got: {msg}"
+                );
+                assert!(
+                    msg.contains("Delta Y = 0"),
+                    "Expected 'Delta Y = 0', got: {msg}"
+                );
+                assert!(
+                    msg.contains("Delta Z = 0"),
+                    "Expected 'Delta Z = 0', got: {msg}"
+                );
             }
             _ => panic!("Expected CmdResult::Measurement"),
         }
     }
 }
-

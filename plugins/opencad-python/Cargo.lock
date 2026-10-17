@@ -28,7 +28,6 @@ dependencies = [
  "cfg-if",
  "getrandom 0.3.4",
  "once_cell",
- "serde",
  "version_check",
  "zerocopy",
 ]
@@ -1264,15 +1263,15 @@ dependencies = [
 
 [[package]]
 name = "opencadcodec"
-version = "0.5.5"
-source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=cdf2277#cdf227782acab8b0b7035d99ed02530a90ae6773"
+version = "0.6.0"
+source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=85bb5a2#85bb5a2aa64108230ae71e5a2965690efd97c9e2"
 dependencies = [
- "ahash 0.8.12",
  "anyhow",
  "bitflags",
  "byteorder",
  "encoding_rs",
  "flate2",
+ "foldhash",
  "indexmap",
  "itoa",
  "memmap2",
@@ -1281,7 +1280,7 @@ dependencies = [
  "rayon",
  "ryu",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "web-time",
 ]
 

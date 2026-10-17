@@ -76,15 +76,22 @@ MCP advertise the whole surface; feature detection is `capabilities` (§4).
 
 `OpenCADStudio --http 8090` runs a private, window-less session behind a
 resource-oriented REST surface at `http://127.0.0.1:<port>/api/v1` (loopback
-bind only, permissive CORS, JSON bodies, one request per connection). A
+bind only, JSON bodies, one request per connection, no CORS headers). A
 machine-readable OpenAPI 3 description of the whole surface is served at
 `GET /api/v1/openapi`.
+
+Every request carries `Authorization: Bearer <token>`: the value of
+`OCS_API_TOKEN` when the launcher set it, otherwise a random token printed on
+stderr at startup. A request without it is answered **401**
+`{"code":"unauthorized"}`. Loopback is shared by every process and user on
+the machine, so the port alone is no credential.
 
 | Status | Meaning |
 |---|---|
 | `200` | Success (read or update) |
 | `201` | A resource was created (document, entities, block, group, selection set, layout) |
 | `400` | Validation failure — the body keeps the symbolic `code` and message |
+| `401` | Missing or wrong bearer token (`code:"unauthorized"`) |
 | `404` | Unknown route or unknown handle (`code:"entity_absent"`) |
 | `409` | State conflict (`stale_state`, `document_not_active`) or GUI required (`gui_required`) |
 | `503` | Dispatcher busy |
@@ -130,7 +137,7 @@ Differences worth knowing:
 - Unknown POST paths are treated as op attempts and forwarded (any op of the
   surface works — including `operation` to poll a pending pick and `cancel`
   to retract it); truly unrouted paths answer `404 {"code":"unknown_route"}`.
-- `OPTIONS *` answers **204** (CORS preflight).
+- The same bearer token as §3.1 is required on every request.
 
 ### 3.3 stdio JSONL (`--serve`)
 
@@ -142,6 +149,9 @@ envelope; mutations use the envelope of §1).
 ### 3.4 TCP (`--serve --port N`)
 
 The same JSONL protocol as §3.3 over `127.0.0.1:<N>`, one client at a time.
+Every request line carries `"token":"<token>"` (the §3.1 token); a line
+without it is answered `{"ok":false,"code":"unauthorized"}` and the
+connection is closed.
 
 ### 3.5 AI-tool session (`--mcp`)
 
@@ -245,17 +255,18 @@ REST: `POST /documents` (`{}` → fresh document, `{"template":…}`, `{"path":�
 `{"entities":[{…},…]}` — a batch of typed definitions, validated in full
 before anything commits; one undo step; missing layers are auto-created and
 reported in `result.layers_created`. Every definition also accepts `layer`
-and `color` (index).
+and `color` (index); any other field is refused (`unknown_entity_field`).
 
 | Type | Fields |
 |---|---|
 | `Line` | `start`, `end`, optional `thickness` |
 | `Circle` | `center`, `radius` (≥ 0) |
 | `Arc` | `center`, `radius` (> 0), `start_angle_deg`, `end_angle_deg` |
+| `Spline` | `control_points` (more than `degree`) or `fit_points` (≥ 2), optional `degree` (1–10, default 3), `knots` (control points + degree + 1, non-decreasing), `weights` (one positive value per control point), `closed`, `periodic`, `rational`, `planar`, `linear` |
 | `LwPolyline` | `vertices` (≥ 2), `closed`, optional `constant_width` |
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
-| `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg` |
+| `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
 | `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
@@ -343,10 +354,10 @@ registry with write rules), `properties`, `measure` (length/area/bounds),
 | Op | Fields | Semantics |
 |---|---|---|
 | `block_define` | `name`, `base:[x,y,z]`, `handles`, optional `insert_at`, optional `"replace":true` | The sources move into the new definition (flattened at `base` = block origin) and one `Insert` is placed at `insert_at` (default `base`), so the drawing looks unchanged. `"replace":true` drops a same-named definition — children, markers and inserts — inside the same undo step before creating the new one (idempotent re-import). Result `{"block":name,"insert":"<handle>"}`. Names are unique, `*` is reserved. |
-| `block_delete` | `name` | Removes the definition completely: child entities, block markers, every `Insert` referencing it and the table record. One undo step. Result `erased`. Unknown → `block_missing`; `*`-records → `block_protected`. |
+| `block_delete` | `name`, optional `"force":true` | Removes the definition completely: child entities, block markers and the table record. One undo step (`Delete block <name>`). A referenced block is refused (`block_referenced`); `"force":true` erases the referencing INSERTs in the same step and reports `result.references`. Result `erased`. Unknown → `block_missing`; layout/anonymous/xref/dynamic records → `block_protected`; open BEDIT session → `block_in_edit`; invalid/taken names → `block_invalid_name` / `block_exists`. |
 | `wblock` | `path`, `handles` *or* `block`; optional `"template":"<file>"` (the export inherits that file's tables/styles), optional `"normalize":true` (the export is shifted so its overall bounds minimum lands on the origin) | Writes a standalone DWG/DXF (extension decides). The source document is untouched. Result `{path, entities, normalized}`. |
 
-REST: `POST /blocks`, `DELETE /blocks/{name}`, `POST /wblock`.
+REST: `POST /blocks`, `DELETE /blocks/{name}` (add `?force=true` to erase the referencing INSERTs instead of being refused), `POST /wblock`.
 
 ### 6.6 Layouts and plotting
 
@@ -544,7 +555,7 @@ client's own log.
 
 ```sh
 # Create (missing layers auto-created; the batch is atomic).
-curl -s -X POST http://127.0.0.1:8090/api/v1/entities -H "Content-Type: application/json" -d '{
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/entities -H "Content-Type: application/json" -d '{
   "entities":[
     {"type":"Line","start":[0,0],"end":[100,0],"layer":"FRAME"},
     {"type":"Text","value":"PAGE-01","position":[10,50],"height":3.0}
@@ -552,16 +563,16 @@ curl -s -X POST http://127.0.0.1:8090/api/v1/entities -H "Content-Type: applicat
 # → 201 {"result":{"handles":["63","64"],"created":2,"layers_created":["FRAME"]}}
 
 # Filter by property.
-curl -s "http://127.0.0.1:8090/api/v1/entities?type=Line&where=%5B%7B%22path%22%3A%22%2Flayer%22%2C%22op%22%3A%22eq%22%2C%22value%22%3A%22FRAME%22%7D%5D"
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" "http://127.0.0.1:8090/api/v1/entities?type=Line&where=%5B%7B%22path%22%3A%22%2Flayer%22%2C%22op%22%3A%22eq%22%2C%22value%22%3A%22FRAME%22%7D%5D"
 
 # Mark, wrap into a reusable block, plot every sheet, save as a template.
-curl -s -X PUT http://127.0.0.1:8090/api/v1/entities/64/xdata/SPEC \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X PUT http://127.0.0.1:8090/api/v1/entities/64/xdata/SPEC \
   -H "Content-Type: application/json" -d '[{"code":1000,"value":"PAGE-01"}]'
-curl -s -X POST http://127.0.0.1:8090/api/v1/blocks \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/blocks \
   -H "Content-Type: application/json" -d '{"name":"MARK","base":[0,0,0],"handles":["63","64"]}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/plot \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/plot \
   -H "Content-Type: application/json" -d '{"path":"C:/out/pages.pdf","layout":"all","per_page":true}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/save \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/save \
   -H "Content-Type: application/json" -d '{"path":"C:/out/session.dwt"}'
 ```
 
@@ -572,14 +583,14 @@ OpenCADStudio.exe "C:/drawings/plan.dwg" --http 8090   # the editor stays intera
 
 # Ask the person to pick block references; the connection parks until they
 # press Enter (or Esc). No polling loop needed.
-curl -s -m 1800 -X POST http://127.0.0.1:8090/api/v1/user_select \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -m 1800 -X POST http://127.0.0.1:8090/api/v1/user_select \
   -H "Content-Type: application/json" \
   -d '{"request_id":"sample-1","type":"INSERT","detail":"full","prompt":"Pick the title blocks"}'
 # → {"ok":true,"status":"completed","result":{"cancelled":false,"count":2,…}}
 
 # Read the same entities back, then continue driving the live drawing.
-curl -s -X POST http://127.0.0.1:8090/api/v1/get_selection -d '{}'
-curl -s -X POST http://127.0.0.1:8090/api/v1/entities/transform \
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/get_selection -d '{}'
+curl -s -H "Authorization: Bearer $OCS_API_TOKEN" -X POST http://127.0.0.1:8090/api/v1/entities/transform \
   -H "Content-Type: application/json" \
   -d '{"handles":["6F"],"action":"move","vector":[5,0]}'
 ```

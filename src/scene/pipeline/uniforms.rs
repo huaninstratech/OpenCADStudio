@@ -39,7 +39,9 @@ pub struct Uniforms {
     // jitter.
     pub view_rot: glam::Mat4,
     pub eye_high: [f32; 3],
-    pub _pad_eh: f32,
+    /// Extra screen pixels added to every line width. Only the selection
+    /// overlay pass sees a non-zero value (`Pipeline::upload_uniforms`).
+    pub highlight_widen: f32,
     pub eye_low: [f32; 3],
     pub _pad_el: f32,
 
@@ -121,7 +123,7 @@ impl Uniforms {
             lineweight_scale: 1.0,
             view_rot: camera.view_proj_rte(bounds),
             eye_high,
-            _pad_eh: 0.0,
+            highlight_widen: 0.0,
             eye_low,
             _pad_el: 0.0,
             light_position_type: [[0.0; 4]; 4],

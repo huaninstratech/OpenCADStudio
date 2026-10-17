@@ -44,9 +44,23 @@ dl /tmp/NotoThai.ttf "$RAW/NotoSansThai/hinted/ttf/NotoSansThai-Regular.ttf"
 merge /tmp/NotoThai.ttf /tmp/NotoThaiMerged.ttf
 sub /tmp/NotoThaiMerged.ttf "U+0000-024F,U+1E00-1EFF,U+2000-206F,U+0E00-0E7F" thai.ttf
 
+dl /tmp/NotoLao.ttf "$RAW/NotoSansLao/hinted/ttf/NotoSansLao-Regular.ttf"
+merge /tmp/NotoLao.ttf /tmp/NotoLaoMerged.ttf
+sub /tmp/NotoLaoMerged.ttf "U+0000-024F,U+1E00-1EFF,U+2000-206F,U+0E80-0EFF" lao.ttf
+
 dl /tmp/NotoDeva.ttf "$RAW/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Regular.ttf"
 merge /tmp/NotoDeva.ttf /tmp/NotoDevaMerged.ttf
 sub /tmp/NotoDevaMerged.ttf "U+0000-024F,U+1E00-1EFF,U+2000-206F,U+0900-097F,U+A8E0-A8FF" devanagari.ttf
+
+# Armenian + Georgian follow the same one-source pattern (both are
+# non-CJK alphabets; no shaping tables needed beyond the merge).
+dl /tmp/NotoArmenian.ttf "$RAW/NotoSansArmenian/hinted/ttf/NotoSansArmenian-Regular.ttf"
+merge /tmp/NotoArmenian.ttf /tmp/NotoArmenianMerged.ttf
+sub /tmp/NotoArmenianMerged.ttf "U+0000-024F,U+1E00-1EFF,U+2000-206F,U+0530-058F,U+FB13-FB17" armenian.ttf
+
+dl /tmp/NotoGeorgian.ttf "$RAW/NotoSansGeorgian/hinted/ttf/NotoSansGeorgian-Regular.ttf"
+merge /tmp/NotoGeorgian.ttf /tmp/NotoGeorgianMerged.ttf
+sub /tmp/NotoGeorgianMerged.ttf "U+0000-024F,U+1E00-1EFF,U+2000-206F,U+10A0-10FF,U+1C90-1CBF,U+2D00-2D2F" georgian.ttf
 
 # CJK comes from the noto-cjk repo (CFF/OTF; ttf-parser reads CFF outlines) and
 # is split by language: Simplified Chinese, Traditional Chinese, Japanese and

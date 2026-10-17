@@ -1,17 +1,20 @@
+use crate::t;
 use codec::entities::{BoundaryEdge, Hatch};
+use glam::Vec3;
 use kernel::geom2d::{
     Arc as KernelArc, Curve as KernelCurve, Ellipse as KernelEllipse,
     EllipseArc as KernelEllipseArc, Line as KernelLine, NurbsCurve as KernelNurbs,
     Parameterization, Polyline as KernelPolyline, PolylineVertex as KernelVertex,
 };
-use glam::Vec3;
-use crate::t;
 
 use crate::command::EntityTransform;
-use crate::entities::common::{center_grip, circle_grip, edit_angle_prop as edit_angle, edit_prop as edit, parse_f64, ro_prop as ro};
+use crate::entities::common::{
+    center_grip, circle_grip, edit_angle_prop as edit_angle, edit_prop as edit, parse_f64,
+    ro_prop as ro,
+};
 use crate::entities::traits::{FallbackTess, Grippable, PropertyEditable, Transformable};
-use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::convert::tess_util::FallbackGeometry;
+use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
 
 /// The area enclosed by the hatch boundary paths.
@@ -122,18 +125,14 @@ pub(crate) fn edge_curve(edge: &BoundaryEdge) -> Option<KernelCurve> {
             let weights = s
                 .rational
                 .then(|| s.control_points.iter().map(|p| p.z).collect::<Vec<f64>>());
-            let curve = KernelNurbs::new(
-                s.degree.max(1) as usize,
-                control,
-                s.knots.clone(),
-                weights,
-            )
-            .or_else(|| {
-                // A fit-point boundary spline, interpolated the same way a
-                // SPLINE entity's is.
-                let fit: Vec<[f64; 2]> = s.fit_points.iter().map(|p| [p.x, p.y]).collect();
-                KernelNurbs::interpolate(&fit, None, None, Parameterization::Chord)
-            })?;
+            let curve =
+                KernelNurbs::new(s.degree.max(1) as usize, control, s.knots.clone(), weights)
+                    .or_else(|| {
+                        // A fit-point boundary spline, interpolated the same way a
+                        // SPLINE entity's is.
+                        let fit: Vec<[f64; 2]> = s.fit_points.iter().map(|p| [p.x, p.y]).collect();
+                        KernelNurbs::interpolate(&fit, None, None, Parameterization::Chord)
+                    })?;
             KernelCurve::Nurbs(curve)
         }
     })
@@ -185,10 +184,7 @@ fn boundary_centroid(h: &Hatch) -> Option<(f64, f64)> {
 /// Scale a catalog pattern about its intrinsic coordinate origin.
 /// Pattern lines loaded from DXF/DWG are rendered prebaked, so their metadata
 /// scale is not applied again by the renderer.
-pub(crate) fn scale_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
-    factor: f64,
-) {
+pub(crate) fn scale_pattern_geometry(pattern: &mut codec::entities::HatchPattern, factor: f64) {
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
         line.base_point.x = origin_x + (line.base_point.x - origin_x) * factor;
@@ -203,18 +199,12 @@ pub(crate) fn scale_pattern_geometry(
 
 /// Rotate a catalog pattern about its intrinsic coordinate origin.
 /// This keeps the line angle, base point and world-space offset in sync.
-pub(crate) fn rotate_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
-    angle: f64,
-) {
+pub(crate) fn rotate_pattern_geometry(pattern: &mut codec::entities::HatchPattern, angle: f64) {
     let (sin, cos) = angle.sin_cos();
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
         line.angle += angle;
-        let (x, y) = (
-            line.base_point.x - origin_x,
-            line.base_point.y - origin_y,
-        );
+        let (x, y) = (line.base_point.x - origin_x, line.base_point.y - origin_y);
         line.base_point.x = origin_x + x * cos - y * sin;
         line.base_point.y = origin_y + x * sin + y * cos;
         let (x, y) = (line.offset.x, line.offset.y);
@@ -315,11 +305,7 @@ pub fn clear_background_color(h: &mut Hatch) {
 }
 
 fn associative_property(h: &Hatch) -> Property {
-    if h
-        .paths
-        .iter()
-        .any(|path| !path.boundary_handles.is_empty())
-    {
+    if h.paths.iter().any(|path| !path.boundary_handles.is_empty()) {
         Property {
             label: t!("Associative").into_owned(),
             field: "associative",
@@ -362,11 +348,18 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
 
     if g.enabled {
         // ── Gradient fill ──────────────────────────────────────────────────
-        let grad_type = if g.is_single_color { "One color" } else { "Two color" };
-        let (kind, inverted) =
-            crate::scene::model::hatch_model::GradientKind::from_name(&g.name);
+        let grad_type = if g.is_single_color {
+            "One color"
+        } else {
+            "Two color"
+        };
+        let (kind, inverted) = crate::scene::model::hatch_model::GradientKind::from_name(&g.name);
         let mut pattern_props = vec![
-            ro(t!("Type").as_ref(), "fill_kind", t!("Gradient").into_owned()),
+            ro(
+                t!("Type").as_ref(),
+                "fill_kind",
+                t!("Gradient").into_owned(),
+            ),
             Property {
                 label: t!("Color mode").into_owned(),
                 field: "fill_type",
@@ -428,8 +421,16 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
                 title: t!("Geometry").into_owned(),
                 props: vec![
                     edit(t!("Elevation").as_ref(), "elevation", h.elevation),
-                    ro(t!("Area").as_ref(), "area", crate::entities::common::format_area(area)),
-                    ro(t!("Cumulative area").as_ref(), "cumulative_area", crate::entities::common::format_area(area)),
+                    ro(
+                        t!("Area").as_ref(),
+                        "area",
+                        crate::entities::common::format_area(area),
+                    ),
+                    ro(
+                        t!("Cumulative area").as_ref(),
+                        "cumulative_area",
+                        crate::entities::common::format_area(area),
+                    ),
                 ],
             },
             PropSection {
@@ -449,7 +450,6 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
             },
         ];
     }
-
 
     // ── Hatch (pattern / solid) ────────────────────────────────────────────
     // Show only controls used by the selected fill type.
@@ -537,8 +537,16 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
             title: t!("Geometry").into_owned(),
             props: vec![
                 edit(t!("Elevation").as_ref(), "elevation", h.elevation),
-                ro(t!("Area").as_ref(), "area", crate::entities::common::format_area(area)),
-                ro(t!("Cumulative area").as_ref(), "cumulative_area", crate::entities::common::format_area(area)),
+                ro(
+                    t!("Area").as_ref(),
+                    "area",
+                    crate::entities::common::format_area(area),
+                ),
+                ro(
+                    t!("Cumulative area").as_ref(),
+                    "cumulative_area",
+                    crate::entities::common::format_area(area),
+                ),
             ],
         },
     ];
@@ -588,11 +596,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             // update from boundary edits. Only enable it when a real
             // relationship is available; disabling retains the handles so the
             // user can turn it back on later.
-            if !requested
-                || h.paths
-                    .iter()
-                    .any(|path| !path.boundary_handles.is_empty())
-            {
+            if !requested || h.paths.iter().any(|path| !path.boundary_handles.is_empty()) {
                 h.is_associative = requested;
             }
             return;
@@ -614,9 +618,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
                         h.pattern = codec::entities::HatchPattern::new("_USER");
                     }
                     HatchPatternType::Predefined => {
-                        if let Some(entry) =
-                            crate::scene::model::hatch_patterns::find("ANSI31")
-                        {
+                        if let Some(entry) = crate::scene::model::hatch_patterns::find("ANSI31") {
                             let mut pattern =
                                 crate::scene::model::hatch_patterns::build_dxf_pattern(entry);
                             scale_pattern_geometry(&mut pattern, h.pattern_scale);
@@ -756,7 +758,8 @@ impl Transformable for Hatch {
 /// Assign sequential grip IDs across all boundary paths and edges.
 /// Exposed control points per edge type:
 ///   Polyline       → each vertex (x, y)
-///   Line           → start, end
+///   Line           → each corner once: where one line ends and the next
+///                    starts is a single grip moving both ends
 ///   CircularArc    → center
 ///   EllipticArc    → center
 ///   Spline         → fit points if present, else control points (x, y)
@@ -769,8 +772,7 @@ impl Grippable for Hatch {
         // pattern exists). Dragging it moves the pattern tiling origin; boundary
         // grips follow from the next id.
         if let Some(l0) = self.pattern.lines.first() {
-            let (gx, gy) =
-                boundary_centroid(self).unwrap_or((l0.base_point.x, l0.base_point.y));
+            let (gx, gy) = boundary_centroid(self).unwrap_or((l0.base_point.x, l0.base_point.y));
             out.push(circle_grip(id, glam::DVec3::new(gx, gy, elev)));
             id += 1;
         } else if self.is_associative {
@@ -783,51 +785,9 @@ impl Grippable for Hatch {
         if self.is_associative {
             return out;
         }
-        for path in &self.paths {
-            for edge in &path.edges {
-                match edge {
-                    BoundaryEdge::Polyline(p) => {
-                        for v in &p.vertices {
-                            out.push(center_grip(id, glam::DVec3::new(v.x, v.y, elev)));
-                            id += 1;
-                        }
-                    }
-                    BoundaryEdge::Line(l) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(l.start.x, l.start.y, elev),
-                        ));
-                        id += 1;
-                        out.push(center_grip(id, glam::DVec3::new(l.end.x, l.end.y, elev)));
-                        id += 1;
-                    }
-                    BoundaryEdge::CircularArc(a) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(a.center.x, a.center.y, elev),
-                        ));
-                        id += 1;
-                    }
-                    BoundaryEdge::EllipticArc(e) => {
-                        out.push(center_grip(
-                            id,
-                            glam::DVec3::new(e.center.x, e.center.y, elev),
-                        ));
-                        id += 1;
-                    }
-                    BoundaryEdge::Spline(s) => {
-                        let pts: Vec<[f64; 2]> = if !s.fit_points.is_empty() {
-                            s.fit_points.iter().map(|p| [p.x, p.y]).collect()
-                        } else {
-                            s.control_points.iter().map(|p| [p.x, p.y]).collect()
-                        };
-                        for [x, y] in pts {
-                            out.push(center_grip(id, glam::DVec3::new(x, y, elev)));
-                            id += 1;
-                        }
-                    }
-                }
-            }
+        for (_, [x, y]) in boundary_points(self) {
+            out.push(center_grip(id, glam::DVec3::new(x, y, elev)));
+            id += 1;
         }
         out
     }
@@ -865,97 +825,40 @@ impl Grippable for Hatch {
             id += 1;
         }
 
-        'outer: for path in &mut self.paths {
-            for edge in &mut path.edges {
-                match edge {
-                    BoundaryEdge::Polyline(p) => {
-                        for v in &mut p.vertices {
-                            if id == grip_id {
-                                let (nx, ny) =
-                                    resolve(&apply, Vec3::new(v.x as f32, v.y as f32, elev));
-                                v.x = nx;
-                                v.y = ny;
-                                break 'outer;
-                            }
-                            id += 1;
-                        }
-                    }
-                    BoundaryEdge::Line(l) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(l.start.x as f32, l.start.y as f32, elev),
-                            );
-                            l.start.x = nx;
-                            l.start.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                        if id == grip_id {
-                            let (nx, ny) =
-                                resolve(&apply, Vec3::new(l.end.x as f32, l.end.y as f32, elev));
-                            l.end.x = nx;
-                            l.end.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::CircularArc(a) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(a.center.x as f32, a.center.y as f32, elev),
-                            );
-                            a.center.x = nx;
-                            a.center.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::EllipticArc(e) => {
-                        if id == grip_id {
-                            let (nx, ny) = resolve(
-                                &apply,
-                                Vec3::new(e.center.x as f32, e.center.y as f32, elev),
-                            );
-                            e.center.x = nx;
-                            e.center.y = ny;
-                            break 'outer;
-                        }
-                        id += 1;
-                    }
-                    BoundaryEdge::Spline(s) => {
-                        if !s.fit_points.is_empty() {
-                            for fp in &mut s.fit_points {
-                                if id == grip_id {
-                                    let (nx, ny) =
-                                        resolve(&apply, Vec3::new(fp.x as f32, fp.y as f32, elev));
-                                    fp.x = nx;
-                                    fp.y = ny;
-                                    break 'outer;
-                                }
-                                id += 1;
-                            }
-                        } else {
-                            for cp in &mut s.control_points {
-                                if id == grip_id {
-                                    let (nx, ny) =
-                                        resolve(&apply, Vec3::new(cp.x as f32, cp.y as f32, elev));
-                                    cp.x = nx;
-                                    cp.y = ny;
-                                    break 'outer;
-                                }
-                                id += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let Some(&(point, [x, y])) = boundary_points(self).get(grip_id.wrapping_sub(id)) else {
+            return;
+        };
+        let (nx, ny) = resolve(&apply, Vec3::new(x as f32, y as f32, elev));
+        set_boundary_point(self, point, nx, ny);
     }
 
     fn grip_menu(&self, grip_id: usize) -> Vec<crate::scene::model::object::GripMenuItem> {
         use crate::scene::model::object::{GripMenuAction, GripMenuItem};
+        if let Some(point) = vertex_point_at(self, grip_id) {
+            let removable = match point {
+                BoundaryPoint::LineVertex {
+                    ending, starting, ..
+                } => ending.is_some() && starting.is_some(),
+                _ => true,
+            };
+            let mut items = vec![
+                GripMenuItem {
+                    label: "Stretch",
+                    action: GripMenuAction::Stretch,
+                },
+                GripMenuItem {
+                    label: "Add Vertex",
+                    action: GripMenuAction::AddVertex,
+                },
+            ];
+            if removable {
+                items.push(GripMenuItem {
+                    label: "Remove Vertex",
+                    action: GripMenuAction::RemoveVertex,
+                });
+            }
+            return items;
+        }
         if self.pattern.lines.is_empty() || grip_id != 0 {
             return vec![GripMenuItem {
                 label: "Stretch",
@@ -982,12 +885,23 @@ impl Grippable for Hatch {
         ]
     }
 
-    fn apply_grip_menu(&mut self, grip_id: usize, action: crate::scene::model::object::GripMenuAction) {
+    fn apply_grip_menu(
+        &mut self,
+        grip_id: usize,
+        action: crate::scene::model::object::GripMenuAction,
+    ) {
         use crate::scene::model::object::GripMenuAction as A;
+        if let Some(point) = vertex_point_at(self, grip_id) {
+            edit_boundary_vertex(self, point, action);
+            return;
+        }
         if grip_id == 0 && matches!(action, A::OriginPoint) {
             if let (Some((gx, gy)), Some((_ox, _oy))) = (
                 boundary_centroid(self),
-                self.pattern.lines.first().map(|line| (line.base_point.x, line.base_point.y)),
+                self.pattern
+                    .lines
+                    .first()
+                    .map(|line| (line.base_point.x, line.base_point.y)),
             ) {
                 self.set_pattern_origin(codec::types::Vector2::new(gx, gy));
             }
@@ -1054,8 +968,7 @@ impl FallbackTess for Hatch {
                 let Some(curve) = edge_curve(edge) else {
                     continue;
                 };
-                let local = curve
-                    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+                let local = curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
                 if local.len() < 2 {
                     continue;
                 }
@@ -1067,11 +980,9 @@ impl FallbackTess for Hatch {
                     .map(|point| to_wcs(point[0], point[1]))
                     .collect();
                 match edge {
-                    BoundaryEdge::Polyline(poly) => key_verts.extend(
-                        poly.vertices
-                            .iter()
-                            .map(|point| to_wcs(point.x, point.y)),
-                    ),
+                    BoundaryEdge::Polyline(poly) => {
+                        key_verts.extend(poly.vertices.iter().map(|point| to_wcs(point.x, point.y)))
+                    }
                     _ => key_verts.extend([world[0], *world.last().unwrap()]),
                 }
                 match edge {
@@ -1092,5 +1003,347 @@ impl FallbackTess for Hatch {
             pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         }
         (pts, snap_pts, vec![], key_verts)
+    }
+}
+
+/// Where one boundary grip's point lives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BoundaryPoint {
+    PolylineVertex {
+        path: usize,
+        edge: usize,
+        vertex: usize,
+    },
+    /// A corner of a chain of line edges: the end of `ending` and the start
+    /// of `starting`, kept together so moving it never opens the boundary.
+    LineVertex {
+        path: usize,
+        ending: Option<usize>,
+        starting: Option<usize>,
+    },
+    ArcCenter {
+        path: usize,
+        edge: usize,
+    },
+    EllipseCenter {
+        path: usize,
+        edge: usize,
+    },
+    SplinePoint {
+        path: usize,
+        edge: usize,
+        index: usize,
+        fit: bool,
+    },
+}
+
+fn same_point(a: &codec::types::Vector2, b: &codec::types::Vector2) -> bool {
+    let scale = a.x.abs().max(a.y.abs()).max(1.0);
+    (a.x - b.x).abs() <= 1e-9 * scale && (a.y - b.y).abs() <= 1e-9 * scale
+}
+
+/// The non-associative boundary's grip points, in grip order (after the
+/// pattern-origin grip), each joined corner of a line chain once.
+fn boundary_points(hatch: &Hatch) -> Vec<(BoundaryPoint, [f64; 2])> {
+    let mut out = Vec::new();
+    for (path_index, path) in hatch.paths.iter().enumerate() {
+        let mut pending_end: Option<usize> = None;
+        let mut first_start: Option<usize> = None;
+        let line = |edge: usize| match &path.edges[edge] {
+            BoundaryEdge::Line(line) => Some(line),
+            _ => None,
+        };
+        for (edge_index, edge) in path.edges.iter().enumerate() {
+            if let BoundaryEdge::Line(current) = edge {
+                match pending_end {
+                    Some(previous) if same_point(&line(previous).unwrap().end, &current.start) => {
+                        out.push((
+                            BoundaryPoint::LineVertex {
+                                path: path_index,
+                                ending: Some(previous),
+                                starting: Some(edge_index),
+                            },
+                            [current.start.x, current.start.y],
+                        ));
+                    }
+                    pending => {
+                        if let Some(previous) = pending {
+                            let end = &line(previous).unwrap().end;
+                            out.push((
+                                BoundaryPoint::LineVertex {
+                                    path: path_index,
+                                    ending: Some(previous),
+                                    starting: None,
+                                },
+                                [end.x, end.y],
+                            ));
+                        }
+                        if edge_index == 0 {
+                            first_start = Some(out.len());
+                        }
+                        out.push((
+                            BoundaryPoint::LineVertex {
+                                path: path_index,
+                                ending: None,
+                                starting: Some(edge_index),
+                            },
+                            [current.start.x, current.start.y],
+                        ));
+                    }
+                }
+                pending_end = Some(edge_index);
+                continue;
+            }
+            if let Some(previous) = pending_end.take() {
+                let end = &line(previous).unwrap().end;
+                out.push((
+                    BoundaryPoint::LineVertex {
+                        path: path_index,
+                        ending: Some(previous),
+                        starting: None,
+                    },
+                    [end.x, end.y],
+                ));
+            }
+            match edge {
+                BoundaryEdge::Polyline(polyline) => {
+                    for (vertex, v) in polyline.vertices.iter().enumerate() {
+                        out.push((
+                            BoundaryPoint::PolylineVertex {
+                                path: path_index,
+                                edge: edge_index,
+                                vertex,
+                            },
+                            [v.x, v.y],
+                        ));
+                    }
+                }
+                BoundaryEdge::CircularArc(arc) => out.push((
+                    BoundaryPoint::ArcCenter {
+                        path: path_index,
+                        edge: edge_index,
+                    },
+                    [arc.center.x, arc.center.y],
+                )),
+                BoundaryEdge::EllipticArc(ellipse) => out.push((
+                    BoundaryPoint::EllipseCenter {
+                        path: path_index,
+                        edge: edge_index,
+                    },
+                    [ellipse.center.x, ellipse.center.y],
+                )),
+                BoundaryEdge::Spline(spline) => {
+                    let fit = !spline.fit_points.is_empty();
+                    let points: Vec<[f64; 2]> = if fit {
+                        spline.fit_points.iter().map(|p| [p.x, p.y]).collect()
+                    } else {
+                        spline.control_points.iter().map(|p| [p.x, p.y]).collect()
+                    };
+                    for (index, point) in points.into_iter().enumerate() {
+                        out.push((
+                            BoundaryPoint::SplinePoint {
+                                path: path_index,
+                                edge: edge_index,
+                                index,
+                                fit,
+                            },
+                            point,
+                        ));
+                    }
+                }
+                BoundaryEdge::Line(_) => {}
+            }
+        }
+        // A closed chain: the last line ends where the first one starts.
+        if let Some(last) = pending_end {
+            let end = line(last).unwrap().end.clone();
+            match first_start.map(|slot| (slot, &mut out[slot])) {
+                Some((
+                    _,
+                    (
+                        BoundaryPoint::LineVertex {
+                            ending,
+                            starting: Some(0),
+                            ..
+                        },
+                        _,
+                    ),
+                )) if ending.is_none() && same_point(&line(0).unwrap().start, &end) => {
+                    *ending = Some(last);
+                }
+                _ => out.push((
+                    BoundaryPoint::LineVertex {
+                        path: path_index,
+                        ending: Some(last),
+                        starting: None,
+                    },
+                    [end.x, end.y],
+                )),
+            }
+        }
+    }
+    out
+}
+
+/// Move one boundary grip point, every edge end it stands for included.
+fn set_boundary_point(hatch: &mut Hatch, point: BoundaryPoint, x: f64, y: f64) {
+    match point {
+        BoundaryPoint::PolylineVertex { path, edge, vertex } => {
+            if let BoundaryEdge::Polyline(polyline) = &mut hatch.paths[path].edges[edge] {
+                polyline.vertices[vertex].x = x;
+                polyline.vertices[vertex].y = y;
+            }
+        }
+        BoundaryPoint::LineVertex {
+            path,
+            ending,
+            starting,
+        } => {
+            if let Some(edge) = ending {
+                if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
+                    line.end = codec::types::Vector2::new(x, y);
+                }
+            }
+            if let Some(edge) = starting {
+                if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
+                    line.start = codec::types::Vector2::new(x, y);
+                }
+            }
+        }
+        BoundaryPoint::ArcCenter { path, edge } => {
+            if let BoundaryEdge::CircularArc(arc) = &mut hatch.paths[path].edges[edge] {
+                arc.center.x = x;
+                arc.center.y = y;
+            }
+        }
+        BoundaryPoint::EllipseCenter { path, edge } => {
+            if let BoundaryEdge::EllipticArc(ellipse) = &mut hatch.paths[path].edges[edge] {
+                ellipse.center.x = x;
+                ellipse.center.y = y;
+            }
+        }
+        BoundaryPoint::SplinePoint {
+            path,
+            edge,
+            index,
+            fit,
+        } => {
+            if let BoundaryEdge::Spline(spline) = &mut hatch.paths[path].edges[edge] {
+                if fit {
+                    if let Some(point) = spline.fit_points.get_mut(index) {
+                        point.x = x;
+                        point.y = y;
+                    }
+                } else if let Some(point) = spline.control_points.get_mut(index) {
+                    point.x = x;
+                    point.y = y;
+                }
+            }
+        }
+    }
+}
+
+/// The boundary vertex a grip stands for, when it is one that vertices can
+/// be added after or removed at.
+fn vertex_point_at(hatch: &Hatch, grip_id: usize) -> Option<BoundaryPoint> {
+    if hatch.is_associative {
+        return None;
+    }
+    // Grip 0 is the pattern origin when there is a pattern.
+    let first = usize::from(!hatch.pattern.lines.is_empty());
+    let (point, _) = *boundary_points(hatch).get(grip_id.checked_sub(first)?)?;
+    matches!(
+        point,
+        BoundaryPoint::PolylineVertex { .. } | BoundaryPoint::LineVertex { .. }
+    )
+    .then_some(point)
+}
+
+/// Add a vertex after `point` (halfway along the following segment, on
+/// the arc for a bulged one) or remove `point`, keeping the loop closed.
+fn edit_boundary_vertex(
+    hatch: &mut Hatch,
+    point: BoundaryPoint,
+    action: crate::scene::model::object::GripMenuAction,
+) {
+    use crate::scene::model::object::GripMenuAction as A;
+    match point {
+        BoundaryPoint::PolylineVertex { path, edge, vertex } => {
+            let BoundaryEdge::Polyline(polyline) = &mut hatch.paths[path].edges[edge] else {
+                return;
+            };
+            let n = polyline.vertices.len();
+            match action {
+                A::AddVertex => {
+                    if vertex + 1 == n && !polyline.is_closed {
+                        let last = polyline.vertices[vertex].clone();
+                        polyline
+                            .vertices
+                            .push(codec::types::Vector3::new(last.x, last.y, 0.0));
+                        return;
+                    }
+                    let a = polyline.vertices[vertex].clone();
+                    let b = polyline.vertices[(vertex + 1) % n].clone();
+                    let (cx, cy) = (b.x - a.x, b.y - a.y);
+                    // The arc's midpoint sits off the chord by the sagitta,
+                    // to the right of a positive (counter-clockwise) bulge.
+                    let sagitta = a.z * 0.5;
+                    let half = (a.z.atan() * 0.5).tan();
+                    let mid = codec::types::Vector3::new(
+                        (a.x + b.x) * 0.5 + cy * sagitta,
+                        (a.y + b.y) * 0.5 - cx * sagitta,
+                        half,
+                    );
+                    polyline.vertices[vertex].z = half;
+                    polyline.vertices.insert(vertex + 1, mid);
+                }
+                A::RemoveVertex if n > if polyline.is_closed { 3 } else { 2 } => {
+                    polyline.vertices.remove(vertex);
+                }
+                _ => {}
+            }
+        }
+        BoundaryPoint::LineVertex {
+            path,
+            ending,
+            starting,
+        } => {
+            let edges = &mut hatch.paths[path].edges;
+            match (action, ending, starting) {
+                (A::AddVertex, _, Some(edge)) => {
+                    let BoundaryEdge::Line(line) = &mut edges[edge] else {
+                        return;
+                    };
+                    let mid = codec::types::Vector2::new(
+                        (line.start.x + line.end.x) * 0.5,
+                        (line.start.y + line.end.y) * 0.5,
+                    );
+                    let tail = codec::entities::LineEdge {
+                        start: mid.clone(),
+                        end: line.end.clone(),
+                    };
+                    line.end = mid;
+                    edges.insert(edge + 1, BoundaryEdge::Line(tail));
+                }
+                (A::RemoveVertex, Some(previous), Some(edge)) if previous != edge => {
+                    let lines = edges
+                        .iter()
+                        .filter(|edge| matches!(edge, BoundaryEdge::Line(_)))
+                        .count();
+                    if lines <= 3 {
+                        return;
+                    }
+                    let BoundaryEdge::Line(removed) = edges[edge].clone() else {
+                        return;
+                    };
+                    if let BoundaryEdge::Line(line) = &mut edges[previous] {
+                        line.end = removed.end;
+                    }
+                    edges.remove(edge);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }

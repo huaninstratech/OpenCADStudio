@@ -28,9 +28,12 @@ pub enum Script {
     Latin,
     Cyrillic,
     Greek,
+    Armenian,
+    Georgian,
     Arabic,
     Hebrew,
     Thai,
+    Lao,
     Devanagari,
     Chinese,
     TraditionalChinese,
@@ -46,9 +49,12 @@ impl Script {
             Script::Latin => "fonts/latin.ttf",
             Script::Cyrillic => "fonts/cyrillic.ttf",
             Script::Greek => "fonts/greek.ttf",
+            Script::Armenian => "fonts/armenian.ttf",
+            Script::Georgian => "fonts/georgian.ttf",
             Script::Arabic => "fonts/arabic.ttf",
             Script::Hebrew => "fonts/hebrew.ttf",
             Script::Thai => "fonts/thai.ttf",
+            Script::Lao => "fonts/lao.ttf",
             Script::Devanagari => "fonts/devanagari.ttf",
             Script::Chinese => "fonts/chinese.ttf",
             Script::TraditionalChinese => "fonts/traditional_chinese.ttf",
@@ -66,9 +72,12 @@ impl Script {
             Script::Latin
             | Script::Cyrillic
             | Script::Greek
+            | Script::Armenian
+            | Script::Georgian
             | Script::Arabic
             | Script::Hebrew
             | Script::Thai
+            | Script::Lao
             | Script::Devanagari => "Noto Sans",
         }
     }
@@ -85,6 +94,9 @@ impl Script {
             8 => Script::Japanese,
             9 => Script::Korean,
             10 => Script::TraditionalChinese,
+            11 => Script::Lao,
+            12 => Script::Armenian,
+            13 => Script::Georgian,
             _ => Script::Latin,
         }
     }
@@ -103,6 +115,9 @@ impl Script {
             Script::Japanese => 8,
             Script::Korean => 9,
             Script::TraditionalChinese => 10,
+            Script::Lao => 11,
+            Script::Armenian => 12,
+            Script::Georgian => 13,
         }
     }
 }
@@ -139,10 +154,13 @@ pub fn scripts_for_language_tag(language: &str) -> Vec<Script> {
             "el" => Some(Script::Greek),
             "he" | "yi" => Some(Script::Hebrew),
             "hi" | "mr" | "ne" => Some(Script::Devanagari),
+            "hy" => Some(Script::Armenian),
             "ja" => Some(Script::Japanese),
+            "ka" => Some(Script::Georgian),
             "ko" => Some(Script::Korean),
             "ru" | "uk" | "bg" | "sr" => Some(Script::Cyrillic),
             "th" => Some(Script::Thai),
+            "lo" => Some(Script::Lao),
             "zh" => Some(Script::Chinese),
             _ => None,
         }
@@ -176,6 +194,7 @@ pub fn requires_shaping(text: &str) -> bool {
                 | 0x08A0..=0x08FF
                 | 0x0900..=0x097F
                 | 0x0E00..=0x0E7F
+                | 0x0E80..=0x0EFF
                 | 0xA8E0..=0xA8FF
                 | 0xFB1D..=0xFB4F
                 | 0xFB50..=0xFDFF
@@ -213,17 +232,28 @@ pub fn set_cjk_lang_from_codepage(code_page: &str) -> bool {
 
 /// The script font that covers `ch`, or `None` for control / uncovered code
 /// points. Ranges mirror the subset unicode ranges in `web/fonts/generate.sh`.
+/// Chars outside every range (scripts with no shipped subset, e.g. most
+/// South-East Asian and African scripts) return `None` and render nothing —
+/// see `ttf_glyph::build_fallback`.
 #[cfg(target_arch = "wasm32")]
 pub fn script_of(ch: char) -> Option<Script> {
     Some(match ch as u32 {
         0x0000..=0x024F | 0x1E00..=0x1EFF | 0x2000..=0x206F => Script::Latin,
         0x0370..=0x03FF | 0x1F00..=0x1FFF => Script::Greek,
         0x0400..=0x052F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F => Script::Cyrillic,
+        // Armenian sits directly below Hebrew in the block layout (ends at
+        // U+058F; Hebrew starts at U+0590), plus its presentation ligatures.
+        0x0530..=0x058F | 0xFB13..=0xFB17 => Script::Armenian,
         0x0590..=0x05FF | 0xFB1D..=0xFB4F => Script::Hebrew,
         0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
             Script::Arabic
         }
         0x0900..=0x097F | 0xA8E0..=0xA8FF => Script::Devanagari,
+        0x0E00..=0x0E7F => Script::Thai,
+        0x0E80..=0x0EFF => Script::Lao,
+        // Georgian: Asomtavruli/Nuskhuri, Mtavruli capitals, and the legacy
+        // Supplement (khutsuri round mkhedruli).
+        0x10A0..=0x10FF | 0x1C90..=0x1CBF | 0x2D00..=0x2D2F => Script::Georgian,
         // Hangul → always Korean; kana → always Japanese.
         0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3 => Script::Korean,
         0x3040..=0x30FF | 0x31F0..=0x31FF => Script::Japanese,
@@ -284,23 +314,34 @@ mod imp {
 
     /// Record a fetch result: `Some(bytes)` on success, `None` on failure.
     pub fn insert(script: Script, bytes: Option<Vec<u8>>) {
-        let mut store = store().lock().unwrap();
-        match bytes {
-            Some(bytes) => {
-                let bytes = Arc::new(bytes);
-                store.states.insert(script, State::Loaded(bytes.clone()));
-                if script != Script::Latin {
-                    store
-                        .states
-                        .entry(Script::Latin)
-                        .or_insert_with(|| State::Loaded(bytes));
+        let mut fetched: Option<Arc<Vec<u8>>> = None;
+        {
+            let mut store = store().lock().unwrap();
+            match bytes {
+                Some(bytes) => {
+                    let bytes = Arc::new(bytes);
+                    store.states.insert(script, State::Loaded(bytes.clone()));
+                    if script != Script::Latin {
+                        store
+                            .states
+                            .entry(Script::Latin)
+                            .or_insert_with(|| State::Loaded(bytes.clone()));
+                    }
+                    fetched = Some(bytes);
+                }
+                None => {
+                    store.states.insert(script, State::Failed);
                 }
             }
-            None => {
-                store.states.insert(script, State::Failed);
-            }
         }
-        drop(store);
+        // Join the system-font database before the generation bump wakes
+        // consumers: a text style naming a TTF family (or one of its aliases,
+        // e.g. Arial → Noto Sans) then resolves to filled glyphs instead of
+        // LFF strokes. Family-name memo + glyph caches are invalidated by the
+        // caller (`clear_fallback_cache`) on the same message.
+        if let Some(bytes) = fetched {
+            crate::scene::text::sysfont::register_web_font(&bytes);
+        }
         super::bump_generation();
     }
 
@@ -320,7 +361,9 @@ mod imp {
         let resp_val = JsFuture::from(win.fetch_with_str(script.asset()))
             .await
             .map_err(|e| format!("{e:?}"))?;
-        let resp: web_sys::Response = resp_val.dyn_into().map_err(|_| "bad response".to_string())?;
+        let resp: web_sys::Response = resp_val
+            .dyn_into()
+            .map_err(|_| "bad response".to_string())?;
         if !resp.ok() {
             return Err(format!("HTTP {}", resp.status()));
         }

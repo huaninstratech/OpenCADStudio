@@ -39,6 +39,47 @@ pub struct Sheet {
     pub texts: Vec<Text>,
     /// DGN: sub units per master unit (the scale a Sub conversion offers).
     pub sub_per_master: f64,
+    /// DGN: the colours come from the file's own colour table, which the
+    /// reference shows adapted to the background ([`dgn_table_color`]).
+    pub table_colors: bool,
+    /// The colour of each path and text the sheet draws, one per element.
+    pub element_colors: Vec<[u8; 3]>,
+}
+
+/// How a colour from a DGN file's colour table shows over a background
+/// (its largest channel and whether it is light), as the reference draws
+/// it: a near-white colour (61 or less from white, channels summed) is white,
+/// or black on a light background; over a background with a channel of 32 or
+/// more, colours whose largest channel is 76, 127, 153 or 204 drop a shade
+/// (to 38, 76, 127 or 165, hue kept) and the greys 91, 132, 173 and 214 drop
+/// to 45, 91, 137 and 183 — grey 51 to black from a channel of 30.
+pub fn dgn_table_color(rgb: [u8; 3], bg_max: u8, light: bool) -> [u8; 3] {
+    if rgb.iter().map(|&c| 255 - c as u32).sum::<u32>() <= 61 {
+        return if light { [0; 3] } else { [255; 3] };
+    }
+    if rgb[0] == rgb[1] && rgb[1] == rgb[2] {
+        let v = match rgb[0] {
+            51 if bg_max >= 30 => 0,
+            91 if bg_max >= 32 => 45,
+            132 if bg_max >= 32 => 91,
+            173 if bg_max >= 32 => 137,
+            214 if bg_max >= 32 => 183,
+            v => v,
+        };
+        return [v; 3];
+    }
+    let top = rgb.into_iter().max().unwrap_or(0);
+    let to = match top {
+        76 => 38,
+        127 => 76,
+        153 => 127,
+        204 => 165,
+        _ => return rgb,
+    };
+    if bg_max < 32 {
+        return rgb;
+    }
+    rgb.map(|c| ((c as u32 * to + top as u32 / 2) / top as u32) as u8)
 }
 
 /// Builds paths from pen moves.
@@ -91,7 +132,10 @@ impl PathBuilder {
 
     fn flush(&mut self, closed: bool) {
         if !self.current.is_empty() {
-            self.subpaths.push(SubPath { segments: std::mem::take(&mut self.current), closed });
+            self.subpaths.push(SubPath {
+                segments: std::mem::take(&mut self.current),
+                closed,
+            });
         }
     }
 
@@ -111,6 +155,18 @@ pub fn arc_cubics(
     start: f64,
     sweep: f64,
 ) -> Vec<[[f64; 2]; 4]> {
+    // The sweep can be a raw f64 out of file bytes (DGN `f64_at(e, 112)`):
+    // 1e300 or inf saturates the `as usize` cast to `usize::MAX` and
+    // `Vec::with_capacity` panics `capacity overflow`; ~1e17 would ask
+    // for 2 EB and abort. Legitimate callers top out near 104 rad (DGN
+    // V7, ±5965°), so the sweep is clamped at 4096 pieces' worth; NaN
+    // keeps its old single-degenerate-piece behaviour.
+    const MAX_SWEEP_MAGNITUDE: f64 = 4096.0 * std::f64::consts::FRAC_PI_2;
+    let sweep = if sweep.is_nan() || sweep.abs() <= MAX_SWEEP_MAGNITUDE {
+        sweep
+    } else {
+        sweep.signum() * MAX_SWEEP_MAGNITUDE
+    };
     let n = ((sweep.abs() / (std::f64::consts::FRAC_PI_2)).ceil() as usize).max(1);
     let step = sweep / n as f64;
     let k = 4.0 / 3.0 * (step / 4.0).tan();
@@ -131,11 +187,22 @@ pub fn arc_cubics(
     out
 }
 
-/// Bounds of the paths, when there are any.
+/// Tight bounds of the paths (curves by their extreme points, not their
+/// control points), when there are any.
 pub fn paths_bounds(paths: &[Path]) -> Option<[f64; 4]> {
-    let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut b = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
     let mut add = |p: [f64; 2]| {
-        b = [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])];
+        b = [
+            b[0].min(p[0]),
+            b[1].min(p[1]),
+            b[2].max(p[0]),
+            b[3].max(p[1]),
+        ];
     };
     for path in paths {
         for sp in &path.subpaths {
@@ -147,15 +214,498 @@ pub fn paths_bounds(paths: &[Path]) -> Option<[f64; 4]> {
                     }
                     Segment::Cubic(a, c1, c2, c) => {
                         add(*a);
-                        add(*c1);
-                        add(*c2);
                         add(*c);
+                        for t in cubic_extrema(*a, *c1, *c2, *c) {
+                            add(cubic_at(*a, *c1, *c2, *c, t));
+                        }
                     }
                 }
             }
         }
     }
     (b[0] <= b[2]).then_some(b)
+}
+
+fn cubic_at(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], t: f64) -> [f64; 2] {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    [
+        a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+        a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1],
+    ]
+}
+
+/// Parameters in (0, 1) where a cubic turns in x or in y.
+fn cubic_extrema(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]) -> Vec<f64> {
+    let mut out = Vec::new();
+    for i in 0..2 {
+        // The derivative's quadratic a·t² + b·t + c.
+        let a = 3.0 * (-p0[i] + 3.0 * p1[i] - 3.0 * p2[i] + p3[i]);
+        let b = 6.0 * (p0[i] - 2.0 * p1[i] + p2[i]);
+        let c = 3.0 * (p1[i] - p0[i]);
+        if a.abs() < 1e-12 {
+            if b.abs() > 1e-12 {
+                out.push(-c / b);
+            }
+            continue;
+        }
+        let disc = b * b - 4.0 * a * c;
+        if disc >= 0.0 {
+            let r = disc.sqrt();
+            out.push((-b + r) / (2.0 * a));
+            out.push((-b - r) / (2.0 * a));
+        }
+    }
+    out.retain(|t| *t > 0.0 && *t < 1.0);
+    out
+}
+
+/// The colour table a DGN file without one is drawn with (index 255, the
+/// background entry, black).
+pub const DGN_DEFAULT_COLORS: [[u8; 3]; 256] = [
+    [255, 255, 255],
+    [0, 0, 255],
+    [0, 255, 0],
+    [255, 0, 0],
+    [255, 255, 0],
+    [255, 0, 255],
+    [255, 127, 0],
+    [0, 255, 255],
+    [64, 64, 64],
+    [192, 192, 192],
+    [254, 0, 96],
+    [160, 224, 0],
+    [0, 254, 160],
+    [128, 0, 160],
+    [176, 176, 176],
+    [0, 240, 240],
+    [240, 240, 240],
+    [0, 0, 240],
+    [0, 240, 0],
+    [240, 0, 0],
+    [240, 240, 0],
+    [240, 0, 240],
+    [240, 122, 0],
+    [0, 240, 240],
+    [240, 240, 240],
+    [0, 0, 240],
+    [0, 240, 0],
+    [240, 0, 0],
+    [240, 240, 0],
+    [240, 0, 240],
+    [240, 122, 0],
+    [0, 225, 225],
+    [225, 225, 225],
+    [0, 0, 225],
+    [0, 225, 0],
+    [225, 0, 0],
+    [225, 225, 0],
+    [225, 0, 225],
+    [225, 117, 0],
+    [0, 225, 225],
+    [225, 225, 225],
+    [0, 0, 225],
+    [0, 225, 0],
+    [225, 0, 0],
+    [225, 225, 0],
+    [225, 0, 225],
+    [225, 117, 0],
+    [0, 210, 210],
+    [210, 210, 210],
+    [0, 0, 210],
+    [0, 210, 0],
+    [210, 0, 0],
+    [210, 210, 0],
+    [210, 0, 210],
+    [210, 112, 0],
+    [0, 210, 210],
+    [210, 210, 210],
+    [0, 0, 210],
+    [0, 210, 0],
+    [210, 0, 0],
+    [210, 210, 0],
+    [210, 0, 210],
+    [210, 112, 0],
+    [0, 195, 195],
+    [195, 195, 195],
+    [0, 0, 195],
+    [0, 195, 0],
+    [195, 0, 0],
+    [195, 195, 0],
+    [195, 0, 195],
+    [195, 107, 0],
+    [0, 195, 195],
+    [195, 195, 195],
+    [0, 0, 195],
+    [0, 195, 0],
+    [195, 0, 0],
+    [195, 195, 0],
+    [195, 0, 195],
+    [195, 107, 0],
+    [0, 180, 180],
+    [180, 180, 180],
+    [0, 0, 180],
+    [0, 180, 0],
+    [180, 0, 0],
+    [180, 180, 0],
+    [180, 0, 180],
+    [180, 102, 0],
+    [0, 180, 180],
+    [180, 180, 180],
+    [0, 0, 180],
+    [0, 180, 0],
+    [180, 0, 0],
+    [180, 180, 0],
+    [180, 0, 180],
+    [180, 102, 0],
+    [0, 165, 165],
+    [165, 165, 165],
+    [0, 0, 165],
+    [0, 165, 0],
+    [165, 0, 0],
+    [165, 165, 0],
+    [165, 0, 165],
+    [165, 97, 0],
+    [0, 165, 165],
+    [165, 165, 165],
+    [0, 0, 165],
+    [0, 165, 0],
+    [165, 0, 0],
+    [165, 165, 0],
+    [165, 0, 165],
+    [165, 97, 0],
+    [0, 150, 150],
+    [150, 150, 150],
+    [0, 0, 150],
+    [0, 150, 0],
+    [150, 0, 0],
+    [150, 150, 0],
+    [150, 0, 150],
+    [150, 92, 0],
+    [0, 150, 150],
+    [150, 150, 150],
+    [0, 0, 150],
+    [0, 150, 0],
+    [150, 0, 0],
+    [150, 150, 0],
+    [150, 0, 150],
+    [150, 92, 0],
+    [0, 135, 135],
+    [135, 135, 135],
+    [0, 0, 135],
+    [0, 135, 0],
+    [135, 0, 0],
+    [135, 135, 0],
+    [135, 0, 135],
+    [135, 87, 0],
+    [0, 135, 135],
+    [135, 135, 135],
+    [0, 0, 135],
+    [0, 135, 0],
+    [135, 0, 0],
+    [135, 135, 0],
+    [135, 0, 135],
+    [135, 87, 0],
+    [0, 120, 120],
+    [120, 120, 120],
+    [0, 0, 120],
+    [0, 120, 0],
+    [120, 0, 0],
+    [120, 120, 0],
+    [120, 0, 120],
+    [120, 82, 0],
+    [0, 120, 120],
+    [120, 120, 120],
+    [0, 0, 120],
+    [0, 120, 0],
+    [120, 0, 0],
+    [120, 120, 0],
+    [120, 0, 120],
+    [120, 82, 0],
+    [0, 105, 105],
+    [105, 105, 105],
+    [0, 0, 105],
+    [0, 105, 0],
+    [105, 0, 0],
+    [105, 105, 0],
+    [105, 0, 105],
+    [105, 77, 0],
+    [0, 105, 105],
+    [105, 105, 105],
+    [0, 0, 105],
+    [0, 105, 0],
+    [105, 0, 0],
+    [105, 105, 0],
+    [105, 0, 105],
+    [105, 77, 0],
+    [0, 90, 90],
+    [90, 90, 90],
+    [0, 0, 90],
+    [0, 90, 0],
+    [90, 0, 0],
+    [90, 90, 0],
+    [90, 0, 90],
+    [90, 72, 0],
+    [0, 90, 90],
+    [90, 90, 90],
+    [0, 0, 90],
+    [0, 90, 0],
+    [90, 0, 0],
+    [90, 90, 0],
+    [90, 0, 90],
+    [90, 72, 0],
+    [0, 75, 75],
+    [75, 75, 75],
+    [0, 0, 75],
+    [0, 75, 0],
+    [75, 0, 0],
+    [75, 75, 0],
+    [75, 0, 75],
+    [75, 67, 0],
+    [0, 75, 75],
+    [75, 75, 75],
+    [0, 0, 75],
+    [0, 75, 0],
+    [75, 0, 0],
+    [75, 75, 0],
+    [75, 0, 75],
+    [75, 67, 0],
+    [0, 60, 60],
+    [60, 60, 60],
+    [0, 0, 60],
+    [0, 60, 0],
+    [60, 0, 0],
+    [60, 60, 0],
+    [60, 0, 60],
+    [60, 62, 0],
+    [0, 60, 60],
+    [60, 60, 60],
+    [0, 0, 60],
+    [0, 60, 0],
+    [60, 0, 0],
+    [60, 60, 0],
+    [60, 0, 60],
+    [60, 62, 0],
+    [0, 45, 45],
+    [45, 45, 45],
+    [0, 0, 45],
+    [0, 45, 0],
+    [45, 0, 0],
+    [45, 45, 0],
+    [45, 0, 45],
+    [45, 57, 0],
+    [0, 45, 45],
+    [45, 45, 45],
+    [0, 0, 45],
+    [0, 45, 0],
+    [45, 0, 0],
+    [45, 45, 0],
+    [45, 0, 45],
+    [45, 57, 0],
+    [0, 30, 30],
+    [30, 30, 30],
+    [0, 0, 30],
+    [0, 30, 0],
+    [30, 0, 0],
+    [30, 30, 0],
+    [30, 0, 30],
+    [30, 52, 0],
+    [0, 30, 30],
+    [30, 30, 30],
+    [0, 0, 30],
+    [0, 30, 0],
+    [30, 0, 0],
+    [30, 30, 0],
+    [30, 0, 30],
+    [192, 192, 192],
+    [0, 0, 0],
+];
+
+/// A colour table element's 256 colours: entries 0-254 from `first`, and
+/// entry 255 (the background) from the three bytes that open the table at
+/// `first - 3`.
+pub fn dgn_color_table(e: &[u8], first: usize) -> Option<Vec<[u8; 3]>> {
+    let bg = e.get(first - 3..first)?;
+    let body = e.get(first..first + 255 * 3)?;
+    let mut out: Vec<[u8; 3]> = body.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    out.push([bg[0], bg[1], bg[2]]);
+    Some(out)
+}
+
+/// A DGN element as drawing geometry (what DGNIMPORT converts): its level,
+/// symbology and shape, in the units of the run that read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DgnElement {
+    /// Level number (V7) or id (V8).
+    pub level: u32,
+    /// Colour; `None` takes the level's.
+    pub color: Option<[u8; 3]>,
+    /// Weight 0-31; `None` takes the level's.
+    pub weight: Option<u32>,
+    /// Line style; `None` takes the level's.
+    pub style: Option<u32>,
+    pub geom: DgnGeom,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DgnGeom {
+    Line([f64; 2], [f64; 2]),
+    /// A line string, curve or B-spline (sampled), or a shape (its points
+    /// end where they start).
+    Points(Vec<[f64; 2]>),
+    /// An elliptical arc: the point at parameter t is
+    /// `center + cos t · u + sin t · v`, from `start` over `sweep` (radians).
+    Arc {
+        center: [f64; 2],
+        u: [f64; 2],
+        v: [f64; 2],
+        start: f64,
+        sweep: f64,
+    },
+    /// A complex chain or shape: its components in order.
+    Chain(Vec<DgnGeom>),
+    Text {
+        text: String,
+        origin: [f64; 2],
+        height: f64,
+        width_factor: f64,
+        rotation: f64,
+        /// Font number (V7); `None` when the file's font is not read.
+        font: Option<u32>,
+    },
+    /// A text node: its lines.
+    TextNode(Vec<DgnGeom>),
+    /// A shared cell instance: x' = m[0]·x + m[1]·y + origin.x,
+    /// y' = m[2]·x + m[3]·y + origin.y.
+    Cell {
+        name: String,
+        m: [f64; 4],
+        origin: [f64; 2],
+        /// Scale along z (1 in a 2D file).
+        z_scale: f64,
+    },
+}
+
+impl DgnGeom {
+    /// The geometry through x' = s·x + t (lengths scaled by `s`).
+    pub fn scaled(&self, s: f64, t: [f64; 2]) -> DgnGeom {
+        let p = |q: [f64; 2]| [q[0] * s + t[0], q[1] * s + t[1]];
+        let v = |q: [f64; 2]| [q[0] * s, q[1] * s];
+        match self {
+            DgnGeom::Line(a, b) => DgnGeom::Line(p(*a), p(*b)),
+            DgnGeom::Points(pts) => DgnGeom::Points(pts.iter().map(|q| p(*q)).collect()),
+            DgnGeom::Arc {
+                center,
+                u,
+                v: w,
+                start,
+                sweep,
+            } => DgnGeom::Arc {
+                center: p(*center),
+                u: v(*u),
+                v: v(*w),
+                start: *start,
+                sweep: *sweep,
+            },
+            DgnGeom::Chain(parts) => DgnGeom::Chain(parts.iter().map(|g| g.scaled(s, t)).collect()),
+            DgnGeom::TextNode(parts) => {
+                DgnGeom::TextNode(parts.iter().map(|g| g.scaled(s, t)).collect())
+            }
+            DgnGeom::Text {
+                text,
+                origin,
+                height,
+                width_factor,
+                rotation,
+                font,
+            } => DgnGeom::Text {
+                text: text.clone(),
+                origin: p(*origin),
+                height: height * s,
+                width_factor: *width_factor,
+                rotation: *rotation,
+                font: *font,
+            },
+            DgnGeom::Cell {
+                name,
+                m,
+                origin,
+                z_scale,
+            } => DgnGeom::Cell {
+                name: name.clone(),
+                m: *m,
+                origin: p(*origin),
+                z_scale: *z_scale,
+            },
+        }
+    }
+}
+
+/// Collects elements in file order, gathering the components of a complex
+/// chain, shape or text node into their header's element.
+#[derive(Default)]
+pub struct DgnCollector {
+    pub elements: Vec<DgnElement>,
+    /// The open complex element and how many components it still takes.
+    open: Option<(usize, DgnElement)>,
+}
+
+impl DgnCollector {
+    /// A complex chain or shape (or a text node) header with `count`
+    /// components.
+    pub fn open(&mut self, count: usize, header: DgnElement) {
+        self.close();
+        if count > 0 {
+            self.open = Some((count, header));
+        }
+    }
+
+    pub fn push(&mut self, element: DgnElement) {
+        if let Some((left, header)) = self.open.as_mut() {
+            if let DgnGeom::Chain(parts) | DgnGeom::TextNode(parts) = &mut header.geom {
+                parts.push(element.geom);
+            }
+            *left -= 1;
+            if *left == 0 {
+                self.close();
+            }
+            return;
+        }
+        self.elements.push(element);
+    }
+
+    /// Ends a complex element cut short with the components it has.
+    pub fn close(&mut self) {
+        if let Some((_, header)) = self.open.take() {
+            self.elements.push(header);
+        }
+    }
+}
+
+/// What DGNIMPORT reads from a model: its elements and the shared cells
+/// they place (in master units, the global origin at 0,0), the levels by
+/// number or id (name, colour) and the sub units per master unit.
+#[derive(Clone, Debug, Default)]
+pub struct DgnImport {
+    pub elements: Vec<DgnElement>,
+    pub cells: Vec<(String, Vec<DgnElement>)>,
+    pub levels: std::collections::HashMap<u32, (String, Option<[u8; 3]>)>,
+    pub sub_per_master: f64,
+    /// Master and sub unit names, when the file has them.
+    pub unit_names: (String, String),
+    /// A V7 file (its elements carry their own line style and weight).
+    pub v7: bool,
+}
+
+/// The elements through x' = s·x + t.
+pub fn scaled_elements(elements: &[DgnElement], s: f64, t: [f64; 2]) -> Vec<DgnElement> {
+    elements
+        .iter()
+        .map(|e| DgnElement {
+            geom: e.geom.scaled(s, t),
+            ..e.clone()
+        })
+        .collect()
 }
 
 /// A line of text the host draws with its own font.
@@ -182,7 +732,12 @@ pub const CAP_PER_EM: f64 = 0.716;
 
 /// Points of a B-spline curve: its order, control points and knot vector
 /// (clamped: `order` equal knots at each end).
-pub fn bspline_points(order: usize, poles: &[[f64; 2]], knots: &[f64], samples: usize) -> Vec<[f64; 2]> {
+pub fn bspline_points(
+    order: usize,
+    poles: &[[f64; 2]],
+    knots: &[f64],
+    samples: usize,
+) -> Vec<[f64; 2]> {
     let n = poles.len();
     if order < 2 || n < order || knots.len() != n + order {
         return poles.to_vec();
@@ -201,11 +756,63 @@ pub fn bspline_points(order: usize, poles: &[[f64; 2]], knots: &[f64], samples: 
             for j in (r..order).rev() {
                 let i = j + k + 1 - order;
                 let den = knots[i + order - r] - knots[i];
-                let a = if den.abs() < 1e-15 { 0.0 } else { (t - knots[i]) / den };
-                d[j] = [d[j - 1][0] * (1.0 - a) + d[j][0] * a, d[j - 1][1] * (1.0 - a) + d[j][1] * a];
+                let a = if den.abs() < 1e-15 {
+                    0.0
+                } else {
+                    (t - knots[i]) / den
+                };
+                d[j] = [
+                    d[j - 1][0] * (1.0 - a) + d[j][0] * a,
+                    d[j - 1][1] * (1.0 - a) + d[j][1] * a,
+                ];
             }
         }
         out.push(d[order - 1]);
     }
     out
+}
+
+#[cfg(test)]
+mod arc_cubics_sweep_tests {
+    use super::arc_cubics;
+
+    /// The sweep is a raw f64 out of DGN element bytes (`f64_at(e, 112)`):
+    /// 1e300 / inf saturate the `as usize` cast to `usize::MAX` and
+    /// `Vec::with_capacity` panics `capacity overflow`; ~1e17 would ask
+    /// for 2 EB and abort. Legitimate callers top out near 104 rad.
+    #[test]
+    fn an_enormous_sweep_is_clamped_instead_of_panicking() {
+        for sweep in [1e300, f64::INFINITY, -1e300, f64::NEG_INFINITY] {
+            let pieces = arc_cubics([0.0; 2], 1.0, 1.0, 0.0, 0.0, sweep);
+            assert_eq!(pieces.len(), 4096, "sweep {sweep}");
+            assert!(pieces
+                .iter()
+                .flatten()
+                .all(|p| p[0].is_finite() && p[1].is_finite()));
+        }
+    }
+
+    /// NaN behaves as before: one degenerate piece, no panic.
+    #[test]
+    fn a_nan_sweep_still_yields_a_single_piece() {
+        assert_eq!(arc_cubics([0.0; 2], 1.0, 1.0, 0.0, 0.0, f64::NAN).len(), 1);
+    }
+
+    /// Ordinary arcs keep their exact piece count, ceil(|sweep| / 90°).
+    #[test]
+    fn ordinary_sweeps_keep_their_piece_counts() {
+        let expect =
+            |sweep: f64| ((sweep.abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).max(1);
+        for sweep in [
+            0.0,
+            1.0,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::TAU,
+            104.1,
+            -2.5,
+        ] {
+            let pieces = arc_cubics([0.0; 2], 3.0, 2.0, 0.3, 0.5, sweep);
+            assert_eq!(pieces.len(), expect(sweep), "sweep {sweep}");
+        }
+    }
 }

@@ -94,12 +94,10 @@ mod parametric_constraint_undo_tests {
     fn add_line(app: &mut OpenCADStudio, x1: f64, y1: f64, x2: f64, y2: f64) -> Handle {
         app.tabs[app.active_tab]
             .scene
-            .add_entity(codec::EntityType::Line(
-                codec::entities::Line::from_points(
-                    codec::types::Vector3::new(x1, y1, 0.0),
-                    codec::types::Vector3::new(x2, y2, 0.0),
-                ),
-            ))
+            .add_entity(codec::EntityType::Line(codec::entities::Line::from_points(
+                codec::types::Vector3::new(x1, y1, 0.0),
+                codec::types::Vector3::new(x2, y2, 0.0),
+            )))
     }
 
     fn line_angle_deg(app: &OpenCADStudio, handle: Handle) -> f64 {
@@ -211,14 +209,11 @@ mod parametric_constraint_undo_tests {
         let mut app = OpenCADStudio::new_for_test();
         let _ = app.automation_op(r#"{"op":"new"}"#);
         let handle = add_line(&mut app, 0.0, 0.0, 5.0, 2.0);
-        let (original_start, original_end, original_length) = match app.tabs[app.active_tab]
-            .scene
-            .document
-            .get_entity(handle)
-        {
-            Some(codec::EntityType::Line(line)) => (line.start, line.end, line.length()),
-            other => panic!("expected a Line, got {other:?}"),
-        };
+        let (original_start, original_end, original_length) =
+            match app.tabs[app.active_tab].scene.document.get_entity(handle) {
+                Some(codec::EntityType::Line(line)) => (line.start, line.end, line.length()),
+                other => panic!("expected a Line, got {other:?}"),
+            };
         let direction = codec::types::Vector3::new(3.0, 4.0, 0.0).normalize();
 
         let _ = app.apply_cmd_result(CmdResult::AddHorizontalConstraint {
@@ -264,7 +259,13 @@ mod parametric_constraint_undo_tests {
             Some(codec::EntityType::Line(line)) => line,
             other => panic!("expected a Line after redo, got {other:?}"),
         };
-        assert!((line.end - line.start).normalize().cross(&direction).length() < 1.0e-7);
+        assert!(
+            (line.end - line.start)
+                .normalize()
+                .cross(&direction)
+                .length()
+                < 1.0e-7
+        );
     }
 
     #[test]
@@ -832,9 +833,7 @@ mod parametric_constraint_undo_tests {
         else {
             panic!("expected second line");
         };
-        assert!(
-            (first.end - codec::types::Vector3::new(5.0, 0.0, 0.0)).length() < 1.0e-7
-        );
+        assert!((first.end - codec::types::Vector3::new(5.0, 0.0, 0.0)).length() < 1.0e-7);
         assert!((second.start - first.end).length() < 1.0e-7);
         assert!((second.length() - 5.0).abs() < 1.0e-7);
     }
@@ -889,13 +888,12 @@ mod delobj_tests {
         let profile = app.tabs[i]
             .scene
             .add_entity(codec::EntityType::Circle(circle));
-        let path =
-            app.tabs[i]
-                .scene
-                .add_entity(codec::EntityType::Line(codec::Line::from_points(
-                    Vector3::new(0.0, 0.0, 0.0),
-                    Vector3::new(0.0, 0.0, 5.0),
-                )));
+        let path = app.tabs[i]
+            .scene
+            .add_entity(codec::EntityType::Line(codec::Line::from_points(
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 5.0),
+            )));
         app.delete_objects = value;
 
         let _ = app.apply_cmd_result(CmdResult::SweepEntities {
@@ -904,6 +902,7 @@ mod delobj_tests {
             mode,
             options: crate::command::SweepOptions::default(),
             color: [1.0; 4],
+            expressions: [None, None],
         });
 
         let created = app.tabs[i]
@@ -934,14 +933,17 @@ mod delobj_tests {
                 expected,
             );
         }
-        assert_eq!(
-            sweep_source_presence(2, crate::command::ExtrudeMode::Surface),
-            (false, false),
-        );
-        assert_eq!(
-            sweep_source_presence(3, crate::command::ExtrudeMode::Surface),
-            (false, true),
-        );
+        // A swept surface is associative by default (SURFACEASSOCIATIVITY 1)
+        // and keeps the profile and path it follows, whatever DELOBJ says;
+        // DELOBJ reaches surfaces only with associativity off, a profile-wide
+        // switch this parallel test leaves alone.
+        assert!(crate::scene::model::sweep_model::surface_associativity());
+        for value in [2, 3] {
+            assert_eq!(
+                sweep_source_presence(value, crate::command::ExtrudeMode::Surface),
+                (true, true),
+            );
+        }
     }
 }
 
@@ -965,16 +967,16 @@ mod thicken_tests {
         )
         .unwrap();
         let source = app.add_surface_model(
-            codec::EntityType::Surface(Surface::new(SurfaceKind::Plane)),
+            codec::EntityType::Surface(Box::new(Surface::new(SurfaceKind::Plane))),
             body,
         );
         assert!(!source.is_null());
         let i = app.active_tab;
         let invalid = app.tabs[i]
             .scene
-            .add_entity(codec::EntityType::Surface(Surface::new(
+            .add_entity(codec::EntityType::Surface(Box::new(Surface::new(
                 SurfaceKind::Generic,
-            )));
+            ))));
         let original =
             serde_json::to_value(app.tabs[i].scene.document.get_entity(source).unwrap()).unwrap();
         let before = app.tabs[i].history.undo_stack.len();
@@ -1060,7 +1062,7 @@ mod thicken_tests {
             kernel::brep::extrude_surface(Plane::XY, &[Curve::Nurbs(profile)], [0.0, 0.0, 2.0])
                 .unwrap();
         let source = app.add_surface_model(
-            codec::EntityType::Surface(Surface::new(SurfaceKind::Generic)),
+            codec::EntityType::Surface(Box::new(Surface::new(SurfaceKind::Generic))),
             body,
         );
         let i = app.active_tab;
@@ -1126,6 +1128,724 @@ mod dispatched_command_task_tests {
             app.tabs[i].render_mode,
             Mode::GouraudShaded,
             "Relaunch dropped the dispatched command's task"
+        );
+    }
+}
+
+/// PW-1 BEDIT characterization tests.
+///
+/// Two groups:
+/// - `locked_*`: behavior Phase 1 must preserve (save keeps edits, discard
+///   restores the definition, refusals stay refused).
+/// - `documenting_*`: today's questionable behavior, pinned so the refactor
+///   cannot change it silently. Each one is expected to flip in Phase 1.
+#[cfg(test)]
+mod bedit_characterization_tests {
+    use super::super::*;
+    use codec::entities::{Circle, Insert, Line};
+    use codec::types::Vector3;
+    use codec::EntityType;
+
+    /// Fresh document with one block definition `BLK` (one line) and one
+    /// model-space INSERT referencing it. Returns the INSERT handle and the
+    /// definition's member handles.
+    fn setup_block_and_insert(app: &mut OpenCADStudio) -> (Handle, Vec<Handle>) {
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let tab = app.active_tab;
+        app.tabs[tab].scene.define_block_raw(
+            "BLK",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::new(10.0, 0.0, 0.0),
+            ))],
+        );
+        let insert = app.tabs[tab]
+            .scene
+            .document
+            .add_entity(EntityType::Insert(Insert::new(
+                "BLK",
+                Vector3::new(100.0, 0.0, 0.0),
+            )))
+            .expect("insert");
+        let members = block_members(app, "BLK");
+        (insert, members)
+    }
+
+    fn block_members(app: &OpenCADStudio, name: &str) -> Vec<Handle> {
+        app.tabs[app.active_tab]
+            .scene
+            .document
+            .block_records
+            .get(name)
+            .map(|br| br.entity_handles.clone())
+            .unwrap_or_default()
+    }
+
+    /// Definition state as (handle, Debug form) in member order. The Debug
+    /// form stands in for PartialEq, which EntityType does not provide.
+    fn definition_state(app: &OpenCADStudio, name: &str) -> Vec<(Handle, String)> {
+        let tab = app.active_tab;
+        block_members(app, name)
+            .into_iter()
+            .map(|h| {
+                let e = app.tabs[tab].scene.document.get_entity(h);
+                (h, format!("{e:?}"))
+            })
+            .collect()
+    }
+
+    fn undo_depth(app: &OpenCADStudio) -> usize {
+        app.tabs[app.active_tab].history.undo_stack.len()
+    }
+
+    fn begin_bedit(app: &mut OpenCADStudio, insert: Handle) {
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+        assert!(
+            app.tabs[app.active_tab].active_block_edit.is_some(),
+            "setup: BEDIT_BEGIN should open a block-edit session"
+        );
+    }
+
+    fn add_circle_in_bedit(app: &mut OpenCADStudio) -> Handle {
+        let tab = app.active_tab;
+        app.tabs[tab]
+            .scene
+            .add_entity(EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 2.0)))
+    }
+
+    // ---- locked: must survive Phase 1 ----
+
+    /// Locked: save keeps the entity added inside the session.
+    #[test]
+    fn locked_save_keeps_entity_added_in_session() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        begin_bedit(&mut app, insert);
+        add_circle_in_bedit(&mut app);
+        let _ = app.dispatch_command("BEDIT_SAVE");
+
+        assert!(app.tabs[app.active_tab].active_block_edit.is_none());
+        assert_eq!(
+            block_members(&app, "BLK").len(),
+            2,
+            "save keeps the new entity"
+        );
+    }
+
+    /// Locked: discard restores the definition to its entry state exactly
+    /// (same handles, same geometry, same order).
+    #[test]
+    fn locked_discard_restores_definition_to_entry_state() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let entry = definition_state(&app, "BLK");
+        begin_bedit(&mut app, insert);
+        add_circle_in_bedit(&mut app);
+        let _ = app.dispatch_command("BEDIT_DISCARD");
+
+        assert!(app.tabs[app.active_tab].active_block_edit.is_none());
+        assert_eq!(definition_state(&app, "BLK"), entry);
+    }
+
+    /// Locked: refusals. A non-INSERT is rejected and no session opens.
+    #[test]
+    fn locked_bedit_refuses_non_insert_object() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let tab = app.active_tab;
+        let line = app.tabs[tab]
+            .scene
+            .document
+            .add_entity(EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::new(1.0, 0.0, 0.0),
+            )))
+            .expect("line");
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", line.value()));
+        assert!(app.tabs[tab].active_block_edit.is_none());
+        assert!(app.tabs[tab].block_edits.is_empty());
+    }
+
+    /// Locked: refusal. The `BEDIT` picker command is rejected while a
+    /// REFEDIT session is active and no BEDIT session opens.
+    #[test]
+    fn locked_bedit_picker_refused_while_refedit_active() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        let _ = app.dispatch_command(&format!("REFEDIT_BEGIN:{}", insert.value()));
+        assert!(
+            app.tabs[tab].refedit_session.is_some(),
+            "setup: REFEDIT_BEGIN should open a REFEDIT session"
+        );
+        let _ = app.dispatch_command("BEDIT");
+        assert!(app.tabs[tab].active_block_edit.is_none());
+        assert!(app.tabs[tab].block_edits.is_empty());
+    }
+
+    /// Every entry point must refuse while REFEDIT is active.
+    #[test]
+    fn locked_bedit_begin_refuses_active_refedit() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        let _ = app.dispatch_command(&format!("REFEDIT_BEGIN:{}", insert.value()));
+        assert!(app.tabs[tab].refedit_session.is_some());
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+        assert!(
+            app.tabs[tab].active_block_edit.is_none(),
+            "begin must refuse while REFEDIT is active"
+        );
+    }
+
+    /// Locked: refusal. An xref definition cannot be edited.
+    #[test]
+    fn locked_bedit_refuses_xref_definition() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        app.tabs[tab]
+            .scene
+            .document
+            .block_records
+            .get_mut("BLK")
+            .expect("block record")
+            .flags
+            .is_xref = true;
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+        assert!(app.tabs[tab].active_block_edit.is_none());
+        assert!(app.tabs[tab].block_edits.is_empty());
+    }
+
+    /// V7 (reference check): while a block editor session is open this
+    /// command set is refused outright with "not allowed in block editor";
+    /// the refusal pushes no undo entry and starts no command.
+    #[test]
+    fn locked_deny_list_refuses_while_session_open() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+        assert!(
+            app.tabs[tab].active_block_edit.is_some(),
+            "setup: BEDIT_BEGIN should open a session"
+        );
+        let undo_depth = app.tabs[tab].history.undo_stack.len();
+        for verb in [
+            "LAYOUT",
+            "VPORTS",
+            "MVIEW",
+            "WBLOCK",
+            "PURGE",
+            "RENAME",
+            "REFEDIT",
+            "REFEDIT_BEGIN",
+            "PLOT",
+        ] {
+            let revision = app.command_line.error_revision;
+            let _ = app.dispatch_command(verb);
+            assert_eq!(
+                app.command_line.error_revision,
+                revision.wrapping_add(1),
+                "{verb} must refuse with a command-line error"
+            );
+            assert!(
+                app.command_line
+                    .last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("command not allowed in block editor"),
+                "{verb}: got {:?}",
+                app.command_line.last_error
+            );
+            assert!(
+                app.tabs[tab].active_block_edit.is_some(),
+                "{verb} must keep the session open"
+            );
+            assert!(
+                app.tabs[tab].active_cmd.is_none(),
+                "{verb} must not install a command"
+            );
+            assert_eq!(
+                app.tabs[tab].history.undo_stack.len(),
+                undo_depth,
+                "{verb} must push no undo entry"
+            );
+        }
+    }
+
+    /// Spec 8: a rejected command must not cancel a running command — the
+    /// deny hook sits before the running-command teardown.
+    #[test]
+    fn locked_deny_list_does_not_cancel_a_running_command() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+        assert!(app.tabs[tab].active_block_edit.is_some());
+        let _ = app.dispatch_command("LINE");
+        assert_eq!(
+            app.tabs[tab].active_cmd.as_deref().map(|cmd| cmd.name()),
+            Some("LINE"),
+            "setup: LINE should be running inside the session"
+        );
+        let _ = app.dispatch_command("LAYOUT");
+        assert!(app
+            .command_line
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("command not allowed in block editor"));
+        assert_eq!(
+            app.tabs[tab].active_cmd.as_deref().map(|cmd| cmd.name()),
+            Some("LINE"),
+            "the refused command must leave the running LINE untouched"
+        );
+    }
+
+    /// V7: the reference keeps XREF, NEW, OPEN, SAVEAS and BEDIT available
+    /// inside the editor — the deny list must not touch them.
+    #[test]
+    fn locked_deny_list_leaves_v7_allowed_commands_alone() {
+        for verb in ["XREF", "NEW", "OPEN", "SAVEAS", "BEDIT"] {
+            let mut app = OpenCADStudio::new_for_test();
+            let (insert, _) = setup_block_and_insert(&mut app);
+            let tab = app.active_tab;
+            let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", insert.value()));
+            assert!(app.tabs[tab].active_block_edit.is_some());
+            let _ = app.dispatch_command(verb);
+            assert!(
+                !app.command_line
+                    .last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not allowed in block editor"),
+                "{verb} is available in the reference session and must not be denied: {:?}",
+                app.command_line.last_error
+            );
+        }
+    }
+
+    // ---- documenting: today's behavior, expected to flip in Phase 1 ----
+
+    /// Discard removes local before-images before drawing undo resumes.
+    #[test]
+    fn locked_modify_discard_then_undo_does_not_restore_local_edits() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, members) = setup_block_and_insert(&mut app);
+        let line = members[0];
+        let entry = definition_state(&app, "BLK");
+        begin_bedit(&mut app, insert);
+
+        let tab = app.active_tab;
+        // Record the undo step before the mutation so the recorder captures it.
+        app.push_undo_snapshot(tab, "modify inside BEDIT");
+        app.tabs[tab]
+            .scene
+            .document
+            .get_entity_mut(line)
+            .map(|e| {
+                if let EntityType::Line(l) = e {
+                    l.end = Vector3::new(99.0, 0.0, 0.0);
+                }
+            })
+            .expect("line in definition");
+        app.finish_pending_history(tab);
+
+        let _ = app.dispatch_command("BEDIT_DISCARD");
+        app.finish_pending_history(tab);
+        assert_eq!(
+            definition_state(&app, "BLK"),
+            entry,
+            "discard restores entry"
+        );
+
+        app.undo_steps(1);
+        // Pinned: the state after one undo, observed on current code.
+        assert_eq!(
+            definition_state(&app, "BLK"),
+            entry,
+            "documenting: undo after discard restores the entry state (ISS-02 not reproduced here)"
+        );
+    }
+
+    /// Local undo restores both the entity store and block membership.
+    #[test]
+    fn locked_session_undo_restores_membership_without_crossing_entry() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        begin_bedit(&mut app, insert);
+        let tab = app.active_tab;
+        app.push_undo_snapshot(tab, "add circle in BEDIT");
+        add_circle_in_bedit(&mut app);
+        app.finish_pending_history(tab);
+        assert_eq!(block_members(&app, "BLK").len(), 2);
+
+        app.undo_steps(1);
+        let members = block_members(&app, "BLK");
+        assert_eq!(
+            members.len(),
+            1,
+            "block membership must match the undone entity store"
+        );
+        let dangling = members
+            .iter()
+            .filter(|h| app.tabs[tab].scene.document.get_entity(**h).is_none())
+            .count();
+        assert_eq!(dangling, 0, "every member must have an entity");
+        assert!(
+            app.tabs[tab].active_block_edit.is_some(),
+            "documenting: undo does not close the session"
+        );
+    }
+
+    /// Opening starts an empty local history; undo cannot cross entry.
+    #[test]
+    fn locked_session_entry_has_no_undo_step() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        begin_bedit(&mut app, insert);
+        app.finish_pending_history(tab);
+        let depth_after_begin = undo_depth(&app);
+        assert_eq!(depth_after_begin, 0, "opening must not record an undo step");
+
+        app.undo_steps(1);
+        assert!(
+            app.tabs[tab].active_block_edit.is_some(),
+            "documenting: undoing BEDIT_BEGIN does not close the open session"
+        );
+    }
+
+    /// Switching a clean block replaces the single session.
+    #[test]
+    fn locked_clean_switch_replaces_the_session() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        let tab = app.active_tab;
+        app.tabs[tab].scene.define_block_raw(
+            "OTHER",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::new(5.0, 0.0, 0.0),
+            ))],
+        );
+        let other_insert = app.tabs[tab]
+            .scene
+            .document
+            .add_entity(EntityType::Insert(Insert::new(
+                "OTHER",
+                Vector3::new(200.0, 0.0, 0.0),
+            )))
+            .expect("insert");
+        begin_bedit(&mut app, insert);
+        begin_bedit(&mut app, other_insert);
+        assert_eq!(
+            app.tabs[tab].block_edits.len(),
+            1,
+            "a drawing has only one block-editor session"
+        );
+    }
+
+    /// No-change Save and Discard leave the drawing history untouched.
+    #[test]
+    fn locked_clean_save_and_discard_leave_history_unchanged() {
+        let mut app = OpenCADStudio::new_for_test();
+        let (insert, _) = setup_block_and_insert(&mut app);
+        begin_bedit(&mut app, insert);
+        app.finish_pending_history(app.active_tab);
+        let after_begin = undo_depth(&app);
+
+        let _ = app.dispatch_command("BEDIT_SAVE");
+        app.finish_pending_history(app.active_tab);
+        assert_eq!(undo_depth(&app), after_begin, "save pushes no undo entry");
+
+        begin_bedit(&mut app, insert);
+        app.finish_pending_history(app.active_tab);
+        let before_discard = undo_depth(&app);
+        let _ = app.dispatch_command("BEDIT_DISCARD");
+        app.finish_pending_history(app.active_tab);
+        assert_eq!(
+            undo_depth(&app),
+            before_discard,
+            "discard pushes no undo entry (not undoable)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod block_base_point_tests {
+    use super::super::*;
+    use crate::command::{CadCommand, CmdResult};
+    use crate::modules::insert::insert_block::InsertBlockCommand;
+    use codec::entities::AttributeDefinition;
+    use codec::types::Vector3;
+    use codec::EntityType;
+
+    /// base-point fix (A), host side: `AttreqNeeded` is where the host resolves the
+    /// block's ATTDEFs, so it also injects the definition's base point. Without
+    /// that the committed attribute lands on the codec transform's position.
+    #[test]
+    fn locked_attreq_injects_the_block_base_point_for_attribute_placement() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        // Block "ATTREQ_BP": base (10,5,0); LINE (10,5)-(30,5); ATTDEF TAG1 at
+        // (12,8). Rendering convention (see scene::block_base_point_tests): the
+        // ATTDEF lands at (100,100) + Rot(30)*Scale(2)*((12,8) - (10,5))
+        //   = (100,100) + 2*(1.732051 - 1.5, 1 + 2.598076) = (100.464102, 107.196152).
+        app.tabs[i].scene.define_block_raw(
+            "ATTREQ_BP",
+            Vector3::new(10.0, 5.0, 0.0),
+            vec![
+                EntityType::Line(codec::entities::Line::from_points(
+                    Vector3::new(10.0, 5.0, 0.0),
+                    Vector3::new(30.0, 5.0, 0.0),
+                )),
+                EntityType::AttributeDefinition(AttributeDefinition {
+                    insertion_point: Vector3::new(12.0, 8.0, 0.0),
+                    height: 1.0,
+                    ..AttributeDefinition::new(
+                        "TAG1".to_string(),
+                        "Tag one".to_string(),
+                        String::new(),
+                    )
+                }),
+            ],
+        );
+
+        let mut cmd = InsertBlockCommand::classic_for_block(
+            "ATTREQ_BP".to_string(),
+            Vec::new(),
+            String::new(),
+        );
+        let _ = cmd.on_point(glam::DVec3::new(100.0, 100.0, 0.0));
+        assert!(matches!(cmd.on_text_input("2"), Some(CmdResult::NeedPoint)));
+        assert!(matches!(cmd.on_text_input("2"), Some(CmdResult::NeedPoint)));
+        assert!(matches!(
+            cmd.on_text_input("30"),
+            Some(CmdResult::AttreqNeeded { .. })
+        ));
+        app.tabs[i].active_cmd = Some(Box::new(cmd));
+
+        let _ = app.apply_cmd_result(CmdResult::AttreqNeeded {
+            block_name: "ATTREQ_BP".to_string(),
+        });
+        let result = app.tabs[i]
+            .active_cmd
+            .as_mut()
+            .expect("the INSERT command waits for the attribute value")
+            .on_text_input("VALUE1")
+            .expect("the value finishes the INSERT");
+        let _ = app.apply_cmd_result(result);
+
+        let attribute = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                EntityType::Insert(ins) if ins.block_name == "ATTREQ_BP" => {
+                    ins.attributes.first().cloned()
+                }
+                _ => None,
+            })
+            .expect("the committed INSERT's attribute");
+        assert_eq!(attribute.tag, "TAG1");
+        let point = attribute.insertion_point;
+        assert!(
+            (point.x - 100.464102).abs() < 1e-6
+                && (point.y - 107.196152).abs() < 1e-6
+                && point.z.abs() < 1e-9,
+            "attribute at ({:.6},{:.6},{:.6}), expected (100.464102,107.196152,0)",
+            point.x,
+            point.y,
+            point.z
+        );
+    }
+
+    /// base-point fix (D), host side: picking an existing block in the Block
+    /// Definition dialog prefills the base point from that definition.
+    #[test]
+    fn locked_block_def_name_select_prefills_the_definition_base_point() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.define_block_raw(
+            "DEF_BASE",
+            Vector3::new(10.0, 5.0, 0.0),
+            vec![EntityType::Line(codec::entities::Line::from_points(
+                Vector3::new(10.0, 5.0, 0.0),
+                Vector3::new(30.0, 5.0, 0.0),
+            ))],
+        );
+        app.block_definition = Some(
+            crate::ui::window::block_definition::BlockDefinitionState::new(
+                vec!["DEF_BASE".to_string()],
+                Vec::new(),
+                0,
+            ),
+        );
+        assert_eq!(
+            app.block_definition
+                .as_ref()
+                .map(|s| s.base_point_y.as_str()),
+            Some("0"),
+            "a new block starts at 0"
+        );
+
+        let _ = app.update(Message::BlockDefNameSelect("DEF_BASE".to_string()));
+
+        let state = app.block_definition.as_ref().expect("the dialog is open");
+        assert_eq!(state.name, "DEF_BASE");
+        assert_eq!(state.base_point_x, "10.0000");
+        assert_eq!(state.base_point_y, "5.0000");
+        assert_eq!(state.base_point_z, "0.0000");
+        assert_eq!(state.parse_base_point(), glam::DVec3::new(10.0, 5.0, 0.0));
+    }
+
+    /// A block with base (10,5,0) and LINE (10,5)-(30,5), referenced by an
+    /// INSERT at (100,100) with 30° rotation and uniform scale 2. Under the
+    /// convention the LINE renders at (100,100)-(134.641016,120).
+    fn block_and_instance_with_base(app: &mut OpenCADStudio, name: &str) -> codec::Handle {
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.define_block_raw(
+            name,
+            Vector3::new(10.0, 5.0, 0.0),
+            vec![EntityType::Line(codec::entities::Line::from_points(
+                Vector3::new(10.0, 5.0, 0.0),
+                Vector3::new(30.0, 5.0, 0.0),
+            ))],
+        );
+        let mut insert =
+            codec::entities::Insert::new(name.to_string(), Vector3::new(100.0, 100.0, 0.0));
+        insert.set_x_scale(2.0);
+        insert.set_y_scale(2.0);
+        insert.set_z_scale(2.0);
+        insert.rotation = std::f64::consts::PI / 6.0;
+        app.tabs[i].scene.add_entity(EntityType::Insert(insert))
+    }
+
+    /// base-point follow-up fix: the REFEDIT working copy is placed through the
+    /// base-point-aware INSERT transform, so it sits exactly on the rendered
+    /// reference, and saving folds it back to the same block-local geometry.
+    #[test]
+    fn locked_refedit_working_copy_sits_on_the_rendered_reference() {
+        let mut app = OpenCADStudio::new_for_test();
+        let handle = block_and_instance_with_base(&mut app, "REFEDIT_BP");
+        let i = app.active_tab;
+
+        let _ = app.dispatch_command(&format!("REFEDIT_BEGIN:{}", handle.value()));
+        assert!(
+            app.tabs[i].refedit_session.is_some(),
+            "setup: REFEDIT_BEGIN opens a session"
+        );
+
+        // The working copy is the LINE the session moved into model space.
+        let temp: Vec<codec::Handle> = app.tabs[i]
+            .refedit_session
+            .as_ref()
+            .expect("the session")
+            .temp_handles
+            .clone();
+        let line = temp
+            .iter()
+            .find_map(|h| match app.tabs[i].scene.document.get_entity(*h) {
+                Some(EntityType::Line(line)) => Some(line.clone()),
+                _ => None,
+            })
+            .expect("the working-copy LINE");
+        // (100,100) + Rot(30)*2*((10,5)-(10,5)) and ...*((30,5)-(10,5)).
+        assert!(
+            (line.start.x - 100.0).abs() < 1e-6
+                && (line.start.y - 100.0).abs() < 1e-9
+                && (line.end.x - 134.641016).abs() < 1e-6
+                && (line.end.y - 120.0).abs() < 1e-6,
+            "working copy at ({:.6},{:.6})-({:.6},{:.6}), expected (100,100)-(134.641016,120)",
+            line.start.x,
+            line.start.y,
+            line.end.x,
+            line.end.y
+        );
+
+        // Saving without editing restores the definition verbatim: the
+        // inverse is the exact inverse of the forward transform.
+        let _ = app.dispatch_command("REFCLOSE_SAVE");
+        assert!(app.tabs[i].refedit_session.is_none());
+        let stored = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("REFEDIT_BP")
+            .expect("the block record")
+            .entity_handles
+            .iter()
+            .find_map(|h| match app.tabs[i].scene.document.get_entity(*h) {
+                Some(EntityType::Line(line)) => Some(line.clone()),
+                _ => None,
+            })
+            .expect("the stored LINE");
+        assert!(
+            (stored.start.x - 10.0).abs() < 1e-9
+                && (stored.start.y - 5.0).abs() < 1e-9
+                && (stored.end.x - 30.0).abs() < 1e-9
+                && (stored.end.y - 5.0).abs() < 1e-9,
+            "stored LINE at ({:.9},{:.9})-({:.9},{:.9}), expected (10,5)-(30,5)",
+            stored.start.x,
+            stored.start.y,
+            stored.end.x,
+            stored.end.y
+        );
+        assert_eq!(
+            crate::scene::render_graph::block_base_point(&app.tabs[i].scene.document, "REFEDIT_BP"),
+            Vector3::new(10.0, 5.0, 0.0),
+            "the base point survives the round trip"
+        );
+    }
+
+    /// base-point follow-up fix: the dynamic-block visibility grip is a
+    /// block-definition coordinate, so it follows the base-point convention
+    /// too: (100,100) + Rot(30)*2*((12,3) - (10,5)) = (105.464102, 98.535898).
+    #[test]
+    fn locked_visibility_grip_follows_the_base_point_convention() {
+        let mut app = OpenCADStudio::new_for_test();
+        let handle = block_and_instance_with_base(&mut app, "VIS_BP");
+        let i = app.active_tab;
+
+        let def_block = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("VIS_BP")
+            .expect("the block record")
+            .handle;
+        let mut param = codec::objects::BlockVisibilityParameter::default();
+        param.owner = def_block;
+        param.def_point = Vector3::new(12.0, 3.0, 0.0);
+        app.tabs[i]
+            .scene
+            .document
+            .block_visibility_params
+            .insert(codec::Handle::new(0x70), param);
+        app.tabs[i].selected_handle = Some(handle);
+
+        app.refresh_visibility_grip([0.0, 0.0, 0.0]);
+
+        let grip = app.tabs[i]
+            .selected_grips
+            .last()
+            .expect("the visibility lookup grip");
+        assert!(
+            (grip.world.x - 105.464102).abs() < 1e-6 && (grip.world.y - 98.535898).abs() < 1e-6,
+            "grip at ({:.6},{:.6}), expected (105.464102,98.535898)",
+            grip.world.x,
+            grip.world.y
+        );
+        assert!(
+            app.tabs[i].visibility_grip.is_some(),
+            "the selection is a dynamic-block reference"
         );
     }
 }

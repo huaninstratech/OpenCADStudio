@@ -16,9 +16,7 @@ impl Scene {
         }
     }
 
-    pub(crate) fn model_pane_min_reporter(
-        &self,
-    ) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+    pub(crate) fn model_pane_min_reporter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
         self.model_pane_min_px.clone()
     }
 
@@ -26,8 +24,84 @@ impl Scene {
     /// cached layout-name list is invalidated on insert.
     pub fn add_layout(&mut self, name: &str) -> codec::Result<Handle> {
         let handle = self.document.add_layout(name)?;
+        // Opening it fits the sheet the document made for it (placed at the
+        // origin) to its page and, with LAYOUTCREATEVIEWPORT, gives it its
+        // first viewport; saved before that, it is written with none.
+        self.unopened_layouts.insert(name.to_string());
         self.bump_layout_epoch();
         Ok(handle)
+    }
+
+    /// Give layout `name` the page of layout `source`: its page setup,
+    /// limits and UCS, and the sheet viewport's view. It opens as it is, so
+    /// it does not get the first viewport a new layout gets. The paper-space
+    /// objects are copied by the caller.
+    pub fn copy_layout_page(&mut self, source: &str, name: &str) {
+        let find = |document: &codec::CadDocument, wanted: &str| {
+            document.objects.values().find_map(|object| match object {
+                ObjectType::Layout(layout) if layout.name == wanted => Some(layout.clone()),
+                _ => None,
+            })
+        };
+        let (Some(from), Some(to)) = (find(&self.document, source), find(&self.document, name))
+        else {
+            return;
+        };
+        if let Some(ObjectType::Layout(layout)) = self.document.objects.get_mut(&to.handle) {
+            *layout = codec::objects::Layout {
+                handle: to.handle,
+                owner: to.owner,
+                name: to.name.clone(),
+                tab_order: to.tab_order,
+                block_record: to.block_record,
+                viewport: to.viewport,
+                viewports: to.viewports.clone(),
+                reactors: to.reactors.clone(),
+                xdictionary_handle: to.xdictionary_handle,
+                ..from.clone()
+            };
+        }
+        if let Some(EntityType::Viewport(sheet)) = self.document.get_entity(from.viewport).cloned()
+        {
+            if let Some(EntityType::Viewport(target)) = self.document.get_entity_mut(to.viewport) {
+                *target = codec::entities::Viewport {
+                    common: target.common.clone(),
+                    ..sheet
+                };
+            }
+        }
+        self.unopened_layouts.remove(name);
+        self.bump_layout_epoch();
+    }
+
+    /// The paper-space objects of layout `name`, without its sheet viewport.
+    pub fn layout_paper_entities(&self, name: &str) -> Vec<Handle> {
+        let Some((record, sheet)) = self.document.objects.values().find_map(|object| match object {
+            ObjectType::Layout(layout) if layout.name == name => {
+                Some((layout.block_record, layout.viewport))
+            }
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        self.document
+            .block_records
+            .iter()
+            .find(|br| br.handle == record)
+            .map(|br| {
+                br.entity_handles
+                    .iter()
+                    .copied()
+                    .filter(|handle| *handle != sheet)
+                    .filter(|handle| {
+                        !matches!(
+                            self.document.get_entity(*handle),
+                            None | Some(EntityType::Block(_) | EntityType::BlockEnd(_))
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Rename a paper-space layout.  Updates the Layout object name in the document.
@@ -36,6 +110,9 @@ impl Scene {
             if let ObjectType::Layout(l) = obj {
                 if l.name == old_name {
                     l.name = new_name.to_string();
+                    if self.unopened_layouts.remove(old_name) {
+                        self.unopened_layouts.insert(new_name.to_string());
+                    }
                     self.bump_layout_epoch();
                     return;
                 }
@@ -185,7 +262,10 @@ impl Scene {
         let cam = self.camera.borrow().clone();
         let (mode, grid_on, snap_on) = {
             let tiles = self.model_tiles.borrow();
-            let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+            let active = self
+                .active_model_tile
+                .get()
+                .min(tiles.len().saturating_sub(1));
             tiles
                 .get(active)
                 .map(|t| (t.render_mode, t.grid_on, t.snap_on))
@@ -294,8 +374,16 @@ impl Scene {
         if a == b {
             return;
         }
-        let pa = self.model_panes.iter().find(|(_, &v)| v == a).map(|(p, _)| *p);
-        let pb = self.model_panes.iter().find(|(_, &v)| v == b).map(|(p, _)| *p);
+        let pa = self
+            .model_panes
+            .iter()
+            .find(|(_, &v)| v == a)
+            .map(|(p, _)| *p);
+        let pb = self
+            .model_panes
+            .iter()
+            .find(|(_, &v)| v == b)
+            .map(|(p, _)| *p);
         if let (Some(pa), Some(pb)) = (pa, pb) {
             self.model_panes.swap(pa, pb);
         }
@@ -309,26 +397,27 @@ impl Scene {
         let old = self.model_tiles.borrow().clone();
         let order: Vec<iced::widget::pane_grid::Pane> =
             self.model_panes.iter().map(|(p, _)| *p).collect();
-        let fallback = old
-            .first()
-            .cloned()
-            .unwrap_or_else(|| ModelTile {
-                rect: iced::Rectangle {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1.0,
-                    height: 1.0,
-                },
-                camera: self.camera.borrow().clone(),
-                render_mode: codec::entities::ViewportRenderMode::Wireframe2D,
-                grid_on: false,
-                snap_on: false,
-            });
+        let fallback = old.first().cloned().unwrap_or_else(|| ModelTile {
+            rect: iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            camera: self.camera.borrow().clone(),
+            render_mode: codec::entities::ViewportRenderMode::Wireframe2D,
+            grid_on: false,
+            snap_on: false,
+        });
         let mut new_tiles = Vec::with_capacity(order.len());
         let mut new_active = 0usize;
         for (new_idx, pane) in order.iter().enumerate() {
             let old_idx = *self.model_panes.get(*pane).unwrap_or(&0);
-            new_tiles.push(old.get(old_idx).cloned().unwrap_or_else(|| fallback.clone()));
+            new_tiles.push(
+                old.get(old_idx)
+                    .cloned()
+                    .unwrap_or_else(|| fallback.clone()),
+            );
             if let Some(v) = self.model_panes.get_mut(*pane) {
                 *v = new_idx;
             }
@@ -458,7 +547,6 @@ impl Scene {
         }
     }
 
-
     /// Screen-pixel rectangle of the active Model tile within a canvas of
     /// `(vw, vh)`. Full canvas outside the Model layout or for a single
     /// tile. Used to map cursor coordinates into the active tile so pick /
@@ -476,10 +564,18 @@ impl Scene {
 
     pub fn active_model_tile_bounds(&self, vw: f32, vh: f32) -> iced::Rectangle {
         if self.current_layout != "Model" {
-            return iced::Rectangle { x: 0.0, y: 0.0, width: vw, height: vh };
+            return iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: vw,
+                height: vh,
+            };
         }
         let tiles = self.model_tiles.borrow();
-        let active = self.active_model_tile.get().min(tiles.len().saturating_sub(1));
+        let active = self
+            .active_model_tile
+            .get()
+            .min(tiles.len().saturating_sub(1));
         match tiles.get(active) {
             Some(t) => iced::Rectangle {
                 x: t.rect.x * vw,
@@ -487,11 +583,15 @@ impl Scene {
                 width: (t.rect.width * vw).max(1.0),
                 height: (t.rect.height * vh).max(1.0),
             },
-            None => iced::Rectangle { x: 0.0, y: 0.0, width: vw, height: vh },
+            None => iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: vw,
+                height: vh,
+            },
         }
     }
 }
-
 
 /// Reconstruct a `pane_grid` configuration from a set of (tile-index, rect)
 /// items covering `region`, by recursively finding a full vertical or

@@ -1,14 +1,15 @@
 // Small platform shims for things the desktop build does natively but the web
 // (wasm) build must handle differently or skip.
 
+pub mod ui_font;
+
 /// Drawing hyperlinks may open web pages, never local files or custom handlers.
 pub(crate) fn web_hyperlink(value: &str) -> Option<String> {
     if value.chars().any(char::is_control) {
         return None;
     }
     let url = url::Url::parse(value.trim()).ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
-        .then(|| url.into())
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then(|| url.into())
 }
 
 #[test]
@@ -17,9 +18,15 @@ fn drawing_hyperlinks_only_open_web_pages() {
         assert!(web_hyperlink(value).is_some(), "{value}");
     }
     for value in [
-        "", "https://", "javascript:alert(1)", "data:text/html,example",
-        "file:///tmp/program.desktop", "/tmp/program.desktop", "custom:run",
-        "mailto:user@example.com", "https://example.com/\npath",
+        "",
+        "https://",
+        "javascript:alert(1)",
+        "data:text/html,example",
+        "file:///tmp/program.desktop",
+        "/tmp/program.desktop",
+        "custom:run",
+        "mailto:user@example.com",
+        "https://example.com/\npath",
     ] {
         assert!(web_hyperlink(value).is_none(), "{value}");
     }
@@ -52,14 +59,10 @@ pub fn open_url<Message: Send + 'static>(
 fn linux_activation_token(window: &dyn iced::window::Window) -> Option<String> {
     use iced::window::raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-    let RawWindowHandle::Wayland(window_handle) =
-        window.window_handle().ok()?.as_raw()
-    else {
+    let RawWindowHandle::Wayland(window_handle) = window.window_handle().ok()?.as_raw() else {
         return None;
     };
-    let RawDisplayHandle::Wayland(display_handle) =
-        window.display_handle().ok()?.as_raw()
-    else {
+    let RawDisplayHandle::Wayland(display_handle) = window.display_handle().ok()?.as_raw() else {
         return None;
     };
 
@@ -67,13 +70,11 @@ fn linux_activation_token(window: &dyn iced::window::Window) -> Option<String> {
     // The returned token is an owned string and is immediately handed to the
     // child process.
     unsafe {
-        iced::futures::executor::block_on(
-            ashpd::ActivationToken::from_wayland_raw(
-                None,
-                window_handle.surface.as_ptr(),
-                display_handle.display.as_ptr(),
-            ),
-        )
+        iced::futures::executor::block_on(ashpd::ActivationToken::from_wayland_raw(
+            None,
+            window_handle.surface.as_ptr(),
+            display_handle.display.as_ptr(),
+        ))
     }
     .map(String::from)
 }
@@ -101,10 +102,7 @@ fn open_url_linux(url: &str, activation_token: Option<String>) {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
-pub fn open_url<Message>(
-    url: &str,
-    _parent: Option<iced::window::Id>,
-) -> iced::Task<Message> {
+pub fn open_url<Message>(url: &str, _parent: Option<iced::window::Id>) -> iced::Task<Message> {
     let _ = open::that_detached(url);
     iced::Task::none()
 }
@@ -112,10 +110,7 @@ pub fn open_url<Message>(
 /// Web opens the tab synchronously so the browser still sees the click as a
 /// user gesture and does not block it as a pop-up.
 #[cfg(target_arch = "wasm32")]
-pub fn open_url<Message>(
-    url: &str,
-    _parent: Option<iced::window::Id>,
-) -> iced::Task<Message> {
+pub fn open_url<Message>(url: &str, _parent: Option<iced::window::Id>) -> iced::Task<Message> {
     if let Some(window) = web_sys::window() {
         let _ = window.open_with_url_and_target_and_features(url, "_blank", "noopener,noreferrer");
     }
@@ -148,12 +143,11 @@ pub fn set_unsaved_changes_warning(active: bool) {
             return;
         }
         if active {
-            let callback = wasm_bindgen::closure::Closure::new(
-                move |event: web_sys::BeforeUnloadEvent| {
+            let callback =
+                wasm_bindgen::closure::Closure::new(move |event: web_sys::BeforeUnloadEvent| {
                     event.prevent_default();
                     event.set_return_value("");
-                },
-            );
+                });
             window.set_onbeforeunload(Some(callback.as_ref().unchecked_ref()));
             *warning = Some(callback);
         } else {
@@ -192,6 +186,75 @@ pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         Ok(status) => Err(format!("File manager exited with {status}")),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// If the main application window is minimized, restore it quietly in the background
+/// without activating it or stealing user focus, so viewport captures succeed.
+#[cfg(target_os = "windows")]
+pub fn restore_window_if_minimized() -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+        SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_SHOWNOACTIVATE,
+    };
+    type BOOL = i32;
+
+    struct Context {
+        pid: u32,
+        restored: bool,
+    }
+
+    unsafe {
+        let current_pid = GetCurrentProcessId();
+        let mut ctx = Context {
+            pid: current_pid,
+            restored: false,
+        };
+
+        unsafe extern "system" fn enum_wnd(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam as *mut Context);
+            let mut wnd_pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut wnd_pid);
+            if wnd_pid == ctx.pid {
+                let mut class_buf = [0u16; 64];
+                let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), 64);
+                let class_str = String::from_utf16_lossy(&class_buf[..len as usize]);
+
+                // CRITICAL FIX: Only touch the main application window ("Window Class").
+                // NEVER touch "Winit Thread Event Target" or hidden helper windows!
+                if class_str.starts_with("Window Class") {
+                    if IsIconic(hwnd) != 0 {
+                        let fg = GetForegroundWindow();
+                        // Restore in background without activation (never steal user focus)
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        // Ensure it stays behind active user applications
+                        if fg != hwnd && !fg.is_null() {
+                            SetWindowPos(
+                                hwnd,
+                                HWND_BOTTOM,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                            );
+                        }
+                        ctx.restored = true;
+                    }
+                }
+            }
+            1
+        }
+        EnumWindows(Some(enum_wnd), (&mut ctx as *mut Context) as LPARAM);
+        ctx.restored
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn restore_window_if_minimized() -> bool {
+    false
 }
 
 /// Copy the rendered web canvas during the frame callback, before the browser
@@ -236,6 +299,17 @@ pub fn capture_canvas() -> Option<iced::window::Screenshot> {
     ))
 }
 
+/// Web: is the page visible? `requestAnimationFrame` — and therefore the
+/// frames subscription and any canvas readback — never runs while
+/// `document.hidden`, so the control `capture` op refuses to wait for a frame
+/// that could never come.
+#[cfg(target_arch = "wasm32")]
+pub fn page_visible() -> bool {
+    !web_sys::window()
+        .and_then(|window| window.document())
+        .is_some_and(|document| document.hidden())
+}
+
 /// Web: read text from the system clipboard via the async Clipboard API.
 /// iced's own `clipboard::read` is a no-op on the web (the browser clipboard is
 /// async + permission-gated), so the editor paste paths use this instead. The
@@ -250,11 +324,181 @@ pub async fn read_clipboard_text() -> Option<String> {
     value.as_string()
 }
 
+/// Extension the pasted-image registry name carries for a clipboard MIME
+/// type. Unknown image types fall back to `png` — the flavor every OS
+/// screenshot paste uses — so the reference still names a decodable format.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // tested everywhere, used on wasm
+pub(crate) fn clipboard_image_extension(mime_type: &str) -> &'static str {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" | "image/x-ms-bmp" | "image/x-bmp" => "bmp",
+        _ => "png",
+    }
+}
+
+#[test]
+fn clipboard_image_extensions_cover_the_paste_flavors() {
+    assert_eq!(clipboard_image_extension("image/png"), "png");
+    assert_eq!(clipboard_image_extension("IMAGE/JPEG"), "jpg");
+    assert_eq!(clipboard_image_extension(" image/webp "), "webp");
+    assert_eq!(clipboard_image_extension("image/gif"), "gif");
+    assert_eq!(clipboard_image_extension("image/x-ms-bmp"), "bmp");
+    // Anything else (a vendor flavor, a bare "image/*") still gets a name
+    // the image registry can key and the `image` crate can decode.
+    assert_eq!(clipboard_image_extension("image/avif"), "png");
+    assert_eq!(clipboard_image_extension(""), "png");
+}
+
+/// Web: read an image from the system clipboard via the async Clipboard API
+/// (`navigator.clipboard.read()`), used when a paste found no text. Returns
+/// the registry name (`pasted-YYYYMMDD-HHMMSS-mmm[-N].<ext>`, unique against
+/// the registry) plus the image bytes,
+/// or `None` when the clipboard holds no image item or the read is denied.
+/// Like `read_clipboard_text`, the Ctrl+V keypress that reaches it is a user
+/// gesture, which is what makes the permission-gated read allowed at all.
+#[cfg(target_arch = "wasm32")]
+pub async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
+    use wasm_bindgen::JsCast;
+
+    let clipboard = web_sys::window()?.navigator().clipboard();
+    let items = wasm_bindgen_futures::JsFuture::from(clipboard.read())
+        .await
+        .ok()?;
+    let items = js_sys::Array::from(&items);
+    for index in 0..items.length() {
+        let Ok(item) = items.get(index).dyn_into::<web_sys::ClipboardItem>() else {
+            continue;
+        };
+        // A clipboard item can offer several flavors; take the first image
+        // one (browsers list at most one per item in practice). An item with
+        // no image flavor just moves the search to the next one.
+        let Some(mime_type) = item
+            .types()
+            .iter()
+            .filter_map(|kind| kind.as_string())
+            .find(|mime| mime.starts_with("image/"))
+        else {
+            continue;
+        };
+        let blob = wasm_bindgen_futures::JsFuture::from(item.get_type(&mime_type))
+            .await
+            .ok()?
+            .dyn_into::<web_sys::Blob>()
+            .ok()?;
+        let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+            .await
+            .ok()?;
+        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+        if bytes.is_empty() {
+            return None;
+        }
+        let name = pasted_image_name(&mime_type);
+        // Register under the chosen name BEFORE returning: no other wasm
+        // code can run between the uniqueness check and this insert (one
+        // thread), so a second paste landing in the same millisecond sees
+        // this name as taken and takes a `-2` suffix instead of overwriting
+        // these bytes. The paste handler's own `register_source` call with
+        // the same name is then an idempotent overwrite of identical bytes.
+        crate::scene::model::image_model::register_source(
+            &name,
+            std::sync::Arc::new(bytes.clone()),
+        );
+        return Some((name, bytes));
+    }
+    None
+}
+
+/// Registry name for a pasted clipboard image:
+/// `pasted-YYYYMMDD-HHMMSS-mmm.ext` stamped from the wall clock (local time,
+/// the same clock a screenshot file name uses) at millisecond precision, with
+/// the extension derived from the MIME type. Milliseconds alone don't
+/// guarantee uniqueness (two pastes inside one ms), so the name is pushed
+/// through [`unique_pasted_image_name`] against the live registry — a reused
+/// key would overwrite the earlier paste's bytes (the registry is last-wins)
+/// and make its entity display the newer pixels.
+#[cfg(target_arch = "wasm32")]
+fn pasted_image_name(mime_type: &str) -> String {
+    let now = js_sys::Date::new_0();
+    unique_pasted_image_name(
+        &format!(
+            "pasted-{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
+            now.get_full_year(),
+            now.get_month() + 1,
+            now.get_date(),
+            now.get_hours(),
+            now.get_minutes(),
+            now.get_seconds(),
+            (now.get_time() as u64) % 1000,
+        ),
+        clipboard_image_extension(mime_type),
+        crate::scene::model::image_model::has_source,
+    )
+}
+
+/// Turn `base` + `ext` into a registry name not taken yet: the bare
+/// `base.ext` first, then `-2`, `-3`, … inserted before the extension while
+/// the candidate already names a registered source. The taken-check is
+/// injectable so this — the part worth locking with tests — runs natively;
+/// wasm passes [`crate::scene::model::image_model::has_source`].
+pub(crate) fn unique_pasted_image_name(
+    base: &str,
+    ext: &str,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    let first = format!("{base}.{ext}");
+    if !taken(&first) {
+        return first;
+    }
+    for suffix in 2u64.. {
+        let candidate = format!("{base}-{suffix}.{ext}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("an unbounded suffix space always yields a free name")
+}
+
+#[test]
+fn pasted_image_names_never_reuse_a_taken_registry_key() {
+    let mut taken: Vec<String> = Vec::new();
+    let claim = |taken: &mut Vec<String>| {
+        let name = unique_pasted_image_name("pasted-20260915-101500-123", "png", |candidate| {
+            taken.iter().any(|used| used == candidate)
+        });
+        taken.push(name.clone());
+        name
+    };
+    // Fresh registry: the bare millisecond-stamped name is used as-is.
+    assert_eq!(claim(&mut taken), "pasted-20260915-101500-123.png");
+    // A second paste inside the same millisecond suffixes instead of
+    // overwriting — each name below must differ from every earlier one.
+    assert_eq!(claim(&mut taken), "pasted-20260915-101500-123-2.png");
+    assert_eq!(claim(&mut taken), "pasted-20260915-101500-123-3.png");
+    // The extension is part of the key: a jpg landing in the same
+    // millisecond does not collide with the pngs above.
+    assert_eq!(
+        unique_pasted_image_name("pasted-20260915-101500-123", "jpg", |candidate| {
+            taken.iter().any(|used| used == candidate)
+        }),
+        "pasted-20260915-101500-123.jpg"
+    );
+    // Freed suffixes are reused in order: with `-2` unregistered again, the
+    // next paste takes `-2` back before walking further.
+    taken.remove(1);
+    assert_eq!(claim(&mut taken), "pasted-20260915-101500-123-2.png");
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/web/clipboard.js")]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = copyHistory)]
-    pub fn copy_history_text(text: &str, fallback_label: &str, close_label: &str) -> js_sys::Promise;
+    pub fn copy_history_text(
+        text: &str,
+        fallback_label: &str,
+        close_label: &str,
+    ) -> js_sys::Promise;
 }
 
 /// Web: write text to the system clipboard (fire-and-forget). Backs Ctrl+C in
@@ -286,9 +530,7 @@ pub fn synthesize_typing(text: &str) {
         init.set_bubbles(true);
         init.set_cancelable(true);
         for kind in ["keydown", "keyup"] {
-            if let Ok(ev) =
-                web_sys::KeyboardEvent::new_with_keyboard_event_init_dict(kind, &init)
-            {
+            if let Ok(ev) = web_sys::KeyboardEvent::new_with_keyboard_event_init_dict(kind, &init) {
                 let _ = canvas.dispatch_event(&ev);
             }
         }
@@ -553,6 +795,121 @@ pub fn file_dialog() -> rfd::AsyncFileDialog {
     rfd::AsyncFileDialog::new()
 }
 
+// ── FILEDIA and file pickers that keep their file type ───────────────────────
+
+static FILE_DIA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// FILEDIA (a profile setting): commands that have a command-line form show
+/// their file dialogs only while it is on.
+pub fn file_dia() -> bool {
+    FILE_DIA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_file_dia(on: bool) {
+    FILE_DIA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The file type ATTACH's picker was last left on (1-based; 7 = Drawing).
+static ATTACH_FILTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
+
+pub fn attach_filter() -> u32 {
+    ATTACH_FILTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_attach_filter(index: u32) {
+    ATTACH_FILTER.store(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A file type of [`pick_file_with_filter`]: its label and extensions
+/// (`"*"` for every file).
+pub type FileFilter = (String, &'static [&'static str]);
+
+/// Open-file dialog that starts on file type `index` (1-based) and returns the
+/// picked path with the file type the dialog was left on.
+#[cfg(target_os = "windows")]
+pub async fn pick_file_with_filter(
+    title: String,
+    filters: Vec<FileFilter>,
+    index: u32,
+) -> Option<(std::path::PathBuf, u32)> {
+    // The dialog blocks, so it runs on its own thread like the async picker.
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(open_file_dialog_blocking(&title, &filters, index));
+    });
+    rx.await.ok().flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn open_file_dialog_blocking(
+    title: &str,
+    filters: &[FileFilter],
+    index: u32,
+) -> Option<(std::path::PathBuf, u32)> {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let mut filter = Vec::new();
+    for (label, extensions) in filters {
+        let pattern = extensions
+            .iter()
+            .map(|e| format!("*.{e}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        filter.extend(wide(label));
+        filter.extend(wide(&pattern));
+    }
+    filter.push(0);
+    let title = wide(title);
+    let dir = crate::config::last_dialog_dir().map(|d| wide(&d.to_string_lossy()));
+    let mut file = vec![0u16; 32768];
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: index,
+        lpstrFile: file.as_mut_ptr(),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        lpstrInitialDir: dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+        Flags: OFN_EXPLORER
+            | OFN_FILEMUSTEXIST
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR
+            | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    // SAFETY: every pointer in `ofn` points into buffers that outlive the call.
+    let picked = unsafe {
+        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        GetOpenFileNameW(&mut ofn)
+    };
+    if picked == 0 {
+        return None;
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&file[..len]));
+    crate::config::remember_dialog_dir(&path);
+    Some((path, ofn.nFilterIndex))
+}
+
+/// Elsewhere the picker cannot start on a file type; the index passes through.
+#[cfg(not(target_os = "windows"))]
+pub async fn pick_file_with_filter(
+    title: String,
+    filters: Vec<FileFilter>,
+    index: u32,
+) -> Option<(std::path::PathBuf, u32)> {
+    let mut dialog = file_dialog().set_title(title);
+    for (label, extensions) in &filters {
+        dialog = dialog.add_filter(label, extensions);
+    }
+    let handle = dialog.pick_file().await?;
+    Some((handle_path(&handle), index))
+}
+
 /// Trigger a browser download of `bytes` as `name`. Builds a Blob, points a
 /// hidden `<a download>` at it and clicks it programmatically — because this
 /// runs inside the Save button's click (a user gesture), the file downloads
@@ -560,9 +917,18 @@ pub fn file_dialog() -> rfd::AsyncFileDialog {
 #[cfg(target_arch = "wasm32")]
 pub fn download_bytes(name: &str, bytes: &[u8]) {
     use wasm_bindgen::JsCast;
-    let Some(window) = web_sys::window() else { return };
-    let Some(document) = window.document() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
     let array = js_sys::Uint8Array::from(bytes);
+    // A host page that embeds the app takes the file instead of a download.
+    if let Some(hook) = save_hook() {
+        let _ = hook.call2(&window, &wasm_bindgen::JsValue::from_str(name), &array);
+        return;
+    }
+    let Some(document) = window.document() else {
+        return;
+    };
     let parts = js_sys::Array::new();
     parts.push(&array.buffer());
     let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence(&parts) else {
@@ -578,6 +944,217 @@ pub fn download_bytes(name: &str, bytes: &[u8]) {
         a.click();
     }
     let _ = web_sys::Url::revoke_object_url(&url);
+}
+
+/// The `window.openCadStudioSaveFile(name, bytes)` function an embedding page
+/// registers to receive saved and exported files, if any.
+#[cfg(target_arch = "wasm32")]
+pub fn save_hook() -> Option<js_sys::Function> {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window()?;
+    js_sys::Reflect::get(
+        window.as_ref(),
+        &wasm_bindgen::JsValue::from_str("openCadStudioSaveFile"),
+    )
+    .ok()?
+    .dyn_into::<js_sys::Function>()
+    .ok()
+}
+
+/// Show a plot preview as an in-page overlay. The plotted PDF arrives already
+/// rasterised to PNG pages: inline `<img>` elements render in every browser,
+/// with no popup permission and no PDF viewer plugin — both of which embedded
+/// browser hosts routinely withhold. A Download button still hands out the
+/// vector PDF, Close drops the overlay. Web only.
+#[cfg(target_arch = "wasm32")]
+pub fn show_pdf_preview(name: &str, pdf_bytes: &[u8], page_pngs: &[Vec<u8>], total_pages: usize) {
+    use wasm_bindgen::JsCast;
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    // One preview at a time: a replotted preview replaces its predecessor,
+    // revokes its blob URLs and DROPS its Download closure (freeing the full
+    // PDF copy the closure captured — a `forget()` would leak one per
+    // preview), so repeated previews cannot stack overlays or leak the
+    // images underneath.
+    const OVERLAY_ID: &str = "ocs-plot-preview";
+    if let Some(previous) = document.get_element_by_id(OVERLAY_ID) {
+        previous.remove();
+    }
+    for url in preview_urls()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(..)
+    {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    }
+    // Take the previous closure out so it destructs BEFORE the new preview
+    // stores its own: removing the overlay element already released the JS
+    // handler reference, so this drop is the last one and actually frees
+    // the captured bytes.
+    drop(PREVIEW_DOWNLOAD_CLOSURE.with(|slot| slot.borrow_mut().take()));
+    if page_pngs.is_empty() {
+        // Rasterisation produced nothing: deliver the PDF itself rather than
+        // show an empty frame.
+        download_bytes(name, pdf_bytes);
+        return;
+    }
+    let Ok(el) = document.create_element("div") else {
+        download_bytes(name, pdf_bytes);
+        return;
+    };
+    let backdrop: web_sys::HtmlElement = el.unchecked_into();
+    backdrop.set_id(OVERLAY_ID);
+    backdrop
+        .set_attribute(
+            "style",
+            "position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:30000;overflow:auto;\
+             display:flex;flex-direction:column;align-items:center;gap:14px;padding:24px;\
+             font-family:system-ui,sans-serif;color:#ddd",
+        )
+        .ok();
+
+    let mut urls = Vec::new();
+    for png in page_pngs {
+        let array = js_sys::Uint8Array::from(png.as_slice());
+        let parts = js_sys::Array::new();
+        parts.push(&array.buffer());
+        let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence(&parts) else {
+            continue;
+        };
+        let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+            continue;
+        };
+        if let Ok(el) = document.create_element("img") {
+            let img: web_sys::HtmlImageElement = el.unchecked_into();
+            img.set_src(&url);
+            img.set_attribute(
+                "style",
+                "max-width:min(92vw,1000px);height:auto;background:#fff;\
+                 box-shadow:0 2px 14px rgba(0,0,0,.6)",
+            )
+            .ok();
+            backdrop.append_child(&img).ok();
+            urls.push(url);
+        }
+    }
+    if urls.is_empty() {
+        download_bytes(name, pdf_bytes);
+        return;
+    }
+    preview_urls()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(urls.iter().cloned());
+
+    // Sticky action bar so Download/Close stay reachable while pages scroll.
+    let bar: web_sys::HtmlElement = document
+        .create_element("div")
+        .ok()
+        .and_then(|el| {
+            let bar: web_sys::HtmlElement = el.unchecked_into();
+            bar.set_attribute(
+                "style",
+                "position:sticky;top:0;display:flex;gap:12px;align-items:center;\
+                 background:rgba(0,0,0,.88);padding:4px 8px",
+            )
+            .ok()?;
+            Some(bar)
+        })
+        .unwrap_or_else(|| backdrop.clone());
+    if let Ok(el) = document.create_element("span") {
+        let label: web_sys::HtmlElement = el.unchecked_into();
+        label.set_inner_text(&if total_pages > urls.len() {
+            format!(
+                "Plot preview — first {} of {} pages",
+                urls.len(),
+                total_pages
+            )
+        } else {
+            format!(
+                "Plot preview — {} page{}",
+                urls.len(),
+                if urls.len() == 1 { "" } else { "s" }
+            )
+        });
+        bar.append_child(&label).ok();
+    }
+    let button = |text: &str| -> Option<web_sys::HtmlElement> {
+        let el = document.create_element("button").ok()?;
+        let btn: web_sys::HtmlElement = el.unchecked_into();
+        btn.set_inner_text(text);
+        btn.set_attribute(
+            "style",
+            "padding:8px 18px;border:0;border-radius:4px;cursor:pointer;\
+             background:#3399e6;color:#fff;font-size:14px",
+        )
+        .ok()?;
+        Some(btn)
+    };
+    if let Some(dl) = button("Download PDF") {
+        let name = name.to_string();
+        let bytes = pdf_bytes.to_vec();
+        // A plain FnMut stays usable for every click; the one-shot variant
+        // throws on the second click, and users click Download twice. The
+        // closure is HELD in a registry (not `forget()`ed): replacing or
+        // closing the overlay drops it and frees the captured PDF copy,
+        // while the cloned JS function keeps the live handler working.
+        let closure: wasm_bindgen::closure::Closure<dyn FnMut()> =
+            wasm_bindgen::closure::Closure::new(move || {
+                download_bytes(&name, &bytes);
+            });
+        let click: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        PREVIEW_DOWNLOAD_CLOSURE.with(|slot| *slot.borrow_mut() = Some(closure));
+        dl.set_onclick(Some(&click));
+        bar.append_child(&dl).ok();
+    }
+    if let Some(close) = button("Close") {
+        let backdrop = backdrop.clone();
+        let click = wasm_bindgen::closure::Closure::once_into_js(move || {
+            for url in preview_urls()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain(..)
+            {
+                let _ = web_sys::Url::revoke_object_url(&url);
+            }
+            backdrop.remove();
+        });
+        let click: js_sys::Function = click.unchecked_into();
+        close.set_onclick(Some(&click));
+        bar.append_child(&close).ok();
+    }
+    if let Some(first) = backdrop.first_child() {
+        let _ = backdrop.insert_before(&bar, Some(&first));
+    }
+    if let Some(body) = document.body() {
+        body.append_child(&backdrop).ok();
+    }
+}
+
+/// Blob URLs owned by the live preview overlay, revoked when it is closed or
+/// replaced. They live outside the wasm heap and are not GC'd on their own.
+#[cfg(target_arch = "wasm32")]
+fn preview_urls() -> &'static std::sync::Mutex<Vec<String>> {
+    static URLS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    URLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+// The live preview overlay's Download-button closure. The closure captures
+// a full copy of the PDF bytes, so `forget()`-ing it would leak one PDF per
+// preview; holding it here lets the next `show_pdf_preview` drop and free
+// the previous one (the overlay element's removal already released the JS
+// handler reference). A thread-local `RefCell` rather than a static
+// `Mutex` like `preview_urls`: `Closure` is not `Send`, and the overlay
+// only ever lives on the one UI thread.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PREVIEW_DOWNLOAD_CLOSURE:
+        std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Short platform string for bug reports: OS + architecture on the desktop,
@@ -636,6 +1213,66 @@ pub mod crash_log {
         crate::config::config_dir().map(|path| path.join("crash_logs"))
     }
 
+    /// The report a given process left behind, if it left one.
+    ///
+    /// Reports are named for the process that wrote them, so a caller holding
+    /// a process id from somewhere else — the GPU crash sentinel does — can
+    /// ask what killed that exact run instead of guessing from the newest
+    /// file, which on a busy machine may belong to a different one.
+    ///
+    /// Process ids are reused, so only a report written at or after
+    /// `not_before` (Unix seconds — when that run started) counts: an old
+    /// report from an unrelated run that once had the same id does not.
+    pub fn report_for_pid(pid: u32, not_before: u64) -> Option<String> {
+        let directory = directory()?;
+        let suffix = format!("-{pid}.log");
+        let entry = std::fs::read_dir(directory).ok()?.flatten().find(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("crash-")
+                .and_then(|rest| rest.strip_suffix(suffix.as_str()))
+                .and_then(|when| when.parse::<u64>().ok())
+                .is_some_and(|when| when >= not_before)
+        })?;
+        std::fs::read_to_string(entry.path()).ok()
+    }
+
+    /// Whether a report describes the graphics device giving up.
+    ///
+    /// Deliberately narrow. Anything that reaches wgpu — an exhausted device,
+    /// a lost one, a buffer that was never created — is the backend's
+    /// business; a panic in the drawing code that happens to run on a frame
+    /// is not, and must not cost the user a working backend.
+    pub fn is_device_failure(report: &str) -> bool {
+        let mut panic_line = "";
+        let mut at_line = "";
+        for line in report.lines() {
+            if let Some(rest) = line.strip_prefix("panic: ") {
+                panic_line = rest;
+            } else if let Some(rest) = line.strip_prefix("at: ") {
+                at_line = rest;
+            }
+        }
+        // The message wgpu panics with names the call, and the location names
+        // wgpu itself; either alone is enough, since a stripped build can
+        // leave the message terse. Plain words like "buffer" or "surface"
+        // are not: drawing code and the modelling kernel panic with those
+        // too, and that is no reason to give up a working backend.
+        let haystack = format!("{panic_line} {at_line}").to_ascii_lowercase();
+        ["wgpu", "out of memory", "device lost", "validation error"]
+            .iter()
+            .any(|needle| haystack.contains(needle))
+    }
+
+    /// The backend a report says was live, as written by [`report_from`].
+    pub fn backend_in_report(report: &str) -> Option<String> {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix("gpu backend: "))
+            .map(str::trim)
+            .filter(|backend| !backend.is_empty() && *backend != "(default)")
+            .map(str::to_string)
+    }
+
     /// Chain a report writer onto the current panic hook.
     ///
     /// Call once, early: a panic before this runs is still silent.
@@ -684,7 +1321,10 @@ pub mod crash_log {
             format!("when: {when} (unix seconds)"),
             format!("os: {} {}", std::env::consts::OS, std::env::consts::ARCH),
             format!("gpu backend: {backend}"),
-            format!("thread: {}", std::thread::current().name().unwrap_or("unnamed")),
+            format!(
+                "thread: {}",
+                std::thread::current().name().unwrap_or("unnamed")
+            ),
             format!("panic: {payload}"),
             format!("at: {where_}"),
             String::new(),
@@ -767,6 +1407,46 @@ pub mod crash_log {
                 header.lines().all(|line| !line.starts_with(' ')),
                 "header lines must not be indented:\n{header}"
             );
+        }
+
+        /// Only the device's own failures may cost a backend. A panic in
+        /// drawing code that merely happened to run on a frame must not.
+        #[test]
+        fn a_device_failure_is_told_apart_from_an_ordinary_panic() {
+            let device = super::report_from(
+                "Error in Buffer::get_mapped_range: Validation Error",
+                "wgpu-29.0.4/src/backend/wgpu_core.rs:2253:18",
+                1,
+            );
+            assert!(super::is_device_failure(&device), "{device}");
+
+            let oom = super::report_from("Out of Memory", "src/scene/pipeline/mod.rs:10:1", 1);
+            assert!(super::is_device_failure(&oom), "{oom}");
+
+            let ordinary = super::report_from(
+                "index out of bounds: the len is 3 but the index is 7",
+                "src/app/commands/draw.rs:120:5",
+                1,
+            );
+            assert!(
+                !super::is_device_failure(&ordinary),
+                "an indexing bug is not the graphics device's fault:
+{ordinary}"
+            );
+        }
+
+        /// The backend line is what the sentinel joins on, so it has to come
+        /// back out — and "(default)" names nothing to blame.
+        #[test]
+        fn the_backend_is_read_back_out_of_a_report() {
+            // SAFETY: single-threaded test mutating a process-local variable.
+            unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+            let named = super::report_from("boom", "x.rs:1:1", 0);
+            assert_eq!(super::backend_in_report(&named).as_deref(), Some("dx12"));
+
+            unsafe { std::env::remove_var("WGPU_BACKEND") };
+            let unnamed = super::report_from("boom", "x.rs:1:1", 0);
+            assert_eq!(super::backend_in_report(&unnamed), None);
         }
 
         /// A panic with no message still has to produce a filed report rather
@@ -860,7 +1540,10 @@ pub mod web_diag {
                 );
                 let _ = body.append_child(&overlay);
                 for (id, label) in [
-                    ("ocs-err-title", crate::t!("OpenCADStudio renderer error — copy this into a bug report:")),
+                    (
+                        "ocs-err-title",
+                        crate::t!("OpenCADStudio renderer error — copy this into a bug report:"),
+                    ),
                     ("ocs-err-copy", crate::t!("Copy")),
                     ("ocs-err-dismiss", crate::t!("Dismiss")),
                 ] {
@@ -898,4 +1581,35 @@ pub mod web_diag {
             let _ = pre.append_child(&line);
         }
     }
+}
+
+/// The user's Documents folder (the known folder, wherever it is
+/// redirected), else the home folder.
+#[cfg(target_os = "windows")]
+pub fn documents_dir() -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: SHGetKnownFolderPath writes a CoTaskMemAlloc'd, NUL-terminated
+    // wide string to `raw`, freed below.
+    let hr =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut raw) };
+    let path = if hr == 0 && !raw.is_null() {
+        // SAFETY: `raw` is a valid NUL-terminated wide string from the call above.
+        let len = unsafe { (0..).take_while(|&k| *raw.add(k) != 0).count() };
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(wide)))
+    } else {
+        None
+    };
+    // SAFETY: freeing the buffer SHGetKnownFolderPath allocated (null is a no-op).
+    unsafe { CoTaskMemFree(raw as *const core::ffi::c_void) };
+    path.or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn documents_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let documents = home.join("Documents");
+    Some(if documents.is_dir() { documents } else { home })
 }

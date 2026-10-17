@@ -36,6 +36,14 @@ impl XrefCommand {
         }
     }
 
+    /// -XREF already at its Attach file prompt (XATTACH while FILEDIA is 0).
+    pub fn attach(saved_paths: Vec<(String, String)>) -> Self {
+        Self {
+            step: Step::File { overlay: false },
+            saved_paths,
+        }
+    }
+
     /// Whether any reference name matches `pattern` (`*` / `?` wildcards).
     fn matches(&self, pattern: &str) -> bool {
         self.saved_paths
@@ -139,7 +147,11 @@ impl CadCommand for XrefCommand {
             Step::List => CmdResult::Dispatch(format!("XREFLIST {value}")),
             Step::Names(op) => CmdResult::Dispatch(format!("XREF {op} {value}")),
             Step::File { overlay } => {
-                let verb = if overlay { "XREFOVERLAYFILE" } else { "XREFATTACHFILE" };
+                let verb = if overlay {
+                    "XREFOVERLAYFILE"
+                } else {
+                    "XREFATTACHFILE"
+                };
                 CmdResult::Dispatch(format!("{verb} {value}"))
             }
             Step::PathNames => {
@@ -186,11 +198,109 @@ impl CadCommand for XrefCommand {
         match self.step.clone() {
             Step::Option => self.choose("A"),
             Step::List => CmdResult::Dispatch("XREFLIST *".to_string()),
-            Step::NewPath { .. } => {
-                CmdResult::Measurement("Path unchanged.".to_string())
-            }
+            Step::NewPath { .. } => CmdResult::Measurement("Path unchanged.".to_string()),
             Step::PathTypeKind { .. } => CmdResult::NeedPoint,
             _ => CmdResult::Cancel,
+        }
+    }
+}
+
+/// -ATTACH (and ATTACH while FILEDIA is 0): the file on the command line,
+/// then the attach flow of its file type.
+pub struct AttachCommand {
+    /// The drawing whose reference type is asked; `None` while asking for the file.
+    drawing: Option<String>,
+}
+
+impl AttachCommand {
+    pub fn new() -> Self {
+        Self { drawing: None }
+    }
+
+    fn reference(path: &str, overlay: bool) -> CmdResult {
+        let verb = if overlay {
+            "XREFOVERLAYFILE"
+        } else {
+            "XREFATTACHFILE"
+        };
+        CmdResult::Dispatch(format!("{verb} {path}"))
+    }
+}
+
+impl CadCommand for AttachCommand {
+    fn name(&self) -> &'static str {
+        "-ATTACH"
+    }
+
+    fn prompt(&self) -> String {
+        match self.drawing {
+            None => "-ATTACH  Path to file to attach:".to_string(),
+            Some(_) => {
+                "-ATTACH  Specify reference type [Attachment/Overlay] <Attachment>:".to_string()
+            }
+        }
+    }
+
+    fn options(&self) -> Vec<CmdOption> {
+        match self.drawing {
+            None => Vec::new(),
+            Some(_) => vec![
+                CmdOption::new("Attachment", "A"),
+                CmdOption::new("Overlay", "O"),
+            ],
+        }
+    }
+
+    fn input_kind(&self) -> InputKind {
+        match self.drawing {
+            None => InputKind::FreeText,
+            Some(_) => InputKind::SingleToken,
+        }
+    }
+
+    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        let value = text.trim().trim_matches('"');
+        if let Some(path) = self.drawing.clone() {
+            return Some(match value.to_uppercase().as_str() {
+                "A" | "ATTACHMENT" => Self::reference(&path, false),
+                "O" | "OVERLAY" => Self::reference(&path, true),
+                _ => CmdResult::ReportError("Invalid option keyword.".to_string()),
+            });
+        }
+        if value.is_empty() {
+            return Some(self.on_enter());
+        }
+        if !std::path::Path::new(value).is_file() {
+            return Some(CmdResult::ReportError(format!("{value} not found.")));
+        }
+        let ext = std::path::Path::new(value)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        Some(match ext.as_str() {
+            "pdf" => CmdResult::Dispatch(format!("-PDFATTACH {value}")),
+            "dwf" | "dwfx" => CmdResult::Dispatch(format!("-DWFATTACH {value}")),
+            "dgn" => CmdResult::Dispatch(format!("-DGNATTACH {value}")),
+            "rcp" | "rcs" => CmdResult::Dispatch(format!("-POINTCLOUDATTACH {value}")),
+            // Images have no dialog after the file: ATTACH places them.
+            e if crate::modules::insert::xattach::IMAGE_EXTENSIONS.contains(&e) => {
+                CmdResult::Dispatch(format!("ATTACH {value}"))
+            }
+            _ => {
+                self.drawing = Some(value.to_string());
+                CmdResult::NeedPoint
+            }
+        })
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        match self.drawing.clone() {
+            None => CmdResult::ReportError("Filename cannot be blank".to_string()),
+            Some(path) => Self::reference(&path, false),
         }
     }
 }

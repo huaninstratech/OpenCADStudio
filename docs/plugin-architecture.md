@@ -137,6 +137,7 @@ pub trait BuiltinPlugin: Send + Sync {
     fn ribbon(&self) -> Box<dyn CadModule>;            // the ribbon tab
     fn dispatch(&self, host: &mut dyn HostApi, cmd: &str) -> bool;
     fn on_load(&mut self, host: &mut dyn HostApi) {}
+    fn entity_classes(&self) -> Option<&'static EntityClasses> {} // API v10
 }
 ```
 
@@ -298,6 +299,57 @@ handle: `run "MY_CMD 2F 30"`.
 Store domain data on entities as XDATA (under your `xdata_apps` ids), not in a
 side database, so it round-trips through DWG/DXF. `write_record` also registers
 the APPID. Document your schemas in the plugin's own `PLUGIN.md`.
+
+### Entity class display labels (API v10)
+
+A plugin can give its XDATA-stamped entities human type names in the host UI.
+The split between *identity* (in the drawing) and *labels* (in the plugin) is
+the point:
+
+- **Identity** — the plugin stamps one string value into an entity's XDATA
+  record: `"<class_prefix><KEY>"`, e.g. `"CVIFC-CLASS:LINE"`. The key is
+  stable, meaningless to the host, and round-trips the DWG/DXF verbatim.
+- **Labels** — the plugin declares a table and exposes it through
+  `BuiltinPlugin::entity_classes()`:
+
+```rust
+use ocs_plugin_api::manifest::EntityClasses;
+
+static ENTITY_CLASSES: EntityClasses = EntityClasses {
+    app_id: "CVIFC",                    // one of the manifest's xdata_apps
+    class_prefix: "CVIFC-CLASS:",
+    labels: &[
+        ("LINE", "Linear Element"),
+        ("CIRCULARARC", "Circular Arc Element"),
+    ],
+};
+
+impl BuiltinPlugin for MyPlugin {
+    fn entity_classes(&self) -> Option<&'static EntityClasses> {
+        Some(&ENTITY_CLASSES)
+    }
+    // ...
+}
+```
+
+The host resolves them at display time only: the single-entity Properties
+panel title becomes `"Linear Element (Line)"`, and the records/automation
+`display_type` field takes the same form. The rule is display-only — a label
+never governs behavior, and the raw schema fields (`type`, `dxf_name`,
+`record_type`, the command-line `LIST` output) stay native so existing scripts
+and filters keep working.
+
+**Gating.** Declarations are consulted through the live plugin manager, never
+cached: a plugin that is not installed, is disabled, is excluded by
+`OCS_PLUGIN_MAX_API_VERSION`, failed at load, has been removed, or whose
+process has died contributes nothing — its entities display as their bare
+native type ("Line"), immediately, with no re-open needed. An `app_id` claimed
+by more than one loaded plugin resolves through the first-loaded declaration;
+later duplicates are ignored (debug-logged). A class key that is empty,
+missing from the table, or mapped to an empty label falls back to the native
+type. Because labels are display text resolved from the loaded plugin, they
+are plugin-localizable and fixable without rewriting drawings — and
+`plugin.toml` (the pre-load discovery file) deliberately does not carry them.
 
 ---
 

@@ -52,8 +52,9 @@ def cargo_version():
 
 def display_version(cargo):
     year, week, patch = cargo.split(".")
-    if len(year) == 4 and year.startswith("20") and patch == "0":
-        return versions(f"{year}.{int(week):02}")["version"]
+    if len(year) == 4 and year.startswith("20"):
+        weekly = f"{year}.{int(week):02}"
+        return versions(weekly if patch == "0" else f"{weekly}.{patch}")["version"]
     return cargo
 
 

@@ -28,5 +28,10 @@
     "repo": "schoeller/ocs_python_repl",
     "name": "Python REPL Plugin",
     "description": "Out-of-process V4 plugin for Open CAD Studio that opens an IPython REPL in an OS terminal window bound to the active document tab. Python code reads the live document through a zero-copy shared-memory snapshot and mutates it through the plugin API. Limited to entity types Point, Line, Circle, Arc, Ellipse, Polyline, Polyline2D, Polyline3D, LwPolyline, Spline, MText and XData"
+  },
+  {
+    "repo": "AAD001-Dwg/OpenCadStudio-construction-layer-plugin",
+    "name": "Construction Layers & Guides",
+    "description": "Construction layers, infinite lines, rays, reference circles and LibreCAD/FreeCAD drafting guides with real-time viewport preview and auto-conversion."
   }
 ]

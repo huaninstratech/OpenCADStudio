@@ -13,11 +13,41 @@ impl OpenCADStudio {
 
     pub(super) fn show_next_startup_modal(&mut self) {
         if self.active_modal.is_none() && self.opening.is_none() && self.pending_opens.is_empty() {
+            // A queued AutosaveRestore can outlive its pending list when a
+            // concurrent open displaces the modal and the entry is consumed
+            // meanwhile; resurfacing it would show an empty prompt.
+            #[cfg(target_arch = "wasm32")]
+            while self.pending_startup_modals.front() == Some(&ModalKind::AutosaveRestore)
+                && self.web_autosave_pending.is_empty()
+            {
+                self.pending_startup_modals.pop_front();
+            }
             if let Some(&kind) = self.pending_startup_modals.front() {
                 self.active_modal = Some(kind);
                 self.reset_modal_geometry();
             }
         }
+    }
+
+    /// Queue the web crash-recovery prompt behind whatever startup modal is
+    /// already showing (donation, GPU warning…); the after-message hook in
+    /// `update` surfaces it as soon as the slot is free. No-op when nothing
+    /// is pending: once the autosave OPFS directory merely exists (even with
+    /// no entries), queueing unconditionally would show an empty
+    /// "Recover Drawing" modal on every boot.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn queue_autosave_restore_prompt(&mut self) {
+        if self.web_autosave_pending.is_empty() {
+            return;
+        }
+        if !self
+            .pending_startup_modals
+            .contains(&ModalKind::AutosaveRestore)
+        {
+            self.pending_startup_modals
+                .push_back(ModalKind::AutosaveRestore);
+        }
+        self.show_next_startup_modal();
     }
 
     /// Notice when the scene is drawn by a software rasterizer, or not at
@@ -44,7 +74,8 @@ impl OpenCADStudio {
         };
         match &self.gpu_status {
             GpuStatus::Software(adapter) => {
-                self.command_line.push_warning(&software_rasterizer_warning(adapter));
+                self.command_line
+                    .push_warning(&software_rasterizer_warning(adapter));
             }
             GpuStatus::NoRenderer => {
                 crate::scene::pipeline::report_gpu_line(
@@ -117,9 +148,15 @@ mod tests {
         // The name carries parentheses and commas of its own; the localized
         // template must still place it whole. The loader follows the system
         // locale here, so the assertions stay language-neutral.
-        assert!(warning.contains("(llvmpipe (LLVM 20.1.8, 256 bits))"), "{warning}");
+        assert!(
+            warning.contains("(llvmpipe (LLVM 20.1.8, 256 bits))"),
+            "{warning}"
+        );
         assert!(warning.contains("GPU"), "{warning}");
-        assert!(!warning.contains("{adapter}") && !warning.contains("__ocs_"), "{warning}");
+        assert!(
+            !warning.contains("{adapter}") && !warning.contains("__ocs_"),
+            "{warning}"
+        );
         // Every platform has a hint, and it is a sentence, not a missing key.
         let hint = gpu_platform_hint();
         assert!(hint.len() > 20 && !hint.contains("hint-"), "{hint}");

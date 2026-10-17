@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Listener;
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, ToNsName};
 
-use crate::host::{CommandSource, CommandStep, ExecutionResult, HostApi, HostNotification, PluginNotification};
+use crate::host::{
+    CommandSource, CommandStep, ExecutionResult, HostApi, HostNotification, PluginNotification,
+};
 use crate::ipc::protocol::{
     CadDocument, EntityType, Handle, HostRequest, HostResponse, HostToPlugin, InteractiveEvent,
     PluginToHost, RunnerHandshake, PLUGIN_TOKEN_ENV,
@@ -100,7 +102,11 @@ impl HostApi for NullHost {
     ) -> Option<&crate::ipc::protocol::ExtendedDataRecord> {
         None
     }
-    fn write_record(&mut self, _handle: Handle, _record: crate::ipc::protocol::ExtendedDataRecord) -> bool {
+    fn write_record(
+        &mut self,
+        _handle: Handle,
+        _record: crate::ipc::protocol::ExtendedDataRecord,
+    ) -> bool {
         false
     }
     fn remove_record(&mut self, _handle: Handle, _app_name: &str) -> bool {
@@ -112,10 +118,7 @@ impl HostApi for NullHost {
     fn push_output(&mut self, _msg: &str) {}
     fn push_error(&mut self, _msg: &str) {}
     fn start_interactive(&mut self, _command: Box<dyn crate::host::InteractiveCommand>) {}
-    fn plugin_state_any(
-        &self,
-        _plugin_id: &str,
-    ) -> Option<&(dyn std::any::Any + Send + Sync)> {
+    fn plugin_state_any(&self, _plugin_id: &str) -> Option<&(dyn std::any::Any + Send + Sync)> {
         None
     }
     fn plugin_state_any_mut(
@@ -128,8 +131,8 @@ impl HostApi for NullHost {
         &mut self,
         _plugin_id: &'static str,
         _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
-    ) -> &mut (dyn std::any::Any + Send + Sync) {
-        panic!("NullHost: ensure_plugin_state_any not available")
+    ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+        None
     }
 }
 
@@ -419,7 +422,11 @@ impl PluginProcess {
             // the V4 reader thread. The notification handler receives an empty
             // plugin id until we read the manifest below; that brief window is
             // fine because the plugin has not yet been asked to do work.
-            let stream = stream.lock().unwrap_or_else(|e| e.into_inner()).take().expect("V4 stream");
+            let stream = stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("V4 stream");
             let plugin_id_placeholder = Arc::new(std::sync::Mutex::new(String::new()));
             let handler_for_v4: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> = {
                 let plugin_id = Arc::clone(&plugin_id_placeholder);
@@ -434,7 +441,9 @@ impl PluginProcess {
                 HostResponse::Manifest(m) => m,
                 other => return Err(PluginError::UnexpectedResponse(Box::new(other))),
             };
-            *plugin_id_placeholder.lock().unwrap_or_else(|e| e.into_inner()) = manifest.id.clone();
+            *plugin_id_placeholder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = manifest.id.clone();
             ribbon = match v4_conn.call(host, HostRequest::GetRibbon, no_op)? {
                 HostResponse::Ribbon(r) => r,
                 other => return Err(PluginError::UnexpectedResponse(Box::new(other))),
@@ -626,8 +635,14 @@ impl PluginProcess {
 
     /// Release a completed or abandoned V4 interactive command in the runner.
     pub fn drop_interactive(&self, command_id: u64) -> Result<(), PluginError> {
-        let Some(v4) = &self.v4 else { return Ok(()); };
-        match v4.call(&mut NullHost, HostRequest::DropInteractive { command_id }, &mut |_| {})? {
+        let Some(v4) = &self.v4 else {
+            return Ok(());
+        };
+        match v4.call(
+            &mut NullHost,
+            HostRequest::DropInteractive { command_id },
+            &mut |_| {},
+        )? {
             HostResponse::Bool(true) => Ok(()),
             other => Err(PluginError::UnexpectedResponse(Box::new(other))),
         }
@@ -886,10 +901,7 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 
 /// Describe why a runner failed before/during connection, including any stderr
 /// it produced.
-fn spawn_failure_status(
-    child: &Mutex<Option<Child>>,
-    last_stderr: &Mutex<String>,
-) -> String {
+fn spawn_failure_status(child: &Mutex<Option<Child>>, last_stderr: &Mutex<String>) -> String {
     let mut parts = vec![format_exit_status(child_status(child))];
     if let Ok(line) = last_stderr.lock() {
         if !line.is_empty() {
@@ -1138,6 +1150,74 @@ fn generate_token() -> Result<String, PluginError> {
     Ok(out)
 }
 
+/// In-crate test support: build a `PluginProcess` whose fields are otherwise
+/// private to this module, so sibling test modules (`process::manager`) can
+/// put one in a `PluginManager` without spawning a real runner.
+#[cfg(all(test, feature = "host"))]
+impl PluginProcess {
+    /// A process backed by a real sleeping child process and a local socket
+    /// pair, carrying the given manifest (no cdylib, no runner). The
+    /// runner-side peer socket is dropped immediately; nothing reads it.
+    pub(crate) fn fake(manifest: OwnedPluginManifest) -> Self {
+        use interprocess::local_socket::traits::Stream as StreamTrait;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "ocs_plugin_fake_process_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let name_ref = name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("valid name");
+        let listener = ListenerOptions::new()
+            .name(name_ref)
+            .create_sync()
+            .expect("listener");
+        let client_name = name.clone();
+        let client_thread: std::thread::JoinHandle<Stream> = std::thread::spawn(move || {
+            StreamTrait::connect(client_name.to_ns_name::<GenericNamespaced>().unwrap())
+                .expect("connect")
+        });
+        let host_stream = listener.accept().expect("accept");
+        drop(client_thread.join().expect("client thread"));
+
+        Self {
+            stream: Mutex::new(Some(host_stream)),
+            v4: None,
+            child: Mutex::new(Some(sleepy_test_child())),
+            id: manifest.id.clone(),
+            manifest,
+            ribbon: vec![],
+            io_lines: Mutex::new(None),
+        }
+    }
+}
+
+/// A child that lives ~30 s — long enough to read as "alive", short enough to
+/// never hang a leaked test. Shared by `PluginProcess::fake` and this module's
+/// own tests.
+#[cfg(all(test, feature = "host"))]
+fn sleepy_test_child() -> Child {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("ping -n 30 127.0.0.1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,6 +1237,22 @@ mod tests {
         let host = PathBuf::from("/app/OpenCADStudio");
         let runner = distinct_runner_path(&host);
         assert_eq!(runner, PathBuf::from("/app/OpenCADStudio-plugin-runner"));
+    }
+
+    #[test]
+    fn null_host_ensure_plugin_state_does_not_panic() {
+        let mut null = NullHost;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = null.ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32));
+        }));
+        assert!(
+            outcome.is_ok(),
+            "NullHost ensure_plugin_state must degrade, not panic: {:?}",
+            outcome.err()
+        );
+        assert!(null
+            .ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32))
+            .is_none());
     }
 }
 
@@ -1243,7 +1339,10 @@ mod timeout_tests {
         fn push_undo(&mut self, _label: &str) {}
         fn set_dirty(&mut self) {}
         fn push_info(&mut self, msg: &str) {
-            self.push_info_messages.lock().unwrap().push(msg.to_string());
+            self.push_info_messages
+                .lock()
+                .unwrap()
+                .push(msg.to_string());
         }
         fn push_output(&mut self, _msg: &str) {}
         fn push_error(&mut self, _msg: &str) {}
@@ -1261,8 +1360,8 @@ mod timeout_tests {
             &mut self,
             _plugin_id: &'static str,
             _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
-        ) -> &mut (dyn std::any::Any + Send + Sync) {
-            panic!("not used")
+        ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+            None
         }
     }
 
@@ -1321,6 +1420,7 @@ mod timeout_tests {
             ribbon_order: 0,
             xdata_apps: vec![],
             command_prefixes: vec![],
+            entity_classes: None,
         }
     }
 
@@ -1417,7 +1517,9 @@ mod timeout_tests {
             )
             .expect("send nested request");
             let resp = recv::<HostToPlugin>(&mut peer).expect("read nested response");
-            assert!(matches!(resp, HostToPlugin::Response(ref r) if matches!(**r, PluginResponse::Ok)));
+            assert!(
+                matches!(resp, HostToPlugin::Response(ref r) if matches!(**r, PluginResponse::Ok))
+            );
             send(&mut peer, &PluginToHost::Response(HostResponse::Bool(true)))
                 .expect("send final response");
         });
@@ -1427,7 +1529,11 @@ mod timeout_tests {
         assert!(result.expect("dispatch succeeds"));
         assert!(process.is_alive(), "process should still be alive");
         let infos = host.take_push_info();
-        assert_eq!(infos, vec!["hello".to_string()], "push_info should be delivered to host");
+        assert_eq!(
+            infos,
+            vec!["hello".to_string()],
+            "push_info should be delivered to host"
+        );
 
         // Clean up the helper child so it does not outlive the test.
         if let Some(mut child) = process
@@ -1460,19 +1566,22 @@ mod timeout_tests {
 
     #[test]
     fn runner_handshake_correct_token_is_accepted() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("OCS_PLUGIN_MAX_API_VERSION");
         let result = verify_runner_handshake(
             RunnerHandshake::Token("correct-token".to_string()),
             "correct-token",
         );
-        assert!(result.is_ok(), "expected authentication success, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected authentication success, got {result:?}"
+        );
         assert!(!result.unwrap(), "V3 token should select V3 path");
     }
 
     #[test]
     fn runner_handshake_tokenv4_selects_v4_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("OCS_PLUGIN_MAX_API_VERSION");
         let result = verify_runner_handshake(
             RunnerHandshake::TokenV4 {
@@ -1481,13 +1590,16 @@ mod timeout_tests {
             },
             "correct-token",
         );
-        assert!(result.is_ok(), "expected authentication success, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected authentication success, got {result:?}"
+        );
         assert!(result.unwrap(), "TokenV4 should select V4 path");
     }
 
     #[test]
     fn runner_handshake_tokenv4_mismatched_version_is_rejected() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("OCS_PLUGIN_MAX_API_VERSION");
         let result = verify_runner_handshake(
             RunnerHandshake::TokenV4 {
@@ -1504,7 +1616,7 @@ mod timeout_tests {
 
     #[test]
     fn runner_handshake_tokenv4_rejected_when_v4_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("OCS_PLUGIN_MAX_API_VERSION", "3");
         let result = verify_runner_handshake(
             RunnerHandshake::TokenV4 {

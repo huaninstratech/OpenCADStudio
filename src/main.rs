@@ -5,10 +5,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use OpenCADStudio::app;
-#[cfg(not(target_arch = "wasm32"))]
-use OpenCADStudio::{cli, io, mcp, rest};
 #[cfg(target_arch = "wasm32")]
 use OpenCADStudio::sys;
+#[cfg(not(target_arch = "wasm32"))]
+use OpenCADStudio::{cli, io, mcp, rest};
 
 fn main() -> iced::Result {
     // Web (wasm) uses the single-window entry; native uses the multi-window
@@ -27,7 +27,14 @@ fn main() -> iced::Result {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use clap::Parser;
-        let args = cli::Cli::parse();
+        // `/b script.scr`, the startup switch shortcuts carry, is `--script`.
+        let args = cli::Cli::parse_from(std::env::args_os().map(|arg| {
+            if arg == "/b" || arg == "/B" {
+                "--script".into()
+            } else {
+                arg
+            }
+        }));
 
         // GPU probe child: exercise one backend offscreen, print one JSON
         // line on success and exit 0/1. This must run before any logging/GUI
@@ -65,6 +72,18 @@ fn main() -> iced::Result {
                 size,
             );
             std::process::exit(if ok { 0 } else { 1 });
+        }
+
+        if args.sync_mcp_schemas {
+            let synced = mcp::sync_agent_tool_schemas();
+            if synced {
+                println!("Successfully synchronized OpenCADStudio MCP schemas to ~/.gemini/antigravity/mcp/opencadstudio/");
+            } else {
+                eprintln!(
+                    "Antigravity MCP directory ~/.gemini/antigravity/mcp/ not found; skipped sync."
+                );
+            }
+            return Ok(());
         }
 
         // MCP is a client-neutral local entry point. It uses only stdin,
@@ -192,8 +211,9 @@ fn main() -> iced::Result {
         // The probe enables the packed renderer automatically on GPUs without
         // shader storage buffers; an explicit `--compat-renderer` does the
         // same without the notice.
-        let compat_renderer = args.compat_renderer || gpu.compat_renderer;
-        let gpu_compat_auto = !args.compat_renderer && gpu.compat_renderer;
+        let saved_compat = OpenCADStudio::gpu_backend::load_prefs().compat_renderer;
+        let compat_renderer = args.compat_renderer || saved_compat || gpu.compat_renderer;
+        let gpu_compat_auto = !args.compat_renderer && !saved_compat && gpu.compat_renderer;
         let _ = cli::GUI_CONFIG.set(cli::GuiConfig {
             files: if args.new { Vec::new() } else { args.files },
             new: args.new,

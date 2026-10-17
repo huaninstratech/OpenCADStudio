@@ -30,6 +30,11 @@ pub struct AppConfig {
     /// General edge-stack dock layout (which panels are docked, side, order,
     /// width and auto-collapse) for the Properties panel and block palette.
     pub dock: crate::ui::dock::DockState,
+    /// Whether the optional Graphic Attributes palette is visible.
+    pub show_graphic_attributes: bool,
+    /// Graphic Attributes creates fills on the current layer instead of the
+    /// layer of the filled object.
+    pub graphic_fills_on_current_layer: bool,
     /// Add a newly selected annotation scale to existing annotative objects.
     pub annotation_auto_scale: i8,
     /// Apply the annotation scale to model-space display. `false` (the
@@ -56,6 +61,8 @@ impl Default for AppConfig {
             start: StartConfig::default(),
             statusbar: StatusBarConfig::default(),
             dock: crate::ui::dock::DockState::default(),
+            show_graphic_attributes: false,
+            graphic_fills_on_current_layer: false,
             annotation_auto_scale: -4,
             annotation_scale_modelspace: false,
             ribbon: RibbonConfig::default(),
@@ -107,9 +114,74 @@ impl UiThemeConfig {
     pub fn to_iced(&self) -> iced::Theme {
         if self.name == "Custom" {
             iced::Theme::custom("Custom", self.palette.to_iced())
+        } else if self.name.eq_ignore_ascii_case("System") {
+            resolve_system_theme()
         } else {
             builtin_theme(&self.name).unwrap_or(iced::Theme::Oxocarbon)
         }
+    }
+}
+
+/// Resolve the `System` color scheme (COLORSCHEME SYSTEM) to a concrete
+/// theme: the browser `prefers-color-scheme` media query on the web, the
+/// Windows `AppsUseLightTheme` personalization value natively, and the dark
+/// default on the remaining native platforms (no cheap OS query there).
+/// Read at boot (`apply_config`) and re-read whenever COLORSCHEME SYSTEM
+/// runs again — there is no live preference listener by design.
+pub fn resolve_system_theme() -> iced::Theme {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let light = web_sys::window().is_some_and(|window| {
+            window
+                .match_media("(prefers-color-scheme: light)")
+                .ok()
+                .flatten()
+                .is_some_and(|query| query.matches())
+        });
+        if light {
+            iced::Theme::Light
+        } else {
+            iced::Theme::Dark
+        }
+    }
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+    {
+        use windows_sys::Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+        };
+        let sub_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let value: Vec<u16> = "AppsUseLightTheme"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // ERROR_SUCCESS (0) with data 1 means the apps theme is Light; a
+        // missing value (older Windows, wiped personalization) is Dark.
+        let light = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                sub_key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                &mut data as *mut u32 as *mut core::ffi::c_void,
+                &mut size,
+            ) == 0
+                && data == 1
+        };
+        if light {
+            iced::Theme::Light
+        } else {
+            iced::Theme::Dark
+        }
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "windows")))]
+    {
+        iced::Theme::Dark
     }
 }
 
@@ -194,7 +266,9 @@ pub fn all_themes() -> Vec<iced::Theme> {
 }
 
 pub fn builtin_theme(name: &str) -> Option<iced::Theme> {
-    all_themes().into_iter().find(|theme| theme.to_string() == name)
+    all_themes()
+        .into_iter()
+        .find(|theme| theme.to_string() == name)
 }
 
 fn color_to_rgb(color: iced::Color) -> [u8; 3] {
@@ -215,14 +289,20 @@ pub(crate) fn rgb_to_hex(rgb: [u8; 3]) -> String {
 
 pub(crate) fn parse_hex(value: &str) -> Option<[u8; 3]> {
     let value = value.trim().strip_prefix('#').unwrap_or(value.trim());
-    if value.len() != 6 {
+    // Walk pairs of hex digits as chars: the old byte-length guard let a
+    // 6-byte multibyte string (`aébé`) through to fixed-offset slices that
+    // split a character. Exactly two digits per channel, or it is not a colour.
+    let mut bytes = [0u8; 3];
+    let mut chars = value.chars();
+    for slot in &mut bytes {
+        let high = chars.next()?.to_digit(16)?;
+        let low = chars.next()?.to_digit(16)?;
+        *slot = ((high << 4) | low) as u8;
+    }
+    if chars.next().is_some() {
         return None;
     }
-    Some([
-        u8::from_str_radix(&value[0..2], 16).ok()?,
-        u8::from_str_radix(&value[2..4], 16).ok()?,
-        u8::from_str_radix(&value[4..6], 16).ok()?,
-    ])
+    Some(bytes)
 }
 
 /// Canvas mode for Model space.
@@ -282,6 +362,11 @@ pub struct ModelSpaceThemeConfig {
     pub selection_crossing_color: u8,
     /// SELECTIONEFFECTCOLOR: ACI index for selected entities highlight (0 = Theme Primary, 1..=255 = ACI).
     pub selection_highlight_color: u8,
+    /// Selection highlight opacity in percent (10–100); below 100 the
+    /// object's own colour shows through.
+    pub selection_highlight_opacity: u8,
+    /// Extra screen pixels the selection highlight is drawn wider (0–6).
+    pub selection_highlight_widen: u8,
     /// SELECTIONEFFECT: whether selected objects glow with solid highlight (true) or dash (false).
     pub selection_effect: bool,
     /// SELECTIONPREVIEW bitmask: 1 = idle, 2 = during a command, 3 = both.
@@ -294,6 +379,8 @@ pub struct ModelSpaceThemeConfig {
     pub grip_hot: u8,
     /// GRIPHOVER: hovered/warm grip ACI color (0 = Theme Primary Strong, 1..=255 = ACI).
     pub grip_hover: u8,
+    /// SNAPMARKERSIZE: object-snap marker half-size in pixels (1–20, default 5).
+    pub snap_marker_size: u8,
 }
 
 impl Default for ModelSpaceThemeConfig {
@@ -309,12 +396,15 @@ impl Default for ModelSpaceThemeConfig {
             selection_window_color: 0,
             selection_crossing_color: 0,
             selection_highlight_color: 0,
+            selection_highlight_opacity: 100,
+            selection_highlight_widen: 0,
             selection_effect: true,
             selection_preview: 3,
             grip_size: 5,
             grip_color: 0,
             grip_hot: 0,
             grip_hover: 0,
+            snap_marker_size: 5,
         }
     }
 }
@@ -359,13 +449,13 @@ impl ModelSpaceThemeConfig {
 
     /// Resolve active selection highlight overlay color as [f32; 4].
     pub fn resolve_selection_color(&self) -> [f32; 4] {
-        if self.selection_highlight_color == 0 {
-            crate::scene::model::wire_model::WireModel::SELECTED
-        } else if let Some((r, g, b)) = codec::types::aci_table::aci_to_rgb(self.selection_highlight_color) {
-            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-        } else {
-            crate::scene::model::wire_model::WireModel::SELECTED
-        }
+        let mut color = codec::types::aci_table::aci_to_rgb(self.selection_highlight_color)
+            .filter(|_| self.selection_highlight_color != 0)
+            .map_or(crate::scene::model::wire_model::WireModel::SELECTED, |(r, g, b)| {
+                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+            });
+        color[3] = f32::from(self.selection_highlight_opacity.clamp(10, 100)) / 100.0;
+        color
     }
 }
 
@@ -441,6 +531,8 @@ pub struct RecentConfig {
     pub files: Vec<String>,
     /// How many recent files to keep.
     pub limit: usize,
+    /// List, icons or large previews.
+    pub view: super::RecentView,
 }
 
 impl Default for RecentConfig {
@@ -448,6 +540,7 @@ impl Default for RecentConfig {
         Self {
             files: Vec::new(),
             limit: super::recent::RECENT_DEFAULT,
+            view: super::RecentView::default(),
         }
     }
 }
@@ -527,6 +620,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_scheme_resolves_to_a_concrete_theme_and_keeps_its_name() {
+        // Fresh configs keep the existing default; SYSTEM is opt-in.
+        assert_ne!(UiThemeConfig::default().name, "System");
+        let mut cfg = UiThemeConfig::default();
+        cfg.name = "System".to_string();
+        let resolved = cfg.to_iced();
+        // Case-insensitive like the other stored names.
+        cfg.name = "system".to_string();
+        assert_eq!(cfg.to_iced(), resolved);
+        assert!(
+            matches!(resolved, iced::Theme::Light | iced::Theme::Dark),
+            "SYSTEM must resolve through the platform preference"
+        );
+        // The stored name survives resolution; re-runs re-resolve.
+        assert_eq!(cfg.name, "system");
+        assert_eq!(resolve_system_theme(), resolved);
+    }
+
+    #[test]
     fn test_model_space_defaults() {
         let cfg = ModelSpaceThemeConfig::default();
         assert_eq!(cfg.mode, ModelSpaceMode::MatchTheme);
@@ -597,7 +709,8 @@ mod tests {
         original.model_space.selection_window_color = 5;
 
         let serialized = serde_json::to_string(&original).expect("serialize config");
-        let deserialized: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        let deserialized: AppConfig =
+            serde_json::from_str(&serialized).expect("deserialize config");
 
         assert_eq!(deserialized.model_space.mode, ModelSpaceMode::Custom);
         assert_eq!(deserialized.model_space.custom_bg, Some([12, 34, 56]));
@@ -607,14 +720,55 @@ mod tests {
     }
 
     #[test]
+    fn graphic_attributes_visibility_defaults_off_and_round_trips() {
+        let missing: AppConfig = serde_json::from_str("{}").expect("deserialize old config");
+        assert!(!missing.show_graphic_attributes);
+
+        let mut original = AppConfig::default();
+        original.show_graphic_attributes = true;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.show_graphic_attributes);
+    }
+
+    #[test]
     fn test_parse_theme_name() {
         assert_eq!(parse_theme_name("light"), Some(iced::Theme::Light));
         assert_eq!(parse_theme_name("DARK"), Some(iced::Theme::Dark));
-        assert_eq!(parse_theme_name("solarized light"), Some(iced::Theme::SolarizedLight));
-        assert_eq!(parse_theme_name("tokyo-night-storm"), Some(iced::Theme::TokyoNightStorm));
-        assert_eq!(parse_theme_name("Kanagawa_Lotus"), Some(iced::Theme::KanagawaLotus));
+        assert_eq!(
+            parse_theme_name("solarized light"),
+            Some(iced::Theme::SolarizedLight)
+        );
+        assert_eq!(
+            parse_theme_name("tokyo-night-storm"),
+            Some(iced::Theme::TokyoNightStorm)
+        );
+        assert_eq!(
+            parse_theme_name("Kanagawa_Lotus"),
+            Some(iced::Theme::KanagawaLotus)
+        );
         assert_eq!(parse_theme_name("1"), None);
         assert_eq!(parse_theme_name("0"), None);
         assert_eq!(parse_theme_name("nonexistent_theme"), None);
+    }
+
+    /// The old guard checked the BYTE length (`value.len() != 6`) but sliced
+    /// at fixed byte offsets — a 6-byte multibyte string like `aébé` passed
+    /// the guard and then split a character:
+    /// `byte index 2 is not a char boundary; it is inside 'é'`. Pasting it
+    /// into any Options colour field killed the process on the keystroke.
+    #[test]
+    fn test_parse_hex_rejects_multibyte_input_without_panicking() {
+        for value in ["aébé", "#aébé", "éééééé", "#ébé#"] {
+            assert_eq!(parse_hex(value), None, "{value} should not parse");
+        }
+        // Non-hex garbage and wrong lengths stay None.
+        for value in ["gggggg", "a1b2c", "a1b2c34", "#GGHHII"] {
+            assert_eq!(parse_hex(value), None, "{value} should not parse");
+        }
+        // Valid input keeps working, with and without '#', with whitespace.
+        assert_eq!(parse_hex("a1b2c3"), Some([0xa1, 0xb2, 0xc3]));
+        assert_eq!(parse_hex("#A1B2C3"), Some([0xa1, 0xb2, 0xc3]));
+        assert_eq!(parse_hex("  000000  "), Some([0, 0, 0]));
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::host::{HostApi, HostNotification, PluginNotification};
 use crate::process::{PluginError, PluginProcess};
-use crate::ribbon::owned::{to_shared_module, SharedCadModule};
+use crate::ribbon::owned::{to_shared_module, OwnedEntityClasses, SharedCadModule};
 
 /// Callback the host installs to receive plugin-to-host notifications.
 pub type NotificationHandler = Arc<dyn Fn(&str, Option<u64>, PluginNotification) + Send + Sync>;
@@ -97,11 +97,7 @@ impl PluginManager {
 
     /// Fan out a host notification to every alive V4 plugin. Per-process errors
     /// are logged; this is best-effort.
-    pub fn broadcast_notification(
-        &self,
-        command_id: Option<u64>,
-        notification: HostNotification,
-    ) {
+    pub fn broadcast_notification(&self, command_id: Option<u64>, notification: HostNotification) {
         for p in &self.plugins {
             if !p.process.is_alive() {
                 continue;
@@ -197,6 +193,29 @@ impl PluginManager {
                 out.append(&mut group.command_ids());
             }
             out.extend(p.process.manifest().command_prefixes.iter().cloned());
+        }
+        out
+    }
+
+    /// Entity-class declarations of every alive, non-disabled plugin that
+    /// made one (API v10), in load order, as `(plugin id, declaration)`.
+    ///
+    /// The host consults this at display time only — never cached — so the
+    /// result always mirrors the live loaded set: a plugin that failed to
+    /// load, is disabled, was removed, or whose process has died contributes
+    /// nothing, and entities it stamped fall back to their native type names.
+    pub fn entity_class_declarations<F: Fn(&str) -> bool>(
+        &self,
+        is_disabled: F,
+    ) -> Vec<(String, OwnedEntityClasses)> {
+        let mut out = Vec::new();
+        for p in &self.plugins {
+            if is_disabled(p.process.id()) || !p.process.is_alive() {
+                continue;
+            }
+            if let Some(classes) = p.process.manifest().entity_classes.clone() {
+                out.push((p.process.id().to_string(), classes));
+            }
         }
         out
     }
@@ -351,8 +370,8 @@ mod tests {
                 &mut self,
                 _plugin_id: &'static str,
                 _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
-            ) -> &mut (dyn std::any::Any + Send + Sync) {
-                panic!("not used")
+            ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+                None
             }
         }
 
@@ -361,5 +380,104 @@ mod tests {
         let result = manager.dispatch(&mut host, "FOO", |_| false);
         assert!(!result.handled);
         assert!(result.started.is_none());
+    }
+
+    fn manifest_with_entity_classes(id: &str) -> crate::ribbon::owned::OwnedPluginManifest {
+        crate::ribbon::owned::OwnedPluginManifest {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version: 10,
+            ribbon_order: 0,
+            xdata_apps: vec![],
+            command_prefixes: vec![],
+            entity_classes: Some(OwnedEntityClasses {
+                app_id: "CVIFC".to_string(),
+                class_prefix: "CVIFC-CLASS:".to_string(),
+                labels: [("LINE".to_string(), "Linear Element".to_string())]
+                    .into_iter()
+                    .collect(),
+            }),
+        }
+    }
+
+    fn plain_manifest(id: &str) -> crate::ribbon::owned::OwnedPluginManifest {
+        crate::ribbon::owned::OwnedPluginManifest {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version: 10,
+            ribbon_order: 0,
+            xdata_apps: vec![],
+            command_prefixes: vec![],
+            entity_classes: None,
+        }
+    }
+
+    #[test]
+    fn entity_class_declarations_skip_disabled_and_undeclaring_plugins() {
+        let mut manager = PluginManager::new();
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.live",
+            ))),
+            module: to_shared_module("test.live".into(), "Live".into(), vec![]),
+        });
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(plain_manifest("test.plain"))),
+            module: to_shared_module("test.plain".into(), "Plain".into(), vec![]),
+        });
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.off",
+            ))),
+            module: to_shared_module("test.off".into(), "Off".into(), vec![]),
+        });
+
+        // Alive + enabled + declaring → reported, with the declaration intact.
+        let declarations = manager.entity_class_declarations(|id| id == "test.off");
+        assert_eq!(
+            declarations.len(),
+            1,
+            "only the live, enabled plugin reports"
+        );
+        assert_eq!(declarations[0].0, "test.live");
+        assert_eq!(declarations[0].1.app_id, "CVIFC");
+        assert_eq!(declarations[0].1.class_prefix, "CVIFC-CLASS:");
+        assert_eq!(
+            declarations[0].1.labels.get("LINE").map(String::as_str),
+            Some("Linear Element")
+        );
+
+        // Everything disabled → nothing contributes.
+        assert!(manager.entity_class_declarations(|_| true).is_empty());
+    }
+
+    #[test]
+    fn entity_class_declarations_revert_when_the_plugin_process_dies() {
+        let mut manager = PluginManager::new();
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(PluginProcess::fake(manifest_with_entity_classes(
+                "test.live",
+            ))),
+            module: to_shared_module("test.live".into(), "Live".into(), vec![]),
+        });
+        assert_eq!(
+            manager.entity_class_declarations(|_| false).len(),
+            1,
+            "declaration visible while the process is alive"
+        );
+
+        manager.plugins[0]
+            .process
+            .shutdown_and_wait(Duration::from_secs(5))
+            .expect("child shut down");
+
+        assert!(
+            manager.entity_class_declarations(|_| false).is_empty(),
+            "a dead plugin process must contribute no declarations"
+        );
     }
 }

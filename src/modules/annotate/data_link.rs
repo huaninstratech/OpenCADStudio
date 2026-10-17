@@ -79,7 +79,12 @@ impl DataLinkPlaceCommand {
             if column > 0 {
                 x += self.table.columns[column - 1].width;
             }
-            points.push(self.plane.to_world(point + DVec3::X * x).as_vec3().to_array());
+            points.push(
+                self.plane
+                    .to_world(point + DVec3::X * x)
+                    .as_vec3()
+                    .to_array(),
+            );
             points.push(
                 self.plane
                     .to_world(point + DVec3::new(x, -self.table.total_height(), 0.0))
@@ -92,7 +97,12 @@ impl DataLinkPlaceCommand {
             if row > 0 {
                 y -= self.table.rows[row - 1].height;
             }
-            points.push(self.plane.to_world(point + DVec3::Y * y).as_vec3().to_array());
+            points.push(
+                self.plane
+                    .to_world(point + DVec3::Y * y)
+                    .as_vec3()
+                    .to_array(),
+            );
             points.push(
                 self.plane
                     .to_world(point + DVec3::new(self.table.total_width(), y, 0.0))
@@ -134,6 +144,8 @@ impl DataLinkPlaceCommand {
             plinegen: true,
             fill_tris: Vec::new(),
             fill_tris_low: Vec::new(),
+
+            ..Default::default()
         }
     }
 }
@@ -160,7 +172,7 @@ impl CadCommand for DataLinkPlaceCommand {
         self.table.insertion_point = codec::types::Vector3::new(point.x, point.y, point.z);
         CmdResult::CommitAndExit(
             self.plane
-                .place_entity(EntityType::Table(self.table.clone())),
+                .place_entity(EntityType::Table(Box::new(self.table.clone()))),
         )
     }
 

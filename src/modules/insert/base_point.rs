@@ -1,38 +1,56 @@
-use crate::t;
-
 use crate::command::{CadCommand, CmdResult};
-use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use glam::DVec3;
-
-pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/base_point.svg"));
-pub fn tool() -> ToolDef {
-    ToolDef {
-        id: "BASE",
-        label: "Set Base\nPoint",
-        icon: ICON,
-        event: ModuleEvent::Command("BASE".to_string()),
-    }
-}
 
 // ── Command implementation ────────────────────────────────────────────────
 
-/// Picks one point and delegates to the inline `BASE <x> <y> <z>` handler,
-/// which writes the active space's insertion base point onto the document.
-pub struct BaseCommand;
+/// BASE (`Enter base point <x,y,z>:`) and INSBASE
+/// (`Enter new value for INSBASE <x,y,z>:`): a point sets the active space's
+/// insertion base through the inline `BASE <x> <y> <z>` handler; Enter keeps
+/// the current one.
+pub struct BaseCommand {
+    current: DVec3,
+    variable: bool,
+}
 
 impl BaseCommand {
-    pub fn new() -> Self {
-        Self
+    pub fn new(current: DVec3) -> Self {
+        Self {
+            current,
+            variable: false,
+        }
     }
+
+    /// The INSBASE system variable's prompt.
+    pub fn insbase(current: DVec3) -> Self {
+        Self {
+            current,
+            variable: true,
+        }
+    }
+}
+
+fn point_text(p: DVec3) -> String {
+    format!("{:.4},{:.4},{:.4}", p.x, p.y, p.z)
 }
 
 impl CadCommand for BaseCommand {
     fn name(&self) -> &'static str {
-        "BASE"
+        if self.variable {
+            "INSBASE"
+        } else {
+            "BASE"
+        }
     }
 
     fn prompt(&self) -> String {
-        t!("BASE  Specify base point:").into_owned()
+        if self.variable {
+            format!(
+                "Enter new value for INSBASE <{}>:",
+                point_text(self.current)
+            )
+        } else {
+            format!("Enter base point <{}>:", point_text(self.current))
+        }
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
@@ -40,7 +58,7 @@ impl CadCommand for BaseCommand {
     }
 
     fn on_enter(&mut self) -> CmdResult {
-        CmdResult::Cancel
+        CmdResult::Measurement(String::new())
     }
 }
 

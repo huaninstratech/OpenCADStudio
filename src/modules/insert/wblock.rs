@@ -4,8 +4,8 @@
 //   block name  → copies the named block definition to a new document
 //   *           → copies currently selected model-space entities
 
-use codec::{CadDocument, EntityType};
 use crate::t;
+use codec::{CadDocument, EntityType};
 
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 
@@ -43,11 +43,7 @@ pub fn extract_block_into(
 
     let handles = br.entity_handles.clone();
     if handles.is_empty() {
-        return Err(t!(
-            "Block \"%{name}\" has no entities.",
-            name = block_name
-        )
-        .into_owned());
+        return Err(t!("Block \"%{name}\" has no entities.", name = block_name).into_owned());
     }
 
     copy_with_dependencies(src, &handles, out, None);
@@ -114,7 +110,13 @@ fn copy_with_dependencies(
         })
         .collect();
     let (entities, deps) = crate::app::copy_to_clipboard_kernel(src, &handles);
-    crate::app::paste_entities_kernel(out, &entities, &deps, translate);
+    crate::app::paste_entities_kernel(
+        out,
+        &entities,
+        &deps,
+        translate,
+        crate::app::PasteSpace::Model,
+    );
 }
 
 /// Translate every entity of `out` so the overall bounds minimum lands on
@@ -156,7 +158,10 @@ impl crate::command::CadCommand for WblockPickBasePointCommand {
     }
 
     fn on_point(&mut self, pt: glam::DVec3) -> crate::command::CmdResult {
-        crate::command::CmdResult::Dispatch(format!("WBLOCK_POINT_PICKED {} {} {}", pt.x, pt.y, pt.z))
+        crate::command::CmdResult::Dispatch(format!(
+            "WBLOCK_POINT_PICKED {} {} {}",
+            pt.x, pt.y, pt.z
+        ))
     }
 
     fn on_enter(&mut self) -> crate::command::CmdResult {
@@ -181,8 +186,11 @@ pub fn extract_entities_to_doc_with_base(
     if handles.is_empty() {
         return Err(t!("No entities selected for WBLOCK.").into_owned());
     }
-    let shift = crate::command::EntityTransform::Translate(-base_point);
-    copy_with_dependencies(src, handles, &mut out, Some(&shift));
+    // The objects keep their coordinates; the base point becomes the new
+    // drawing's insertion base (INSBASE).
+    copy_with_dependencies(src, handles, &mut out, None);
+    out.header.model_space_insertion_base =
+        codec::types::Vector3::new(base_point.x, base_point.y, base_point.z);
     if out.entities().count() == 0 {
         return Err(t!("None of the selected entities could be exported.").into_owned());
     }
@@ -213,12 +221,16 @@ mod tests {
 
         assert_eq!(out.header.insertion_units, 4);
         assert_eq!(out.entities().count(), 1);
+        assert_eq!(
+            out.header.model_space_insertion_base,
+            Vector3::new(10.0, 20.0, 0.0)
+        );
         let e = out.entities().next().unwrap();
         if let EntityType::Line(l) = e {
-            assert!((l.start.x - 0.0).abs() < 1e-6);
-            assert!((l.start.y - 0.0).abs() < 1e-6);
-            assert!((l.end.x - 20.0).abs() < 1e-6);
-            assert!((l.end.y - 20.0).abs() < 1e-6);
+            assert!((l.start.x - 10.0).abs() < 1e-6);
+            assert!((l.start.y - 20.0).abs() < 1e-6);
+            assert!((l.end.x - 30.0).abs() < 1e-6);
+            assert!((l.end.y - 40.0).abs() < 1e-6);
         } else {
             panic!("Expected Line entity");
         }
@@ -242,4 +254,3 @@ mod tests {
         assert!(extract_block_to_doc(&doc, "NON_EXISTENT").is_err());
     }
 }
-

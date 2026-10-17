@@ -1,5 +1,6 @@
 pub mod camera;
+pub mod dispatch;
+pub mod render;
 pub mod transform;
 pub mod viewport_pane;
-pub mod render;
-pub mod dispatch;
+pub use render::device_scale;

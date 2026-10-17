@@ -1,5 +1,5 @@
-use codec::entities::{RasterImage, Wipeout};
 use crate::t;
+use codec::entities::{RasterImage, Wipeout};
 
 use crate::command::EntityTransform;
 use crate::entities::common::{
@@ -7,8 +7,8 @@ use crate::entities::common::{
     ro_prop as ro, square_grip,
 };
 use crate::entities::text_support::{resolve_text_style, text_local_bounds};
-use crate::entities::traits::{Grippable, PropertyEditable, Transformable, RenderConvertible};
-use crate::scene::convert::acad_to_render::{GlyphRun, TextStroke, RenderEntity, RenderObject};
+use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::scene::convert::acad_to_render::{GlyphRun, RenderEntity, RenderObject, TextStroke};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
 use crate::scene::text::lff;
@@ -103,7 +103,10 @@ pub(crate) fn image_world_to_clip(img: &RasterImage, p: [f64; 3]) -> codec::type
     // Solve d = a·u + b·v in the image plane (x/y components).
     let det = u.x * v.y - u.y * v.x;
     let (a, b) = if det.abs() > 1e-300 {
-        ((d[0] * v.y - d[1] * v.x) / det, (u.x * d[1] - u.y * d[0]) / det)
+        (
+            (d[0] * v.y - d[1] * v.x) / det,
+            (u.x * d[1] - u.y * d[0]) / det,
+        )
     } else {
         (0.0, 0.0)
     };
@@ -142,15 +145,18 @@ impl RenderConvertible for RasterImage {
 
         // Diagonals are the BROKEN-reference placeholder; a resolvable image
         // draws its pixels inside the frame, so the X would scribble over it.
-        let path_probe = self.file_path.trim();
-        let resolvable = path_probe.is_empty()
-            || crate::scene::model::image_model::resolve_image(path_probe).is_some();
+        // One probe for the whole conversion: the outline below and the
+        // placeholder branch further down must agree on a single answer.
+        let path = self.file_path.trim();
+        let resolvable =
+            path.is_empty() || crate::scene::model::image_model::resolve_image(path).is_some();
         // Outline: the clip boundary, or — when it hides its inside — the
         // frame with the boundary as a hole. Must match the raster's own clip
         // triangulation in `ImageModel` so outline and pixels align.
         let pts = match image_clip_polygon(self) {
             Some(poly) => {
-                let mut ring: Vec<[f64; 3]> = poly.iter().map(|p| px_to_world(p[0], p[1])).collect();
+                let mut ring: Vec<[f64; 3]> =
+                    poly.iter().map(|p| px_to_world(p[0], p[1])).collect();
                 ring.push(ring[0]);
                 if self.clip_boundary.clip_mode == codec::entities::ClipMode::Inside {
                     let mut frame = image_wire(corners, false);
@@ -166,16 +172,15 @@ impl RenderConvertible for RasterImage {
 
         // A raster OCS can display renders its pixels (built separately) inside
         // this frame — just draw the frame/clip outline. A reference it cannot
-        // resolve (an offline/broken URL, a missing or renamed file) gets
-        // AutoCAD's broken-reference treatment: the frame plus the saved path
-        // drawn as text, so the user sees WHICH reference is unresolved instead
-        // of an empty box. `resolve_image` is memoised and shared with the
-        // raster loader, so a URL that fetches online is treated as resolvable
-        // (no placeholder — the image shows) while an offline one falls back to
-        // the path text, and neither is fetched twice.
-        let path = self.file_path.trim();
-        let resolvable =
-            path.is_empty() || crate::scene::model::image_model::resolve_image(path).is_some();
+        // resolve (an offline/broken URL, a missing or renamed file) gets the
+        // usual broken-reference treatment: the frame plus the saved path drawn
+        // as text, so the user sees WHICH reference is unresolved instead of an
+        // empty box. `resolve_image` is memoised and shared with the raster
+        // loader, so a URL that fetches online is treated as resolvable (no
+        // placeholder — the image shows) while an offline one falls back to the
+        // path text, and neither is fetched twice. The scene's text-cache
+        // classifier runs the same probe, so erasing this placeholder drops its
+        // glyphs from the text buffer instead of leaving them on screen.
         if resolvable {
             return Some(RenderEntity {
                 // Picked on its frame only (shown or hidden), like the other
@@ -320,22 +325,49 @@ impl PropertyEditable for RasterImage {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
         let rotation_deg = self.u_vector.y.atan2(self.u_vector.x).to_degrees();
         let scale = self.u_vector.length();
-        let show_image = self.flags.contains(codec::entities::ImageDisplayFlags::SHOW_IMAGE);
+        let show_image = self
+            .flags
+            .contains(codec::entities::ImageDisplayFlags::SHOW_IMAGE);
         let show_clipped = self
             .flags
             .contains(codec::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY);
         let clip_inverted = self.clip_boundary.clip_mode == codec::entities::ClipMode::Inside;
         let transparency = self.common.transparency.to_string();
+        let whole = |label: &str, field: &'static str, value: u8| Property {
+            label: t!(label).into_owned(),
+            field,
+            value: PropValue::EditText(value.to_string()),
+        };
         vec![
+            PropSection {
+                title: t!("Image Adjust").into_owned(),
+                props: vec![
+                    whole("Brightness", "ri_bright", self.brightness),
+                    whole("Contrast", "ri_contrast", self.contrast),
+                    whole("Fade", "ri_fade", self.fade),
+                ],
+            },
             PropSection {
                 title: t!("Geometry").into_owned(),
                 props: vec![
                     edit(t!("Position X").as_ref(), "ri_ox", self.insertion_point.x),
                     edit(t!("Position Y").as_ref(), "ri_oy", self.insertion_point.y),
                     edit(t!("Position Z").as_ref(), "ri_oz", self.insertion_point.z),
-                    ro(t!("Rotation").as_ref(), "ri_rotation", crate::entities::common::format_angle(rotation_deg.to_radians())),
-                    ro(t!("Width").as_ref(), "ri_width", crate::entities::common::format_length(self.width())),
-                    ro(t!("Height").as_ref(), "ri_height", crate::entities::common::format_length(self.height())),
+                    ro(
+                        t!("Rotation").as_ref(),
+                        "ri_rotation",
+                        crate::entities::common::format_angle(rotation_deg.to_radians()),
+                    ),
+                    ro(
+                        t!("Width").as_ref(),
+                        "ri_width",
+                        crate::entities::common::format_length(self.width()),
+                    ),
+                    ro(
+                        t!("Height").as_ref(),
+                        "ri_height",
+                        crate::entities::common::format_length(self.height()),
+                    ),
                     ro(t!("Scale").as_ref(), "ri_scale", format!("{:.4}", scale)),
                 ],
             },
@@ -343,9 +375,6 @@ impl PropertyEditable for RasterImage {
                 title: t!("Misc").into_owned(),
                 props: vec![
                     ro(t!("Name").as_ref(), "ri_name", self.file_name().to_string()),
-                    edit(t!("Brightness").as_ref(), "ri_bright", self.brightness as f64),
-                    edit(t!("Contrast").as_ref(), "ri_contrast", self.contrast as f64),
-                    edit(t!("Fade").as_ref(), "ri_fade", self.fade as f64),
                     ro(t!("Transparency").as_ref(), "ri_transparency", transparency),
                     Property {
                         label: t!("Show image").into_owned(),
@@ -380,7 +409,9 @@ impl PropertyEditable for RasterImage {
         match field {
             "ri_show_image" => {
                 let on = if value == "toggle" {
-                    !self.flags.contains(codec::entities::ImageDisplayFlags::SHOW_IMAGE)
+                    !self
+                        .flags
+                        .contains(codec::entities::ImageDisplayFlags::SHOW_IMAGE)
                 } else {
                     value == "true"
                 };
@@ -424,9 +455,10 @@ impl PropertyEditable for RasterImage {
             "ri_ox" => self.insertion_point.x = v,
             "ri_oy" => self.insertion_point.y = v,
             "ri_oz" => self.insertion_point.z = v,
-            "ri_bright" => self.brightness = v.clamp(0.0, 100.0) as u8,
-            "ri_contrast" => self.contrast = v.clamp(0.0, 100.0) as u8,
-            "ri_fade" => self.fade = v.clamp(0.0, 100.0) as u8,
+            // Out-of-range values are refused before they get here.
+            "ri_bright" if (0.0..=100.0).contains(&v) => self.brightness = v as u8,
+            "ri_contrast" if (0.0..=100.0).contains(&v) => self.contrast = v as u8,
+            "ri_fade" if (0.0..=100.0).contains(&v) => self.fade = v as u8,
             _ => {}
         }
     }
@@ -434,21 +466,25 @@ impl PropertyEditable for RasterImage {
 
 impl Transformable for RasterImage {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            crate::scene::view::transform::reflect_xy_point(
-                &mut entity.insertion_point.x,
-                &mut entity.insertion_point.y,
-                p1,
-                p2,
-            );
-            let ax = (p2.x - p1.x) as f64;
-            let ay = (p2.y - p1.y) as f64;
-            let len2 = ax * ax + ay * ay;
-            if len2 > 1e-12 {
-                reflect_vec3(&mut entity.u_vector.x, &mut entity.u_vector.y, ax, ay, len2);
-                reflect_vec3(&mut entity.v_vector.x, &mut entity.v_vector.y, ax, ay, len2);
-            }
-        });
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                crate::scene::view::transform::reflect_xy_point(
+                    &mut entity.insertion_point.x,
+                    &mut entity.insertion_point.y,
+                    p1,
+                    p2,
+                );
+                let ax = (p2.x - p1.x) as f64;
+                let ay = (p2.y - p1.y) as f64;
+                let len2 = ax * ax + ay * ay;
+                if len2 > 1e-12 {
+                    reflect_vec3(&mut entity.u_vector.x, &mut entity.u_vector.y, ax, ay, len2);
+                    reflect_vec3(&mut entity.v_vector.x, &mut entity.v_vector.y, ax, ay, len2);
+                }
+            },
+        );
     }
 }
 
@@ -476,16 +512,8 @@ fn wipeout_plane(wipeout: &Wipeout) -> kernel::space::Plane {
             wipeout.insertion_point.y,
             wipeout.insertion_point.z,
         ],
-        [
-            wipeout.u_vector.x,
-            wipeout.u_vector.y,
-            wipeout.u_vector.z,
-        ],
-        [
-            wipeout.v_vector.x,
-            wipeout.v_vector.y,
-            wipeout.v_vector.z,
-        ],
+        [wipeout.u_vector.x, wipeout.u_vector.y, wipeout.u_vector.z],
+        [wipeout.v_vector.x, wipeout.v_vector.y, wipeout.v_vector.z],
     )
 }
 
@@ -601,18 +629,15 @@ impl Grippable for Wipeout {
             GripApply::Translate(delta) => glam::DVec3::from(current) + delta,
             GripApply::Absolute(point) => point,
         };
-        let u_hat = glam::DVec3::new(self.u_vector.x, self.u_vector.y, self.u_vector.z)
-            .normalize_or_zero();
-        let v_hat = glam::DVec3::new(self.v_vector.x, self.v_vector.y, self.v_vector.z)
-            .normalize_or_zero();
+        let u_hat =
+            glam::DVec3::new(self.u_vector.x, self.u_vector.y, self.u_vector.z).normalize_or_zero();
+        let v_hat =
+            glam::DVec3::new(self.v_vector.x, self.v_vector.y, self.v_vector.z).normalize_or_zero();
         if u_hat == glam::DVec3::ZERO || v_hat == glam::DVec3::ZERO {
             return;
         }
-        let resize_plane = kernel::space::Plane::from_axes(
-            [0.0; 3],
-            u_hat.to_array(),
-            v_hat.to_array(),
-        );
+        let resize_plane =
+            kernel::space::Plane::from_axes([0.0; 3], u_hat.to_array(), v_hat.to_array());
         let (width, height, insertion) = match grip_id {
             0 => {
                 let fixed = glam::DVec3::from(corners[2]);
@@ -655,11 +680,8 @@ impl Grippable for Wipeout {
             _ => return,
         };
         if width.abs() > 1e-9 && height.abs() > 1e-9 {
-            self.insertion_point = codec::types::Vector3::new(
-                insertion.x,
-                insertion.y,
-                insertion.z,
-            );
+            self.insertion_point =
+                codec::types::Vector3::new(insertion.x, insertion.y, insertion.z);
             let sx = self.size.x.abs().max(1e-9);
             let sy = self.size.y.abs().max(1e-9);
             self.u_vector = codec::types::Vector3::new(
@@ -678,7 +700,9 @@ impl Grippable for Wipeout {
 
 impl PropertyEditable for Wipeout {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
-        let show_image = self.flags.contains(codec::entities::WipeoutDisplayFlags::SHOW_IMAGE);
+        let show_image = self
+            .flags
+            .contains(codec::entities::WipeoutDisplayFlags::SHOW_IMAGE);
         let show_clipped = self
             .flags
             .contains(codec::entities::WipeoutDisplayFlags::USE_CLIPPING_BOUNDARY);
@@ -692,8 +716,16 @@ impl PropertyEditable for Wipeout {
             PropSection {
                 title: t!("Image Adjust").into_owned(),
                 props: vec![
-                    ro(t!("Brightness").as_ref(), "wo_brightness", self.brightness.to_string()),
-                    ro(t!("Contrast").as_ref(), "wo_contrast", self.contrast.to_string()),
+                    ro(
+                        t!("Brightness").as_ref(),
+                        "wo_brightness",
+                        self.brightness.to_string(),
+                    ),
+                    ro(
+                        t!("Contrast").as_ref(),
+                        "wo_contrast",
+                        self.contrast.to_string(),
+                    ),
                     ro(t!("Fade").as_ref(), "wo_fade", self.fade.to_string()),
                 ],
             },
@@ -712,9 +744,21 @@ impl PropertyEditable for Wipeout {
             PropSection {
                 title: t!("Misc").into_owned(),
                 props: vec![
-                    ro(t!("Show image").as_ref(), "wo_show_image", if show_image { t!("Yes") } else { t!("No") }),
-                    ro(t!("Show clipped").as_ref(), "wo_show_clipped", if show_clipped { t!("Yes") } else { t!("No") }),
-                    ro(t!("Background transparency").as_ref(), "wo_bg_transparency", if bg_transparency { t!("Yes") } else { t!("No") }),
+                    ro(
+                        t!("Show image").as_ref(),
+                        "wo_show_image",
+                        if show_image { t!("Yes") } else { t!("No") },
+                    ),
+                    ro(
+                        t!("Show clipped").as_ref(),
+                        "wo_show_clipped",
+                        if show_clipped { t!("Yes") } else { t!("No") },
+                    ),
+                    ro(
+                        t!("Background transparency").as_ref(),
+                        "wo_bg_transparency",
+                        if bg_transparency { t!("Yes") } else { t!("No") },
+                    ),
                 ],
             },
         ]
@@ -722,7 +766,8 @@ impl PropertyEditable for Wipeout {
 
     fn apply_geom_prop(&mut self, field: &str, value: &str) {
         if field == "wo_rotation" {
-            let Some(target_degrees) = parse_angle_deg(value).filter(|value| value.is_finite()) else {
+            let Some(target_degrees) = parse_angle_deg(value).filter(|value| value.is_finite())
+            else {
                 return;
             };
             let u = glam::DVec3::new(self.u_vector.x, self.u_vector.y, self.u_vector.z);
@@ -783,21 +828,25 @@ impl PropertyEditable for Wipeout {
 
 impl Transformable for Wipeout {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            crate::scene::view::transform::reflect_xy_point(
-                &mut entity.insertion_point.x,
-                &mut entity.insertion_point.y,
-                p1,
-                p2,
-            );
-            let ax = (p2.x - p1.x) as f64;
-            let ay = (p2.y - p1.y) as f64;
-            let len2 = ax * ax + ay * ay;
-            if len2 > 1e-12 {
-                reflect_vec3(&mut entity.u_vector.x, &mut entity.u_vector.y, ax, ay, len2);
-                reflect_vec3(&mut entity.v_vector.x, &mut entity.v_vector.y, ax, ay, len2);
-            }
-        });
+        crate::scene::view::transform::apply_standard_entity_transform(
+            self,
+            t,
+            |entity, p1, p2| {
+                crate::scene::view::transform::reflect_xy_point(
+                    &mut entity.insertion_point.x,
+                    &mut entity.insertion_point.y,
+                    p1,
+                    p2,
+                );
+                let ax = (p2.x - p1.x) as f64;
+                let ay = (p2.y - p1.y) as f64;
+                let len2 = ax * ax + ay * ay;
+                if len2 > 1e-12 {
+                    reflect_vec3(&mut entity.u_vector.x, &mut entity.u_vector.y, ax, ay, len2);
+                    reflect_vec3(&mut entity.v_vector.x, &mut entity.v_vector.y, ax, ay, len2);
+                }
+            },
+        );
     }
 }
 
@@ -824,7 +873,10 @@ mod wipeout_property_tests {
                 .atan2(wipeout.u_vector.x)
                 .to_degrees()
                 .rem_euclid(360.0);
-            assert!((angle - target).abs() < 1e-9, "target={target} actual={angle}");
+            assert!(
+                (angle - target).abs() < 1e-9,
+                "target={target} actual={angle}"
+            );
             assert!((wipeout.u_vector.length() - lengths.0).abs() < 1e-12);
             assert!((wipeout.v_vector.length() - lengths.1).abs() < 1e-12);
         }

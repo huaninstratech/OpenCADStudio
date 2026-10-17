@@ -1,0 +1,464 @@
+//! Shared native graph construction for Block Editor authoring objects.
+use codec::objects::{
+    BlockEvalExpression, BlockEvalValue, DynamicBlockData, DynamicBlockObject, ObjectType,
+};
+use codec::xdata::{ExtendedDataRecord, XDataValue};
+use codec::{CadDocument, EntityType, Handle};
+
+pub(super) const MAJOR: i32 = 33;
+pub(super) const MINOR: i32 = 329;
+pub(super) const NO_VALUE: i16 = -9999;
+pub(super) const ELEMENT_TAG: &str = "AcDbBlockRepETag";
+pub(super) const REPRESENTATION_TAG: &str = "AcDbBlockRepBTag";
+pub(super) const TRUE_NAME: &str = "AcDbDynamicBlockTrueName";
+pub(super) const GUID: &str = "AcDbDynamicBlockGUID";
+
+#[derive(Clone, Copy)]
+pub(super) struct Slots {
+    pub node: i32,
+    pub eval: i32,
+    pub edge: i32,
+}
+
+/// Resolve a graph without touching it. Reject malformed/opaque relationships
+/// before opening a history transaction or allocating any new native objects.
+pub(super) fn graph(
+    document: &CadDocument,
+    definition: Handle,
+) -> Result<Option<Handle>, &'static str> {
+    if !document
+        .block_records
+        .iter()
+        .any(|record| record.handle == definition)
+    {
+        return Err("The block definition is no longer available.");
+    }
+    let Some(dictionary) = document.extension_dictionary_handle(definition) else {
+        return Ok(None);
+    };
+    let Some(ObjectType::Dictionary(record)) = document.objects.get(&dictionary) else {
+        return Err("The block extension dictionary is unavailable.");
+    };
+    let Some(handle) = record.get("ACAD_ENHANCEDBLOCK") else {
+        return Ok(None);
+    };
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get(&handle) else {
+        return Err("The block authoring graph cannot be edited.");
+    };
+    let DynamicBlockData::EvaluationGraph(graph) = &object.data else {
+        return Err("The block authoring graph cannot be edited.");
+    };
+    if object.owner != dictionary {
+        return Err("The block authoring graph has an invalid owner.");
+    }
+    let nodes: rustc_hash::FxHashSet<_> = graph.nodes.iter().map(|node| node.id).collect();
+    let edges: rustc_hash::FxHashSet<_> = graph.edges.iter().map(|edge| edge.id).collect();
+    if nodes.len() != graph.nodes.len()
+        || edges.len() != graph.edges.len()
+        || graph
+            .nodes
+            .iter()
+            .any(|node| node.id < 0 || document.objects.get(&node.expression).is_none())
+        || graph.edges.iter().any(|edge| {
+            edge.id < 0
+                || !nodes.contains(&edge.source_node)
+                || !nodes.contains(&edge.destination_node)
+        })
+    {
+        return Err("The block authoring graph has invalid node relationships.");
+    }
+    slots(Some(graph))?;
+    Ok(Some(handle))
+}
+
+fn slots(graph: Option<&codec::objects::BlockEvaluationGraph>) -> Result<Slots, &'static str> {
+    let node = graph
+        .and_then(|graph| graph.nodes.iter().map(|node| node.id).max())
+        .unwrap_or(-1)
+        .checked_add(1);
+    let eval = graph
+        .map(|graph| {
+            graph.first_node_id.max(graph.first_node_id_copy).max(
+                graph
+                    .nodes
+                    .iter()
+                    .map(|node| node.next_id)
+                    .max()
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or(0)
+        .checked_add(1);
+    let edge = graph
+        .and_then(|graph| graph.edges.iter().map(|edge| edge.id).max())
+        .unwrap_or(-1)
+        .checked_add(1);
+    match (node, eval, edge) {
+        (Some(node), Some(eval), Some(edge))
+            if node.checked_add(3).is_some()
+                && eval.checked_add(3).is_some()
+                && edge.checked_add(2).is_some() =>
+        {
+            Ok(Slots { node, eval, edge })
+        }
+        _ => Err("The block authoring graph has no free node IDs."),
+    }
+}
+
+/// Prepare an existing graph for appending, or create the native graph and
+/// definition metadata once. Existing nodes, edges, GUIDs and relationships stay.
+pub(super) fn prepare(
+    document: &mut CadDocument,
+    definition: Handle,
+) -> Result<(Handle, Slots), &'static str> {
+    if let Some(handle) = graph(document, definition)? {
+        let ObjectType::DynamicBlock(object) = &document.objects[&handle] else {
+            unreachable!()
+        };
+        let DynamicBlockData::EvaluationGraph(graph) = &object.data else {
+            unreachable!()
+        };
+        return Ok((handle, slots(Some(graph))?));
+    }
+    register_classes(
+        document,
+        &[
+            ("ACAD_EVALUATION_GRAPH", "AcDbEvalGraph", 55),
+            (
+                "ACDB_DYNAMICBLOCKPURGEPREVENTER_VERSION",
+                "AcDbDynamicBlockPurgePreventer",
+                61,
+            ),
+        ],
+    );
+    for app in [ELEMENT_TAG, REPRESENTATION_TAG, TRUE_NAME, GUID] {
+        ensure_app_id(document, app);
+    }
+    let name = document
+        .block_records
+        .iter()
+        .find(|record| record.handle == definition)
+        .unwrap()
+        .name
+        .clone();
+    let dictionary = document.ensure_extension_dictionary(definition);
+    let handle = document.allocate_handle();
+    let preventer = document.allocate_handle();
+    let mut object = dynamic(
+        handle,
+        dictionary,
+        "ACAD_EVALUATION_GRAPH",
+        "AcDbEvalGraph",
+        DynamicBlockData::EvaluationGraph(Default::default()),
+    );
+    object.reactors.push(dictionary);
+    document
+        .objects
+        .insert(handle, ObjectType::DynamicBlock(object));
+    let mut object = dynamic(
+        preventer,
+        dictionary,
+        "ACDB_DYNAMICBLOCKPURGEPREVENTER_VERSION",
+        "AcDbDynamicBlockPurgePreventer",
+        DynamicBlockData::Representation(codec::objects::BlockRepresentationData {
+            flags: 1,
+            block: definition,
+        }),
+    );
+    object.reactors.push(dictionary);
+    document
+        .objects
+        .insert(preventer, ObjectType::DynamicBlock(object));
+    if let Some(ObjectType::Dictionary(dictionary)) = document.objects.get_mut(&dictionary) {
+        dictionary.add_entry("ACAD_ENHANCEDBLOCK", handle);
+        dictionary.add_entry("AcDbDynamicBlockRoundTripPurgePreventer", preventer);
+    }
+    let mut name_record = ExtendedDataRecord::new(TRUE_NAME);
+    name_record.add_value(XDataValue::String(name));
+    document.set_object_xdata_record(definition, name_record);
+    let mut guid = ExtendedDataRecord::new(GUID);
+    guid.add_value(XDataValue::String(new_guid()));
+    document.set_object_xdata_record(definition, guid);
+    tag_members(document, definition);
+    Ok((handle, slots(None)?))
+}
+
+/// Preflight the larger subgraph needed by parameters with state expressions.
+pub(super) fn capacity(
+    document: &CadDocument,
+    definition: Handle,
+    nodes: i32,
+    edges: i32,
+) -> Result<(), &'static str> {
+    let graph = graph(document, definition)?.and_then(|handle| match &document.objects[&handle] {
+        ObjectType::DynamicBlock(object) => match &object.data {
+            DynamicBlockData::EvaluationGraph(graph) => Some(graph),
+            _ => None,
+        },
+        _ => None,
+    });
+    let start = slots(graph)?;
+    if start.node.checked_add(nodes - 1).is_none()
+        || start.eval.checked_add(nodes - 1).is_none()
+        || start.edge.checked_add(edges - 1).is_none()
+    {
+        return Err("The block authoring graph has no free node IDs.");
+    }
+    Ok(())
+}
+
+/// A parameter, its single grip and two position expressions. Supports one-point
+/// parameters and two-point parameters configured with one end grip.
+/// Graph node IDs, expression IDs and edge IDs are separate namespaces.
+pub(super) fn append(
+    document: &mut CadDocument,
+    handle: Handle,
+    slots: Slots,
+    expressions: [Handle; 4],
+) {
+    append_components(document, handle, slots, &expressions, &[2, 3]);
+}
+
+/// Append a parameter and grip, followed by its location/state expressions.
+/// `components` gives the expression offsets in native dependency order.
+pub(super) fn append_components(
+    document: &mut CadDocument,
+    handle: Handle,
+    slots: Slots,
+    expressions: &[Handle],
+    components: &[usize],
+) {
+    use codec::objects::{BlockEvaluationEdge, BlockEvaluationNode};
+    let ObjectType::DynamicBlock(object) = document.objects.get_mut(&handle).unwrap() else {
+        unreachable!()
+    };
+    let DynamicBlockData::EvaluationGraph(graph) = &mut object.data else {
+        unreachable!()
+    };
+    let n = slots.node;
+    let e = slots.edge;
+    let mut links = vec![[-1; 4]; expressions.len()];
+    links[0] = [e, e, e + 1, e + components.len() as i32];
+    links[1] = [-1, -1, e, e];
+    for (index, component) in components.iter().enumerate() {
+        let edge = e + 1 + index as i32;
+        links[*component] = [edge, edge, -1, -1];
+    }
+    for (offset, expression) in expressions.iter().copied().enumerate() {
+        graph.nodes.push(BlockEvaluationNode {
+            id: n + offset as i32,
+            edge_flags: 32,
+            next_id: slots.eval + offset as i32,
+            expression,
+            node_data: links[offset],
+            active_cycles: None,
+        });
+    }
+    let dependencies = std::iter::once((0, n + 1, n, [-1; 5])).chain(
+        components.iter().enumerate().map(|(index, component)| {
+            let offset = index as i32 + 1;
+            let previous = if index == 0 { -1 } else { e + offset - 1 };
+            let next = if index + 1 == components.len() {
+                -1
+            } else {
+                e + offset + 1
+            };
+            (
+                offset,
+                n,
+                n + *component as i32,
+                [-1, -1, previous, next, -1],
+            )
+        }),
+    );
+    for (offset, source_node, destination_node, outgoing_edges) in dependencies {
+        graph.edges.push(BlockEvaluationEdge {
+            id: e + offset,
+            next_id: 0,
+            incoming_edge: 1,
+            source_node,
+            destination_node,
+            outgoing_edges,
+        });
+    }
+    graph.first_node_id = slots.eval + (expressions.len() as i32 - 1);
+    graph.first_node_id_copy = graph.first_node_id;
+}
+
+pub(super) fn register_classes(document: &mut CadDocument, classes: &[(&str, &str, i32)]) {
+    for &(dxf_name, cpp_class_name, maintenance_version) in classes {
+        if let Some(existing) = document.classes.get_mut_by_name(dxf_name) {
+            existing.proxy_flags = codec::classes::ProxyFlags(1153);
+            existing.dwg_version = 25;
+            existing.maintenance_version = maintenance_version;
+            continue;
+        }
+        document.classes.add_or_update(codec::classes::DxfClass {
+            dxf_name: dxf_name.to_string(),
+            cpp_class_name: cpp_class_name.to_string(),
+            application_name: "ObjectDBX Classes".to_string(),
+            proxy_flags: codec::classes::ProxyFlags(1153),
+            instance_count: 0,
+            was_zombie: false,
+            is_an_entity: false,
+            class_number: 0,
+            item_class_id: 0x1F3,
+            dwg_version: 25,
+            maintenance_version,
+            unknown1: 0,
+            unknown2: 0,
+        });
+    }
+}
+
+pub(super) fn ensure_app_id(document: &mut CadDocument, name: &str) {
+    if !document.app_ids.contains(name) {
+        let mut app = codec::tables::AppId::new(name);
+        app.handle = document.allocate_handle();
+        let _ = document.app_ids.add(app);
+    }
+}
+
+pub(super) fn expression(
+    node_id: i32,
+    value_code: i16,
+    value: BlockEvalValue,
+) -> BlockEvalExpression {
+    BlockEvalExpression {
+        parent_id: BlockEvalExpression::NO_PARENT,
+        major: MAJOR,
+        minor: MINOR,
+        value_code,
+        value,
+        node_id,
+    }
+}
+
+pub(super) fn dynamic(
+    handle: Handle,
+    owner: Handle,
+    dxf_name: &str,
+    cpp_class_name: &str,
+    data: DynamicBlockData,
+) -> DynamicBlockObject {
+    let mut object = DynamicBlockObject::new(dxf_name, cpp_class_name);
+    object.handle = handle;
+    object.owner = owner;
+    object.data = data;
+    object
+}
+
+pub(crate) fn members(document: &CadDocument, definition: Handle) -> Vec<Handle> {
+    document
+        .block_records
+        .iter()
+        .find(|record| record.handle == definition)
+        .map(|record| {
+            record
+                .entity_handles
+                .iter()
+                .copied()
+                .filter(|handle| {
+                    !matches!(
+                        document.get_entity(*handle),
+                        None | Some(EntityType::Block(_) | EntityType::BlockEnd(_))
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn element_tag(id: i32, handle: Handle) -> ExtendedDataRecord {
+    let mut tag = ExtendedDataRecord::new(ELEMENT_TAG);
+    tag.add_value(XDataValue::Integer16(1));
+    tag.add_value(XDataValue::Integer32(id));
+    tag.add_value(XDataValue::Handle(handle));
+    tag
+}
+
+pub(super) fn element_id(entity: &EntityType) -> Option<i32> {
+    entity
+        .common()
+        .extended_data
+        .get_record(ELEMENT_TAG)?
+        .values
+        .iter()
+        .find_map(|value| match value {
+            XDataValue::Integer32(id) => Some(*id),
+            _ => None,
+        })
+}
+
+pub(super) fn set_entity_tag(
+    document: &mut CadDocument,
+    handle: Handle,
+    record: ExtendedDataRecord,
+) {
+    let app = document
+        .app_ids
+        .get(&record.application_name)
+        .map(|app| app.handle.value());
+    if let Some(entity) = document.get_entity_mut(handle) {
+        let xdata = &mut entity.common_mut().extended_data;
+        // The fresh record, not bytes kept from a read, is what gets written.
+        if let Some(app) = app {
+            xdata.raw_dwg_eed.retain(|(owner, _)| *owner != app);
+        }
+        xdata.upsert_record(record);
+    }
+}
+
+/// Point each tagged member's element tag back at the member itself, after
+/// the definition was copied onto new handles.
+pub(crate) fn retag_members(document: &mut CadDocument, definition: Handle) {
+    for handle in members(document, definition) {
+        if let Some(id) = document.get_entity(handle).and_then(element_id) {
+            set_entity_tag(document, handle, element_tag(id, handle));
+        }
+    }
+}
+
+/// Give every object of the definition its element tag, numbering the new
+/// ones after the highest id in use, and record the next id on the block.
+pub(super) fn tag_members(document: &mut CadDocument, definition: Handle) {
+    let members = members(document, definition);
+    let mut next = members
+        .iter()
+        .filter_map(|handle| document.get_entity(*handle).and_then(element_id))
+        .max()
+        .map_or(0, |id| id + 1);
+    for handle in members {
+        let id = match document.get_entity(handle).and_then(element_id) {
+            Some(id) => id,
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+        set_entity_tag(document, handle, element_tag(id, handle));
+    }
+    let mut tag = ExtendedDataRecord::new(ELEMENT_TAG);
+    tag.add_value(XDataValue::Integer16(1));
+    tag.add_value(XDataValue::Integer32(next));
+    document.set_object_xdata_record(definition, tag);
+}
+
+pub(super) fn new_guid() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        bytes = seed.to_le_bytes();
+    }
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+    format!(
+        "{{{}-{}-{}-{}-{}}}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}

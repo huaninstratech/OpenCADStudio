@@ -8,7 +8,9 @@ license = "GPL-3.0-only"
 repository = "your-account/your-plugin-repo"
 
 [opencad]
-api_version = 5
+# Keep in sync with the Rust manifest's `ApiVersion::CURRENT` — this is the
+# pre-load gate; the runner also checks the compiled-in symbol.
+api_version = 10
 # Replace both placeholders in the packaging step. The v1 template's
 # release workflow contains a working example.
 rustc_version = "__RUSTC_VERSION__"
@@ -21,3 +23,7 @@ command_prefixes = [
     "COUNT_MARKED_SURVEY_POINTS",
 ]
 xdata_apps = ["SURVEYMARK"]
+# NOTE: the plugin's entity-class display labels (see `ENTITY_CLASSES` in
+# src/lib.rs) travel on the registered manifest over IPC, not in this file —
+# they only apply while the plugin is loaded, so plugin.toml (the pre-load
+# discovery file) deliberately does not carry them.

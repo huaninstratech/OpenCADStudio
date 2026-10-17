@@ -4,12 +4,26 @@
 
 use super::*;
 use crate::io::xref_model::Pathtype;
+use crate::modules::insert::xattach::IMAGE_EXTENSIONS;
 use crate::modules::insert::xattach::{
-    existing_reference, path_to_block_name, prepare_xref_definition, stored_path,
-    XAttachCommand, XrefAttachRequest, XrefPlacement,
+    existing_reference, path_to_block_name, prepare_xref_definition, stored_path, XAttachCommand,
+    XrefAttachRequest, XrefPlacement,
 };
 use crate::modules::insert::xref_cmd::display_path;
 use crate::ui::window::xref_attach::{XrefAttachMsg, XrefAttachState};
+
+/// ATTACH's file types, in the reference order (the picker counts from 1).
+const ATTACH_FILTERS: [(&str, &[&str]); 8] = [
+    ("All image files", IMAGE_EXTENSIONS),
+    ("DWF files (*.dwfx; *.dwf)", &["dwfx", "dwf"]),
+    ("MicroStation DGN (*.dgn)", &["dgn"]),
+    ("All DGN Files (*.*)", &["*"]),
+    ("PDF files (*.pdf)", &["pdf"]),
+    ("Point Cloud (*.rcp; *.rcs)", &["rcp", "rcs"]),
+    ("Drawing (*.dwg)", &["dwg"]),
+    ("All files (*.*)", &["*"]),
+];
+const ALL_DGN_FILTER: u32 = 4;
 
 impl OpenCADStudio {
     /// DWFATTACH / DGNATTACH on the command line: with a file, from its
@@ -22,9 +36,12 @@ impl OpenCADStudio {
     ) {
         use crate::command::CadCommand;
         let insunits = self.tabs[i].scene.document.header.insertion_units;
-        let mut command = crate::modules::insert::pdf_attach::PdfAttachCommand::for_kind(kind, insunits);
+        let mut command =
+            crate::modules::insert::pdf_attach::PdfAttachCommand::for_kind(kind, insunits);
         if !file.trim().is_empty() {
-            if let Some(crate::command::CmdResult::ReportError(message)) = command.on_text_input(file) {
+            if let Some(crate::command::CmdResult::ReportError(message)) =
+                command.on_text_input(file)
+            {
                 self.command_line.push_error(&message);
             }
         }
@@ -39,12 +56,26 @@ impl OpenCADStudio {
             Some((verb, rest)) => (verb.to_ascii_uppercase(), rest.trim()),
             None => (upper.clone(), ""),
         };
+        // FILEDIA 0 sends the picking commands to their command-line forms.
+        let dialog = crate::sys::file_dia();
         match (verb.as_str(), rest.is_empty()) {
-            ("ATTACH", true) => Some(Task::done(Message::AttachPick)),
-            ("DWFATTACH", true) => Some(Task::done(Message::UnderlayAttachPick(
+            ("ATTACH", true) if dialog => Some(Task::done(Message::AttachPick)),
+            ("ATTACH", true) | ("-ATTACH", _) => {
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::xref_cmd::AttachCommand::new();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                if !rest.is_empty() {
+                    return Some(
+                        self.feed_command(crate::command::StepInput::Text(rest.to_string())),
+                    );
+                }
+                Some(Task::none())
+            }
+            ("DWFATTACH", true) if dialog => Some(Task::done(Message::UnderlayAttachPick(
                 codec::entities::UnderlayType::Dwf,
             ))),
-            ("DGNATTACH", true) => Some(Task::done(Message::UnderlayAttachPick(
+            ("DGNATTACH", true) if dialog => Some(Task::done(Message::UnderlayAttachPick(
                 codec::entities::UnderlayType::Dgn,
             ))),
             // A file after DWFATTACH / DGNATTACH, or the - forms, go on the
@@ -57,7 +88,29 @@ impl OpenCADStudio {
                 self.start_underlay_attach(i, codec::entities::UnderlayType::Dgn, rest);
                 Some(Task::none())
             }
-            ("XATTACH", true) => Some(Task::done(Message::XAttachPick)),
+            // POINTCLOUDATTACH picks the file; with a file, or as
+            // -POINTCLOUDATTACH, it asks on the command line.
+            ("POINTCLOUDATTACH", true) if dialog => Some(Task::done(Message::PointCloudAttachPick)),
+            ("POINTCLOUDATTACH" | "-POINTCLOUDATTACH", _) => {
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::pc_attach::PointCloudAttachCommand::new();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                if !rest.is_empty() {
+                    return Some(
+                        self.feed_command(crate::command::StepInput::Text(rest.to_string())),
+                    );
+                }
+                Some(Task::none())
+            }
+            ("XATTACH", true) if dialog => Some(Task::done(Message::XAttachPick)),
+            ("XATTACH", true) => {
+                let command =
+                    crate::modules::insert::xref_cmd::XrefCommand::attach(self.saved_xref_paths(i));
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                Some(Task::none())
+            }
             // A file named on the command line skips the picker.
             // Handled at once, so the placement it starts belongs to this
             // command line (automation included).
@@ -78,15 +131,8 @@ impl OpenCADStudio {
                 Some(self.finish_dispatch(cmd))
             }
             ("-XREF", true) => {
-                let saved: Vec<(String, String)> = self.tabs[i]
-                    .scene
-                    .document
-                    .block_records
-                    .iter()
-                    .filter(|br| br.flags.is_xref || br.flags.is_xref_overlay)
-                    .map(|br| (br.name.clone(), br.xref_path.clone()))
-                    .collect();
-                let command = crate::modules::insert::xref_cmd::XrefCommand::new(saved);
+                let command =
+                    crate::modules::insert::xref_cmd::XrefCommand::new(self.saved_xref_paths(i));
                 self.command_line.push_info(&command.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(command));
                 Some(Task::none())
@@ -110,6 +156,18 @@ impl OpenCADStudio {
         }
     }
 
+    /// Saved paths by reference name, for -XREF.
+    fn saved_xref_paths(&self, i: usize) -> Vec<(String, String)> {
+        self.tabs[i]
+            .scene
+            .document
+            .block_records
+            .iter()
+            .filter(|br| br.flags.is_xref || br.flags.is_xref_overlay)
+            .map(|br| (br.name.clone(), br.xref_path.clone()))
+            .collect()
+    }
+
     /// `-XREF ?` — the reference table as the reference application prints it.
     fn list_xrefs(&mut self, i: usize, pattern: &str) {
         let rows: Vec<(String, &'static str, String)> = self.tabs[i]
@@ -118,26 +176,31 @@ impl OpenCADStudio {
             .block_records
             .iter()
             .filter(|br| br.flags.is_xref || br.flags.is_xref_overlay)
-            .filter(|br| {
-                pattern == "*" || crate::io::xref_model::wildcard_match(&br.name, pattern)
-            })
+            .filter(|br| pattern == "*" || crate::io::xref_model::wildcard_match(&br.name, pattern))
             .map(|br| {
-                let kind = if br.flags.is_xref_overlay { "Overlay" } else { "Attach" };
+                let kind = if br.flags.is_xref_overlay {
+                    "Overlay"
+                } else {
+                    "Attach"
+                };
                 (br.name.clone(), kind, display_path(&br.xref_path))
             })
             .collect();
         let out = &mut self.command_line;
         out.push_output("");
+        out.push_output(&format!("{:<34}{:<13}{}", "Xref name", "Xref Type", "Path"));
         out.push_output(&format!(
             "{:<34}{:<13}{}",
-            "Xref name",
-            "Xref Type",
-            "Path"
+            "----------------------", "---------", "----------"
         ));
-        out.push_output(&format!("{:<34}{:<13}{}", "----------------------", "---------", "----------"));
         out.push_output("");
         for (name, kind, path) in &rows {
-            out.push_output(&format!("{:<34}{:<13}{}", format!("\"{name}\""), *kind, path));
+            out.push_output(&format!(
+                "{:<34}{:<13}{}",
+                format!("\"{name}\""),
+                *kind,
+                path
+            ));
         }
         out.push_output("");
         out.push_output(&format!("Total Xref(s): {}", rows.len()));
@@ -157,9 +220,8 @@ impl OpenCADStudio {
         let host = self.tabs[i].current_path.clone();
         if let Some(host) = host.as_deref() {
             if crate::modules::insert::xattach::is_self_attach(host, &full, host.parent()) {
-                self.command_line.push_error(
-                    "Error: Possible circular reference to current drawing. *Invalid*",
-                );
+                self.command_line
+                    .push_error("Error: Possible circular reference to current drawing. *Invalid*");
                 return;
             }
         }
@@ -167,8 +229,7 @@ impl OpenCADStudio {
         if let Some(existing) = existing.as_ref() {
             self.command_line
                 .push_output(&format!("Xref \"{}\" has already been defined.", existing));
-            self.command_line
-                .push_output("Using existing definition.");
+            self.command_line.push_output("Using existing definition.");
         } else {
             let verb = if request.overlay {
                 format!("Overlay Xref \"{}\": {}", name, display_path(&full))
@@ -196,7 +257,8 @@ impl OpenCADStudio {
         }
         let (wires, source_units) = self.xref_preview(i, existing.as_deref(), &full);
         let host_units = self.tabs[i].scene.document.header.insertion_units;
-        let unit = crate::app::properties::insert_unit_scale(host_units, source_units).unwrap_or(1.0);
+        let unit =
+            crate::app::properties::insert_unit_scale(host_units, source_units).unwrap_or(1.0);
         let command = command.with_preview(wires, unit);
         self.command_line.push_info(&command.prompt());
         self.tabs[i].active_cmd = Some(Box::new(command));
@@ -313,8 +375,8 @@ impl OpenCADStudio {
             let source_units = crate::io::load_file(std::path::Path::new(path))
                 .map(|doc| doc.header.insertion_units)
                 .unwrap_or(0);
-            state.unit_label = crate::t!(crate::app::properties::insunits_name(source_units))
-                .into_owned();
+            state.unit_label =
+                crate::t!(crate::app::properties::insunits_name(source_units)).into_owned();
             let factor =
                 crate::app::properties::insert_unit_scale(host_units, source_units).unwrap_or(1.0);
             state.unit_factor = crate::app::properties::format_unit_factor(factor);
@@ -355,25 +417,12 @@ impl OpenCADStudio {
                 },
                 Message::AttachPickResult,
             ),
-            Message::AttachPick => Task::perform(
+            Message::PointCloudAttachPick => Task::perform(
                 async {
                     let handle = crate::sys::file_dialog()
-                        .set_title(crate::t!("Select Reference File").as_ref())
-                        .add_filter(
-                            crate::t!("All Reference Files").as_ref(),
-                            &[
-                                "dwg", "dxf", "pdf", "dwf", "dwfx", "dgn", "png", "jpg", "jpeg",
-                                "bmp", "tif", "tiff",
-                            ],
-                        )
-                        .add_filter(crate::t!("Drawing").as_ref(), &["dwg", "dxf"])
-                        .add_filter(crate::t!("PDF Files").as_ref(), &["pdf"])
-                        .add_filter(crate::t!("DWF Files").as_ref(), &["dwf", "dwfx"])
-                        .add_filter(crate::t!("DGN Files").as_ref(), &["dgn"])
-                        .add_filter(
-                            crate::t!("Images").as_ref(),
-                            &["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
-                        )
+                        .set_title(crate::t!("Select Point Cloud File").as_ref())
+                        .add_filter(crate::t!("Point Cloud Project").as_ref(), &["rcp"])
+                        .add_filter(crate::t!("Point Cloud Scan").as_ref(), &["rcs"])
                         .pick_file()
                         .await;
                     match handle {
@@ -383,11 +432,41 @@ impl OpenCADStudio {
                 },
                 Message::AttachPickResult,
             ),
+            Message::AttachPick => {
+                let filters = ATTACH_FILTERS
+                    .iter()
+                    .map(|(label, extensions)| (crate::t!(label).to_string(), *extensions))
+                    .collect();
+                let title = crate::t!("Select Reference File").to_string();
+                let index = crate::sys::attach_filter();
+                Task::perform(
+                    async move {
+                        match crate::sys::pick_file_with_filter(title, filters, index).await {
+                            Some((path, index)) => {
+                                crate::sys::set_attach_filter(index);
+                                Ok(path)
+                            }
+                            None => Err("Cancelled".to_string()),
+                        }
+                    },
+                    Message::AttachPickResult,
+                )
+            }
             Message::AttachPickResult(Ok(path)) => {
-                let ext = path
+                // The file type the picker was left on is a profile setting.
+                self.save_config();
+                let mut ext = path
                     .extension()
                     .map(|e| e.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_default();
+                // Any file picked under "All DGN Files" is a DGN.
+                let known = ["dwg", "dxf", "pdf", "dwf", "dwfx", "dgn", "rcp", "rcs"];
+                if crate::sys::attach_filter() == ALL_DGN_FILTER
+                    && !known.contains(&ext.as_str())
+                    && !IMAGE_EXTENSIONS.contains(&ext.as_str())
+                {
+                    ext = "dgn".to_string();
+                }
                 match ext.as_str() {
                     "pdf" => match std::fs::read(&path) {
                         Ok(bytes) => self.update(Message::PdfAttachPickResult(Ok((
@@ -405,9 +484,14 @@ impl OpenCADStudio {
                         let path = path.to_string_lossy().into_owned();
                         match std::fs::read(&path) {
                             Ok(bytes) => {
-                                crate::scene::model::pdf_raster::register_source(&path, std::sync::Arc::new(bytes));
+                                crate::scene::model::pdf_raster::register_source(
+                                    &path,
+                                    std::sync::Arc::new(bytes),
+                                );
                                 crate::scene::model::underlay_vector::forget(&path);
-                                if crate::scene::model::underlay_vector::item_names(kind, &path).is_some_and(|n| !n.is_empty()) {
+                                if crate::scene::model::underlay_vector::item_names(kind, &path)
+                                    .is_some_and(|n| !n.is_empty())
+                                {
                                     self.open_underlay_attach_dialog(kind, &path);
                                 } else {
                                     self.command_line.push_error(&format!(
@@ -423,7 +507,18 @@ impl OpenCADStudio {
                         }
                         Task::none()
                     }
-                    "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" => {
+                    // A point cloud goes on to the Attach Point Cloud dialog.
+                    "rcp" | "rcs" => {
+                        if crate::scene::model::point_cloud::load(&path).is_none() {
+                            self.command_line
+                                .push_error("All scans are not found or invalid.");
+                            self.command_line.push_error("Attach point cloud failed");
+                            return Task::none();
+                        }
+                        self.open_point_cloud_attach_dialog(&path);
+                        Task::none()
+                    }
+                    e if IMAGE_EXTENSIONS.contains(&e) => {
                         let result = image::image_dimensions(&path)
                             .map(|(w, h)| (path.clone(), w, h))
                             .map_err(|e| e.to_string());
@@ -470,7 +565,8 @@ impl OpenCADStudio {
                 {
                     let host = self.tabs[self.active_tab].current_path.clone();
                     let base = host.as_deref().and_then(|h| h.parent());
-                    let full = crate::modules::insert::xattach::resolve_xref_store_path(&saved, base);
+                    let full =
+                        crate::modules::insert::xattach::resolve_xref_store_path(&saved, base);
                     self.load_xref_attach_file(&mut state, &full);
                 }
             }
@@ -530,7 +626,9 @@ impl OpenCADStudio {
                     insert: (!state.insert_on_screen)
                         .then(|| state.insert_point())
                         .flatten(),
-                    scale: (!state.scale_on_screen).then(|| state.scale_values()).flatten(),
+                    scale: (!state.scale_on_screen)
+                        .then(|| state.scale_values())
+                        .flatten(),
                     rotation: (!state.rotation_on_screen)
                         .then(|| crate::entities::common::parse_typed_angle(&state.rotation))
                         .flatten()
@@ -538,9 +636,7 @@ impl OpenCADStudio {
                 };
                 let invalid = (!state.insert_on_screen && placement.insert.is_none())
                     || (!state.scale_on_screen
-                        && placement
-                            .scale
-                            .is_none_or(|s| s.iter().any(|v| *v == 0.0)))
+                        && placement.scale.is_none_or(|s| s.iter().any(|v| *v == 0.0)))
                     || (!state.rotation_on_screen && placement.rotation.is_none());
                 if invalid || state.path.is_empty() {
                     self.command_line

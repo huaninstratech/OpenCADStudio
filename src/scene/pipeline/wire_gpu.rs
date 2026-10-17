@@ -71,22 +71,55 @@ pub struct WireInstance {
     /// Endpoint width / the per-wire maximum width, normalized by the vertex
     /// fetch unit. `[0, 0]` means use the constant width. Ratios retain the
     /// full f32 world-width scale in `WireConst` while making every instance
-    /// exactly one 64-byte cache line.
-    pub taper_ratio: [u16; 2],
+    /// exactly one 64-byte cache line. A constant-width band carries its
+    /// joint miters (`band_miters`) here instead.
+    pub taper_ratio: [i16; 2],
 }
 
 impl WireInstance {
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         // Must match `InstanceIn` in wire_indexed.wgsl.
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, pos_a) as u64,      shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, pos_b) as u64,      shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, pos_a_low) as u64,  shader_location: 2, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, pos_b_low) as u64,  shader_location: 3, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, distance_a) as u64, shader_location: 4, format: wgpu::VertexFormat::Float32   },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, distance_b) as u64, shader_location: 5, format: wgpu::VertexFormat::Float32   },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, wire_id) as u64,    shader_location: 6, format: wgpu::VertexFormat::Uint32    },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(WireInstance, taper_ratio) as u64, shader_location: 7, format: wgpu::VertexFormat::Unorm16x2 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, pos_a) as u64,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, pos_b) as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, pos_a_low) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, pos_b_low) as u64,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, distance_a) as u64,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, distance_b) as u64,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, wire_id) as u64,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Uint32,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(WireInstance, taper_ratio) as u64,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Snorm16x2,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<WireInstance>() as u64,
@@ -117,7 +150,9 @@ pub struct WireConst {
     /// in drawing units.
     pub world_half_width: f32,
     pub is_tapered: f32,
-    pub _pad2: f32,
+    /// Non-zero hides every segment of the wire: arena slabs of hidden
+    /// entities stay resident and are collapsed by the vertex shader.
+    pub hidden: f32,
     /// Point-marker origin as a double-single pair. `marker_normal_scale.w`
     /// stores the viewport-height percentage; zero disables marker scaling.
     pub marker_origin_high: [f32; 4],
@@ -194,22 +229,74 @@ impl PackedWireInstance {
         // the web viewport drew no lines at all (#414). The struct fields are
         // laid out so each packed group is contiguous.
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pos_a) as u64,          shader_location: 0,  format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pos_b) as u64,          shader_location: 1,  format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, color) as u64,          shader_location: 2,  format: wgpu::VertexFormat::Unorm8x4  },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pos_a) as u64,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pos_b) as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, color) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Unorm8x4,
+            },
             // dists = (distance_a, distance_b, half_width, pattern_length)
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, distance_a) as u64,     shader_location: 3,  format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pat0) as u64,           shader_location: 4,  format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pat1) as u64,           shader_location: 5,  format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, distance_a) as u64,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pat0) as u64,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pat1) as u64,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32x4,
+            },
             // misc = (draw_depth, align_end, align_total, world_half_width)
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, draw_depth) as u64,     shader_location: 6,  format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pos_a_low) as u64,      shader_location: 7,  format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, pos_b_low) as u64,      shader_location: 8,  format: wgpu::VertexFormat::Float32x3 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, draw_depth) as u64,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pos_a_low) as u64,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, pos_b_low) as u64,
+                shader_location: 8,
+                format: wgpu::VertexFormat::Float32x3,
+            },
             // taper = (world_hw_a, world_hw_b)
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, world_hw_a) as u64,     shader_location: 9,  format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, marker_origin_high) as u64, shader_location: 10, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, marker_origin_low) as u64, shader_location: 11, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(PackedWireInstance, marker_normal_scale) as u64, shader_location: 12, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, world_hw_a) as u64,
+                shader_location: 9,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, marker_origin_high) as u64,
+                shader_location: 10,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, marker_origin_low) as u64,
+                shader_location: 11,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(PackedWireInstance, marker_normal_scale) as u64,
+                shader_location: 12,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<PackedWireInstance>() as u64,
@@ -288,18 +375,42 @@ pub struct BlockWireVertex {
     pub pos_b: [f32; 3],
     pub pos_b_low: [f32; 3],
     pub distances: [f32; 2],
-    pub taper_ratio: [u16; 2],
+    pub taper_ratio: [i16; 2],
 }
 
 impl BlockWireVertex {
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, pos_a) as u64,       shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, pos_b) as u64,       shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, pos_a_low) as u64,   shader_location: 2, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, pos_b_low) as u64,   shader_location: 3, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, distances) as u64,   shader_location: 4, format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireVertex, taper_ratio) as u64, shader_location: 5, format: wgpu::VertexFormat::Unorm16x2 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, pos_a) as u64,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, pos_b) as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, pos_a_low) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, pos_b_low) as u64,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, distances) as u64,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireVertex, taper_ratio) as u64,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Snorm16x2,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as u64,
@@ -320,9 +431,21 @@ pub struct BlockWireInstance {
 impl BlockWireInstance {
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireInstance, translation) as u64,     shader_location: 6, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireInstance, translation_low) as u64, shader_location: 7, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: std::mem::offset_of!(BlockWireInstance, depth) as u64,           shader_location: 8, format: wgpu::VertexFormat::Float32x2 },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireInstance, translation) as u64,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireInstance, translation_low) as u64,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::offset_of!(BlockWireInstance, depth) as u64,
+                shader_location: 8,
+                format: wgpu::VertexFormat::Float32x2,
+            },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as u64,
@@ -332,21 +455,49 @@ impl BlockWireInstance {
     }
 }
 
-#[derive(Clone)]
-pub struct BlockWireGpu {
+/// One packed upload shared by many block definitions.
+///
+/// A drawing of block-heavy plan content reaches thousands of definitions, and
+/// a buffer per definition is what runs a device out of memory: the payloads
+/// are a few hundred bytes each, but every allocation costs a page of its own —
+/// on D3D12 enough of them to exhaust a 6 GB card at 12 MB of actual geometry.
+/// So the definitions share one buffer set: their constants in one uniform
+/// buffer addressed by dynamic offset, their segments in one geometry buffer
+/// addressed by `first_vertex`, and their placements in one instance buffer
+/// addressed by `first_instance`.
+pub struct BlockArena {
     /// Packed mode only; `None` in storage mode, where the segments reach the
-    /// shader through `const_bind_group` instead.
+    /// shader through `bind_group` instead.
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub instance_buffer: wgpu::Buffer,
-    pub vertex_count: u32,
-    pub instance_count: u32,
-    pub is_3d_mesh_edge: bool,
-    pub const_bind_group: std::sync::Arc<wgpu::BindGroup>,
+    pub bind_group: std::sync::Arc<wgpu::BindGroup>,
+    /// Device bytes of the three buffers, for the live-memory report.
+    pub bytes: u64,
 }
 
-/// Binding 0 is the definition's constants. In storage mode binding 1 carries
-/// that chunk's segments, which is why the bind group is per-chunk there and
-/// shared across chunks in packed mode.
+#[derive(Clone)]
+pub struct BlockWireGpu {
+    pub arena: std::sync::Arc<BlockArena>,
+    /// First vertex of this definition's slice of the arena. The shader reads
+    /// `vertex_index / 6` as the segment index and `vertex_index % 6` as the
+    /// quad corner, so a slice that starts a whole number of segments in needs
+    /// no shader change — the arithmetic lands on the right record either way.
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+    pub first_instance: u32,
+    pub instance_count: u32,
+    /// Byte offset of this definition's `WireConst` in the arena's uniform
+    /// buffer, passed as the bind group's dynamic offset.
+    pub const_offset: u32,
+    pub is_3d_mesh_edge: bool,
+    /// The records this batch was packed from. The buffers are rebuilt every
+    /// build, so this is what tells a cache hit from a re-emission.
+    pub geometry: std::sync::Arc<BlockGeometryRecords>,
+}
+
+/// Binding 0 is the definition's constants, one dynamic-offset slice of the
+/// arena's uniform buffer. In storage mode binding 1 carries the arena's
+/// segments, which every definition in it indexes through `first_vertex`.
 pub fn block_const_bind_group_layout(
     device: &wgpu::Device,
     uses_storage: bool,
@@ -356,8 +507,8 @@ pub fn block_const_bind_group_layout(
         visibility: wgpu::ShaderStages::VERTEX,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<WireConst>() as u64),
         },
         count: None,
     }];
@@ -538,15 +689,27 @@ fn marker_metadata(wire: &WireModel) -> ([f32; 4], [f32; 4], [f32; 4]) {
         for tg in &wire.tangent_geoms {
             match tg {
                 crate::scene::model::wire_model::TangentGeom::Arc { axis_x, axis_y, .. }
-                | crate::scene::model::wire_model::TangentGeom::PlanarCircle { axis_x, axis_y, .. } => {
+                | crate::scene::model::wire_model::TangentGeom::PlanarCircle {
+                    axis_x,
+                    axis_y,
+                    ..
+                } => {
                     let ax = glam::DVec3::from_array(*axis_x);
                     let ay = glam::DVec3::from_array(*axis_y);
                     let n = ax.cross(ay).normalize_or(glam::DVec3::Z);
-                    return ([0.0; 4], [0.0; 4], [n.x as f32, n.y as f32, n.z as f32, 0.0]);
+                    return (
+                        [0.0; 4],
+                        [0.0; 4],
+                        [n.x as f32, n.y as f32, n.z as f32, 0.0],
+                    );
                 }
                 crate::scene::model::wire_model::TangentGeom::PlanarEllipse { normal, .. } => {
                     let n = glam::DVec3::from_array(*normal).normalize_or(glam::DVec3::Z);
-                    return ([0.0; 4], [0.0; 4], [n.x as f32, n.y as f32, n.z as f32, 0.0]);
+                    return (
+                        [0.0; 4],
+                        [0.0; 4],
+                        [n.x as f32, n.y as f32, n.z as f32, 0.0],
+                    );
                 }
                 _ => {}
             }
@@ -577,6 +740,108 @@ fn marker_metadata(wire: &WireModel) -> ([f32; 4], [f32; 4], [f32; 4]) {
     )
 }
 
+/// Largest |tan(turn/2)| a band joint is mitered at; sharper turns stay butt
+/// ends instead of growing a long spike. Must match `MITER_LIMIT` in the wire
+/// shaders, which decode the normalized value back.
+pub(crate) const MITER_LIMIT: f64 = 8.0;
+
+/// Per-segment miter factors `[k_a, k_b]` of a constant-width world band,
+/// normalized by `MITER_LIMIT`. The shader slides each quad corner by
+/// `k·side·half_width` along the segment, so neighbouring segments meet on
+/// their joint's bisector instead of leaving a notch at the outer corner.
+/// Empty for every other wire.
+fn band_miters(wire: &WireModel, normal: [f32; 4]) -> Vec<[f32; 2]> {
+    let n = wire.points.len();
+    if wire.world_width <= 0.0 || !wire.taper_widths.is_empty() || n < 3 {
+        return Vec::new();
+    }
+    let at = |i: usize| -> Option<glam::DVec3> {
+        let h = wire.points[i];
+        let l = wire.points_low.get(i).copied().unwrap_or([0.0; 3]);
+        finite3(h).then(|| {
+            glam::DVec3::new(
+                h[0] as f64 + l[0] as f64,
+                h[1] as f64 + l[1] as f64,
+                h[2] as f64 + l[2] as f64,
+            )
+        })
+    };
+    let same = |a: glam::DVec3, b: glam::DVec3| a.distance(b) <= 1e-9 * (1.0 + a.length());
+    let first = (0..n).find_map(|i| at(i).map(|p| (i, p)));
+    let last = (0..n).rev().find_map(|i| at(i).map(|p| (i, p)));
+    let closed = matches!((first, last), (Some((i, a)), Some((j, b))) if i < j && same(a, b));
+    // Direction leaving joint `from` (or arriving at it when `step` walks
+    // back), skipping duplicate points and NaN breaks whose next run starts
+    // at the same joint; a closed wire wraps around once.
+    let neighbour = |from: usize, step: isize| -> Option<glam::DVec3> {
+        let joint = at(from)?;
+        let mut i = from as isize;
+        let mut wrapped = false;
+        let mut broken = false;
+        loop {
+            i += step;
+            if i < 0 || i >= n as isize {
+                if !closed || wrapped {
+                    return None;
+                }
+                wrapped = true;
+                i = if step > 0 {
+                    first?.0 as isize
+                } else {
+                    last?.0 as isize
+                };
+                continue;
+            }
+            let Some(q) = at(i as usize) else {
+                broken = true;
+                continue;
+            };
+            if same(q, joint) {
+                broken = false;
+                continue;
+            }
+            if broken {
+                return None;
+            }
+            let d = if step > 0 { q - joint } else { joint - q };
+            return Some(d.normalize());
+        }
+    };
+    let axis = glam::DVec3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64);
+    let axis = if axis.length() > 1e-4 {
+        axis.normalize()
+    } else {
+        glam::DVec3::Z
+    };
+    // tan of half the signed turn from `d1` to `d2` about the band normal.
+    let half_turn = |d1: glam::DVec3, d2: glam::DVec3| -> f32 {
+        let cos = d1.dot(d2);
+        if cos <= -1.0 + 1e-9 {
+            return 0.0;
+        }
+        let t = axis.dot(d1.cross(d2)) / (1.0 + cos);
+        if t.abs() > MITER_LIMIT {
+            0.0
+        } else {
+            (t / MITER_LIMIT) as f32
+        }
+    };
+    (0..n - 1)
+        .map(|i| {
+            let (Some(a), Some(b)) = (at(i), at(i + 1)) else {
+                return [0.0; 2];
+            };
+            if same(a, b) {
+                return [0.0; 2];
+            }
+            let d = (b - a).normalize();
+            let k_a = neighbour(i, -1).map_or(0.0, |prev| half_turn(prev, d));
+            let k_b = neighbour(i + 1, 1).map_or(0.0, |next| -half_turn(d, next));
+            [k_a, k_b]
+        })
+        .collect()
+}
+
 /// Emit packed per-segment instances (each carries the wire's constants).
 pub(crate) fn emit_wire_packed(
     wire: &WireModel,
@@ -584,9 +849,19 @@ pub(crate) fn emit_wire_packed(
     draw_depth: f32,
 ) -> Vec<PackedWireInstance> {
     let color_u8 = pack_color(color);
-    let pat0 = [wire.pattern[0], wire.pattern[1], wire.pattern[2], wire.pattern[3]];
-    let pat1 = [wire.pattern[4], wire.pattern[5], wire.pattern[6], wire.pattern[7]];
-    let half_width = wire.line_weight_px * 0.5;
+    let pat0 = [
+        wire.pattern[0],
+        wire.pattern[1],
+        wire.pattern[2],
+        wire.pattern[3],
+    ];
+    let pat1 = [
+        wire.pattern[4],
+        wire.pattern[5],
+        wire.pattern[6],
+        wire.pattern[7],
+    ];
+    let half_width = wire.line_weight_px.max(1.0) * 0.5;
     let n = wire.points.len();
     let seg_count = n.saturating_sub(1);
     if seg_count == 0 {
@@ -599,6 +874,7 @@ pub(crate) fn emit_wire_packed(
         (Vec::new(), 0.0, 0.0)
     };
     let (marker_origin_high, marker_origin_low, marker_normal_scale) = marker_metadata(wire);
+    let miters = band_miters(wire, marker_normal_scale);
     let low = |i: usize| -> [f32; 3] { wire.points_low.get(i).copied().unwrap_or([0.0; 3]) };
     let is_tapered = !wire.taper_widths.is_empty();
     let tw = |i: usize| -> f32 {
@@ -638,8 +914,17 @@ pub(crate) fn emit_wire_packed(
             world_half_width: wire.world_width * 0.5,
             world_hw_a: tw(i),
             world_hw_b: tw(i + 1),
-            marker_origin_high,
-            marker_origin_low,
+            // The origin `w` slots are free: they carry the band miters.
+            marker_origin_high: {
+                let mut m = marker_origin_high;
+                m[3] = miters.get(i).map_or(0.0, |k| k[0]);
+                m
+            },
+            marker_origin_low: {
+                let mut m = marker_origin_low;
+                m[3] = miters.get(i).map_or(0.0, |k| k[1]);
+                m
+            },
             marker_normal_scale,
         });
     }
@@ -666,16 +951,26 @@ pub(crate) fn emit_wire_native(
     let is_tapered = !wire.taper_widths.is_empty();
     let cst = WireConst {
         color,
-        pat0: [wire.pattern[0], wire.pattern[1], wire.pattern[2], wire.pattern[3]],
-        pat1: [wire.pattern[4], wire.pattern[5], wire.pattern[6], wire.pattern[7]],
-        half_width: wire.line_weight_px * 0.5,
+        pat0: [
+            wire.pattern[0],
+            wire.pattern[1],
+            wire.pattern[2],
+            wire.pattern[3],
+        ],
+        pat1: [
+            wire.pattern[4],
+            wire.pattern[5],
+            wire.pattern[6],
+            wire.pattern[7],
+        ],
+        half_width: wire.line_weight_px.max(1.0) * 0.5,
         pattern_length: wire.pattern_length,
         draw_depth,
         align_end,
         align_total,
         world_half_width: wire.world_width * 0.5,
         is_tapered: if is_tapered { 1.0 } else { 0.0 },
-        _pad2: 0.0,
+        hidden: 0.0,
         marker_origin_high,
         marker_origin_low,
         marker_normal_scale,
@@ -684,14 +979,17 @@ pub(crate) fn emit_wire_native(
         return (Vec::new(), cst);
     }
     let low = |i: usize| -> [f32; 3] { wire.points_low.get(i).copied().unwrap_or([0.0; 3]) };
-    let taper_ratio = |i: usize| -> u16 {
+    let snorm = |v: f32| -> i16 { (v.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16 };
+    let taper_ratio = |i: usize| -> i16 {
         if !is_tapered || wire.world_width <= 0.0 {
             0
         } else {
             let width = wire.taper_widths.get(i).copied().unwrap_or(0.0);
-            ((width / wire.world_width).clamp(0.0, 1.0) * u16::MAX as f32).round() as u16
+            snorm(width / wire.world_width)
         }
     };
+    // A constant-width band reuses the slot for its joint miters.
+    let miters = band_miters(wire, marker_normal_scale);
     let mut instances: Vec<WireInstance> = Vec::with_capacity(seg_count);
     for i in 0..seg_count {
         let a = wire.points[i];
@@ -712,7 +1010,10 @@ pub(crate) fn emit_wire_native(
             distance_a: dist_a,
             distance_b: dist_b,
             wire_id,
-            taper_ratio: [taper_ratio(i), taper_ratio(i + 1)],
+            taper_ratio: match miters.get(i) {
+                Some(k) => [snorm(k[0]), snorm(k[1])],
+                None => [taper_ratio(i), taper_ratio(i + 1)],
+            },
         });
     }
     (instances, cst)
@@ -740,12 +1041,88 @@ pub fn fast_parse_u64(s: &str) -> Option<u64> {
 /// wires that carry no document handle). A wire carrying a block-local
 /// `depth_override` (a wide-polyline band inside a block) composes it into
 /// the insert's own sub-range so the band orders against its block siblings.
+/// One block-instanced wire to draw: a wire of the set, or a prototype wire
+/// reached through a stub, moved by `delta` with its depth shifted by
+/// `depth_delta` and owned (named, depth-ordered) by the stub `owner`.
+#[derive(Clone, Copy)]
+pub struct BlockRef<'a> {
+    pub wire: &'a WireModel,
+    pub delta: [f64; 3],
+    pub depth_delta: f32,
+    pub owner: Option<&'a WireModel>,
+}
+
+impl<'a> From<&'a WireModel> for BlockRef<'a> {
+    fn from(wire: &'a WireModel) -> Self {
+        Self {
+            wire,
+            delta: [0.0; 3],
+            depth_delta: 0.0,
+            owner: None,
+        }
+    }
+}
+
+impl<'a> BlockRef<'a> {
+    /// The wire whose name and visibility stand for this copy.
+    pub fn named(&self) -> &'a WireModel {
+        self.owner.unwrap_or(self.wire)
+    }
+
+    /// The copy's draw depth: its owner's slot, the prototype wire's
+    /// block-local depth shifted for this copy.
+    pub fn draw_depth(&self, depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>) -> f32 {
+        let base = fast_parse_u64(&self.named().name).and_then(|h| depth_map.get(&h).copied());
+        match (base, self.wire.depth_override) {
+            (Some([d, half]), Some(local)) => d + (local + self.depth_delta) * half,
+            (Some([d, _]), None) => d,
+            (None, _) => 0.0,
+        }
+    }
+}
+
+/// Push the block-instanced wires `wire` stands for: itself, or every copy a
+/// stub holds (stubs inside stubs included).
+pub fn push_block_refs<'a>(wire: &'a WireModel, out: &mut Vec<BlockRef<'a>>) {
+    fn walk<'a>(
+        wire: &'a WireModel,
+        delta: [f64; 3],
+        depth_delta: f32,
+        owner: &'a WireModel,
+        out: &mut Vec<BlockRef<'a>>,
+    ) {
+        match &wire.stub {
+            Some(stub) => {
+                let delta = [
+                    delta[0] + stub.delta[0],
+                    delta[1] + stub.delta[1],
+                    delta[2] + stub.delta[2],
+                ];
+                for inner in stub.prototype.iter() {
+                    walk(inner, delta, depth_delta + stub.depth_delta, owner, out);
+                }
+            }
+            None if wire.render_instance.is_some() => out.push(BlockRef {
+                wire,
+                delta,
+                depth_delta,
+                owner: Some(owner),
+            }),
+            None => {}
+        }
+    }
+    if wire.stub.is_some() {
+        walk(wire, [0.0; 3], 0.0, wire, out);
+    } else if wire.render_instance.is_some() {
+        out.push(BlockRef::from(wire));
+    }
+}
+
 pub(crate) fn wire_draw_depth(
     wire: &WireModel,
     depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
 ) -> f32 {
-    let base = fast_parse_u64(&wire.name)
-        .and_then(|h| depth_map.get(&h).copied());
+    let base = fast_parse_u64(&wire.name).and_then(|h| depth_map.get(&h).copied());
     match (base, wire.depth_override) {
         (Some([d, half]), Some(local)) => d + local * half,
         (Some([d, _]), None) => d,
@@ -756,10 +1133,13 @@ pub(crate) fn wire_draw_depth(
 /// Cached block geometry keyed by source, edge mode, colour and base translation.
 /// Vertices use the first instance's world coordinates, so changing that base
 /// must invalidate the geometry as well as rebuild the relative placements.
-pub type BlockGeometryCache = rustc_hash::FxHashMap<
-    BlockGeometryKey,
-    std::sync::Arc<Vec<BlockGeometryChunk>>,
->;
+///
+/// The cache holds the records rather than device buffers: the buffers are
+/// packed arenas shared by every definition of a build, so they cannot be kept
+/// per definition, and re-packing them is a handful of writes while re-emitting
+/// the records is the expensive half.
+pub type BlockGeometryCache =
+    rustc_hash::FxHashMap<BlockGeometryKey, std::sync::Arc<BlockGeometryRecords>>;
 
 /// How this device draws block wires. The layout and the mode are decided
 /// together when the pipeline is built and are never chosen independently, so
@@ -770,68 +1150,62 @@ pub struct BlockWireTarget<'a> {
     pub mode: WirePipelineMode,
 }
 
-/// Device bytes held by a whole block-geometry cache.
-pub fn block_geometry_bytes(cache: &BlockGeometryCache) -> u64 {
-    cache
-        .values()
-        .flat_map(|chunks| chunks.iter())
-        .map(|chunk| chunk.gpu_bytes)
+/// Device bytes the arenas behind these batches hold, counting each arena once
+/// however many batches draw out of it. `seen` carries the arenas already
+/// counted, so slots that share a cached build are not counted twice.
+pub fn block_arena_bytes(batches: &[BlockWireGpu], seen: &mut rustc_hash::FxHashSet<usize>) -> u64 {
+    batches
+        .iter()
+        .filter(|batch| seen.insert(std::sync::Arc::as_ptr(&batch.arena) as usize))
+        .map(|batch| batch.arena.bytes)
         .sum()
 }
 
 /// `(source_id, mesh_edge, colour bits, base translation bits)`.
 pub type BlockGeometryKey = (u64, bool, [u32; 4], [u64; 3]);
 
-/// One drawable slice of a block definition's geometry.
+/// One block definition's geometry on the host: the constants its every
+/// segment shares, and one record per segment.
 ///
-/// The two pipeline modes put the segments in different places, so the chunk
-/// carries whichever the mode produced:
-///
-/// * packed — `vertex_buffer` holds six copies of each segment, one per corner
-///   of its quad, and `bind_group` is the definition's constants alone;
-/// * storage — the segments are in a read-only storage buffer inside
-///   `bind_group`, one copy each, and `vertex_buffer` is `None`.
-///
-/// `vertex_count` is six per segment either way: in storage mode the shader
-/// divides `vertex_index` by six to find its segment.
-pub struct BlockGeometryChunk {
-    pub vertex_buffer: Option<wgpu::Buffer>,
-    pub vertex_count: u32,
-    pub bind_group: std::sync::Arc<wgpu::BindGroup>,
-    /// Device bytes this chunk holds. Recorded at build because in storage mode
-    /// the buffer is owned by `bind_group` and cannot be measured from here.
-    pub gpu_bytes: u64,
+/// Both pipeline modes pack from this. Packed mode writes six copies of each
+/// record, one per corner of its quad; storage mode writes one and lets the
+/// shader divide `vertex_index` by six. `vertex_count` is six per segment
+/// either way.
+pub struct BlockGeometryRecords {
+    pub constant: WireConst,
+    pub records: Vec<BlockWireVertex>,
 }
 
 impl BlockWireGpu {
     /// Identity of the geometry this batch draws, comparable across pipeline
     /// modes.
     ///
-    /// Packed mode keeps the segments in `vertex_buffer`; storage mode keeps
-    /// them inside `const_bind_group`, which is per-chunk there, and leaves
-    /// `vertex_buffer` `None`. Both are built on the same cache miss and
-    /// reused together on a hit, so the pair answers "is this the same
-    /// geometry as before?" in either mode — which `vertex_buffer` alone
-    /// cannot once it is always `None`.
-    pub fn geometry_id(&self) -> (Option<&wgpu::Buffer>, &wgpu::BindGroup) {
-        (self.vertex_buffer.as_ref(), self.const_bind_group.as_ref())
+    /// Identity of the geometry this batch draws, comparable across builds.
+    ///
+    /// The arena buffers are packed fresh every build, so they say nothing
+    /// about whether the geometry changed. The records behind them do: a cache
+    /// hit hands out the same `Arc`, and anything that invalidates the key —
+    /// a new base instance, a colour change — emits new records.
+    pub fn geometry_id(&self) -> *const BlockGeometryRecords {
+        std::sync::Arc::as_ptr(&self.geometry)
     }
 
     pub fn from_wires(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        wires: &[&WireModel],
+        wires: &[BlockRef<'_>],
         depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
         color_override: Option<[f32; 4]>,
         target: BlockWireTarget<'_>,
         mut cache: Option<&mut BlockGeometryCache>,
     ) -> Vec<Self> {
         let BlockWireTarget { const_bgl, mode } = target;
-        let mut slots: rustc_hash::FxHashMap<(u64, bool), usize> =
-            rustc_hash::FxHashMap::default();
-        let mut groups: Vec<(bool, Vec<&WireModel>)> = Vec::new();
-        for &wire in wires {
-            if color_override.is_none() && !wire.display_visible {
+        let mut slots: rustc_hash::FxHashMap<(u64, bool), usize> = rustc_hash::FxHashMap::default();
+        let mut groups: Vec<(bool, Vec<BlockRef<'_>>)> = Vec::new();
+        for &block in wires {
+            let wire = block.wire;
+            if color_override.is_none() && !(wire.display_visible && block.named().display_visible)
+            {
                 continue;
             }
             let Some(instance) = wire.render_instance else {
@@ -847,20 +1221,20 @@ impl BlockWireGpu {
                 groups.push((mesh_edge, Vec::new()));
                 slot
             });
-            groups[slot].1.push(wire);
+            groups[slot].1.push(block);
         }
 
-        let mut out = Vec::new();
+        let mut arena = BlockArenaBuilder::new(device, mode);
         let mut live_keys: rustc_hash::FxHashSet<BlockGeometryKey> =
             rustc_hash::FxHashSet::default();
-        // Geometry bytes actually sent to the device this call, so the storage
-        // path's saving is visible rather than assumed.
-        let mut uploaded_bytes = 0usize;
-        let mut uploaded_segments = 0usize;
-        // Definitions whose upload the device rejected, so they were not cached.
-        let mut poisoned = 0usize;
+        // Records emitted this call, so a cache that is earning its keep is
+        // visible rather than assumed.
+        let mut emitted_segments = 0usize;
         for (mesh_edge, group) in groups {
-            let Some(&source) = group.first() else {
+            // A copy reached through a stub carries the prototype's
+            // geometry at the prototype's placement, which is what `base`
+            // means; its own `delta` only moves the instance.
+            let Some(source) = group.first().map(|block| block.wire) else {
                 continue;
             };
             let Some(base) = source.render_instance else {
@@ -874,177 +1248,311 @@ impl BlockWireGpu {
                 base.translation.map(f64::to_bits),
             );
             live_keys.insert(cache_key);
-            // Reuse this definition's geometry when it is already on the GPU.
-            if let Some(chunks) = cache
+            // Reuse this definition's records when they are already emitted.
+            let geometry = match cache
                 .as_deref()
                 .and_then(|c| c.get(&cache_key))
                 .map(std::sync::Arc::clone)
             {
-                let instances = block_instances(&group, base, mesh_edge, depth_map);
-                push_block_batches(&mut out, device, queue, &chunks, &instances, mesh_edge);
-                continue;
-            }
-            // A failed allocation still produces a `Buffer`; it is simply
-            // invalid, and every later use of it reports again. Cached, it
-            // freezes the viewport for the rest of the session because the key
-            // keeps hitting and nothing ever rebuilds. Watch the device's error
-            // count across the build and refuse to cache what it condemns.
-            let errors_before = super::gpu_errors_seen();
-            let (segments, mut constant) = emit_wire_native(source, 0, color, 0.0);
-            if segments.is_empty() {
-                continue;
-            }
-            constant.draw_depth = 0.0;
-            let records: Vec<BlockWireVertex> = segments
-                .iter()
-                .map(|segment| BlockWireVertex {
-                    pos_a: segment.pos_a,
-                    pos_a_low: segment.pos_a_low,
-                    pos_b: segment.pos_b,
-                    pos_b_low: segment.pos_b_low,
-                    distances: [segment.distance_a, segment.distance_b],
-                    taper_ratio: segment.taper_ratio,
-                })
-                .collect();
-            // Queue uploads avoid mapping a failed allocation.
-            let const_buffer = super::gpu_upload::upload_buffer(
-                device,
-                queue,
-                "block_wire.const",
-                std::slice::from_ref(&constant),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            // Bound uploads so a block-heavy drawing cannot ask a low-VRAM
-            // device for one multi-hundred-MB buffer.
-            let chunks: Vec<BlockGeometryChunk> = if mode.uses_storage() {
-                // One record per segment. A storage chunk is bounded by the
-                // binding size as well as the buffer budget, and needs no
-                // grouping: the shader indexes segments directly.
-                let max_records =
-                    super::gpu_budget::max_storage_elements::<BlockWireVertex>(device);
-                records
-                    .chunks(max_records)
-                    .map(|chunk| {
-                        let segments = super::gpu_upload::upload_buffer(
-                            device,
-                            queue,
-                            "block_wire.segments",
-                            chunk,
-                            wgpu::BufferUsages::STORAGE,
-                        );
-                        BlockGeometryChunk {
-                            vertex_buffer: None,
-                            vertex_count: chunk.len() as u32 * 6,
-                            gpu_bytes: std::mem::size_of_val(chunk) as u64,
-                            bind_group: std::sync::Arc::new(device.create_bind_group(
-                                &wgpu::BindGroupDescriptor {
-                                    label: Some("block_wire.const.bg"),
-                                    layout: const_bgl,
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            resource: const_buffer.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: segments.as_entire_binding(),
-                                        },
-                                    ],
-                                },
-                            )),
-                        }
-                    })
-                    .collect()
-            } else {
-                // Six copies per segment, one per corner of its quad, without
-                // splitting a segment's six vertices across two buffers.
-                let mut vertices = Vec::with_capacity(records.len() * 6);
-                for record in &records {
-                    vertices.extend_from_slice(&[*record; 6]);
+                Some(hit) => hit,
+                None => {
+                    let (segments, mut constant) = emit_wire_native(source, 0, color, 0.0);
+                    if segments.is_empty() {
+                        continue;
+                    }
+                    constant.draw_depth = 0.0;
+                    let records: Vec<BlockWireVertex> = segments
+                        .iter()
+                        .map(|segment| BlockWireVertex {
+                            pos_a: segment.pos_a,
+                            pos_a_low: segment.pos_a_low,
+                            pos_b: segment.pos_b,
+                            pos_b_low: segment.pos_b_low,
+                            distances: [segment.distance_a, segment.distance_b],
+                            taper_ratio: segment.taper_ratio,
+                        })
+                        .collect();
+                    emitted_segments += records.len();
+                    let built = std::sync::Arc::new(BlockGeometryRecords { constant, records });
+                    // Records are device-independent, so a build the device
+                    // rejected poisons nothing: the next one packs these same
+                    // records into fresh buffers instead of caching a buffer
+                    // the device condemned under a key that keeps hitting it.
+                    if let Some(cache) = cache.as_deref_mut() {
+                        cache.insert(cache_key, std::sync::Arc::clone(&built));
+                    }
+                    built
                 }
-                let max_verts =
-                    super::gpu_budget::max_elements_grouped::<BlockWireVertex>(device, 6);
-                let shared = std::sync::Arc::new(device.create_bind_group(
-                    &wgpu::BindGroupDescriptor {
-                        label: Some("block_wire.const.bg"),
-                        layout: const_bgl,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: const_buffer.as_entire_binding(),
-                        }],
-                    },
-                ));
-                vertices
-                    .chunks(max_verts)
-                    .map(|chunk| BlockGeometryChunk {
-                        gpu_bytes: std::mem::size_of_val(chunk) as u64,
-                        vertex_buffer: Some(super::gpu_upload::upload_buffer(
-                            device,
-                            queue,
-                            "block_wire.vertices",
-                            chunk,
-                            wgpu::BufferUsages::VERTEX,
-                        )),
-                        vertex_count: chunk.len() as u32,
-                        bind_group: std::sync::Arc::clone(&shared),
-                    })
-                    .collect()
             };
-            uploaded_segments += records.len();
-            uploaded_bytes += records.len()
-                * std::mem::size_of::<BlockWireVertex>()
-                * if mode.uses_storage() { 1 } else { 6 };
-            let chunks = std::sync::Arc::new(chunks);
-            let built_clean = super::gpu_errors_seen() == errors_before;
-            if built_clean {
-                if let Some(cache) = cache.as_deref_mut() {
-                    cache.insert(cache_key, std::sync::Arc::clone(&chunks));
-                }
-            } else {
-                // Draw this frame with what we have — a degraded frame beats a
-                // blank one — but leave the cache clean so the next frame tries
-                // again. `live_keys` still holds the key, so the retain below
-                // does not evict a good entry from an earlier frame.
-                poisoned += 1;
-            }
             let instances = block_instances(&group, base, mesh_edge, depth_map);
-            push_block_batches(&mut out, device, queue, &chunks, &instances, mesh_edge);
+            if instances.is_empty() {
+                continue;
+            }
+            arena.push(&geometry, &instances, mesh_edge);
         }
         // Release geometry that this build no longer uses.
         if let Some(cache) = cache {
             cache.retain(|key, _| live_keys.contains(key));
         }
-        if crate::perf::enabled() && uploaded_segments > 0 {
+        let out = arena.finish(device, queue, const_bgl);
+        if crate::perf::enabled() && arena.segments > 0 {
             crate::perf_record!(
-                "[perf] block-wire-geometry mode={} definitions={} segments={} bytes={} \
-bytes_if_packed={} poisoned={}",
-                if mode.uses_storage() { "storage" } else { "packed" },
+                "[perf] block-wire-geometry mode={} definitions={} arenas={} batches={} \
+segments={} bytes={} bytes_if_per_definition={} emitted={}",
+                if mode.uses_storage() {
+                    "storage"
+                } else {
+                    "packed"
+                },
                 live_keys.len(),
-                uploaded_segments,
-                uploaded_bytes,
-                uploaded_segments * std::mem::size_of::<BlockWireVertex>() * 6,
-                poisoned,
+                arena.arenas,
+                out.len(),
+                arena.segments,
+                arena.bytes,
+                BlockArenaBuilder::per_definition_bytes(out.len()),
+                emitted_segments,
             );
         }
         out
     }
 }
 
+/// Packs the definitions of one build into shared buffers, starting another
+/// arena whenever constants, geometry or placements would outgrow the
+/// per-buffer budget.
+struct BlockArenaBuilder {
+    mode: WirePipelineMode,
+    /// Vertices written per segment: one in storage mode, six in packed mode.
+    per_segment: usize,
+    max_verts: usize,
+    max_consts: usize,
+    max_instances: usize,
+    const_stride: usize,
+    chunks: Vec<BlockArenaChunk>,
+    /// Totals for the perf line.
+    arenas: usize,
+    segments: usize,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct BlockArenaChunk {
+    verts: Vec<BlockWireVertex>,
+    consts: Vec<WireConst>,
+    instances: Vec<BlockWireInstance>,
+    batches: Vec<PendingBlockBatch>,
+}
+
+/// One definition's slice of an arena, waiting for the arena's buffers.
+struct PendingBlockBatch {
+    first_vertex: u32,
+    vertex_count: u32,
+    first_instance: u32,
+    instance_count: u32,
+    const_offset: u32,
+    is_3d_mesh_edge: bool,
+    geometry: std::sync::Arc<BlockGeometryRecords>,
+}
+
+impl BlockArenaBuilder {
+    fn new(device: &wgpu::Device, mode: WirePipelineMode) -> Self {
+        let storage = mode.uses_storage();
+        // A uniform binding addressed by dynamic offset must start on the
+        // device's alignment, so the constants are written on that stride.
+        let align = (device.limits().min_uniform_buffer_offset_alignment as usize).max(1);
+        let const_stride = std::mem::size_of::<WireConst>().max(1).div_ceil(align) * align;
+        Self {
+            mode,
+            per_segment: if storage { 1 } else { 6 },
+            max_verts: if storage {
+                super::gpu_budget::max_storage_elements::<BlockWireVertex>(device)
+            } else {
+                super::gpu_budget::max_elements_grouped::<BlockWireVertex>(device, 6)
+            },
+            max_consts: (super::gpu_budget::buffer_budget(device) / const_stride).max(1),
+            max_instances: super::gpu_budget::max_elements::<BlockWireInstance>(device),
+            const_stride,
+            chunks: Vec::new(),
+            arenas: 0,
+            segments: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Append one definition and its placements.
+    fn push(
+        &mut self,
+        geometry: &std::sync::Arc<BlockGeometryRecords>,
+        instances: &[BlockWireInstance],
+        mesh_edge: bool,
+    ) {
+        self.segments += geometry.records.len();
+        // A definition's geometry, constants and placements must land in the
+        // same arena — one bind group and one instance buffer draw them — so a
+        // definition too large for one arena is split into pieces that each
+        // carry their own copy of the constants.
+        for run in instances.chunks(self.max_instances) {
+            let mut placed = 0usize;
+            while placed < geometry.records.len() {
+                let index = self.chunk_with_room(run.len());
+                let chunk = &mut self.chunks[index];
+                let room = (self.max_verts - chunk.verts.len()) / self.per_segment;
+                let take = room.min(geometry.records.len() - placed);
+                // Segments already in this arena, times the six vertices the
+                // shader spends on each: storage mode divides `vertex_index` by
+                // six to index the record, packed mode finds the six copies.
+                let first_vertex = (chunk.verts.len() / self.per_segment) as u32 * 6;
+                let records = &geometry.records[placed..placed + take];
+                if self.per_segment == 1 {
+                    chunk.verts.extend_from_slice(records);
+                } else {
+                    for record in records {
+                        chunk.verts.extend_from_slice(&[*record; 6]);
+                    }
+                }
+                let const_offset = (chunk.consts.len() * self.const_stride) as u32;
+                chunk.consts.push(geometry.constant);
+                let first_instance = chunk.instances.len() as u32;
+                chunk.instances.extend_from_slice(run);
+                chunk.batches.push(PendingBlockBatch {
+                    first_vertex,
+                    vertex_count: take as u32 * 6,
+                    first_instance,
+                    instance_count: run.len() as u32,
+                    const_offset,
+                    is_3d_mesh_edge: mesh_edge,
+                    geometry: std::sync::Arc::clone(geometry),
+                });
+                placed += take;
+            }
+        }
+    }
+
+    /// The open arena when it has room for one more segment, one more set of
+    /// constants and `instances` placements; a fresh one otherwise. `instances`
+    /// never exceeds one arena's budget, so a fresh arena always has room.
+    fn chunk_with_room(&mut self, instances: usize) -> usize {
+        let fits = self.chunks.last().is_some_and(|chunk| {
+            self.max_verts - chunk.verts.len() >= self.per_segment
+                && chunk.consts.len() < self.max_consts
+                && self.max_instances - chunk.instances.len() >= instances
+        });
+        if !fits {
+            self.chunks.push(BlockArenaChunk::default());
+        }
+        self.chunks.len() - 1
+    }
+
+    /// Upload each arena and turn its pending slices into draw batches.
+    fn finish(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        const_bgl: &wgpu::BindGroupLayout,
+    ) -> Vec<BlockWireGpu> {
+        let storage = self.mode.uses_storage();
+        let mut out = Vec::new();
+        for chunk in std::mem::take(&mut self.chunks) {
+            let mut const_bytes = vec![0u8; chunk.consts.len() * self.const_stride];
+            for (slot, cst) in chunk.consts.iter().enumerate() {
+                let at = slot * self.const_stride;
+                const_bytes[at..at + std::mem::size_of::<WireConst>()]
+                    .copy_from_slice(bytemuck::bytes_of(cst));
+            }
+            let consts = super::gpu_upload::upload_bytes(
+                device,
+                queue,
+                "block_wire.consts",
+                &const_bytes,
+                std::mem::size_of::<WireConst>(),
+                wgpu::BufferUsages::UNIFORM,
+            );
+            let geometry = super::gpu_upload::upload_buffer(
+                device,
+                queue,
+                if storage {
+                    "block_wire.segments"
+                } else {
+                    "block_wire.vertices"
+                },
+                &chunk.verts,
+                if storage {
+                    wgpu::BufferUsages::STORAGE
+                } else {
+                    wgpu::BufferUsages::VERTEX
+                },
+            );
+            let instance_buffer =
+                instance_buffer(device, queue, "block_wire.instances", &chunk.instances);
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &consts,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<WireConst>() as u64),
+                }),
+            }];
+            if storage {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: geometry.as_entire_binding(),
+                });
+            }
+            let bind_group =
+                std::sync::Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("block_wire.const.bg"),
+                    layout: const_bgl,
+                    entries: &entries,
+                }));
+            let bytes = consts.size() + geometry.size() + instance_buffer.size();
+            self.arenas += 1;
+            self.bytes += bytes;
+            // In storage mode the bind group owns the segments; in packed mode
+            // the draw binds them as vertex buffer 0.
+            let arena = std::sync::Arc::new(BlockArena {
+                vertex_buffer: (!storage).then(|| geometry.clone()),
+                instance_buffer,
+                bind_group,
+                bytes,
+            });
+            out.extend(chunk.batches.into_iter().map(|pending| BlockWireGpu {
+                arena: std::sync::Arc::clone(&arena),
+                first_vertex: pending.first_vertex,
+                vertex_count: pending.vertex_count,
+                first_instance: pending.first_instance,
+                instance_count: pending.instance_count,
+                const_offset: pending.const_offset,
+                is_3d_mesh_edge: pending.is_3d_mesh_edge,
+                geometry: pending.geometry,
+            }));
+        }
+        out
+    }
+
+    /// What a buffer per definition would have cost: payloads of a few hundred
+    /// bytes, but a device page each, which is the footprint that ran a 6 GB
+    /// card out of memory on a drawing holding 12 MB of block geometry.
+    fn per_definition_bytes(definitions: usize) -> u64 {
+        const PAGE: u64 = 64 * 1024;
+        definitions as u64 * 2 * PAGE
+    }
+}
+
 /// Placements and draw depths relative to the group's first instance.
 fn block_instances(
-    group: &[&WireModel],
+    group: &[BlockRef<'_>],
     base: crate::scene::model::instance_model::RenderInstance,
     mesh_edge: bool,
     depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
 ) -> Vec<BlockWireInstance> {
     group
         .iter()
-        .filter_map(|wire| {
-            let instance = wire.render_instance?;
+        .filter_map(|block| {
+            let instance = block.wire.render_instance?;
             let delta = [
-                instance.translation[0] - base.translation[0],
-                instance.translation[1] - base.translation[1],
-                instance.translation[2] - base.translation[2],
+                instance.translation[0] + block.delta[0] - base.translation[0],
+                instance.translation[1] + block.delta[1] - base.translation[1],
+                instance.translation[2] + block.delta[2] - base.translation[2],
             ];
             let high = delta.map(|value| value as f32);
             Some(BlockWireInstance {
@@ -1058,47 +1566,13 @@ fn block_instances(
                     if mesh_edge {
                         0.0
                     } else {
-                        wire_draw_depth(wire, depth_map)
+                        block.draw_depth(depth_map)
                     },
                     0.0,
                 ],
             })
         })
         .collect()
-}
-
-/// One batch per (geometry chunk × instance chunk). Instance buffers are built
-/// once and shared across geometry chunks rather than re-uploaded per chunk.
-fn push_block_batches(
-    out: &mut Vec<BlockWireGpu>,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    chunks: &[BlockGeometryChunk],
-    instances: &[BlockWireInstance],
-    mesh_edge: bool,
-) {
-    let max_instances = super::gpu_budget::max_elements::<BlockWireInstance>(device);
-    let instance_chunks: Vec<(wgpu::Buffer, u32)> = instances
-        .chunks(max_instances)
-        .map(|chunk| {
-            (
-                instance_buffer(device, queue, "block_wire.instances", chunk),
-                chunk.len() as u32,
-            )
-        })
-        .collect();
-    for chunk in chunks {
-        for (instance_buffer, instance_count) in &instance_chunks {
-            out.push(BlockWireGpu {
-                vertex_buffer: chunk.vertex_buffer.clone(),
-                instance_buffer: instance_buffer.clone(),
-                vertex_count: chunk.vertex_count,
-                instance_count: *instance_count,
-                is_3d_mesh_edge: mesh_edge,
-                const_bind_group: std::sync::Arc::clone(&chunk.bind_group),
-            });
-        }
-    }
 }
 
 /// Upload one constant chunk; its instances use chunk-local wire IDs.
@@ -1192,8 +1666,7 @@ impl WireGpu {
                     emit_wire_native(wire, idx as u32, color, wire_draw_depth(wire, depth_map))
                 })
                 .collect();
-            let mut instances =
-                Vec::with_capacity(per.iter().map(|(items, _)| items.len()).sum());
+            let mut instances = Vec::with_capacity(per.iter().map(|(items, _)| items.len()).sum());
             let mut consts = Vec::with_capacity(per.len());
             for (mut items, constant) in per {
                 instances.append(&mut items);
@@ -1218,9 +1691,7 @@ impl WireGpu {
         use crate::par::prelude::*;
         let per: Vec<Vec<PackedWireInstance>> = wires
             .par_iter()
-            .map(|wire| {
-                emit_wire_packed(wire, color, wire_draw_depth(wire, depth_map))
-            })
+            .map(|wire| emit_wire_packed(wire, color, wire_draw_depth(wire, depth_map)))
             .collect();
         let mut instances = Vec::with_capacity(per.iter().map(Vec::len).sum());
         for mut items in per {
@@ -1266,8 +1737,7 @@ impl WireGpu {
                     emit_wire_packed(wire, wire.color, depth)
                 })
                 .collect();
-            let mut instances =
-                Vec::with_capacity(per.iter().map(Vec::len).sum());
+            let mut instances = Vec::with_capacity(per.iter().map(Vec::len).sum());
             for mut items in per {
                 instances.append(&mut items);
             }
@@ -1347,7 +1817,11 @@ impl WireGpu {
                     // depth — they must NOT take the draw-order z-bias (which
                     // pulls 2D wires toward the camera), or the hidden edges of a
                     // small / distant mesh peek through its own shaded fill.
-                    let dd = if mesh_edge { 0.0 } else { wire_draw_depth(w, depth_map) };
+                    let dd = if mesh_edge {
+                        0.0
+                    } else {
+                        wire_draw_depth(w, depth_map)
+                    };
                     emit_wire_native(w, idx as u32, w.color, dd)
                 })
                 .collect();
@@ -1377,7 +1851,11 @@ impl WireGpu {
         let per: Vec<Vec<PackedWireInstance>> = wires
             .iter()
             .map(|w| {
-                let dd = if mesh_edge { 0.0 } else { wire_draw_depth(w, depth_map) };
+                let dd = if mesh_edge {
+                    0.0
+                } else {
+                    wire_draw_depth(w, depth_map)
+                };
                 emit_wire_packed(w, w.color, dd)
             })
             .collect();
@@ -1539,9 +2017,8 @@ mod block_wire_storage_tests {
             draw_order_shader!("block_wire_storage.wgsl"),
         ] {
             assert!(source.contains("if world_hw < 0.0"));
-            assert!(source.contains(
-                "resolve_hw(0.0, wire_const.world_half_width, wire_const.half_width)"
-            ));
+            assert!(source
+                .contains("resolve_hw(0.0, wire_const.world_half_width, wire_const.half_width)"));
         }
     }
 
@@ -1561,7 +2038,8 @@ mod block_wire_storage_tests {
     #[test]
     fn wire_indexed_shader_validates_with_naga() {
         let source = draw_order_shader!("wire_indexed.wgsl");
-        let module = naga::front::wgsl::parse_str(source).expect("wire_indexed.wgsl parses cleanly");
+        let module =
+            naga::front::wgsl::parse_str(source).expect("wire_indexed.wgsl parses cleanly");
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),

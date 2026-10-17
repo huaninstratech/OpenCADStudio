@@ -12,6 +12,7 @@
   <a href="docs/readme/README.it.md">Italiano</a> ·
   <a href="docs/readme/README.ja.md">日本語</a> ·
   <a href="docs/readme/README.ko.md">한국어</a> ·
+  <a href="docs/readme/README.lo.md">ລາວ</a> ·
   <a href="docs/readme/README.pl.md">Polski</a> ·
   <a href="docs/readme/README.ru.md">Русский</a> ·
   <a href="docs/readme/README.zh-CN.md">简体中文</a> ·
@@ -124,6 +125,12 @@ The Flatpak opens and saves drawings through the file chooser. External referenc
 flatpak override --user --filesystem=home io.github.HakanSeven12.OpenCadStudio
 ```
 
+Each release also carries a snap. It is not in the Snap Store yet, so snapd installs it only with `--dangerous`, and it does not update itself:
+
+```bash
+sudo snap install --dangerous OpenCADStudio-*-linux-x86_64.snap
+```
+
 ### macOS
 
 The published macOS package supports Apple Silicon:
@@ -136,9 +143,9 @@ The application is ad-hoc signed but is not currently notarized by Apple.
 
 ## Languages
 
-Open CAD Studio can follow the system language or use any of these 21 interface languages:
+Open CAD Studio can follow the system language or use any of these 22 interface languages:
 
-> Arabic · Brazilian Portuguese · Bulgarian · Czech · Dutch · English · Finnish · French · German · Greek · Hindi · Hungarian · Italian · Japanese · Korean · Polish · Russian · Simplified Chinese · Spanish · Traditional Chinese · Turkish
+> Arabic · Brazilian Portuguese · Bulgarian · Czech · Dutch · English · Finnish · French · German · Greek · Hindi · Hungarian · Italian · Japanese · Korean · Lao · Polish · Russian · Simplified Chinese · Spanish · Traditional Chinese · Turkish
 
 Change the language from the application settings. The browser version also uses the browser's preferred locale when **System** is selected.
 

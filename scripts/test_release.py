@@ -49,7 +49,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             binary = str(Path(temp) / "build-script")
             subprocess.run(["rustc", str(Path(__file__).resolve().parents[1] / "build.rs"), "-o", binary], check=True)
-            for cargo in ("0.9.8", "2026.9.0", "2026.35.0", "2026.53.0", "2027.1.0"):
+            for cargo in ("0.9.8", "2026.9.0", "2026.35.0", "2026.53.0", "2027.1.0", "2026.40.1", "2026.5.2"):
                 result = subprocess.check_output([binary], text=True, env={**os.environ, "CARGO_PKG_VERSION": cargo})
                 self.assertIn(f"cargo:rustc-env=OCS_APP_VERSION={release.display_version(cargo)}\n", result)
 

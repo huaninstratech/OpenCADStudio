@@ -81,18 +81,25 @@ fn equirect_uv(ndc: vec2<f32>, rotation: f32) -> vec2<f32> {
 fn image_uv(source_uv: vec2<f32>) -> vec2<f32> {
     var uv = source_uv;
     if u.background_image_params.x < 0.5 {
-        uv = (source_uv - u.background_image_transform.xy)
-            / max(abs(u.background_image_transform.zw), vec2<f32>(1e-6));
+        // Not fitted: the image at its own pixel size times its scale (a
+        // negative scale mirrors it), centred on the viewport and moved by
+        // its offset in pixels, right and down.
+        let pixel = (source_uv - vec2<f32>(0.5)) * max(u.viewport_size, vec2<f32>(1.0))
+            - u.background_image_transform.xy;
+        let size = u.background_image_transform.zw;
+        let safe = select(size, vec2<f32>(1e-6), abs(size) < vec2<f32>(1e-6));
+        uv = pixel / safe + vec2<f32>(0.5);
+        return select(uv, fract(uv), u.background_image_params.z > 0.5);
     }
+    // Fitted: the image fills the viewport; keeping its aspect ratio it
+    // covers the viewport and the overflow is cut off evenly.
     if u.background_image_params.y > 0.5 {
         let image_aspect = max(u.background_image_params.w, 1e-6);
         let viewport_aspect = max(u.viewport_size.x / max(u.viewport_size.y, 1.0), 1e-6);
         if image_aspect > viewport_aspect {
-            let scale = viewport_aspect / image_aspect;
-            uv.y = (uv.y - 0.5) / scale + 0.5;
+            uv.x = (uv.x - 0.5) * (viewport_aspect / image_aspect) + 0.5;
         } else {
-            let scale = image_aspect / viewport_aspect;
-            uv.x = (uv.x - 0.5) / scale + 0.5;
+            uv.y = (uv.y - 0.5) * (image_aspect / viewport_aspect) + 0.5;
         }
     }
     if u.background_image_params.z > 0.5 {
@@ -108,15 +115,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if mode == 1u {
         color = u.viewport_background.rgb;
     } else if mode == 2u {
+        // Bottom to top along the "up" direction turned counter-clockwise by
+        // the rotation, in pixels from the viewport centre. As the reference
+        // draws it: the middle colour sits (horizon - 0.5) viewport widths
+        // from the centre and blends linearly into the top and bottom colours
+        // over height viewport heights on each side; two colours are one blend
+        // over a viewport height on each side of the centre.
         let angle = u.background_params.w;
-        let axis = vec2<f32>(-sin(angle), cos(angle));
-        let coordinate = dot(in.uv - vec2<f32>(0.5), axis) + 0.5;
-        let horizon = clamp(u.background_params.y, 0.0, 1.0);
-        let half_height = max(abs(u.background_params.z) * 0.5, 1e-3);
-        let lower = smoothstep(horizon - half_height, horizon, coordinate);
-        let upper = smoothstep(horizon, horizon + half_height, coordinate);
-        let low_color = mix(u.background_bottom.rgb, u.background_middle.rgb, lower);
-        color = mix(low_color, u.background_top.rgb, upper);
+        let up = vec2<f32>(-sin(angle), cos(angle));
+        let size = max(u.viewport_size, vec2<f32>(1.0));
+        let pixel = (vec2<f32>(in.uv.x, 1.0 - in.uv.y) - vec2<f32>(0.5)) * size;
+        let along = dot(pixel, up);
+        let three = abs(u.background_params.z) > 1e-6;
+        let middle_at = select(0.0, (u.background_params.y - 0.5) * size.x, three);
+        let half_band = select(1.0, abs(u.background_params.z), three) * size.y;
+        let middle = select(mix(u.background_bottom.rgb, u.background_top.rgb, 0.5),
+            u.background_middle.rgb, three);
+        let lower = clamp((along - middle_at + half_band) / half_band, 0.0, 1.0);
+        let upper = clamp((along - middle_at) / half_band, 0.0, 1.0);
+        color = mix(mix(u.background_bottom.rgb, middle, lower), u.background_top.rgb, upper);
     } else if mode == 3u {
         let direction = world_direction(in.ndc);
         if direction.z >= 0.0 {

@@ -446,6 +446,122 @@ fn triangulate_contours(contours: &[Vec<[f32; 2]>]) -> Vec<[f32; 2]> {
     tris
 }
 
+// ── Glyph source (for exporters that embed the font) ─────────────────────────
+
+/// One font file's bytes, shared by every glyph taken from it.
+#[derive(Debug)]
+pub struct FontBlob {
+    /// The whole font file (a collection keeps all its faces).
+    pub data: Vec<u8>,
+    /// Face index within `data` (0 for a plain .ttf/.otf).
+    pub index: u32,
+    /// Stable identity: byte length, face index, `head.checkSumAdjustment`.
+    pub id: (usize, u32, u32),
+}
+
+/// The TrueType face and glyph a filled glyph was outlined from.
+///
+/// The PDF exporter embeds `font` and draws the glyph as text instead of
+/// filling the tessellated outline: a glyph of a stroke-heavy CJK face
+/// (DFKai-SB) tessellates into hundreds of triangles, so a text-heavy sheet
+/// exported as hundreds of megabytes that viewers crawl through.
+#[derive(Clone, Debug)]
+pub struct GlyphSource {
+    pub font: Arc<FontBlob>,
+    pub gid: u16,
+    /// Font-unit -> 9-unit factor the outline was normalised with
+    /// ([`cap_scale`] or [`em_scale`]) -- the exporter needs it to place the
+    /// embedded glyph exactly over the outline's tile.
+    pub k: f32,
+    pub units_per_em: u16,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn face_key(data: &[u8], index: u32) -> Option<FaceKey> {
+    use skrifa::raw::TableProvider;
+    let font = skrifa::FontRef::from_index(data, index).ok()?;
+    let head = font.head().ok()?;
+    Some(FaceKey {
+        len: data.len(),
+        index,
+        checksum_adjustment: head.checksum_adjustment(),
+    })
+}
+
+/// Copy each font file once per process, however many glyphs come from it.
+#[cfg(not(target_arch = "wasm32"))]
+fn blob_for(data: &[u8], index: u32) -> Option<Arc<FontBlob>> {
+    static BLOBS: OnceLock<Mutex<HashMap<FaceKey, Arc<FontBlob>>>> = OnceLock::new();
+    let key = face_key(data, index)?;
+    let mut blobs = BLOBS
+        .get_or_init(|| Mutex::new(HashMap::default()))
+        .lock()
+        .unwrap();
+    Some(
+        blobs
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(FontBlob {
+                    data: data.to_vec(),
+                    index,
+                    id: (key.len, key.index, key.checksum_adjustment),
+                })
+            })
+            .clone(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn source_for(
+    data: &[u8],
+    index: u32,
+    face: &ttf_parser::Face,
+    gid: ttf_parser::GlyphId,
+    k: f32,
+) -> Option<GlyphSource> {
+    Some(GlyphSource {
+        font: blob_for(data, index)?,
+        gid: gid.0,
+        k,
+        units_per_em: face.units_per_em(),
+    })
+}
+
+/// Source of [`glyph`]`(family, ch)`: same face, same glyph, same scale.
+/// Cached per `(family, char)`, like the glyph itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn glyph_source(family: &str, ch: char) -> Option<GlyphSource> {
+    type SourceCache = HashMap<(String, char), Option<GlyphSource>>;
+    static CACHE: OnceLock<Mutex<SourceCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::default()));
+    let key = (family.to_string(), ch);
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let built = sysfont::with_face_data(family, |data, index| {
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        let gid = face.glyph_index(ch)?;
+        source_for(data, index, &face, gid, cap_scale(&face))
+    })
+    .flatten();
+    cache.lock().unwrap().insert(key, built.clone());
+    built
+}
+
+/// Source of [`fallback_glyph`]`(ch)`: the face the fallback search settles on.
+/// Cached per character, like the glyph itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fallback_source(ch: char) -> Option<GlyphSource> {
+    static CACHE: OnceLock<Mutex<HashMap<char, Option<GlyphSource>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::default()));
+    if let Some(hit) = cache.lock().unwrap().get(&ch) {
+        return hit.clone();
+    }
+    let built = pick_fallback(ch, true).and_then(|(_, source)| source);
+    cache.lock().unwrap().insert(ch, built.clone());
+    built
+}
+
 // ── Shaping ────────────────────────────────────────────────────────────────
 
 /// One shaped glyph, positioned within its run. Strokes are in 9-unit space and
@@ -461,7 +577,45 @@ pub struct ShapedRun {
     pub glyphs: Vec<PlacedGlyph>,
     /// Total pen advance of the run (9-unit).
     pub advance: f32,
+    /// Every laid-out glyph (blank ones too) as the byte range of the text it
+    /// shows and its visual [left, right] pen cell, 9-unit.
+    pub cells: Vec<(usize, usize, f32, f32)>,
 }
+
+/// Each character's visual [left, right] cell (9-unit) in logical order:
+/// the cell of the glyph that shows it; a glyph showing several characters
+/// shares its cell among them in reading order.
+pub fn char_cells(run: &ShapedRun, text: &str) -> Vec<(f32, f32)> {
+    text.char_indices()
+        .map(|(byte, _)| {
+            let Some(&(start, end, x0, x1)) = run
+                .cells
+                .iter()
+                .find(|(start, end, _, _)| (*start..(*end).max(start + 1)).contains(&byte))
+            else {
+                return (0.0, 0.0);
+            };
+            let chars: Vec<usize> = text[start..end.min(text.len())]
+                .char_indices()
+                .map(|(i, _)| start + i)
+                .collect();
+            let (n, k) = (
+                chars.len().max(1),
+                chars.iter().position(|&b| b == byte).unwrap_or(0),
+            );
+            let rtl = text[start..end.min(text.len())]
+                .chars()
+                .any(crate::entities::text_support::is_rtl_char);
+            let slot = (x1 - x0) / n as f32;
+            let k = if rtl { n - 1 - k } else { k };
+            (x0 + slot * k as f32, x0 + slot * (k + 1) as f32)
+        })
+        .collect()
+}
+
+/// Left-to-right mark, shaped ahead of every run so its base direction is
+/// left to right; layout also uses it to close a right-to-left run.
+pub(crate) const LRM: char = '\u{200E}';
 
 type ShapeCache = HashMap<(String, String), Option<Arc<ShapedRun>>>;
 
@@ -538,6 +692,12 @@ pub fn fallback_glyph(ch: char) -> Option<Arc<Glyph>> {
 pub fn clear_fallback_cache() {
     fallback_cache().lock().unwrap().clear();
     shape_cache().lock().unwrap().clear();
+    // Web only: the per-family outline cache can also hold stale `None`s —
+    // the family only became resolvable when the font joined the sysfont
+    // database (`register_web_font`). On desktop the font set never changes,
+    // so the cache is kept.
+    #[cfg(target_arch = "wasm32")]
+    cache().lock().unwrap().clear();
     #[cfg(target_arch = "wasm32")]
     crate::scene::text::sdf_atlas::reset_font_entries();
 }
@@ -572,7 +732,18 @@ mod fallback_tests {
 /// no stroke font provides.
 #[cfg(not(target_arch = "wasm32"))]
 fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
-    outline_from_fallback_face(ch).or_else(|| installed_family_glyph(ch))
+    pick_fallback(ch, false).map(|(glyph, _)| glyph)
+}
+
+/// The fallback glyph for `ch` together with the face it came from -- the
+/// same search for both, so the glyph drawn on screen and the font an
+/// exporter embeds can never disagree.
+///
+/// The source holds a copy of the whole font file, so it is built only when
+/// asked for (`with_source`, an exporter): drawing on screen never keeps one.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_fallback(ch: char, with_source: bool) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
+    outline_from_fallback_face(ch, with_source).or_else(|| installed_family_glyph(ch, with_source))
 }
 
 /// Outline `ch` from a parsed face, in the 9-unit text space.
@@ -582,7 +753,13 @@ fn build_fallback(ch: char) -> Option<Arc<Glyph>> {
 /// text height — so size the substitute by its em box. Everything else keeps the
 /// cap-height normalisation that lines it up with the Latin stroke glyphs.
 #[cfg(not(target_arch = "wasm32"))]
-fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> Option<Glyph> {
+fn outline_char(
+    data: &[u8],
+    index: u32,
+    face: &ttf_parser::Face,
+    ch: char,
+    with_source: bool,
+) -> Option<(Glyph, Option<GlyphSource>)> {
     let gid = face.glyph_index(ch)?;
     let k = if is_full_width(ch) {
         em_scale(face)
@@ -594,11 +771,15 @@ fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> O
     outline_glyph_into(data, index, face, gid, &mut fl);
     fl.flush();
     let fill_tris = triangulate_contours(&fl.contours);
-    Some(Glyph {
+    let glyph = Glyph {
         strokes: fl.contours,
         advance,
         fill_tris,
-    })
+    };
+    let source = with_source
+        .then(|| source_for(data, index, face, gid, k))
+        .flatten();
+    Some((glyph, source))
 }
 
 /// Outline `ch` from the face cosmic-text picks for it: it knows the platform's
@@ -608,7 +789,10 @@ fn outline_char(data: &[u8], index: u32, face: &ttf_parser::Face, ch: char) -> O
 /// does, for every character, because ttf-parser reads no contours out of it —
 /// so an empty outline is not an answer and the caller has to keep looking.
 #[cfg(not(target_arch = "wasm32"))]
-fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
+fn outline_from_fallback_face(
+    ch: char,
+    with_source: bool,
+) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
     use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
     let mut fs = font_system().lock().unwrap();
     // Default family → cosmic's own fallback search chooses a covering font.
@@ -627,13 +811,15 @@ fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
             let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
             let font = fs.get_font(g.font_id, g.font_weight)?;
             let face = ttf_parser::Face::parse(font.data(), face_index).ok()?;
-            let Some(glyph) = outline_char(font.data(), face_index, &face, ch) else {
+            let Some((glyph, source)) =
+                outline_char(font.data(), face_index, &face, ch, with_source)
+            else {
                 continue;
             };
             if glyph.strokes.is_empty() && glyph.fill_tris.is_empty() {
                 continue;
             }
-            return Some(Arc::new(glyph));
+            return Some((Arc::new(glyph), source));
         }
     }
     None
@@ -645,19 +831,22 @@ fn outline_from_fallback_face(ch: char) -> Option<Arc<Glyph>> {
 /// and covers neither Cyrillic nor Greek, however many fonts the machine has
 /// that do.
 #[cfg(not(target_arch = "wasm32"))]
-fn installed_family_glyph(ch: char) -> Option<Arc<Glyph>> {
+fn installed_family_glyph(
+    ch: char,
+    with_source: bool,
+) -> Option<(Arc<Glyph>, Option<GlyphSource>)> {
     crate::scene::text::sysfont::families()
         .iter()
         .find_map(|family| {
-            let glyph = sysfont::with_face_data(family, |data, index| {
+            let (glyph, source) = sysfont::with_face_data(family, |data, index| {
                 let face = ttf_parser::Face::parse(data, index).ok()?;
-                outline_char(data, index, &face, ch)
+                outline_char(data, index, &face, ch, with_source)
             })
             .flatten()?;
             // A face that yields no outline (the system font, a space) is not a
             // font that draws this character.
             (!glyph.strokes.is_empty() || !glyph.fill_tris.is_empty())
-                .then(|| Arc::new(glyph))
+                .then(|| (Arc::new(glyph), source))
         })
 }
 
@@ -727,21 +916,35 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
         database.load_font_data((*bytes).clone());
     }
     database.set_sans_serif_family(crate::scene::text::web_font::primary_script().family());
-    let mut font_system = FontSystem::new_with_locale_and_db(
-        crate::i18n::active_language_tag(),
-        database,
-    );
+    let mut font_system =
+        FontSystem::new_with_locale_and_db(crate::i18n::active_language_tag(), database);
     let attrs = Attrs::new().family(Family::SansSerif);
     let mut buffer = Buffer::new(&mut font_system, Metrics::new(SHAPE_FS, SHAPE_FS));
     buffer.set_size(&mut font_system, None, None);
-    buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced, None);
+    // A leading left-to-right mark keeps the paragraph direction left to
+    // right, as the reference lays text out (right-to-left runs still read
+    // backwards); `cells` stay relative to `text`.
+    let marked = format!("{LRM}{text}");
+    buffer.set_text(&mut font_system, &marked, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(&mut font_system, false);
 
     let mut glyphs = Vec::new();
+    let mut cells = Vec::new();
     let mut advance = 0.0_f32;
     for run in buffer.layout_runs() {
         advance = advance.max(run.line_w * px_to_9);
         for glyph in run.glyphs.iter() {
+            // A cluster the shaper merged into the mark keeps its own part.
+            let m = LRM.len_utf8();
+            if glyph.end > m {
+                let start = glyph.start.saturating_sub(m);
+                cells.push((
+                    start,
+                    glyph.end - m,
+                    glyph.x * px_to_9,
+                    (glyph.x + glyph.w) * px_to_9,
+                ));
+            }
             let face_index = font_system
                 .db_mut()
                 .face(glyph.font_id)
@@ -780,7 +983,11 @@ fn build_shaped(_family: &str, text: &str) -> Option<ShapedRun> {
     if advance <= 0.0 && glyphs.is_empty() {
         None
     } else {
-        Some(ShapedRun { glyphs, advance })
+        Some(ShapedRun {
+            glyphs,
+            advance,
+            cells,
+        })
     }
 }
 
@@ -809,7 +1016,11 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     let mut buf = Buffer::new(&mut fs, Metrics::new(SHAPE_FS, SHAPE_FS));
     // No wrapping: a run is a single line.
     buf.set_size(&mut fs, None, None);
-    buf.set_text(&mut fs, text, &attrs, Shaping::Advanced, None);
+    // A leading left-to-right mark keeps the paragraph direction left to
+    // right, as the reference lays text out (right-to-left runs still read
+    // backwards); `cells` stay relative to `text`.
+    let marked = format!("{LRM}{text}");
+    buf.set_text(&mut fs, &marked, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(&mut fs, false);
 
     if primary_metrics.is_none() {
@@ -843,10 +1054,21 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     let px_to_9 = CAP_UNITS * upem_p / (SHAPE_FS * cap_p);
 
     let mut glyphs: Vec<PlacedGlyph> = Vec::new();
+    let mut cells = Vec::new();
     let mut advance = 0.0_f32;
     for run in buf.layout_runs() {
         advance = advance.max(run.line_w * px_to_9);
         for g in run.glyphs.iter() {
+            // A cluster the shaper merged into the mark keeps its own part.
+            let m = LRM.len_utf8();
+            if g.end > m {
+                cells.push((
+                    g.start.saturating_sub(m),
+                    g.end - m,
+                    g.x * px_to_9,
+                    (g.x + g.w) * px_to_9,
+                ));
+            }
             let face_index = fs.db_mut().face(g.font_id).map(|f| f.index).unwrap_or(0);
             let Some(font) = fs.get_font(g.font_id, g.font_weight) else {
                 continue;
@@ -885,13 +1107,16 @@ fn build_shaped(family: &str, text: &str) -> Option<ShapedRun> {
     if advance <= 0.0 && glyphs.is_empty() {
         return None;
     }
-    Some(ShapedRun { glyphs, advance })
+    Some(ShapedRun {
+        glyphs,
+        advance,
+        cells,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn shape_run_falls_back_for_missing_script() {
@@ -948,18 +1173,36 @@ mod tests {
     #[test]
     fn shape_run_positions_glyphs() {
         let fams = sysfont::families();
-        if fams.is_empty() { eprintln!("no fonts; skip"); return; }
-        let fam = fams.iter().find(|f| glyph(f, 'A').is_some()).expect("family");
+        if fams.is_empty() {
+            eprintln!("no fonts; skip");
+            return;
+        }
+        let fam = fams
+            .iter()
+            .find(|f| glyph(f, 'A').is_some())
+            .expect("family");
         let run = shape_run(fam, "AVA").expect("shaped");
         eprintln!("glyphs={} advance={:.3}", run.glyphs.len(), run.advance);
         assert_eq!(run.glyphs.len(), 3);
         assert!(run.advance > 0.0);
         // glyphs must be laid out left-to-right: each glyph's strokes sit at a
         // greater x than the previous glyph's start.
-        let xs: Vec<f32> = run.glyphs.iter()
-            .filter_map(|g| g.strokes.iter().flatten().map(|p| p[0]).fold(None, |m,x| Some(m.map_or(x, |mm:f32| mm.min(x)))))
+        let xs: Vec<f32> = run
+            .glyphs
+            .iter()
+            .filter_map(|g| {
+                g.strokes
+                    .iter()
+                    .flatten()
+                    .map(|p| p[0])
+                    .fold(None, |m, x| Some(m.map_or(x, |mm: f32| mm.min(x))))
+            })
             .collect();
-        assert!(xs.windows(2).all(|w| w[1] >= w[0] - 1.0), "glyphs not L->R: {:?}", xs);
+        assert!(
+            xs.windows(2).all(|w| w[1] >= w[0] - 1.0),
+            "glyphs not L->R: {:?}",
+            xs
+        );
     }
 
     #[test]

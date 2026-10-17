@@ -54,11 +54,10 @@ fn bodies(document: &CadDocument) -> Vec<(Handle, String)> {
         .filter(|entity| matches!(entity, EntityType::Solid3D(_)))
         .map(|entity| {
             let handle = entity.common().handle;
-            let label = crate::scene::model::solid_history::primitive_property_operation(
-                document, handle,
-            )
-            .as_ref()
-            .map_or("Solid", operation_label);
+            let label =
+                crate::scene::model::solid_history::primitive_property_operation(document, handle)
+                    .as_ref()
+                    .map_or("Solid", operation_label);
             (handle, format!("{label} {:X}", handle.value()))
         })
         .collect()
@@ -87,20 +86,24 @@ fn entry_row(label: String, command: String) -> Element<'static, Message> {
 
 /// A row that states something rather than doing something.
 fn note_row(label: String) -> Element<'static, Message> {
-    container(text(label).size(11).style(crate::ui::style::common::muted_style))
-        .width(Fill)
-        .padding([3, 10])
-        .into()
+    container(
+        text(label)
+            .size(11)
+            .style(crate::ui::style::common::muted_style),
+    )
+    .width(Fill)
+    .padding([3, 10])
+    .into()
 }
 
 pub fn view<'a>(
     document: &'a CadDocument,
     open_sketch: Option<&'a str>,
     width: f32,
-    auto_collapse: bool,
+    chrome: crate::ui::dock::Chrome,
 ) -> Element<'a, Message> {
     let title_bar =
-        crate::ui::dock::title_bar(PanelId::Browser, crate::t!("Browser").into_owned(), auto_collapse);
+        crate::ui::dock::title_bar(PanelId::Browser, crate::t!("Browser").into_owned(), chrome);
 
     let mut tree = column![].spacing(1);
 
@@ -123,7 +126,9 @@ pub fn view<'a>(
     }
 
     let bodies = bodies(document);
-    tree = tree.push(section_header(crate::tf!("Bodies ({})", bodies.len()).into_owned()));
+    tree = tree.push(section_header(
+        crate::tf!("Bodies ({})", bodies.len()).into_owned(),
+    ));
     if bodies.is_empty() {
         tree = tree.push(note_row(crate::t!("No solids yet").into_owned()));
     } else {
@@ -143,5 +148,5 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    crate::ui::dock::frame(column![title_bar, body].spacing(6), width)
+    crate::ui::dock::frame(title_bar, column![body].spacing(6), width)
 }

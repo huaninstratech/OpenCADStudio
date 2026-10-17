@@ -30,6 +30,7 @@ pub(super) fn viewport_controls<'a>(
     tile_count: usize,
     render_mode_menu_open: bool,
     render_mode_preview: Option<codec::entities::ViewportRenderMode>,
+    style_name: Option<String>,
 ) -> Element<'a, Message> {
     let render_modes: Vec<RenderModeChoice> = crate::modules::view::visual_style::VISUAL_STYLES
         .iter()
@@ -98,7 +99,7 @@ pub(super) fn viewport_controls<'a>(
     // flyout keeps the current style unchanged while hovering; a click commits.
     let picker_head = button(
         row![
-            text(RenderModeChoice(render_mode).to_string()).size(11),
+            text(style_name.unwrap_or_else(|| RenderModeChoice(render_mode).to_string())).size(11),
             crate::ui::icons::themed_arrow_toggle(render_mode_menu_open, 9.0),
         ]
         .spacing(6)
@@ -346,26 +347,26 @@ pub(super) fn dyn_component_value(
     ) && relative
         && !comma_cartesian;
     match f.component {
-        DynComponent::X if relative => crate::entities::common::format_length(if wh { dx.abs() } else { dx }),
-        DynComponent::Y if relative => crate::entities::common::format_length(if wh { dy.abs() } else { dy }),
+        DynComponent::X if relative => {
+            crate::entities::common::format_length(if wh { dx.abs() } else { dx })
+        }
+        DynComponent::Y if relative => {
+            crate::entities::common::format_length(if wh { dy.abs() } else { dy })
+        }
         DynComponent::Z if relative => crate::entities::common::format_length(0.0),
         DynComponent::X => crate::entities::common::format_length(p.x),
         DynComponent::Y => crate::entities::common::format_length(p.y),
         DynComponent::Z => crate::entities::common::format_length(p.z),
         // Scaled by the role so a diameter box reads twice the radius.
-        DynComponent::Distance => {
-            crate::entities::common::format_length(
-                (dx * dx + dy * dy).sqrt() * f.role.value_scale() as f64,
-            )
-        }
+        DynComponent::Distance => crate::entities::common::format_length(
+            (dx * dx + dy * dy).sqrt() * f.role.value_scale() as f64,
+        ),
         // Shared rule: unsigned magnitude of the short angle, so CW (below the
         // reference axis) reads positive (e.g. 30°, not -30°/330°). The
         // committed value stays signed (see dyn_resolve_point).
-        DynComponent::Angle => {
-            crate::entities::common::format_angle(
-                (crate::command::dyn_display_angle_deg(dy.atan2(dx) as f32) as f64).to_radians(),
-            )
-        }
+        DynComponent::Angle => crate::entities::common::format_angle(
+            (crate::command::dyn_display_angle_deg(dy.atan2(dx) as f32) as f64).to_radians(),
+        ),
         // Typed-only scalar — no geometric value to track when empty.
         DynComponent::Scalar => String::new(),
     }
@@ -379,7 +380,7 @@ mod tests {
     #[test]
     fn test_viewport_controls_construction() {
         for style in crate::modules::view::visual_style::VISUAL_STYLES {
-            let _el = viewport_controls(style.mode, true, true, true, 1, false, None);
+            let _el = viewport_controls(style.mode, true, true, true, 1, false, None, None);
             let _el_open = viewport_controls(
                 style.mode,
                 false,
@@ -388,6 +389,7 @@ mod tests {
                 2,
                 true,
                 Some(M::Wireframe3D),
+                None,
             );
         }
     }

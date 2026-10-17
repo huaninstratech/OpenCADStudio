@@ -3,24 +3,31 @@
 [`open-cad-studio.rb`](open-cad-studio.rb) is a [Homebrew Cask](https://docs.brew.sh/Cask-Cookbook)
 for installing the macOS (Apple Silicon) build.
 
-## Install without a tap (directly from this file)
+## Install through a local tap
+
+Current Homebrew installs casks only from a tap, not from a URL or a file
+path, and it no longer has `--no-quarantine`. Until a public tap exists, put
+the cask in a local one:
 
 ```bash
-brew install --cask --no-quarantine \
+brew tap-new --no-git local/tap
+mkdir -p "$(brew --repository local/tap)/Casks"
+curl -fsSL -o "$(brew --repository local/tap)/Casks/open-cad-studio.rb" \
   https://raw.githubusercontent.com/HakanSeven12/OpenCADStudio/main/packaging/homebrew/open-cad-studio.rb
+brew install --cask local/tap/open-cad-studio
 ```
 
-`--no-quarantine` is required: the app is ad-hoc signed but **not** Apple-notarised
-(notarisation needs a paid Apple Developer ID), so without it Gatekeeper still
-blocks the first launch.
+The app is ad-hoc signed but **not** Apple-notarised (notarisation needs a paid
+Apple Developer ID), so macOS blocks the first launch once: approve it in
+System Settings > Privacy & Security > Open Anyway.
 
-## Publishing as a proper tap (recommended)
+## Publishing as a proper tap
 
 Create a separate GitHub repo named `homebrew-tap` under the same account, put a
 copy of `open-cad-studio.rb` in its `Casks/` directory, then users can run:
 
 ```bash
-brew install --cask --no-quarantine hakanseven12/tap/open-cad-studio
+brew install --cask hakanseven12/tap/open-cad-studio
 ```
 
 `brew upgrade` then keeps the app current automatically.

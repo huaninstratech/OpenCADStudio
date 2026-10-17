@@ -145,12 +145,7 @@ impl V4Connection {
                     payload,
                 }) => {
                     if tab_id.is_none_or(|request_tab| request_tab == host.tab_id()) {
-                        self.respond_to_plugin_request(
-                            host,
-                            rid,
-                            payload,
-                            on_start_interactive,
-                        )?;
+                        self.respond_to_plugin_request(host, rid, payload, on_start_interactive)?;
                     } else {
                         self.deferred
                             .lock()
@@ -167,9 +162,7 @@ impl V4Connection {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.shared.alive.store(false, Ordering::SeqCst);
-                    return Err(PluginError::Runner(
-                        "V4 reader thread disconnected".into(),
-                    ));
+                    return Err(PluginError::Runner("V4 reader thread disconnected".into()));
                 }
             }
         }
@@ -217,12 +210,7 @@ impl V4Connection {
                     payload,
                 }) => {
                     if tab_id.is_none_or(|request_tab| request_tab == current_tab_id) {
-                        self.respond_to_plugin_request(
-                            host,
-                            id,
-                            payload,
-                            on_start_interactive,
-                        )?;
+                        self.respond_to_plugin_request(host, id, payload, on_start_interactive)?;
                     } else {
                         self.deferred
                             .lock()
@@ -238,9 +226,7 @@ impl V4Connection {
                 Err(mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.shared.alive.store(false, Ordering::SeqCst);
-                    return Err(PluginError::Runner(
-                        "V4 reader thread disconnected".into(),
-                    ));
+                    return Err(PluginError::Runner("V4 reader thread disconnected".into()));
                 }
             }
         }
@@ -324,7 +310,11 @@ impl V4Connection {
         while self.shared.alive.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = self.reader_handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = self
+            .reader_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -442,20 +432,23 @@ mod tests {
             label: &str,
             entities: Vec<codec::EntityType>,
         ) -> Result<(), String> {
-            self.transactions.lock().unwrap().push((label.to_owned(), entities));
+            self.transactions
+                .lock()
+                .unwrap()
+                .push((label.to_owned(), entities));
             Ok(())
         }
         fn set_dirty(&mut self) {}
         fn push_info(&mut self, msg: &str) {
-            self.push_info_messages.lock().unwrap().push(msg.to_string());
+            self.push_info_messages
+                .lock()
+                .unwrap()
+                .push(msg.to_string());
         }
         fn push_output(&mut self, _msg: &str) {}
         fn push_error(&mut self, _msg: &str) {}
         fn start_interactive(&mut self, _command: Box<dyn crate::host::InteractiveCommand>) {}
-        fn plugin_state_any(
-            &self,
-            _plugin_id: &str,
-        ) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        fn plugin_state_any(&self, _plugin_id: &str) -> Option<&(dyn std::any::Any + Send + Sync)> {
             None
         }
         fn plugin_state_any_mut(
@@ -468,8 +461,8 @@ mod tests {
             &mut self,
             _plugin_id: &'static str,
             _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
-        ) -> &mut (dyn std::any::Any + Send + Sync) {
-            panic!("not used")
+        ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+            None
         }
     }
 
@@ -489,7 +482,7 @@ mod tests {
 
     #[test]
     fn execute_code_timeout_floor_is_at_least_60s_and_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_call_timeout = std::env::var("OCS_PLUGIN_CALL_TIMEOUT_SECS").ok();
         let prev_test_floor = std::env::var("OCS_PLUGIN_TEST_FLOOR_SECS").ok();
         let prev_execute_timeout = std::env::var("OCS_PLUGIN_EXECUTE_TIMEOUT_SECS").ok();
@@ -526,7 +519,7 @@ mod tests {
 
     #[test]
     fn v4_connection_request_response() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
@@ -537,7 +530,10 @@ mod tests {
             // Read the host's V4 request and respond.
             let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
             match req {
-                HostToPluginV4::Request { id, payload: HostRequest::Dispatch { cmd } } => {
+                HostToPluginV4::Request {
+                    id,
+                    payload: HostRequest::Dispatch { cmd },
+                } => {
                     assert_eq!(cmd, "HELLO");
                     send(
                         &mut runner_stream,
@@ -554,7 +550,13 @@ mod tests {
 
         let mut host = DummyHost::new();
         let resp = conn
-            .call(&mut host, HostRequest::Dispatch { cmd: "HELLO".to_string() }, &mut |_| {})
+            .call(
+                &mut host,
+                HostRequest::Dispatch {
+                    cmd: "HELLO".to_string(),
+                },
+                &mut |_| {},
+            )
             .unwrap();
         assert!(matches!(resp, HostResponse::Bool(true)));
         runner.join().unwrap();
@@ -563,7 +565,7 @@ mod tests {
 
     #[test]
     fn v4_connection_handles_nested_plugin_request() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
@@ -573,7 +575,10 @@ mod tests {
         let runner = thread::spawn(move || {
             let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
             match req {
-                HostToPluginV4::Request { id, payload: HostRequest::Dispatch { .. } } => {
+                HostToPluginV4::Request {
+                    id,
+                    payload: HostRequest::Dispatch { .. },
+                } => {
                     // Send a nested plugin request.
                     send(
                         &mut runner_stream,
@@ -587,8 +592,10 @@ mod tests {
                     // Read the response to the nested request.
                     let resp = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
                     match resp {
-                        HostToPluginV4::Response { id: rid, payload: PluginResponse::Ok }
-                            if rid == 99 => {}
+                        HostToPluginV4::Response {
+                            id: rid,
+                            payload: PluginResponse::Ok,
+                        } if rid == 99 => {}
                         other => panic!("unexpected nested response: {other:?}"),
                     }
                     // Now respond to the original dispatch.
@@ -607,18 +614,28 @@ mod tests {
 
         let mut host = DummyHost::new();
         let resp = conn
-            .call(&mut host, HostRequest::Dispatch { cmd: "NESTED".to_string() }, &mut |_| {})
+            .call(
+                &mut host,
+                HostRequest::Dispatch {
+                    cmd: "NESTED".to_string(),
+                },
+                &mut |_| {},
+            )
             .unwrap();
         assert!(matches!(resp, HostResponse::Bool(true)));
         let infos = host.take_push_info();
-        assert_eq!(infos, vec!["nested".to_string()], "push_info should be delivered to host");
+        assert_eq!(
+            infos,
+            vec!["nested".to_string()],
+            "push_info should be delivered to host"
+        );
         runner.join().unwrap();
         restore_test_env();
     }
 
     #[test]
     fn v4_connection_routes_entity_transaction_over_nested_ipc() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
@@ -632,36 +649,63 @@ mod tests {
 
         let runner = thread::spawn(move || {
             let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
-            let HostToPluginV4::Request { id, payload: HostRequest::Dispatch { .. } } = req else {
+            let HostToPluginV4::Request {
+                id,
+                payload: HostRequest::Dispatch { .. },
+            } = req
+            else {
                 panic!("unexpected host request: {req:?}");
             };
-            send(&mut runner_stream, &PluginToHostV4::Request {
-                id: 99,
-                tab_id: Some(0),
-                payload: PluginRequest::UpdateEntitiesTransaction {
-                    label: "Move point".into(),
-                    entities: vec![sent],
+            send(
+                &mut runner_stream,
+                &PluginToHostV4::Request {
+                    id: 99,
+                    tab_id: Some(0),
+                    payload: PluginRequest::UpdateEntitiesTransaction {
+                        label: "Move point".into(),
+                        entities: vec![sent],
+                    },
                 },
-            }).unwrap();
-            assert!(matches!(recv::<HostToPluginV4>(&mut runner_stream).unwrap(),
-                HostToPluginV4::Response { id: 99, payload: PluginResponse::EntityTransactionResult(Ok(())) }));
-            send(&mut runner_stream, &PluginToHostV4::Response {
-                id,
-                payload: HostResponse::Bool(true),
-            }).unwrap();
+            )
+            .unwrap();
+            assert!(matches!(
+                recv::<HostToPluginV4>(&mut runner_stream).unwrap(),
+                HostToPluginV4::Response {
+                    id: 99,
+                    payload: PluginResponse::EntityTransactionResult(Ok(()))
+                }
+            ));
+            send(
+                &mut runner_stream,
+                &PluginToHostV4::Response {
+                    id,
+                    payload: HostResponse::Bool(true),
+                },
+            )
+            .unwrap();
         });
 
         let mut host = DummyHost::new();
-        assert!(matches!(conn.call(&mut host, HostRequest::Dispatch { cmd: "MOVE".into() }, &mut |_| {}).unwrap(),
-            HostResponse::Bool(true)));
-        assert_eq!(host.take_transactions(), vec![("Move point".into(), vec![expected])]);
+        assert!(matches!(
+            conn.call(
+                &mut host,
+                HostRequest::Dispatch { cmd: "MOVE".into() },
+                &mut |_| {}
+            )
+            .unwrap(),
+            HostResponse::Bool(true)
+        ));
+        assert_eq!(
+            host.take_transactions(),
+            vec![("Move point".into(), vec![expected])]
+        );
         runner.join().unwrap();
         restore_test_env();
     }
 
     #[test]
     fn v4_connection_notification_invokes_handler() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         use crate::host::LogLevel;
 
@@ -700,7 +744,7 @@ mod tests {
 
     #[test]
     fn v4_connection_handler_panic_is_isolated() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         use crate::host::LogLevel;
 
@@ -735,7 +779,11 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(200));
         let got = received.lock().unwrap().clone();
-        assert_eq!(got.len(), 1, "second notification should survive handler panic");
+        assert_eq!(
+            got.len(),
+            1,
+            "second notification should survive handler panic"
+        );
         assert_eq!(got[0].0, Some(1));
         runner.join().unwrap();
         drop(conn);
@@ -744,7 +792,7 @@ mod tests {
 
     #[test]
     fn v4_connection_notification_rate_limiter_drops_excess() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         std::env::set_var("OCS_PLUGIN_NOTIFY_RATE_LIMIT", "2");
         use crate::host::LogLevel;
@@ -757,6 +805,7 @@ mod tests {
                 *received2.lock().unwrap() += 1;
             });
         let conn = V4Connection::new(host_stream, handler).unwrap();
+        let (checked_tx, checked_rx) = mpsc::channel::<()>();
 
         let runner = thread::spawn(move || {
             for _ in 0..10 {
@@ -772,9 +821,9 @@ mod tests {
                 )
                 .unwrap();
             }
-            // Keep the stream open long enough for the host to verify the
-            // reader thread is still alive after the flood.
-            std::thread::sleep(Duration::from_millis(300));
+            // Keep the stream open until the host has checked the reader
+            // thread survived the flood; a fixed sleep raced on slow runners.
+            let _ = checked_rx.recv_timeout(Duration::from_secs(30));
         });
 
         std::thread::sleep(Duration::from_millis(200));
@@ -783,7 +832,11 @@ mod tests {
             count <= 3,
             "rate limiter should drop most notifications, got {count}"
         );
-        assert!(conn.is_alive(), "connection should survive rate-limited flood");
+        assert!(
+            conn.is_alive(),
+            "connection should survive rate-limited flood"
+        );
+        checked_tx.send(()).unwrap();
         runner.join().unwrap();
         drop(conn);
         std::env::remove_var("OCS_PLUGIN_NOTIFY_RATE_LIMIT");
@@ -792,7 +845,7 @@ mod tests {
 
     #[test]
     fn execute_code_returns_delayed_result_with_tab_index() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
 
         let (host_stream, mut runner_stream) = connect_pair();
@@ -816,7 +869,10 @@ mod tests {
                     assert_eq!(command_id, 1);
                     assert_eq!(source, CommandSource::Editor);
                     assert_eq!(code, "1+1");
-                    assert_eq!(tab_index, 0, "ExecuteCode should be tied to the host's tab index");
+                    assert_eq!(
+                        tab_index, 0,
+                        "ExecuteCode should be tied to the host's tab index"
+                    );
                     thread::sleep(Duration::from_millis(100));
                     send(
                         &mut runner_stream,

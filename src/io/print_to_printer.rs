@@ -1,11 +1,16 @@
 // print_to_printer — send the current layout to the system printer.
 //
-// Strategy:
+// Desktop strategy:
 //   1. Render the drawing to a temporary PDF (reusing the PDF export pipeline).
 //   2. Send that PDF to the system printer with `lp` (Linux/macOS) or
 //      `ShellExecute PRINT` (Windows).
 //
 // The function is async so the UI remains responsive while the job is queued.
+//
+// The web build has no system printers: `preview_page_pdf` /
+// `preview_pages_pdf` render the same PDF bytes, rasterise them, and show
+// the pages in an in-page overlay — the plot preview stays on screen
+// rather than handing a file to an external viewer.
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::pdf_export;
@@ -129,9 +134,8 @@ pub fn printer_report() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         match pdf_printto_command() {
-            Some(command) => lines.push(
-                crate::tf!("Plots go through the PDF application: {command}").into_owned(),
-            ),
+            Some(command) => lines
+                .push(crate::tf!("Plots go through the PDF application: {command}").into_owned()),
             None => lines.push(
                 crate::t!(
                     "Plots go straight to the printer (no PDF application registers a print verb)."
@@ -159,7 +163,11 @@ pub fn printer_media_report(printer: &str) -> Vec<String> {
     lines.push(crate::tf!("{printer}: {count} sheet(s) reported").into_owned());
     for media in &caps.media {
         let m = media.margins;
-        let borderless = if media.borderless { " (borderless available)" } else { "" };
+        let borderless = if media.borderless {
+            " (borderless available)"
+        } else {
+            ""
+        };
         lines.push(format!(
             "  {} — margins L {:.1} B {:.1} R {:.1} T {:.1} mm{borderless}",
             media.paper.display(),
@@ -230,8 +238,12 @@ pub(crate) fn pdf_printto_command() -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::{AssocQueryStringW, ASSOCF_NOTRUNCATE, ASSOCSTR_COMMAND};
 
-    let wide =
-        |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
+    };
     let extension = wide(".pdf");
     let verb = wide("printto");
     let mut len = 0u32;
@@ -320,15 +332,21 @@ mod print_route_tests {
     fn a_named_printer_is_kept_and_blank_means_the_default() {
         assert_eq!(
             plan_print_route(Some("Office Laser"), Some("Home Inkjet"), false),
-            Ok(PrintRoute::Direct { printer: "Office Laser".into() })
+            Ok(PrintRoute::Direct {
+                printer: "Office Laser".into()
+            })
         );
         assert_eq!(
             plan_print_route(Some("  "), Some("Home Inkjet"), false),
-            Ok(PrintRoute::Direct { printer: "Home Inkjet".into() })
+            Ok(PrintRoute::Direct {
+                printer: "Home Inkjet".into()
+            })
         );
         assert_eq!(
             plan_print_route(None, Some(" Home Inkjet "), true),
-            Ok(PrintRoute::PdfApplication { printer: "Home Inkjet".into() })
+            Ok(PrintRoute::PdfApplication {
+                printer: "Home Inkjet".into()
+            })
         );
     }
 
@@ -500,9 +518,7 @@ mod printer_buffer_tests {
 /// Build the platform printer-properties command.
 #[cfg(not(target_arch = "wasm32"))]
 fn printer_properties_command(printer: Option<&str>) -> (&'static str, Vec<String>) {
-    let named = printer
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
+    let named = printer.map(str::trim).filter(|name| !name.is_empty());
 
     // `/e` opens the driver's *printing preferences* (paper, tray, duplex,
     // quality — what a print job honours), not the device's admin properties
@@ -672,7 +688,10 @@ fn with_printer_devmode(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DevmodeSheet {
     Id(u16),
-    UserMm { width_tenths: i16, length_tenths: i16 },
+    UserMm {
+        width_tenths: i16,
+        length_tenths: i16,
+    },
 }
 
 /// Fetch the printer driver's DEVMODE, flip its orientation to match the
@@ -688,8 +707,8 @@ fn oriented_printer_devmode(
     sheet: Option<DevmodeSheet>,
 ) -> Option<Vec<u8>> {
     use windows_sys::Win32::Graphics::Gdi::{
-        DEVMODEW, DM_IN_BUFFER, DM_ORIENTATION, DM_OUT_BUFFER, DM_PAPERLENGTH, DM_PAPERSIZE,
-        DM_PAPERWIDTH, DMORIENT_LANDSCAPE, DMORIENT_PORTRAIT,
+        DEVMODEW, DMORIENT_LANDSCAPE, DMORIENT_PORTRAIT, DM_IN_BUFFER, DM_ORIENTATION,
+        DM_OUT_BUFFER, DM_PAPERLENGTH, DM_PAPERSIZE, DM_PAPERWIDTH,
     };
     use windows_sys::Win32::Graphics::Printing::DocumentPropertiesW;
     let attempt = |sheet: Option<DevmodeSheet>| {
@@ -707,7 +726,10 @@ fn oriented_printer_devmode(
                     (*dm).dmFields &= !(DM_PAPERWIDTH | DM_PAPERLENGTH);
                     (*dm).Anonymous1.Anonymous1.dmPaperSize = id as i16;
                 }
-                Some(DevmodeSheet::UserMm { width_tenths, length_tenths }) => {
+                Some(DevmodeSheet::UserMm {
+                    width_tenths,
+                    length_tenths,
+                }) => {
                     (*dm).dmFields |= DM_PAPERSIZE | DM_PAPERWIDTH | DM_PAPERLENGTH;
                     (*dm).Anonymous1.Anonymous1.dmPaperSize =
                         crate::io::windows_media::DMPAPER_USER as i16;
@@ -776,16 +798,20 @@ pub(crate) fn windows_printer_media(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateDCW, DeleteDC, GetDeviceCaps, DEVMODEW, DM_PAPERLENGTH, DM_PAPERSIZE,
-        DM_PAPERWIDTH, HORZRES, LOGPIXELSX, LOGPIXELSY, PHYSICALHEIGHT, PHYSICALOFFSETX,
-        PHYSICALOFFSETY, PHYSICALWIDTH, VERTRES,
+        CreateDCW, DeleteDC, GetDeviceCaps, DEVMODEW, DM_PAPERLENGTH, DM_PAPERSIZE, DM_PAPERWIDTH,
+        HORZRES, LOGPIXELSX, LOGPIXELSY, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY,
+        PHYSICALWIDTH, VERTRES,
     };
     use windows_sys::Win32::Storage::Xps::{
         DeviceCapabilitiesW, DC_PAPERNAMES, DC_PAPERS, DC_PAPERSIZE,
     };
 
-    let wide =
-        |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
+    };
     let device_wide = wide(printer.trim());
     // SAFETY: the device name is NUL-terminated; a null output buffer asks
     // for the count only.
@@ -849,8 +875,10 @@ pub(crate) fn windows_printer_media(
             let fields = dm.dmFields;
             let paper = unsafe { dm.Anonymous1.Anonymous1 };
             let id = (fields & DM_PAPERSIZE != 0).then_some(paper.dmPaperSize as u16);
-            let size = (fields & DM_PAPERWIDTH != 0 && fields & DM_PAPERLENGTH != 0)
-                .then_some((i32::from(paper.dmPaperWidth), i32::from(paper.dmPaperLength)));
+            let size = (fields & DM_PAPERWIDTH != 0 && fields & DM_PAPERLENGTH != 0).then_some((
+                i32::from(paper.dmPaperWidth),
+                i32::from(paper.dmPaperLength),
+            ));
             (id, size)
         })
         .unwrap_or((None, None));
@@ -861,7 +889,14 @@ pub(crate) fn windows_printer_media(
         .map(|b| b.as_ptr().cast::<DEVMODEW>())
         .unwrap_or(std::ptr::null());
     // SAFETY: the strings are NUL-terminated and `devmode` outlives the DC.
-    let hdc = unsafe { CreateDCW(winspool.as_ptr(), device_wide.as_ptr(), std::ptr::null(), init) };
+    let hdc = unsafe {
+        CreateDCW(
+            winspool.as_ptr(),
+            device_wide.as_ptr(),
+            std::ptr::null(),
+            init,
+        )
+    };
     let margins = if hdc.is_null() {
         None
     } else {
@@ -901,14 +936,19 @@ fn gdi_raster_print(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Graphics::Gdi::{
         CreateDCW, DeleteDC, GetDeviceCaps, SetStretchBltMode, StretchDIBits, BITMAPINFO,
-        BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, DEVMODEW, HORZRES, SRCCOPY,
+        BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DEVMODEW, DIB_RGB_COLORS, HORZRES, SRCCOPY,
         VERTRES,
     };
     // windows-sys 0.61 groups the spooler-document calls (StartDoc/StartPage/
     // EndPage/EndDoc/DOCINFOW) under Storage::Xps, not Graphics::Gdi.
     use windows_sys::Win32::Storage::Xps::{EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 
-    let wide = |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
+    };
 
     // The device is resolved by the caller (`plan_print_route`): a name the
     // dialog chose or the system default looked up by name.
@@ -944,7 +984,12 @@ fn gdi_raster_print(
     // SAFETY: all pointers are NUL-terminated / valid for the call; the DC is
     // released below and dm_buf outlives it.
     let hdc = unsafe {
-        CreateDCW(winspool.as_ptr(), device_wide.as_ptr(), std::ptr::null(), init)
+        CreateDCW(
+            winspool.as_ptr(),
+            device_wide.as_ptr(),
+            std::ptr::null(),
+            init,
+        )
     };
     if hdc.is_null() {
         return Err(format!("Could not open printer \"{device}\" for printing."));
@@ -952,8 +997,12 @@ fn gdi_raster_print(
 
     let result = (|| -> Result<(), String> {
         // SAFETY: hdc is a valid printer DC; each capability is a documented index.
-        let (page_w, page_h) =
-            unsafe { (GetDeviceCaps(hdc, HORZRES as i32), GetDeviceCaps(hdc, VERTRES as i32)) };
+        let (page_w, page_h) = unsafe {
+            (
+                GetDeviceCaps(hdc, HORZRES as i32),
+                GetDeviceCaps(hdc, VERTRES as i32),
+            )
+        };
         if page_w <= 0 || page_h <= 0 {
             return Err("Printer reported no printable area.".into());
         }
@@ -1001,10 +1050,9 @@ fn gdi_raster_print(
         };
         // SAFETY: info and its strings outlive every StartDoc/EndDoc call here.
         if unsafe { StartDocW(hdc, &info) } <= 0 {
-            return Err(format!(
-                "Print job could not start (code {}).",
-                unsafe { windows_sys::Win32::Foundation::GetLastError() }
-            ));
+            return Err(format!("Print job could not start (code {}).", unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            }));
         }
         unsafe { SetStretchBltMode(hdc, COLORONCOLOR) };
         let mut bmi = BITMAPINFO {
@@ -1023,10 +1071,9 @@ fn gdi_raster_print(
         };
         for _ in 0..copies.max(1) {
             if unsafe { StartPage(hdc) } <= 0 {
-                return Err(format!(
-                    "Could not start a print page (code {}).",
-                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
-                ));
+                return Err(format!("Could not start a print page (code {}).", unsafe {
+                    windows_sys::Win32::Foundation::GetLastError()
+                }));
             }
             // StartPage resets DC attributes, so the stretch mode is set per page.
             unsafe { SetStretchBltMode(hdc, COLORONCOLOR) };
@@ -1063,10 +1110,9 @@ fn gdi_raster_print(
             }
         }
         if unsafe { EndDoc(hdc) } <= 0 {
-            return Err(format!(
-                "Print job could not complete (code {}).",
-                unsafe { windows_sys::Win32::Foundation::GetLastError() }
-            ));
+            return Err(format!("Print job could not complete (code {}).", unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            }));
         }
         Ok(())
     })();
@@ -1083,8 +1129,7 @@ pub fn open_in_viewer(path: &std::path::Path) -> Result<(), String> {
     // the user's PDF application or leave generated previews in the temp
     // directory. Production viewers need the file after this call returns;
     // the test path has no external consumer, so it can be removed now.
-    std::fs::remove_file(path)
-        .map_err(|error| format!("Could not consume test preview: {error}"))
+    std::fs::remove_file(path).map_err(|error| format!("Could not consume test preview: {error}"))
 }
 
 /// Open a file with the OS default application (used for print preview).
@@ -1123,7 +1168,11 @@ mod preview_isolation_tests {
 
         super::open_in_viewer(&path).unwrap();
 
-        assert!(!path.exists(), "test preview was not cleaned up: {}", path.display());
+        assert!(
+            !path.exists(),
+            "test preview was not cleaned up: {}",
+            path.display()
+        );
     }
 }
 
@@ -1136,7 +1185,7 @@ fn shell_print_to(path: &std::path::Path, printer: &str, copies: u32) -> Result<
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_ASSOCIATION};
     use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SE_ERR_NOASSOC,
+        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SE_ERR_NOASSOC, SHELLEXECUTEINFOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -1171,12 +1220,74 @@ fn shell_print_to(path: &std::path::Path, printer: &str, copies: u32) -> Result<
     Ok(())
 }
 
+/// Render a page and show it the way each platform previews: the OS PDF
+/// viewer on desktop, an in-page rasterised overlay on the web. `stem` names
+/// the web download (`{stem}_preview.pdf`); the desktop temp file is unchanged.
+pub fn preview_page_pdf(
+    stem: &str,
+    page: &crate::io::pdf_export::PdfPageInput,
+) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = stem;
+        let tmp = temp_pdf_path("preview");
+        crate::io::pdf_export::export_pdf(page, &tmp)?;
+        open_in_viewer(&tmp)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bytes = crate::io::pdf_export::render_pdf_bytes(std::slice::from_ref(page), None)?;
+        web_preview_overlay(stem, &bytes)
+    }
+}
+
+/// Web-only multi-page variant used by print-all: render every layout into
+/// one PDF and preview the first pages in the overlay.
+#[cfg(target_arch = "wasm32")]
+pub fn preview_pages_pdf(
+    stem: &str,
+    pages: &[crate::io::pdf_export::PdfPageInput],
+) -> Result<(), String> {
+    let bytes = crate::io::pdf_export::render_pdf_bytes(pages, None)?;
+    web_preview_overlay(stem, &bytes)
+}
+
+/// Web preview: rasterise the plotted PDF (the same hayro pipeline that draws
+/// PDF underlays) and show the pages in an in-page overlay. The browser gets
+/// plain PNGs, so neither popup permission nor a PDF viewer plugin is needed.
+/// Rasterisation is bounded by a total pixel budget so large sheets lower the
+/// preview DPI instead of the tab's memory ceiling.
+#[cfg(target_arch = "wasm32")]
+fn web_preview_overlay(stem: &str, bytes: &[u8]) -> Result<(), String> {
+    use crate::scene::model::pdf_raster;
+    const PREVIEW_DPI: f32 = 150.0;
+    const MAX_PREVIEW_PAGES: usize = 12;
+    let (pages, total_pages) = pdf_raster::rasterize_preview_pages(
+        std::sync::Arc::new(bytes.to_vec()),
+        PREVIEW_DPI,
+        MAX_PREVIEW_PAGES,
+    );
+    let mut pngs = Vec::with_capacity(pages.len());
+    for page in &pages {
+        let encoded =
+            image::RgbaImage::from_raw(page.width, page.height, page.pixels.as_ref().clone())
+                .and_then(|img| {
+                    let mut out = Vec::new();
+                    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                        .ok()?;
+                    Some(out)
+                });
+        if let Some(png) = encoded {
+            pngs.push(png);
+        }
+    }
+    crate::sys::show_pdf_preview(&format!("{stem}_preview.pdf"), bytes, &pngs, total_pages);
+    Ok(())
+}
+
 /// Dispatch a PDF to a specific printer with [`PrintOptions`].
 #[cfg(not(target_arch = "wasm32"))]
-fn dispatch_to_printer_opts(
-    path: &std::path::Path,
-    opts: &PrintOptions,
-) -> Result<String, String> {
+fn dispatch_to_printer_opts(path: &std::path::Path, opts: &PrintOptions) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         let default_printer = windows_default_printer().ok();
@@ -1244,20 +1355,17 @@ fn dispatch_to_printer_opts(
         for (key, value) in &opts.driver_options {
             cmd.arg("-o").arg(format!("{key}={value}"));
         }
-        let lp_result = cmd
-            .arg("--")
-            .arg(path_str.as_ref())
-            .output();
+        let lp_result = cmd.arg("--").arg(path_str.as_ref()).output();
         if let Ok(out) = &lp_result {
             if !out.status.success() {
                 // Continue to the lpr fallback below.
             } else {
-            let msg = String::from_utf8_lossy(&out.stdout);
-            let printer = msg
-                .split_whitespace()
-                .find(|w| w.contains('-'))
-                .unwrap_or("printer")
-                .to_string();
+                let msg = String::from_utf8_lossy(&out.stdout);
+                let printer = msg
+                    .split_whitespace()
+                    .find(|w| w.contains('-'))
+                    .unwrap_or("printer")
+                    .to_string();
                 return Ok(printer);
             }
         }
@@ -1324,7 +1432,10 @@ mod printer_properties_tests {
         // 210mm at 300 DPI ≈ 2480 px, aspect 210:148.
         assert!((page.width as f64 - 210.0 / 25.4 * 300.0).abs() < 2.0);
         assert!((page.height as f64 - 148.0 / 25.4 * 300.0).abs() < 2.0);
-        assert_eq!(page.pixels.len(), page.width as usize * page.height as usize * 4);
+        assert_eq!(
+            page.pixels.len(),
+            page.width as usize * page.height as usize * 4
+        );
     }
 
     /// Opening the printer DC and reading its printable area must work with
@@ -1338,20 +1449,36 @@ mod printer_properties_tests {
         };
 
         let wide = |s: &str| -> Vec<u16> {
-            std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(Some(0))
+                .collect()
         };
         let winspool = wide("WINSPOOL");
         let device = wide("Microsoft Print to PDF");
         // SAFETY: NUL-terminated strings; the DC is released before returning.
         let hdc = unsafe {
-            CreateDCW(winspool.as_ptr(), device.as_ptr(), std::ptr::null(), std::ptr::null())
+            CreateDCW(
+                winspool.as_ptr(),
+                device.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
         };
         assert!(!hdc.is_null(), "printer DC should open");
         // SAFETY: capability indexes on a valid DC.
-        let (w, h) = unsafe { (GetDeviceCaps(hdc, HORZRES as i32), GetDeviceCaps(hdc, VERTRES as i32)) };
+        let (w, h) = unsafe {
+            (
+                GetDeviceCaps(hdc, HORZRES as i32),
+                GetDeviceCaps(hdc, VERTRES as i32),
+            )
+        };
         // SAFETY: releasing the DC opened above.
         unsafe { DeleteDC(hdc) };
-        assert!(w > 0 && h > 0, "printable area should be reported, got {w}x{h}");
+        assert!(
+            w > 0 && h > 0,
+            "printable area should be reported, got {w}x{h}"
+        );
     }
 
     /// End to end through the real spooler: plot a page with black ink, run
@@ -1368,7 +1495,12 @@ mod printer_properties_tests {
         let mut ops = Vec::new();
         // A big black block in the middle of an A4 page.
         ops.push(printpdf::Op::SetFillColor {
-            col: Color::Rgb(Rgb { r: 0.0, g: 0.0, b: 0.0, icc_profile: None }),
+            col: Color::Rgb(Rgb {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                icc_profile: None,
+            }),
         });
         // printpdf 0.9's DrawRectangle never paints (its serializer always
         // ends the path with `n`), so the ink must be a filled polygon — the
@@ -1377,10 +1509,34 @@ mod printer_properties_tests {
             polygon: printpdf::Polygon {
                 rings: vec![printpdf::PolygonRing {
                     points: vec![
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(60.0).into(), y: Mm(60.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(150.0).into(), y: Mm(60.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(150.0).into(), y: Mm(100.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(60.0).into(), y: Mm(100.0).into() }, bezier: false },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(60.0).into(),
+                                y: Mm(60.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(150.0).into(),
+                                y: Mm(60.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(150.0).into(),
+                                y: Mm(100.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(60.0).into(),
+                                y: Mm(100.0).into(),
+                            },
+                            bezier: false,
+                        },
                     ],
                 }],
                 mode: printpdf::PaintMode::Fill,
@@ -1402,11 +1558,8 @@ mod printer_properties_tests {
 
         // The spooled PDF must contain the black block: rasterise it and
         // count clearly-dark pixels.
-        let page = crate::scene::model::pdf_raster::rasterize_page(
-            &printed.to_string_lossy(),
-            "1",
-        )
-        .expect("spooled output should rasterise");
+        let page = crate::scene::model::pdf_raster::rasterize_page(&printed.to_string_lossy(), "1")
+            .expect("spooled output should rasterise");
         let dark = page
             .pixels
             .chunks_exact(4)
@@ -1432,16 +1585,45 @@ mod printer_properties_tests {
         let mut document = PdfDocument::new("gdi orientation test");
         let mut ops = Vec::new();
         ops.push(printpdf::Op::SetFillColor {
-            col: Color::Rgb(Rgb { r: 0.0, g: 0.0, b: 0.0, icc_profile: None }),
+            col: Color::Rgb(Rgb {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                icc_profile: None,
+            }),
         });
         ops.push(printpdf::Op::DrawPolygon {
             polygon: printpdf::Polygon {
                 rings: vec![printpdf::PolygonRing {
                     points: vec![
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(20.0).into(), y: Mm(20.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(270.0).into(), y: Mm(20.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(270.0).into(), y: Mm(45.0).into() }, bezier: false },
-                        printpdf::LinePoint { p: printpdf::Point { x: Mm(20.0).into(), y: Mm(45.0).into() }, bezier: false },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(20.0).into(),
+                                y: Mm(20.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(270.0).into(),
+                                y: Mm(20.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(270.0).into(),
+                                y: Mm(45.0).into(),
+                            },
+                            bezier: false,
+                        },
+                        printpdf::LinePoint {
+                            p: printpdf::Point {
+                                x: Mm(20.0).into(),
+                                y: Mm(45.0).into(),
+                            },
+                            bezier: false,
+                        },
                     ],
                 }],
                 mode: printpdf::PaintMode::Fill,
@@ -1449,7 +1631,9 @@ mod printer_properties_tests {
             },
         });
         // Landscape A4: 297 × 210 mm.
-        document.pages.push(OutputPage::new(Mm(297.0), Mm(210.0), ops));
+        document
+            .pages
+            .push(OutputPage::new(Mm(297.0), Mm(210.0), ops));
         let bytes = document.save(&PdfSaveOptions::default(), &mut Vec::new());
         let plot = std::env::temp_dir().join("ocs_gdi_orientation_source.pdf");
         std::fs::write(&plot, &bytes).unwrap();
@@ -1459,11 +1643,8 @@ mod printer_properties_tests {
         let result = super::gdi_raster_print(&plot, "Microsoft Print to PDF", 1, Some(&printed));
         assert!(result.is_ok(), "GDI print failed: {result:?}");
 
-        let page = crate::scene::model::pdf_raster::rasterize_page(
-            &printed.to_string_lossy(),
-            "1",
-        )
-        .expect("spooled output should rasterise");
+        let page = crate::scene::model::pdf_raster::rasterize_page(&printed.to_string_lossy(), "1")
+            .expect("spooled output should rasterise");
         std::fs::remove_file(&plot).ok();
         std::fs::remove_file(&printed).ok();
 
@@ -1477,7 +1658,8 @@ mod printer_properties_tests {
         let mut dark = 0usize;
         for y in 0..page.height {
             for x in 0..page.width {
-                let px = &page.pixels[((y * page.width + x) * 4) as usize..((y * page.width + x) * 4 + 3) as usize];
+                let px = &page.pixels
+                    [((y * page.width + x) * 4) as usize..((y * page.width + x) * 4 + 3) as usize];
                 if px.iter().all(|&c| c < 100) {
                     dark += 1;
                     min_x = min_x.min(x);
@@ -1487,7 +1669,10 @@ mod printer_properties_tests {
                 }
             }
         }
-        assert!(dark > 1_000, "printed page must carry ink; {dark} dark pixels");
+        assert!(
+            dark > 1_000,
+            "printed page must carry ink; {dark} dark pixels"
+        );
         let ink_w = (max_x - min_x + 1) as f64;
         let ink_h = (max_y - min_y + 1) as f64;
         assert_eq!(
@@ -1547,7 +1732,10 @@ mod printer_properties_tests {
         );
         // SAFETY: the buffer holds at least a public DEVMODEW, just checked.
         let named = unsafe { (*(devmode.as_ptr() as *const DEVMODEW)).dmSize } as usize;
-        assert!(named > 0 && named <= devmode.len(), "dmSize {named} outside the buffer");
+        assert!(
+            named > 0 && named <= devmode.len(),
+            "dmSize {named} outside the buffer"
+        );
 
         // And the symptom the lost DEVMODE produced: the driver's default
         // sheet is one of the sheets it lists, so the report can name it.
@@ -1589,7 +1777,10 @@ mod printer_properties_tests {
             );
             // SAFETY: the printer branch of the DEVMODE union.
             let got = unsafe { dm.Anonymous1.Anonymous1.dmOrientation };
-            assert_eq!(got, want as i16, "landscape={landscape}: wrong dmOrientation");
+            assert_eq!(
+                got, want as i16,
+                "landscape={landscape}: wrong dmOrientation"
+            );
         }
     }
 
@@ -1601,13 +1792,30 @@ mod printer_properties_tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_preferences_keep_the_printer_name_in_one_argument() {
-        for name in ["Office Printer", "Wide Format Plotter 1200", "Εκτυπωτής γραφείου"] {
+        for name in [
+            "Office Printer",
+            "Wide Format Plotter 1200",
+            "Εκτυπωτής γραφείου",
+        ] {
             let (program, args) = printer_properties_command(Some(name));
             assert_eq!(program, "rundll32.exe");
-            assert!(args.contains(&"/e".to_string()), "{args:?} must ask for preferences");
-            assert!(!args.contains(&"/p".to_string()), "{args:?} must not ask for properties");
-            let flag = args.iter().position(|arg| arg == "/n").expect("/n introduces the name");
-            assert_eq!(args.get(flag + 1).map(String::as_str), Some(name), "{args:?}");
+            assert!(
+                args.contains(&"/e".to_string()),
+                "{args:?} must ask for preferences"
+            );
+            assert!(
+                !args.contains(&"/p".to_string()),
+                "{args:?} must not ask for properties"
+            );
+            let flag = args
+                .iter()
+                .position(|arg| arg == "/n")
+                .expect("/n introduces the name");
+            assert_eq!(
+                args.get(flag + 1).map(String::as_str),
+                Some(name),
+                "{args:?}"
+            );
             assert_eq!(args.iter().filter(|arg| arg.as_str() == name).count(), 1);
         }
     }
@@ -1617,9 +1825,7 @@ mod printer_properties_tests {
     fn macos_opens_print_settings() {
         let expected = (
             "open",
-            vec![
-                "x-apple.systempreferences:com.apple.Print-Scan-Settings.extension".to_string(),
-            ],
+            vec!["x-apple.systempreferences:com.apple.Print-Scan-Settings.extension".to_string()],
         );
         assert_eq!(
             printer_properties_command(Some("  Office LaserJet  ")),
@@ -1751,7 +1957,11 @@ pub fn parse_lpoptions(text: &str) -> Vec<PrinterOption> {
         }
         options.push(PrinterOption {
             key: key.to_string(),
-            label: if label.is_empty() { key.to_string() } else { label.to_string() },
+            label: if label.is_empty() {
+                key.to_string()
+            } else {
+                label.to_string()
+            },
             default,
             choices,
         });
@@ -1835,7 +2045,13 @@ Broken line without colon\n";
         // PageSize is the plot dialog's business; everything else is listed.
         assert_eq!(
             keys,
-            ["MediaType", "ColorModel", "Duplex", "cupsPrintQuality", "print-scaling"]
+            [
+                "MediaType",
+                "ColorModel",
+                "Duplex",
+                "cupsPrintQuality",
+                "print-scaling"
+            ]
         );
         let media = &options[0];
         assert_eq!(media.label, "Media Type");
@@ -1855,7 +2071,10 @@ Broken line without colon\n";
         assert_eq!(humanize_keyword("AutoGray"), "Auto Gray");
         assert_eq!(humanize_keyword("ProcessGray"), "Process Gray");
         assert_eq!(humanize_keyword("auto-fit"), "auto-fit");
-        assert_eq!(humanize_keyword("PhotographicSemiGloss"), "Photographic Semi Gloss");
+        assert_eq!(
+            humanize_keyword("PhotographicSemiGloss"),
+            "Photographic Semi Gloss"
+        );
         assert_eq!(humanize_keyword("A4"), "A4");
     }
 }

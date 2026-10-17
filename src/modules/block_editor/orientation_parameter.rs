@@ -1,0 +1,193 @@
+//! Interactive native Rotation, Alignment and Flip placement.
+use crate::command::{CadCommand, CmdResult};
+use crate::scene::{
+    block_orientation_parameter::{self, Kind},
+    WireModel,
+};
+use codec::{types::Vector3, Handle};
+use glam::DVec3;
+
+pub struct OrientationParameterCommand {
+    document_id: u64,
+    definition: Handle,
+    kind: Kind,
+    base: Option<DVec3>,
+    second: Option<DVec3>,
+}
+
+impl OrientationParameterCommand {
+    pub(crate) fn new(document_id: u64, definition: Handle, kind: Kind) -> Self {
+        Self {
+            document_id,
+            definition,
+            kind,
+            base: None,
+            second: None,
+        }
+    }
+    fn finish(&self, end: DVec3, reference: DVec3) -> CmdResult {
+        let base = self.base.unwrap();
+        let vector = |p: DVec3| Vector3::new(p.x, p.y, p.z);
+        if let Some(error) = block_orientation_parameter::points_error(
+            self.kind,
+            vector(base),
+            vector(end),
+            vector(reference),
+        ) {
+            return CmdResult::ReportError(crate::t!(error).into_owned());
+        }
+        CmdResult::PlaceBlockOrientationParameter {
+            document_id: self.document_id,
+            definition: self.definition,
+            kind: self.kind,
+            base,
+            end,
+            reference,
+        }
+    }
+    fn rotation_at(&self, angle: f64) -> CmdResult {
+        let base = self.base.unwrap();
+        let reference = self.second.unwrap();
+        let radius = (reference - base).length();
+        self.finish(
+            base + DVec3::new(angle.cos(), angle.sin(), 0.0) * radius,
+            reference,
+        )
+    }
+}
+
+impl CadCommand for OrientationParameterCommand {
+    fn name(&self) -> &'static str {
+        "BPARAMETER"
+    }
+    fn prompt(&self) -> String {
+        let step = if self.base.is_none() {
+            "Specify parameter base point:"
+        } else {
+            match (self.kind, self.second.is_some()) {
+                (Kind::Rotation, false) => "Specify parameter radius or pick a radius point:",
+                (Kind::Rotation, true) => "Specify default rotation angle or pick direction <0>:",
+                (Kind::Alignment, _) => "Specify alignment direction (tangent):",
+                (Kind::Flip, false) => "Specify reflection line endpoint:",
+                (Kind::Flip, true) => "Specify flip parameter label location:",
+            }
+        };
+        crate::tf!(
+            "BPARAMETER {}  {}",
+            crate::t!(self.kind.name()),
+            crate::t!(step)
+        )
+        .into_owned()
+    }
+    fn on_point(&mut self, point: DVec3) -> CmdResult {
+        if !point.is_finite() {
+            return CmdResult::ReportError(
+                crate::t!("Specify a finite parameter location.").into_owned(),
+            );
+        }
+        let Some(base) = self.base else {
+            self.base = Some(point);
+            return CmdResult::NeedPoint;
+        };
+        if (point.z - base.z).abs() > 1e-8 {
+            return CmdResult::ReportError(
+                crate::t!("Specify points in the same block XY plane.").into_owned(),
+            );
+        }
+        if self.kind == Kind::Flip && self.second.is_some() {
+            return self.finish(self.second.unwrap(), point);
+        }
+        let d = point - base;
+        let radius = d.x.hypot(d.y);
+        if radius <= 1e-10 || !radius.is_finite() || !d.length().is_finite() {
+            return CmdResult::ReportError(
+                crate::t!("Specify a finite nonzero parameter direction or radius.").into_owned(),
+            );
+        }
+        match self.kind {
+            Kind::Alignment => self.finish(point, point),
+            Kind::Flip => {
+                self.second = Some(point);
+                CmdResult::NeedPoint
+            }
+            Kind::Rotation => {
+                if self.second.is_some() {
+                    self.rotation_at(d.y.atan2(d.x))
+                } else {
+                    self.second = Some(base + DVec3::X * radius);
+                    CmdResult::NeedPoint
+                }
+            }
+        }
+    }
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        if self.kind != Kind::Rotation || self.base.is_none() {
+            return None;
+        }
+        let value = text.trim().parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return Some(CmdResult::ReportError(
+                crate::t!("Specify a finite radius or angle.").into_owned(),
+            ));
+        }
+        Some(if self.second.is_some() {
+            self.rotation_at(value.rem_euclid(360.0).to_radians())
+        } else if value > 1e-10 {
+            self.on_point(self.base.unwrap() + DVec3::X * value)
+        } else {
+            CmdResult::ReportError(crate::t!("Specify a positive parameter radius.").into_owned())
+        })
+    }
+    fn on_preview_wires(&mut self, point: DVec3) -> Vec<WireModel> {
+        let Some(base) = self.base.filter(|_| point.is_finite()) else {
+            return vec![];
+        };
+        let mut lines = vec![];
+        if self.kind == Kind::Rotation {
+            let radius = self
+                .second
+                .map(|p| (p - base).length())
+                .unwrap_or((point - base).length());
+            if !radius.is_finite() {
+                return vec![];
+            }
+            let angle = (point.y - base.y).atan2(point.x - base.x);
+            let end = base + DVec3::new(angle.cos(), angle.sin(), 0.0) * radius;
+            lines.push(vec![base.to_array(), end.to_array()]);
+            lines.push(
+                (0..=64)
+                    .map(|i| {
+                        let a = std::f64::consts::TAU * i as f64 / 64.0;
+                        (base + DVec3::new(a.cos(), a.sin(), 0.0) * radius).to_array()
+                    })
+                    .collect(),
+            );
+        } else {
+            lines.push(vec![
+                base.to_array(),
+                self.second.unwrap_or(point).to_array(),
+            ]);
+            if let Some(end) = self.second {
+                lines.push(vec![end.to_array(), point.to_array()]);
+            }
+        }
+        lines
+            .into_iter()
+            .map(|points| {
+                WireModel::solid_f64(
+                    "preview_orientation_parameter".into(),
+                    points,
+                    WireModel::CYAN,
+                    false,
+                )
+            })
+            .collect()
+    }
+    fn on_enter(&mut self) -> CmdResult {
+        if self.kind == Kind::Rotation && self.second.is_some() {
+            self.rotation_at(0.0)
+        } else {
+            CmdResult::Cancel
+        }
+    }
+}

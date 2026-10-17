@@ -97,15 +97,11 @@ impl Scene {
 
     pub fn set_current_drawing_limits(&mut self, min: glam::DVec2, max: glam::DVec2) {
         if self.input_uses_model_space() {
-            self.document.header.model_space_limits_min =
-                codec::types::Vector2::new(min.x, min.y);
-            self.document.header.model_space_limits_max =
-                codec::types::Vector2::new(max.x, max.y);
+            self.document.header.model_space_limits_min = codec::types::Vector2::new(min.x, min.y);
+            self.document.header.model_space_limits_max = codec::types::Vector2::new(max.x, max.y);
         } else {
-            self.document.header.paper_space_limits_min =
-                codec::types::Vector2::new(min.x, min.y);
-            self.document.header.paper_space_limits_max =
-                codec::types::Vector2::new(max.x, max.y);
+            self.document.header.paper_space_limits_min = codec::types::Vector2::new(min.x, min.y);
+            self.document.header.paper_space_limits_max = codec::types::Vector2::new(max.x, max.y);
         }
 
         // Keep the current Layout object synchronized with the header values.
@@ -134,21 +130,27 @@ impl Scene {
             self.fit_all();
             return;
         };
+        // In a 3D view ZOOM All is Zoom Extents. In plan it shows the larger
+        // of the limits and the extents, so geometry outside the limits (a
+        // drawing placed at survey coordinates) stays on screen (#1829).
+        // ponytail: plan means looking down world Z; a rotated UCS plan view
+        // counts as 3D and gets Zoom Extents.
+        let eye = self.camera.borrow().rotation * glam::Vec3::Z;
+        if self.active_viewport.is_none() && eye.z.abs() < 0.999 {
+            self.fit_all();
+            return;
+        }
 
         let mut min = glam::Vec3::new(limit_min.x as f32, limit_min.y as f32, 0.0);
         let mut max = glam::Vec3::new(limit_max.x as f32, limit_max.y as f32, 0.0);
-
-        // Model-space content counts toward the frame — drawings exported by
-        // nesting/CAM tools routinely sit far outside a template's default
-        // LIMITS. Paper space keeps the sheet rectangle: the sheet is the
-        // frame there.
-        if self.current_layout == "Model" || self.active_viewport.is_some() {
-            if let Some((extents_min, extents_max)) = self.model_space_extents() {
-                if extents_min.is_finite() && extents_max.is_finite() {
-                    min = min.min(extents_min);
-                    max = max.max(extents_max);
-                }
-            }
+        let block = if self.current_layout == "Model" || self.active_viewport.is_some() {
+            self.model_space_block_handle()
+        } else {
+            self.current_layout_block_handle()
+        };
+        if let Some((lo, hi)) = self.visible_block_bounds(block) {
+            min = min.min(lo.as_vec3());
+            max = max.max(hi.as_vec3());
         }
 
         // MSPACE owns a camera encoded on the active viewport entity.

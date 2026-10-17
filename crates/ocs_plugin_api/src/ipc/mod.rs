@@ -23,13 +23,13 @@ pub mod client;
 #[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
+pub mod proxy;
+#[cfg(feature = "host")]
 pub mod server;
 #[cfg(feature = "host")]
 pub mod transport;
 #[cfg(feature = "host")]
 pub mod v4;
-#[cfg(feature = "host")]
-pub mod proxy;
 
 #[cfg(all(test, feature = "host"))]
 mod tests {
@@ -156,6 +156,71 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn registered_manifest_roundtrips_entity_classes_over_bincode() {
+        // The registration handshake is length-framed bincode, so the manifest
+        // and its API-v10 entity-class declaration must survive exactly that
+        // wire format.
+        let manifest = crate::ribbon::owned::OwnedPluginManifest {
+            id: "opencad.civil_ifc".to_string(),
+            name: "Civil IFC".to_string(),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version: 10,
+            ribbon_order: 50,
+            xdata_apps: vec!["CVIFC".to_string()],
+            command_prefixes: vec![],
+            entity_classes: Some(crate::ribbon::owned::OwnedEntityClasses {
+                app_id: "CVIFC".to_string(),
+                class_prefix: "CVIFC-CLASS:".to_string(),
+                labels: [
+                    ("LINE".to_string(), "Linear Element".to_string()),
+                    (
+                        "CIRCULARARC".to_string(),
+                        "Circular Arc Element".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+        };
+        let resp = HostResponse::Manifest(manifest);
+        let bytes = bincode::serialize(&resp).unwrap();
+        let got: HostResponse = bincode::deserialize(&bytes).unwrap();
+        match got {
+            HostResponse::Manifest(m) => {
+                let classes = m.entity_classes.expect("declaration survives");
+                assert_eq!(classes.app_id, "CVIFC");
+                assert_eq!(classes.class_prefix, "CVIFC-CLASS:");
+                assert_eq!(
+                    classes.labels.get("LINE").map(String::as_str),
+                    Some("Linear Element")
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_entity_classes_default_when_absent() {
+        // A manifest serialized before the field existed (an older runner)
+        // decodes with the declaration defaulting to `None`.
+        let older = r#"{
+            "id": "old.plugin",
+            "name": "Old",
+            "version": "0.1.0",
+            "description": "test",
+            "api_version": 9,
+            "ribbon_order": 0,
+            "xdata_apps": [],
+            "command_prefixes": []
+        }"#;
+        let m: crate::ribbon::owned::OwnedPluginManifest =
+            serde_json::from_str(older).expect("older manifest decodes");
+        assert_eq!(m.id, "old.plugin");
+        assert!(m.entity_classes.is_none());
     }
 
     #[test]

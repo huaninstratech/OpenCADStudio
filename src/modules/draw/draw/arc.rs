@@ -1,14 +1,14 @@
 // Arc creation commands.
 
+use crate::t;
 use codec::types::Vector3;
 use codec::{Arc as CadArc, EntityType};
-use crate::t;
 use kernel::geom2d::{self, Curve as KernelCurve};
 
+use super::apollonius::{self, Circle2D};
 use crate::command::{CadCommand, CmdResult, TangentObject, WorkingPlane};
 use crate::modules::IconKind;
 use crate::scene::model::wire_model::{TangentGeom, WireModel};
-use super::apollonius::{self, Circle2D};
 use glam::{DVec2, DVec3};
 
 const TAU: f64 = std::f64::consts::TAU;
@@ -82,14 +82,13 @@ fn arc_preview(
     let points = KernelCurve::Arc(arc)
         .tessellate_angle(TAU / 64.0)
         .into_iter()
-        .map(|point| plane.to_world(DVec3::new(point[0], point[1], center_local.z)).to_array())
+        .map(|point| {
+            plane
+                .to_world(DVec3::new(point[0], point[1], center_local.z))
+                .to_array()
+        })
         .collect();
-    let mut wire = WireModel::solid_f64(
-        "rubber_band".into(),
-        points,
-        WireModel::CYAN,
-        false,
-    );
+    let mut wire = WireModel::solid_f64("rubber_band".into(), points, WireModel::CYAN, false);
     wire.tangent_geoms.push(TangentGeom::Arc {
         center: [center.x, center.y, center.z],
         axis_x: plane.x.to_array(),
@@ -109,12 +108,7 @@ fn make_arc(
     plane: WorkingPlane,
 ) -> Option<EntityType> {
     let center = plane.to_local(center);
-    let arc = geom2d::bounded_arc(
-        [center.x, center.y],
-        radius,
-        start_angle,
-        end_angle,
-    )?;
+    let arc = geom2d::bounded_arc([center.x, center.y], radius, start_angle, end_angle)?;
     Some(plane.place_entity(EntityType::Arc(CadArc {
         center: Vector3::new(center.x, center.y, center.z),
         radius: arc.radius,
@@ -233,12 +227,7 @@ fn arc_continue(
 ) -> Option<(DVec3, f64, f64, f64)> {
     let (s, e) = (plane.to_local(s), plane.to_local(e));
     let tangent = plane.vector_to_local(t);
-    let arc = geom2d::arc_from_start_tangent(
-        [s.x, s.y],
-        [tangent.x, tangent.y],
-        [e.x, e.y],
-        flip,
-    )?;
+    let arc = geom2d::arc_from_start_tangent([s.x, s.y], [tangent.x, tangent.y], [e.x, e.y], flip)?;
     let center = plane.to_world(DVec3::new(arc.centre[0], arc.centre[1], s.z));
     Some((center, arc.radius, arc.start_angle, arc.end_angle))
 }
@@ -277,10 +266,7 @@ fn end_angle_from_chord_len(start_angle: f64, chord: f64, r: f64) -> Option<f64>
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArcPick {
     Point(DVec3),
-    Tangent {
-        target: TangentObject,
-        hit: DVec3,
-    },
+    Tangent { target: TangentObject, hit: DVec3 },
 }
 
 impl ArcPick {
@@ -378,10 +364,17 @@ fn fluid_anchor_point(pick: ArcPick, cursor: DVec3, plane: WorkingPlane) -> DVec
             TangentObject::Circle { center, radius } => {
                 let loc_center = plane.to_local(center);
                 let loc_pt = plane.to_local(cursor);
-                let d = (DVec2::new(loc_pt.x, loc_pt.y) - DVec2::new(loc_center.x, loc_center.y)).length();
+                let d = (DVec2::new(loc_pt.x, loc_pt.y) - DVec2::new(loc_center.x, loc_center.y))
+                    .length();
                 if d > 1e-6 {
-                    let dir = (DVec2::new(loc_pt.x, loc_pt.y) - DVec2::new(loc_center.x, loc_center.y)).normalize();
-                    plane.to_world(DVec3::new(loc_center.x + dir.x * radius, loc_center.y + dir.y * radius, loc_center.z))
+                    let dir = (DVec2::new(loc_pt.x, loc_pt.y)
+                        - DVec2::new(loc_center.x, loc_center.y))
+                    .normalize();
+                    plane.to_world(DVec3::new(
+                        loc_center.x + dir.x * radius,
+                        loc_center.y + dir.y * radius,
+                        loc_center.z,
+                    ))
                 } else {
                     hit
                 }
@@ -430,7 +423,8 @@ impl Ellipse2D {
     }
 
     pub fn normal_at(&self, t: f64) -> DVec2 {
-        (self.major_dir * (self.b * t.cos()) + self.minor_dir * (self.a * t.sin())).normalize_or_zero()
+        (self.major_dir * (self.b * t.cos()) + self.minor_dir * (self.a * t.sin()))
+            .normalize_or_zero()
     }
 
     pub fn param_at(&self, pt: DVec2) -> f64 {
@@ -456,12 +450,10 @@ impl Ellipse2D {
         let a2_b2 = a * a - b * b;
 
         // Normal equation: g(t) = (a^2 - b^2) * sin(t)*cos(t) - a*uc*sin(t) + b*vc*cos(t) = 0
-        let g = |t: f64| -> f64 {
-            0.5 * a2_b2 * (2.0 * t).sin() - a * uc * t.sin() + b * vc * t.cos()
-        };
-        let g_prime = |t: f64| -> f64 {
-            a2_b2 * (2.0 * t).cos() - a * uc * t.cos() - b * vc * t.sin()
-        };
+        let g =
+            |t: f64| -> f64 { 0.5 * a2_b2 * (2.0 * t).sin() - a * uc * t.sin() + b * vc * t.cos() };
+        let g_prime =
+            |t: f64| -> f64 { a2_b2 * (2.0 * t).cos() - a * uc * t.cos() - b * vc * t.sin() };
 
         let n_slices = 16;
         let dt = std::f64::consts::TAU / (n_slices as f64);
@@ -572,15 +564,382 @@ fn target_to_circle2d_pure(target: TangentObject, plane: WorkingPlane) -> Option
     }
 }
 
-/// Solves PPC (Point, Point, Curve) where Curve is an Ellipse.
-/// Scans the full perimeter t ∈ [0, 2π) to find all valid tangent circles passing through p1 and p2,
-/// and selects the one closest to `hint`.
-pub fn solve_ellipse_ppc(
-    ell: &Ellipse2D,
+fn target_to_line2d(target: TangentObject, plane: WorkingPlane) -> Option<(DVec2, DVec2)> {
+    match target {
+        TangentObject::Line { p1, p2 } => {
+            let loc1 = plane.to_local(p1);
+            let loc2 = plane.to_local(p2);
+            Some((DVec2::new(loc1.x, loc1.y), DVec2::new(loc2.x, loc2.y)))
+        }
+        _ => None,
+    }
+}
+
+/// Solves PPC (Point, Point, Curve) where Curve is an infinite 2D Line passing through `l_p1` and `l_p2`.
+/// Closed-form quadratic solution along the perpendicular bisector of `p1` and `p2`.
+pub fn solve_line_ppc(
+    l_p1: DVec2,
+    l_p2: DVec2,
     p1: DVec2,
     p2: DVec2,
     hint: DVec2,
 ) -> Option<DVec2> {
+    let line_vec = l_p2 - l_p1;
+    let line_len = line_vec.length();
+    if line_len < 1e-9 {
+        return None;
+    }
+    let v_line = line_vec / line_len;
+    let n_line = DVec2::new(-v_line.y, v_line.x);
+
+    let d_vec = p2 - p1;
+    let d_len = d_vec.length();
+    if d_len < 1e-9 {
+        return None;
+    }
+    let u_seg = d_vec / d_len;
+    let w_bisector = DVec2::new(-u_seg.y, u_seg.x);
+    let m = (p1 + p2) * 0.5;
+    let r0 = d_len * 0.5;
+    let r0_sq = r0 * r0;
+
+    let h0 = (m - l_p1).dot(n_line);
+    let k = w_bisector.dot(n_line);
+
+    let a = k * k - 1.0;
+    let b = 2.0 * h0 * k;
+    let c = h0 * h0 - r0_sq;
+
+    let mut s_candidates = Vec::with_capacity(2);
+    if a.abs() < 1e-9 {
+        if b.abs() > 1e-9 {
+            s_candidates.push(-c / b);
+        }
+    } else {
+        let disc = 4.0 * (h0 * h0 - r0_sq * (1.0 - k * k));
+        if disc >= -1e-9 {
+            let sqrt_disc = disc.max(0.0).sqrt();
+            s_candidates.push((-b + sqrt_disc) / (2.0 * a));
+            s_candidates.push((-b - sqrt_disc) / (2.0 * a));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for s in s_candidates {
+        let center = m + w_bisector * s;
+        let r = (r0_sq + s * s).sqrt();
+        if r < 1e-4 || r > 1e8 {
+            continue;
+        }
+        let t_pt = center - n_line * ((center - l_p1).dot(n_line));
+        // Ensure t_pt, p1, p2 are non-collinear
+        let cross = (p2.x - p1.x) * (t_pt.y - p1.y) - (p2.y - p1.y) * (t_pt.x - p1.x);
+        let norm_cross = cross.abs() / (d_len * (t_pt - p1).length().max(1.0));
+        if norm_cross < 1e-6 {
+            continue;
+        }
+        candidates.push((t_pt, r));
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|(pt_a, r_a), (pt_b, r_b)| {
+            let dist_a = (*pt_a - hint).length_squared() + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*pt_b - hint).length_squared() + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            dist_a.total_cmp(&dist_b)
+        })
+        .map(|(pt, _)| pt)
+}
+
+/// Solves CCP (Curve, Curve, Point) where both curves are Lines.
+pub fn solve_line_line_ccp(
+    l1_p1: DVec2,
+    l1_p2: DVec2,
+    l2_p1: DVec2,
+    l2_p2: DVec2,
+    p: DVec2,
+    hint1: DVec2,
+    hint2: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    let d1 = l1_p2 - l1_p1;
+    let d2 = l2_p2 - l2_p1;
+    let l1_len = d1.length();
+    let l2_len = d2.length();
+    if l1_len < 1e-9 || l2_len < 1e-9 {
+        return None;
+    }
+    let v1 = d1 / l1_len;
+    let v2 = d2 / l2_len;
+    let n1 = DVec2::new(-v1.y, v1.x);
+    let n2 = DVec2::new(-v2.y, v2.x);
+
+    let mut candidates = Vec::new();
+    let cross12 = v1.x * v2.y - v1.y * v2.x;
+
+    if cross12.abs() < 1e-6 {
+        // Parallel lines
+        let dist_lines = (l2_p1 - l1_p1).dot(n1).abs();
+        let r = dist_lines * 0.5;
+        if r > 1e-4 {
+            let mid_line_p = l1_p1 + n1 * ((l2_p1 - l1_p1).dot(n1) * 0.5);
+            let w = mid_line_p - p;
+            let a = 1.0;
+            let b = 2.0 * w.dot(v1);
+            let c = w.length_squared() - r * r;
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let sqrt_d = disc.sqrt();
+                for t in [(-b + sqrt_d) / (2.0 * a), (-b - sqrt_d) / (2.0 * a)] {
+                    let center = mid_line_p + v1 * t;
+                    let t1 = center - n1 * ((center - l1_p1).dot(n1));
+                    let t2 = center - n2 * ((center - l2_p1).dot(n2));
+                    candidates.push((t1, t2, r));
+                }
+            }
+        }
+    } else {
+        // Intersecting lines: find intersection point V
+        let delta = l2_p1 - l1_p1;
+        let t_intersect = (delta.x * v2.y - delta.y * v2.x) / cross12;
+        let v_intersect = l1_p1 + v1 * t_intersect;
+
+        let b1 = (v1 + v2).normalize_or_zero();
+        let b2 = (v1 - v2).normalize_or_zero();
+
+        for bisector in [b1, b2] {
+            if bisector.length_squared() < 0.5 {
+                continue;
+            }
+            let sigma = (bisector.x * v1.y - bisector.y * v1.x).abs();
+            if sigma < 1e-6 || (1.0 - sigma * sigma).abs() < 1e-6 {
+                continue;
+            }
+            let cos2 = 1.0 - sigma * sigma;
+            let w = v_intersect - p;
+            let a = cos2;
+            let b = 2.0 * w.dot(bisector);
+            let c = w.length_squared();
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let sqrt_d = disc.sqrt();
+                for t in [(-b + sqrt_d) / (2.0 * a), (-b - sqrt_d) / (2.0 * a)] {
+                    let center = v_intersect + bisector * t;
+                    let r = t.abs() * sigma;
+                    if r < 1e-4 || r > 1e8 {
+                        continue;
+                    }
+                    let t1 = center - n1 * ((center - l1_p1).dot(n1));
+                    let t2 = center - n2 * ((center - l2_p1).dot(n2));
+                    candidates.push((t1, t2, r));
+                }
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|(t1_a, t2_a, r_a), (t1_b, t2_b, r_b)| {
+            let dist_a = (*t1_a - hint1).length_squared()
+                + (*t2_a - hint2).length_squared()
+                + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*t1_b - hint1).length_squared()
+                + (*t2_b - hint2).length_squared()
+                + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            dist_a.total_cmp(&dist_b)
+        })
+        .map(|(t1, t2, _)| (t1, t2))
+}
+
+/// Solves CCP (Curve, Curve, Point) where Curve 1 is a Circle and Curve 2 is a Line.
+pub fn solve_circle_line_ccp(
+    c1: Circle2D,
+    l_p1: DVec2,
+    l_p2: DVec2,
+    p: DVec2,
+    hint_c: DVec2,
+    hint_l: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    let line_vec = l_p2 - l_p1;
+    let line_len = line_vec.length();
+    if line_len < 1e-9 {
+        return None;
+    }
+    let v_line = line_vec / line_len;
+    let n_line = DVec2::new(-v_line.y, v_line.x);
+
+    let n_steps = 144;
+    let dt = TAU / (n_steps as f64);
+    let mut candidates = Vec::new();
+
+    let eval_t = |theta: f64| -> Option<(f64, DVec2, f64, DVec2)> {
+        let n_hat = DVec2::new(theta.cos(), theta.sin());
+        let pt = c1.center + n_hat * c1.radius;
+        let w = pt - p;
+        let w_dot_n = w.dot(n_hat);
+        if w_dot_n.abs() < 1e-6 {
+            return None;
+        }
+        let lambda = -w.length_squared() / (2.0 * w_dot_n);
+        let r = lambda.abs();
+        if r < 1e-4 || r > 1e8 {
+            return None;
+        }
+        let center = pt + n_hat * lambda;
+        let d_line = (center - l_p1).dot(n_line).abs();
+        let res = d_line - r;
+        Some((res, pt, r, center))
+    };
+
+    for i in 0..n_steps {
+        let t_a = i as f64 * dt;
+        let t_b = (i + 1) as f64 * dt;
+
+        let Some((res_a, _, _, _)) = eval_t(t_a) else {
+            continue;
+        };
+        let Some((res_b, _, _, _)) = eval_t(t_b) else {
+            continue;
+        };
+
+        if res_a.signum() != res_b.signum() {
+            let mut lo = t_a;
+            let mut hi = t_b;
+            let mut best_t = (lo + hi) * 0.5;
+            for _ in 0..16 {
+                let mid = (lo + hi) * 0.5;
+                let Some((res_m, _, _, _)) = eval_t(mid) else {
+                    break;
+                };
+                best_t = mid;
+                if res_m.abs() < 1e-8 {
+                    break;
+                }
+                if res_m.signum() == res_a.signum() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            if let Some((res, pt_c, r, center)) = eval_t(best_t) {
+                if res.abs() < 1e-3 {
+                    let pt_l = center - n_line * ((center - l_p1).dot(n_line));
+                    candidates.push((pt_c, pt_l, r));
+                }
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|(c_a, l_a, r_a), (c_b, l_b, r_b)| {
+            let dist_a = (*c_a - hint_c).length_squared()
+                + (*l_a - hint_l).length_squared()
+                + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*c_b - hint_c).length_squared()
+                + (*l_b - hint_l).length_squared()
+                + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            dist_a.total_cmp(&dist_b)
+        })
+        .map(|(pt_c, pt_l, _)| (pt_c, pt_l))
+}
+
+/// Solves CCP (Curve, Curve, Point) where Curve 1 is an Ellipse and Curve 2 is a Line.
+pub fn solve_ellipse_line_ccp(
+    ell: &Ellipse2D,
+    l_p1: DVec2,
+    l_p2: DVec2,
+    p: DVec2,
+    hint_e: DVec2,
+    hint_l: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    let line_vec = l_p2 - l_p1;
+    let line_len = line_vec.length();
+    if line_len < 1e-9 {
+        return None;
+    }
+    let v_line = line_vec / line_len;
+    let n_line = DVec2::new(-v_line.y, v_line.x);
+
+    let n_steps = 144;
+    let dt = TAU / (n_steps as f64);
+    let mut candidates = Vec::new();
+
+    let eval_t = |t: f64| -> Option<(f64, DVec2, f64, DVec2)> {
+        let pt = ell.point_at(t);
+        let n_hat = ell.normal_at(t);
+        let w = pt - p;
+        let w_dot_n = w.dot(n_hat);
+        if w_dot_n.abs() < 1e-6 {
+            return None;
+        }
+        let lambda = -w.length_squared() / (2.0 * w_dot_n);
+        let r = lambda.abs();
+        if r < 1e-4 || r > 1e8 {
+            return None;
+        }
+        let center = pt + n_hat * lambda;
+        let d_line = (center - l_p1).dot(n_line).abs();
+        let res = d_line - r;
+        Some((res, pt, r, center))
+    };
+
+    for i in 0..n_steps {
+        let t_a = i as f64 * dt;
+        let t_b = (i + 1) as f64 * dt;
+
+        let Some((res_a, _, _, _)) = eval_t(t_a) else {
+            continue;
+        };
+        let Some((res_b, _, _, _)) = eval_t(t_b) else {
+            continue;
+        };
+
+        if res_a.signum() != res_b.signum() {
+            let mut lo = t_a;
+            let mut hi = t_b;
+            let mut best_t = (lo + hi) * 0.5;
+            for _ in 0..16 {
+                let mid = (lo + hi) * 0.5;
+                let Some((res_m, _, _, _)) = eval_t(mid) else {
+                    break;
+                };
+                best_t = mid;
+                if res_m.abs() < 1e-8 {
+                    break;
+                }
+                if res_m.signum() == res_a.signum() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            if let Some((res, pt_e, r, center)) = eval_t(best_t) {
+                if res.abs() < 1e-3 {
+                    let pt_l = center - n_line * ((center - l_p1).dot(n_line));
+                    candidates.push((pt_e, pt_l, r));
+                }
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|(e_a, l_a, r_a), (e_b, l_b, r_b)| {
+            let dist_a = (*e_a - hint_e).length_squared()
+                + (*l_a - hint_l).length_squared()
+                + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*e_b - hint_e).length_squared()
+                + (*l_b - hint_l).length_squared()
+                + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            dist_a.total_cmp(&dist_b)
+        })
+        .map(|(pt_e, pt_l, _)| (pt_e, pt_l))
+}
+
+/// Solves PPC (Point, Point, Curve) where Curve is an Ellipse.
+/// Scans the full perimeter t ∈ [0, 2π) to find all valid tangent circles passing through p1 and p2,
+/// and selects the one closest to `hint`.
+pub fn solve_ellipse_ppc(ell: &Ellipse2D, p1: DVec2, p2: DVec2, hint: DVec2) -> Option<DVec2> {
     let d_vec = p2 - p1;
     let d_len = d_vec.length();
     if d_len < 1e-9 {
@@ -613,8 +972,12 @@ pub fn solve_ellipse_ppc(
         let t_a = i as f64 * dt;
         let t_b = (i + 1) as f64 * dt;
 
-        let Some((res_a, _, _, _)) = eval_t(t_a) else { continue; };
-        let Some((res_b, _, _, _)) = eval_t(t_b) else { continue; };
+        let Some((res_a, _, _, _)) = eval_t(t_a) else {
+            continue;
+        };
+        let Some((res_b, _, _, _)) = eval_t(t_b) else {
+            continue;
+        };
 
         let n_hat_a = ell.normal_at(t_a);
         let det_a = n_hat_a.y * n_bisect.x - n_hat_a.x * n_bisect.y;
@@ -630,7 +993,9 @@ pub fn solve_ellipse_ppc(
             let mut best_t = (lo + hi) * 0.5;
             for _ in 0..16 {
                 let mid = (lo + hi) * 0.5;
-                let Some((res_m, _, _, _)) = eval_t(mid) else { break; };
+                let Some((res_m, _, _, _)) = eval_t(mid) else {
+                    break;
+                };
                 best_t = mid;
                 if res_m.abs() < 1e-8 {
                     break;
@@ -696,8 +1061,12 @@ pub fn solve_ellipse_circle_ccp(
             let t_a = i as f64 * dt;
             let t_b = (i + 1) as f64 * dt;
 
-            let Some((_, _, _, res_ext_a, res_int_a)) = eval_t(t_a) else { continue; };
-            let Some((_, _, _, res_ext_b, res_int_b)) = eval_t(t_b) else { continue; };
+            let Some((_, _, _, res_ext_a, res_int_a)) = eval_t(t_a) else {
+                continue;
+            };
+            let Some((_, _, _, res_ext_b, res_int_b)) = eval_t(t_b) else {
+                continue;
+            };
 
             let pt_a = ell.point_at(t_a);
             let n_hat_a = ell.normal_at(t_a);
@@ -709,14 +1078,20 @@ pub fn solve_ellipse_circle_ccp(
                 continue;
             }
 
-            let (ra, rb) = if is_ext { (res_ext_a, res_ext_b) } else { (res_int_a, res_int_b) };
+            let (ra, rb) = if is_ext {
+                (res_ext_a, res_ext_b)
+            } else {
+                (res_int_a, res_int_b)
+            };
             if ra.signum() != rb.signum() {
                 let mut lo = t_a;
                 let mut hi = t_b;
                 let mut best_t = (lo + hi) * 0.5;
                 for _ in 0..16 {
                     let mid = (lo + hi) * 0.5;
-                    let Some((_, _, _, res_ext_m, res_int_m)) = eval_t(mid) else { break; };
+                    let Some((_, _, _, res_ext_m, res_int_m)) = eval_t(mid) else {
+                        break;
+                    };
                     let rm = if is_ext { res_ext_m } else { res_int_m };
                     best_t = mid;
                     if rm.abs() < 1e-8 {
@@ -756,8 +1131,12 @@ pub fn solve_ellipse_circle_ccp(
     candidates
         .into_iter()
         .min_by(|(pt1_a, pt2_a, r_a), (pt1_b, pt2_b, r_b)| {
-            let dist_a = (*pt1_a - hint_ell).length_squared() + (*pt2_a - hint_c2).length_squared() + if *r_a > 50000.0 { 1e8 } else { 0.0 };
-            let dist_b = (*pt1_b - hint_ell).length_squared() + (*pt2_b - hint_c2).length_squared() + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            let dist_a = (*pt1_a - hint_ell).length_squared()
+                + (*pt2_a - hint_c2).length_squared()
+                + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*pt1_b - hint_ell).length_squared()
+                + (*pt2_b - hint_c2).length_squared()
+                + if *r_b > 50000.0 { 1e8 } else { 0.0 };
             dist_a.total_cmp(&dist_b)
         })
         .map(|(pt1, pt2, _)| (pt1, pt2))
@@ -790,9 +1169,11 @@ pub fn solve_ellipse_ellipse_ccp(
         }
         let center = pt1 + n_hat * lambda;
         let normal_pts = ell2.normal_points_for_center(center);
-        let pt2 = normal_pts
-            .into_iter()
-            .min_by(|a, b| (*a - hint2).length_squared().total_cmp(&(*b - hint2).length_squared()))?;
+        let pt2 = normal_pts.into_iter().min_by(|a, b| {
+            (*a - hint2)
+                .length_squared()
+                .total_cmp(&(*b - hint2).length_squared())
+        })?;
         let d2 = (center - pt2).length();
         let res = d2 - r;
         Some((pt1, pt2, r, res))
@@ -802,8 +1183,12 @@ pub fn solve_ellipse_ellipse_ccp(
         let t_a = i as f64 * dt;
         let t_b = (i + 1) as f64 * dt;
 
-        let Some((_, _, _, res_a)) = eval_t(t_a) else { continue; };
-        let Some((_, _, _, res_b)) = eval_t(t_b) else { continue; };
+        let Some((_, _, _, res_a)) = eval_t(t_a) else {
+            continue;
+        };
+        let Some((_, _, _, res_b)) = eval_t(t_b) else {
+            continue;
+        };
 
         let pt_a = ell1.point_at(t_a);
         let n_hat_a = ell1.normal_at(t_a);
@@ -821,7 +1206,9 @@ pub fn solve_ellipse_ellipse_ccp(
             let mut best_t = (lo + hi) * 0.5;
             for _ in 0..16 {
                 let mid = (lo + hi) * 0.5;
-                let Some((_, _, _, res_m)) = eval_t(mid) else { break; };
+                let Some((_, _, _, res_m)) = eval_t(mid) else {
+                    break;
+                };
                 best_t = mid;
                 if res_m.abs() < 1e-8 {
                     break;
@@ -843,8 +1230,12 @@ pub fn solve_ellipse_ellipse_ccp(
     candidates
         .into_iter()
         .min_by(|(pt1_a, pt2_a, r_a), (pt1_b, pt2_b, r_b)| {
-            let dist_a = (*pt1_a - hint1).length_squared() + (*pt2_a - hint2).length_squared() + if *r_a > 50000.0 { 1e8 } else { 0.0 };
-            let dist_b = (*pt1_b - hint1).length_squared() + (*pt2_b - hint2).length_squared() + if *r_b > 50000.0 { 1e8 } else { 0.0 };
+            let dist_a = (*pt1_a - hint1).length_squared()
+                + (*pt2_a - hint2).length_squared()
+                + if *r_a > 50000.0 { 1e8 } else { 0.0 };
+            let dist_b = (*pt1_b - hint1).length_squared()
+                + (*pt2_b - hint2).length_squared()
+                + if *r_b > 50000.0 { 1e8 } else { 0.0 };
             dist_a.total_cmp(&dist_b)
         })
         .map(|(pt1, pt2, _)| (pt1, pt2))
@@ -863,11 +1254,55 @@ fn solve_tangent_ccp(
     let hint1 = DVec2::new(plane.to_local(h1).x, plane.to_local(h1).y);
     let hint2 = DVec2::new(plane.to_local(h2).x, plane.to_local(h2).y);
 
+    let l1 = target_to_line2d(t1, plane);
+    let l2 = target_to_line2d(t2, plane);
     let ell1 = target_to_ellipse2d(t1, plane);
     let ell2 = target_to_ellipse2d(t2, plane);
     let c1 = target_to_circle2d_pure(t1, plane);
     let c2 = target_to_circle2d_pure(t2, plane);
 
+    // Line + Line
+    if let (Some((l1_a, l1_b)), Some((l2_a, l2_b))) = (l1, l2) {
+        let (w1, w2) = solve_line_line_ccp(l1_a, l1_b, l2_a, l2_b, p, hint1, hint2)?;
+        return Some((
+            plane.to_world(DVec3::new(w1.x, w1.y, z)),
+            plane.to_world(DVec3::new(w2.x, w2.y, z)),
+        ));
+    }
+
+    // Line + Circle / Circle + Line
+    if let (Some((l1_a, l1_b)), Some(c2)) = (l1, c2) {
+        let (w2, w1) = solve_circle_line_ccp(c2, l1_a, l1_b, p, hint2, hint1)?;
+        return Some((
+            plane.to_world(DVec3::new(w1.x, w1.y, z)),
+            plane.to_world(DVec3::new(w2.x, w2.y, z)),
+        ));
+    }
+    if let (Some(c1), Some((l2_a, l2_b))) = (c1, l2) {
+        let (w1, w2) = solve_circle_line_ccp(c1, l2_a, l2_b, p, hint1, hint2)?;
+        return Some((
+            plane.to_world(DVec3::new(w1.x, w1.y, z)),
+            plane.to_world(DVec3::new(w2.x, w2.y, z)),
+        ));
+    }
+
+    // Line + Ellipse / Ellipse + Line
+    if let (Some((l1_a, l1_b)), Some(ell2)) = (l1, ell2) {
+        let (w2, w1) = solve_ellipse_line_ccp(&ell2, l1_a, l1_b, p, hint2, hint1)?;
+        return Some((
+            plane.to_world(DVec3::new(w1.x, w1.y, z)),
+            plane.to_world(DVec3::new(w2.x, w2.y, z)),
+        ));
+    }
+    if let (Some(ell1), Some((l2_a, l2_b))) = (ell1, l2) {
+        let (w1, w2) = solve_ellipse_line_ccp(&ell1, l2_a, l2_b, p, hint1, hint2)?;
+        return Some((
+            plane.to_world(DVec3::new(w1.x, w1.y, z)),
+            plane.to_world(DVec3::new(w2.x, w2.y, z)),
+        ));
+    }
+
+    // Ellipse + Circle / Circle + Ellipse
     if let (Some(ell1), Some(c2)) = (ell1, c2) {
         let (w1, w2) = solve_ellipse_circle_ccp(&ell1, c2, p, hint1, hint2)?;
         return Some((
@@ -884,6 +1319,7 @@ fn solve_tangent_ccp(
         ));
     }
 
+    // Ellipse + Ellipse
     if let (Some(ell1), Some(ell2)) = (ell1, ell2) {
         let (w1, w2) = solve_ellipse_ellipse_ccp(&ell1, &ell2, p, hint1, hint2)?;
         return Some((
@@ -892,6 +1328,7 @@ fn solve_tangent_ccp(
         ));
     }
 
+    // Circle + Circle
     if let (Some(c1), Some(c2)) = (c1, c2) {
         let sols = apollonius::solve_ccp(c1, c2, p);
         if let Some(best) = apollonius::best_ccp(&sols, hint1, hint2) {
@@ -916,6 +1353,13 @@ fn solve_tangent_ppc(
     let pt1 = DVec2::new(plane.to_local(p1).x, plane.to_local(p1).y);
     let pt2 = DVec2::new(plane.to_local(p2).x, plane.to_local(p2).y);
     let hint1 = DVec2::new(plane.to_local(h1).x, plane.to_local(h1).y);
+
+    if let Some((l1, l2)) = target_to_line2d(t1, plane) {
+        if let Some(w1_2d) = solve_line_ppc(l1, l2, pt1, pt2, hint1) {
+            return Some(plane.to_world(DVec3::new(w1_2d.x, w1_2d.y, z)));
+        }
+        return None;
+    }
 
     if let Some(ell) = target_to_ellipse2d(t1, plane) {
         if let Some(w1_2d) = solve_ellipse_ppc(&ell, pt1, pt2, hint1) {
@@ -946,9 +1390,15 @@ pub(crate) fn solve_arc_3_inputs(
         // Case 1: Two tangents and one point (Apollonius CCP)
         // (Tangent, Point, Tangent) -> bridging arc through middle point!
         (
-            ArcPick::Tangent { target: t1, hit: h1 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
             ArcPick::Point(mid),
-            ArcPick::Tangent { target: t2, hit: h2 },
+            ArcPick::Tangent {
+                target: t2,
+                hit: h2,
+            },
         ) => {
             if let Some((w1, w2)) = solve_tangent_ccp(t1, h1, t2, h2, mid, plane) {
                 return arc_through_points(w1, mid, w2, plane);
@@ -956,8 +1406,14 @@ pub(crate) fn solve_arc_3_inputs(
         }
         // (Tangent, Tangent, Point)
         (
-            ArcPick::Tangent { target: t1, hit: h1 },
-            ArcPick::Tangent { target: t2, hit: h2 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
+            ArcPick::Tangent {
+                target: t2,
+                hit: h2,
+            },
             ArcPick::Point(end),
         ) => {
             if let Some((w1, w2)) = solve_tangent_ccp(t1, h1, t2, h2, end, plane) {
@@ -967,8 +1423,14 @@ pub(crate) fn solve_arc_3_inputs(
         // (Point, Tangent, Tangent)
         (
             ArcPick::Point(start),
-            ArcPick::Tangent { target: t1, hit: h1 },
-            ArcPick::Tangent { target: t2, hit: h2 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
+            ArcPick::Tangent {
+                target: t2,
+                hit: h2,
+            },
         ) => {
             if let Some((w1, w2)) = solve_tangent_ccp(t1, h1, t2, h2, start, plane) {
                 return arc_through_points(w1, start, w2, plane);
@@ -978,7 +1440,10 @@ pub(crate) fn solve_arc_3_inputs(
         // Case 2: One tangent and two points (Apollonius PPC)
         // (Tangent, Point, Point)
         (
-            ArcPick::Tangent { target: t1, hit: h1 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
             ArcPick::Point(mid),
             ArcPick::Point(end),
         ) => {
@@ -990,7 +1455,10 @@ pub(crate) fn solve_arc_3_inputs(
         (
             ArcPick::Point(start),
             ArcPick::Point(mid),
-            ArcPick::Tangent { target: t1, hit: h1 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
         ) => {
             if let Some(w1) = solve_tangent_ppc(t1, h1, start, mid, plane) {
                 return arc_through_points(start, mid, w1, plane);
@@ -999,7 +1467,10 @@ pub(crate) fn solve_arc_3_inputs(
         // (Point, Tangent, Point)
         (
             ArcPick::Point(start),
-            ArcPick::Tangent { target: t1, hit: h1 },
+            ArcPick::Tangent {
+                target: t1,
+                hit: h1,
+            },
             ArcPick::Point(end),
         ) => {
             if let Some(w1) = solve_tangent_ppc(t1, h1, start, end, plane) {
@@ -1174,21 +1645,53 @@ impl CadCommand for ArcCSECommand {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ArcStep {
     Start,
-    Second { s: ArcPick },
-    End3 { s: ArcPick, m: ArcPick },
+    Second {
+        s: ArcPick,
+    },
+    End3 {
+        s: ArcPick,
+        m: ArcPick,
+    },
     CenterFirst,
-    StartAfterCenter { c: DVec3 },
-    CenterAfterStart { s: DVec3 },
+    StartAfterCenter {
+        c: DVec3,
+    },
+    CenterAfterStart {
+        s: DVec3,
+    },
     /// Start and centre known: end point [Angle / chord Length].
-    EndSC { s: DVec3, c: DVec3 },
-    AngleSC { s: DVec3, c: DVec3 },
-    LengthSC { s: DVec3, c: DVec3 },
-    EndAfterStart { s: DVec3 },
+    EndSC {
+        s: DVec3,
+        c: DVec3,
+    },
+    AngleSC {
+        s: DVec3,
+        c: DVec3,
+    },
+    LengthSC {
+        s: DVec3,
+        c: DVec3,
+    },
+    EndAfterStart {
+        s: DVec3,
+    },
     /// Start and end known: centre point [Angle / Direction / Radius].
-    CenterSE { s: DVec3, e: DVec3 },
-    AngleSE { s: DVec3, e: DVec3 },
-    DirectionSE { s: DVec3, e: DVec3 },
-    RadiusSE { s: DVec3, e: DVec3 },
+    CenterSE {
+        s: DVec3,
+        e: DVec3,
+    },
+    AngleSE {
+        s: DVec3,
+        e: DVec3,
+    },
+    DirectionSE {
+        s: DVec3,
+        e: DVec3,
+    },
+    RadiusSE {
+        s: DVec3,
+        e: DVec3,
+    },
 }
 
 pub struct ArcCommand {
@@ -1214,7 +1717,11 @@ impl ArcCommand {
         }
         let sa = angle_xy(c, s, self.plane);
         let ea = angle_xy(c, e, self.plane);
-        Some(if self.cw { (c, r, ea, sa) } else { (c, r, sa, ea) })
+        Some(if self.cw {
+            (c, r, ea, sa)
+        } else {
+            (c, r, sa, ea)
+        })
     }
 
     /// Arc about `c` from `s` sweeping the signed `span` (radians, CCW > 0).
@@ -1225,7 +1732,11 @@ impl ArcCommand {
         }
         let sa = angle_xy(c, s, self.plane);
         let ea = sa + span;
-        Some(if span < 0.0 { (c, r, ea, sa) } else { (c, r, sa, ea) })
+        Some(if span < 0.0 {
+            (c, r, ea, sa)
+        } else {
+            (c, r, sa, ea)
+        })
     }
 
     /// Arc about `c` from `s` with chord `len` (Ctrl flips).
@@ -1236,7 +1747,11 @@ impl ArcCommand {
         }
         let sa = angle_xy(c, s, self.plane);
         let ea = end_angle_from_chord_len(sa, len, r)?;
-        Some(if self.cw { (c, r, ea, sa) } else { (c, r, sa, ea) })
+        Some(if self.cw {
+            (c, r, ea, sa)
+        } else {
+            (c, r, sa, ea)
+        })
     }
 
     /// Sweep from `s` to the cursor about `c`, going the way Ctrl says.
@@ -1264,7 +1779,11 @@ impl ArcCommand {
         }
     }
 
-    fn preview(&self, arc: Option<(DVec3, f64, f64, f64)>, fallback: WireModel) -> Option<WireModel> {
+    fn preview(
+        &self,
+        arc: Option<(DVec3, f64, f64, f64)>,
+        fallback: WireModel,
+    ) -> Option<WireModel> {
         match arc {
             Some((c, r, sa, ea)) => arc_preview(c, r, sa, ea, self.plane).or(Some(fallback)),
             None => Some(fallback),
@@ -1309,7 +1828,9 @@ impl CadCommand for ArcCommand {
         use crate::command::CmdOption;
         match self.step {
             ArcStep::Start => vec![CmdOption::new("Center", "C")],
-            ArcStep::Second { .. } => vec![CmdOption::new("Center", "C"), CmdOption::new("End", "E")],
+            ArcStep::Second { .. } => {
+                vec![CmdOption::new("Center", "C"), CmdOption::new("End", "E")]
+            }
             ArcStep::EndSC { .. } => vec![
                 CmdOption::new("Angle", "A"),
                 CmdOption::new("chord Length", "L"),
@@ -1337,12 +1858,16 @@ impl CadCommand for ArcCommand {
     fn point_step_accepts_keywords(&self) -> bool {
         matches!(
             self.step,
-            ArcStep::Start | ArcStep::Second { .. } | ArcStep::EndSC { .. } | ArcStep::CenterSE { .. }
+            ArcStep::Start
+                | ArcStep::Second { .. }
+                | ArcStep::EndSC { .. }
+                | ArcStep::CenterSE { .. }
         )
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
-        self.on_point_with_tangent(pt, None).unwrap_or(CmdResult::NeedPoint)
+        self.on_point_with_tangent(pt, None)
+            .unwrap_or(CmdResult::NeedPoint)
     }
 
     fn on_point_with_tangent(
@@ -1571,7 +2096,9 @@ impl CadCommand for ArcCommand {
     }
 
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
-        self.on_preview_wires_with_tangent(pt, None).into_iter().next()
+        self.on_preview_wires_with_tangent(pt, None)
+            .into_iter()
+            .next()
     }
 
     fn on_preview_wires_with_tangent(
@@ -1604,26 +2131,49 @@ impl CadCommand for ArcCommand {
                     WireModel::CYAN,
                     false,
                 );
-                self.preview(solve_arc_3_inputs(s, m, p3, self.plane), fallback).into_iter().collect()
+                self.preview(solve_arc_3_inputs(s, m, p3, self.plane), fallback)
+                    .into_iter()
+                    .collect()
             }
-            ArcStep::EndSC { s, c } => self.preview(self.sc_end(s, c, pt), line_wire(c, pt)).into_iter().collect(),
+            ArcStep::EndSC { s, c } => self
+                .preview(self.sc_end(s, c, pt), line_wire(c, pt))
+                .into_iter()
+                .collect(),
             ArcStep::AngleSC { s, c } => {
                 let span = self.cursor_span(s, c, pt);
-                self.preview(self.sc_angle(s, c, span), line_wire(c, pt)).into_iter().collect()
+                self.preview(self.sc_angle(s, c, span), line_wire(c, pt))
+                    .into_iter()
+                    .collect()
             }
-            ArcStep::LengthSC { s, c } => {
-                self.preview(self.sc_length(s, c, s.distance(pt)), line_wire(s, pt)).into_iter().collect()
-            }
-            ArcStep::CenterSE { s, e } => self.preview(self.sc_end(s, pt, e), line_wire(s, e)).into_iter().collect(),
-            ArcStep::AngleSE { s, e } => {
-                self.preview(arc_from_sagitta(s, e, pt, self.cw, self.plane), line_wire(s, e)).into_iter().collect()
-            }
-            ArcStep::DirectionSE { s, e } => {
-                self.preview(arc_continue(s, pt - s, e, self.cw, self.plane), line_wire(s, e)).into_iter().collect()
-            }
-            ArcStep::RadiusSE { s, e } => {
-                self.preview(arc_from_se_radius(s, e, pt, self.cw, self.plane), line_wire(s, e)).into_iter().collect()
-            }
+            ArcStep::LengthSC { s, c } => self
+                .preview(self.sc_length(s, c, s.distance(pt)), line_wire(s, pt))
+                .into_iter()
+                .collect(),
+            ArcStep::CenterSE { s, e } => self
+                .preview(self.sc_end(s, pt, e), line_wire(s, e))
+                .into_iter()
+                .collect(),
+            ArcStep::AngleSE { s, e } => self
+                .preview(
+                    arc_from_sagitta(s, e, pt, self.cw, self.plane),
+                    line_wire(s, e),
+                )
+                .into_iter()
+                .collect(),
+            ArcStep::DirectionSE { s, e } => self
+                .preview(
+                    arc_continue(s, pt - s, e, self.cw, self.plane),
+                    line_wire(s, e),
+                )
+                .into_iter()
+                .collect(),
+            ArcStep::RadiusSE { s, e } => self
+                .preview(
+                    arc_from_se_radius(s, e, pt, self.cw, self.plane),
+                    line_wire(s, e),
+                )
+                .into_iter()
+                .collect(),
         }
     }
 }
@@ -1660,7 +2210,8 @@ impl CadCommand for Arc3PCommand {
         }
     }
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
-        self.on_point_with_tangent(pt, None).unwrap_or(CmdResult::NeedPoint)
+        self.on_point_with_tangent(pt, None)
+            .unwrap_or(CmdResult::NeedPoint)
     }
 
     fn on_point_with_tangent(
@@ -1702,7 +2253,9 @@ impl CadCommand for Arc3PCommand {
         CmdResult::Cancel
     }
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
-        self.on_preview_wires_with_tangent(pt, None).into_iter().next()
+        self.on_preview_wires_with_tangent(pt, None)
+            .into_iter()
+            .next()
     }
 
     fn on_preview_wires_with_tangent(
@@ -1725,7 +2278,9 @@ impl CadCommand for Arc3PCommand {
                 if let Some((center, radius, start, end)) =
                     solve_arc_3_inputs(p1, p2, p3, self.plane)
                 {
-                    arc_preview(center, radius, start, end, self.plane).into_iter().collect()
+                    arc_preview(center, radius, start, end, self.plane)
+                        .into_iter()
+                        .collect()
                 } else {
                     vec![WireModel::solid_f64(
                         "rubber_band".into(),
@@ -1951,9 +2506,7 @@ impl CadCommand for ArcSCACommand {
             anchor: DynAnchor::Point(self.c),
             fields: vec![DynFieldSpec::new(DynRole::Angle)],
             guide: DynGuide::Polar,
-            ref_point: Some(
-                self.c + self.plane.x * self.sa.cos() + self.plane.y * self.sa.sin(),
-            ),
+            ref_point: Some(self.c + self.plane.x * self.sa.cos() + self.plane.y * self.sa.sin()),
         })
     }
     fn dyn_commit_as_text(&self) -> bool {
@@ -2172,9 +2725,7 @@ impl CadCommand for ArcSEACommand {
                 CmdResult::NeedPoint
             }
             _ => match arc_from_sagitta(self.s, self.e, pt, self.ctrl, self.plane) {
-                Some((center, radius, sa, ea)) => {
-                    arc_result(center, radius, sa, ea, self.plane)
-                }
+                Some((center, radius, sa, ea)) => arc_result(center, radius, sa, ea, self.plane),
                 None => CmdResult::NeedPoint,
             },
         }
@@ -2283,9 +2834,7 @@ impl CadCommand for ArcSERCommand {
                 CmdResult::NeedPoint
             }
             _ => match arc_from_se_radius(self.s, self.e, pt, self.ctrl, self.plane) {
-                Some((center, radius, sa, ea)) => {
-                    arc_result(center, radius, sa, ea, self.plane)
-                }
+                Some((center, radius, sa, ea)) => arc_result(center, radius, sa, ea, self.plane),
                 None => CmdResult::NeedPoint,
             },
         }
@@ -2325,8 +2874,7 @@ impl CadCommand for ArcSERCommand {
         if self.step != 2 {
             return None;
         }
-        arc_from_se_radius(self.s, self.e, cursor, self.ctrl, self.plane)
-            .map(|(_, r, _, _)| r)
+        arc_from_se_radius(self.s, self.e, cursor, self.ctrl, self.plane).map(|(_, r, _, _)| r)
     }
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
         match self.step {
@@ -2399,9 +2947,7 @@ impl CadCommand for ArcSEDCommand {
                 CmdResult::NeedPoint
             }
             _ => match arc_continue(self.s, pt - self.s, self.e, self.ctrl, self.plane) {
-                Some((center, radius, sa, ea)) => {
-                    arc_result(center, radius, sa, ea, self.plane)
-                }
+                Some((center, radius, sa, ea)) => arc_result(center, radius, sa, ea, self.plane),
                 None => CmdResult::NeedPoint,
             },
         }
@@ -2557,9 +3103,7 @@ impl CadCommand for ArcCSACommand {
             anchor: DynAnchor::Point(self.c),
             fields: vec![DynFieldSpec::new(DynRole::Angle)],
             guide: DynGuide::Polar,
-            ref_point: Some(
-                self.c + self.plane.x * self.sa.cos() + self.plane.y * self.sa.sin(),
-            ),
+            ref_point: Some(self.c + self.plane.x * self.sa.cos() + self.plane.y * self.sa.sin()),
         })
     }
     fn dyn_commit_as_text(&self) -> bool {
@@ -2723,6 +3267,223 @@ impl CadCommand for ArcCSLCommand {
     }
 }
 
+/// Solves an arc continuing from start point `s` with initial tangent `tangent`
+/// that touches `target` tangentially.
+///
+/// Returns `(center, radius, start_angle, end_angle, tangent_pt_on_target)`.
+pub fn solve_tangent_continue(
+    s: DVec3,
+    tangent: DVec3,
+    target: TangentObject,
+    hit: DVec3,
+    flip: bool,
+    plane: WorkingPlane,
+) -> Option<(DVec3, f64, f64, f64, DVec3)> {
+    let s_loc = plane.to_local(s);
+    let t_loc = plane.vector_to_local(tangent);
+    let hit_loc = plane.to_local(hit);
+
+    let s2 = DVec2::new(s_loc.x, s_loc.y);
+    let t2 = DVec2::new(t_loc.x, t_loc.y).normalize_or_zero();
+    let hit2 = DVec2::new(hit_loc.x, hit_loc.y);
+
+    if t2.length_squared() < 1e-12 {
+        return None;
+    }
+    let n2 = DVec2::new(-t2.y, t2.x);
+
+    match target {
+        TangentObject::Circle { center, radius } => {
+            let c_loc = plane.to_local(center);
+            let c2 = DVec2::new(c_loc.x, c_loc.y);
+            let r2 = radius.abs();
+            if r2 < 1e-6 {
+                return None;
+            }
+            let d = s2 - c2;
+            let d_len_sq = d.length_squared();
+            let d_dot_n = d.dot(n2);
+
+            let mut candidates = Vec::new();
+            for sigma in [1.0, -1.0] {
+                let denom = 2.0 * (d_dot_n - sigma * r2);
+                if denom.abs() > 1e-9 {
+                    let r = (r2 * r2 - d_len_sq) / denom;
+                    if r.abs() > 1e-4 && r.abs() < 1e8 {
+                        let center2 = s2 + n2 * r;
+                        let v = center2 - c2;
+                        let dist = v.length();
+                        if dist > 1e-9 {
+                            let u = v / dist;
+                            let p1 = c2 + u * r2;
+                            let p2 = c2 - u * r2;
+                            let (best_p, err) = if ((p1 - center2).length() - r.abs()).abs()
+                                <= ((p2 - center2).length() - r.abs())
+                            {
+                                (p1, ((p1 - center2).length() - r.abs()).abs())
+                            } else {
+                                (p2, ((p2 - center2).length() - r.abs()).abs())
+                            };
+                            if err < 1e-3 {
+                                candidates.push(best_p);
+                            }
+                        }
+                    }
+                }
+            }
+
+            candidates
+                .into_iter()
+                .filter_map(|best_p| {
+                    let tgt_world = plane.to_world(DVec3::new(best_p.x, best_p.y, s_loc.z));
+                    let res = arc_continue(s, tangent, tgt_world, flip, plane)?;
+                    let score = (best_p - hit2).length_squared();
+                    Some((score, res, tgt_world))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, (c, r, sa, ea), tgt_world)| (c, r, sa, ea, tgt_world))
+        }
+
+        TangentObject::Line { p1, p2 } => {
+            let p1_loc = plane.to_local(p1);
+            let p2_loc = plane.to_local(p2);
+            let p1_2 = DVec2::new(p1_loc.x, p1_loc.y);
+            let p2_2 = DVec2::new(p2_loc.x, p2_loc.y);
+            let line_vec = p2_2 - p1_2;
+            let line_len = line_vec.length();
+            if line_len < 1e-9 {
+                return None;
+            }
+            let v_line = line_vec / line_len;
+            let n_line = DVec2::new(-v_line.y, v_line.x);
+            let d0 = (s2 - p1_2).dot(n_line);
+            let k = n2.dot(n_line);
+
+            let mut r_candidates = Vec::new();
+            if (1.0 - k).abs() > 1e-9 {
+                r_candidates.push(d0 / (1.0 - k));
+            }
+            if (1.0 + k).abs() > 1e-9 {
+                r_candidates.push(-d0 / (1.0 + k));
+            }
+            if (1.0 - k * k).abs() <= 1e-9 && k.abs() > 1e-9 {
+                r_candidates.push(-d0 / (2.0 * k));
+            }
+
+            let mut candidates = Vec::new();
+            for r in r_candidates {
+                if r.abs() > 1e-4 && r.abs() < 1e8 {
+                    let center2 = s2 + n2 * r;
+                    let p_tgt2 = center2 - n_line * ((center2 - p1_2).dot(n_line));
+                    let err = ((p_tgt2 - center2).length() - r.abs()).abs();
+                    if err < 1e-3 {
+                        candidates.push(p_tgt2);
+                    }
+                }
+            }
+
+            candidates
+                .into_iter()
+                .filter_map(|best_p| {
+                    let tgt_world = plane.to_world(DVec3::new(best_p.x, best_p.y, s_loc.z));
+                    let res = arc_continue(s, tangent, tgt_world, flip, plane)?;
+                    let seg_t = (best_p - p1_2).dot(v_line);
+                    let outside_dist = if seg_t < 0.0 {
+                        -seg_t
+                    } else if seg_t > line_len {
+                        seg_t - line_len
+                    } else {
+                        0.0
+                    };
+                    let score =
+                        (best_p - hit2).length_squared() + outside_dist * outside_dist * 100.0;
+                    Some((score, res, tgt_world))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, (c, r, sa, ea), tgt_world)| (c, r, sa, ea, tgt_world))
+        }
+
+        TangentObject::Ellipse { .. } => {
+            let ell = target_to_ellipse2d(target, plane)?;
+
+            let eval_t = |t: f64| -> Option<(f64, DVec2, f64, DVec2)> {
+                let pt = ell.point_at(t);
+                let n_hat = ell.normal_at(t);
+                let delta = pt - s2;
+                let det = n2.y * n_hat.x - n2.x * n_hat.y;
+                if det.abs() < 1e-6 {
+                    return None;
+                }
+                let r = (-delta.x * n_hat.y + delta.y * n_hat.x) / det;
+                let lambda = (n2.x * delta.y - n2.y * delta.x) / det;
+                let center = s2 + n2 * r;
+                let res = r.abs() - lambda.abs();
+                Some((res, pt, r.abs(), center))
+            };
+
+            let n_steps = 144;
+            let dt = std::f64::consts::TAU / (n_steps as f64);
+            let mut candidates = Vec::new();
+
+            for i in 0..n_steps {
+                let t_a = i as f64 * dt;
+                let t_b = (i + 1) as f64 * dt;
+
+                let Some((res_a, _, _, _)) = eval_t(t_a) else {
+                    continue;
+                };
+                let Some((res_b, _, _, _)) = eval_t(t_b) else {
+                    continue;
+                };
+
+                let n_hat_a = ell.normal_at(t_a);
+                let det_a = n2.y * n_hat_a.x - n2.x * n_hat_a.y;
+                let n_hat_b = ell.normal_at(t_b);
+                let det_b = n2.y * n_hat_b.x - n2.x * n_hat_b.y;
+                if det_a.signum() != det_b.signum() {
+                    continue;
+                }
+
+                if res_a.signum() != res_b.signum() {
+                    let mut lo = t_a;
+                    let mut hi = t_b;
+                    let mut best_t = (lo + hi) * 0.5;
+                    for _ in 0..16 {
+                        let mid = (lo + hi) * 0.5;
+                        let Some((res_m, _, _, _)) = eval_t(mid) else {
+                            break;
+                        };
+                        best_t = mid;
+                        if res_m.abs() < 1e-8 {
+                            break;
+                        }
+                        if res_m.signum() == res_a.signum() {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if let Some((res, pt, r, _center)) = eval_t(best_t) {
+                        if res.abs() < 1e-3 && r.is_finite() && r > 1e-4 && r < 1e8 {
+                            candidates.push(pt);
+                        }
+                    }
+                }
+            }
+
+            candidates
+                .into_iter()
+                .filter_map(|best_p| {
+                    let tgt_world = plane.to_world(DVec3::new(best_p.x, best_p.y, s_loc.z));
+                    let res = arc_continue(s, tangent, tgt_world, flip, plane)?;
+                    let score = (best_p - hit2).length_squared();
+                    Some((score, res, tgt_world))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, (c, r, sa, ea), tgt_world)| (c, r, sa, ea, tgt_world))
+        }
+    }
+}
 
 // ── Command 11: Continue  (ARC_CONT) ──────────────────────────────────────
 pub struct ArcContCommand {
@@ -2731,6 +3492,7 @@ pub struct ArcContCommand {
     /// Live Ctrl state (set via `set_ctrl`): flips the arc to the other way.
     ctrl: bool,
     plane: WorkingPlane,
+    resolved_end: Option<DVec3>,
 }
 
 impl ArcContCommand {
@@ -2740,6 +3502,7 @@ impl ArcContCommand {
             tangent,
             ctrl: false,
             plane: WorkingPlane::default(),
+            resolved_end: None,
         }
     }
 }
@@ -2759,11 +3522,28 @@ impl CadCommand for ArcContCommand {
         self.ctrl = ctrl;
     }
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        self.on_point_with_tangent(pt, None)
+            .unwrap_or(CmdResult::NeedPoint)
+    }
+    fn on_point_with_tangent(
+        &mut self,
+        pt: DVec3,
+        tangent: Option<TangentObject>,
+    ) -> Option<CmdResult> {
+        if let Some(target) = tangent {
+            if let Some((center, radius, sa, ea, tgt_pt)) =
+                solve_tangent_continue(self.s, self.tangent, target, pt, self.ctrl, self.plane)
+            {
+                self.resolved_end = Some(tgt_pt);
+                return Some(arc_result(center, radius, sa, ea, self.plane));
+            }
+        }
         match arc_continue(self.s, self.tangent, pt, self.ctrl, self.plane) {
             Some((center, radius, sa, ea)) => {
-                arc_result(center, radius, sa, ea, self.plane)
+                self.resolved_end = Some(pt);
+                Some(arc_result(center, radius, sa, ea, self.plane))
             }
-            None => CmdResult::NeedPoint,
+            None => Some(CmdResult::NeedPoint),
         }
     }
     fn on_enter(&mut self) -> CmdResult {
@@ -2773,25 +3553,70 @@ impl CadCommand for ArcContCommand {
         CmdResult::Cancel
     }
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
-        match arc_continue(self.s, self.tangent, pt, self.ctrl, self.plane) {
-            Some((center, radius, sa, ea)) => arc_preview(center, radius, sa, ea, self.plane),
-            None => Some(line_wire(self.s, pt)),
+        self.on_preview_wires_with_tangent(pt, None)
+            .into_iter()
+            .next()
+    }
+    fn on_preview_wires_with_tangent(
+        &mut self,
+        pt: DVec3,
+        tangent: Option<TangentObject>,
+    ) -> Vec<WireModel> {
+        if let Some(target) = tangent {
+            if let Some((center, radius, sa, ea, _tgt_pt)) =
+                solve_tangent_continue(self.s, self.tangent, target, pt, self.ctrl, self.plane)
+            {
+                return arc_preview(center, radius, sa, ea, self.plane)
+                    .into_iter()
+                    .collect();
+            }
         }
+        match arc_continue(self.s, self.tangent, pt, self.ctrl, self.plane) {
+            Some((center, radius, sa, ea)) => arc_preview(center, radius, sa, ea, self.plane)
+                .into_iter()
+                .collect(),
+            None => vec![line_wire(self.s, pt)],
+        }
+    }
+    fn resolved_anchor(&self) -> Option<DVec3> {
+        self.resolved_end
     }
 }
 
 // ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC", "ARC_3P"] });  // Arc3PCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_CSA"] });  // ArcCSACommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_CSL"] });  // ArcCSLCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_CSE"] });  // ArcCSECommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SCA"] });  // ArcSCACommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SCE"] });  // ArcSCECommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SCL"] });  // ArcSCLCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SEA"] });  // ArcSEACommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SED"] });  // ArcSEDCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_SER"] });  // ArcSERCommand
-inventory::submit!(crate::command::CommandRegistration { names: &["ARC_CONT"] });  // ArcContCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC", "ARC_3P"]
+}); // Arc3PCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_CSA"]
+}); // ArcCSACommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_CSL"]
+}); // ArcCSLCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_CSE"]
+}); // ArcCSECommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SCA"]
+}); // ArcSCACommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SCE"]
+}); // ArcSCECommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SCL"]
+}); // ArcSCLCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SEA"]
+}); // ArcSEACommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SED"]
+}); // ArcSEDCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_SER"]
+}); // ArcSERCommand
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["ARC_CONT"]
+}); // ArcContCommand
 
 #[cfg(test)]
 mod acad_flow_tests {
@@ -2947,7 +3772,10 @@ mod acad_flow_tests {
         assert!((dist_to_mid - arc.radius).abs() < 1e-3);
         // The arc must be tangent to c1: |center - c1.center| = |arc.radius +- 10|
         let dist_to_c1 = (center - DVec3::new(-20.0, 0.0, 0.0)).length();
-        assert!((dist_to_c1 - (arc.radius + 10.0)).abs() < 1e-3 || (dist_to_c1 - (arc.radius - 10.0).abs()).abs() < 1e-3);
+        assert!(
+            (dist_to_c1 - (arc.radius + 10.0)).abs() < 1e-3
+                || (dist_to_c1 - (arc.radius - 10.0).abs()).abs() < 1e-3
+        );
     }
 
     #[test]
@@ -3015,7 +3843,10 @@ mod acad_flow_tests {
         };
         let d_start = check_on_ellipse(arc_start);
         let d_end = check_on_ellipse(arc_end);
-        assert!(d_start < 1e-3 || d_end < 1e-3, "One arc endpoint must lie on the ellipse: d_start={d_start}, d_end={d_end}");
+        assert!(
+            d_start < 1e-3 || d_end < 1e-3,
+            "One arc endpoint must lie on the ellipse: d_start={d_start}, d_end={d_end}"
+        );
     }
 
     #[test]
@@ -3053,12 +3884,14 @@ mod acad_flow_tests {
             arc.center.y + arc.radius * arc.end_angle.sin(),
             0.0,
         );
-        let check_on_ellipse = |pt: DVec3| {
-            ((pt.x / 20.0).powi(2) + (pt.y / 10.0).powi(2) - 1.0).abs()
-        };
+        let check_on_ellipse =
+            |pt: DVec3| ((pt.x / 20.0).powi(2) + (pt.y / 10.0).powi(2) - 1.0).abs();
         let d_start = check_on_ellipse(arc_start);
         let d_end = check_on_ellipse(arc_end);
-        assert!(d_start < 1e-3 || d_end < 1e-3, "Arc must terminate exactly on ellipse: d_start={d_start}, d_end={d_end}");
+        assert!(
+            d_start < 1e-3 || d_end < 1e-3,
+            "Arc must terminate exactly on ellipse: d_start={d_start}, d_end={d_end}"
+        );
     }
 
     #[test]
@@ -3100,7 +3933,10 @@ mod acad_flow_tests {
         };
         let d_start = check_on_ellipse(arc_start);
         let d_end = check_on_ellipse(arc_end);
-        assert!(d_start < 1e-3 || d_end < 1e-3, "Arc must terminate exactly on ellipse: d_start={d_start}, d_end={d_end}");
+        assert!(
+            d_start < 1e-3 || d_end < 1e-3,
+            "Arc must terminate exactly on ellipse: d_start={d_start}, d_end={d_end}"
+        );
     }
 
     #[test]
@@ -3141,9 +3977,7 @@ mod acad_flow_tests {
             let dy = pt.y - 0.0;
             ((dx / 20.0).powi(2) + (dy / 10.0).powi(2) - 1.0).abs()
         };
-        let check_on_circle = |pt: DVec3| {
-            ((pt - DVec3::new(30.0, 0.0, 0.0)).length() - 10.0).abs()
-        };
+        let check_on_circle = |pt: DVec3| ((pt - DVec3::new(30.0, 0.0, 0.0)).length() - 10.0).abs();
 
         // BOTH endpoints must be tangent: one on ellipse 1, one on circle 2!
         let start_on_e1 = check_on_ellipse(arc_start) < 1e-3;
@@ -3213,5 +4047,303 @@ mod acad_flow_tests {
             "Both endpoints must terminate tangentially on the respective ellipses! start: {arc_start:?}, end: {arc_end:?}"
         );
     }
-}
 
+    #[test]
+    fn arc_cont_tangent_to_circle() {
+        let s = DVec3::new(0.0, 0.0, 0.0);
+        let tangent = DVec3::new(1.0, 0.0, 0.0);
+        let mut cmd = ArcContCommand::new(s, tangent);
+
+        let circle = TangentObject::Circle {
+            center: DVec3::new(10.0, 10.0, 0.0),
+            radius: 4.0,
+        };
+
+        let hit = DVec3::new(10.0, 6.0, 0.0);
+        let result = cmd.on_point_with_tangent(hit, Some(circle));
+        let arc = committed_arc(result.expect("arc cont command completed with tangent circle"));
+
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+        let start_pt = DVec3::new(
+            arc.center.x + arc.radius * arc.start_angle.cos(),
+            arc.center.y + arc.radius * arc.start_angle.sin(),
+            0.0,
+        );
+        let end_pt = DVec3::new(
+            arc.center.x + arc.radius * arc.end_angle.cos(),
+            arc.center.y + arc.radius * arc.end_angle.sin(),
+            0.0,
+        );
+        assert!(start_pt.distance(s) < 1e-3 || end_pt.distance(s) < 1e-3);
+
+        let resolved = cmd.resolved_anchor().expect("resolved anchor must exist");
+        let circle_center = DVec3::new(10.0, 10.0, 0.0);
+        assert!(
+            (resolved.distance(circle_center) - 4.0).abs() < 1e-3,
+            "resolved point must be on circle circumference"
+        );
+
+        let center_dist = center.distance(circle_center);
+        let is_ext_tangent = (center_dist - (arc.radius + 4.0)).abs() < 1e-3;
+        let is_int_tangent = (center_dist - (arc.radius - 4.0).abs()).abs() < 1e-3;
+        assert!(
+            is_ext_tangent || is_int_tangent,
+            "Arc must be tangent to circle: center_dist={center_dist}, arc.radius={}",
+            arc.radius
+        );
+    }
+
+    #[test]
+    fn arc_cont_tangent_to_line() {
+        let s = DVec3::new(0.0, 0.0, 0.0);
+        let tangent = DVec3::new(1.0, 0.0, 0.0);
+        let mut cmd = ArcContCommand::new(s, tangent);
+
+        let line = TangentObject::Line {
+            p1: DVec3::new(5.0, 10.0, 0.0),
+            p2: DVec3::new(15.0, 10.0, 0.0),
+        };
+
+        let hit = DVec3::new(10.0, 10.0, 0.0);
+        let result = cmd.on_point_with_tangent(hit, Some(line));
+        let arc = committed_arc(result.expect("arc cont completed with tangent line"));
+
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+        assert!(((center.y - 10.0).abs() - arc.radius).abs() < 1e-3);
+
+        let resolved = cmd.resolved_anchor().expect("resolved anchor must exist");
+        assert!(
+            (resolved.y - 10.0).abs() < 1e-3,
+            "resolved point must lie on the line"
+        );
+    }
+
+    #[test]
+    fn arc_cont_tangent_to_ellipse() {
+        let s = DVec3::new(0.0, 0.0, 0.0);
+        let tangent = DVec3::new(1.0, 0.0, 0.0);
+        let mut cmd = ArcContCommand::new(s, tangent);
+
+        let ell = TangentObject::Ellipse {
+            center: DVec3::new(20.0, 10.0, 0.0),
+            major_axis: DVec3::new(10.0, 0.0, 0.0),
+            normal: DVec3::Z,
+            minor_axis_ratio: 0.5,
+        };
+
+        let hit = DVec3::new(15.0, 10.0, 0.0);
+        let result = cmd.on_point_with_tangent(hit, Some(ell));
+        let _arc = committed_arc(result.expect("arc cont completed with tangent ellipse"));
+
+        let resolved = cmd.resolved_anchor().expect("resolved anchor must exist");
+        let dx = (resolved.x - 20.0) / 10.0;
+        let dy = (resolved.y - 10.0) / 5.0;
+        assert!(
+            (dx * dx + dy * dy - 1.0).abs() < 1e-3,
+            "resolved point must lie on ellipse"
+        );
+    }
+
+    #[test]
+    fn arc_3p_fluid_tangent_start_from_line() {
+        let mut cmd = Arc3PCommand::new();
+        let line = TangentObject::Line {
+            p1: DVec3::new(-10.0, 0.0, 0.0),
+            p2: DVec3::new(10.0, 0.0, 0.0),
+        };
+
+        // Pick 1: Tangent on line y = 0
+        let r1 = cmd.on_point_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        assert!(matches!(r1, Some(CmdResult::NeedPoint)));
+
+        // Pick 2: Pass-through point
+        let r2 = cmd.on_point_with_tangent(DVec3::new(0.0, 2.0, 0.0), None);
+        assert!(matches!(r2, Some(CmdResult::NeedPoint)));
+
+        // Live preview at (2, 2, 0)
+        let preview = cmd.on_preview_wires_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+        assert!(!preview.is_empty(), "Live preview must generate arc wire");
+        assert!(
+            preview[0]
+                .tangent_geoms
+                .iter()
+                .any(|g| matches!(g, TangentGeom::Arc { .. })),
+            "Preview must produce an analytical arc geometry"
+        );
+
+        // Pick 3: Second pass-through point
+        let r3 = cmd.on_point_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+        let arc = committed_arc(r3.expect("command completed"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+
+        // Expected center: (1.0, 1.25, 0.0), radius: 1.25
+        assert!((center.x - 1.0).abs() < 1e-3);
+        assert!((center.y - 1.25).abs() < 1e-3);
+        assert!((arc.radius - 1.25).abs() < 1e-3);
+
+        // Tangent to y = 0 line
+        assert!((center.y.abs() - arc.radius).abs() < 1e-3);
+        // Passes through (0, 2) and (2, 2)
+        assert!(((center - DVec3::new(0.0, 2.0, 0.0)).length() - arc.radius).abs() < 1e-3);
+        assert!(((center - DVec3::new(2.0, 2.0, 0.0)).length() - arc.radius).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arc_3p_fluid_tangent_end_at_line() {
+        let mut cmd = Arc3PCommand::new();
+        let line = TangentObject::Line {
+            p1: DVec3::new(-10.0, 0.0, 0.0),
+            p2: DVec3::new(10.0, 0.0, 0.0),
+        };
+
+        // Pick 1: Point 1
+        cmd.on_point_with_tangent(DVec3::new(0.0, 2.0, 0.0), None);
+        // Pick 2: Point 2
+        cmd.on_point_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+
+        // Preview with tangent snap on line
+        let preview = cmd.on_preview_wires_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        assert!(!preview.is_empty(), "Live preview must generate arc wire");
+        assert!(
+            preview[0]
+                .tangent_geoms
+                .iter()
+                .any(|g| matches!(g, TangentGeom::Arc { .. })),
+            "Preview must produce an analytical arc geometry"
+        );
+
+        // Pick 3: Tangent on line
+        let r3 = cmd.on_point_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        let arc = committed_arc(r3.expect("command completed"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+
+        assert!((center.x - 1.0).abs() < 1e-3);
+        assert!((center.y - 1.25).abs() < 1e-3);
+        assert!((arc.radius - 1.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arc_command_start_from_tangent_line() {
+        let mut cmd = ArcCommand::new();
+        let line = TangentObject::Line {
+            p1: DVec3::new(-10.0, 0.0, 0.0),
+            p2: DVec3::new(10.0, 0.0, 0.0),
+        };
+
+        // Pick 1: Tangent snap to line
+        let r1 = cmd.on_point_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        assert!(matches!(r1, Some(CmdResult::NeedPoint)));
+
+        // Pick 2: Point
+        let r2 = cmd.on_point_with_tangent(DVec3::new(0.0, 2.0, 0.0), None);
+        assert!(matches!(r2, Some(CmdResult::NeedPoint)));
+
+        // Move to Pick 3: Live preview should show curved arc wire, NOT fallback straight line
+        let preview = cmd.on_preview_wires_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+        assert!(!preview.is_empty(), "Live preview must exist");
+        assert!(
+            preview[0]
+                .tangent_geoms
+                .iter()
+                .any(|g| matches!(g, TangentGeom::Arc { .. })),
+            "Preview must produce an arc, not a straight fallback line"
+        );
+
+        // Pick 3: Point -> Must commit CadArc!
+        let r3 = cmd.on_point_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+        let arc = committed_arc(r3.expect("arc command must commit"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+        assert!((center.y.abs() - arc.radius).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arc_command_end_at_tangent_line() {
+        let mut cmd = ArcCommand::new();
+        let line = TangentObject::Line {
+            p1: DVec3::new(-10.0, 0.0, 0.0),
+            p2: DVec3::new(10.0, 0.0, 0.0),
+        };
+
+        // Pick 1: Point
+        cmd.on_point_with_tangent(DVec3::new(0.0, 2.0, 0.0), None);
+        // Pick 2: Point
+        cmd.on_point_with_tangent(DVec3::new(2.0, 2.0, 0.0), None);
+
+        // Preview with tangent on line
+        let preview = cmd.on_preview_wires_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        assert!(!preview.is_empty());
+        assert!(
+            preview[0]
+                .tangent_geoms
+                .iter()
+                .any(|g| matches!(g, TangentGeom::Arc { .. })),
+            "Preview must produce an arc, not a straight fallback line"
+        );
+
+        // Pick 3: Tangent on line -> commits CadArc!
+        let r3 = cmd.on_point_with_tangent(DVec3::new(1.0, 0.0, 0.0), Some(line));
+        let arc = committed_arc(r3.expect("arc command must commit"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+        assert!((center.y.abs() - arc.radius).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arc_3p_fluid_tangent_two_lines_and_point() {
+        let mut cmd = Arc3PCommand::new();
+        let line1 = TangentObject::Line {
+            p1: DVec3::new(-10.0, 0.0, 0.0),
+            p2: DVec3::new(10.0, 0.0, 0.0),
+        };
+        let line2 = TangentObject::Line {
+            p1: DVec3::new(0.0, -10.0, 0.0),
+            p2: DVec3::new(0.0, 10.0, 0.0),
+        };
+
+        // Pick 1: Tangent on Line 1 (y = 0)
+        cmd.on_point_with_tangent(DVec3::new(2.0, 0.0, 0.0), Some(line1));
+        // Pick 2: Point in first quadrant
+        cmd.on_point_with_tangent(
+            DVec3::new(1.0 - (0.5_f64).sqrt(), 1.0 - (0.5_f64).sqrt(), 0.0),
+            None,
+        );
+        // Pick 3: Tangent on Line 2 (x = 0)
+        let r3 = cmd.on_point_with_tangent(DVec3::new(0.0, 2.0, 0.0), Some(line2));
+        let arc = committed_arc(r3.expect("two-line arc command must commit"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+
+        // Center should be equidistant to both lines (x = y = radius)
+        assert!((center.x.abs() - arc.radius).abs() < 1e-3);
+        assert!((center.y.abs() - arc.radius).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arc_3p_fluid_tangent_line_and_circle() {
+        let mut cmd = Arc3PCommand::new();
+        let line = TangentObject::Line {
+            p1: DVec3::new(-20.0, 0.0, 0.0),
+            p2: DVec3::new(20.0, 0.0, 0.0),
+        };
+        let circle = TangentObject::Circle {
+            center: DVec3::new(0.0, 10.0, 0.0),
+            radius: 2.0,
+        };
+
+        // Pick 1: Tangent on line
+        cmd.on_point_with_tangent(DVec3::new(0.0, 0.0, 0.0), Some(line));
+        // Pick 2: Middle point
+        cmd.on_point_with_tangent(DVec3::new(3.0, 4.0, 0.0), None);
+        // Pick 3: Tangent on circle
+        let r3 = cmd.on_point_with_tangent(DVec3::new(0.0, 8.0, 0.0), Some(circle));
+        let arc = committed_arc(r3.expect("line and circle arc must commit"));
+        let center = DVec3::new(arc.center.x, arc.center.y, arc.center.z);
+
+        // Distance from center to line must equal radius
+        assert!((center.y.abs() - arc.radius).abs() < 1e-3);
+        // Distance from center to circle must equal radius +- circle.radius
+        let dist_to_circle = center.distance(DVec3::new(0.0, 10.0, 0.0));
+        assert!(
+            (dist_to_circle - (arc.radius + 2.0)).abs() < 1e-3
+                || (dist_to_circle - (arc.radius - 2.0).abs()).abs() < 1e-3
+        );
+    }
+}

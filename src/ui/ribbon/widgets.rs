@@ -20,10 +20,10 @@ use iced::{
 
 use crate::app::Message;
 use crate::modules::{IconKind, ModuleEvent, RibbonItem, StyleKey, ToolDef};
-use crate::ui::wrap_bar::PosReport;
+use crate::t;
 use crate::ui::icons;
 use crate::ui::properties::{acad_color_display, linetype_display_name, LwItem};
-use crate::t;
+use crate::ui::wrap_bar::PosReport;
 
 use super::LayerInfo;
 
@@ -37,7 +37,11 @@ pub(super) struct ToggleState {
     pub show_viewcube: bool,
     pub show_ucs_icon: bool,
     pub show_properties: bool,
+    pub show_count_palette: bool,
+    pub show_graphic_attributes: bool,
+    pub show_authoring_palettes: bool,
     pub show_block_palette: bool,
+    pub show_sheet_set: bool,
     pub show_file_tabs: bool,
     pub show_layout_tabs: bool,
 }
@@ -90,13 +94,14 @@ const COMBO_PANEL_PAD: Padding = Padding {
 thread_local! {
     /// Ribbon layout runs on every pointer-driven view update. Cache the font-
     /// measured width per translated label so the automatic sizing stays cheap.
-    static LARGE_WIDTH_CACHE: RefCell<HashMap<String, f32>> =
-        RefCell::new(HashMap::default());
+    /// Tagged with the UI-font generation it was measured with.
+    static LARGE_WIDTH_CACHE: RefCell<(u32, HashMap<String, f32>)> =
+        RefCell::new((0, HashMap::default()));
 }
 
 /// Dropdown items that report a state and cannot be picked.
 pub(super) fn is_disabled_item(cmd: &str) -> bool {
-    cmd == "FRAMES3"
+    matches!(cmd, "FRAMES3" | "UOSNAP2")
 }
 
 fn ribbon_label_bounds(
@@ -107,8 +112,8 @@ fn ribbon_label_bounds(
 ) -> Size {
     use advanced_text::{Paragraph as _, Renderer as _};
 
-    let paragraph = <iced::Renderer as advanced_text::Renderer>::Paragraph::with_text(
-        advanced_text::Text {
+    let paragraph =
+        <iced::Renderer as advanced_text::Renderer>::Paragraph::with_text(advanced_text::Text {
             content: label,
             bounds: Size::new(width, f32::INFINITY),
             size: Pixels(LARGE_LABEL_SIZE),
@@ -120,8 +125,7 @@ fn ribbon_label_bounds(
             wrapping,
             ellipsis: advanced_text::Ellipsis::None,
             hint_factor: None,
-        },
-    );
+        });
     paragraph.min_bounds()
 }
 
@@ -136,12 +140,7 @@ fn measure_large_width(renderer: &iced::Renderer, label: &str) -> f32 {
         .0;
     let max_label_height = line_height * LARGE_LABEL_LINES + 0.5;
     let fits = |width: f32| {
-        let bounds = ribbon_label_bounds(
-            renderer,
-            label,
-            width,
-            advanced_text::Wrapping::Word,
-        );
+        let bounds = ribbon_label_bounds(renderer, label, width, advanced_text::Wrapping::Word);
         bounds.width <= width + 0.5 && bounds.height <= max_label_height
     };
 
@@ -175,13 +174,20 @@ fn measure_large_width(renderer: &iced::Renderer, label: &str) -> f32 {
 }
 
 fn automatic_large_width(renderer: &iced::Renderer, label: &str) -> f32 {
-    if let Some(width) = LARGE_WIDTH_CACHE.with(|cache| cache.borrow().get(label).copied()) {
+    let generation = crate::sys::ui_font::generation();
+    if let Some(width) = LARGE_WIDTH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != generation {
+            *cache = (generation, HashMap::default());
+        }
+        cache.1.get(label).copied()
+    }) {
         return width;
     }
 
     let width = measure_large_width(renderer, label);
     LARGE_WIDTH_CACHE.with(|cache| {
-        cache.borrow_mut().insert(label.to_string(), width);
+        cache.borrow_mut().1.insert(label.to_string(), width);
     });
     width
 }
@@ -215,11 +221,9 @@ impl Widget<Message, Theme, iced::Renderer> for AutomaticLargeWidth<'_> {
         limits: &layout::Limits,
     ) -> layout::Node {
         let width = automatic_large_width(renderer, &self.label);
-        self.content.as_widget_mut().layout(
-            tree,
-            renderer,
-            &limits.width(Length::Fixed(width)),
-        )
+        self.content
+            .as_widget_mut()
+            .layout(tree, renderer, &limits.width(Length::Fixed(width)))
     }
 
     fn operate(
@@ -244,9 +248,9 @@ impl Widget<Message, Theme, iced::Renderer> for AutomaticLargeWidth<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget_mut().update(
-            tree, event, layout, cursor, renderer, shell, viewport,
-        );
+        self.content
+            .as_widget_mut()
+            .update(tree, event, layout, cursor, renderer, shell, viewport);
     }
 
     fn mouse_interaction(
@@ -308,7 +312,7 @@ pub(super) const TOP_HIST_GAP: f32 = 4.0;
 
 pub(crate) const UNDO_HISTORY_ID: &str = "UNDO_HISTORY";
 pub(crate) const REDO_HISTORY_ID: &str = "REDO_HISTORY";
-pub(super) const LAYER_COMBO_ID: &str = "LAYER_COMBO";
+pub(crate) const LAYER_COMBO_ID: &str = "LAYER_COMBO";
 /// Dropdown id for the tab-bar panel-density selector.
 pub(super) const COLLAPSE_MODE_ID: &str = "COLLAPSE_MODE";
 pub(super) const PROP_COLOR_ID: &str = "PROP_COLOR";
@@ -368,18 +372,18 @@ pub(super) fn make_icon(icon: IconKind, size: f32) -> Element<'static, Message> 
     }
 }
 
-pub(super) fn is_active_tool(
-    id: &str,
-    active_tool: &Option<String>,
-    state: &ToggleState,
-) -> bool {
+pub(super) fn is_active_tool(id: &str, active_tool: &Option<String>, state: &ToggleState) -> bool {
     match id {
         "ORTHO" => state.ortho_mode,
         "PERSP" => !state.ortho_mode,
         "NAVVCUBE" => state.show_viewcube,
         "UCSICON" => state.show_ucs_icon,
         "PROPERTIES" => state.show_properties,
+        "COUNTLIST" => state.show_count_palette,
+        "GRAPHICATTRIBUTES" => state.show_graphic_attributes,
+        "BAUTHORPALETTE" => state.show_authoring_palettes,
         "BLOCKPALETTE" => state.show_block_palette,
+        "SHEETSET" => state.show_sheet_set,
         "FILETAB" => state.show_file_tabs,
         "LAYOUTTAB" => state.show_layout_tabs,
         id => active_tool.as_deref() == Some(id),
@@ -403,8 +407,10 @@ pub(super) fn tool_btn_style(
     button::Style {
         background: is_active
             .then_some(Background::Color(pair.color))
-            .or_else(|| matches!(status, button::Status::Hovered | button::Status::Pressed)
-                .then_some(Background::Color(pair.color))),
+            .or_else(|| {
+                matches!(status, button::Status::Hovered | button::Status::Pressed)
+                    .then_some(Background::Color(pair.color))
+            }),
         text_color: pair.text,
         border: Border {
             radius: 3.0.into(),
@@ -446,7 +452,7 @@ pub(super) fn combo_btn_style(
     }
 }
 
-pub(super) fn popup_row_style(theme: &Theme, status: button::Status) -> button::Style {
+pub(crate) fn popup_row_style(theme: &Theme, status: button::Status) -> button::Style {
     let palette = theme.palette();
     let pair = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         palette.background.weak
@@ -460,7 +466,7 @@ pub(super) fn popup_row_style(theme: &Theme, status: button::Status) -> button::
     }
 }
 
-pub(super) fn popup_panel_style(theme: &Theme) -> container::Style {
+pub(crate) fn popup_panel_style(theme: &Theme) -> container::Style {
     let palette = theme.palette();
     container::Style {
         background: Some(Background::Color(palette.background.base.color)),
@@ -503,6 +509,8 @@ fn tool_description(id: &str) -> Option<&'static str> {
 /// A tool's tooltip: its name, its description when one is known, and the
 /// command it runs.
 fn tool_tip_text(label: &str, id: &str) -> String {
+    // A macro (`PDFIMPORT;FILE`) shows the command it starts.
+    let id = id.split(';').next().unwrap_or(id);
     match tool_description(id) {
         Some(description) => format!("{label}\n{}\n{} {id}", t!(description), t!("Command:")),
         None => format!("{label}\n{} {id}", t!("Command:")),
@@ -547,11 +555,13 @@ pub(super) fn render_small<'a>(
                 .width(Length::Fixed(SMALL_W))
                 .height(ROW_H)
                 .padding([4, 4]);
-            tooltip(btn, make_tip(tip_text), TipPos::Right)
-                .gap(6.0)
-                .delay(Duration::from_millis(400))
-                .style(tip_style)
-                .into()
+            super::keytips::anchor(
+                t.id,
+                tooltip(btn, make_tip(tip_text), TipPos::Right)
+                    .gap(6.0)
+                    .delay(Duration::from_millis(400))
+                    .style(tip_style),
+            )
         }
 
         RibbonItem::LabeledTool(t) => {
@@ -562,16 +572,26 @@ pub(super) fn render_small<'a>(
             let tip_text = tool_tip_text(&label, t.id);
             let content = row![
                 container(make_icon(t.icon, SMALL_ICON)).width(Length::Fixed(SMALL_W)),
-                text(label).size(10).wrapping(advanced_text::Wrapping::None),
-            ].spacing(3).align_y(iced::Center);
+                super::keytips::label_anchor(
+                    || super::keytips::label_id(t.id),
+                    text(label).size(10).wrapping(advanced_text::Wrapping::None),
+                ),
+            ]
+            .spacing(3)
+            .align_y(iced::Center);
             let btn = button(content)
                 .on_press(Message::RibbonToolClick { tool_id, event })
                 .style(move |theme: &Theme, status| tool_btn_style(theme, active, status))
                 .width(Length::Fixed(LABELED_SMALL_W + ARROW_W))
                 .height(ROW_H)
                 .padding([3, 4]);
-            tooltip(btn, make_tip(tip_text), TipPos::Right)
-                .gap(6.0).delay(Duration::from_millis(400)).style(tip_style).into()
+            super::keytips::anchor(
+                t.id,
+                tooltip(btn, make_tip(tip_text), TipPos::Right)
+                    .gap(6.0)
+                    .delay(Duration::from_millis(400))
+                    .style(tip_style),
+            )
         }
 
         RibbonItem::Dropdown {
@@ -638,9 +658,7 @@ pub(super) fn render_small<'a>(
                     .align_y(iced::Center),
             )
             .on_press(Message::ToggleRibbonDropdown(id.to_string()))
-            .style(move |theme: &Theme, status| {
-                tool_btn_style(theme, dd_open, status)
-            })
+            .style(move |theme: &Theme, status| tool_btn_style(theme, dd_open, status))
             .width(Length::Fixed(ARROW_W))
             .height(ROW_H)
             .padding(0);
@@ -661,15 +679,30 @@ pub(super) fn render_small<'a>(
             .into()
         }
 
-        RibbonItem::LabeledDropdown { id, label, icon, items, default } => {
+        RibbonItem::LabeledDropdown {
+            id,
+            label,
+            icon,
+            items,
+            default,
+        } => {
             let active = active_tool.as_deref() == Some(*id)
-                || items.iter().any(|(cmd, _, _)| active_tool.as_deref() == Some(*cmd));
+                || items
+                    .iter()
+                    .any(|(cmd, _, _)| active_tool.as_deref() == Some(*cmd));
             let dd_open = open_dd.as_deref() == Some(*id);
             let last = last_cmd.get(id).copied().unwrap_or(*default);
-            let cur_icon = last_cmd.get(id).copied().and_then(|cmd| {
-                items.iter().find(|(candidate, _, _)| *candidate == cmd)
-                    .map(|(_, _, item_icon)| *item_icon)
-            }).or_else(|| items.first().map(|(_, _, item_icon)| *item_icon)).unwrap_or(*icon);
+            let cur_icon = last_cmd
+                .get(id)
+                .copied()
+                .and_then(|cmd| {
+                    items
+                        .iter()
+                        .find(|(candidate, _, _)| *candidate == cmd)
+                        .map(|(_, _, item_icon)| *item_icon)
+                })
+                .or_else(|| items.first().map(|(_, _, item_icon)| *item_icon))
+                .unwrap_or(*icon);
             let localized_label = if label.is_empty() {
                 items
                     .iter()
@@ -681,8 +714,15 @@ pub(super) fn render_small<'a>(
             };
             let face = row![
                 container(make_icon(cur_icon, SMALL_ICON)).width(Length::Fixed(SMALL_W)),
-                text(localized_label.clone()).size(10).wrapping(advanced_text::Wrapping::None),
-            ].spacing(3).align_y(iced::Center);
+                super::keytips::label_anchor(
+                    || super::keytips::label_id(id),
+                    text(localized_label.clone())
+                        .size(10)
+                        .wrapping(advanced_text::Wrapping::None),
+                ),
+            ]
+            .spacing(3)
+            .align_y(iced::Center);
             // A state that is only shown (not chosen) opens the list instead.
             let face_btn = button(face)
                 .on_press(if is_disabled_item(last) {
@@ -694,20 +734,39 @@ pub(super) fn render_small<'a>(
                     }
                 })
                 .style(move |theme: &Theme, status| tool_btn_style(theme, active, status))
-                .width(Length::Shrink).height(ROW_H).padding([3, 4]);
-            let arrow = button(container(icons::themed_arrow_down(8.0))
-                .width(Fill).height(Fill).align_x(iced::Center).align_y(iced::Center))
-                .on_press(Message::ToggleRibbonDropdown(id.to_string()))
-                .style(move |theme: &Theme, status| tool_btn_style(theme, dd_open, status))
-                .width(Length::Fixed(ARROW_W)).height(ROW_H).padding(0);
+                .width(Length::Shrink)
+                .height(ROW_H)
+                .padding([3, 4]);
+            let arrow = button(
+                container(icons::themed_arrow_down(8.0))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_x(iced::Center)
+                    .align_y(iced::Center),
+            )
+            .on_press(Message::ToggleRibbonDropdown(id.to_string()))
+            .style(move |theme: &Theme, status| tool_btn_style(theme, dd_open, status))
+            .width(Length::Fixed(ARROW_W))
+            .height(ROW_H)
+            .padding(0);
             let face_tip = tool_tip_text(&localized_label, last);
             let arrow_tip = format!("{} {}", localized_label, t!("options"));
-            PosReport::new(*id, row![
-                tooltip(face_btn, make_tip(face_tip), TipPos::Right)
-                    .gap(6.0).delay(Duration::from_millis(400)).style(tip_style),
-                tooltip(arrow, make_tip(arrow_tip), TipPos::Right)
-                    .gap(6.0).delay(Duration::from_millis(400)).style(tip_style),
-            ].spacing(0).height(ROW_H)).into()
+            PosReport::new(
+                *id,
+                row![
+                    tooltip(face_btn, make_tip(face_tip), TipPos::Right)
+                        .gap(6.0)
+                        .delay(Duration::from_millis(400))
+                        .style(tip_style),
+                    tooltip(arrow, make_tip(arrow_tip), TipPos::Right)
+                        .gap(6.0)
+                        .delay(Duration::from_millis(400))
+                        .style(tip_style),
+                ]
+                .spacing(0)
+                .height(ROW_H),
+            )
+            .into()
         }
 
         _ => text("").into(),
@@ -759,15 +818,29 @@ pub(super) fn render_large_dropdown<'a>(
     let cur_icon = last_cmd
         .get(id)
         .copied()
-        .and_then(|cmd| items.iter().find(|(c, _, _)| *c == cmd).map(|(_, _, ik)| *ik))
+        .and_then(|cmd| {
+            items
+                .iter()
+                .find(|(c, _, _)| *c == cmd)
+                .map(|(_, _, ik)| *ik)
+        })
         .or_else(|| items.first().map(|(_, _, ik)| *ik))
         .unwrap_or(icon);
     let cur_label = last_cmd
         .get(id)
         .copied()
-        .and_then(|cmd| items.iter().find(|(c, _, _)| *c == cmd).map(|(_, lbl, _)| *lbl))
+        .and_then(|cmd| {
+            items
+                .iter()
+                .find(|(c, _, _)| *c == cmd)
+                .map(|(_, lbl, _)| *lbl)
+        })
         .or_else(|| items.first().map(|(_, lbl, _)| *lbl))
         .unwrap_or(id);
+    // An empty label: the face keeps its own icon and names the chosen item.
+    let names_item = explicit_label == Some("");
+    let cur_icon = if names_item { icon } else { cur_icon };
+    let explicit_label = explicit_label.filter(|label| !label.is_empty());
     let label = t!(explicit_label.unwrap_or(cur_label)).into_owned();
     let tip_text = tool_tip_text(&t!(cur_label), last);
     let arr_tip = format!("{} {}", label, t!("options"));
@@ -781,11 +854,14 @@ pub(super) fn render_large_dropdown<'a>(
                 .height(Fill)
                 .align_x(iced::Center)
                 .align_y(iced::Center),
-            text(label.clone())
-                .size(10)
-                .width(Fill)
-                .align_x(iced::Center)
-                .wrapping(advanced_text::Wrapping::Word),
+            super::keytips::label_anchor(
+                || super::keytips::label_id(id),
+                text(label.clone())
+                    .size(10)
+                    .width(Fill)
+                    .align_x(iced::Center)
+                    .wrapping(advanced_text::Wrapping::Word),
+            ),
         ]
         .align_x(iced::Center)
         .spacing(0)
@@ -814,9 +890,7 @@ pub(super) fn render_large_dropdown<'a>(
             .align_y(iced::Center),
     )
     .on_press(Message::ToggleRibbonDropdown(id.to_string()))
-    .style(move |theme: &Theme, status| {
-        tool_btn_style(theme, dd_open, status)
-    })
+    .style(move |theme: &Theme, status| tool_btn_style(theme, dd_open, status))
     .width(Fill)
     .height(LARGE_ARR)
     .padding(0);
@@ -835,8 +909,7 @@ pub(super) fn render_large_dropdown<'a>(
         .width(Fill)
         .height(Fill);
 
-    PosReport::new(id, automatic_large_button(label, content.into()))
-    .into()
+    PosReport::new(id, automatic_large_button(label, content.into())).into()
 }
 
 /// A row of small tool buttons beneath a combo dropdown. Shared by the
@@ -851,20 +924,18 @@ fn tool_row<'a>(tools: &[ToolDef], active_tool: &Option<String>) -> Element<'a, 
             let event = t.event.clone();
             let icon_el: Element<Message> = make_icon(t.icon, 16.0);
             let msg = module_event_to_message(event);
-            tooltip(
+            let btn = tooltip(
                 button(icon_el)
                     .on_press(msg)
-                    .style(move |theme: &Theme, status| {
-                        tool_btn_style(theme, is_active, status)
-                    })
+                    .style(move |theme: &Theme, status| tool_btn_style(theme, is_active, status))
                     .padding([2, 5]),
                 make_tip(tip.to_string()),
                 TipPos::Right,
             )
             .gap(4.0)
             .delay(Duration::from_millis(400))
-            .style(tip_style)
-            .into()
+            .style(tip_style);
+            super::keytips::anchor(t.id, btn)
         })
         .collect();
     row(btns).spacing(2).align_y(iced::Center).into()
@@ -883,10 +954,7 @@ fn combo_panel_col(width: f32, items: Vec<Element<'_, Message>>) -> Element<'_, 
 }
 
 /// Render a full-height large button (LargeTool, LargeDropdown, LayerCombo, StyleCombo).
-pub(super) fn render_large<'a>(
-    item: &RibbonItem,
-    ctx: &RenderCtx<'_>,
-) -> Element<'a, Message> {
+pub(super) fn render_large<'a>(item: &RibbonItem, ctx: &RenderCtx<'_>) -> Element<'a, Message> {
     let active_tool = ctx.active_tool;
     let open_dd = ctx.open_dd;
     let last_cmd = ctx.last_cmd;
@@ -914,11 +982,14 @@ pub(super) fn render_large<'a>(
                         .height(Fill)
                         .align_x(iced::Center)
                         .align_y(iced::Center),
-                    text(label.clone())
-                        .size(10)
-                        .width(Fill)
-                        .align_x(iced::Center)
-                        .wrapping(advanced_text::Wrapping::Word),
+                    super::keytips::label_anchor(
+                        || super::keytips::label_id(t.id),
+                        text(label.clone())
+                            .size(10)
+                            .width(Fill)
+                            .align_x(iced::Center)
+                            .wrapping(advanced_text::Wrapping::Word),
+                    ),
                 ]
                 .align_x(iced::Center)
                 .spacing(0)
@@ -935,15 +1006,17 @@ pub(super) fn render_large<'a>(
                 bottom: 4.0,
                 left: 4.0,
             });
-            tooltip(
-                automatic_large_button(label, btn.into()),
-                make_tip(tip_text),
-                TipPos::Right,
-            )
+            super::keytips::anchor(
+                t.id,
+                tooltip(
+                    automatic_large_button(label, btn.into()),
+                    make_tip(tip_text),
+                    TipPos::Right,
+                )
                 .gap(6.0)
                 .delay(Duration::from_millis(400))
-                .style(tip_style)
-                .into()
+                .style(tip_style),
+            )
         }
 
         RibbonItem::LargeDropdown {
@@ -952,26 +1025,37 @@ pub(super) fn render_large<'a>(
             icon,
             items,
             default,
-        } => {
-                render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx)
-            }
+        } => render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx),
 
-        RibbonItem::LabeledDropdown { id, label, icon, items, default } => {
-            render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx)
-        }
+        RibbonItem::LabeledDropdown {
+            id,
+            label,
+            icon,
+            items,
+            default,
+        } => render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx),
 
-        RibbonItem::ToolGrid { columns } => columns.iter().fold(
-            row![].spacing(2).height(Fill).align_y(iced::Top),
-            |row, tools| {
-                let column = tools.iter().fold(
-                    column![].spacing(2).width(Length::Fixed(SMALL_W)),
-                    |column, tool| column.push(render_small(
-                        &RibbonItem::Tool(tool.clone()), active_tool, open_dd, last_cmd, state,
-                    )),
-                );
-                row.push(column)
-            },
-        ).into(),
+        RibbonItem::ToolGrid { columns } => columns
+            .iter()
+            .fold(
+                row![].spacing(2).height(Fill).align_y(iced::Top),
+                |row, tools| {
+                    let column = tools.iter().fold(
+                        column![].spacing(2).width(Length::Fixed(SMALL_W)),
+                        |column, tool| {
+                            column.push(render_small(
+                                &RibbonItem::Tool(tool.clone()),
+                                active_tool,
+                                open_dd,
+                                last_cmd,
+                                state,
+                            ))
+                        },
+                    );
+                    row.push(column)
+                },
+            )
+            .into(),
 
         // A plain Dropdown renders large too (used by a collapsed panel whose
         // representative tool is a dropdown).
@@ -980,9 +1064,7 @@ pub(super) fn render_large<'a>(
             icon,
             items,
             default,
-        } => {
-                render_large_dropdown(*id, *icon, None, items, *default, ctx)
-        }
+        } => render_large_dropdown(*id, *icon, None, items, *default, ctx),
 
         RibbonItem::LayerComboGroup { row2, row3 } => {
             const TOOL_BUTTON_W: f32 = 26.0;
@@ -992,7 +1074,9 @@ pub(super) fn render_large<'a>(
             let tools_w = tool_count * TOOL_BUTTON_W
                 + (tool_count - 1.0).max(0.0) * TOOL_SPACING
                 + GROUP_PADDING;
-            let combo_w = (LARGE_W * 2.5).max(tools_w);
+            // Wide enough to read a typical layer name (about 25 characters)
+            // in the closed combo.
+            let combo_w = (LARGE_W * 2.5).max(tools_w).max(250.0);
 
             let info = layer_infos.iter().find(|l| l.name == active_layer);
             let lc = info.map(|l| l.color).unwrap_or(Color::WHITE);
@@ -1017,15 +1101,13 @@ pub(super) fn render_large<'a>(
                 .width(12)
                 .height(12);
 
-            const FIXED_COMBO_W: f32 =
-                14.0 * 3.0 + 12.0 + 9.0 + 4.0 * 4.0 + 8.0 * 2.0;
+            const FIXED_COMBO_W: f32 = 14.0 * 3.0 + 12.0 + 9.0 + 4.0 * 4.0 + 8.0 * 2.0;
             let name_w = (combo_w - FIXED_COMBO_W).max(24.0);
             // About 6 px per glyph at 11 px. The dropdown itself keeps the
             // complete layer name available; only its closed ribbon label is
             // shortened to preserve the fixed row height.
             let name_budget = ((name_w / 6.0) as usize).max(4);
-            let active_layer_label =
-                crate::ui::text_util::elide(active_layer, name_budget);
+            let active_layer_label = crate::ui::text_util::elide(active_layer, name_budget);
 
             let combo_btn = button(
                 row![
@@ -1033,25 +1115,28 @@ pub(super) fn render_large<'a>(
                     freeze_icon,
                     lock_icon,
                     swatch,
-                    container(text(active_layer_label).size(11))
-                        .width(name_w)
-                        .clip(true),
+                    container(super::keytips::label_anchor(
+                        || super::keytips::label_id(LAYER_COMBO_ID),
+                        text(active_layer_label).size(11),
+                    ))
+                    .width(name_w)
+                    .clip(true),
                     icons::themed_arrow_down(9.0),
                 ]
                 .spacing(4)
                 .align_y(iced::Center),
             )
             .on_press(Message::ToggleRibbonDropdown(LAYER_COMBO_ID.to_string()))
-            .style(move |theme: &Theme, status| {
-                combo_btn_style(theme, is_open, status, 3.0)
-            })
+            .style(move |theme: &Theme, status| combo_btn_style(theme, is_open, status, 3.0))
             .padding([3, 8])
             .width(Fill);
 
             combo_panel_col(
                 combo_w,
                 vec![
-                    container(PosReport::new(LAYER_COMBO_ID, combo_btn)).width(Fill).into(),
+                    container(PosReport::new(LAYER_COMBO_ID, combo_btn))
+                        .width(Fill)
+                        .into(),
                     tool_row(row2, active_tool),
                     tool_row(row3, active_tool),
                 ],
@@ -1103,9 +1188,12 @@ pub(super) fn render_large<'a>(
                 button(
                     row![
                         swatch_el,
-                        container(text(label).size(10))
-                            .width(Fill)
-                            .clip(true),
+                        container(super::keytips::label_anchor(
+                            || super::keytips::label_id(dd_id),
+                            text(label).size(10),
+                        ))
+                        .width(Fill)
+                        .clip(true),
                         if is_open {
                             icons::themed_arrow_up(8.0)
                         } else {
@@ -1116,14 +1204,15 @@ pub(super) fn render_large<'a>(
                     .align_y(iced::Center),
                 )
                 .on_press(Message::ToggleRibbonDropdown(dd_id.to_string()))
-                .style(move |theme: &Theme, status| {
-                    combo_btn_style(theme, is_open, status, 2.0)
-                })
+                .style(move |theme: &Theme, status| combo_btn_style(theme, is_open, status, 2.0))
                 .padding([3, 8])
                 .width(Length::Fixed(PROP_W))
             };
 
-            let (color_swatch, _) = acad_color_display(active_color);
+            // ByLayer shows the current layer's colour.
+            let color_swatch = super::layer_color(layer_infos, active_layer)
+                .filter(|_| active_color == AcadColor::ByLayer)
+                .unwrap_or_else(|| acad_color_display(active_color).0);
             let color_row = prop_row(
                 crate::ui::color_select::color_display_name(active_color),
                 PROP_COLOR_ID,
@@ -1176,9 +1265,12 @@ pub(super) fn render_large<'a>(
             // ── combo button ──
             let combo_btn = button(
                 row![
-                    container(text(active.clone()).size(11))
-                        .width(Fill)
-                        .clip(true),
+                    container(super::keytips::label_anchor(
+                        || super::keytips::label_id(combo_id),
+                        text(active.clone()).size(11),
+                    ))
+                    .width(Fill)
+                    .clip(true),
                     if is_open {
                         icons::themed_arrow_up(9.0)
                     } else {
@@ -1189,9 +1281,7 @@ pub(super) fn render_large<'a>(
                 .align_y(iced::Center),
             )
             .on_press(Message::ToggleRibbonDropdown(combo_id.to_string()))
-            .style(move |theme: &Theme, status| {
-                combo_btn_style(theme, is_open, status, 3.0)
-            })
+            .style(move |theme: &Theme, status| combo_btn_style(theme, is_open, status, 3.0))
             .padding([3, 8])
             .width(Fill);
 
@@ -1202,9 +1292,11 @@ pub(super) fn render_large<'a>(
                 iced::widget::Space::new().width(0).height(0).into();
 
             let mut col_items: Vec<Element<Message>> =
-                vec![container(row![PosReport::new(*combo_id, combo_btn), items_panel].spacing(0))
-                    .width(Fill)
-                    .into()];
+                vec![
+                    container(row![PosReport::new(*combo_id, combo_btn), items_panel].spacing(0))
+                        .width(Fill)
+                        .into(),
+                ];
             for row_tools in rows {
                 col_items.push(tool_row(row_tools, active_tool));
             }
@@ -1264,11 +1356,13 @@ pub(super) fn quick_access_btn<'a>(
     .width(Length::Fixed(TOP_HIST_W))
     .height(24)
     .padding([2, 0]);
-    tooltip(btn, make_tip(t!(label).into_owned()), TipPos::Bottom)
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style)
-        .into()
+    super::keytips::anchor_with(
+        || super::keytips::quick_access_anchor(cmd),
+        tooltip(btn, make_tip(t!(label).into_owned()), TipPos::Bottom)
+            .gap(6.0)
+            .delay(Duration::from_millis(400))
+            .style(tip_style),
+    )
 }
 
 pub(super) fn render_history_control<'a>(
@@ -1293,9 +1387,7 @@ pub(super) fn render_history_control<'a>(
                 .align_x(iced::Center)
                 .align_y(iced::Center),
         )
-        .style(move |theme: &Theme, status| {
-            top_hist_btn_style(theme, active, dd_open, status)
-        })
+        .style(move |theme: &Theme, status| top_hist_btn_style(theme, active, dd_open, status))
         .width(Length::Fixed(TOP_HIST_W))
         .height(24)
         .padding([2, 0]);
@@ -1334,9 +1426,7 @@ pub(super) fn render_history_control<'a>(
             .align_x(iced::Center)
             .align_y(iced::Center),
         )
-        .style(move |theme: &Theme, status| {
-            top_hist_btn_style(theme, active, dd_open, status)
-        })
+        .style(move |theme: &Theme, status| top_hist_btn_style(theme, active, dd_open, status))
         .width(Length::Fixed(TOP_ARR_W))
         .height(24)
         .padding(0);
@@ -1347,10 +1437,7 @@ pub(super) fn render_history_control<'a>(
         };
         tooltip(
             btn,
-            make_tip(format!(
-                "{}",
-                t!("%{label} history", label = t!(label))
-            )),
+            make_tip(format!("{}", t!("%{label} history", label = t!(label)))),
             TipPos::Right,
         )
         .gap(6.0)
@@ -1376,10 +1463,9 @@ pub(super) fn top_hist_btn_style(
         _ => palette.background.base,
     };
     button::Style {
-        background: (!active || open || matches!(
-            status,
-            button::Status::Hovered | button::Status::Pressed
-        ))
+        background: (!active
+            || open
+            || matches!(status, button::Status::Hovered | button::Status::Pressed))
         .then_some(Background::Color(pair.color)),
         text_color: pair.text,
         border: Border {

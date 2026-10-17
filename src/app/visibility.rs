@@ -136,7 +136,10 @@ impl OpenCADStudio {
             return;
         };
 
-        let wp = ins.get_transform().apply(Vector3::new(
+        // `def_point` is a block-definition coordinate (see the codec's
+        // BlockVisibilityParameter), so the grip follows the same base-point
+        // convention as the rendered reference.
+        let wp = crate::scene::render_graph::insert_transform(doc, ins).apply(Vector3::new(
             param.def_point.x,
             param.def_point.y,
             param.def_point.z,
@@ -183,6 +186,12 @@ impl OpenCADStudio {
             return;
         }
 
+        // A reference to the definition itself, or to a copy other
+        // references share, gets its own evaluated copy first, so the state
+        // picked for it leaves the definition and the others alone.
+        self.push_undo_snapshot(i, "Visibility State");
+        self.tabs[i].scene.visibility_representation(insert_handle);
+
         // Resolve everything against an immutable borrow first.
         let mapping = {
             let doc = &self.tabs[i].scene.document;
@@ -198,8 +207,6 @@ impl OpenCADStudio {
         let Some(mapping) = mapping else {
             return;
         };
-
-        self.push_undo_snapshot(i, "Visibility State");
 
         // Apply invisibility flags to the anonymous block's members.
         {

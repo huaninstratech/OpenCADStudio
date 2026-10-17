@@ -5,33 +5,20 @@
 
 use super::*;
 use crate::command::EntityTransform;
+use crate::entity_creation::{build_entity, deg_field, point_field};
 
 type Parsed<T> = Result<T, Value>;
-
-/// `[x,y]` or `[x,y,z]` (missing z = 0) from `req[key]`.
-fn point_field(req: &Value, key: &str) -> Parsed<codec::types::Vector3> {
-    let values = req[key]
-        .as_array()
-        .filter(|v| (2..=3).contains(&v.len()))
-        .ok_or_else(|| failure("invalid_point", format!("{key} must be [x,y] or [x,y,z]")))?;
-    let coord = |i: usize| {
-        values[i]
-            .as_f64()
-            .filter(|v| v.is_finite())
-            .ok_or_else(|| failure("invalid_point", format!("{key} needs finite coordinates")))
-    };
-    Ok(codec::types::Vector3::new(coord(0)?, coord(1)?, values.get(2).and_then(Value::as_f64).unwrap_or(0.0)))
-}
-
-fn deg_field(req: &Value, key: &str) -> f64 {
-    req[key].as_f64().unwrap_or(0.0).to_radians()
-}
 
 pub(super) fn hex_handles(req: &Value, key: &str) -> Parsed<Vec<codec::Handle>> {
     let list = req[key]
         .as_array()
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| failure("handles_required", format!("Supply a non-empty {key}:[…] list")))?;
+        .ok_or_else(|| {
+            failure(
+                "handles_required",
+                format!("Supply a non-empty {key}:[…] list"),
+            )
+        })?;
     list.iter()
         .map(|v| {
             u64::from_str_radix(
@@ -54,7 +41,10 @@ pub(super) fn hex_handles(req: &Value, key: &str) -> Parsed<Vec<codec::Handle>> 
 
 /// Every handle must exist in the document; otherwise `entity_absent` naming
 /// the missing ones so the caller can refresh instead of guessing.
-pub(super) fn require_existing(document: &codec::CadDocument, handles: &[codec::Handle]) -> Parsed<()> {
+pub(super) fn require_existing(
+    document: &codec::CadDocument,
+    handles: &[codec::Handle],
+) -> Parsed<()> {
     let missing: Vec<String> = handles
         .iter()
         .filter(|h| document.get_entity(**h).is_none())
@@ -70,208 +60,27 @@ pub(super) fn require_existing(document: &codec::CadDocument, handles: &[codec::
     }
 }
 
-fn apply_common_properties(spec: &Value, entity: &mut codec::EntityType) -> Parsed<()> {
-    if let Some(layer) = spec["layer"].as_str() {
-        if !layer.is_empty()
-            && !matches!(
-                entity,
-                codec::EntityType::Block(_) | codec::EntityType::BlockEnd(_)
-            )
-        {
-            entity.common_mut().layer = layer.to_owned();
-        }
-    }
-    if let Some(index) = spec["color"].as_i64().and_then(|v| i16::try_from(v).ok()) {
-        entity.common_mut().color = codec::types::Color::from_index(index);
-    }
-    Ok(())
-}
-
-/// One `entities` array entry → a real entity. Geometry validation happens
-/// here so a bad definition aborts the whole batch before anything commits.
-fn build_entity(spec: &Value) -> Parsed<codec::EntityType> {
-    use codec::entities::*;
-    use codec::types::Vector3;
-    let kind = spec["type"].as_str().unwrap_or("").to_ascii_uppercase();
-    let entity = match kind.as_str() {
-        "LINE" => {
-            let mut line = Line::from_points(point_field(spec, "start")?, point_field(spec, "end")?);
-            if let Some(t) = spec["thickness"].as_f64() {
-                line.thickness = t;
-            }
-            EntityType::Line(line)
-        }
-        "CIRCLE" => {
-            let radius = spec["radius"]
-                .as_f64()
-                .filter(|r| r.is_finite() && *r >= 0.0)
-                .ok_or_else(|| failure("invalid_radius", "circle needs a finite radius >= 0"))?;
-            EntityType::Circle(Circle::from_center_radius(point_field(spec, "center")?, radius))
-        }
-        "ARC" => {
-            let radius = spec["radius"]
-                .as_f64()
-                .filter(|r| r.is_finite() && *r > 0.0)
-                .ok_or_else(|| failure("invalid_radius", "arc needs a finite radius > 0"))?;
-            EntityType::Arc(Arc::from_center_radius_angles(
-                point_field(spec, "center")?,
-                radius,
-                deg_field(spec, "start_angle_deg"),
-                deg_field(spec, "end_angle_deg"),
-            ))
-        }
-        "LWPOLYLINE" | "POLYLINE" => {
-            let vertices = spec["vertices"]
-                .as_array()
-                .filter(|v| v.len() >= 2)
-                .ok_or_else(|| failure("invalid_vertices", "polyline needs vertices:[[x,y],…]"))?;
-            let mut pline = LwPolyline::new();
-            for point in vertices {
-                let x = point[0].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
-                    failure("invalid_vertices", "polyline vertices must be finite [x,y]")
-                })?;
-                let y = point[1].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
-                    failure("invalid_vertices", "polyline vertices must be finite [x,y]")
-                })?;
-                pline.add_point(codec::types::Vector2::new(x, y));
-            }
-            if spec["closed"].as_bool().unwrap_or(false) {
-                pline.close();
-            }
-            if let Some(width) = spec["constant_width"].as_f64() {
-                pline.constant_width = width;
-            }
-            EntityType::LwPolyline(pline)
-        }
-        "POINT" => EntityType::Point(Point::at(point_field(spec, "location")?)),
-        "TEXT" => {
-            let value = spec["value"].as_str().unwrap_or("");
-            if value.is_empty() {
-                return Err(failure("invalid_text", "text needs a non-empty value"));
-            }
-            let mut text = Text::with_value(value, point_field(spec, "position")?)
-                .with_height(spec["height"].as_f64().unwrap_or(2.5).abs().max(1e-6))
-                .with_rotation(deg_field(spec, "rotation_deg"));
-            if let Some(style) = spec["style"].as_str().filter(|s| !s.is_empty()) {
-                text.style = style.to_owned();
-            }
-            EntityType::Text(text)
-        }
-        "MTEXT" => {
-            let value = spec["value"].as_str().unwrap_or("");
-            if value.is_empty() {
-                return Err(failure("invalid_text", "mtext needs a non-empty value"));
-            }
-            let mut mtext = MText::with_value(value, point_field(spec, "position")?)
-                .with_height(spec["height"].as_f64().unwrap_or(2.5).abs().max(1e-6));
-            if let Some(width) = spec["width"].as_f64().filter(|w| *w > 0.0) {
-                mtext.rectangle_width = width;
-            }
-            mtext.rotation = deg_field(spec, "rotation_deg");
-            EntityType::MText(mtext)
-        }
-        "INSERT" => {
-            let block = spec["block"].as_str().unwrap_or("");
-            if block.is_empty() {
-                return Err(failure("block_required", "insert needs a block name"));
-            }
-            let mut insert = Insert::new(block, point_field(spec, "position")?)
-                .with_rotation(deg_field(spec, "rotation_deg"));
-            match &spec["scale"] {
-                Value::Number(factor) => {
-                    let factor = factor.as_f64().filter(|f| *f != 0.0).ok_or_else(|| {
-                        failure("invalid_scale", "insert scale must be nonzero")
-                    })?;
-                    insert = insert.with_uniform_scale(factor);
-                }
-                Value::Array(factors) if factors.len() == 3 => {
-                    let axis = |i: usize| {
-                        factors[i].as_f64().filter(|f| *f != 0.0).ok_or_else(|| {
-                            failure("invalid_scale", "insert scale components must be nonzero")
-                        })
-                    };
-                    insert = insert.with_scale(axis(0)?, axis(1)?, axis(2)?);
-                }
-                _ => {}
-            }
-            EntityType::Insert(insert)
-        }
-        "SOLID" => {
-            let corners = spec["corners"]
-                .as_array()
-                .filter(|v| (3..=4).contains(&v.len()))
-                .ok_or_else(|| failure("invalid_corners", "solid needs 3 or 4 corners"))?;
-            let corner = |i: usize| -> Parsed<Vector3> {
-                let raw = &corners[i];
-                let coord = |k: usize| {
-                    raw.get(k)
-                        .and_then(Value::as_f64)
-                        .filter(|v| v.is_finite())
-                        .unwrap_or(0.0)
-                };
-                Ok(Vector3::new(coord(0), coord(1), coord(2)))
-            };
-            let fourth = corners
-                .get(3)
-                .map(|_| corner(3))
-                .unwrap_or_else(|| Ok(Vector3::ZERO));
-            EntityType::Solid(Solid::new(corner(0)?, corner(1)?, corner(2)?, fourth?))
-        }
-        "HATCH" => {
-            let boundary = spec["boundary"]
-                .as_array()
-                .filter(|v| v.len() >= 3)
-                .ok_or_else(|| failure("invalid_boundary", "hatch needs boundary:[[x,y],…] (>= 3 points)"))?;
-            let mut vertices = Vec::with_capacity(boundary.len());
-            for point in boundary {
-                let x = point[0].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
-                    failure("invalid_boundary", "hatch boundary must be finite [x,y]")
-                })?;
-                let y = point[1].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
-                    failure("invalid_boundary", "hatch boundary must be finite [x,y]")
-                })?;
-                vertices.push(codec::types::Vector2::new(x, y));
-            }
-            let mut hatch = Hatch::new();
-            if spec["solid"].as_bool().unwrap_or(false) {
-                hatch.is_solid = true;
-            } else {
-                hatch.is_solid = false;
-                hatch.pattern = HatchPattern::new(
-                    spec["pattern"].as_str().unwrap_or("ANSI31"),
-                );
-                hatch.pattern_scale = spec["pattern_scale"].as_f64().unwrap_or(1.0).abs().max(1e-6);
-                hatch.pattern_angle = deg_field(spec, "pattern_angle_deg");
-            }
-            let mut path = BoundaryPath::external();
-            path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(vertices, true)));
-            hatch.paths.push(path);
-            EntityType::Hatch(hatch)
-        }
-        other => {
-            return Err(failure(
-                "unknown_entity_type",
-                format!(
-                    "Unknown entity type '{other}'. Supported: Line, Circle, Arc, LwPolyline, Point, Text, MText, Insert, Solid, Hatch"
-                ),
-            ))
-        }
-    };
-    let mut entity = entity;
-    apply_common_properties(spec, &mut entity)?;
-    Ok(entity)
-}
-
 impl OpenCADStudio {
     /// `entities_create` — build a batch of typed entities, auto-create the
     /// layers they name, and commit everything as one undoable step. All definitions are validated before the first
     /// entity is added, so the batch is all-or-nothing.
     pub(super) fn control_entities_create(&mut self, req: &Value) -> Result<Task<Message>, Value> {
+        if self.tabs[self.active_tab].scene.block_edit_block.is_some() {
+            return Err(failure(
+                "block_editor_open",
+                "finish the open block editor before adding entities to a block",
+            ));
+        }
         let list = req["entities"]
             .as_array()
             .filter(|v| !v.is_empty())
             .ok_or_else(|| failure("entities_required", "Supply entities:[{type:…},…]"))?;
-        let built: Vec<codec::EntityType> = list.iter().map(build_entity).collect::<Parsed<_>>()?;
+        let built: Vec<codec::EntityType> = {
+            let document = &self.tabs[self.active_tab].scene.document;
+            list.iter()
+                .map(|spec| build_entity(spec, Some(document)))
+                .collect::<Parsed<_>>()?
+        };
 
         let i = self.active_tab;
         self.push_undo_snapshot(i, "ENTITIESCREATE");
@@ -334,9 +143,24 @@ impl OpenCADStudio {
         req: &Value,
     ) -> Result<Task<Message>, Value> {
         let handles = hex_handles(req, "handles")?;
-        let action = req["action"].as_str().unwrap_or("move").to_ascii_lowercase();
+        let action = req["action"]
+            .as_str()
+            .unwrap_or("move")
+            .trim()
+            .to_ascii_lowercase();
         let i = self.active_tab;
         require_existing(&self.tabs[i].scene.document, &handles)?;
+        if !matches!(
+            action.as_str(),
+            "move" | "copy" | "rotate" | "scale" | "mirror" | "array"
+        ) {
+            return Err(failure(
+                "invalid_action",
+                format!(
+                    "Unknown transform action '{action}'. Use move, copy, rotate, scale, mirror or array"
+                ),
+            ));
+        }
 
         let transform = |req: &Value| -> Parsed<EntityTransform> {
             Ok(match action.as_str() {
@@ -473,7 +297,14 @@ impl OpenCADStudio {
                 }
                 affected = handles.len();
             }
-            _ => unreachable!("validated by transform()"),
+            other => {
+                return Err(failure(
+                    "invalid_action",
+                    format!(
+                        "Unknown transform action '{other}'. Use move, copy, rotate, scale, mirror or array"
+                    ),
+                ))
+            }
         }
         self.post_ref_op(i);
         self.set_control_result(json!({
@@ -538,7 +369,11 @@ impl OpenCADStudio {
                     .map(|record| {
                         (
                             record.application_name.clone(),
-                            json!(record.values.iter().map(xdata_value_json).collect::<Vec<_>>()),
+                            json!(record
+                                .values
+                                .iter()
+                                .map(xdata_value_json)
+                                .collect::<Vec<_>>()),
                         )
                     })
                     .collect();
@@ -572,11 +407,10 @@ impl OpenCADStudio {
 
         // World → block space translates `base` onto the block origin; the
         // inverse places the Insert so entities keep their world position.
-        let world_to_block = codec::types::Transform::from_translation(
-            codec::types::Vector3::new(-base.x, -base.y, -base.z),
-        );
-        let block_to_world =
-            codec::types::Transform::from_translation(insert_at);
+        let world_to_block = codec::types::Transform::from_translation(codec::types::Vector3::new(
+            -base.x, -base.y, -base.z,
+        ));
+        let block_to_world = codec::types::Transform::from_translation(insert_at);
         self.push_undo_snapshot(i, "BLOCKDEFINE");
         // CF-01.3 (barcode re-import): `replace:true` drops the previous
         // definition — its children, markers and inserts — inside the same
@@ -596,27 +430,37 @@ impl OpenCADStudio {
         Ok(Task::none())
     }
 
-    /// `block_delete` — remove a block definition together with its child
-    /// entities, the Block/BlockEnd markers and every Insert referencing it.
+    /// `block_delete` — remove a block definition. A definition something
+    /// still points at is refused unless the request carries `"force": true`,
+    /// which erases the referencing INSERTs in the same undo step.
     pub(super) fn control_block_delete(&mut self, req: &Value) -> Result<Task<Message>, Value> {
         let name = string(req, "name")?.to_owned();
-        if name.starts_with('*') {
-            return Err(failure(
-                "block_protected",
-                "Layout block records cannot be deleted",
-            ));
-        }
+        let force = req["force"].as_bool().unwrap_or(false);
         let i = self.active_tab;
-        if self.tabs[i].scene.document.block_records.get(&name).is_none() {
-            return Err(failure(
-                "block_missing",
-                format!("Block '{name}' does not exist"),
-            ));
-        }
-        self.push_undo_snapshot(i, "BLOCKDELETE");
-        let erased = erase_block_definition(&mut self.tabs[i].scene, &name);
+        let open_edits: Vec<codec::Handle> = self.tabs[i]
+            .block_edits
+            .iter()
+            .map(|session| session.br_handle)
+            .collect();
+        self.push_undo_snapshot(i, format!("Delete block {name}"));
+        let options = crate::scene::block_service::DeleteOptions {
+            force,
+            open_edits: &open_edits,
+        };
+        let outcome =
+            match crate::scene::block_service::delete(&mut self.tabs[i].scene, &name, options) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.discard_last_undo_entry(i);
+                    return Err(failure(block_error_code(&error), error.to_string()));
+                }
+            };
         self.post_ref_op(i);
-        self.set_control_result(json!({ "block": name, "erased": erased }));
+        self.set_control_result(json!({
+            "block": outcome.name,
+            "erased": outcome.erased,
+            "references": outcome.references.len(),
+        }));
         Ok(Task::none())
     }
 
@@ -654,7 +498,7 @@ impl OpenCADStudio {
 /// Silent no-op for an unknown name (callers validate first);
 /// `*`-prefixed layout records are rejected by the callers. Returns the
 /// number of entities erased.
-fn erase_block_definition(scene: &mut crate::scene::Scene, name: &str) -> usize {
+pub(crate) fn erase_block_definition(scene: &mut crate::scene::Scene, name: &str) -> usize {
     let Some(record) = scene.document.block_records.get(name) else {
         return 0;
     };
@@ -677,6 +521,21 @@ fn erase_block_definition(scene: &mut crate::scene::Scene, name: &str) -> usize 
     scene.erase_entities(&victims);
     scene.document.block_records.remove(name);
     victims.len()
+}
+
+/// The automation error code for each [`BlockServiceError`], so a headless
+/// client branches on a stable machine-readable code while the text stays the
+/// one the shared formatter produced.
+fn block_error_code(error: &crate::scene::block_service::BlockServiceError) -> &'static str {
+    use crate::scene::block_service::BlockServiceError as E;
+    match error {
+        E::NotFound(_) => "block_missing",
+        E::InvalidName(_) => "block_invalid_name",
+        E::NameExists(_) => "block_exists",
+        E::Referenced { .. } => "block_referenced",
+        E::InEditSession(_) => "block_in_edit",
+        E::Protected(_) => "block_protected",
+    }
 }
 
 /// `data:[{code,value},…]` → typed XData values; an absent or empty list

@@ -4,10 +4,12 @@ version = "2026.50.0"
 edition = "2021"
 build = "build.rs"
 default-run = "OpenCADStudio"
+autotests = false
 
 [workspace]
 members = [
     "crates/ocs_plugin_api",
+    "crates/ocs_save",
     "crates/ocs_web_worker",
     "crates/dwg-thumbnailer",
     "crates/dwg-thumbnailer-win",
@@ -18,6 +20,8 @@ winresource = "0.1"
 
 [dependencies]
 serde_json = "1"
+# Offline validation of the same contracts published to automation clients.
+jsonschema = { version = "0.49", default-features = false }
 serde = { version = "1", features = ["derive"] }
 calamine = "0.36.1"
 base64 = "0.22"
@@ -26,26 +30,41 @@ url = "2"
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["image", "svg", "advanced", "canvas", "smol", "markdown"] }
 iced_runtime = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
 iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
-iced_aw = { git = "https://github.com/HakanSeven12/iced_aw.git", branch = "agent/fix-iced-fonts", features = ["menu", "context_menu", "color_picker", "drop_down"] }
+iced_aw = { git = "https://github.com/HakanSeven12/iced_aw.git", branch = "agent/fix-iced-fonts", features = ["menu", "context_menu", "drop_down", "number_input"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = { version = "0.33", features = ["bytemuck"] }
 rfd = "0.17"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-codec = { package = "opencadcodec", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "cdf2277", features = ["serde"] }
-kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "52a9ebe", features = ["acis", "offset"] }
-kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "52a9ebe" }
-graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "597c8b8" }
+codec = { package = "opencadcodec", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "85bb5a2", features = ["serde"] }
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "c038693", features = ["acis", "offset"] }
+kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "c038693" }
+graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "d518926" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
+# Shared SAVE serialization dispatch + web-worker wire format: one
+# implementation for the inline (fallback/native) path and the worker path.
+ocs_save = { path = "crates/ocs_save" }
 flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+# Raster decode set: png/jpeg/bmp/tiff plus webp/gif (both pure-Rust in
+# image 0.25, so the wasm target stays C-free). Every format named here must
+# also appear in the IMAGE picker filter (io::pick_image_file) and the web
+# drop filter (io::web_drop::is_image_name).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp", "gif"] }
 hayro = "0.7.1"
 kurbo = "0.13"
 # DWF/DWFx packages, their XPS pages and DWF/DGN underlay rasters.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
 tiny-skia = "0.11"
+# PDF writer shared by desktop export and the web export/preview/print path.
+printpdf = { version = "0.9.1", default-features = false, features = ["images"] }
+# TrueType subsetting for searchable PDF text (same version printpdf itself
+# uses, so no new binary enters the lockfile). Same feature set as printpdf's
+# own allsorts use (pure-Rust flate backend) — the defaults would drag in the
+# libz-sys C dependency. Pure Rust, so the web build embeds
+# the same subsets.
+allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
 # Rasterises assets/logo.svg into the window icon at startup, so the taskbar
 # icon comes from the same file every other build target does. Already in the
 # tree behind iced's svg feature; named here only to use it directly.
@@ -73,10 +92,10 @@ naga = { version = "27", features = ["wgsl-in"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.8"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Globalization", "Win32_Security_Authentication_Identity", "Win32_UI_Controls_Dialogs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "wayland"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "settings", "wayland"] }
 
 # For `src/bin/ocs_launcher.rs` only (the .app's real CFBundleExecutable,
 # see that file for why) — already in the tree transitively via winit, pinned
@@ -85,7 +104,7 @@ ashpd = { version = "0.13.13", default-features = false, features = ["async-io",
 objc2 = "0.5"
 # The `NSEvent`/`block2` features are for the trackpad pinch monitor in
 # `src/input/trackpad.rs` — see that file for why the gesture is read there.
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder", "NSRunningApplication", "NSEvent", "block2"] }
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSFont", "NSResponder", "NSRunningApplication", "NSEvent", "block2"] }
 block2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString", "NSObject", "NSNotification", "NSThread", "NSEnumerator"] }
 
@@ -101,7 +120,6 @@ meshopt = "0.6.2"
 i18n-embed = { version = "0.16", features = ["desktop-requester"] }
 rayon = "1"
 open = "5"
-printpdf = { version = "0.9.1", default-features = false, features = ["images"] }
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -126,31 +144,69 @@ web-sys = { version = "=0.3.85", features = [
     "File",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
+    # FileSystemFileHandle derefs to FileSystemHandle for the `name()`
+    # getter the in-place save (io::fs_access) reads off a picked handle.
+    "FileSystemHandle",
     "FileSystemGetDirectoryOptions",
     "FileSystemGetFileOptions",
     "FileSystemWritableFileStream",
     "WritableStream",
     "Url",
     "Response",
+    # The wasm remote-raster fetch (image_model::fetch_remote_web) builds a
+    # `Request` with an `AbortController` signal for its deadline; the fetch
+    # rejection is classified via `DomException` (AbortError = timeout) and
+    # the body size is pre-checked against the Content-Length `Headers`.
+    "Request",
+    "RequestInit",
+    "AbortController",
+    "AbortSignal",
+    "DomException",
+    "Headers",
     "Worker",
     "WorkerOptions",
     "WorkerType",
     "MessageEvent",
     "ErrorEvent",
     "Clipboard",
+    # The web image paste reads `navigator.clipboard.read()` items
+    # (sys::read_clipboard_image): their `types()`/`getType()` surface lives
+    # on ClipboardItem.
+    "ClipboardItem",
     "KeyboardEvent",
     "KeyboardEventInit",
     "EventInit",
     "EventTarget",
     "BeforeUnloadEvent",
+    # COLORSCHEME SYSTEM resolves prefers-color-scheme through a media
+    # query listener read at boot and on every re-run.
+    "MediaQueryList",
     "console",
     "Node",
     "HtmlElement",
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
     "ImageData",
+    "DragEvent",
+    "DataTransfer",
+    "FileList",
+    "Event",
+    "ReadableStreamDefaultReader",
+    "ReadableStream",
+    # The ?file= boot deep link reads location.search and compares the link's
+    # origin against the page's (io::web_link).
+    "Location",
 ] }
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["webgl", "fira-sans"] }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+debug = 1
 
 [profile.release]
 strip = true
@@ -162,3 +218,7 @@ harness = false
 [[bench]]
 name = "command_benchmarks"
 harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

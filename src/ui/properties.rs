@@ -10,6 +10,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{fmt, sync::Arc};
 
+use crate::t;
 use crate::ui::ROW_H;
 use codec::types::{Color as AcadColor, LineWeight};
 use codec::Handle;
@@ -20,7 +21,6 @@ use iced::widget::{
 use iced::{
     mouse, Background, Border, Color, Element, Length, Padding, Point, Rectangle, Size, Theme,
 };
-use crate::t;
 
 // ── Row-height-derived constants ─────────────────────────────────────────
 const FONT_SZ: f32 = ROW_H * 0.42; // ≈11 px
@@ -55,6 +55,9 @@ pub fn linetype_display_name(name: &str) -> String {
 
 impl fmt::Display for LinetypeItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.name.is_empty() && !self.art.is_empty() {
+            return f.write_str(&self.art);
+        }
         let name = linetype_display_name(&self.name);
         if self.art.is_empty() {
             write!(f, "{name}")
@@ -95,6 +98,7 @@ impl fmt::Display for SelectionGroup {
 #[derive(Clone)]
 struct HatchPatternPreview {
     pattern: crate::scene::model::hatch_model::HatchPattern,
+    padding: f32,
 }
 
 impl canvas::Program<Message> for HatchPatternPreview {
@@ -112,7 +116,7 @@ impl canvas::Program<Message> for HatchPatternPreview {
 
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let palette = theme.palette();
-        let pad = 4.0;
+        let pad = self.padding;
         let sample = canvas::Path::rectangle(
             Point::new(pad, pad),
             Size::new(
@@ -201,6 +205,31 @@ fn hatch_preview_scale(pattern: &crate::scene::model::hatch_model::HatchPattern)
     }
 }
 
+fn hatch_pattern_preview(
+    pattern: crate::scene::model::hatch_model::HatchPattern,
+    height: f32,
+) -> Element<'static, Message> {
+    canvas(HatchPatternPreview {
+        pattern,
+        padding: 4.0,
+    })
+    .width(Length::Fill)
+    .height(height)
+    .into()
+}
+
+pub(crate) fn compact_hatch_pattern_preview(
+    pattern: crate::scene::model::hatch_model::HatchPattern,
+) -> Element<'static, Message> {
+    canvas(HatchPatternPreview {
+        pattern,
+        padding: 0.5,
+    })
+    .width(Length::Fill)
+    .height(ROW_H)
+    .into()
+}
+
 fn hatch_pattern_matches(
     entry: &crate::scene::model::hatch_patterns::PatternEntry,
     search: &str,
@@ -208,7 +237,10 @@ fn hatch_pattern_matches(
     let query = search.trim();
     query.is_empty()
         || entry.name.to_lowercase().contains(&query.to_lowercase())
-        || entry.description.to_lowercase().contains(&query.to_lowercase())
+        || entry
+            .description
+            .to_lowercase()
+            .contains(&query.to_lowercase())
 }
 
 pub(crate) fn filtered_hatch_patterns(
@@ -218,6 +250,113 @@ pub(crate) fn filtered_hatch_patterns(
         .iter()
         .filter(|entry| hatch_pattern_matches(entry, search))
         .collect()
+}
+
+/// Messages of a hatch pattern picker; the Properties panel and the Graphic
+/// Attributes palette each route them to their own state.
+pub(crate) struct PatternPickerMessages {
+    pub search_id: &'static str,
+    pub on_search: fn(String) -> Message,
+    pub on_confirm: Message,
+    pub on_focus: fn(usize) -> Message,
+    pub on_changed: fn(String) -> Message,
+}
+
+pub(crate) fn hatch_pattern_picker_content<'a>(
+    search_value: &'a str,
+    focus: usize,
+    current: &'a str,
+    messages: PatternPickerMessages,
+) -> Element<'a, Message> {
+    let PatternPickerMessages {
+        search_id,
+        on_search,
+        on_confirm,
+        on_focus,
+        on_changed,
+    } = messages;
+    let search = text_input(t!("Search patterns…").as_ref(), search_value)
+        .id(iced::widget::Id::new(search_id))
+        .on_input(on_search)
+        .on_submit(on_confirm)
+        .size(FONT_SZ)
+        .padding([5, 7])
+        .width(Length::Fill);
+
+    let mut grid = column![].spacing(6);
+    let visible = filtered_hatch_patterns(search_value);
+    for (row_index, pair) in visible.chunks(2).enumerate() {
+        let mut cards = row![].spacing(6);
+        for (column_index, entry) in pair.iter().enumerate() {
+            let index = row_index * 2 + column_index;
+            let selected = current.eq_ignore_ascii_case(&entry.name);
+            let focused = focus == index;
+            let name = entry.name.clone();
+            let preview = hatch_pattern_preview(entry.gpu.clone(), PATTERN_PREVIEW_H);
+            let card = button(
+                column![
+                    preview,
+                    container(text(crate::ui::text_util::elide(&entry.name, 20)).size(FONT_SZ))
+                        .width(Length::Fill)
+                        .align_x(iced::Center),
+                ]
+                .spacing(3),
+            )
+            .on_press(on_changed(name))
+            .style(move |theme: &Theme, status| {
+                let palette = theme.palette();
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let pair = if selected {
+                    palette.primary.weak
+                } else if hovered || focused {
+                    palette.background.strong
+                } else {
+                    palette.background.weak
+                };
+                button::Style {
+                    background: Some(Background::Color(pair.color)),
+                    text_color: pair.text,
+                    border: Border {
+                        color: if selected || focused {
+                            palette.primary.base.color
+                        } else {
+                            palette.background.neutral.color
+                        },
+                        width: if selected || focused { 2.0 } else { 1.0 },
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                }
+            })
+            .padding(5)
+            .width(PATTERN_CARD_W);
+            cards = cards.push(mouse_area(card).on_enter(on_focus(index)));
+        }
+        grid = grid.push(cards);
+    }
+
+    let results: Element<'_, Message> = if visible.is_empty() {
+        container(
+            text(t!("No matching patterns"))
+                .size(FONT_SZ)
+                .style(hint_text_style),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .into()
+    } else {
+        scrollable(grid)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    };
+    container(column![search, results].spacing(7))
+        .style(container::bordered_box)
+        .padding(8)
+        .width(PATTERN_PICKER_W)
+        .height(Length::Fixed(PATTERN_PICKER_H))
+        .into()
 }
 
 /// All standard CAD lineweight options for the combobox.
@@ -288,7 +427,10 @@ impl FieldKey {
 }
 
 /// Text-input widget id for one column of a named-parameter row.
-pub fn prop_param_field_id(index: usize, field: crate::ui::window::named_parameters::ParamField) -> iced::widget::Id {
+pub fn prop_param_field_id(
+    index: usize,
+    field: crate::ui::window::named_parameters::ParamField,
+) -> iced::widget::Id {
     use crate::ui::window::named_parameters::ParamField;
     let suffix = match field {
         ParamField::Name => "name",
@@ -336,16 +478,12 @@ pub fn active_key_focused(
 /// assembled lets a `PropSyncActive` event map a focused text-input id back to
 /// its field key in O(1) instead of re-scanning the sections, enabling
 /// select-all-on-focus for both text inputs and edit-choices (e.g. transparency).
-pub fn build_field_key_map(
-    sections: &[PropSection],
-) -> HashMap<iced::widget::Id, FieldKey> {
+pub fn build_field_key_map(sections: &[PropSection]) -> HashMap<iced::widget::Id, FieldKey> {
     let mut map = HashMap::default();
     for section in sections {
         for prop in &section.props {
             let key = match &prop.value {
-                PropValue::EditText(_)
-                | PropValue::PlainText(_)
-                | PropValue::EditChoice { .. } => {
+                PropValue::EditText(_) | PropValue::PlainText(_) | PropValue::EditChoice { .. } => {
                     Some(FieldKey::Geom(prop.field))
                 }
                 PropValue::AttrText { tag, .. } => Some(FieldKey::Attr(tag.clone())),
@@ -372,6 +510,13 @@ pub fn build_field_key_map(
 /// the `WebFieldCopy` operation idiom: `focusable` fires for every focusable
 /// widget, and we record the one that `is_focused()`.
 pub fn sync_active_field_task() -> iced::Task<Message> {
+    focused_widget_task(Message::PropSyncActive)
+}
+
+/// Ask the widget tree which field holds keyboard focus.
+pub fn focused_widget_task(
+    on_result: fn(Option<iced::advanced::widget::Id>) -> Message,
+) -> iced::Task<Message> {
     use iced::advanced::widget::operation::{Focusable, Outcome};
     use iced::advanced::widget::{Id, Operation};
     #[derive(Default)]
@@ -396,7 +541,7 @@ pub fn sync_active_field_task() -> iced::Task<Message> {
             Outcome::Some(self.focused.clone())
         }
     }
-    iced::advanced::widget::operate(FocusedId::default()).map(Message::PropSyncActive)
+    iced::advanced::widget::operate(FocusedId::default()).map(on_result)
 }
 
 /// A translated choice label paired with the unchanged value stored in the
@@ -450,6 +595,8 @@ pub struct PropertiesPanel {
     /// commit onto a different entity (e.g. two title blocks sharing a `REV1`
     /// tag).
     pub source_handles: Vec<Handle>,
+    /// Definition shown by the no-selection Block section, separate from entity targets.
+    pub block_definition: Option<Handle>,
     /// Whether the quick color picker dropdown is open.
     pub color_picker_open: bool,
     /// Whether the MTEXT background-colour picker dropdown is open. Separate
@@ -476,6 +623,12 @@ pub struct PropertiesPanel {
     pub collapsed_sections: HashSet<String>,
     /// Whether the editable-dropdown (block Name) option list is open.
     pub edit_choice_open: bool,
+    /// The open dropdown belongs to Quick Properties, not the docked panel:
+    /// both render these rows, and two open copies swallow each other's
+    /// clicks (#1766).
+    pub picker_in_quick: bool,
+    /// Set while `quick_view` builds its rows.
+    pub rendering_quick: std::cell::Cell<bool>,
     /// Field key of the value row currently being edited, or `None`. Marked when
     /// the user focuses an editable value field and cleared on commit / when the
     /// selection changes, so the active row can be highlighted. Geometry fields
@@ -506,6 +659,7 @@ impl Default for PropertiesPanel {
             hatch_pattern_focus: 0,
             edit_buf: HashMap::default(),
             source_handles: vec![],
+            block_definition: None,
             color_picker_open: false,
             bg_color_picker_open: false,
             open_color_field: None,
@@ -514,6 +668,8 @@ impl Default for PropertiesPanel {
             expanded_groups: HashSet::default(),
             collapsed_sections: HashSet::default(),
             edit_choice_open: false,
+            picker_in_quick: false,
+            rendering_quick: std::cell::Cell::new(false),
             active_field: None,
             field_key_by_id: HashMap::default(),
         }
@@ -535,6 +691,11 @@ impl PropertiesPanel {
         self.field_key_by_id.get(id).cloned()
     }
 
+    /// Whether the open dropdown belongs to the surface being built.
+    fn picker_here(&self) -> bool {
+        self.picker_in_quick == self.rendering_quick.get()
+    }
+
     pub fn selected_handles(&self) -> Vec<Handle> {
         self.selected_group
             .as_ref()
@@ -542,11 +703,11 @@ impl PropertiesPanel {
             .unwrap_or_default()
     }
 
-    pub fn view(&self, width: f32, auto_collapse: bool) -> Element<'_, Message> {
+    pub fn view(&self, width: f32, chrome: crate::ui::dock::Chrome) -> Element<'_, Message> {
         use crate::ui::dock::PanelId;
         // ── Header ──────────────────────────────────────────────────────────
         let header =
-            crate::ui::dock::title_bar(PanelId::Properties, t!("Properties").into_owned(), auto_collapse);
+            crate::ui::dock::title_bar(PanelId::Properties, t!("Properties").into_owned(), chrome);
 
         // ── Title bar (entity type / "No Selection") ─────────────────────
         let title_content: Element<'_, Message> = if self.selection_groups.is_empty() {
@@ -573,13 +734,13 @@ impl PropertiesPanel {
             .style(|theme: &Theme| {
                 let palette = theme.palette();
                 container::Style {
-                background: Some(Background::Color(palette.background.weakest.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
+                    background: Some(Background::Color(palette.background.weakest.color)),
+                    border: Border {
+                        color: palette.background.neutral.color,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
                 }
             })
             .width(Length::Fill)
@@ -599,24 +760,26 @@ impl PropertiesPanel {
             for section in &self.sections {
                 col = col.push(self.render_section(section));
             }
-            scrollable(col.width(Length::Fill))
-                .spacing(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+            Element::from(
+                scrollable(col.width(Length::Fill))
+                    .spacing(8)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .map(|message| tag_picker(false, message))
         };
 
         container(column![header, title_bar, content])
             .style(|theme: &Theme| {
                 let palette = theme.palette();
                 container::Style {
-                background: Some(Background::Color(palette.background.base.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
+                    background: Some(Background::Color(palette.background.base.color)),
+                    border: Border {
+                        color: palette.background.neutral.color,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
                 }
             })
             .width(Length::Fixed(width))
@@ -636,9 +799,9 @@ impl PropertiesPanel {
                 .size(FONT_SZ)
                 .style(muted_text_style),
         )
-            .style(|theme: &Theme| {
-                let palette = theme.palette();
-                container::Style {
+        .style(|theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
                 background: Some(Background::Color(palette.background.weakest.color)),
                 border: Border {
                     color: palette.background.neutral.color,
@@ -646,33 +809,38 @@ impl PropertiesPanel {
                     radius: 0.0.into(),
                 },
                 ..Default::default()
-                }
-            })
-            .width(Length::Fill)
-            .padding([4, 10]);
+            }
+        })
+        .width(Length::Fill)
+        .padding([4, 10]);
 
         let mut sections = column![].spacing(0);
+        self.rendering_quick.set(true);
         for section in &self.sections {
             sections = sections.push(self.render_section(section));
         }
+        self.rendering_quick.set(false);
 
-        let content = scrollable(sections.width(Length::Fill))
-            .spacing(8)
-            .width(Length::Fill)
-            .height(Length::Shrink);
+        let content = Element::from(
+            scrollable(sections.width(Length::Fill))
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Shrink),
+        )
+        .map(|message| tag_picker(true, message));
 
         Some(
             container(column![title, content].spacing(0))
                 .style(|theme: &Theme| {
                     let palette = theme.palette();
                     container::Style {
-                    background: Some(Background::Color(palette.background.base.color)),
-                    border: Border {
-                        color: palette.background.neutral.color,
-                        width: 1.0,
-                        radius: 3.0.into(),
-                    },
-                    ..Default::default()
+                        background: Some(Background::Color(palette.background.base.color)),
+                        border: Border {
+                            color: palette.background.neutral.color,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
                     }
                 })
                 .width(230)
@@ -702,23 +870,17 @@ impl PropertiesPanel {
                 .padding([3, 8]),
         )
         .on_double_click(Message::PropSectionToggle(section.title.clone()));
-        let hdr = container(
-            row![
-                title,
-                toggle,
-            ]
-            .align_y(iced::Center),
-        )
+        let hdr = container(row![title, toggle,].align_y(iced::Center))
             .style(|theme: &Theme| {
                 let palette = theme.palette();
                 container::Style {
-                background: Some(Background::Color(palette.background.weak.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
+                    background: Some(Background::Color(palette.background.weak.color)),
+                    border: Border {
+                        color: palette.background.neutral.color,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
                 }
             })
             .width(Length::Fill);
@@ -771,9 +933,7 @@ impl PropertiesPanel {
         label: &'a str,
     ) -> Element<'a, Message> {
         match &prop.value {
-            PropValue::ColorChoice(color) => {
-                self.render_color_row(label, prop.field, *color, None)
-            }
+            PropValue::ColorChoice(color) => self.render_color_row(label, prop.field, *color, None),
             PropValue::NamedColorChoice { color, name } => {
                 self.render_color_row(label, prop.field, *color, Some(name))
             }
@@ -783,9 +943,7 @@ impl PropertiesPanel {
             PropValue::FieldLwChoice { field, value } => {
                 self.render_field_lw_row(label, field, *value)
             }
-            PropValue::FieldLwVaries { field } => {
-                self.render_field_lw_varies_row(label, field)
-            }
+            PropValue::FieldLwVaries { field } => self.render_field_lw_varies_row(label, field),
             PropValue::LwVaries => self.render_lw_varies_row(label),
             PropValue::LinetypeChoice(lt) => self.render_linetype_row(label, lt),
             PropValue::Choice { selected, options } if prop.field == "annotative_scale" => {
@@ -810,16 +968,19 @@ impl PropertiesPanel {
             PropValue::ReadOnlyWithTooltip { value, tooltip } => {
                 render_ro_with_tooltip_row(label, value, tooltip)
             }
-            PropValue::HatchPatternChoice(current) => {
-                self.render_hatch_pattern_row(label, current)
-            }
+            PropValue::HatchPatternChoice(current) => self.render_hatch_pattern_row(label, current),
             PropValue::AttrText { tag, value } => self.render_attr_row(tag, value),
-            PropValue::EntityLink { id, handles, conflicting } => {
-                render_entity_link_row(label, *id, handles.clone(), *conflicting)
-            }
-            PropValue::ParamRow { index, name, formula, resolved } => {
-                self.render_param_row(*index, name, formula, resolved)
-            }
+            PropValue::EntityLink {
+                id,
+                handles,
+                conflicting,
+            } => render_entity_link_row(label, *id, handles.clone(), *conflicting),
+            PropValue::ParamRow {
+                index,
+                name,
+                formula,
+                resolved,
+            } => self.render_param_row(*index, name, formula, resolved),
             PropValue::ParamAddRow => render_param_add_row(),
             PropValue::ParamsVisibilityToggle(value) => render_params_visibility_toggle_row(*value),
         }
@@ -867,7 +1028,7 @@ impl PropertiesPanel {
         if field == "background_color" {
             let selector = crate::ui::color_select::color_selector(
                 color,
-                self.bg_color_picker_open,
+                self.bg_color_picker_open && self.picker_here(),
                 crate::ui::color_select::ColorExtras {
                     by_layer: true,
                     by_block: true,
@@ -878,10 +1039,7 @@ impl PropertiesPanel {
                 // "More Colors…" opens the full palette window targeting the
                 // background colour — this used to just close the picker
                 // (#415).
-                Message::OpenColorWindow(
-                    crate::app::ColorPickTarget::PropertiesBg,
-                    color,
-                ),
+                Message::OpenColorWindow(crate::app::ColorPickTarget::PropertiesBg, color),
             );
             return prop_row_widget(label, selector);
         }
@@ -903,7 +1061,7 @@ impl PropertiesPanel {
                 | "background_fill_color"
                 | "indicator_fill_color"
         ) {
-            let open = self.open_color_field.as_deref() == Some(field);
+            let open = self.open_color_field.as_deref() == Some(field) && self.picker_here();
             let fsel = field.to_string();
             let full_palette_field = field.to_string();
             let extras = if field == "dim_text_fill_color" {
@@ -946,7 +1104,7 @@ impl PropertiesPanel {
         let selector = crate::ui::color_select::color_selector_with_name(
             color,
             display_name,
-            self.color_picker_open,
+            self.color_picker_open && self.picker_here(),
             crate::ui::color_select::ColorExtras {
                 by_layer: true,
                 by_block: true,
@@ -954,17 +1112,14 @@ impl PropertiesPanel {
             },
             Message::PropColorChanged,
             Message::PropColorPickerToggle,
-            Message::OpenColorWindow(
-                crate::app::ColorPickTarget::Properties,
-                color,
-            ),
+            Message::OpenColorWindow(crate::app::ColorPickTarget::Properties, color),
         );
         prop_row_widget(label, selector)
     }
 
     fn render_color_varies_row<'a>(&'a self, label: &'a str) -> Element<'a, Message> {
         let selector = crate::ui::color_select::color_selector_varies(
-            self.color_picker_open,
+            self.color_picker_open && self.picker_here(),
             crate::ui::color_select::ColorExtras {
                 by_layer: true,
                 by_block: true,
@@ -972,10 +1127,7 @@ impl PropertiesPanel {
             },
             Message::PropColorChanged,
             Message::PropColorPickerToggle,
-            Message::OpenColorWindow(
-                crate::app::ColorPickTarget::Properties,
-                AcadColor::ByLayer,
-            ),
+            Message::OpenColorWindow(crate::app::ColorPickTarget::Properties, AcadColor::ByLayer),
         );
         prop_row_widget(label, selector)
     }
@@ -1272,7 +1424,7 @@ impl PropertiesPanel {
             })
             .width(Length::Fill);
         let caret = button(
-            container(if self.edit_choice_open {
+            container(if self.edit_choice_open && self.picker_here() {
                 crate::ui::icons::themed_arrow_up(9.0)
             } else {
                 crate::ui::icons::themed_arrow_down(9.0)
@@ -1325,7 +1477,7 @@ impl PropertiesPanel {
             })
             .width(Length::Fill);
 
-        if !self.edit_choice_open {
+        if !(self.edit_choice_open && self.picker_here()) {
             return prop_row_with_active(label, head.into(), active);
         }
 
@@ -1410,24 +1562,46 @@ impl PropertiesPanel {
         use crate::ui::window::named_parameters::ParamField;
 
         let name_key = FieldKey::Param(index, ParamField::Name);
-        let name_display = self.edit_buf.get(&name_key).map(|s| s.as_str()).unwrap_or(name);
+        let name_display = self
+            .edit_buf
+            .get(&name_key)
+            .map(|s| s.as_str())
+            .unwrap_or(name);
         let name_active = self.active_field.as_ref() == Some(&name_key);
         let name_input = text_input("name", name_display)
             .id(name_key.widget_id())
-            .on_input(move |v| Message::PropParamInput { index, field: ParamField::Name, value: v })
-            .on_submit(Message::PropParamCommit { index, field: ParamField::Name })
+            .on_input(move |v| Message::PropParamInput {
+                index,
+                field: ParamField::Name,
+                value: v,
+            })
+            .on_submit(Message::PropParamCommit {
+                index,
+                field: ParamField::Name,
+            })
             .size(FONT_SZ)
             .style(text_input_style)
             .padding([3, 6])
             .width(Length::FillPortion(3));
 
         let formula_key = FieldKey::Param(index, ParamField::Formula);
-        let formula_display = self.edit_buf.get(&formula_key).map(|s| s.as_str()).unwrap_or(formula);
+        let formula_display = self
+            .edit_buf
+            .get(&formula_key)
+            .map(|s| s.as_str())
+            .unwrap_or(formula);
         let formula_active = self.active_field.as_ref() == Some(&formula_key);
         let formula_input = text_input("formula", formula_display)
             .id(formula_key.widget_id())
-            .on_input(move |v| Message::PropParamInput { index, field: ParamField::Formula, value: v })
-            .on_submit(Message::PropParamCommit { index, field: ParamField::Formula })
+            .on_input(move |v| Message::PropParamInput {
+                index,
+                field: ParamField::Formula,
+                value: v,
+            })
+            .on_submit(Message::PropParamCommit {
+                index,
+                field: ParamField::Formula,
+            })
             .size(FONT_SZ)
             .style(text_input_style)
             .padding([3, 6])
@@ -1437,11 +1611,11 @@ impl PropertiesPanel {
             Ok(v) => (format!("{v:.4}"), false),
             Err(_) => ("—".to_string(), true),
         };
-        let value_label = container(
-            text(value_text).size(FONT_SZ).style(move |theme: &Theme| iced::widget::text::Style {
+        let value_label = container(text(value_text).size(FONT_SZ).style(move |theme: &Theme| {
+            iced::widget::text::Style {
                 color: is_error.then_some(theme.palette().danger.base.color),
-            }),
-        )
+            }
+        }))
         .width(Length::FillPortion(2))
         .align_x(iced::Right);
 
@@ -1458,25 +1632,40 @@ impl PropertiesPanel {
                 Background::Color(theme.palette().background.base.color)
             }
         };
-        let content = container(row![name_input, formula_input, value_label, delete_btn].spacing(4).align_y(iced::Center))
-            .style(move |theme: &Theme| container::Style { background: Some(bg(theme)), ..Default::default() })
-            .padding([2, 6])
-            .width(Length::Fill);
+        let content = container(
+            row![name_input, formula_input, value_label, delete_btn]
+                .spacing(4)
+                .align_y(iced::Center),
+        )
+        .style(move |theme: &Theme| container::Style {
+            background: Some(bg(theme)),
+            ..Default::default()
+        })
+        .padding([2, 6])
+        .width(Length::Fill);
 
         if let Err(err) = resolved {
-            tooltip(content, text(err.as_str()).size(FONT_SZ), tooltip::Position::Top)
-                .gap(4.0)
-                .padding(6.0)
-                .style(|theme: &Theme| {
-                    let palette = theme.palette();
-                    container::Style {
-                        background: Some(Background::Color(palette.danger.weak.color)),
-                        text_color: Some(palette.danger.weak.text),
-                        border: Border { color: palette.danger.base.color, width: 1.0, radius: 4.0.into() },
-                        ..Default::default()
-                    }
-                })
-                .into()
+            tooltip(
+                content,
+                text(err.as_str()).size(FONT_SZ),
+                tooltip::Position::Top,
+            )
+            .gap(4.0)
+            .padding(6.0)
+            .style(|theme: &Theme| {
+                let palette = theme.palette();
+                container::Style {
+                    background: Some(Background::Color(palette.danger.weak.color)),
+                    text_color: Some(palette.danger.weak.text),
+                    border: Border {
+                        color: palette.danger.base.color,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
         } else {
             content.into()
         }
@@ -1492,7 +1681,7 @@ impl PropertiesPanel {
                 text(crate::ui::text_util::elide(current, 16))
                     .size(FONT_SZ)
                     .width(Length::Fill),
-                if self.hatch_pattern_picker_open {
+                if self.hatch_pattern_picker_open && self.picker_here() {
                     crate::ui::icons::themed_arrow_up(FONT_SZ)
                 } else {
                     crate::ui::icons::themed_arrow_down(FONT_SZ)
@@ -1512,7 +1701,7 @@ impl PropertiesPanel {
                 })),
                 text_color: palette.background.base.text,
                 border: Border {
-                    color: if self.hatch_pattern_picker_open {
+                    color: if self.hatch_pattern_picker_open && self.picker_here() {
                         palette.primary.base.color
                     } else {
                         palette.background.neutral.color
@@ -1526,104 +1715,28 @@ impl PropertiesPanel {
         .padding([COMBO_PAD_V, 6.0])
         .width(Length::Fill);
 
-        if !self.hatch_pattern_picker_open {
+        if !(self.hatch_pattern_picker_open && self.picker_here()) {
             return prop_row_widget(label, head.into());
         }
 
-        let search = text_input(t!("Search patterns…").as_ref(), &self.hatch_pattern_search)
-            .id(iced::widget::Id::new("hatch-pattern-search"))
-            .on_input(Message::PropHatchPatternSearchChanged)
-            .on_submit(Message::PropHatchPatternConfirm)
-            .size(FONT_SZ)
-            .padding([5, 7])
-            .width(Length::Fill);
-
-        let mut grid = column![].spacing(6);
-        let visible = filtered_hatch_patterns(&self.hatch_pattern_search);
-        for (row_index, pair) in visible.chunks(2).enumerate() {
-            let mut cards = row![].spacing(6);
-            for (column_index, entry) in pair.iter().enumerate() {
-                let index = row_index * 2 + column_index;
-                let selected = current.eq_ignore_ascii_case(&entry.name);
-                let focused = self.hatch_pattern_focus == index;
-                let name = entry.name.clone();
-                let preview = canvas(HatchPatternPreview {
-                    pattern: entry.gpu.clone(),
-                })
-                .width(Length::Fill)
-                .height(PATTERN_PREVIEW_H);
-                let card = button(
-                    column![
-                        preview,
-                        container(text(crate::ui::text_util::elide(&entry.name, 20)).size(FONT_SZ))
-                            .width(Length::Fill)
-                            .align_x(iced::Center),
-                    ]
-                    .spacing(3),
-                )
-                .on_press(Message::PropHatchPatternChanged(name))
-                .style(move |theme: &Theme, status| {
-                    let palette = theme.palette();
-                    let hovered =
-                        matches!(status, button::Status::Hovered | button::Status::Pressed);
-                    let pair = if selected {
-                        palette.primary.weak
-                    } else if hovered || focused {
-                        palette.background.strong
-                    } else {
-                        palette.background.weak
-                    };
-                    button::Style {
-                        background: Some(Background::Color(pair.color)),
-                        text_color: pair.text,
-                        border: Border {
-                            color: if selected || focused {
-                                palette.primary.base.color
-                            } else {
-                                palette.background.neutral.color
-                            },
-                            width: if selected || focused { 2.0 } else { 1.0 },
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    }
-                })
-                .padding(5)
-                .width(PATTERN_CARD_W);
-                cards = cards.push(
-                    mouse_area(card).on_enter(Message::PropHatchPatternFocus(index)),
-                );
-            }
-            grid = grid.push(cards);
-        }
-
-        let results: Element<'_, Message> = if visible.is_empty() {
-            container(
-                text(t!("No matching patterns"))
-                    .size(FONT_SZ)
-                    .style(hint_text_style),
-            )
-            .padding(12)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-            .into()
-        } else {
-            scrollable(grid)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into()
-        };
-        let popup = container(column![search, results].spacing(7))
-            .style(container::bordered_box)
-            .padding(8)
-            .width(PATTERN_PICKER_W)
-            .height(Length::Fixed(PATTERN_PICKER_H));
+        let popup = hatch_pattern_picker_content(
+            &self.hatch_pattern_search,
+            self.hatch_pattern_focus,
+            current,
+            PatternPickerMessages {
+                search_id: "hatch-pattern-search",
+                on_search: Message::PropHatchPatternSearchChanged,
+                on_confirm: Message::PropHatchPatternConfirm,
+                on_focus: Message::PropHatchPatternFocus,
+                on_changed: Message::PropHatchPatternChanged,
+            },
+        );
 
         prop_row_widget(
             label,
             crate::ui::color_select::drop_down_below(
                 head.into(),
-                popup.into(),
+                popup,
                 Some(Length::Fixed(PATTERN_PICKER_W)),
                 Length::Fixed(PATTERN_PICKER_H),
                 Message::PropHatchPatternPickerToggle(current.to_string()),
@@ -1677,38 +1790,35 @@ fn render_bool_row<'a>(label: &'a str, field: &'static str, value: bool) -> Elem
     } else {
         t!("No").into_owned()
     };
-    let btn =
-        button(
-            text(btn_label)
-                .size(FONT_SZ)
-                .style(move |theme: &Theme| iced::widget::text::Style {
-                    color: value.then_some(theme.palette().warning.base.color),
-                }),
-        )
-        .on_press(Message::PropBoolToggle(field))
-        .style(move |theme: &Theme, status| {
-            let palette = theme.palette();
-            let pair = match status {
-                button::Status::Hovered | button::Status::Pressed => palette.background.weak,
-                _ => palette.background.base,
-            };
-            button::Style {
-                background: Some(Background::Color(pair.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 2.0.into(),
-                },
-                text_color: if value {
-                    palette.warning.base.color
-                } else {
-                    pair.text
-                },
-                ..Default::default()
-            }
-        })
-        .padding([2, 6])
-        .width(Length::Fill);
+    let btn = button(text(btn_label).size(FONT_SZ).style(move |theme: &Theme| {
+        iced::widget::text::Style {
+            color: value.then_some(theme.palette().warning.base.color),
+        }
+    }))
+    .on_press(Message::PropBoolToggle(field))
+    .style(move |theme: &Theme, status| {
+        let palette = theme.palette();
+        let pair = match status {
+            button::Status::Hovered | button::Status::Pressed => palette.background.weak,
+            _ => palette.background.base,
+        };
+        button::Style {
+            background: Some(Background::Color(pair.color)),
+            border: Border {
+                color: palette.background.neutral.color,
+                width: 1.0,
+                radius: 2.0.into(),
+            },
+            text_color: if value {
+                palette.warning.base.color
+            } else {
+                pair.text
+            },
+            ..Default::default()
+        }
+    })
+    .padding([2, 6])
+    .width(Length::Fill);
 
     prop_row_widget(label, btn.into())
 }
@@ -1737,9 +1847,7 @@ fn coord_group_len(props: &[crate::scene::model::object::Property], idx: usize) 
     let groupable = |p: &crate::scene::model::object::Property| {
         matches!(
             p.value,
-            PropValue::EditText(_)
-                | PropValue::ReadOnly(_)
-                | PropValue::ReadOnlyWithTooltip { .. }
+            PropValue::EditText(_) | PropValue::ReadOnly(_) | PropValue::ReadOnlyWithTooltip { .. }
         )
     };
     let Some((base, 0)) = coord_suffix(&props[idx].label) else {
@@ -1825,9 +1933,7 @@ fn render_group_row(
     .height(Length::Fixed(ROW_H));
     let label_col = container(label_btn)
         .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.palette().background.weakest.color,
-            )),
+            background: Some(Background::Color(theme.palette().background.weakest.color)),
             ..Default::default()
         })
         .width(Length::FillPortion(5))
@@ -1838,9 +1944,7 @@ fn render_group_row(
     let value_field = crate::ui::read_only::field(&joined, FONT_SZ, Length::Fill);
     let value_col = container(value_field)
         .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.palette().background.base.color,
-            )),
+            background: Some(Background::Color(theme.palette().background.base.color)),
             ..Default::default()
         })
         .width(Length::FillPortion(6))
@@ -1865,10 +1969,7 @@ fn render_group_row(
         })
         .into()
 }
-fn render_annotative_scale_row<'a>(
-    label: &'a str,
-    value: &'a str,
-) -> Element<'a, Message> {
+fn render_annotative_scale_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     let field = crate::ui::read_only::field(value, FONT_SZ, Length::Fill);
 
     let manage = button(text("...").size(FONT_SZ))
@@ -1876,14 +1977,10 @@ fn render_annotative_scale_row<'a>(
         .style(button::secondary)
         .padding([2, 7]);
 
-    let controls = row![
-        field,
-        manage,
-        iced::widget::space().width(10)
-    ]
-    .spacing(2)
-    .align_y(iced::Center)
-    .width(Length::Fill);
+    let controls = row![field, manage, iced::widget::space().width(10)]
+        .spacing(2)
+        .align_y(iced::Center)
+        .width(Length::Fill);
 
     prop_row_widget(label, controls.into())
 }
@@ -1913,22 +2010,26 @@ fn render_ro_with_tooltip_row<'a>(
     tooltip_text: &'a str,
 ) -> Element<'a, Message> {
     let field = crate::ui::read_only::field(value, FONT_SZ, Length::Fill);
-    let wrapped = tooltip(field, text(tooltip_text).size(FONT_SZ), tooltip::Position::Top)
-        .gap(4.0)
-        .padding(6.0)
-        .style(|theme: &Theme| {
-            let palette = theme.palette();
-            container::Style {
-                background: Some(Background::Color(palette.background.base.color)),
-                text_color: Some(palette.background.base.text),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        });
+    let wrapped = tooltip(
+        field,
+        text(tooltip_text).size(FONT_SZ),
+        tooltip::Position::Top,
+    )
+    .gap(4.0)
+    .padding(6.0)
+    .style(|theme: &Theme| {
+        let palette = theme.palette();
+        container::Style {
+            background: Some(Background::Color(palette.background.base.color)),
+            text_color: Some(palette.background.base.text),
+            border: Border {
+                color: palette.background.neutral.color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        }
+    });
     prop_row_widget(label, wrapped.into())
 }
 
@@ -1961,7 +2062,11 @@ fn render_entity_link_row<'a>(
             };
             button::Style {
                 background: Some(Background::Color(pair.color)),
-                border: Border { color: palette.background.neutral.color, width: 1.0, radius: 2.0.into() },
+                border: Border {
+                    color: palette.background.neutral.color,
+                    width: 1.0,
+                    radius: 2.0.into(),
+                },
                 text_color: pair.text,
                 ..Default::default()
             }
@@ -1984,11 +2089,18 @@ fn render_entity_link_row<'a>(
 /// — avoids a separate "pending new row" concept, since every row always
 /// reflects a real committed table entry.
 fn render_param_add_row<'a>() -> Element<'a, Message> {
-    let btn = button(row![text("+").size(FONT_SZ), text(t!("Add parameter").into_owned()).size(FONT_SZ)].spacing(6).align_y(iced::Center))
-        .on_press(Message::PropParamAddNew)
-        .style(button::text)
-        .padding([4, 8])
-        .width(Length::Fill);
+    let btn = button(
+        row![
+            text("+").size(FONT_SZ),
+            text(t!("Add parameter").into_owned()).size(FONT_SZ)
+        ]
+        .spacing(6)
+        .align_y(iced::Center),
+    )
+    .on_press(Message::PropParamAddNew)
+    .style(button::text)
+    .padding([4, 8])
+    .width(Length::Fill);
     container(btn).width(Length::Fill).into()
 }
 
@@ -2017,16 +2129,28 @@ fn render_params_visibility_toggle_row<'a>(value: bool) -> Element<'a, Message> 
         };
         button::Style {
             background: Some(Background::Color(pair.color)),
-            border: Border { color: palette.background.neutral.color, width: 1.0, radius: 2.0.into() },
+            border: Border {
+                color: palette.background.neutral.color,
+                width: 1.0,
+                radius: 2.0.into(),
+            },
             text_color: pair.text,
             ..Default::default()
         }
     })
     .padding([4, 8])
     .width(Length::Fill);
-    container(row![text(t!("Values").into_owned()).size(FONT_SZ).width(Length::Fill), btn].align_y(iced::Center))
-        .width(Length::Fill)
-        .into()
+    container(
+        row![
+            text(t!("Values").into_owned())
+                .size(FONT_SZ)
+                .width(Length::Fill),
+            btn
+        ]
+        .align_y(iced::Center),
+    )
+    .width(Length::Fill)
+    .into()
 }
 
 /// Build a label | widget property row.
@@ -2047,23 +2171,23 @@ fn prop_row_with_active<'a>(
             .size(FONT_SZ)
             .style(muted_text_style),
     )
-        .style(move |theme: &Theme| container::Style {
-            background: Some(Background::Color(if active {
-                theme.palette().primary.weak.color
-            } else {
-                theme.palette().background.weakest.color
-            })),
-            ..Default::default()
-        })
-        .width(Length::FillPortion(5))
-        .height(Length::Fixed(ROW_H))
-        .align_y(iced::Center)
-        .padding(Padding {
-            top: 0.0,
-            bottom: 0.0,
-            left: 6.0,
-            right: 6.0,
-        });
+    .style(move |theme: &Theme| container::Style {
+        background: Some(Background::Color(if active {
+            theme.palette().primary.weak.color
+        } else {
+            theme.palette().background.weakest.color
+        })),
+        ..Default::default()
+    })
+    .width(Length::FillPortion(5))
+    .height(Length::Fixed(ROW_H))
+    .align_y(iced::Center)
+    .padding(Padding {
+        top: 0.0,
+        bottom: 0.0,
+        left: 6.0,
+        right: 6.0,
+    });
     let value_col = container(widget)
         .style(move |theme: &Theme| container::Style {
             background: Some(Background::Color(if active {
@@ -2174,7 +2298,7 @@ fn text_input_style(theme: &Theme, status: text_input::Status) -> text_input::St
     }
 }
 
-fn combo_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+pub(crate) fn combo_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
     text_input_style(theme, status)
 }
 
@@ -2198,7 +2322,7 @@ mod tests {
     };
 
     fn sample_sections() -> Vec<crate::scene::model::object::PropSection> {
-        use crate::scene::model::object::{Property, PropValue};
+        use crate::scene::model::object::{PropValue, Property};
         vec![
             crate::scene::model::object::PropSection {
                 title: "Geometry".into(),
@@ -2241,7 +2365,10 @@ mod tests {
         //
         // Focus on the active field's own input → row stays marked active.
         let focused = prop_geom_field_id("pos_x");
-        assert!(active_key_focused(Some(&FieldKey::Geom("pos_x")), Some(&focused)));
+        assert!(active_key_focused(
+            Some(&FieldKey::Geom("pos_x")),
+            Some(&focused)
+        ));
 
         // Focus moves to another property field → superseded (cleared here; the
         // manual focus-setter then marks the new field active).
@@ -2258,7 +2385,10 @@ mod tests {
         assert!(!active_key_focused(Some(&FieldKey::Geom("pos_x")), None));
 
         // No active field (or one whose input isn't focused) never reads active.
-        assert!(!active_key_focused(None, Some(&prop_geom_field_id("pos_x"))));
+        assert!(!active_key_focused(
+            None,
+            Some(&prop_geom_field_id("pos_x"))
+        ));
     }
 
     #[test]
@@ -2310,5 +2440,20 @@ mod tests {
 
         assert!(scale.is_finite());
         assert!((0.01..=100.0).contains(&scale));
+    }
+}
+
+/// Marks a dropdown toggle with the surface it came from (see
+/// `PropertiesPanel::picker_in_quick`).
+fn tag_picker(quick: bool, message: Message) -> Message {
+    match message {
+        Message::PropColorPickerToggle
+        | Message::PropBgColorPickerToggle
+        | Message::PropColorFieldToggle(_)
+        | Message::PropEditChoiceToggle
+        | Message::PropHatchPatternPickerToggle(_) => {
+            Message::PropPickerSurface(quick, Box::new(message))
+        }
+        other => other,
     }
 }

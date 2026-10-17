@@ -134,7 +134,9 @@ fn placeholder_swatch<'a>() -> Element<'a, Message> {
     .style(|theme: &Theme| {
         let palette = theme.palette();
         container::Style {
-            background: Some(Background::Color(palette.background.weak.color.scale_alpha(0.5))),
+            background: Some(Background::Color(
+                palette.background.weak.color.scale_alpha(0.5),
+            )),
             border: Border {
                 color: palette.background.neutral.color.scale_alpha(0.5),
                 width: 1.0,
@@ -147,24 +149,22 @@ fn placeholder_swatch<'a>() -> Element<'a, Message> {
 }
 
 fn divider<'a>() -> Element<'a, Message> {
-    container(
-        Space::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0)),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.neutral.color)),
-        ..Default::default()
-    })
-    .into()
+    container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(theme.palette().background.neutral.color)),
+            ..Default::default()
+        })
+        .into()
 }
 
+/// `shown` overrides the swatch, so ByLayer can show the layer's colour.
 fn logical_row<'a>(
     color: AcadColor,
     cur_color: AcadColor,
     label: &'static str,
+    shown: Option<iced::Color>,
 ) -> Element<'a, Message> {
-    let (bg, _) = acad_color_display(color);
+    let bg = shown.unwrap_or_else(|| acad_color_display(color).0);
     let selected = color == cur_color;
 
     let swatch = container(
@@ -190,12 +190,9 @@ fn logical_row<'a>(
     });
 
     button(
-        row![
-            swatch,
-            text(t!(label)).size(11),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
+        row![swatch, text(t!(label)).size(11),]
+            .spacing(8)
+            .align_y(iced::Center),
     )
     .on_press(Message::RibbonColorChanged(color))
     .style(popup_row_style)
@@ -205,28 +202,27 @@ fn logical_row<'a>(
 }
 
 fn more_colors_row<'a>(active_color: AcadColor) -> Element<'a, Message> {
-    button(
-        row![text(t!("Select Color...")).size(11)]
-            .align_y(iced::Center),
-    )
-    .on_press(Message::OpenColorWindow(
-        crate::app::ColorPickTarget::Ribbon,
-        active_color,
-    ))
-    .style(popup_row_style)
-    .padding([4, 4])
-    .width(Length::Fill)
-    .into()
+    button(row![text(t!("Select Color...")).size(11)].align_y(iced::Center))
+        .on_press(Message::OpenColorWindow(
+            crate::app::ColorPickTarget::Ribbon,
+            active_color,
+        ))
+        .style(popup_row_style)
+        .padding([4, 4])
+        .width(Length::Fill)
+        .into()
 }
 
 /// Builds the complete 5-section color dropdown panel element.
+/// `layer_color` is the current layer's colour, shown on the ByLayer row.
 pub fn color_dropdown_panel<'a>(
     active_color: AcadColor,
     recent_colors: &[AcadColor],
+    layer_color: Option<iced::Color>,
 ) -> Element<'a, Message> {
     // 1. ByLayer and ByBlock
-    let by_layer = logical_row(AcadColor::ByLayer, active_color, "ByLayer");
-    let by_block = logical_row(AcadColor::ByBlock, active_color, "ByBlock");
+    let by_layer = logical_row(AcadColor::ByLayer, active_color, "ByLayer", layer_color);
+    let by_block = logical_row(AcadColor::ByBlock, active_color, "ByBlock", None);
     let section1 = column![by_layer, by_block].spacing(2);
 
     // 2. 45-swatch Quick Pick Grid (5 rows × 9 columns)

@@ -27,7 +27,7 @@ struct Uniforms {
     lineweight_scale: f32,
     view_rot: mat4x4<f32>,
     eye_high: vec3<f32>,
-    _pad_eh: f32,
+    highlight_widen: f32,
     eye_low: vec3<f32>,
     _pad_el: f32,
 }
@@ -70,6 +70,8 @@ struct VertexIn {
 
 const MODEL_LINEWEIGHT_BOOST: f32 = 2.0;
 const MODEL_LINEWEIGHT_MAX_PX: f32 = 10.0;
+// Must match `MITER_LIMIT` in wire_gpu.rs.
+const MITER_LIMIT: f32 = 8.0;
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -85,7 +87,13 @@ struct VertexOut {
     @location(9) @interpolate(flat) cap_ends: vec3<f32>,
 }
 
+// The selection pass widens highlighted lines by `highlight_widen` pixels;
+// every other pass uploads zero.
 fn resolve_hw(taper_ratio: f32, world_hw: f32, px_hw: f32) -> f32 {
+    return resolve_hw_base(taper_ratio, world_hw, px_hw) + u.highlight_widen * 0.5;
+}
+
+fn resolve_hw_base(taper_ratio: f32, world_hw: f32, px_hw: f32) -> f32 {
     if taper_ratio > 0.0 {
         return max((taper_ratio * world_hw) / u.world_per_pixel, 0.5);
     }
@@ -144,7 +152,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, in: VertexIn) -> VertexOut 
     let seg_pos_b = vec3<f32>(seg.pos_b_x, seg.pos_b_y, seg.pos_b_z);
     let seg_pos_b_low = vec3<f32>(seg.pos_b_low_x, seg.pos_b_low_y, seg.pos_b_low_z);
     let seg_distances = vec2<f32>(seg.distance_a, seg.distance_b);
-    let seg_taper_ratio = unpack2x16unorm(seg.taper_ratio);
+    let seg_taper_ratio = unpack2x16snorm(seg.taper_ratio);
     let which_end_arr = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
     let side_arr = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
     let which_end = which_end_arr[corner];
@@ -192,13 +200,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, in: VertexIn) -> VertexOut 
         }
         perp_world = normalize(perp_world);
 
+        // A constant-width band slides each corner along the segment onto
+        // its joint's bisector (miter), so neighbours meet without a notch.
+        let miter = select(seg_taper_ratio, vec2<f32>(0.0), is_tapered) * MITER_LIMIT;
+        let along = mix(miter.x, miter.y, which_end) * eff_hw * side;
         let pos_rel = mix(rel_a, rel_b, which_end);
-        let world_pos = pos_rel + perp_world * (eff_hw * side);
+        let world_pos = pos_rel + perp_world * (eff_hw * side) + world_dir * along;
         var clip_pos = u.view_rot * vec4<f32>(world_pos, 1.0);
         clip_pos = apply_draw_order(clip_pos, in.depth.x);
 
         final_clip = clip_pos;
-        out_dist = mix(seg_distances.x, seg_distances.y, which_end);
+        out_dist = mix(seg_distances.x, seg_distances.y, which_end) + along * (seg_distances.y - seg_distances.x) / max(world_len, 1e-6);
         out_cap = vec2<f32>(which_end * world_len, eff_hw * side);
         out_cap_ends = vec3<f32>(world_len, world_hw_a, world_hw_b);
     } else {

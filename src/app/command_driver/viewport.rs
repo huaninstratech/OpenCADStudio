@@ -1,7 +1,11 @@
 use super::*;
 
 impl OpenCADStudio {
-    pub(super) fn handle_mview_create(&mut self, viewport: codec::entities::Viewport, preserve_view: bool) {
+    pub(super) fn handle_mview_create(
+        &mut self,
+        viewport: codec::entities::Viewport,
+        preserve_view: bool,
+    ) {
         let i = self.active_tab;
         let saved_view = preserve_view.then(|| {
             (
@@ -58,21 +62,25 @@ impl OpenCADStudio {
         self.tabs[i].scene.clear_preview_wire();
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
-        let Some(codec::EntityType::Viewport(vp)) = self.tabs[i].scene.document.get_entity(viewport).cloned()
+        let Some(codec::EntityType::Viewport(vp)) =
+            self.tabs[i].scene.document.get_entity(viewport).cloned()
         else {
             return;
         };
         if boundary.is_none() && !boundary_handle.is_null() {
             let scene = &self.tabs[i].scene;
             let closed = scene.entity_belongs_to_current_layout(boundary_handle)
-                && scene.document.get_entity(boundary_handle).is_some_and(|entity| match entity {
-                    codec::EntityType::Circle(_) => true,
-                    codec::EntityType::Ellipse(ellipse) => ellipse.is_full(),
-                    codec::EntityType::LwPolyline(polyline) => polyline.is_closed,
-                    codec::EntityType::Polyline(polyline) => polyline.is_closed(),
-                    codec::EntityType::Polyline2D(polyline) => polyline.is_closed(),
-                    _ => false,
-                });
+                && scene
+                    .document
+                    .get_entity(boundary_handle)
+                    .is_some_and(|entity| match entity {
+                        codec::EntityType::Circle(_) => true,
+                        codec::EntityType::Ellipse(ellipse) => ellipse.is_full(),
+                        codec::EntityType::LwPolyline(polyline) => polyline.is_closed,
+                        codec::EntityType::Polyline(polyline) => polyline.is_closed(),
+                        codec::EntityType::Polyline2D(polyline) => polyline.is_closed(),
+                        _ => false,
+                    });
             if !closed {
                 self.command_line
                     .push_error(crate::t!("Object is not a closed curve.").as_ref());
@@ -90,6 +98,7 @@ impl OpenCADStudio {
         let mut vp = vp;
         if clip.is_null() {
             vp.clip_boundary_handle = Handle::NULL;
+            vp.status.non_rectangular_clipping = false;
         } else {
             let (lo, hi) = clip_boundary_extents(scene, clip)
                 .map(|(lo, hi)| (glam::DVec2::from(lo), glam::DVec2::from(hi)))
@@ -99,13 +108,18 @@ impl OpenCADStudio {
                 if created {
                     scene.erase_entities(&[clip]);
                 }
-                self.command_line
-                    .push_error(crate::t!("MVIEW: the clipping boundary has no usable area.").as_ref());
+                self.command_line.push_error(
+                    crate::t!("MVIEW: the clipping boundary has no usable area.").as_ref(),
+                );
                 return;
             }
             // Model units per paper unit; the view centre follows the paper
             // centre so the model does not move on the sheet.
-            let scale = if vp.height.abs() > 1e-12 { vp.view_height / vp.height } else { 1.0 };
+            let scale = if vp.height.abs() > 1e-12 {
+                vp.view_height / vp.height
+            } else {
+                1.0
+            };
             let center = (lo + hi) * 0.5;
             let (dx, dy) = (center.x - vp.center.x, center.y - vp.center.y);
             let (s, c) = (-vp.twist_angle).sin_cos();
@@ -117,6 +131,7 @@ impl OpenCADStudio {
             vp.height = hi.y - lo.y;
             vp.view_height = vp.height * scale;
             vp.clip_boundary_handle = clip;
+            vp.status.non_rectangular_clipping = true;
             if let Some(entity) = scene.document.get_entity_mut(clip) {
                 let common = entity.common_mut();
                 if !common.reactors.contains(&viewport) {
@@ -228,6 +243,7 @@ impl OpenCADStudio {
         viewport.height = max_y - min_y;
         viewport.id = 2;
         viewport.clip_boundary_handle = clip_handle;
+        viewport.status.non_rectangular_clipping = !clip_handle.is_null();
         let viewport_handle = self.commit_entity_handle(codec::EntityType::Viewport(viewport));
         if let Some(viewport_handle) = viewport_handle {
             if !created_boundary {
@@ -418,7 +434,7 @@ impl OpenCADStudio {
         }
     }
 
-    pub(super) fn handle_zoom_to_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
+    pub(in crate::app) fn handle_zoom_to_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
         let i = self.active_tab;
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
@@ -429,6 +445,53 @@ impl OpenCADStudio {
             .zoom_to_window(p1.as_vec3(), p2.as_vec3());
         self.command_line
             .push_output(crate::t!("Zoom Window").as_ref());
+    }
+
+    /// MVSETUP Scale viewports: each picked layout viewport shows the model
+    /// at `factor` paper units per model unit. One undo step.
+    pub(in crate::app) fn handle_scale_viewports(&mut self, handles: Vec<Handle>, factor: f64) {
+        let i = self.active_tab;
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        let handles: Vec<Handle> = handles
+            .into_iter()
+            .filter(|handle| {
+                matches!(
+                    self.tabs[i].scene.document.get_entity(*handle),
+                    Some(codec::EntityType::Viewport(viewport)) if viewport.id > 1
+                )
+            })
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        self.push_undo_snapshot(i, "MVSETUP");
+        for handle in handles {
+            self.tabs[i]
+                .scene
+                .set_viewport_scale_factor_for(handle, factor);
+        }
+        self.tabs[i].dirty = true;
+    }
+
+    /// Turn the active view about its line of sight so the drawing shows
+    /// `twist` radians counter-clockwise from its untwisted orientation.
+    pub(in crate::app) fn handle_twist_view(&mut self, twist: f64) {
+        let i = self.active_tab;
+        self.tabs[i].scene.remember_current_view();
+        let set = |camera: &mut crate::scene::view::camera::Camera| {
+            // The drawing turns one way when the camera rolls the other.
+            camera.roll_by(-twist as f32 - camera.roll());
+        };
+        if self.tabs[i].scene.active_viewport.is_some() {
+            self.tabs[i].scene.mutate_active_viewport_camera(set);
+        } else {
+            set(&mut self.tabs[i].scene.camera.borrow_mut());
+        }
+        self.tabs[i].scene.camera_generation += 1;
+        if let Some(prompt) = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt()) {
+            self.command_line.push_info(&prompt);
+        }
     }
 
     pub(super) fn handle_set_plot_window(&mut self, p1: glam::DVec3, p2: glam::DVec3) {
@@ -489,7 +552,10 @@ impl OpenCADStudio {
 
 /// Paper-space extents of a viewport clip boundary: exact for lines, arcs
 /// and circles (bulges included), else from its outline.
-fn clip_boundary_extents(scene: &crate::scene::Scene, clip: Handle) -> Option<([f64; 2], [f64; 2])> {
+fn clip_boundary_extents(
+    scene: &crate::scene::Scene,
+    clip: Handle,
+) -> Option<([f64; 2], [f64; 2])> {
     let exact = scene
         .document
         .get_entity(clip)

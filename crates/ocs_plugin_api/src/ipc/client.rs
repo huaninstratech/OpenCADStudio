@@ -16,7 +16,7 @@ use crate::ipc::protocol::{
     HostResponse, HostToPlugin, PluginRequest, PluginResponse, PluginToHost, RunnerHandshake,
 };
 use crate::ipc::transport::{recv, send};
-use crate::shm::{DocumentViewInfo, SharedDocumentReader, DocumentViewData};
+use crate::shm::{DocumentViewData, DocumentViewInfo, SharedDocumentReader};
 
 /// Shared registry of active interactive commands, keyed by host-assigned id.
 pub type InteractiveRegistry = Rc<RefCell<HashMap<u64, Box<dyn InteractiveCommand>>>>;
@@ -60,7 +60,10 @@ impl IpcClient {
         &self,
         req: PluginRequest,
     ) -> Result<PluginResponse, crate::ipc::transport::TransportError> {
-        send(&mut self.stream.borrow_mut(), &PluginToHost::Request(Box::new(req)))?;
+        send(
+            &mut self.stream.borrow_mut(),
+            &PluginToHost::Request(Box::new(req)),
+        )?;
         loop {
             match recv::<HostToPlugin>(&mut self.stream.borrow_mut())? {
                 HostToPlugin::Response(resp) => return Ok(*resp),
@@ -364,10 +367,11 @@ impl HostApi for PluginHostApi {
         &mut self,
         _plugin_id: &'static str,
         _init: &mut dyn FnMut() -> Box<dyn Any + Send + Sync>,
-    ) -> &mut (dyn Any + Send + Sync) {
+    ) -> Option<&mut (dyn Any + Send + Sync)> {
         // Same limitation as `plugin_state_any`. This would need a serializable
-        // state contract to work across processes.
-        panic!("ensure_plugin_state is not supported for out-of-process plugins; keep state in the plugin crate")
+        // state contract to work across processes. Degrade to `None` so plugins
+        // keep running with state unavailable instead of crashing the runner.
+        None
     }
 
     fn document_reader(&self) -> Box<dyn DocumentReader + '_> {
@@ -388,16 +392,18 @@ impl HostApi for PluginHostApi {
             }
         }
         match self.doc_view.borrow().as_ref() {
-            Some(info) => match SharedDocumentReader::<DocumentViewData>::open(Path::new(&info.path)) {
-                Ok(reader) => Box::new(reader),
-                Err(e) => {
-                    eprintln!(
-                        "[plugin] failed to open document view at {}: {e}",
-                        info.path
-                    );
-                    Box::new(EmptyDocumentReader)
+            Some(info) => {
+                match SharedDocumentReader::<DocumentViewData>::open(Path::new(&info.path)) {
+                    Ok(reader) => Box::new(reader),
+                    Err(e) => {
+                        eprintln!(
+                            "[plugin] failed to open document view at {}: {e}",
+                            info.path
+                        );
+                        Box::new(EmptyDocumentReader)
+                    }
                 }
-            },
+            }
             None => Box::new(EmptyDocumentReader),
         }
     }
@@ -418,7 +424,9 @@ impl HostApi for PluginHostApi {
     }
 
     fn system_variable(&self, name: &str) -> Option<HostSettingValue> {
-        match self.client.request(PluginRequest::GetSystemVariable { name: name.to_owned() }) {
+        match self.client.request(PluginRequest::GetSystemVariable {
+            name: name.to_owned(),
+        }) {
             Ok(PluginResponse::SystemVariable(value)) => value,
             _ => None,
         }
@@ -450,11 +458,16 @@ impl HostApi for PluginHostApi {
         label: &str,
         entities: Vec<EntityType>,
     ) -> Result<(), String> {
-        match self.client.request(PluginRequest::UpdateEntitiesTransaction {
-            label: label.to_owned(), entities,
-        }) {
+        match self
+            .client
+            .request(PluginRequest::UpdateEntitiesTransaction {
+                label: label.to_owned(),
+                entities,
+            }) {
             Ok(PluginResponse::EntityTransactionResult(result)) => {
-                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
                 result
             }
             Ok(PluginResponse::Error(error)) => Err(error),
@@ -470,10 +483,18 @@ impl HostApi for PluginHostApi {
         }
     }
 
-    fn solid_operation(&mut self, operation: crate::host::SolidOperation) -> Result<Handle, String> {
-        match self.client.request(PluginRequest::SolidOperation { operation }) {
+    fn solid_operation(
+        &mut self,
+        operation: crate::host::SolidOperation,
+    ) -> Result<Handle, String> {
+        match self
+            .client
+            .request(PluginRequest::SolidOperation { operation })
+        {
             Ok(PluginResponse::SolidResult(result)) => {
-                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
                 result
             }
             Ok(PluginResponse::Error(error)) => Err(error),
@@ -482,7 +503,10 @@ impl HostApi for PluginHostApi {
         }
     }
 
-    fn run_command(&mut self, request: crate::host::CommandRequest) -> Result<crate::host::CommandOutcome, String> {
+    fn run_command(
+        &mut self,
+        request: crate::host::CommandRequest,
+    ) -> Result<crate::host::CommandOutcome, String> {
         match self.client.request(PluginRequest::RunCommand { request }) {
             Ok(PluginResponse::CommandResult(result)) => {
                 self.document_cache = OnceCell::new();
@@ -494,10 +518,18 @@ impl HostApi for PluginHostApi {
         }
     }
 
-    fn table_operation(&mut self, operation: crate::host::TableOperation) -> Result<Handle, String> {
-        match self.client.request(PluginRequest::TableOperation { operation }) {
+    fn table_operation(
+        &mut self,
+        operation: crate::host::TableOperation,
+    ) -> Result<Handle, String> {
+        match self
+            .client
+            .request(PluginRequest::TableOperation { operation })
+        {
             Ok(PluginResponse::TableResult(result)) => {
-                if result.is_ok() { self.document_cache = OnceCell::new(); }
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
                 result
             }
             Ok(PluginResponse::Error(error)) => Err(error),
@@ -507,7 +539,9 @@ impl HostApi for PluginHostApi {
     }
 
     fn set_selection(&mut self, handles: &[Handle]) -> Result<(), String> {
-        match self.client.request(PluginRequest::SetSelection { handles: handles.to_vec() }) {
+        match self.client.request(PluginRequest::SetSelection {
+            handles: handles.to_vec(),
+        }) {
             Ok(PluginResponse::SelectionResult(result)) => result,
             Ok(PluginResponse::Error(error)) => Err(error),
             Ok(other) => Err(format!("unexpected selection response: {other:?}")),
@@ -554,7 +588,10 @@ impl HostApi for PluginHostApi {
     }
 
     fn execute_command(&mut self, cmd: &str) -> bool {
-        match self.client.request(PluginRequest::ExecuteCommand(cmd.to_string())) {
+        match self
+            .client
+            .request(PluginRequest::ExecuteCommand(cmd.to_string()))
+        {
             Ok(PluginResponse::Bool(b)) => b,
             Ok(other) => {
                 eprintln!("[plugin] unexpected ExecuteCommand response: {other:?}");
@@ -564,6 +601,112 @@ impl HostApi for PluginHostApi {
                 eprintln!("[plugin] ExecuteCommand request failed: {e}");
                 false
             }
+        }
+    }
+
+    fn create_xrecord(
+        &mut self,
+        dictionary_path: &[&str],
+        name: &str,
+        entries: Vec<crate::host::XRecordEntry>,
+    ) -> Result<Handle, String> {
+        match self.client.request(PluginRequest::CreateXRecord {
+            dictionary_path: dictionary_path.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+            entries,
+        }) {
+            Ok(PluginResponse::XRecordCreateResult(result)) => {
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected XRecord create response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn read_xrecord(
+        &self,
+        dictionary_path: &[&str],
+        name: &str,
+    ) -> Result<Vec<crate::host::XRecordEntry>, String> {
+        match self.client.request(PluginRequest::ReadXRecord {
+            dictionary_path: dictionary_path.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+        }) {
+            Ok(PluginResponse::XRecordEntries(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected XRecord read response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn update_xrecord(
+        &mut self,
+        dictionary_path: &[&str],
+        name: &str,
+        entries: Vec<crate::host::XRecordEntry>,
+    ) -> Result<Handle, String> {
+        match self.client.request(PluginRequest::UpdateXRecord {
+            dictionary_path: dictionary_path.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+            entries,
+        }) {
+            Ok(PluginResponse::XRecordUpdateResult(result)) => {
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected XRecord update response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn delete_xrecord(
+        &mut self,
+        dictionary_path: &[&str],
+        name: &str,
+    ) -> Result<crate::host::XRecord, String> {
+        match self.client.request(PluginRequest::DeleteXRecord {
+            dictionary_path: dictionary_path.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+        }) {
+            Ok(PluginResponse::XRecordDeleteResult(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected XRecord delete response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn list_xrecords(&self, dictionary_path: &[&str]) -> Result<Vec<String>, String> {
+        match self.client.request(PluginRequest::ListXRecords {
+            dictionary_path: dictionary_path.iter().map(|s| s.to_string()).collect(),
+        }) {
+            Ok(PluginResponse::XRecordNames(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected XRecord list response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn set_reference_only(&mut self, handle: Handle, reference_only: bool) -> Result<(), String> {
+        match self.client.request(PluginRequest::SetReferenceOnly {
+            handle,
+            reference_only,
+        }) {
+            Ok(PluginResponse::SetReferenceOnlyResult(result)) => {
+                if result.is_ok() {
+                    self.document_cache = OnceCell::new();
+                }
+                result
+            }
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected reference-only response: {other:?}")),
+            Err(error) => Err(error.to_string()),
         }
     }
 }
@@ -634,6 +777,22 @@ mod tests {
     }
 
     #[test]
+    fn ensure_plugin_state_does_not_panic_for_out_of_process_hosts() {
+        let (mut api, _peer) = make_client();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = api.ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32));
+        }));
+        assert!(
+            outcome.is_ok(),
+            "out-of-process ensure_plugin_state must degrade, not panic: {:?}",
+            outcome.err()
+        );
+        assert!(api
+            .ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32))
+            .is_none());
+    }
+
+    #[test]
     fn push_info_emits_request() {
         let (mut api, mut peer) = make_client();
         let peer_handle = thread::spawn(move || {
@@ -645,7 +804,11 @@ mod tests {
                 },
                 other => panic!("unexpected: {other:?}"),
             }
-            send(&mut peer, &HostToPlugin::Response(Box::new(PluginResponse::Ok))).unwrap();
+            send(
+                &mut peer,
+                &HostToPlugin::Response(Box::new(PluginResponse::Ok)),
+            )
+            .unwrap();
         });
         api.push_info("hello host");
         peer_handle.join().unwrap();
@@ -702,7 +865,10 @@ mod tests {
             EntityType::Point(Point::new()),
         ]);
         peer_handle.join().unwrap();
-        assert_eq!(handles, vec![Handle::new(10), Handle::new(11), Handle::new(12)]);
+        assert_eq!(
+            handles,
+            vec![Handle::new(10), Handle::new(11), Handle::new(12)]
+        );
     }
 
     #[test]
@@ -717,7 +883,11 @@ mod tests {
                 },
                 other => panic!("unexpected: {other:?}"),
             }
-            send(&mut peer, &HostToPlugin::Response(Box::new(PluginResponse::Bool(true)))).unwrap();
+            send(
+                &mut peer,
+                &HostToPlugin::Response(Box::new(PluginResponse::Bool(true))),
+            )
+            .unwrap();
         });
         assert!(api.update_entity(EntityType::Point(Point::new())));
         peer_handle.join().unwrap();
@@ -737,9 +907,77 @@ mod tests {
                 },
                 other => panic!("unexpected: {other:?}"),
             }
-            send(&mut peer, &HostToPlugin::Response(Box::new(PluginResponse::Bool(true)))).unwrap();
+            send(
+                &mut peer,
+                &HostToPlugin::Response(Box::new(PluginResponse::Bool(true))),
+            )
+            .unwrap();
         });
         assert!(api.remove_entity(Handle::new(7)));
+        peer_handle.join().unwrap();
+    }
+
+    #[test]
+    fn xrecord_requests_await_their_typed_responses() {
+        let (mut api, mut peer) = make_client();
+        let peer_handle = thread::spawn(move || {
+            let msg = recv::<PluginToHost>(&mut peer).unwrap();
+            match msg {
+                PluginToHost::Request(req) => match *req {
+                    PluginRequest::CreateXRecord {
+                        dictionary_path,
+                        name,
+                        entries,
+                    } => {
+                        assert_eq!(dictionary_path, vec!["CVIFC".to_owned()]);
+                        assert_eq!(name, "alpha");
+                        assert_eq!(
+                            entries,
+                            vec![crate::host::XRecordEntry::string(1, "{\"k\":\"road\"}")]
+                        );
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            }
+            send(
+                &mut peer,
+                &HostToPlugin::Response(Box::new(PluginResponse::XRecordCreateResult(Ok(
+                    Handle::new(21),
+                )))),
+            )
+            .unwrap();
+            let msg = recv::<PluginToHost>(&mut peer).unwrap();
+            match msg {
+                PluginToHost::Request(req) => match *req {
+                    PluginRequest::ListXRecords { dictionary_path } => {
+                        assert_eq!(dictionary_path, vec!["CVIFC".to_owned()]);
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            }
+            send(
+                &mut peer,
+                &HostToPlugin::Response(Box::new(PluginResponse::XRecordNames(Ok(vec![
+                    "alpha".to_owned()
+                ])))),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            api.create_xrecord(
+                &["CVIFC"],
+                "alpha",
+                vec![crate::host::XRecordEntry::string(1, "{\"k\":\"road\"}")]
+            )
+            .unwrap(),
+            Handle::new(21)
+        );
+        assert_eq!(
+            api.list_xrecords(&["CVIFC"]).unwrap(),
+            vec!["alpha".to_owned()]
+        );
         peer_handle.join().unwrap();
     }
 }

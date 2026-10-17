@@ -20,7 +20,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
   discussions: read
   pages: write
   id-token: write
@@ -109,6 +109,16 @@ jobs:
       - name: Build web bundle
         run: trunk build --locked --release --public-url /app/ --dist dist/app --html-output index.html web-app.html
 
+      - name: Stamp the service worker cache version
+        # web/sw.js ships a placeholder cache name; each deploy gets one
+        # derived from the bundle contents, so the new worker drops the
+        # previous deploy's cached assets when it activates.
+        run: |
+          test -f dist/app/sw.js
+          hash=$(find dist/app -type f ! -name sw.js -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c 1-12)
+          sed -i "s/^const CACHE_VERSION = \"[^\"]*\";/const CACHE_VERSION = \"$hash\";/" dist/app/sw.js
+          grep -q "^const CACHE_VERSION = \"$hash\";" dist/app/sw.js
+
       - name: Check out current website
         uses: actions/checkout@v4
         with:
@@ -134,6 +144,19 @@ jobs:
         run: |
           jq -n --arg version "${RELEASE_TAG#v}" --arg commit "$RELEASE_COMMIT" \
             '{version: $version, commit: $commit}' > dist/app/release.json
+
+      # Attach the bundle to the release so a version can be pinned and
+      # self-hosted; it expects to be served from /app/. Taken before the
+      # site data below is added, and skipped for hotfixes built from main.
+      - name: Attach web bundle to the release
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_main) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          ASSET="OpenCADStudio-$RELEASE_TAG-web.zip"
+          (cd dist && zip -qr "../$ASSET" app)
+          gh release upload "$RELEASE_TAG" "$ASSET" --clobber --repo "$GITHUB_REPOSITORY"
 
       # GitHub Pages runs Jekyll, which ignores files; opt out so the
       # wasm-bindgen output is served verbatim.

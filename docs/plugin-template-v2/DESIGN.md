@@ -20,7 +20,7 @@ rather than a runtime dependency of the host.
 |---|---|
 | `COUNT_SURVEY_POINTS` | Count point entities on the `SURVEY` layer via `document_reader()`. |
 | `ADD_SURVEY_POINT` | Add a new point entity on the `SURVEY` layer via `host.add_entity()`. |
-| `MARK_FIRST_SURVEY_POINT` | Read the first `SURVEY` point and mark it with an XDATA record. |
+| `MARK_FIRST_SURVEY_POINT` | Read the first `SURVEY` point and mark it with an XDATA record (including the `SURVEY-CLASS:POINT` identity key). |
 | `COUNT_MARKED_SURVEY_POINTS` | Count `SURVEY` points that carry the `SURVEYMARK` XDATA record. |
 
 ---
@@ -47,6 +47,24 @@ Each [`ReaderEntity`](ocs_plugin_api::host::ReaderEntity) exposes the entity
 3. Read the record back later with `host.read_record(handle, app_name)`.
 
 This is the primary read→write round-trip pattern the template demonstrates.
+
+### Entity class display labels
+
+The template also demonstrates the entity-class label convention (API v10):
+
+- the plugin declares `ENTITY_CLASSES` and exposes it through
+  `BuiltinPlugin::entity_classes()`: app `SURVEYMARK`, prefix
+  `SURVEY-CLASS:`, and key → label mappings;
+- `MARK_FIRST_SURVEY_POINT` stamps a `SURVEY-CLASS:POINT` string value into
+  the point's XDATA alongside the existing marker value.
+
+While the plugin is loaded, the host shows marked points as
+"Survey Point (Point)" in the Properties panel title and in the
+`display_type` field of the records/automation APIs; without the plugin they
+are plain "Point" again. Only the stable key round-trips the drawing — the
+label text lives in the plugin and can be reworded or localized without
+touching saved files. The label is display-only: it never governs snapping,
+selection, or any other behavior.
 
 ### Ribbon integration
 

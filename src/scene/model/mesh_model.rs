@@ -105,8 +105,7 @@ pub struct MeshLodSet {
     /// Face-level ACIS material overrides, resolved from each LOD's
     /// `triangle_material_handles`. Only handles actually referenced by the
     /// tessellation are retained.
-    pub face_materials:
-        rustc_hash::FxHashMap<codec::Handle, super::material_model::MeshMaterial>,
+    pub face_materials: rustc_hash::FxHashMap<codec::Handle, super::material_model::MeshMaterial>,
     /// Effective AcDbVisualStyle override resolved from the entity's full,
     /// face and edge style handles.
     pub visual_style: Option<super::visual_style_model::MeshVisualStyle>,
@@ -146,6 +145,9 @@ pub struct MeshLodSet {
     pub instance_handle: Option<codec::Handle>,
     /// Effective colour after INSERT inheritance, without copying the mesh.
     pub instance_color: Option<[f32; 4]>,
+    /// Colour of the edge and silhouette lines when it differs from the
+    /// faces': colour 7 drawn against the background it sits on.
+    pub edge_color: Option<[f32; 4]>,
     /// Precise world bounds used by the interaction index.
     pub instance_aabb: Option<[f64; 6]>,
 }
@@ -250,6 +252,7 @@ impl MeshLodSet {
             instance_transform: None,
             instance_handle: None,
             instance_color: None,
+            edge_color: None,
             instance_aabb: None,
         }
     }
@@ -293,10 +296,12 @@ impl MeshLodSet {
     pub fn geometry_edges(&self) -> (&[[f32; 3]], &[[f32; 3]]) {
         self.instance_source.as_ref().map_or(
             (self.edge_verts.as_slice(), self.edge_verts_low.as_slice()),
-            |source| (
-                source.edge_verts.as_slice(),
-                source.edge_verts_low.as_slice(),
-            ),
+            |source| {
+                (
+                    source.edge_verts.as_slice(),
+                    source.edge_verts_low.as_slice(),
+                )
+            },
         )
     }
 

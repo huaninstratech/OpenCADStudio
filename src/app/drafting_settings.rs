@@ -25,6 +25,7 @@ impl DraftingSettingsState {
             grid_major_input: format!("{}", app.grid_major_every),
             grid_adaptive: app.grid_adaptive,
             grid_beyond_limits: app.grid_beyond_limits,
+            grid_axes: app.grid_axes,
             isometric: app.isometric_drafting,
             iso_plane: app.iso_plane,
             snap_angle_deg: app.snap_angle_deg,
@@ -32,6 +33,7 @@ impl DraftingSettingsState {
             ortho_on: app.ortho_mode,
             polar_increment_deg: app.polar_increment_deg,
             osnap_on: app.snapper.snap_enabled,
+            osnap_aperture_input: format!("{}", app.snapper.osnap_radius_px),
             otrack_on: app.snapper.otrack_enabled,
             snap_modes: app.snapper.enabled.clone(),
             osnap3d_on: app.snapper.snap3d_enabled,
@@ -44,6 +46,18 @@ impl DraftingSettingsState {
 }
 
 impl OpenCADStudio {
+    /// Turn Dynamic Input on or off with DYNMODE in step: off keeps the mode
+    /// negative (temporarily off), on restores it, or 3 when there was none.
+    pub(in crate::app) fn set_dyn_input(&mut self, on: bool) {
+        self.dyn_input = on;
+        let mode = self.dyn_mode.abs();
+        self.dyn_mode = match (on, mode) {
+            (true, 0) => 3,
+            (true, mode) => mode,
+            (false, mode) => -mode,
+        };
+    }
+
     pub(super) fn drafting_settings_dirty(&self) -> bool {
         match (&self.drafting_settings_state, &self.drafting_settings_saved) {
             (Some(curr), Some(saved)) => curr.is_dirty(saved),
@@ -86,6 +100,7 @@ impl OpenCADStudio {
         self.grid_major_every = gm;
         self.grid_adaptive = state.grid_adaptive;
         self.grid_beyond_limits = state.grid_beyond_limits;
+        self.grid_axes = state.grid_axes;
         self.snapper.grid_snap_on = state.snap_on;
         self.snapper.snap_spacing_x = sx;
         self.snapper.snap_spacing_y = sy;
@@ -95,12 +110,24 @@ impl OpenCADStudio {
         self.polar_mode = state.polar_on;
         self.ortho_mode = state.ortho_on;
         self.polar_increment_deg = state.polar_increment_deg;
+        let aperture = state
+            .osnap_aperture_input
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && (4.0..=40.0).contains(v));
+        let Some(aperture) = aperture else {
+            self.command_line
+                .push_error("OSNAP capture radius must be between 4 and 40 pixels.");
+            return false;
+        };
+        self.snapper.osnap_radius_px = aperture;
         self.snapper.snap_enabled = state.osnap_on;
         self.snapper.otrack_enabled = state.otrack_on;
         self.snapper.enabled = state.snap_modes.clone();
         self.snapper.snap3d_enabled = state.osnap3d_on;
         self.snapper.enabled3d = state.snap3d_modes.clone();
-        self.dyn_input = state.dyn_input_on;
+        self.set_dyn_input(state.dyn_input_on);
         self.quick_properties = state.quick_props_on;
         self.selection_cycling = state.selection_cycling_on;
         self.sync_vport_display(self.active_tab);
@@ -126,6 +153,7 @@ mod tests {
             grid_major_input: "5".to_string(),
             grid_adaptive: true,
             grid_beyond_limits: true,
+            grid_axes: true,
             isometric: false,
             iso_plane: crate::app::settings::IsoPlane::Left,
             snap_angle_deg: 0.0,
@@ -133,6 +161,7 @@ mod tests {
             ortho_on: false,
             polar_increment_deg: 15.0,
             osnap_on: true,
+            osnap_aperture_input: "15".to_string(),
             otrack_on: false,
             snap_modes: rustc_hash::FxHashSet::default(),
             osnap3d_on: false,
@@ -167,6 +196,7 @@ mod tests {
             grid_major_input: "5".to_string(),
             grid_adaptive: true,
             grid_beyond_limits: true,
+            grid_axes: true,
             isometric: false,
             iso_plane: crate::app::settings::IsoPlane::Left,
             snap_angle_deg: 0.0,
@@ -174,6 +204,7 @@ mod tests {
             ortho_on: false,
             polar_increment_deg: 15.0,
             osnap_on: true,
+            osnap_aperture_input: "15".to_string(),
             otrack_on: false,
             snap_modes: rustc_hash::FxHashSet::default(),
             osnap3d_on: false,

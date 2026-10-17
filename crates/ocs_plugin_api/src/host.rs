@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::manifest::PluginManifest;
+use crate::manifest::{EntityClasses, PluginManifest};
 use crate::ribbon::CadModule;
 
 // Re-export the opencadcodec crate and the types that appear in the HostApi trait
@@ -65,15 +65,37 @@ pub enum LogLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SolidPrimitive {
     /// Axis-aligned box from its center and full extents.
-    Box { center: [f64; 3], size: [f64; 3] },
+    Box {
+        center: [f64; 3],
+        size: [f64; 3],
+    },
     /// Right triangular prism from its minimum corner and extents.
-    Wedge { origin: [f64; 3], size: [f64; 3] },
+    Wedge {
+        origin: [f64; 3],
+        size: [f64; 3],
+    },
     /// Cylinder standing on the plane through `center`.
-    Cylinder { center: [f64; 3], radius: f64, height: f64 },
-    Sphere { center: [f64; 3], radius: f64 },
-    Torus { center: [f64; 3], major: f64, minor: f64 },
+    Cylinder {
+        center: [f64; 3],
+        radius: f64,
+        height: f64,
+    },
+    Sphere {
+        center: [f64; 3],
+        radius: f64,
+    },
+    Torus {
+        center: [f64; 3],
+        major: f64,
+        minor: f64,
+    },
     /// Regular pyramid with `sides` base edges.
-    Pyramid { center: [f64; 3], radius: f64, height: f64, sides: u32 },
+    Pyramid {
+        center: [f64; 3],
+        radius: f64,
+        height: f64,
+        sides: u32,
+    },
 }
 
 /// How two solids combine.
@@ -159,12 +181,20 @@ pub enum TableOperation {
     /// Create a dimension style, optionally copying an existing one first.
     /// `properties` is a JSON object of DimStyle fields (see the Python docs);
     /// handles and xref fields are managed by the host and refused.
-    DimStyleCreate { name: String, copy_from: Option<String>, properties: String },
+    DimStyleCreate {
+        name: String,
+        copy_from: Option<String>,
+        properties: String,
+    },
     /// Change only the DimStyle fields the JSON object `properties` names.
     DimStyleModify { name: String, properties: String },
     /// Rename a text or dimension style; references to it follow. `Standard`
     /// is never renamed and a case-only change is refused.
-    StyleRename { kind: TableStyleKind, from: String, to: String },
+    StyleRename {
+        kind: TableStyleKind,
+        from: String,
+        to: String,
+    },
     /// Delete a text or dimension style that is neither current nor in use.
     /// `Standard` is never deleted.
     StyleDelete { kind: TableStyleKind, name: String },
@@ -200,9 +230,17 @@ pub enum TableOperation {
     /// Create a simple linetype. `pattern` is signed lengths in drawing units:
     /// positive is a dash, negative a gap, zero a dot (2-12 elements with at
     /// least one dash or dot and one gap). Returns the linetype's handle.
-    LinetypeCreate { name: String, description: String, pattern: Vec<f64> },
+    LinetypeCreate {
+        name: String,
+        description: String,
+        pattern: Vec<f64>,
+    },
     /// Change a simple linetype's description or pattern in place.
-    LinetypeModify { name: String, description: Option<String>, pattern: Option<Vec<f64>> },
+    LinetypeModify {
+        name: String,
+        description: Option<String>,
+        pattern: Option<Vec<f64>>,
+    },
     /// Rename a linetype; layers and entities that use it follow.
     LinetypeRename { from: String, to: String },
     /// Delete a linetype that no layer, entity, dimension style or the current
@@ -257,7 +295,10 @@ pub struct TextStyleConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SolidOperation {
     /// Build a new solid on `layer` (layer `0` when `None`).
-    Create { primitive: SolidPrimitive, layer: Option<String> },
+    Create {
+        primitive: SolidPrimitive,
+        layer: Option<String>,
+    },
     /// Apply a rigid transform, given as a column-major 4x4 matrix, to an
     /// existing solid. Scaling and shear are refused.
     Transform { handle: Handle, matrix: [f64; 16] },
@@ -265,12 +306,25 @@ pub enum SolidOperation {
     /// ellipse, closed polyline or spline, ...). The new region goes on
     /// `layer`, or on the source's layer when `None`; `delete_source` erases
     /// the profile afterwards, as the REGION command does.
-    RegionFromProfile { source: Handle, layer: Option<String>, delete_source: bool },
+    RegionFromProfile {
+        source: Handle,
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Build a plane surface from one closed planar profile entity.
-    SurfaceFromProfile { source: Handle, layer: Option<String>, delete_source: bool },
+    SurfaceFromProfile {
+        source: Handle,
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Extrude a planar profile along `direction`: a solid when the profile is
     /// closed, a surface when it is open.
-    Extrude { source: Handle, direction: [f64; 3], layer: Option<String>, delete_source: bool },
+    Extrude {
+        source: Handle,
+        direction: [f64; 3],
+        layer: Option<String>,
+        delete_source: bool,
+    },
     /// Combine two solids into a new one. Both operands are consumed unless
     /// `keep_operands`; the result goes on `layer` or the first operand's
     /// layer. The kernel refuses some cases (coincident faces, cuts it has no
@@ -280,7 +334,12 @@ pub enum SolidOperation {
     /// `origin`, `width` drawing units wide, keeping the picture's aspect.
     /// PNG, JPEG and BMP are stored as read; other formats are re-encoded as
     /// PNG. The frame goes on `layer` (layer `0` when `None`).
-    EmbedPicture { path: String, origin: [f64; 3], width: f64, layer: Option<String> },
+    EmbedPicture {
+        path: String,
+        origin: [f64; 3],
+        width: f64,
+        layer: Option<String>,
+    },
     Boolean {
         first: Handle,
         second: Handle,
@@ -302,21 +361,50 @@ pub enum HostSettingValue {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum HostNotification {
-    InputLine { line: String },
+    InputLine {
+        line: String,
+    },
     Cancel,
-    DocumentChanged { version: u64 },
-    SelectionChanged { handles: Vec<Handle> },
+    DocumentChanged {
+        version: u64,
+    },
+    SelectionChanged {
+        handles: Vec<Handle>,
+    },
     Raw(Vec<u8>),
     /// V4 snapshot changed for a specific tab. Discriminant 5.
-    DocumentChangedV4 { tab_id: u64, version: u64 },
+    DocumentChangedV4 {
+        tab_id: u64,
+        version: u64,
+    },
     /// V4 tab closed notification. Discriminant 6.
-    DocumentTabClosed { tab_id: u64 },
+    DocumentTabClosed {
+        tab_id: u64,
+    },
     /// V4 selection changed for a specific tab. Discriminant 7.
-    SelectionChangedV4 { tab_id: u64, handles: Vec<Handle> },
+    SelectionChangedV4 {
+        tab_id: u64,
+        handles: Vec<Handle>,
+    },
     /// V7 active interactive-command state for a tab. Discriminant 8.
-    CommandStateChanged { tab_id: u64, command: Option<String> },
+    CommandStateChanged {
+        tab_id: u64,
+        command: Option<String>,
+    },
     /// V7 drawing epoch, broadcast even without an open shared view. Discriminant 9.
-    DrawingChanged { tab_id: u64, epoch: u64 },
+    DrawingChanged {
+        tab_id: u64,
+        epoch: u64,
+    },
+    /// V9 a document became resident in a tab: a whole document replaced the
+    /// tab's previous content — opened from file, created from a template, or
+    /// loaded by an automation/system open. The counterpart of
+    /// [`HostNotification::DocumentTabClosed`]: with both, a plugin can keep
+    /// per-document state (e.g. runtime designations) in sync from load to
+    /// close. Discriminant 10.
+    DocumentOpened {
+        tab_id: u64,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -329,57 +417,48 @@ impl Serialize for HostNotification {
         match self {
             HostNotification::InputLine { line } => {
                 bytes.push(0);
-                bincode::serialize_into(&mut bytes, line)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, line).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Cancel => bytes.push(1),
             HostNotification::DocumentChanged { version } => {
                 bytes.push(2);
-                bincode::serialize_into(&mut bytes, version)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::SelectionChanged { handles } => {
                 bytes.push(3);
-                bincode::serialize_into(&mut bytes, handles)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Raw(data) => {
                 bytes.push(4);
-                bincode::serialize_into(&mut bytes, data)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, data).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DocumentChangedV4 { tab_id, version } => {
                 bytes.push(5);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, version)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DocumentTabClosed { tab_id } => {
                 bytes.push(6);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::SelectionChangedV4 { tab_id, handles } => {
                 bytes.push(7);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, handles)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::CommandStateChanged { tab_id, command } => {
                 bytes.push(8);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, command)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, command).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::DrawingChanged { tab_id, epoch } => {
                 bytes.push(9);
-                bincode::serialize_into(&mut bytes, tab_id)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, epoch)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, epoch).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::DocumentOpened { tab_id } => {
+                bytes.push(10);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
@@ -424,6 +503,9 @@ impl<'de> Deserialize<'de> for HostNotification {
             9 => bincode::deserialize(rest)
                 .map(|(tab_id, epoch)| HostNotification::DrawingChanged { tab_id, epoch })
                 .map_err(serde::de::Error::custom),
+            10 => bincode::deserialize(rest)
+                .map(|tab_id| HostNotification::DocumentOpened { tab_id })
+                .map_err(serde::de::Error::custom),
             _ => Ok(HostNotification::Unknown(bytes)),
         }
     }
@@ -434,14 +516,28 @@ impl<'de> Deserialize<'de> for HostNotification {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum PluginNotification {
-    Output { text: String },
-    Error { text: String },
-    Prompt { text: String },
-    Progress { percent: u8 },
-    Log { level: LogLevel, text: String },
+    Output {
+        text: String,
+    },
+    Error {
+        text: String,
+    },
+    Prompt {
+        text: String,
+    },
+    Progress {
+        percent: u8,
+    },
+    Log {
+        level: LogLevel,
+        text: String,
+    },
     Raw(Vec<u8>),
     /// V4 REPL status update. Discriminant 6.
-    ReplStatus { status: String, message: String },
+    ReplStatus {
+        status: String,
+        message: String,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -454,42 +550,33 @@ impl Serialize for PluginNotification {
         match self {
             PluginNotification::Output { text } => {
                 bytes.push(0);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Error { text } => {
                 bytes.push(1);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Prompt { text } => {
                 bytes.push(2);
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Progress { percent } => {
                 bytes.push(3);
-                bincode::serialize_into(&mut bytes, percent)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, percent).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Log { level, text } => {
                 bytes.push(4);
-                bincode::serialize_into(&mut bytes, level)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, text)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, level).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, text).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Raw(data) => {
                 bytes.push(5);
-                bincode::serialize_into(&mut bytes, data)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, data).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::ReplStatus { status, message } => {
                 bytes.push(6);
-                bincode::serialize_into(&mut bytes, status)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, message)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, status).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, message).map_err(serde::ser::Error::custom)?;
             }
             PluginNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
@@ -519,8 +606,8 @@ impl<'de> Deserialize<'de> for PluginNotification {
                 .map(|percent| PluginNotification::Progress { percent })
                 .map_err(serde::de::Error::custom),
             4 => {
-                let (level, text): (LogLevel, String) = bincode::deserialize(rest)
-                    .map_err(serde::de::Error::custom)?;
+                let (level, text): (LogLevel, String) =
+                    bincode::deserialize(rest).map_err(serde::de::Error::custom)?;
                 Ok(PluginNotification::Log { level, text })
             }
             5 => bincode::deserialize(rest)
@@ -572,6 +659,21 @@ pub trait BuiltinPlugin: Send + Sync {
     /// Added in API v5. The runner only calls this for plugins that report API
     /// major 5 or newer.
     fn on_load(&mut self, _host: &mut dyn HostApi) {}
+
+    /// Entity-class display declarations (API v10): the XDATA
+    /// class-identity keys the plugin stamps on entities, mapped to the
+    /// display labels the host shows while this plugin is loaded (e.g. the
+    /// Properties panel title becomes `"Linear Element (Line)"`). Display-only
+    /// — the labels never round-trip the drawing and never govern behavior;
+    /// entities carry only the stable identity keys in their XDATA.
+    ///
+    /// The default (`None`) declares no entity classes. The runner only calls
+    /// this for plugins whose exported `ocs_plugin_api_version` symbol reports
+    /// API major 10 or newer, so older cdylibs are never touched past their
+    /// vtable.
+    fn entity_classes(&self) -> Option<&'static EntityClasses> {
+        None
+    }
 }
 
 /// A point-driven interactive command a plugin starts via
@@ -641,7 +743,10 @@ pub enum PreviewWire {
 impl PreviewWire {
     /// Create a polyline preview wire with default host cyan color.
     pub fn new(points: Vec<[f64; 3]>) -> Self {
-        Self::Polyline { points, color: None }
+        Self::Polyline {
+            points,
+            color: None,
+        }
     }
 
     /// Optional RGBA color (0.0 to 1.0) specified for this preview wire.
@@ -833,11 +938,12 @@ pub trait HostApi {
     fn plugin_state_any(&self, plugin_id: &str) -> Option<&(dyn Any + Send + Sync)>;
     fn plugin_state_any_mut(&mut self, plugin_id: &str) -> Option<&mut (dyn Any + Send + Sync)>;
     /// Get the state for `plugin_id`, inserting `init()`'s result if absent.
+    /// Returns `None` when this host cannot store state (e.g. out-of-process).
     fn ensure_plugin_state_any(
         &mut self,
         plugin_id: &'static str,
         init: &mut dyn FnMut() -> Box<dyn Any + Send + Sync>,
-    ) -> &mut (dyn Any + Send + Sync);
+    ) -> Option<&mut (dyn Any + Send + Sync)>;
 
     // ── DocumentReader (added in API v3; appended at the end to keep vtable
     // indices stable for API v2 plugins) ─────────────────────────────────────
@@ -868,9 +974,7 @@ pub trait HostApi {
     /// Returns the optional `command_id` used to correlate the notification
     /// with a running command, and the notification payload. Long-running
     /// plugins should call this periodically to drain the bounded queue.
-    fn try_recv_notification(
-        &mut self,
-    ) -> Option<(Option<u64>, HostNotification)> {
+    fn try_recv_notification(&mut self) -> Option<(Option<u64>, HostNotification)> {
         None
     }
 
@@ -948,7 +1052,9 @@ pub trait HostApi {
     }
 
     /// Current ordered selection in this session's tab (API v7).
-    fn selection(&self) -> Vec<Handle> { Vec::new() }
+    fn selection(&self) -> Vec<Handle> {
+        Vec::new()
+    }
 
     /// Replace this tab's selection with exactly these handles, in order.
     /// Missing or duplicate handles reject the request (API v7).
@@ -1009,6 +1115,135 @@ pub trait HostApi {
     fn execute_command(&mut self, cmd: &str) -> bool {
         let _ = cmd;
         false
+    }
+
+    // ── XRecord objects (added in API v8; appended at the end to keep vtable
+    // indices stable for older plugins) ────────────────────────────────────────
+
+    /// Create an XRecord named `name` under the dictionary addressed by
+    /// `dictionary_path`, storing `entries` (API v8, additive).
+    ///
+    /// The path is walked from the drawing's named-object dictionary root: an
+    /// empty path addresses the root itself, and missing intermediate
+    /// dictionaries are created, so the first call seeds a plugin's namespace.
+    /// Every refusal (empty or invalid names, a path fragment that names a
+    /// non-dictionary object, a name already in use — comparison is
+    /// case-insensitive like dictionary lookups) happens **before** any change,
+    /// so a failure leaves the drawing untouched. The record is registered in
+    /// its dictionary and owned by it; the returned handle stays stable across
+    /// updates.
+    ///
+    /// Undo composition — the entity-write contract: a mutation performed
+    /// inside a plugin-opened [`HostApi::push_undo`] scope joins that scope,
+    /// so an operation composed of several writes (entities and XRecords) is
+    /// a single undo step under the plugin's own label. With no scope open
+    /// the change is one undo step of its own. Refusals record no undo step.
+    fn create_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+        _entries: Vec<XRecordEntry>,
+    ) -> Result<Handle, String> {
+        Err("XRecord creation is not supported by this host".to_owned())
+    }
+
+    /// Read the entries of an existing XRecord by name (API v8, additive).
+    ///
+    /// Resolves `dictionary_path` under the named-object dictionary root and
+    /// returns the record's entries verbatim. Fails when the path, the name or
+    /// the record is missing, or when the name addresses a different object
+    /// kind.
+    fn read_xrecord(
+        &self,
+        _dictionary_path: &[&str],
+        _name: &str,
+    ) -> Result<Vec<XRecordEntry>, String> {
+        Err("XRecord reads are not supported by this host".to_owned())
+    }
+
+    /// Atomically replace the entries of an existing XRecord (API v8,
+    /// additive). Returns the record's handle.
+    ///
+    /// Neither the path nor its dictionaries are created: an update must never
+    /// create anything silently. Identity (handle, owning dictionary) stays;
+    /// the entries and their DWG handle-reference stream are replaced and the
+    /// record's verbatim raw payloads are dropped, so subsequent saves emit the
+    /// new content. A refusal leaves the drawing untouched. Undo composition —
+    /// the entity-write contract: a mutation inside a plugin-opened
+    /// [`HostApi::push_undo`] scope joins that scope; with no scope open it is
+    /// one undo step of its own, whose undo restores the previous entries
+    /// byte-exactly. Refusals record no undo step.
+    fn update_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+        _entries: Vec<XRecordEntry>,
+    ) -> Result<Handle, String> {
+        Err("XRecord updates are not supported by this host".to_owned())
+    }
+
+    /// Delete the XRecord named `name` and its dictionary entry (API v8,
+    /// additive). Returns the removed record, so audits keep the prior
+    /// content. A refusal leaves the drawing untouched. Undo composition — the
+    /// entity-write contract: a mutation inside a plugin-opened
+    /// [`HostApi::push_undo`] scope joins that scope; with no scope open it is
+    /// one undo step of its own. Refusals record no undo step.
+    fn delete_xrecord(
+        &mut self,
+        _dictionary_path: &[&str],
+        _name: &str,
+    ) -> Result<XRecord, String> {
+        Err("XRecord deletes are not supported by this host".to_owned())
+    }
+
+    /// List the XRecord names under the dictionary addressed by
+    /// `dictionary_path` (API v8, additive).
+    ///
+    /// Returns only the dictionary keys that address XRecord objects, in the
+    /// dictionary's own order, so consumers can audit and export without
+    /// knowing names in advance. Fails when the path does not address a
+    /// dictionary.
+    fn list_xrecords(&self, _dictionary_path: &[&str]) -> Result<Vec<String>, String> {
+        Err("XRecord listing is not supported by this host".to_owned())
+    }
+
+    // ── Reference-only designation (added in API v9; appended at the end to
+    // keep vtable indices stable for older plugins) ──────────────────────────
+
+    /// Mark (or unmark) an entity as reference-only (API v9, additive).
+    ///
+    /// A reference-only entity is plugin-owned display geometry: it renders
+    /// normally, but the built-in edit paths treat it like an entity on a
+    /// locked layer — it is neither grip-editable nor click-pickable (a click
+    /// passes through to the editable entity underneath), window and box
+    /// selections skip it, and user-driven writes refuse it. The owning
+    /// plugin keeps full write access through this API: `update_entity`,
+    /// [`update_entities_transaction`](HostApi::update_entities_transaction),
+    /// `remove_entity` and the XDATA record methods keep working, so derived
+    /// display geometry can be refreshed in place.
+    ///
+    /// The designation is a scene-scoped, in-memory set keyed by entity
+    /// handle: it is not written to the saved DWG/DXF (the host stores no
+    /// state of its own in the file), it lives and dies with the drawing tab,
+    /// and a reloaded drawing starts undesignated — the owning plugin
+    /// re-marks its entities when
+    /// [`on_notification`](BuiltinPlugin::on_notification) delivers
+    /// [`HostNotification::DocumentOpened`], making the in-memory designation
+    /// fully equivalent to a persisted one for its use case.
+    ///
+    /// Fails when the entity does not exist or is on a locked layer (the same
+    /// policy as the XDATA record methods). A call that would not change the
+    /// current designation succeeds without recording an undo step — and
+    /// without publishing a document change, so idempotent re-marks cannot
+    /// loop with the notification dispatch.
+    ///
+    /// Undo composition — the entity-write contract: a change performed
+    /// inside a plugin-opened [`HostApi::push_undo`] scope joins that scope,
+    /// so an operation composed of several writes is a single undo step under
+    /// the plugin's own label. With no scope open the change is one undo step
+    /// of its own. Refusals record no undo step.
+    fn set_reference_only(&mut self, _handle: Handle, _reference_only: bool) -> Result<(), String> {
+        Err("The reference-only designation is not supported by this host".to_owned())
     }
 }
 
@@ -1159,17 +1394,20 @@ pub fn plugin_state_mut<'a, T: Any + Send + Sync>(
 }
 
 /// Typed get-or-insert of per-tab plugin state stored under `plugin_id`.
+///
+/// Returns `None` when this host cannot hold state (out-of-process plugins)
+/// or when existing state under `plugin_id` has a different type.
 pub fn ensure_plugin_state<'a, T: Any + Send + Sync>(
     host: &'a mut dyn HostApi,
     plugin_id: &'static str,
     init: impl FnOnce() -> T,
-) -> &'a mut T {
+) -> Option<&'a mut T> {
     let mut init = Some(init);
-    let any = host.ensure_plugin_state_any(plugin_id, &mut || {
-        Box::new((init.take().expect("init called once"))())
+    let any = host.ensure_plugin_state_any(plugin_id, &mut || match init.take() {
+        Some(make) => Box::new(make()),
+        None => Box::new(()),
     });
-    any.downcast_mut::<T>()
-        .expect("plugin state type mismatch for plugin_id")
+    any?.downcast_mut::<T>()
 }
 
 #[cfg(feature = "host")]

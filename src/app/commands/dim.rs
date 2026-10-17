@@ -30,7 +30,7 @@ fn solid_edge_sources(
                 entity,
                 codec::EntityType::Solid3D(_) | codec::EntityType::Surface(_)
             )
-                .then_some(entity.common().handle)
+            .then_some(entity.common().handle)
         })
         .collect::<Vec<_>>();
     app.tabs[tab].scene.restore_solid_models(&handles);
@@ -199,8 +199,9 @@ impl OpenCADStudio {
                     _ => None,
                 };
                 if text_align.is_none() && mtext_ap.is_none() {
-                    self.command_line
-                        .push_error(crate::t!("JUSTIFYTEXT: unknown justification option.").as_ref());
+                    self.command_line.push_error(
+                        crate::t!("JUSTIFYTEXT: unknown justification option.").as_ref(),
+                    );
                     return Some(Task::none());
                 }
                 self.push_undo_snapshot(i, "JUSTIFYTEXT");
@@ -358,10 +359,7 @@ impl OpenCADStudio {
                     .selected_entities()
                     .iter()
                     .filter(|(_, e)| {
-                        matches!(
-                            e,
-                            codec::EntityType::Text(_) | codec::EntityType::MText(_)
-                        )
+                        matches!(e, codec::EntityType::Text(_) | codec::EntityType::MText(_))
                     })
                     .map(|(h, _)| *h)
                     .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
@@ -421,8 +419,7 @@ impl OpenCADStudio {
             "TEXTFIT" => {
                 use crate::command::SelectThenValueCommand;
                 let has_sel = !self.tabs[i].scene.selected_entities().is_empty();
-                let c =
-                    SelectThenValueCommand::new("TEXTFIT", "TEXTFIT  target width:", has_sel);
+                let c = SelectThenValueCommand::new("TEXTFIT", "TEXTFIT  target width:", has_sel);
                 self.command_line.push_info(&c.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(c));
             }
@@ -485,9 +482,9 @@ impl OpenCADStudio {
                     .map(|handle| (handle, crate::scene::ChangeKind::Modified))
                     .collect();
                 self.tabs[i].scene.bump_entities(&changes);
-                self.command_line.push_output(crate::tf!(
-                    "TEXTFIT: fitted {n} text object(s) to width {target}."
-                ).as_ref());
+                self.command_line.push_output(
+                    crate::tf!("TEXTFIT: fitted {n} text object(s) to width {target}.").as_ref(),
+                );
             }
 
             // (text sequential numbering)
@@ -505,20 +502,11 @@ impl OpenCADStudio {
             cmd if cmd.starts_with("TCOUNT ") => {
                 let mut args = cmd.split_whitespace().skip(1);
 
-                let start: i64 = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
+                let start: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
-                let increment: i64 = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
+                let increment: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
-                let placement = args
-                    .next()
-                    .unwrap_or("O")
-                    .to_uppercase();
+                let placement = args.next().unwrap_or("O").to_uppercase();
 
                 let placement = match placement.as_str() {
                     "O" | "OVERWRITE" => "O",
@@ -538,9 +526,7 @@ impl OpenCADStudio {
                     .selected_entities()
                     .iter()
                     .filter_map(|(h, e)| match e {
-                        codec::EntityType::Text(t)
-                            if !self.tabs[i].scene.is_layer_locked(*h) =>
-                        {
+                        codec::EntityType::Text(t) if !self.tabs[i].scene.is_layer_locked(*h) => {
                             Some((*h, t.insertion_point.x, t.insertion_point.y))
                         }
                         _ => None,
@@ -558,10 +544,7 @@ impl OpenCADStudio {
                 texts.sort_by(|a, b| {
                     b.2.partial_cmp(&a.2)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.1.partial_cmp(&b.1)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
+                        .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 });
 
                 self.push_undo_snapshot(i, "TCOUNT");
@@ -589,9 +572,7 @@ impl OpenCADStudio {
 
                 let changes: Vec<_> = texts
                     .iter()
-                    .map(|(handle, _, _)| {
-                        (*handle, crate::scene::ChangeKind::Modified)
-                    })
+                    .map(|(handle, _, _)| (*handle, crate::scene::ChangeKind::Modified))
                     .collect();
 
                 self.tabs[i].scene.bump_entities(&changes);
@@ -618,21 +599,22 @@ impl OpenCADStudio {
                     .header
                     .current_mleader_style_name
                     .clone();
-                let style = self.tabs[i]
-                    .scene
-                    .document
-                    .objects
-                    .iter()
-                    .find_map(|(handle, object)| match object {
-                        codec::objects::ObjectType::MultiLeaderStyle(style)
-                            if style.name.eq_ignore_ascii_case(&name) =>
-                        {
-                            let mut style = style.clone();
-                            style.handle = *handle;
-                            Some(style)
-                        }
-                        _ => None,
-                    });
+                let style =
+                    self.tabs[i]
+                        .scene
+                        .document
+                        .objects
+                        .iter()
+                        .find_map(|(handle, object)| match object {
+                            codec::objects::ObjectType::MultiLeaderStyle(style)
+                                if style.name.eq_ignore_ascii_case(&name) =>
+                            {
+                                let mut style = style.clone();
+                                style.handle = *handle;
+                                Some(style)
+                            }
+                            _ => None,
+                        });
                 let multiplier = self.tabs[i].scene.creation_annotation_multiplier();
                 let block_sources = self.tabs[i]
                     .scene
@@ -656,9 +638,11 @@ impl OpenCADStudio {
                     .iter()
                     .map(|style| (style.name.clone(), style.handle))
                     .collect();
-                let new_cmd = style.map_or_else(MLeaderCommand::new, |style| {
-                    MLeaderCommand::with_style(style, multiplier)
-                }).with_drawing_resources(block_sources, layers, text_styles);
+                let new_cmd = style
+                    .map_or_else(MLeaderCommand::new, |style| {
+                        MLeaderCommand::with_style(style, multiplier)
+                    })
+                    .with_drawing_resources(block_sources, layers, text_styles);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -686,10 +670,7 @@ impl OpenCADStudio {
                     .filter(|handle| scene.entity_belongs_to_active_space(*handle))
                     .and_then(|handle| scene.document.get_entity(handle))
                     .cloned();
-                let cmd = DimContinueCommand::new(
-                    recent,
-                    self.dimension_continue_mode == 1,
-                );
+                let cmd = DimContinueCommand::new(recent, self.dimension_continue_mode == 1);
                 self.command_line.push_info(&cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
             }
@@ -754,11 +735,8 @@ impl OpenCADStudio {
                         surface_area: None,
                     })
                     .collect();
-                let cmd = QdimCommand::new(
-                    selection,
-                    dim_spacing,
-                    self.quick_dimension_snap_priority,
-                );
+                let cmd =
+                    QdimCommand::new(selection, dim_spacing, self.quick_dimension_snap_priority);
                 self.command_line.push_info(&cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
             }
@@ -829,13 +807,15 @@ impl OpenCADStudio {
             "ZOOM EXTENTS ALL" | "ZOOM EXTENTS ALL VIEWPORTS" | "ZOOM EA" | "ZEA" => {
                 self.tabs[i].scene.remember_current_view();
                 self.tabs[i].scene.fit_all_model_viewports();
-                self.command_line.push_output(crate::t!("Zoom Extents — All Viewports").as_ref());
+                self.command_line
+                    .push_output(crate::t!("Zoom Extents — All Viewports").as_ref());
             }
 
             "ZOOM EXTENTS" | "ZOOM E" | "ZOOMEXTENTS" | "ZE" => {
                 self.tabs[i].scene.remember_current_view();
                 self.tabs[i].scene.fit_all();
-                self.command_line.push_output(crate::t!("Zoom Extents").as_ref());
+                self.command_line
+                    .push_output(crate::t!("Zoom Extents").as_ref());
             }
 
             "ZOOM IN" | "ZOOM I" | "ZI" => {
@@ -847,19 +827,22 @@ impl OpenCADStudio {
             "ZOOM OUT" | "ZO" => {
                 self.tabs[i].scene.remember_current_view();
                 self.tabs[i].scene.zoom_camera(1.5);
-                self.command_line.push_output(crate::t!("Zoom Out").as_ref());
+                self.command_line
+                    .push_output(crate::t!("Zoom Out").as_ref());
             }
 
             // ZOOM ALL — fit the configured drawing limits.
             "ZOOM ALL" | "ZOOM A" | "ZA" => {
                 self.tabs[i].scene.remember_current_view();
                 self.tabs[i].scene.fit_all_with_limits();
-                self.command_line.push_output(crate::t!("Zoom All").as_ref());
+                self.command_line
+                    .push_output(crate::t!("Zoom All").as_ref());
             }
 
             "ZOOM PREVIOUS" | "ZOOM P" | "ZP" => {
                 if self.tabs[i].scene.restore_previous_view() {
-                    self.command_line.push_output(crate::t!("Zoom Previous").as_ref());
+                    self.command_line
+                        .push_output(crate::t!("Zoom Previous").as_ref());
                 } else {
                     self.command_line
                         .push_error(crate::t!("ZOOM: no previous view.").as_ref());
@@ -881,7 +864,8 @@ impl OpenCADStudio {
                 } else {
                     self.tabs[i].scene.remember_current_view();
                     if self.tabs[i].scene.zoom_to_entities(&handles) {
-                        self.command_line.push_output(crate::t!("Zoom Object").as_ref());
+                        self.command_line
+                            .push_output(crate::t!("Zoom Object").as_ref());
                     } else {
                         self.command_line.push_error(
                             crate::t!("ZOOM: selected objects have no visible bounds.").as_ref(),
@@ -911,13 +895,29 @@ impl OpenCADStudio {
                     .or_else(|| cmd.strip_prefix("ZOOM S "))
                     .or_else(|| cmd.strip_prefix("ZS "))
                     .unwrap_or("1");
-                if let Ok(factor) = rest.trim().parse::<f32>() {
-                    if factor > 0.0 {
-                        self.tabs[i].scene.remember_current_view();
-                        self.tabs[i].scene.zoom_camera(1.0 / factor);
+                // nXP scales the active viewport against paper space, nX (or
+                // a bare n) the current view (#1465). n may be an expression
+                // such as 1/50.
+                let rest = rest.trim().to_ascii_uppercase();
+                let (number, xp) = match rest.strip_suffix("XP") {
+                    Some(n) => (n, true),
+                    None => (rest.strip_suffix('X').unwrap_or(&rest), false),
+                };
+                let factor = crate::app::expr_eval::eval_number(number.trim())
+                    .filter(|f| f.is_finite() && *f > 0.0);
+                match factor {
+                    Some(factor) if xp && self.tabs[i].scene.set_viewport_scale_factor(factor) => {
+                        self.tabs[i].dirty = true;
                         self.command_line
                             .push_output(crate::tf!("Zoom Scale ×{factor:.3}").as_ref());
                     }
+                    Some(factor) => {
+                        self.tabs[i].scene.remember_current_view();
+                        self.tabs[i].scene.zoom_camera(1.0 / factor as f32);
+                        self.command_line
+                            .push_output(crate::tf!("Zoom Scale ×{factor:.3}").as_ref());
+                    }
+                    None => {}
                 }
             }
 
@@ -931,6 +931,21 @@ impl OpenCADStudio {
             "QUICKPRINT" => {
                 use crate::modules::view::quick_print::QuickPrintCommand;
                 let cmd = QuickPrintCommand::new();
+                self.command_line.push_info(&cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(cmd));
+            }
+
+            "DVIEW" => {
+                use crate::modules::view::dview::DviewCommand;
+                let twist = {
+                    let scene = &self.tabs[i].scene;
+                    let roll = match scene.active_viewport {
+                        Some(_) => scene.navigation_camera().roll(),
+                        None => scene.camera.borrow().roll(),
+                    };
+                    -(roll as f64)
+                };
+                let cmd = DviewCommand::new(twist.rem_euclid(std::f64::consts::TAU));
                 self.command_line.push_info(&cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
             }
@@ -960,7 +975,33 @@ impl OpenCADStudio {
                 } else {
                     self.tabs[i].scene.wire_models_for(&handles)
                 };
-                let new_cmd = StretchCommand::new(handles, wires);
+                // Selected by a crossing window just before: stretch through
+                // that window, no second one asked for (#1068). Every picked
+                // object must touch it, or the selection was changed since.
+                let window = self.tabs[i].last_crossing_window.and_then(|(lo, hi)| {
+                    let touches = |wire: &crate::scene::WireModel| {
+                        let [x0, y0, x1, y1] = wire.aabb.map(f64::from);
+                        x0 <= hi[0] && x1 >= lo[0] && y0 <= hi[1] && y1 >= lo[1]
+                    };
+                    (!handles.is_empty()
+                        && handles.iter().all(|h| {
+                            self.tabs[i]
+                                .scene
+                                .wire_models_for(&[*h])
+                                .iter()
+                                .any(touches)
+                        }))
+                    .then(|| {
+                        (
+                            glam::DVec3::new(lo[0], lo[1], f64::NEG_INFINITY),
+                            glam::DVec3::new(hi[0], hi[1], f64::INFINITY),
+                        )
+                    })
+                });
+                let new_cmd = match window {
+                    Some(window) => StretchCommand::preselected(handles, wires, window),
+                    None => StretchCommand::new(handles, wires),
+                };
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -1217,6 +1258,32 @@ impl OpenCADStudio {
                     self.command_line.push_info(&cmd.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(cmd));
                 } else {
+                    // EXPLMODE 0 keeps references that are not uniformly and
+                    // positively scaled whole.
+                    let selected: Vec<_> =
+                        if super::blockvars::explmode(&self.tabs[i].scene.document) == 0 {
+                            selected
+                                .into_iter()
+                                .filter(|(_, entity)| match entity {
+                                    codec::EntityType::Insert(ins) => {
+                                        let (x, y, z) =
+                                            (ins.x_scale(), ins.y_scale(), ins.z_scale());
+                                        let uniform = x > 0.0
+                                            && (x - y).abs() <= 1e-10
+                                            && (x - z).abs() <= 1e-10;
+                                        if !uniform {
+                                            self.command_line.push_output(
+                                            "The object is not uniformly and positively scaled.",
+                                        );
+                                        }
+                                        uniform
+                                    }
+                                    _ => true,
+                                })
+                                .collect()
+                        } else {
+                            selected
+                        };
                     let replacements = plan_explode(&selected, &self.tabs[i].scene.document);
                     let exploded = replacements.len();
                     if exploded > 0 {
@@ -1229,10 +1296,67 @@ impl OpenCADStudio {
                         self.command_line
                             .push_output(crate::tf!("{exploded} object(s) exploded.").as_ref());
                     } else {
-                        self.command_line
-                            .push_info(crate::t!("EXPLODE: no explodable objects selected.").as_ref());
+                        self.command_line.push_info(
+                            crate::t!("EXPLODE: no explodable objects selected.").as_ref(),
+                        );
                     }
                 }
+            }
+
+            // TXTEXP — text becomes the polylines of its character outlines.
+            "TXTEXP" => {
+                let selected: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .filter(|(handle, _)| !self.tabs[i].scene.is_layer_locked(*handle))
+                    .collect();
+                if selected.is_empty() {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("TXTEXP");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                } else {
+                    use crate::modules::draw::modify::explode::apply_explode_replacements;
+                    use crate::modules::draw::modify::txtexp::plan_text_explode;
+                    let replacements = plan_text_explode(&selected, &self.tabs[i].scene.document);
+                    let exploded = replacements.len();
+                    if exploded > 0 {
+                        self.push_undo_snapshot(i, "TXTEXP");
+                        apply_explode_replacements(&mut self.tabs[i].scene, replacements);
+                        self.tabs[i].dirty = true;
+                        self.refresh_properties();
+                        self.command_line
+                            .push_output(crate::tf!("{exploded} object(s) exploded.").as_ref());
+                    } else {
+                        self.command_line
+                            .push_info(crate::t!("TXTEXP: no text selected.").as_ref());
+                    }
+                }
+            }
+
+            // TXT2MTXT — TEXT / MTEXT combined into MTEXT. A preselection is
+            // used at once; otherwise the selection prompt with SEttings.
+            "TXT2MTXT" => {
+                if !self.tabs[i].scene.selected.is_empty() {
+                    return Some(self.dispatch_command("_TXT2MTXTSEL"));
+                }
+                use crate::modules::draw::select::SelectObjectsCommand;
+                self.command_line
+                    .push_output(crate::t!("Select text objects to combine ...").as_ref());
+                let command = SelectObjectsCommand::with_settings(
+                    "TXT2MTXT",
+                    "_TXT2MTXTSEL",
+                    "Select objects or [SEttings]:",
+                    || crate::command::CmdResult::OpenTxt2MtxtSettings,
+                );
+                self.command_line.push_info(&command.prompt());
+                self.command_line.set_step_options(command.options());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            "_TXT2MTXTSEL" => {
+                self.apply_txt2mtxt(i);
+                return Some(self.finish_dispatch("TXT2MTXT"));
             }
 
             "OFFSET" => {
@@ -1247,7 +1371,8 @@ impl OpenCADStudio {
                     })
                     .collect();
                 // Pick-first (#422): with offsettable objects already selected,
-                // skip the pick step and go straight to distance / side.
+                // skip the distance and pick steps and open on the live side
+                // preview.
                 let preselected: Vec<_> = self.tabs[i]
                     .scene
                     .selected_entities()
@@ -1290,8 +1415,7 @@ impl OpenCADStudio {
                     })
                     .collect();
                 let all_entities: Vec<_> = entities.into_iter().map(|(_, e)| e).collect();
-                let new_cmd =
-                    TrimCommand::with_cutting_edges(all_entities, initial_edges);
+                let new_cmd = TrimCommand::with_cutting_edges(all_entities, initial_edges);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -1304,7 +1428,12 @@ impl OpenCADStudio {
                     .iter()
                     .filter_map(|w| {
                         let h = Scene::handle_from_wire_name(&w.name)?;
-                        self.tabs[i].scene.document.get_entity(h).cloned().map(|e| (h, e))
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .get_entity(h)
+                            .cloned()
+                            .map(|e| (h, e))
                     })
                     .collect();
                 let new_cmd = ExtrimCommand::new(all);
@@ -1328,8 +1457,17 @@ impl OpenCADStudio {
                             .map(|e| (h, e))
                     })
                     .collect();
+                let initial_edges: Vec<codec::Handle> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .filter_map(|(handle, entity)| {
+                        crate::modules::draw::modify::trim::is_trim_boundary_entity(&entity)
+                            .then_some(handle)
+                    })
+                    .collect();
                 let all_entities: Vec<_> = entities.into_iter().map(|(_, e)| e).collect();
-                let new_cmd = ExtendCommand::new(all_entities);
+                let new_cmd = ExtendCommand::with_boundary_edges(all_entities, initial_edges);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
@@ -1353,7 +1491,10 @@ impl OpenCADStudio {
                 let text = cmd.strip_prefix("ARCTEXT").unwrap_or("").trim().to_string();
                 if text.is_empty() {
                     self.command_line.push_info(
-                        crate::t!("Usage: ARCTEXT <text>   (select an arc first; the text follows it)").as_ref(),
+                        crate::t!(
+                            "Usage: ARCTEXT <text>   (select an arc first; the text follows it)"
+                        )
+                        .as_ref(),
                     );
                     return None;
                 }
@@ -1373,7 +1514,8 @@ impl OpenCADStudio {
                 };
                 let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
                 if chars.is_empty() {
-                    self.command_line.push_error(crate::t!("ARCTEXT: no printable text.").as_ref());
+                    self.command_line
+                        .push_error(crate::t!("ARCTEXT: no printable text.").as_ref());
                     return None;
                 }
                 let n = chars.len();
@@ -1396,8 +1538,9 @@ impl OpenCADStudio {
                     self.tabs[i].scene.add_entity(codec::EntityType::Text(t));
                 }
                 self.tabs[i].dirty = true;
-                self.command_line
-                    .push_output(crate::tf!("ARCTEXT: placed {n} character(s) along the arc.").as_ref());
+                self.command_line.push_output(
+                    crate::tf!("ARCTEXT: placed {n} character(s) along the arc.").as_ref(),
+                );
             }
 
             _ => return None,
@@ -1426,4 +1569,53 @@ fn title_case(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+impl OpenCADStudio {
+    /// TXT2MTXT on the selection (in selection order), as one undo step.
+    fn apply_txt2mtxt(&mut self, i: usize) {
+        let scene = &self.tabs[i].scene;
+        let handles: Vec<codec::Handle> = scene
+            .selected_handles_in_order()
+            .into_iter()
+            .filter(|handle| !scene.is_layer_locked(*handle))
+            .collect();
+        let plan = {
+            let selected: Vec<(codec::Handle, &codec::EntityType)> = handles
+                .iter()
+                .filter_map(|h| scene.document.get_entity(*h).map(|e| (*h, e)))
+                .collect();
+            crate::modules::annotate::txt2mtxt::plan(
+                &selected,
+                &scene.document,
+                self.txt2mtxt_settings,
+            )
+        };
+        self.tabs[i].scene.deselect_all();
+        // Enter on an empty selection ends quietly.
+        if handles.is_empty() {
+            return;
+        }
+        let Some(plan) = plan else {
+            self.command_line
+                .push_output("  0 Text objects removed, 0 MText objects added.");
+            return;
+        };
+        self.push_undo_snapshot(i, "TXT2MTXT");
+        self.tabs[i].scene.erase_entities(&plan.erase);
+        let added = plan.add.len();
+        for entity in plan.add {
+            self.tabs[i].scene.add_entity(entity);
+        }
+        self.tabs[i].dirty = true;
+        self.refresh_properties();
+        // Every selected object counts as removed text, the way the
+        // reference reports it.
+        let removed = handles.len();
+        self.command_line.push_output(&if added == 1 {
+            format!("  {removed} Text objects removed, 1 MText object added.")
+        } else {
+            format!("  {removed} Text objects removed, {added} MText objects added.")
+        });
+    }
 }

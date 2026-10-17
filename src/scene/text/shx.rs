@@ -329,9 +329,8 @@ pub fn font_metrics(path: &str) -> Option<(f64, f64)> {
 
 fn glyph_cache(
 ) -> &'static Mutex<HashMap<(String, u16), Option<Arc<crate::scene::text::lff::Glyph>>>> {
-    static C: OnceLock<
-        Mutex<HashMap<(String, u16), Option<Arc<crate::scene::text::lff::Glyph>>>>,
-    > = OnceLock::new();
+    static C: OnceLock<Mutex<HashMap<(String, u16), Option<Arc<crate::scene::text::lff::Glyph>>>>> =
+        OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -544,16 +543,26 @@ fn interpret(
                 }
             }
             7 => {
-                let mut sub = *b.get(i).unwrap_or(&0) as u16;
-                i += 1;
-                // A big font references subshapes by a two-byte code:
-                // `7, 0, hi, lo`.
-                if file.kind == ShxKind::Bigfont && sub == 0 {
-                    let hi = *b.get(i).unwrap_or(&0) as u16;
-                    let lo = *b.get(i + 1).unwrap_or(&0) as u16;
+                let two_bytes = |i: usize| {
+                    ((*b.get(i).unwrap_or(&0) as u16) << 8) | *b.get(i + 1).unwrap_or(&0) as u16
+                };
+                // A unifont names its subshape by a two-byte code point
+                // (`7, hi, lo`); read as one byte, the low byte ran on as an
+                // opcode and the glyph came out mangled (ISOCP's `9`, #1556).
+                // A big font uses `7, 0, hi, lo`; a shape file one byte.
+                let sub = if file.kind == ShxKind::Unifont {
                     i += 2;
-                    sub = (hi << 8) | lo;
-                }
+                    two_bytes(i - 2)
+                } else {
+                    let sub = *b.get(i).unwrap_or(&0) as u16;
+                    i += 1;
+                    if file.kind == ShxKind::Bigfont && sub == 0 {
+                        i += 2;
+                        two_bytes(i - 2)
+                    } else {
+                        sub
+                    }
+                };
                 if !skipping && sub != 0 && sub != shape_number {
                     interpret(file, sub, st, cur, out, depth + 1);
                 }
@@ -608,13 +617,21 @@ fn interpret(
                     if n_oct == 0.0 {
                         n_oct = 8.0;
                     }
+                    // The arc spans `n_oct` octants from `start_oct`, starting
+                    // `so`/256 of an octant into the first one and ending `eo`/256
+                    // into the last (0 = on its far boundary) (#1638).
                     let q = std::f64::consts::FRAC_PI_4;
-                    let start = start_oct * q + so * q / 256.0 * if cw { -1.0 } else { 1.0 };
-                    let total = n_oct * q;
-                    let sweep_mag = total - so * q / 256.0 - (255.0 - eo) * q / 256.0
-                        + if eo == 0.0 { 0.0 } else { 0.0 };
-                    let sweep = sweep_mag.max(0.0) * if cw { -1.0 } else { 1.0 };
-                    emit_arc(st, cur, out, radius, start, sweep);
+                    let dir = if cw { -1.0 } else { 1.0 };
+                    let start = (start_oct + dir * so / 256.0) * q;
+                    let end = if eo == 0.0 {
+                        (start_oct + dir * n_oct) * q
+                    } else {
+                        (start_oct + dir * (n_oct - 1.0 + eo / 256.0)) * q
+                    };
+                    let sweep = end - start;
+                    if sweep * dir > 0.0 {
+                        emit_arc(st, cur, out, radius, start, sweep);
+                    }
                 }
             }
             0xC => {
@@ -652,7 +669,6 @@ fn interpret(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -727,7 +743,10 @@ mod tests {
         assert!((g.advance - 1.125).abs() < 1e-4, "advance {}", g.advance);
         assert_eq!(g.strokes.len(), 1);
         assert!(bigfont_glyph(&path, 'A').is_none());
-        assert!(bigfont_glyph(&path, '國').is_none(), "unknown code must miss, not alias");
+        assert!(
+            bigfont_glyph(&path, '國').is_none(),
+            "unknown code must miss, not alias"
+        );
     }
 
     #[test]
@@ -736,7 +755,37 @@ mod tests {
         assert!(!is_bigfont(&path));
         assert_eq!(font_metrics(&path), Some((6.0, 2.0)));
         let g = font_glyph(&path, 'A' as u16).expect("glyph for A");
-        assert!((g.advance - 9.0).abs() < 1e-4, "6 units at above 6 → 9: {}", g.advance);
+        assert!(
+            (g.advance - 9.0).abs() < 1e-4,
+            "6 units at above 6 → 9: {}",
+            g.advance
+        );
         assert!(font_glyph(&path, 'B' as u16).is_none());
+    }
+
+    /// The `9` program of the ISOCP fonts: a fractional arc into the stem,
+    /// then octant arcs. Its ink spans 36 font units, the cap height; the
+    /// fractional arc used to end short and drop the glyph to ~0.68 (#1638).
+    #[test]
+    fn fractional_arc_spans_its_octants() {
+        const NINE: [u8; 25] = [
+            0x02, 0x08, 0x0a, 0x02, 0x01, 0x0b, 0x6c, 0x00, 0x00, 0x12, 0x62, 0xb4, 0x0a, 0x08,
+            0x04, 0x4c, 0x0a, 0x08, 0x42, 0x80, 0x02, 0x08, 0x06, 0xee, 0x00,
+        ];
+        let mut b = b"AutoCAD-86 unifont 1.0\r\n\x1a".to_vec();
+        b.extend_from_slice(&2u32.to_le_bytes());
+        let head: Vec<u8> = [b"UNI\x00".as_slice(), &[36u8, 8, 2, 0, 0, 0]].concat();
+        b.extend_from_slice(&(head.len() as u16).to_le_bytes());
+        b.extend_from_slice(&head);
+        let glyph: Vec<u8> = [b"\x00".as_slice(), &NINE].concat();
+        b.extend_from_slice(&('9' as u16).to_le_bytes());
+        b.extend_from_slice(&(glyph.len() as u16).to_le_bytes());
+        b.extend_from_slice(&glyph);
+        let path = tmp("nine.shx", &b);
+        let g = font_glyph(&path, '9' as u16).expect("glyph for 9");
+        let ys = g.strokes.iter().flatten().map(|p| p[1]);
+        let (lo, hi) = ys.fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        // 36 font units at above = 36 → the 9-unit cap height.
+        assert!(((hi - lo) - 9.0).abs() < 0.05, "ink height {}", hi - lo);
     }
 }

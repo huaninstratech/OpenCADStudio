@@ -14,16 +14,33 @@ use codec::CadDocument;
 
 /// The community folder's GitHub contents API (lists name + download URL).
 #[cfg(not(target_arch = "wasm32"))]
-const REPO_API_URL: &str =
-    "https://api.github.com/repos/HakanSeven12/OpenCADStudio/contents/fonts";
+const REPO_API_URL: &str = "https://api.github.com/repos/HakanSeven12/OpenCADStudio/contents/fonts";
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+static FONTS_FOLDER: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// A folder chosen in Options to hold the fonts instead of the default one,
+/// such as a share on the office network.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fonts_folder() -> Option<PathBuf> {
+    FONTS_FOLDER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_fonts_folder(folder: Option<PathBuf>) {
+    *FONTS_FOLDER.write().unwrap_or_else(|e| e.into_inner()) = folder;
+}
 
 /// Local store for fonts downloaded from the community repository. Text
 /// resolution searches here after the drawing folder.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fonts_dir() -> Option<PathBuf> {
-    crate::config::config_dir().map(|dir| dir.join("fonts"))
+    fonts_folder().or_else(|| crate::config::config_dir().map(|dir| dir.join("fonts")))
 }
 
 /// Web builds have no filesystem to cache fonts into.
@@ -82,7 +99,10 @@ pub fn missing_shx_fonts(doc: &CadDocument) -> Vec<String> {
         // The primary font and the big font (Asian double-byte glyphs) are
         // both plain .shx files the style depends on.
         for file in [style.font_file.trim(), style.big_font_file.trim()] {
-            if file.is_empty() || !file.to_ascii_lowercase().ends_with(".shx") {
+            if file.is_empty()
+                || !file.to_ascii_lowercase().ends_with(".shx")
+                || crate::io::linetypes::is_bundled_shape_file(file)
+            {
                 continue;
             }
             let resolved = crate::io::resolve_image_file(file, base).is_some()
@@ -160,7 +180,10 @@ fn fetch_repo_fonts() -> Result<Vec<RepoFont>, String> {
     let agent = crate::network::agent(std::time::Duration::from_secs(15));
     let mut response = agent
         .get(REPO_API_URL)
-        .header("User-Agent", concat!("OpenCADStudio/", env!("OCS_APP_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("OpenCADStudio/", env!("OCS_APP_VERSION")),
+        )
         .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("Could not reach the font repository: {e}"))?;
@@ -210,7 +233,8 @@ pub fn download_fonts(
         FontSource::Custom(_) => None,
     };
     let dir = fonts_dir().ok_or_else(|| "Could not resolve the fonts folder.".to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     let mut downloaded = Vec::new();
     for want in missing {
         let file = want.rsplit(['/', '\\']).next().unwrap_or(want);
@@ -224,16 +248,17 @@ pub fn download_fonts(
             }
             // Custom folder: the font is simply `{base}/{file_name}`; a miss
             // (404) is skipped without failing the batch.
-            (FontSource::Custom(base), _) => {
-                Some(format!("{base}/{}", percent_encode_path(file)))
-            }
+            (FontSource::Custom(base), _) => Some(format!("{base}/{}", percent_encode_path(file))),
             (FontSource::Community, None) => None,
         };
         let Some(url) = url else { continue };
         let agent = crate::network::agent(std::time::Duration::from_secs(30));
         let mut response = agent
             .get(&url)
-            .header("User-Agent", concat!("OpenCADStudio/", env!("OCS_APP_VERSION")))
+            .header(
+                "User-Agent",
+                concat!("OpenCADStudio/", env!("OCS_APP_VERSION")),
+            )
             .call()
             .map_err(|e| format!("Could not download {file}: {e}"))?;
         if response.status() != 200 {

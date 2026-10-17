@@ -6,13 +6,14 @@ use crate::scene::pick::xclip as clip;
 
 impl OpenCADStudio {
     /// A block reference's extents in WCS: its block's objects through the
-    /// insert transform.
+    /// insert transform — the base-point-aware one, because that is where the
+    /// renderer puts the contents the user drew the boundary around.
     fn insert_extents(&self, i: usize, insert: codec::Handle) -> ([f64; 2], [f64; 2]) {
         let document = &self.tabs[i].scene.document;
         let Some(codec::EntityType::Insert(ins)) = document.get_entity(insert) else {
             return ([0.0; 2], [0.0; 2]);
         };
-        let xform = ins.get_transform();
+        let xform = crate::scene::render_graph::insert_transform(document, ins);
         let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
         for e in document.entities_in_block(&ins.block_name) {
             let (a, b) = crate::scene::convert::tess::entity_bounds_in(document, e);
@@ -38,11 +39,17 @@ impl OpenCADStudio {
         action: XclipAction,
     ) {
         if let XclipAction::Depth { rejected: true, .. } = action {
-            self.command_line.push_error(crate::modules::insert::xclip::DEPTH_REJECTED);
+            self.command_line
+                .push_error(crate::modules::insert::xclip::DEPTH_REJECTED);
         }
         self.push_undo_snapshot(i, "XCLIP");
         let extents: Vec<_> = inserts.iter().map(|h| self.insert_extents(i, *h)).collect();
-        let current_layer = self.tabs[i].scene.document.header.current_layer_name.clone();
+        let current_layer = self.tabs[i]
+            .scene
+            .document
+            .header
+            .current_layer_name
+            .clone();
         let scene = &mut self.tabs[i].scene;
         let mut polylines = Vec::new();
         for (n, insert) in inserts.iter().enumerate() {
@@ -64,12 +71,21 @@ impl OpenCADStudio {
                     let Some(spatial) = clip::filter_handle(doc, *insert) else {
                         continue;
                     };
-                    let (Some(codec::objects::ObjectType::SpatialFilter(filter)), Some(codec::EntityType::Insert(ins))) =
-                        (doc.objects.get(&spatial), doc.get_entity(*insert))
+                    let (
+                        Some(codec::objects::ObjectType::SpatialFilter(filter)),
+                        Some(codec::EntityType::Insert(ins)),
+                    ) = (doc.objects.get(&spatial), doc.get_entity(*insert))
                     else {
                         continue;
                     };
-                    let outline = clip::clip_outline_world(doc, filter, &ins.get_transform());
+                    // The same base-point-aware transform the spatial filter
+                    // was stored with, so the generated polyline lands on the
+                    // boundary the user drew (the two cancel exactly).
+                    let outline = clip::clip_outline_world(
+                        doc,
+                        filter,
+                        &crate::scene::render_graph::insert_transform(doc, ins),
+                    );
                     let mut pl = codec::entities::LwPolyline::from_points(
                         outline
                             .iter()

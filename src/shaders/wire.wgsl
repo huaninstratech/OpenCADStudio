@@ -37,7 +37,7 @@ struct Uniforms {
     // jitter on pan / zoom / rotate.
     view_rot:         mat4x4<f32>,
     eye_high:         vec3<f32>,
-    _pad_eh:          f32,
+    highlight_widen:          f32,
     eye_low:          vec3<f32>,
     _pad_el:          f32,
 }
@@ -69,6 +69,8 @@ struct InstanceIn {
 
 const MODEL_LINEWEIGHT_BOOST: f32 = 2.0;
 const MODEL_LINEWEIGHT_MAX_PX: f32 = 10.0;
+// Must match `MITER_LIMIT` in wire_gpu.rs.
+const MITER_LIMIT: f32 = 8.0;
 
 struct VertexOut {
     @builtin(position)              clip_pos:       vec4<f32>,
@@ -96,7 +98,13 @@ struct VertexOut {
 // Half-width of one segment end: a tapered band's own end width wins, then a
 // constant world-unit band, then the screen-pixel lineweight (LWDISPLAY off
 // collapses to a hairline).
+// The selection pass widens highlighted lines by `highlight_widen` pixels;
+// every other pass uploads zero.
 fn resolve_hw(taper: f32, world_hw: f32, px_hw: f32) -> f32 {
+    return resolve_hw_base(taper, world_hw, px_hw) + u.highlight_widen * 0.5;
+}
+
+fn resolve_hw_base(taper: f32, world_hw: f32, px_hw: f32) -> f32 {
     if taper >= 0.0 { return max(taper / u.world_per_pixel, 0.5); }
     if world_hw > 0.0 { return max(world_hw / u.world_per_pixel, 0.5); }
     if world_hw < 0.0 { return max(-world_hw, 0.5); }
@@ -191,13 +199,17 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
         }
         perp_world = normalize(perp_world);
 
+        // A constant-width band slides each corner along the segment onto
+        // its joint's bisector (miter), so neighbours meet without a notch.
+        let miter = vec2<f32>(in.marker_origin_high.w, in.marker_origin_low.w) * MITER_LIMIT;
+        let along = mix(miter.x, miter.y, which_end) * eff_hw * side;
         let pos_rel = mix(rel_a, rel_b, which_end);
-        let world_pos = pos_rel + perp_world * (eff_hw * side);
+        let world_pos = pos_rel + perp_world * (eff_hw * side) + world_dir * along;
         var clip_pos = u.view_rot * vec4<f32>(world_pos, 1.0);
         clip_pos = apply_draw_order(clip_pos, in.misc.x);
 
         final_clip = clip_pos;
-        out_dist = mix(in.dists.x, in.dists.y, which_end);
+        out_dist = mix(in.dists.x, in.dists.y, which_end) + along * (in.dists.y - in.dists.x) / max(world_len, 1e-6);
         out_cap = vec2<f32>(which_end * world_len, eff_hw * side);
         out_cap_ends = vec3<f32>(world_len, world_hw_a, world_hw_b);
     } else {
