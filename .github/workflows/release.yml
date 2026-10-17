@@ -249,7 +249,6 @@ jobs:
         shell: bash
         run: |
           cargo build --locked --release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release -p dwg-thumbnailer-win
 
       # Forks do not inherit repository secrets, so every signing step is
