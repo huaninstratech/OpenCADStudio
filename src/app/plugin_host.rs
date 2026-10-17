@@ -943,7 +943,7 @@ impl<'a> HostSession<'a> {
                     frame.common.layer = layer;
                 }
                 self.push_undo("Embed picture");
-                let handle = self.add_entity(EntityType::Ole2Frame(frame));
+                let handle = self.add_entity(EntityType::Ole2Frame(Box::new(frame)));
                 if handle.is_null() {
                     return Err("the picture frame could not be added".into());
                 }
@@ -6708,7 +6708,7 @@ mod tests {
             let EntityType::Dimension(dimension) = &mut after else {
                 unreachable!()
             };
-            if let codec::entities::Dimension::Linear(value) = dimension {
+            if let codec::entities::Dimension::Linear(value) = &mut **dimension {
                 value.second_point.x = 30.0;
             }
             ocs_plugin_api::entity_coverage::validate_entity_mutation(&before, &after).unwrap();
@@ -7414,7 +7414,7 @@ mod tests {
                 .unwrap();
             let mut viewport = codec::entities::Viewport::new();
             viewport.common.owner_handle = owner;
-            let viewport_handle = host.add_entity(EntityType::Viewport(viewport));
+            let viewport_handle = host.add_entity(EntityType::Viewport(Box::new(viewport)));
             let scale_handle = host.document_mut().allocate_handle();
             let mut scale = codec::objects::Scale::new("1:1", 1.0, 1.0);
             scale.handle = scale_handle;
@@ -10861,7 +10861,7 @@ mod tests {
         bare.height = 30.0;
         let bare = host
             .document_mut()
-            .add_entity(EntityType::Viewport(bare))
+            .add_entity(EntityType::Viewport(Box::new(bare)))
             .unwrap();
         assert_eq!(
             host.document().get_entity(bare).map(|e| match e {

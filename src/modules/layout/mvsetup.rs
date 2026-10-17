@@ -144,7 +144,7 @@ impl MvsetupCommand {
                 if self.arrangement == Arrangement::Engineering {
                     viewport.view_direction = directions[(row * 2 + column) as usize].clone();
                 }
-                viewports.push(EntityType::Viewport(viewport));
+                viewports.push(EntityType::Viewport(Box::new(viewport)));
             }
         }
         CmdResult::CommitEntitiesAndExit(viewports)

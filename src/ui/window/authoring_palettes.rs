@@ -193,6 +193,9 @@ fn catalog(
     visibility_error: Option<&'static str>,
     point_error: Option<&'static str>,
     flip_error: Option<&'static str>,
+    lookup_error: Option<&'static str>,
+    move_error: Option<&'static str>,
+    scale_error: Option<&'static str>,
 ) -> Element<'static, Message> {
     let (entries, unavailable) = match tab {
         Tab::Parameters => (
@@ -212,7 +215,11 @@ fn catalog(
         let distance = tab == Tab::Parameters && matches!(*label, "Linear" | "Polar" | "XY");
         let orientation = tab == Tab::Parameters && matches!(*label,"Rotation"|"Alignment"|"Flip");
         let orientation_error = if *label=="Flip" {flip_error} else {point_error};
-        let enabled = (orientation && orientation_error.is_none()) || (visibility && visibility_error.is_none()) || ((point || distance) && point_error.is_none());
+        let single=tab==Tab::Parameters&&matches!(*label,"Lookup"|"Basepoint");
+        let lookup_action=tab==Tab::Actions&&*label=="Lookup";
+        let geometry_action=tab==Tab::Actions&&matches!(*label,"Move"|"Scale");
+        let action_error=if *label=="Scale" {scale_error}else{move_error};
+        let enabled = (geometry_action&&action_error.is_none())||(single&&point_error.is_none())||(lookup_action&&lookup_error.is_none())||(orientation && orientation_error.is_none()) || (visibility && visibility_error.is_none()) || ((point || distance) && point_error.is_none());
         let base = if enabled {
             icons::semantic(icon, 28.0)
         } else {
@@ -221,10 +228,11 @@ fn catalog(
         let icon = if tab != Tab::Parameters && *label != "Block Properties Table" {
             stack![
                 base,
-                container(icons::semantic_disabled(
-                    include_bytes!("../../../assets/icons/ui/bolt.svg"),
-                    14.0
-                ))
+                container(if enabled {
+                    icons::semantic(include_bytes!("../../../assets/icons/ui/bolt.svg"), 14.0)
+                } else {
+                    icons::semantic_disabled(include_bytes!("../../../assets/icons/ui/bolt.svg"), 14.0)
+                })
                 .width(28)
                 .height(28)
                 .align_right(Fill)
@@ -235,8 +243,8 @@ fn catalog(
             base
         };
         let message = enabled.then(|| Message::RibbonToolClick {
-            tool_id: format!("BPARAMETER_{}", label.to_ascii_uppercase()),
-            event: crate::modules::ModuleEvent::Command(format!("BPARAMETER {}", label.to_ascii_uppercase())),
+            tool_id: if geometry_action {format!("BACTION_{}",label.to_ascii_uppercase())}else if lookup_action {"BLOOKUPTABLE".into()}else{format!("BPARAMETER_{}", label.to_ascii_uppercase())},
+            event: crate::modules::ModuleEvent::Command(if geometry_action {format!("BACTION {}",label.to_ascii_uppercase())}else if lookup_action {"BLOOKUPTABLE".into()}else{format!("BPARAMETER {}", label.to_ascii_uppercase())}),
         });
         let description = if visibility {
             crate::t!(visibility_error
@@ -253,6 +261,12 @@ fn catalog(
                 "Alignment" => "Place the alignment base point and tangent direction.",
                 _ => "Place a reflection line and its flip-state label. Associate a Flip action to mirror geometry.",
             })).into_owned()
+        } else if single {
+            crate::t!(point_error.unwrap_or(if *label=="Basepoint" {"Place or relocate the dynamic block insertion anchor."}else{"Place a Lookup parameter, then use the Lookup action to edit its property table."})).into_owned()
+        } else if geometry_action {
+            crate::t!(action_error.unwrap_or("Select a parameter endpoint, select the objects it controls, then place the action marker. Test it using the parameter grip in Test Block.")).into_owned()
+        } else if lookup_action {
+            crate::t!(lookup_error.unwrap_or("Create or edit property Lookup tables for this block.")).into_owned()
         } else {
             unavailable.to_string()
         };
@@ -265,6 +279,12 @@ fn catalog(
             container(entry).id(match *label { "Linear" => "authoring-tool-linear", "Polar" => "authoring-tool-polar", _ => "authoring-tool-xy" }).into()
         } else if orientation {
             container(entry).id(match *label {"Rotation"=>"authoring-tool-rotation","Alignment"=>"authoring-tool-alignment",_=>"authoring-tool-flip"}).into()
+        } else if single {
+            container(entry).id(if *label=="Lookup" {"authoring-tool-lookup"}else{"authoring-tool-basepoint"}).into()
+        } else if geometry_action {
+            container(entry).id(if *label=="Move" {"authoring-tool-move-action"}else{"authoring-tool-scale-action"}).into()
+        } else if lookup_action {
+            container(entry).id("authoring-tool-lookup-table").into()
         } else {
             entry
         }
@@ -378,6 +398,9 @@ pub fn view(
     visibility_error: Option<&'static str>,
     point_error: Option<&'static str>,
     flip_error: Option<&'static str>,
+    lookup_error: Option<&'static str>,
+    move_error: Option<&'static str>,
+    scale_error: Option<&'static str>,
 ) -> Element<'static, Message> {
     let tabs = column(Tab::ALL.into_iter().map(|category| {
         let label = category.label();
@@ -431,7 +454,10 @@ pub fn view(
                 selected_tab,
                 visibility_error,
                 point_error,
-                flip_error
+                flip_error,
+                lookup_error,
+                move_error,
+                scale_error
             ))
             .width(Fill)
             .height(Fill),

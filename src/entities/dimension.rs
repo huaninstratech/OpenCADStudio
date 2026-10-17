@@ -3248,7 +3248,7 @@ pub(crate) fn materialize_large_radial_text_position(
     let Some(EntityType::Dimension(dimension)) = document.get_entity(handle) else {
         return;
     };
-    if !matches!(dimension, Dimension::LargeRadial(_)) || dimension.base().text_user_positioned {
+    if !matches!(&**dimension, Dimension::LargeRadial(_)) || dimension.base().text_user_positioned {
         return;
     }
     let source = document.dim_styles.iter().find(|style| {
@@ -3262,8 +3262,8 @@ pub(crate) fn materialize_large_radial_text_position(
         .map(|style| resolved_dimension_style(style, dimension, document))
         .map(|style| styled_dimension_text_position(dimension, &style, 1.0))
         .unwrap_or_else(|| dimension_text_pos_f64(dimension, None, 2.5, 1.0));
-    if let Some(EntityType::Dimension(Dimension::LargeRadial(radial))) =
-        document.get_entity_mut(handle)
+    if let Some(Dimension::LargeRadial(radial)) =
+        document.get_entity_mut(handle).and_then(as_dimension_mut)
     {
         radial.base.text_middle_point = position;
     }
@@ -6491,7 +6491,7 @@ fn dimension_text_entity(
         }
         mtext.normal = base.normal;
         mtext.common = base.common.clone();
-        return Some(EntityType::MText(mtext));
+        return Some(EntityType::MText(Box::new(mtext)));
     }
 
     let value = if style.is_some_and(|style| style.dimtxtdirection) {
@@ -7150,7 +7150,7 @@ fn dimension_tolerance_entity(
         mtext.style = primary_style;
         mtext.attachment_point = codec::entities::AttachmentPoint::MiddleCenter;
         mtext.common = primary_common;
-        return Some(EntityType::MText(mtext));
+        return Some(EntityType::MText(Box::new(mtext)));
     }
 
     let mut t = Text::with_value(tol, pos)
@@ -9557,5 +9557,24 @@ mod layout_parity_tests {
             points.iter().any(|p| (p.y - 0.8).abs() < 1e-6),
             "hook at the text height"
         );
+    }
+}
+
+/// The dimension an entity is, if it is one. The variant holds it boxed, so
+/// a pattern cannot reach into it; match on this instead.
+pub(crate) fn as_dimension(entity: &codec::EntityType) -> Option<&codec::entities::Dimension> {
+    match entity {
+        codec::EntityType::Dimension(dimension) => Some(dimension),
+        _ => None,
+    }
+}
+
+/// [`as_dimension`], mutably.
+pub(crate) fn as_dimension_mut(
+    entity: &mut codec::EntityType,
+) -> Option<&mut codec::entities::Dimension> {
+    match entity {
+        codec::EntityType::Dimension(dimension) => Some(dimension),
+        _ => None,
     }
 }

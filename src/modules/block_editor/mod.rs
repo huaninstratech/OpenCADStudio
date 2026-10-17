@@ -6,7 +6,9 @@ use crate::modules::parametric::ParametricModule;
 use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
 
 pub mod visibility_parameter;
+pub mod action;
 pub mod point_parameter;
+pub mod single_parameter;
 pub mod distance_parameter;
 pub mod orientation_parameter;
 

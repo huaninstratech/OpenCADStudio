@@ -648,7 +648,7 @@ impl CadCommand for MLeaderCommand {
             text.insertion_point.z,
         ));
         self.text = text.value.clone();
-        self.selected_mtext = Some(text);
+        self.selected_mtext = Some(*text);
         self.content_type = LeaderContentType::MText;
         self.order = CreationOrder::ContentFirst;
         self.step = Step::PickPoints;

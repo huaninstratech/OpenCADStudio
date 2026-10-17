@@ -1514,6 +1514,34 @@ impl DimensionPreview {
 /// Returned by every `CadCommand` method to tell main.rs what to do.
 #[allow(dead_code)]
 pub enum CmdResult {
+    EditBlockAuthoring {
+        document: u64,
+        definition: Handle,
+        handle: Handle,
+        part: crate::scene::block_authoring::edit::Part,
+        position: DVec3,
+    },
+    PlaceBlockAction {
+        document: u64,
+        definition: Handle,
+        kind: crate::scene::block_actions::Kind,
+        parameter: Handle,
+        targets: Vec<Handle>,
+        location: DVec3,
+    },
+    EvaluateBlockParameter {
+        document: u64,
+        definition: Handle,
+        parameter: Handle,
+        position: DVec3,
+    },
+    /// Place or relocate a Basepoint, or place a Lookup parameter.
+    PlaceBlockSingleParameter {
+        document_id: u64,
+        definition: Handle,
+        kind: crate::modules::block_editor::single_parameter::Kind,
+        location: DVec3,
+    },
     /// Place a native Rotation, Alignment or Flip parameter.
     PlaceBlockOrientationParameter {
         document_id: u64,
@@ -2305,6 +2333,8 @@ pub enum CmdResult {
     ReturnPoint(DVec3),
     /// Import a DGN model (DGNIMPORT); ends the command.
     DgnImport(crate::modules::insert::dgn_import::DgnImportRequest),
+    /// Import a 3D Studio file with every question answered; ends the command.
+    TdsImport(crate::modules::insert::tds_import::TdsImportRequest),
 }
 
 /// What kind of value the active command is currently asking for. Drives
@@ -2944,6 +2974,13 @@ pub trait CadCommand: Send {
         _tangent: Option<TangentObject>,
     ) -> Vec<WireModel> {
         self.on_preview_wires(pt)
+    }
+
+    /// Entities the host draws as the live preview, tessellated like the
+    /// drawing's own (arcs, text, linetypes and all). Commands whose preview
+    /// changes an entity's shape return edited copies of it here.
+    fn preview_entities(&mut self, _document: &codec::CadDocument, _pt: DVec3) -> Vec<EntityType> {
+        Vec::new()
     }
 
     /// Source entities replaced by the current live preview. The host removes

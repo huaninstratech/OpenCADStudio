@@ -798,10 +798,16 @@ impl OpenCADStudio {
             }
         }
         let cur = self.tabs[i].last_cursor_world;
-        let previews = self.tabs[i]
+        let tab = &mut self.tabs[i];
+        let previews = tab
             .active_cmd
             .as_mut()
-            .map(|c| c.on_preview_wires(cur))
+            .map(|c| {
+                let mut wires = c.on_preview_wires(cur);
+                let entities = c.preview_entities(&tab.scene.document, cur);
+                wires.extend(tab.scene.wires_for_entities(&entities));
+                wires
+            })
             .unwrap_or_default();
         let preview_hidden = self.tabs[i]
             .active_cmd

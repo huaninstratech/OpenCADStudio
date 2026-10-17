@@ -117,7 +117,7 @@ impl DimContinueCommand {
         let style = SourceStyle::from_base(dimension.base());
         let plane = plane_from_normal(dimension.base().definition_point, style.normal);
         let pick = pick_world.and_then(|point| plane.project(point.to_array()).map(Vec2::from));
-        let kind = match dimension {
+        let kind = match &**dimension {
             Dimension::Linear(source) => {
                 let rotation = source.rotation;
                 let perpendicular = Vec2::new(-rotation.sin(), rotation.cos());
@@ -383,7 +383,7 @@ impl CadCommand for DimContinueCommand {
         }
         self.advance(point);
         CmdResult::CommitDimension {
-            entity: EntityType::Dimension(dimension),
+            entity: EntityType::Dimension(Box::new(dimension)),
             association: DimensionAssociationInput::Infer(None),
             preserve_base_style: self.preserve_base_style,
             continue_command: true,
@@ -433,7 +433,7 @@ impl CadCommand for DimContinueCommand {
     fn dimension_preview(&self, cursor: DVec3) -> Option<Vec<DimensionPreview>> {
         self.build_dimension(cursor).map(|dimension| {
             vec![DimensionPreview {
-                entity: EntityType::Dimension(dimension),
+                entity: EntityType::Dimension(Box::new(dimension)),
                 preserve_base_style: self.preserve_base_style,
             }]
         })

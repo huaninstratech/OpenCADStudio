@@ -151,7 +151,7 @@ impl LeaderCommand {
         CmdResult::CommitManyAndEditText {
             entities: vec![
                 self.plane.place_entity(EntityType::Leader(leader)),
-                self.plane.place_entity(EntityType::MText(mtext)),
+                self.plane.place_entity(EntityType::MText(Box::new(mtext))),
             ],
             edit_index: 1,
             open_editor,

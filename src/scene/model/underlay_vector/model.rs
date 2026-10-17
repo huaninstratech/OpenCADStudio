@@ -532,55 +532,112 @@ pub fn dgn_color_table(e: &[u8], first: usize) -> Option<Vec<[u8; 3]>> {
     Some(out)
 }
 
+/// A symbology attribute of a DGN element: the level's, the enclosing
+/// cell's (V8 "by cell"), or its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum By<T> {
+    Level,
+    Cell,
+    Own(T),
+}
+
+impl<T> By<T> {
+    pub fn own(self) -> Option<T> {
+        match self {
+            By::Own(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// An element's own colour: its index in the file's colour table, that
+/// table entry's RGB and the RGB it is drawn in (a true colour can differ
+/// from the table entry it names).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DgnColor {
+    pub index: u32,
+    pub table: [u8; 3],
+    pub rgb: [u8; 3],
+}
+
 /// A DGN element as drawing geometry (what DGNIMPORT converts): its level,
 /// symbology and shape, in the units of the run that read it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DgnElement {
     /// Level number (V7) or id (V8).
     pub level: u32,
-    /// Colour; `None` takes the level's.
-    pub color: Option<[u8; 3]>,
-    /// Weight 0-31; `None` takes the level's.
-    pub weight: Option<u32>,
-    /// Line style; `None` takes the level's.
-    pub style: Option<u32>,
+    pub color: By<DgnColor>,
+    /// Weight 0-31.
+    pub weight: By<u32>,
+    /// Line style.
+    pub style: By<u32>,
     pub geom: DgnGeom,
+    /// The element is a filled shape (it has a fill linkage).
+    pub filled: bool,
 }
+
+/// A point of a DGN element (z 0 in a 2D file).
+pub type P3 = [f64; 3];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DgnGeom {
-    Line([f64; 2], [f64; 2]),
-    /// A line string, curve or B-spline (sampled), or a shape (its points
-    /// end where they start).
-    Points(Vec<[f64; 2]>),
+    Line(P3, P3),
+    /// A line string, curve or shape (its points end where they start).
+    Points(Vec<P3>),
     /// An elliptical arc: the point at parameter t is
     /// `center + cos t · u + sin t · v`, from `start` over `sweep` (radians).
     Arc {
-        center: [f64; 2],
-        u: [f64; 2],
-        v: [f64; 2],
+        center: P3,
+        u: P3,
+        v: P3,
         start: f64,
         sweep: f64,
+    },
+    /// A B-spline curve: degree, full knot vector and poles.
+    Spline {
+        degree: usize,
+        knots: Vec<f64>,
+        poles: Vec<P3>,
+        closed: bool,
     },
     /// A complex chain or shape: its components in order.
     Chain(Vec<DgnGeom>),
     Text {
         text: String,
-        origin: [f64; 2],
+        /// The text's lower left (baseline start).
+        origin: P3,
         height: f64,
         width_factor: f64,
+        /// Length of the text along its baseline (its justification box).
+        length: f64,
         rotation: f64,
+        /// DGN justification code (2 left bottom).
+        just: u8,
         /// Font number (V7); `None` when the file's font is not read.
         font: Option<u32>,
+        /// Text style id (V8), an entry of [`DgnImport::text_styles`].
+        style: Option<u32>,
     },
-    /// A text node: its lines.
-    TextNode(Vec<DgnGeom>),
+    /// A text node: its lines, its origin (the justification point, when
+    /// read), its justification and (V7) the space between its lines.
+    TextNode {
+        lines: Vec<DgnGeom>,
+        origin: Option<P3>,
+        just: u8,
+        line_spacing: Option<f64>,
+    },
+    /// A cell that is not shared: its name (empty when anonymous) and its
+    /// components, each with its own level and symbology.
+    CellGroup {
+        name: String,
+        parts: Vec<DgnElement>,
+    },
     /// A shared cell instance: x' = m[0]·x + m[1]·y + origin.x,
     /// y' = m[2]·x + m[3]·y + origin.y.
     Cell {
         name: String,
         m: [f64; 4],
-        origin: [f64; 2],
+        origin: P3,
         /// Scale along z (1 in a 2D file).
         z_scale: f64,
     },
@@ -589,8 +646,8 @@ pub enum DgnGeom {
 impl DgnGeom {
     /// The geometry through x' = s·x + t (lengths scaled by `s`).
     pub fn scaled(&self, s: f64, t: [f64; 2]) -> DgnGeom {
-        let p = |q: [f64; 2]| [q[0] * s + t[0], q[1] * s + t[1]];
-        let v = |q: [f64; 2]| [q[0] * s, q[1] * s];
+        let p = |q: P3| [q[0] * s + t[0], q[1] * s + t[1], q[2] * s];
+        let v = |q: P3| [q[0] * s, q[1] * s, q[2] * s];
         match self {
             DgnGeom::Line(a, b) => DgnGeom::Line(p(*a), p(*b)),
             DgnGeom::Points(pts) => DgnGeom::Points(pts.iter().map(|q| p(*q)).collect()),
@@ -607,24 +664,53 @@ impl DgnGeom {
                 start: *start,
                 sweep: *sweep,
             },
+            DgnGeom::Spline {
+                degree,
+                knots,
+                poles,
+                closed,
+            } => DgnGeom::Spline {
+                degree: *degree,
+                knots: knots.clone(),
+                poles: poles.iter().map(|q| p(*q)).collect(),
+                closed: *closed,
+            },
             DgnGeom::Chain(parts) => DgnGeom::Chain(parts.iter().map(|g| g.scaled(s, t)).collect()),
-            DgnGeom::TextNode(parts) => {
-                DgnGeom::TextNode(parts.iter().map(|g| g.scaled(s, t)).collect())
-            }
+            DgnGeom::CellGroup { name, parts } => DgnGeom::CellGroup {
+                name: name.clone(),
+                parts: scaled_elements(parts, s, t),
+            },
+            DgnGeom::TextNode {
+                lines,
+                origin,
+                just,
+                line_spacing,
+            } => DgnGeom::TextNode {
+                lines: lines.iter().map(|g| g.scaled(s, t)).collect(),
+                origin: origin.map(p),
+                just: *just,
+                line_spacing: line_spacing.map(|l| l * s),
+            },
             DgnGeom::Text {
                 text,
                 origin,
                 height,
                 width_factor,
+                length,
                 rotation,
+                just,
                 font,
+                style,
             } => DgnGeom::Text {
                 text: text.clone(),
                 origin: p(*origin),
                 height: height * s,
                 width_factor: *width_factor,
+                length: length * s,
                 rotation: *rotation,
+                just: *just,
                 font: *font,
+                style: *style,
             },
             DgnGeom::Cell {
                 name,
@@ -642,42 +728,69 @@ impl DgnGeom {
 }
 
 /// Collects elements in file order, gathering the components of a complex
-/// chain, shape or text node into their header's element.
+/// chain, shape, text node or cell into their header's element.
 #[derive(Default)]
 pub struct DgnCollector {
     pub elements: Vec<DgnElement>,
-    /// The open complex element and how many components it still takes.
-    open: Option<(usize, DgnElement)>,
+    /// The open complex elements, innermost last, each with how many
+    /// components it still takes. A complex element inside another is one
+    /// component of it once it is complete.
+    open: Vec<(usize, DgnElement)>,
 }
 
 impl DgnCollector {
-    /// A complex chain or shape (or a text node) header with `count`
+    /// A complex chain or shape, a text node or a cell header with `count`
     /// components.
     pub fn open(&mut self, count: usize, header: DgnElement) {
-        self.close();
         if count > 0 {
-            self.open = Some((count, header));
+            self.open.push((count, header));
+        } else {
+            self.skip();
         }
     }
 
-    pub fn push(&mut self, element: DgnElement) {
-        if let Some((left, header)) = self.open.as_mut() {
-            if let DgnGeom::Chain(parts) | DgnGeom::TextNode(parts) = &mut header.geom {
-                parts.push(element.geom);
+    pub fn push(&mut self, mut element: DgnElement) {
+        loop {
+            let Some((left, header)) = self.open.last_mut() else {
+                self.elements.push(element);
+                return;
+            };
+            match &mut header.geom {
+                DgnGeom::Chain(parts) | DgnGeom::TextNode { lines: parts, .. } => {
+                    parts.push(element.geom)
+                }
+                DgnGeom::CellGroup { parts, .. } => parts.push(element),
+                _ => {}
             }
             *left -= 1;
-            if *left == 0 {
-                self.close();
+            if *left > 0 {
+                return;
             }
-            return;
+            let Some((_, done)) = self.open.pop() else {
+                return;
+            };
+            element = done;
         }
-        self.elements.push(element);
     }
 
-    /// Ends a complex element cut short with the components it has.
+    /// A component that converts to nothing (a curve that could not be
+    /// read) still takes its place in the open complex element.
+    pub fn skip(&mut self) {
+        if let Some((left, _)) = self.open.last_mut() {
+            *left -= 1;
+            if *left == 0 {
+                if let Some((_, done)) = self.open.pop() {
+                    self.push(done);
+                }
+            }
+        }
+    }
+
+    /// Ends the complex elements cut short with the components they have
+    /// (an element that is no component ends them all).
     pub fn close(&mut self) {
-        if let Some((_, header)) = self.open.take() {
-            self.elements.push(header);
+        while let Some((_, header)) = self.open.pop() {
+            self.push(header);
         }
     }
 }
@@ -690,11 +803,31 @@ pub struct DgnImport {
     pub elements: Vec<DgnElement>,
     pub cells: Vec<(String, Vec<DgnElement>)>,
     pub levels: std::collections::HashMap<u32, (String, Option<[u8; 3]>)>,
+    /// Level ids in the file's level table order; a V8 file's levels all
+    /// become layers, used or not.
+    pub level_order: Vec<u32>,
     pub sub_per_master: f64,
     /// Master and sub unit names, when the file has them.
     pub unit_names: (String, String),
     /// A V7 file (its elements carry their own line style and weight).
     pub v7: bool,
+    /// The model's reference attachments.
+    pub references: Vec<DgnReference>,
+    /// The text style table (V8): each style's id and name.
+    pub text_styles: Vec<(u32, String)>,
+}
+
+/// A reference attachment of a DGN model: the file and model it shows and
+/// how it is placed (in master units of the attaching model).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DgnReference {
+    /// The file as the attachment names it.
+    pub file: String,
+    pub model: String,
+    pub origin: P3,
+    /// Scale of the reference's master units into the model's.
+    pub scale: f64,
+    pub rotation: f64,
 }
 
 /// The elements through x' = s·x + t.

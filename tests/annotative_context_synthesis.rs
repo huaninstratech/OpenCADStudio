@@ -20,7 +20,7 @@ fn empty_annotation_scales_is_not_annotative() {
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
     let mut m = MText::new();
     m.is_annotative = false; // no native flag, no annotative style
-    let ent = doc.add_entity(EntityType::MText(m)).unwrap();
+    let ent = doc.add_entity(EntityType::MText(Box::new(m))).unwrap();
 
     // Build xdict -> "AcDbContextDataManager" -> "ACDB_ANNOTATIONSCALES" (empty).
     let mk = |doc: &mut CadDocument, owner: Handle| -> Handle {
@@ -92,7 +92,7 @@ fn ocs_synthesized_mtext_context_survives_dwg_roundtrip() {
     m.insertion_point = Vector3::new(100.0, 200.0, 0.0);
     m.rectangle_width = 50.0;
     m.is_annotative = true;
-    let ent = doc.add_entity(EntityType::MText(m)).expect("add mtext");
+    let ent = doc.add_entity(EntityType::MText(Box::new(m))).expect("add mtext");
 
     let sh = doc.allocate_handle();
     let mut scale = Scale::new("1:50", 1.0, 50.0);
@@ -174,7 +174,7 @@ fn object_scale_membership_add_remove_roundtrips() {
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
     let mut m = MText::new();
     m.insertion_point = Vector3::new(1.0, 2.0, 0.0);
-    let ent = doc.add_entity(EntityType::MText(m)).unwrap();
+    let ent = doc.add_entity(EntityType::MText(Box::new(m))).unwrap();
 
     let mk_scale = |doc: &mut CadDocument, name: &str, d: f64| {
         let h = doc.allocate_handle();

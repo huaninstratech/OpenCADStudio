@@ -43,7 +43,7 @@ fn expand_block_mtext(
     mtext.style = "SHOP".to_string();
     mtext.height = 20.0;
     mtext.rectangle_width = 0.0;
-    let mut sub = EntityType::MText(mtext);
+    let mut sub = EntityType::MText(Box::new(mtext));
     sub.common_mut().owner_handle = br_h;
     doc.add_entity(sub).unwrap();
 

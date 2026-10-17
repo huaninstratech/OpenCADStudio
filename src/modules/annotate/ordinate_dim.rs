@@ -80,7 +80,7 @@ impl OrdinateDimCommand {
         }
         dim.refresh_measurement();
         self.plane
-            .place_entity(EntityType::Dimension(Dimension::Ordinate(dim)))
+            .place_entity(EntityType::Dimension(Box::new(Dimension::Ordinate(dim))))
     }
 }
 

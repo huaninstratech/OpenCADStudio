@@ -276,6 +276,17 @@ pub fn page_count(path: &str) -> Option<usize> {
     Some(pdf.pages().len())
 }
 
+/// Whether a registered PDF is encrypted: it does not open with a password
+/// no document uses (an unencrypted file ignores the password).
+pub fn is_encrypted(path: &str) -> bool {
+    source_bytes(path).is_some_and(|bytes| {
+        matches!(
+            Pdf::new_with_password(bytes, "\u{1}"),
+            Err(hayro::hayro_syntax::LoadPdfError::Decryption(_))
+        )
+    })
+}
+
 /// Size of a 1-based page in inches (its rendered width and height at 72
 /// points per inch). An underlay is one drawing unit per page inch.
 pub fn page_size_inches(path: &str, page: &str) -> Option<(f64, f64)> {
@@ -287,25 +298,35 @@ pub fn page_size_inches(path: &str, page: &str) -> Option<(f64, f64)> {
     Some((w as f64 / 72.0, h as f64 / 72.0))
 }
 
-/// Drawing units per page inch that a page's measure gives: the X ratio of
-/// the first viewport's measure dictionary (`/VP [<< /Measure << /X [<< /C
-/// units-per-point >>] >> >>]`, written by plotters with the plot scale),
-/// times 72. `None` when the page has no viewport measure.
+/// Drawing units per page inch a page imports at: the X ratio of the
+/// first viewport's measure dictionary (`/VP [<< /Measure << /X [<< /C
+/// units-per-point >>] >> >>]`, written by plotters with the plot scale)
+/// times 72, or one unit per inch without one; times the page's
+/// `/UserUnit` (points per user-space unit) when it has one.
 pub fn page_units_per_inch(path: &str, page: &str) -> Option<f64> {
     use hayro::hayro_syntax::object::{Array, Dict, Number};
     let bytes = source_bytes(path)?;
     let pdf = Pdf::new(bytes).ok()?;
     let page_no = page.trim().parse::<usize>().ok()?;
     let page = pdf.pages().get(page_no.checked_sub(1)?)?;
-    let viewport = page.raw().get::<Array<'_>>(b"VP")?.iter::<Dict<'_>>().next()?;
-    let ratio = viewport
-        .get::<Dict<'_>>(b"Measure")?
-        .get::<Array<'_>>(b"X")?
-        .iter::<Dict<'_>>()
-        .next()?
-        .get::<Number>(b"C")?
-        .as_f64();
-    (ratio.is_finite() && ratio > 0.0).then_some(ratio * 72.0)
+    let positive = |v: f64| (v.is_finite() && v > 0.0).then_some(v);
+    let measured = (|| {
+        let viewport = page.raw().get::<Array<'_>>(b"VP")?.iter::<Dict<'_>>().next()?;
+        let ratio = viewport
+            .get::<Dict<'_>>(b"Measure")?
+            .get::<Array<'_>>(b"X")?
+            .iter::<Dict<'_>>()
+            .next()?
+            .get::<Number>(b"C")?
+            .as_f64();
+        positive(ratio).map(|r| r * 72.0)
+    })();
+    let user_unit = page
+        .raw()
+        .get::<Number>(b"UserUnit")
+        .and_then(|n| positive(n.as_f64()))
+        .unwrap_or(1.0);
+    Some(measured.unwrap_or(1.0) * user_unit)
 }
 
 /// Display adjustments of an underlay page, applied to its display raster.

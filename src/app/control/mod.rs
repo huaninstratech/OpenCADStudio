@@ -1001,10 +1001,9 @@ impl OpenCADStudio {
             "new" => {
                 if let Some(template) = req["template"].as_str() {
                     match self.apply_template(template) {
-                        Ok(purged) => {
+                        Ok(()) => {
                             self.set_control_result(json!({
                                 "template": template,
-                                "purged": purged,
                                 "total": self.tabs[i].scene.document.entities().count(),
                             }));
                             Task::none()

@@ -130,7 +130,7 @@ fn explode_dimension_linear_golden_segments() {
     let mut d = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
     d.definition_point = Vector3::new(5.0, 3.0, 0.0);
     d.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
-    let pieces = explode_entity(&EntityType::Dimension(Dimension::Linear(d)), &doc);
+    let pieces = explode_entity(&EntityType::Dimension(Box::new(Dimension::Linear(d))), &doc);
     // A baked linear dimension explodes to exactly 2 extension lines + 1
     // dimension line. The arrowheads bake as SOLIDs (see the unit test
     // `linear_dim_bakes_filled_arrowheads`), which is why the Lines count is

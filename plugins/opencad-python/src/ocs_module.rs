@@ -406,7 +406,7 @@ mod ocs {
         text.rotation = rotation;
         host_ctx::with_host(|host| {
             host_ctx::ensure_undo_started(host);
-            host.add_entity(EntityType::MText(text)).value()
+            host.add_entity(EntityType::MText(Box::new(text))).value()
         })
         .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))
     }

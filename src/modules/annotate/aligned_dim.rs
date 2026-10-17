@@ -95,7 +95,7 @@ pub(crate) fn aligned_dimension_entity(
     crate::entities::dimension::reset_automatic_text_position(&mut dim.base);
     dim.base.actual_measurement = dim.measurement();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
-    EntityType::Dimension(Dimension::Aligned(dim))
+    EntityType::Dimension(Box::new(Dimension::Aligned(dim)))
 }
 
 impl CadCommand for AlignedDimensionCommand {

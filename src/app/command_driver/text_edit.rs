@@ -160,7 +160,7 @@ impl OpenCADStudio {
                         Operation::Rotate(degrees) => {
                             dimension.base_mut().text_rotation = degrees.to_radians();
                         }
-                        Operation::Oblique(degrees) => match dimension {
+                        Operation::Oblique(degrees) => match &mut **dimension {
                             codec::entities::Dimension::Linear(value) => {
                                 value.ext_line_rotation = degrees.to_radians();
                             }

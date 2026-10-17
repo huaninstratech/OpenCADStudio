@@ -925,7 +925,7 @@ mod tests {
             }));
         }
         hatch.paths.push(path);
-        let entity = EntityType::Hatch(hatch);
+        let entity = EntityType::Hatch(Box::new(hatch));
         HatcheditCommand::with_handle(Handle::new(7), "ANSI31".into(), 1.0, 0.0, false)
             .with_appearance(Some(&entity), Color::Index(6), Transparency::T_40)
             .with_origin([9.0, 8.0])
@@ -1096,7 +1096,7 @@ mod tests {
             counter_clockwise: true,
         }));
         hatch.paths.push(path);
-        let entity = EntityType::Hatch(hatch);
+        let entity = EntityType::Hatch(Box::new(hatch));
         let mut command =
             HatcheditCommand::with_handle(Handle::new(7), "ANSI31".into(), 1.0, 0.0, false)
                 .with_appearance(Some(&entity), Color::ByLayer, Transparency::ByLayer);

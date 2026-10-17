@@ -783,6 +783,62 @@ fn clip_seg(p0: Point, p1: Point, bounds: iced::Rectangle) -> Option<(Point, Poi
     ))
 }
 
+/// Build a snap-guide end on the acquired screen ray, not on the noisy
+/// cursor-to-base line. Returns the normalized ray and its forward tip.
+fn extension_guide_tip(
+    base: Point,
+    snapped: Point,
+    acquired_direction: Option<Point>,
+) -> Option<(Point, Point)> {
+    let delta = acquired_direction.unwrap_or(Point::new(
+        snapped.x - base.x,
+        snapped.y - base.y,
+    ));
+    let len = delta.x.hypot(delta.y);
+    if !len.is_finite() || len <= 1e-3 {
+        return None;
+    }
+    let u = Point::new(delta.x / len, delta.y / len);
+    let along = (snapped.x - base.x) * u.x + (snapped.y - base.y) * u.y;
+    let tip = Point::new(
+        base.x + u.x * (along + 18.0),
+        base.y + u.y * (along + 18.0),
+    );
+    Some((u, tip))
+}
+
+#[cfg(test)]
+mod extension_guide_tests {
+    use super::*;
+
+    #[test]
+    fn acquired_extension_guide_stays_on_its_origin_when_cursor_wanders() {
+        let base = Point::new(100.0, 200.0);
+        for snap in [
+            Point::new(140.0, 202.0),
+            Point::new(175.0, 193.0),
+            Point::new(240.0, 215.0),
+        ] {
+            let (unit, tip) =
+                extension_guide_tip(base, snap, Some(Point::new(300.0, 0.0))).unwrap();
+            assert!((unit.y).abs() < 1e-5);
+            assert!((tip.y - base.y).abs() < 1e-5);
+            assert!((tip.x - (snap.x + 18.0)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn extension_guide_fallback_keeps_original_behavior_without_acquired_ray() {
+        let base = Point::new(100.0, 200.0);
+        let snap = Point::new(130.0, 240.0);
+        let (u, tip) = extension_guide_tip(base, snap, None).unwrap();
+        assert!((u.x - 0.6).abs() < 1e-5);
+        assert!((u.y - 0.8).abs() < 1e-5);
+        assert!((tip.x - 140.8).abs() < 1e-4);
+        assert!((tip.y - 254.4).abs() < 1e-4);
+    }
+}
+
 pub fn compute_grid_step(distance: f32, fov_y: f32, bounds: iced::Rectangle) -> f32 {
     compute_grid_steps(1.0, 1.0, distance, fov_y, bounds, true).0
 }
@@ -954,6 +1010,7 @@ pub(crate) fn selection_overlay<'a>(
     snap: Option<(Point, SnapType)>,
     snap_ext_base: Option<Point>,
     snap_ext_base2: Option<Point>,
+    snap_ext_dir: Option<Point>,
     grips: Vec<GripMarker>,
     control_polygon: Option<(Vec<Point>, bool)>,
     grip_clip: Option<iced::Rectangle>,
@@ -989,6 +1046,7 @@ pub(crate) fn selection_overlay<'a>(
         snap,
         snap_ext_base,
         snap_ext_base2,
+        snap_ext_dir,
         grips,
         control_polygon,
         grip_clip,
@@ -1023,6 +1081,8 @@ pub(crate) fn selection_overlay<'a>(
 pub(crate) struct AuthoringDimension {
     pub lines: Vec<[Point; 2]>,
     pub round_grips: Vec<Point>,
+    pub base_grips: Vec<Point>,
+    pub lookup_grips: Vec<Point>,
     pub dimensions: Vec<[Point; 2]>,
     pub labels: Vec<(Point, String)>,
     pub grips: Vec<(Point, Option<Point>)>,
@@ -1038,6 +1098,7 @@ struct SelectionCanvas {
     /// Second extension-guide base, present only for an extended intersection so
     /// both crossing extensions stay drawn when the crossing is caught. (#247, #259)
     snap_ext_base2: Option<Point>,
+    snap_ext_dir: Option<Point>,
     grips: Vec<GripMarker>,
     /// Selected spline control polygon and closed state.
     control_polygon: Option<(Vec<Point>, bool)>,
@@ -1702,6 +1763,60 @@ impl canvas::Program<Message> for SelectionCanvas {
                 style: canvas::Style::Solid(marker),
                 ..Default::default()
             };
+            // Construction guides are canvas-space geometry, NOT snap glyphs.
+            // They must be drawn before the SNAPMARKERSIZE transform below.
+            // Scaling a guide around the moving snap position makes a fixed
+            // acquired endpoint visibly slide as the cursor moves.
+            let extension_ray = self.snap_ext_base.and_then(|base| {
+                let acquired = self.snap_ext_dir.or_else(|| {
+                    self.otrack_lines.iter().find_map(|&(origin, tip)| {
+                        let offset = (origin.x - base.x).hypot(origin.y - base.y);
+                        (offset <= 2.0)
+                            .then_some(Point::new(tip.x - origin.x, tip.y - origin.y))
+                    })
+                });
+                extension_guide_tip(base, sp, acquired)
+                    .map(|(unit, tip)| (base, unit, tip))
+            });
+            let guide_dash = canvas::Stroke {
+                line_dash: canvas::LineDash {
+                    segments: &[4.0, 4.0],
+                    offset: 0,
+                },
+                ..canvas::Stroke::default().with_color(marker).with_width(1.0)
+            };
+            match snap_type {
+                SnapType::Extension => {
+                    if let Some((base, _, tip)) = extension_ray {
+                        if let Some((a, b)) = clip_seg(base, tip, bounds) {
+                            frame.stroke(&canvas::Path::line(a, b), guide_dash.clone());
+                        }
+                    }
+                }
+                SnapType::Intersection => {
+                    // Extended-intersection guide origins must also remain
+                    // fixed when SNAPMARKERSIZE changes.
+                    for base in [self.snap_ext_base, self.snap_ext_base2]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let dx = sp.x - base.x;
+                        let dy = sp.y - base.y;
+                        let len = dx.hypot(dy);
+                        if len > 1e-3 {
+                            let tip = Point::new(
+                                sp.x + dx / len * 18.0,
+                                sp.y + dy / len * 18.0,
+                            );
+                            if let Some((a, b)) = clip_seg(base, tip, bounds) {
+                                frame.stroke(&canvas::Path::line(a, b), guide_dash.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
             // SNAPMARKERSIZE scales the glyphs drawn for the default 5 px.
             let scale = self.crosshair.snap_size.clamp(1.0, 20.0) / 5.0;
             frame.with_save(|frame| {
@@ -1799,35 +1914,8 @@ impl canvas::Program<Message> for SelectionCanvas {
                         frame.stroke(&path, stroke);
                     }
                     SnapType::Intersection => {
-                        // An extended intersection sets one or two extension bases;
-                        // draw a dashed guide from each endpoint through the crossing
-                        // so both contributing extension paths stay visible. A real
-                        // on-segment crossing carries no bases, so nothing draws here.
-                        // (#247, #259)
-                        for base in [self.snap_ext_base, self.snap_ext_base2]
-                            .into_iter()
-                            .flatten()
-                        {
-                            let dx = sp.x - base.x;
-                            let dy = sp.y - base.y;
-                            let len = (dx * dx + dy * dy).sqrt();
-                            if len > 1e-3 {
-                                let dash = canvas::Stroke {
-                                    line_dash: canvas::LineDash {
-                                        segments: &[4.0, 4.0],
-                                        offset: 0,
-                                    },
-                                    ..canvas::Stroke::default().with_color(marker).with_width(1.0)
-                                };
-                                let tip =
-                                    Point::new(sp.x + dx / len * 18.0, sp.y + dy / len * 18.0);
-                                // `base` is a projected entity endpoint: clip before
-                                // stroking (see `clip_seg`).
-                                if let Some((a, b)) = clip_seg(base, tip, bounds) {
-                                    frame.stroke(&canvas::Path::line(a, b), dash);
-                                }
-                            }
-                        }
+                        // The guide is drawn unscaled above; only the X glyph
+                        // belongs inside the SNAPMARKERSIZE transform.
                         let r = 5.0_f32;
                         let p1 = canvas::Path::new(|b| {
                             b.move_to(Point::new(sp.x - r, sp.y - r));
@@ -1915,36 +2003,12 @@ impl canvas::Program<Message> for SelectionCanvas {
                         frame.stroke(&path, stroke);
                     }
                     SnapType::Extension => {
-                        // Unit direction from the endpoint the snap extends from
-                        // toward the snap point, so the guide line and the three
-                        // dots follow the actual extension path (#238).
-                        let dir = self.snap_ext_base.and_then(|base| {
-                            let dx = sp.x - base.x;
-                            let dy = sp.y - base.y;
-                            let len = (dx * dx + dy * dy).sqrt();
-                            (len > 1e-3).then(|| (base, Point::new(dx / len, dy / len)))
-                        });
-                        // Dashed guide line from that endpoint, through the snap
-                        // point and a little beyond, so the extension path is
-                        // visible as the cursor tracks along it.
-                        if let Some((base, u)) = dir {
-                            let dash = canvas::Stroke {
-                                line_dash: canvas::LineDash {
-                                    segments: &[4.0, 4.0],
-                                    offset: 0,
-                                },
-                                ..canvas::Stroke::default().with_color(marker).with_width(1.0)
-                            };
-                            let tip = Point::new(sp.x + u.x * 18.0, sp.y + u.y * 18.0);
-                            // `base` is a projected entity endpoint: clip before
-                            // stroking (see `clip_seg`).
-                            if let Some((a, b)) = clip_seg(base, tip, bounds) {
-                                frame.stroke(&canvas::Path::line(a, b), dash);
-                            }
-                        }
-                        // Three dots at the snap point, strung along the extension
-                        // direction (horizontal fallback when the base is unknown).
-                        let u = dir.map(|(_, u)| u).unwrap_or(Point::new(1.0, 0.0));
+                        // Only the three-dot marker is scaled. The actual
+                        // guide and diagnostic dot are drawn in canvas space.
+                        let dir = extension_ray;
+                        // Three dots stay aligned with the *same* acquired ray
+                        // used by the dashed guide (rather than cursor jitter).
+                        let u = dir.map(|(_, u, _)| u).unwrap_or(Point::new(1.0, 0.0));
                         let r = 1.4_f32;
                         for k in [-7.0_f32, 0.0, 7.0] {
                             let dot =
@@ -2413,6 +2477,35 @@ impl canvas::Program<Message> for SelectionCanvas {
                         size: iced::Pixels(13.0),
                         ..Default::default()
                     });
+                }
+                for point in &dimension.base_grips {
+                    let stroke = canvas::Stroke::default().with_color(color);
+                    frame.stroke(&canvas::Path::circle(*point, 6.0), stroke);
+                    frame.stroke(
+                        &canvas::Path::line(
+                            Point::new(point.x - 9.0, point.y),
+                            Point::new(point.x + 9.0, point.y),
+                        ),
+                        stroke,
+                    );
+                    frame.stroke(
+                        &canvas::Path::line(
+                            Point::new(point.x, point.y - 9.0),
+                            Point::new(point.x, point.y + 9.0),
+                        ),
+                        stroke,
+                    );
+                }
+                for point in &dimension.lookup_grips {
+                    frame.fill(
+                        &canvas::Path::new(|p| {
+                            p.move_to(Point::new(point.x - 5.0, point.y - 4.0));
+                            p.line_to(Point::new(point.x + 5.0, point.y - 4.0));
+                            p.line_to(Point::new(point.x, point.y + 5.0));
+                            p.close();
+                        }),
+                        color,
+                    );
                 }
                 for point in &dimension.round_grips {
                     frame.fill(&canvas::Path::circle(*point, 3.5), color);

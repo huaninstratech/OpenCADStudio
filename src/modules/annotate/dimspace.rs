@@ -104,8 +104,8 @@ impl CadCommand for DimSpaceCommand {
         for selected in entities {
             if selected.handle != *base
                 && matches!(
-                    selected.entity,
-                    EntityType::Dimension(
+                    crate::entities::dimension::as_dimension(&selected.entity),
+                    Some(
                         codec::entities::Dimension::Linear(_)
                             | codec::entities::Dimension::Aligned(_)
                     )
@@ -124,11 +124,14 @@ impl CadCommand for DimSpaceCommand {
         match &mut self.step {
             Step::PickBase => {
                 if !matches!(
-                    self.picked_entity.take(),
-                    Some(EntityType::Dimension(
+                    self.picked_entity
+                        .take()
+                        .as_ref()
+                        .and_then(crate::entities::dimension::as_dimension),
+                    Some(
                         codec::entities::Dimension::Linear(_)
                             | codec::entities::Dimension::Aligned(_)
-                    ))
+                    )
                 ) {
                     return CmdResult::ReportError(
                         t!("DIMSPACE: select a linear or aligned dimension.").into_owned(),

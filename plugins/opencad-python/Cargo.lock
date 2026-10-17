@@ -3,6 +3,30 @@
 version = 4
 
 [[package]]
+name = "acadrust"
+version = "0.6.4"
+source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=cf3a040#cf3a04051240cf88440f8aaf41c4841fcb01d0d1"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "byteorder",
+ "encoding_rs",
+ "flate2",
+ "foldhash",
+ "indexmap",
+ "itoa",
+ "memmap2",
+ "nom",
+ "oem_cp",
+ "once_cell",
+ "rayon",
+ "ryu",
+ "serde",
+ "thiserror 2.0.20",
+ "web-time",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1230,19 +1254,28 @@ dependencies = [
 name = "ocs_plugin_api"
 version = "0.2.1"
 dependencies = [
+ "acadrust",
  "bincode",
  "cargo-lock",
  "getrandom 0.2.17",
  "interprocess",
  "libloading 0.8.9",
  "memmap2",
- "opencadcodec",
  "rkyv",
  "serde",
  "serde-reflection",
  "serde_bytes",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "oem_cp"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7959d3349f484aec36462f98226983578bf7d33f9b034c32967489c7000e1f"
+dependencies = [
+ "phf 0.11.3",
 ]
 
 [[package]]
@@ -1259,29 +1292,6 @@ dependencies = [
  "rustpython-vm",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "opencadcodec"
-version = "0.6.0"
-source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=85bb5a2#85bb5a2aa64108230ae71e5a2965690efd97c9e2"
-dependencies = [
- "anyhow",
- "bitflags",
- "byteorder",
- "encoding_rs",
- "flate2",
- "foldhash",
- "indexmap",
- "itoa",
- "memmap2",
- "nom",
- "once_cell",
- "rayon",
- "ryu",
- "serde",
- "thiserror 2.0.20",
- "web-time",
 ]
 
 [[package]]

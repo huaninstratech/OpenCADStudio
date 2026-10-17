@@ -267,6 +267,7 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
     );
     let mut device = Collector {
         want_images: images,
+        visible: vec![Rect::new(0.0, 0.0, w as f64 / 72.0, h as f64 / 72.0)],
         ..Collector::default()
     };
     interpret_page(page, &mut context, &mut device);
@@ -331,6 +332,9 @@ struct Collector {
     want_images: bool,
     images: Vec<PdfImage>,
     order: Vec<Drawn>,
+    /// The visible area, in inches: the page, then each clip path's box
+    /// within the one before it (the last is the current one).
+    visible: Vec<Rect>,
 }
 
 impl Collector {
@@ -358,14 +362,31 @@ fn pt(p: Point) -> [f64; 2] {
     [p.x, p.y]
 }
 
+/// The page transform (user space → inches) at the precision PDF import
+/// reads geometry with: the current transformation matrix, in points, as
+/// 16.16 fixed point held in single precision — each coefficient times
+/// 65536 to the nearest integer, then to the nearest single-precision
+/// number (a 0.12 scale is 7864/65536; a 345.678 offset 22654352/65536) —
+/// and each user-space coordinate as a single-precision number kept to six
+/// decimals (100.3 is 100.300003).
+fn import_precision(transform: Affine) -> impl Fn(Point) -> Point {
+    let points = (Affine::scale(72.0) * transform)
+        .as_coeffs()
+        .map(|v| (v * 65536.0).round() as f32 as f64 / 65536.0);
+    let transform = Affine::scale(1.0 / 72.0) * Affine::new(points);
+    let six = |v: f64| ((v as f32) as f64 * 1e6).round() / 1e6;
+    move |p: Point| transform * Point::new(six(p.x), six(p.y))
+}
+
 fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
+    let transform = import_precision(transform);
     let mut out: Vec<SubPath> = Vec::new();
     let mut start = Point::ZERO;
     let mut last = Point::ZERO;
     for el in path.elements() {
         match *el {
             PathEl::MoveTo(p) => {
-                let p = transform * p;
+                let p = transform(p);
                 out.push(SubPath {
                     segments: Vec::new(),
                     closed: false,
@@ -374,14 +395,14 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
                 last = p;
             }
             PathEl::LineTo(p) => {
-                let p = transform * p;
+                let p = transform(p);
                 if let Some(sp) = out.last_mut() {
                     sp.segments.push(Segment::Line(pt(last), pt(p)));
                 }
                 last = p;
             }
             PathEl::QuadTo(c, p) => {
-                let (c, p) = (transform * c, transform * p);
+                let (c, p) = (transform(c), transform(p));
                 let c1 = last + (c - last) * (2.0 / 3.0);
                 let c2 = p + (c - p) * (2.0 / 3.0);
                 if let Some(sp) = out.last_mut() {
@@ -391,7 +412,7 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
                 last = p;
             }
             PathEl::CurveTo(c1, c2, p) => {
-                let (c1, c2, p) = (transform * c1, transform * c2, transform * p);
+                let (c1, c2, p) = (transform(c1), transform(c2), transform(p));
                 if let Some(sp) = out.last_mut() {
                     sp.segments
                         .push(Segment::Cubic(pt(last), pt(c1), pt(c2), pt(p)));
@@ -438,6 +459,26 @@ impl<'a> Device<'a> for Collector {
         if subpaths.is_empty() {
             return;
         }
+        // A path wholly outside the visible area is left out; one that
+        // reaches into it is kept whole.
+        if let Some(area) = self.visible.last() {
+            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for seg in subpaths.iter().flat_map(|sp| &sp.segments) {
+                let points: &[[f64; 2]] = match seg {
+                    Segment::Line(a, b) => &[*a, *b],
+                    Segment::Cubic(a, b, c, d) => &[*a, *b, *c, *d],
+                };
+                for p in points {
+                    for k in 0..2 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+            if hi[0] < area.x0 || lo[0] > area.x1 || hi[1] < area.y0 || lo[1] > area.y1 {
+                return;
+            }
+        }
         let (stroke, fill) = match mode {
             PathDrawMode::Stroke(props) => {
                 // Width in points: the user-space width through the transform
@@ -454,7 +495,11 @@ impl<'a> Device<'a> for Collector {
             fill,
         });
     }
-    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_clip_path(&mut self, clip: &ClipPath) {
+        let bounds = clip.path.bounding_box();
+        let area = self.visible.last().map_or(bounds, |a| a.intersect(bounds));
+        self.visible.push(area);
+    }
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
     fn draw_glyph(
         &mut self,
@@ -588,7 +633,11 @@ impl<'a> Device<'a> for Collector {
             self.images.push(image);
         }
     }
-    fn pop_clip_path(&mut self) {}
+    fn pop_clip_path(&mut self) {
+        if self.visible.len() > 1 {
+            self.visible.pop();
+        }
+    }
     fn pop_transparency_group(&mut self) {}
 }
 

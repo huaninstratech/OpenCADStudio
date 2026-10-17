@@ -151,7 +151,7 @@ impl DimBaselineCommand {
         let increment = self.effective_increment(&style.style_name);
         let plane = plane_from_normal(dimension.base().definition_point, style.normal);
         let pick = pick.and_then(|point| plane.project(point.to_array()).map(Vec2::from));
-        let kind = match dimension {
+        let kind = match &**dimension {
             Dimension::Linear(source) => {
                 let first = project(&plane, source.first_point);
                 let second = project(&plane, source.second_point);
@@ -441,7 +441,7 @@ impl CadCommand for DimBaselineCommand {
         self.committed += 1;
         self.advance(1.0);
         CmdResult::CommitDimension {
-            entity: EntityType::Dimension(dimension),
+            entity: EntityType::Dimension(Box::new(dimension)),
             association: DimensionAssociationInput::Infer(None),
             preserve_base_style: self.preserve_base_style,
             continue_command: true,
@@ -489,7 +489,7 @@ impl CadCommand for DimBaselineCommand {
     fn dimension_preview(&self, cursor: DVec3) -> Option<Vec<DimensionPreview>> {
         self.build_dimension(cursor).map(|dimension| {
             vec![DimensionPreview {
-                entity: EntityType::Dimension(dimension),
+                entity: EntityType::Dimension(Box::new(dimension)),
                 preserve_base_style: self.preserve_base_style,
             }]
         })

@@ -158,6 +158,16 @@ pub trait TextContent {
     fn replace_text(&mut self, search: &str, rep: &str);
 }
 
+/// Entity variants holding their entity boxed (MTEXT) dispatch through here.
+impl<T: TextContent + ?Sized> TextContent for Box<T> {
+    fn text_content(&self) -> Option<String> {
+        (**self).text_content()
+    }
+    fn replace_text(&mut self, search: &str, rep: &str) {
+        (**self).replace_text(search, rep)
+    }
+}
+
 /// Human-readable variant name used by Quick Select / Select Similar
 /// filtering. Stable across releases — the strings here are the canonical
 /// type identifiers throughout the UI.

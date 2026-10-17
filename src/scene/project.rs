@@ -16,7 +16,7 @@ impl Scene {
         let viewports: Vec<&Viewport> = viewport_handles
             .iter()
             .filter_map(|handle| match self.document.get_entity(*handle) {
-                Some(EntityType::Viewport(vp)) => Some(vp),
+                Some(EntityType::Viewport(vp)) => Some(&**vp),
                 _ => None,
             })
             .filter(|vp| {
@@ -446,7 +446,7 @@ impl Scene {
                 Some(EntityType::Viewport(viewport))
                     if viewport.common.owner_handle == paper_block && viewport.is_on() =>
                 {
-                    Some(viewport)
+                    Some(&**viewport)
                 }
                 _ => None,
             })

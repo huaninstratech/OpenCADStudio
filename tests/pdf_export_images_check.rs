@@ -331,7 +331,7 @@ fn viewport_projection_clips_images_and_respects_frozen_and_nonplot_layers() {
     viewport.view_center = Vector3::new(20.0, 10.0, 0.0);
     viewport.id = 2;
     viewport.status.is_on = true;
-    let handle = scene.add_entity(EntityType::Viewport(viewport));
+    let handle = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
     let (_, _, _, images) = scene.viewport_plot_fills();
     assert_eq!(images.len(), 1);
     let raster = Raster::from_pdf(&export(&[page(images)]), 0);

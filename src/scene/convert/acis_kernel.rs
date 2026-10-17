@@ -70,13 +70,24 @@ pub fn tessellate_sat(
             (owner >= 0 && handle > 0).then(|| (owner, codec::Handle::new(handle as u64)))
         })
         .collect();
+    // A true colour attribute outranks the index one beside it, which only
+    // holds its nearest index.
     let face_colors: std::collections::HashMap<i32, [f32; 4]> = document
         .records
         .iter()
         .filter(|record| record.entity_type == "color-adesk-attrib")
+        .chain(
+            document
+                .records
+                .iter()
+                .filter(|record| record.entity_type == "truecolor-adesk-attrib"),
+        )
         .filter_map(|record| {
             let owner = record.token_pointer(2)?.0;
-            let value = record.token(3)?.as_integer()?;
+            let mut value = record.token(3)?.as_integer()?;
+            if record.entity_type == "truecolor-adesk-attrib" {
+                value = (value & 0x00FF_FFFF) | 0x0100_0000;
+            }
             let source = if (1..=255).contains(&value) {
                 codec::Color::from_index(value as i16)
             } else if value > 257 {

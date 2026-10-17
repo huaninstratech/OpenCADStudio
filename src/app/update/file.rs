@@ -864,6 +864,7 @@ impl OpenCADStudio {
             ucs_view: crate::modules::view::view_cmd::ucs_view(),
             layout_create_viewport: crate::scene::layout_create_viewport(),
             pdf_shx_text: crate::modules::insert::pdf_shx_text::settings(),
+            dgn_import: crate::modules::insert::dgn_import::settings(),
             ncopy_bind: self.ncopy_bind,
             cursor_type: self.cursor_type,
             crosshair_color: self.crosshair_color,
@@ -1012,6 +1013,7 @@ impl OpenCADStudio {
         crate::modules::view::view_cmd::set_ucs_view(s.ucs_view);
         crate::scene::set_layout_create_viewport(s.layout_create_viewport);
         crate::modules::insert::pdf_shx_text::set_settings(s.pdf_shx_text.clone());
+        crate::modules::insert::dgn_import::set_settings(s.dgn_import);
         self.ncopy_bind = s.ncopy_bind;
         self.cursor_type = s.cursor_type;
         self.crosshair_color = s.crosshair_color;
@@ -2068,34 +2070,13 @@ impl OpenCADStudio {
             .xrefs
             .iter()
             .any(|item| item.status == crate::io::xref::XrefStatus::Failed);
-        let document_repaired = parser_errors_recovered
-            || reference_recovered
-            || caches.corrupt_dropped > 0
-            || caches.xref_dropped > 0;
+        let document_repaired = parser_errors_recovered || reference_recovered;
         let recovery_needed = document_repaired || reference_failed;
         let total_ms = open_started
             .map(|started| started.elapsed().as_millis() as u32)
             .unwrap_or(0);
         self.command_line
             .push_output(crate::tf!("Opened \"{name}\" — {entity_count} entities").as_ref());
-        if caches.corrupt_dropped > 0 {
-            self.command_line.push_error(
-                crate::tf!(
-                    "Warning: {} corrupt entities dropped (parser junk — bad normals / counts)",
-                    caches.corrupt_dropped
-                )
-                .as_ref(),
-            );
-        }
-        if caches.xref_dropped > 0 {
-            self.command_line.push_error(
-                crate::tf!(
-                    "Warning: {} corrupt xref entities dropped",
-                    caches.xref_dropped
-                )
-                .as_ref(),
-            );
-        }
         for info in &caches.xrefs {
             match info.status {
                 crate::io::xref::XrefStatus::Loaded => {
@@ -2195,9 +2176,7 @@ impl OpenCADStudio {
                 size_bytes,
                 caches.source_sha256.clone(),
                 caches.read_stats.clone(),
-                entity_count.saturating_add(caches.corrupt_dropped),
-                caches.corrupt_dropped,
-                caches.xref_dropped,
+                entity_count,
                 &caches.xrefs,
                 &doc.notifications,
                 document_repaired,
@@ -4189,14 +4168,39 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
             )
         };
         match capture_window {
-            Some(window) => iced::window::screenshot(window)
-                .map(Some)
-                .then(move |screenshot| {
-                    Task::batch([
-                        Task::done(Message::ThumbnailCaptureFinished),
-                        run_save(screenshot),
-                    ])
-                }),
+            // The screenshot may never come back (a window the compositor
+            // does not draw), so it races a short timeout: whichever answers
+            // first runs the save, with or without the picture.
+            Some(window) => {
+                fn finish<F>(
+                    slot: &std::sync::Mutex<Option<F>>,
+                    screenshot: Option<iced::window::Screenshot>,
+                ) -> Task<Message>
+                where
+                    F: FnMut(Option<iced::window::Screenshot>) -> Task<Message>,
+                {
+                    match slot.lock().ok().and_then(|mut run| run.take()) {
+                        Some(mut run_save) => Task::batch([
+                            Task::done(Message::ThumbnailCaptureFinished),
+                            run_save(screenshot),
+                        ]),
+                        None => Task::none(),
+                    }
+                }
+                let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(run_save)));
+                let (shot_slot, timeout_slot) = (slot.clone(), slot);
+                let (tx, rx) = iced::futures::channel::oneshot::channel::<()>();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let _ = tx.send(());
+                });
+                Task::batch([
+                    iced::window::screenshot(window)
+                        .map(Some)
+                        .then(move |screenshot| finish(&shot_slot, screenshot)),
+                    Task::perform(rx, |_| ()).then(move |_| finish(&timeout_slot, None)),
+                ])
+            }
             None => {
                 self.thumbnail_capture_clean = false;
                 run_save(None)
@@ -5641,15 +5645,26 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
             crate::io::paper_catalog::PaperUnits::Inches => PlotPaperUnits::Inches,
             crate::io::paper_catalog::PaperUnits::Millimeters => PlotPaperUnits::Millimeters,
         };
-        if d.fit_to_paper && !layout_area {
+        if layout_area {
+            // Paper layouts use physical paper-space coordinates, independently
+            // of INSUNITS and the model's scale family. One unit in a metric
+            // paper layout is 1 mm; on an inch plotter, 1 inch is 25.4 such
+            // units. Using dialog_plot_scale_ratio() here incorrectly brings
+            // the model unit conversion (1000 for metres) into the paper
+            // sheet: A3 then appears as 0.420 x 0.297 instead of 420 x 297.
+            let page_unit_mm = plot_paper_unit_mm(ps.paper_units);
+            ps.scale_type = ScaledType::OneToOne;
+            ps.flags.use_standard_scale = false;
+            ps.scale_numerator = 1.0;
+            ps.scale_denominator = page_unit_mm;
+            ps.standard_scale_factor =
+                stored_scale_factor(1.0 / page_unit_mm, ps.paper_units);
+        } else if d.fit_to_paper {
             ps.set_scale_to_fit();
             // The commercial application marks fitted plots with the
             // "standard scale" bit and leaves the ratio it computed.
             ps.flags.use_standard_scale = true;
         } else {
-            // A layout plot goes through the same path as the other areas:
-            // the dialog holds it at 1:1, which the unit conversion turns
-            // into whatever keeps the paper space's unit intact.
             let ((numerator, denominator), standard) = self.dialog_plot_scale_ratio();
             // The commercial application leaves the "standard scale" bit
             // clear even for a standard code and keeps the ratio in the
@@ -8336,6 +8351,56 @@ mod plot_paper_tests {
         assert!((ps.standard_scale_factor - 254.0).abs() < 1e-9);
         let _ = app.on_plot_dialog_open();
         assert_eq!(app.plot_dialog.scale, "1:100");
+    }
+
+    #[test]
+    fn metre_model_a3_layout_uses_millimetre_paper_space() {
+        use codec::objects::{PlotPaperUnits, PlotType, ScaledType};
+
+        let mut app = app_with_printer_named_sheet();
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.insertion_units = 6; // Metres.
+        let _ = app.on_plot_dialog_open();
+        let _ = app.on_plot_dlg(PlotDlgMsg::Paper("ISO_A3_(297.00_x_420.00_MM)".into()));
+        let _ = app.on_plot_dlg(PlotDlgMsg::Orientation("Landscape".into()));
+        let _ = app.on_plot_dlg(PlotDlgMsg::Area("Layout".into()));
+        let _ = app.on_plot_dlg(PlotDlgMsg::SetCurrent);
+
+        let ps = layout_settings(&app);
+        assert_eq!(ps.plot_type, PlotType::Layout);
+        assert_eq!(ps.paper_units, PlotPaperUnits::Millimeters);
+        assert_eq!(ps.scale_type, ScaledType::OneToOne);
+        assert_eq!((ps.scale_numerator, ps.scale_denominator), (1.0, 1.0));
+        assert!((app.tabs[i].scene.paper_space_unit_factor() - 1.0).abs() < 1e-12);
+
+        let ((x0, y0), (x1, y1)) = app.tabs[i].scene.paper_limits().unwrap();
+        assert!(((x1 - x0) - 420.0).abs() < 1e-9);
+        assert!(((y1 - y0) - 297.0).abs() < 1e-9);
+        assert_eq!(app.tabs[i].scene.document.header.insertion_units, 6);
+    }
+
+    #[test]
+    fn metre_model_inch_page_still_uses_millimetre_paper_space() {
+        use codec::objects::{PlotPaperUnits, PlotType};
+
+        let mut app = app_with_printer_named_sheet();
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.insertion_units = 6; // Metres.
+        let _ = app.on_plot_dialog_open();
+        let _ = app.on_plot_dlg(PlotDlgMsg::PaperUnits("Inches".into()));
+        let _ = app.on_plot_dlg(PlotDlgMsg::Area("Layout".into()));
+        let _ = app.on_plot_dlg(PlotDlgMsg::SetCurrent);
+
+        let ps = layout_settings(&app);
+        assert_eq!(ps.plot_type, PlotType::Layout);
+        assert_eq!(ps.paper_units, PlotPaperUnits::Inches);
+        assert!((ps.scale_numerator - 1.0).abs() < 1e-12);
+        assert!((ps.scale_denominator - 25.4).abs() < 1e-12);
+        assert!((app.tabs[i].scene.paper_space_unit_factor() - 1.0).abs() < 1e-12);
+        let ((x0, y0), (x1, y1)) = app.tabs[i].scene.paper_limits().unwrap();
+        assert!(((x1 - x0) - 297.0).abs() < 1e-9);
+        assert!(((y1 - y0) - 210.0).abs() < 1e-9);
+        assert_eq!(app.tabs[i].scene.document.header.insertion_units, 6);
     }
 
     #[test]

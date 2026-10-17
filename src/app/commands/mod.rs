@@ -20,6 +20,7 @@ mod fileops;
 mod inquiry;
 mod layerprops;
 mod layers;
+mod model_import;
 mod pc_colormap;
 mod pc_extract;
 mod pdf_dialogs;
@@ -174,10 +175,32 @@ impl OpenCADStudio {
         };
         let resolved = self.resolve_alias(cmd);
         let cmd = resolved.as_deref().unwrap_or(cmd);
+        if matches!(cmd.split(' ').next(), Some("BACTION" | "BACTIONTOOL")) {
+            let args = cmd.split_once(' ').map_or("", |(_, a)| a.trim());
+            if !args.is_empty() && crate::scene::block_actions::Kind::parse(args).is_none() {
+                self.command_line.push_error(
+                    crate::t!(
+                        "Supported actions: Move, Scale. Other action types are not wired yet."
+                    )
+                    .as_ref(),
+                );
+                return Task::none();
+            }
+            if let Some(error) = self.action_error(crate::scene::block_actions::Kind::parse(args)) {
+                self.command_line.push_error(crate::t!(error).as_ref());
+                return Task::none();
+            }
+        }
         if cmd == "BPARAMETER" || cmd.starts_with("BPARAMETER ") {
             if let Some(error) =
                 self.parameter_placement_error(cmd.strip_prefix("BPARAMETER").unwrap().trim())
             {
+                self.command_line.push_error(crate::t!(error).as_ref());
+                return Task::none();
+            }
+        }
+        if cmd == "BLOOKUPTABLE" || cmd.starts_with("BLOOKUPTABLE ") {
+            if let Some(error) = self.lookup_table_error() {
                 self.command_line.push_error(crate::t!(error).as_ref());
                 return Task::none();
             }
@@ -391,6 +414,9 @@ impl OpenCADStudio {
             return Some(t);
         }
         if let Some(t) = self.dispatch_import(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_model_import(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_bvisibility(cmd, i) {
@@ -834,6 +860,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "SELECTIONCYCLING",
         "UCSDETECT",
         "SURFACEASSOCIATIVITY",
+        "DGNIMPORTMODE",
         "LAYOUTCREATEVIEWPORT",
         "TXT2MTXTCOMBINEMTEXT",
         "TXT2MTXTTEXTORDER",
@@ -1001,6 +1028,8 @@ inventory::submit!(crate::command::CommandRegistration {
         "QNEW",
         "OBJIMPORT",
         "IMPORT",
+        "ACISIN",
+        "WMFIN",
         "DGNIMPORT",
         "-DGNIMPORT",
         "OPEN",

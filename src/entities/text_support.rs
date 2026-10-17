@@ -48,24 +48,34 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
             // drawing) renders its REAL stroke glyphs — pass the absolute
             // path through so `Face::resolve` picks the SHX face. Fonts fetched
             // from the community repository live in the per-user fonts folder,
-            // so that is searched last, after the drawing folder.
-            let shx_path = file
-                .to_ascii_lowercase()
-                .ends_with(".shx")
-                .then(|| {
-                    let base = document
-                        .source_path
-                        .as_deref()
-                        .map(std::path::Path::new)
-                        .and_then(|p| p.parent());
-                    crate::io::resolve_image_file(file, base).or_else(|| {
-                        crate::io::font_repo::local_font_file(file)
-                            .map(|path| path.to_string_lossy().into_owned())
-                    })
+            // so that is searched last, after the drawing folder. A bare name
+            // (`txt`) is looked up as its .shx file first, before any
+            // installed face (measured: `Txt` draws txt.shx, `swiss` swiss.ttf).
+            let explicit_shx = lff::is_shx_name(file);
+            let shx_file = if explicit_shx {
+                Some(file.to_string())
+            } else if std::path::Path::new(file).extension().is_none() {
+                Some(format!("{file}.shx"))
+            } else {
+                None
+            };
+            let shx_path = shx_file.and_then(|shx_file| {
+                let base = document
+                    .source_path
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .and_then(|p| p.parent());
+                crate::io::resolve_image_file(&shx_file, base).or_else(|| {
+                    crate::io::font_repo::local_font_file(&shx_file)
+                        .map(|path| path.to_string_lossy().into_owned())
                 })
-                .flatten();
+            });
             if let Some(p) = shx_path {
                 p
+            } else if explicit_shx {
+                // A missing .shx file draws with the stroke substitute of its
+                // name, never with an installed TrueType face (measured).
+                file.rsplit(['/', '\\']).next().unwrap_or(file).trim().to_string()
             } else if let Some(family) = resolve_font_reference(file) {
                 // The file is installed, so its family is the face to draw with.
                 // Substituting a stroke font instead drops every letter that
@@ -93,7 +103,7 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
         style_name.trim().to_string()
     };
 
-    if !lff::is_builtin(&font_name) {
+    if !lff::is_builtin(&font_name) && !lff::is_shx_name(&font_name) {
         if let Some(canonical) = crate::scene::text::sysfont::canonical_family_name(&font_name) {
             font_name = canonical;
         }
@@ -676,7 +686,9 @@ pub fn adapt_mtext_paragraphs(
                                 ATab::Left(_) => TabKind::Left,
                                 ATab::Center(_) => TabKind::Center,
                                 ATab::Right(_) => TabKind::Right,
-                                ATab::Decimal(..) => TabKind::Decimal,
+                                ATab::Decimal(..) | ATab::DecimalWithCharacter { .. } => {
+                                    TabKind::Decimal
+                                }
                             };
                             TabStop {
                                 position: ts.position() as f32 * entity_height,

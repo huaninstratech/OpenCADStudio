@@ -499,18 +499,7 @@ impl Scene {
                 .map_or(1, |n| n + 1);
             format!("*U{next}")
         };
-        let base = self
-            .document
-            .block_records
-            .iter()
-            .find(|record| record.handle == source)
-            .and_then(
-                |record| match self.document.get_entity(record.block_entity_handle) {
-                    Some(EntityType::Block(block)) => Some(block.base_point),
-                    _ => None,
-                },
-            )
-            .unwrap_or(Vector3::ZERO);
+        let base = super::render_graph::block_base_point(&self.document, &reference.block_name);
         let originals = members(&self.document, source);
         let copies: Vec<EntityType> = originals
             .iter()

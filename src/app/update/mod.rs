@@ -237,6 +237,7 @@ impl OpenCADStudio {
             Some(BlockEditPicker) => self.block_edit_picker = None,
             Some(BlockSaveAs) => self.block_save_as = None,
             Some(BlockVisibility) => self.block_visibility = None,
+            Some(BlockLookup) => self.block_lookup = None,
             Some(PdfAttach) => self.pdf_attach = None,
             Some(UnderlayLayers) => self.underlay_layers = None,
             Some(PdfImportSettings) => self.pdf_import_settings = None,
@@ -254,6 +255,7 @@ impl OpenCADStudio {
             Some(PdfImportFile) => self.pdf_import_file = None,
             Some(ImportFile) => self.import_dialogs.file = None,
             Some(DgnImport) => self.import_dialogs.dgn = None,
+            Some(TdsImport) => self.import_dialogs.tds = None,
             Some(XrefAttach) => self.xref_attach = None,
             Some(WriteBlock) => self.wblock = None,
             Some(Hyperlink) => {
@@ -1938,6 +1940,12 @@ impl OpenCADStudio {
 
             Message::PdfImportPick => Task::perform(
                 async {
+                    // A file named by automation comes back without the picker.
+                    if let Some(path) = crate::sys::take_pdf_import_pick() {
+                        return std::fs::read(&path)
+                            .map(|bytes| (path, std::sync::Arc::new(bytes)))
+                            .map_err(|e| e.to_string());
+                    }
                     let handle = crate::sys::file_dialog()
                         .set_title(crate::t!("Select PDF File").as_ref())
                         .add_filter(crate::t!("PDF Files").as_ref(), &["pdf", "PDF"])
@@ -9949,6 +9957,9 @@ impl OpenCADStudio {
             }
 
             Message::CloseModal => {
+                if self.active_modal == Some(super::ModalKind::BlockLookup) {
+                    self.block_lookup = None;
+                }
                 if self.active_modal == Some(super::ModalKind::BlockVisibility) {
                     self.block_visibility = None;
                 }
@@ -10961,6 +10972,7 @@ impl OpenCADStudio {
             }
             Message::BlockSaveAsApply => self.apply_block_save_as_dialog(),
             Message::BlockVisibility(action) => self.handle_block_visibility(action),
+            Message::BlockLookup(action) => self.handle_block_lookup(action),
             Message::BlockEditPickerName(name) => {
                 if let Some(state) = self.block_edit_picker.as_mut() {
                     state.name = name.clone();

@@ -16,4 +16,4 @@ ocs_plugin_api = { path = "../../crates/ocs_plugin_api", features = ["host"] }
 # entry): the plugin's entities and the host's re-exports are the same types
 # only when both resolve the same revision. The registration `rustc` /
 # `acadrust_source` gates enforce this at load time too.
-acadrust = { package = "opencadcodec", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "85bb5a2" }
+acadrust = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "cf3a040" }

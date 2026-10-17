@@ -90,13 +90,13 @@ fn entered_viewport_survives_a_save_and_reload() {
         sheet.id = 1;
         sheet.width = 420.0;
         sheet.height = 297.0;
-        let sheet = scene.add_entity(EntityType::Viewport(sheet));
+        let sheet = scene.add_entity(EntityType::Viewport(Box::new(sheet)));
         let mut model = Viewport::new();
         model.id = 2;
         model.width = 100.0;
         model.height = 80.0;
         model.view_height = 80.0;
-        let model = scene.add_entity(EntityType::Viewport(model));
+        let model = scene.add_entity(EntityType::Viewport(Box::new(model)));
         assert_ne!(sheet, model);
 
         for entered in [Some(model), None] {

@@ -182,6 +182,7 @@ pub(super) struct DocumentTab {
     /// the active grip edit instead of committing it.
     pub(super) grip_base_pending: bool,
     pub(super) selected_handle: Option<Handle>,
+    pub(super) selected_authoring: Option<Handle>,
     /// Dynamic-block visibility grip for the current single selection.
     pub(super) visibility_grip: Option<super::visibility::VisibilityGrip>,
     pub(super) wireframe: bool,
@@ -657,6 +658,7 @@ impl DocumentTab {
             grip_copy: false,
             grip_base_pending: false,
             selected_handle: None,
+            selected_authoring: None,
             visibility_grip: None,
             wireframe: false,
             render_mode: codec::entities::ViewportRenderMode::Wireframe2D,

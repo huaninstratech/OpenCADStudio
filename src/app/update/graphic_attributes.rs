@@ -1084,7 +1084,7 @@ mod tests {
             .document
             .entities()
             .filter_map(|entity| match entity {
-                EntityType::Hatch(hatch) => Some(hatch),
+                EntityType::Hatch(hatch) => Some(&**hatch),
                 _ => None,
             })
             .collect()

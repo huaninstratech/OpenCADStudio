@@ -519,6 +519,8 @@ pub struct UserSettings {
     /// PDFSHXTEXT's recognition settings (fonts, threshold, PDFSHXLAYER,
     /// PDFSHXBESTFONT, PDFSHXTEXTSETTINGS).
     pub pdf_shx_text: crate::modules::insert::pdf_shx_text::ShxTextSettings,
+    /// DGNIMPORTMODE and the DGN Import window's last choices.
+    pub dgn_import: crate::modules::insert::dgn_import::DgnImportSettings,
     /// Nested-copy symbol handling: false inserts, true binds.
     pub ncopy_bind: bool,
     /// Last Options page; unknown saved names fall back without rejecting the config.
@@ -997,6 +999,7 @@ impl Default for UserSettings {
             ucs_view: true,
             layout_create_viewport: true,
             pdf_shx_text: Default::default(),
+            dgn_import: Default::default(),
             ncopy_bind: false,
             cursor_type: CursorType::Crosshair,
             crosshair_color: None,

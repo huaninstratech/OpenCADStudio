@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use super::model::{
-    arc_cubics, dgn_color_table, paths_bounds, scaled_elements, DgnCollector, DgnElement, DgnGeom,
-    DgnImport, Path, PathBuilder, Segment, Sheet, SubPath, Text, DGN_DEFAULT_COLORS,
+    arc_cubics, bspline_points, dgn_color_table, paths_bounds, scaled_elements, By, DgnCollector,
+    DgnColor, DgnElement, DgnGeom, DgnImport, DgnReference, Path, PathBuilder, Segment, Sheet,
+    SubPath, Text, DGN_DEFAULT_COLORS,
 };
 
 // ── Compound file ───────────────────────────────────────────────────────────
@@ -208,16 +209,22 @@ impl<'a> Cfb<'a> {
     }
 }
 
+/// Far above any real element stream; stops a crafted one from inflating
+/// until memory runs out.
+const STREAM_LIMIT: u64 = 512 << 20;
+
 /// A DGN stream: raw, or zlib data after a 16-byte header.
 fn inflate(data: &[u8]) -> Vec<u8> {
-    // Far above any real element stream; stops a crafted one from
-    // inflating until memory runs out.
-    const STREAM_LIMIT: u64 = 512 << 20;
+    inflate_at_most(data, STREAM_LIMIT)
+}
+
+/// [`inflate`] stopping after `limit` bytes.
+fn inflate_at_most(data: &[u8], limit: u64) -> Vec<u8> {
     for skip in [16usize, 0] {
         if let Some(z) = data.get(skip..) {
             let mut out = Vec::new();
             if flate2::read::ZlibDecoder::new(z)
-                .take(STREAM_LIMIT)
+                .take(limit)
                 .read_to_end(&mut out)
                 .is_ok()
                 && !out.is_empty()
@@ -275,6 +282,34 @@ fn is_component(e: &[u8]) -> bool {
 
 fn f64_at(e: &[u8], at: usize) -> Option<f64> {
     Some(f64::from_le_bytes(e.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// The text style a text element uses: the id in its text style linkage
+/// (the four bytes after `04 20 e6 04 00 00`).
+fn text_style_id(e: &[u8]) -> Option<u32> {
+    let at = e.windows(6).position(|w| w == [0x04, 0x20, 0xe6, 0x04, 0x00, 0x00])? + 6;
+    u32_at(e, at)
+}
+
+/// The text style table (the table entries after a header of table 3):
+/// each style's id and name.
+fn text_style_table(nm: &[&[u8]]) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut table = 0;
+    for e in nm {
+        match kind(e) {
+            96 => table = u32_at(e, 12).unwrap_or(0),
+            95 if table == 3 => {
+                if let (Some(id), Some(name)) = (u32_at(e, 32), marked_string(e, 32)) {
+                    if !out.iter().any(|(i, _)| *i == id) {
+                        out.push((id, name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A string stored after the "ff fe 01 00" marker, when the element has one.
@@ -383,6 +418,99 @@ impl Styles {
             .get(index as usize)
             .copied()
             .unwrap_or([255, 255, 255])
+    }
+
+    /// The colour word as an element's colour: the level's (0xFFFFFFFF),
+    /// the enclosing cell's (0xFFFFFFFE), or a table index (low byte) with
+    /// the table entry and the colour drawn.
+    fn color_word(&self, e: &[u8]) -> By<DgnColor> {
+        match u32_at(e, 52) {
+            None | Some(u32::MAX) => By::Level,
+            Some(0xFFFF_FFFE) => By::Cell,
+            Some(word) => {
+                let index = word & 0xff;
+                By::Own(DgnColor {
+                    index,
+                    table: self
+                        .colors
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or([255, 255, 255]),
+                    rgb: self.color(e),
+                })
+            }
+        }
+    }
+}
+
+/// A B-spline curve from its order and poles, with uniform knots. A closed
+/// curve (its last pole repeating the first) is periodic: its distinct
+/// poles wrap around with knots (i + 1) / (count + 1), and the curve is
+/// clamped at both ends of its domain by knot insertion.
+fn bspline_geom(order: usize, poles: Vec<[f64; 3]>, closed: bool) -> DgnGeom {
+    let degree = order - 1;
+    let distinct = poles.len() - usize::from(closed && poles.first() == poles.last());
+    if !closed || distinct < order {
+        let interior = poles.len() - order;
+        let mut knots = vec![0.0; order];
+        knots.extend((1..=interior).map(|k| k as f64 / (interior + 1) as f64));
+        knots.extend(vec![1.0; order]);
+        return DgnGeom::Spline {
+            degree,
+            knots,
+            poles,
+            closed,
+        };
+    }
+    let mut ctrl: Vec<[f64; 3]> = (0..distinct + degree).map(|i| poles[i % distinct]).collect();
+    let count = ctrl.len() + order;
+    let mut knots: Vec<f64> = (0..count).map(|i| (i + 1) as f64 / (count + 1) as f64).collect();
+    let (lo, hi) = (knots[degree], knots[ctrl.len()]);
+    let same = |a: f64, b: f64| (a - b).abs() < 1e-12;
+    // Knot insertion (Boehm) of t until it is a degree-fold knot.
+    let mut insert = |t: f64| loop {
+        let mult = knots.iter().filter(|k| same(**k, t)).count();
+        if mult >= degree {
+            return;
+        }
+        let Some(k) = knots.iter().rposition(|x| *x <= t + 1e-12) else {
+            return;
+        };
+        let mut next = Vec::with_capacity(ctrl.len() + 1);
+        for i in 0..=ctrl.len() {
+            if i + degree <= k {
+                next.push(ctrl[i]);
+            } else if i + mult > k {
+                next.push(ctrl[i - 1]);
+            } else {
+                let a = (t - knots[i]) / (knots[i + degree] - knots[i]);
+                next.push(std::array::from_fn(|c| (1.0 - a) * ctrl[i - 1][c] + a * ctrl[i][c]));
+            }
+        }
+        ctrl = next;
+        knots.insert(k + 1, t);
+    };
+    insert(lo);
+    insert(hi);
+    // The domain clamped: an order-fold knot at each end, the poles that
+    // span it.
+    let first = knots.iter().position(|k| same(*k, lo)).unwrap_or(1).max(1);
+    let last = knots.iter().rposition(|k| same(*k, hi)).unwrap_or(knots.len() - 1);
+    let mut clamped = vec![lo];
+    clamped.extend_from_slice(&knots[first..=last]);
+    clamped.push(hi);
+    let poles: Vec<[f64; 3]> = ctrl
+        .iter()
+        .skip(first - 1)
+        .take(clamped.len() - order)
+        .copied()
+        .collect();
+    let knots = clamped;
+    DgnGeom::Spline {
+        degree,
+        knots,
+        poles,
+        closed: true,
     }
 }
 
@@ -554,19 +682,36 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
         [q[0], q[1]]
     };
     let mut collect = DgnCollector::default();
+    // An open B-spline curve: order, pole count, closure and its header.
+    let mut spline: Option<(usize, usize, bool, DgnElement)> = None;
     for (index, e) in run.iter().enumerate() {
+        // An element that is no component ends the complex elements still
+        // open.
+        if !is_component(e) {
+            collect.close();
+        }
         if e.len() < 104 || styles.hidden.contains(&u32_at(e, 12).unwrap_or(0)) {
             continue;
         }
         let color = styles.color(e);
-        // Colour and weight words: 0xFFFFFFFF takes the level's; line style
-        // 0x7FFFFFFF (or 0xFFFFFFFF).
+        // Colour and weight words: 0xFFFFFFFF takes the level's, 0xFFFFFFFE
+        // the enclosing cell's; line style 0x7FFFFFFF (or 0xFFFFFFFF) the
+        // level's, 0x7FFFFFFE the cell's.
         let element = |geom: DgnGeom| DgnElement {
             level: u32_at(e, 12).unwrap_or(0),
-            color: (u32_at(e, 52) != Some(u32::MAX)).then_some(color),
-            weight: u32_at(e, 48).filter(|w| *w != u32::MAX).map(|w| w & 31),
-            style: u32_at(e, 44).filter(|s| *s != u32::MAX && *s != 0x7FFF_FFFF),
+            color: styles.color_word(e),
+            weight: match u32_at(e, 48) {
+                None | Some(u32::MAX) => By::Level,
+                Some(0xFFFF_FFFE) => By::Cell,
+                Some(w) => By::Own(w & 31),
+            },
+            style: match u32_at(e, 44) {
+                None | Some(u32::MAX) | Some(0x7FFF_FFFF) => By::Level,
+                Some(0xFFFF_FFFE) | Some(0x7FFF_FFFE) => By::Cell,
+                Some(s) => By::Own(s),
+            },
             geom,
+            filled: matches!(kind(e), 6 | 14) && e.windows(4).any(|w| w == [0x07, 0x10, 0x41, 0x00]),
         };
         let stroke = Some((color, -1.0));
         let d3 = is_3d(e);
@@ -578,6 +723,9 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 if d3 { f64_at(e, at + 16)? } else { 0.0 },
             ])
         };
+        // A point or vector placed in the model (3D kept for the import).
+        let at3 = |p: [f64; 3]| xf_point(xf, p);
+        let dir3 = |v: [f64; 3]| xf_vector(xf, v);
         match kind(e) {
             // A text node: grouped when its count is followed by that many
             // text components.
@@ -587,7 +735,34 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                     parts.iter().all(|p| p.len() >= 104 && kind(p) == 17 && is_component(p))
                 });
                 if texts {
-                    collect.open(n, element(DgnGeom::TextNode(Vec::new())));
+                    // 2D: justification 118, origin 152 (the node's
+                    // justification point).
+                    let origin = (!d3).then(|| p3(152)).flatten().map(at3);
+                    collect.open(
+                        n,
+                        element(DgnGeom::TextNode {
+                            lines: Vec::new(),
+                            origin,
+                            just: if d3 { 0 } else { e.get(118).copied().unwrap_or(0) },
+                            line_spacing: None,
+                        }),
+                    );
+                }
+            }
+            // A cell (not shared): its components follow, flagged as such.
+            2 => {
+                let n = u32_at(e, 104).unwrap_or(0) as usize;
+                let parts = run
+                    .get(index + 1..index + 1 + n)
+                    .is_some_and(|parts| parts.iter().all(|p| is_component(p)));
+                if parts && n > 0 {
+                    collect.open(
+                        n,
+                        element(DgnGeom::CellGroup {
+                            name: marked_string(e, 104).unwrap_or_default(),
+                            parts: Vec::new(),
+                        }),
+                    );
                 }
             }
             12 | 14 => {
@@ -602,7 +777,7 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             }
             3 => {
                 if let (Some(a), Some(b)) = (p3(104), p3(if d3 { 128 } else { 120 })) {
-                    collect.push(element(DgnGeom::Line(plan(a), plan(b))));
+                    collect.push(element(DgnGeom::Line(at3(a), at3(b))));
                     push(
                         &mut raw,
                         &mut complex,
@@ -620,12 +795,10 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             4 | 6 | 11 => {
                 let n = u32_at(e, 104).unwrap_or(0) as usize;
                 let stride = if d3 { 24 } else { 16 };
-                let pts: Vec<[f64; 2]> = (0..n)
-                    .filter_map(|k| p3(112 + k * stride))
-                    .map(plan)
-                    .collect();
+                let pts3: Vec<[f64; 3]> = (0..n).filter_map(|k| p3(112 + k * stride)).collect();
+                let pts: Vec<[f64; 2]> = pts3.iter().map(|p| plan(*p)).collect();
                 if pts.len() >= 2 {
-                    collect.push(element(DgnGeom::Points(pts.clone())));
+                    collect.push(element(DgnGeom::Points(pts3.iter().map(|p| at3(*p)).collect())));
                     let mut pb = PathBuilder::default();
                     pb.move_to(pts[0]);
                     for p in &pts[1..] {
@@ -702,11 +875,11 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 };
                 let closed = sweep.abs() >= std::f64::consts::TAU - 1e-9;
                 {
-                    let (pu, pv) = (axis(u), axis(v));
+                    let (du, dv) = (dir3(u), dir3(v));
                     collect.push(element(DgnGeom::Arc {
-                        center: plan(c),
-                        u: [a * pu[0], a * pu[1]],
-                        v: [b * pv[0], b * pv[1]],
+                        center: at3(c),
+                        u: du.map(|x| a * x),
+                        v: dv.map(|x| b * x),
                         start,
                         sweep,
                     }));
@@ -726,7 +899,8 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             }
             17 => {
                 // 3D: width 112, height 120, quaternion 144, origin 176, the
-                // characters after the string marker. 2D: angle 144, origin
+                // characters after the string marker, as many as the byte
+                // count at 110 holds. 2D: angle 144, origin
                 // 152, a byte count (with its 4-byte marker) at 110 and the
                 // characters from 174.
                 let placed = if d3 {
@@ -736,7 +910,18 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                             f64_at(e, 120)?,
                             quat_axes(e, 144)?,
                             p3(176)?,
-                            marked_string(e, 200)?,
+                            // The byte count at 110 (with the 4-byte marker)
+                            // ends the characters.
+                            {
+                                let count =
+                                    u16::from_le_bytes(e.get(110..112)?.try_into().ok()?) as usize;
+                                let mark = e
+                                    .get(200..)?
+                                    .windows(4)
+                                    .position(|w| w == [0xff, 0xfe, 0x01, 0x00])?
+                                    + 200;
+                                marked_string(&e[..(mark + count.max(4)).min(e.len())], mark)?
+                            },
                         ))
                     })()
                 } else {
@@ -758,6 +943,16 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 let Some((width, height, (u, v), origin, text)) = placed else {
                     continue;
                 };
+                // 2D: the justification (108) and the length of the text box
+                // along the baseline (128).
+                let (just, length) = if d3 {
+                    (2, 0.0)
+                } else {
+                    (
+                        e.get(108).copied().unwrap_or(2),
+                        f64_at(e, 128).filter(|l| l.is_finite()).unwrap_or(0.0),
+                    )
+                };
                 // The text's axes as the plan shows them: its baseline sets the
                 // angle, and each axis's plan length scales its size.
                 let (pu, pv) = (axis(u), axis(v));
@@ -769,11 +964,14 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 let width_factor = if height > 0.0 { width / height } else { 1.0 };
                 collect.push(element(DgnGeom::Text {
                     text: text.clone(),
-                    origin: plan(origin),
+                    origin: at3(origin),
                     height,
                     width_factor,
+                    length: length * su,
                     rotation: pu[1].atan2(pu[0]),
+                    just,
                     font: None,
+                    style: text_style_id(e),
                 }));
                 raw.texts.push(Text {
                     text,
@@ -804,13 +1002,65 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 collect.push(element(DgnGeom::Cell {
                     name: name.clone(),
                     m: [m[0], m[1], m[3], m[4]],
-                    origin: [o[0], o[1]],
+                    origin: o,
                     z_scale: m[8],
                 }));
                 raw.instances.push(Instance {
                     name: name.to_ascii_uppercase(),
                     xf: xf_compose(xf, &local),
                 });
+            }
+            27 => {
+                // B-spline curve header: order and closure in the word at
+                // 108, pole count 112; its poles follow (type 21).
+                let Some(&[lo, hi]) = e.get(108..110) else {
+                    continue;
+                };
+                let flags = u16::from_le_bytes([lo, hi]);
+                // A curve before it that never got its poles still takes
+                // its place in an open cell.
+                let unread = spline.replace((
+                    ((flags & 0x0f) + 2) as usize,
+                    u32_at(e, 112).unwrap_or(0) as usize,
+                    flags & 0x0180 != 0,
+                    element(DgnGeom::Chain(Vec::new())),
+                ));
+                if unread.is_some() {
+                    collect.skip();
+                }
+            }
+            21 => {
+                let n = u32_at(e, 104).unwrap_or(0) as usize;
+                let stride = if d3 { 24 } else { 16 };
+                let poles: Vec<[f64; 3]> = (0..n).filter_map(|k| p3(112 + k * stride)).collect();
+                if let Some((order, count, closed, header)) = spline.take() {
+                    if poles.len() == count && count >= order && order >= 2 {
+                        let poles: Vec<[f64; 3]> = poles.iter().map(|p| at3(*p)).collect();
+                        let geom = bspline_geom(order, poles, closed);
+                        if let DgnGeom::Spline { degree, knots, poles, .. } = &geom {
+                            let plan_poles: Vec<[f64; 2]> =
+                                poles.iter().map(|p| [p[0], p[1]]).collect();
+                            let pts = bspline_points(degree + 1, &plan_poles, knots, 24 * count);
+                            let mut pb = PathBuilder::default();
+                            pb.move_to(pts[0]);
+                            for p in &pts[1..] {
+                                pb.line_to(*p);
+                            }
+                            push(
+                                &mut raw,
+                                &mut complex,
+                                Path {
+                                    subpaths: pb.finish(),
+                                    stroke,
+                                    fill: None,
+                                },
+                            );
+                        }
+                        collect.push(DgnElement { geom, ..header });
+                    } else {
+                        collect.skip();
+                    }
+                }
             }
             _ => {}
         }
@@ -925,6 +1175,11 @@ fn units(header: &[u8]) -> (f64, f64) {
     (master, sub)
 }
 
+/// How many bytes the streams of one file may inflate to in all.
+fn inflate_budget(cfb: &Cfb) -> usize {
+    cfb.b.len().saturating_mul(64).max(256 << 20)
+}
+
 /// Models of the file: (name, graphic stream, header stream).
 fn models(cfb: &Cfb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let streams = cfb.streams();
@@ -939,7 +1194,7 @@ fn models(cfb: &Cfb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     // scales with the file (×64 covers any real compression ratio, so
     // legitimate files never trip it) with a 256 MiB floor for small ones;
     // models past the budget are dropped, the earlier ones still load.
-    let total_limit = cfb.b.len().saturating_mul(64).max(256 << 20);
+    let total_limit = inflate_budget(cfb);
     let mut total = 0usize;
     let mut out = Vec::new();
     for dir in dirs {
@@ -983,12 +1238,14 @@ fn level_table(nm: &[&[u8]]) -> Vec<(u32, String, u32)> {
     out
 }
 
-/// The level table with the file's own names.
+/// The level table with the file's own names: the first one (the file's;
+/// a later level table holds a reference attachment's levels).
 fn level_table_raw(nm: &[&[u8]]) -> Vec<(u32, String, u32)> {
     let mut out = Vec::new();
     let mut in_levels = false;
     for e in nm {
         match kind(e) {
+            96 if u32_at(e, 12) == Some(1) && !out.is_empty() => break,
             96 => in_levels = u32_at(e, 12) == Some(1),
             95 if in_levels && e.len() >= 80 => {
                 let (Some(id), Some(color)) = (u32_at(e, 32), u32_at(e, 72)) else {
@@ -1153,16 +1410,114 @@ fn unit_name(metres: f64) -> String {
         .unwrap_or_default()
 }
 
+/// A design model (not a sheet): the model type byte of its header (4105)
+/// is 2 for a sheet.
+fn is_design(header: &[u8]) -> bool {
+    header.get(4105) != Some(&2)
+}
+
+/// The models DGNIMPORT offers: the design models (sheets are not
+/// imported).
+pub fn design_model_names(bytes: &[u8]) -> Option<Vec<String>> {
+    let cfb = Cfb::open(bytes)?;
+    let names: Vec<String> = models(&cfb)
+        .into_iter()
+        .filter(|m| is_design(&m.2))
+        .map(|m| m.0)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// The control stream (Dgn^C) of model `k` in the order `models` lists
+/// them, inflated within what is left of the file's budget (`used` bytes
+/// are taken by the models already read).
+fn control_stream(cfb: &Cfb, k: usize, used: usize) -> Vec<u8> {
+    let streams = cfb.streams();
+    let mut dirs: Vec<&str> = streams
+        .iter()
+        .filter_map(|(p, _)| p.strip_suffix("/Dgn^G/$1"))
+        .collect();
+    dirs.sort();
+    let Some(dir) = dirs.get(k) else {
+        return Vec::new();
+    };
+    let left = inflate_budget(cfb).saturating_sub(used) as u64;
+    if left == 0 {
+        return Vec::new();
+    }
+    streams
+        .iter()
+        .find(|(p, _)| *p == format!("{dir}/Dgn^C/$1"))
+        .map(|(_, e)| inflate_at_most(&cfb.stream(e), left.min(STREAM_LIMIT)))
+        .unwrap_or_default()
+}
+
+/// Every string of an element stored after the "ff fe 01 00" marker, with
+/// the subtype of the string linkage before it (2 file name, 3 full path,
+/// 4 logical name).
+fn linked_strings(e: &[u8]) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = e
+        .get(from..)
+        .and_then(|rest| rest.windows(4).position(|w| w == [0xff, 0xfe, 0x01, 0x00]))
+    {
+        let at = from + i;
+        let end = e[at + 4..]
+            .iter()
+            .position(|&c| c == 0 || c < 0x20)
+            .map(|n| at + 4 + n)
+            .unwrap_or(e.len());
+        let subtype = at.checked_sub(8).and_then(|p| u32_at(e, p)).unwrap_or(0);
+        out.push((subtype, String::from_utf8_lossy(&e[at + 4..end]).to_string()));
+        from = end.max(at + 4);
+    }
+    out
+}
+
+/// The reference attachments (type 100) of a model's control stream: the
+/// file (full path, else file name), origin 192, rotation rows from 216,
+/// scale 288, in UORs of the model.
+fn references(control: &[u8]) -> Vec<DgnReference> {
+    elements(control)
+        .into_iter()
+        .filter(|e| kind(e) == 100 && e.len() >= 296)
+        .filter_map(|e| {
+            let strings = linked_strings(e);
+            let file = strings
+                .iter()
+                .find(|s| s.0 == 3)
+                .or_else(|| strings.iter().find(|s| s.0 == 2))?
+                .1
+                .clone();
+            Some(DgnReference {
+                file,
+                model: strings
+                    .iter()
+                    .find(|s| s.0 == 1)
+                    .map(|s| s.1.clone())
+                    .unwrap_or_default(),
+                origin: [f64_at(e, 192)?, f64_at(e, 200)?, f64_at(e, 208)?],
+                scale: f64_at(e, 288).filter(|s| *s > 0.0).unwrap_or(1.0),
+                rotation: f64_at(e, 240)?.atan2(f64_at(e, 216)?),
+            })
+        })
+        .collect()
+}
+
 /// The named model element by element (DGNIMPORT): in master units with
 /// the global origin at 0,0, shared cell definitions in master units, and
 /// every level by id with its own name and colour.
 pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
     let cfb = Cfb::open(bytes)?;
     let all = models(&cfb);
-    let (_, graphics, header) = all
+    let designs: Vec<usize> = (0..all.len()).filter(|k| is_design(&all[*k].2)).collect();
+    let k = designs
         .iter()
-        .find(|m| m.0.eq_ignore_ascii_case(name))
-        .or_else(|| all.first())?;
+        .copied()
+        .find(|k| all[*k].0.eq_ignore_ascii_case(name))
+        .or_else(|| designs.first().copied())?;
+    let (_, graphics, header) = &all[k];
     let non_model = non_model(&cfb);
     let nm = elements(&non_model);
     let colors = nm
@@ -1184,6 +1539,7 @@ pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
             (*id, (name.clone(), rgb))
         })
         .collect();
+    let level_order = table.iter().map(|l| l.0).collect();
     let (per_unit, sub_uor) = units(header);
     let s = 1.0 / per_unit;
     let mut cells = Vec::new();
@@ -1195,8 +1551,12 @@ pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
             while j < nm.len() && is_component(nm[j]) {
                 j += 1;
             }
-            let def = read_run(&nm[i + 1..j], &styles, &IDENTITY).elements;
-            cells.push((cell, scaled_elements(&def, s, [0.0, 0.0])));
+            // The cell that draws points belongs to the writing program,
+            // not to the drawing: it is left out.
+            if !cell.eq_ignore_ascii_case("POINT_DISPLAY") {
+                let def = read_run(&nm[i + 1..j], &styles, &IDENTITY).elements;
+                cells.push((cell, scaled_elements(&def, s, [0.0, 0.0])));
+            }
             i = j;
         } else {
             i += 1;
@@ -1210,13 +1570,28 @@ pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
         (Some(n), Some(d)) if n > 0.0 && d > 0.0 => unit_name(d / n),
         _ => String::new(),
     };
+    let used = all.iter().map(|m| m.1.len() + m.2.len()).sum();
+    let references = references(&control_stream(&cfb, k, used))
+        .into_iter()
+        .map(|r| DgnReference {
+            origin: [
+                (r.origin[0] - origin[0]) * s,
+                (r.origin[1] - origin[1]) * s,
+                r.origin[2] * s,
+            ],
+            ..r
+        })
+        .collect();
     Some(DgnImport {
         elements: scaled_elements(&raw.elements, s, [-origin[0] * s, -origin[1] * s]),
         cells,
         levels,
+        level_order,
         sub_per_master: per_unit / sub_uor,
         unit_names: (metres(4180), metres(4196)),
         v7: false,
+        references,
+        text_styles: text_style_table(&nm),
     })
 }
 

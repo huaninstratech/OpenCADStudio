@@ -258,7 +258,7 @@ impl ArcLengthDimensionCommand {
             |handle| DimensionAssociationInput::Explicit(selection.association_sources(handle)),
         );
         CmdResult::CommitDimension {
-            entity: plane.place_entity(EntityType::Dimension(Dimension::Arc(dimension))),
+            entity: plane.place_entity(EntityType::Dimension(Box::new(Dimension::Arc(dimension)))),
             association,
             preserve_base_style: false,
             continue_command: false,

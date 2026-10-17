@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport.twist_angle = std::f64::consts::FRAC_PI_2;
         viewport.view_target = Vector3::new(5.0, 10.0, 0.0);
     }
-    document.add_entity_to_layout(EntityType::Viewport(viewport), "Sheet")?;
+    document.add_entity_to_layout(EntityType::Viewport(Box::new(viewport)), "Sheet")?;
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)

@@ -747,7 +747,7 @@ fn tessellate_sub_local(
     // Sanity guard: skip sub-entities whose primary dimension is so large
     // that adaptive tessellation will explode into hundreds of millions
     // of points. These are typically corrupt-radius primitives that slipped
-    // past purge_corrupt_entities (finite but absurd values).
+    // past the codec's unusable-geometry audit (finite but absurd values).
     if is_unreasonable_extent(sub) {
         return vec![];
     }

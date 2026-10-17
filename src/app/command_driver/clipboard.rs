@@ -301,10 +301,13 @@ impl OpenCADStudio {
             return;
         }
         let blocks = self.clipboard_deps.blocks.clone();
+        let document = &mut self.tabs[i].scene.document;
+        merge_app_ids(document, &self.clipboard_deps);
+        let apps = eed_app_map(document, &self.clipboard_deps);
         // Single shared copy — see `merge_block_defs`. One batched geometry
         // rebuild instead of one per definition; same end state as the
         // per-definition bumps `Scene::define_block_raw` used to run.
-        if merge_block_defs(&mut self.tabs[i].scene.document, &blocks) > 0 {
+        if merge_block_defs(document, &blocks, &apps) > 0 {
             self.tabs[i].scene.bump_geometry();
         }
     }
@@ -515,6 +518,51 @@ pub(crate) fn merge_table_records(doc: &mut codec::CadDocument, deps: &crate::ap
             let _ = doc.dim_styles.add(r);
         }
     }
+    merge_app_ids(doc, deps);
+}
+
+/// Register the copied XDATA's applications this drawing lacks.
+pub(crate) fn merge_app_ids(doc: &mut codec::CadDocument, deps: &crate::app::ClipboardDeps) {
+    for rec in &deps.app_ids {
+        if !doc.app_ids.contains(&rec.name) {
+            let mut r = rec.clone();
+            r.handle = doc.allocate_handle();
+            let _ = doc.app_ids.add(r);
+        }
+    }
+}
+
+/// Source APPID handle → this drawing's APPID of the same name, for the
+/// copied XDATA. Run after [`merge_app_ids`].
+pub(crate) fn eed_app_map(
+    doc: &codec::CadDocument,
+    deps: &crate::app::ClipboardDeps,
+) -> rustc_hash::FxHashMap<u64, u64> {
+    deps.app_ids
+        .iter()
+        .filter_map(|a| Some((a.handle.value(), doc.app_ids.get(&a.name)?.handle.value())))
+        .collect()
+}
+
+/// Re-point a copied entity's verbatim EED at this drawing's APPIDs. A block
+/// whose application the map does not know names no APPID here, and a DWG
+/// carrying one is rejected outright by the reference program, so it goes.
+pub(crate) fn remap_eed_apps(entity: &mut codec::EntityType, apps: &rustc_hash::FxHashMap<u64, u64>) {
+    let remap = |xdata: &mut codec::xdata::ExtendedData| {
+        xdata.raw_dwg_eed.retain_mut(|(app, _)| match apps.get(app) {
+            Some(&target) => {
+                *app = target;
+                true
+            }
+            None => false,
+        });
+    };
+    remap(&mut entity.common_mut().extended_data);
+    if let codec::EntityType::Insert(insert) = entity {
+        for attribute in &mut insert.attributes {
+            remap(&mut attribute.common.extended_data);
+        }
+    }
 }
 
 /// Recreate block definitions the pasted INSERTs reference but the target
@@ -524,11 +572,16 @@ pub(crate) fn merge_table_records(doc: &mut codec::CadDocument, deps: &crate::ap
 pub(crate) fn merge_block_defs(
     doc: &mut codec::CadDocument,
     blocks: &[crate::app::BlockDef],
+    apps: &rustc_hash::FxHashMap<u64, u64>,
 ) -> usize {
     let mut created = Vec::new();
     for def in blocks {
         let before = doc.block_records.len();
-        define_block_raw_doc(doc, &def.name, def.base_point, &def.entities);
+        let mut entities = def.entities.clone();
+        for entity in &mut entities {
+            remap_eed_apps(entity, apps);
+        }
+        define_block_raw_doc(doc, &def.name, def.base_point, &entities);
         if doc.block_records.len() > before {
             created.push(def);
         }
@@ -605,12 +658,14 @@ pub(crate) fn paste_entities_kernel(
     // missing records with fresh handles from the target document.
     merge_table_records(doc, deps);
     // Shared block-definition merge (also used by `merge_clipboard_blocks`).
-    merge_block_defs(doc, &deps.blocks);
+    let apps = eed_app_map(doc, deps);
+    merge_block_defs(doc, &deps.blocks, &apps);
 
     let by_index: Vec<Handle> = entities
         .iter()
         .cloned()
         .map(|mut entity| {
+            remap_eed_apps(&mut entity, &apps);
             let picture_placement = crate::scene::render_graph::dim_picture_placement(&entity);
             if let Some(t) = translate {
                 crate::scene::view::dispatch::apply_transform(&mut entity, t);
@@ -1350,7 +1405,7 @@ mod paste_entities_kernel_tests {
     fn remaps_leader_annotation_link_to_pasted_handles() {
         let mut seed = codec::CadDocument::new();
         let note = seed
-            .add_entity(codec::EntityType::MText(codec::entities::MText::new()))
+            .add_entity(codec::EntityType::MText(Box::new(codec::entities::MText::new())))
             .unwrap();
         let mut leader = codec::entities::Leader::default();
         leader.annotation_handle = note;

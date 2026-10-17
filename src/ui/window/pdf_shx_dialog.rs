@@ -75,10 +75,13 @@ impl ShxSettingsState {
         let Some(font) = self.settings.fonts.get(self.selected) else {
             return;
         };
-        let spec = crate::modules::insert::pdf_shx_text::resolve_font(
+        // A font that is not available has nothing to show.
+        let Some(spec) = crate::modules::insert::pdf_shx_text::resolve_font(
             &font.name,
             self.drawing.as_deref(),
-        );
+        ) else {
+            return;
+        };
         let (strokes, _) = crate::scene::text::lff::tessellate_text_ex(
             [0.0, 0.0],
             9.0,

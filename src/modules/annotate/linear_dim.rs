@@ -141,7 +141,7 @@ pub(crate) fn linear_dimension_entity(
     crate::entities::dimension::reset_automatic_text_position(&mut dim.base);
     dim.base.actual_measurement = dim.measurement();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
-    EntityType::Dimension(Dimension::Linear(dim))
+    EntityType::Dimension(Box::new(Dimension::Linear(dim)))
 }
 
 impl CadCommand for LinearDimensionCommand {

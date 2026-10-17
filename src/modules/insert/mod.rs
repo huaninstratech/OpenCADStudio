@@ -9,6 +9,7 @@ mod content_browser;
 pub(crate) mod create_block;
 mod design_center;
 pub(crate) mod dgn_import;
+pub(crate) mod tds_import;
 pub(crate) mod edit_block;
 mod ifc_data;
 mod landxml;

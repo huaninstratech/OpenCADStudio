@@ -75,7 +75,7 @@ fn block_internal_hatch_reaches_export() {
 
     // A blue hatch, wrapped into a block and inserted in model space — the
     // minimal shape of "coloured fill nested in a block".
-    let h = scene.add_entity(EntityType::Hatch(square_hatch(5)));
+    let h = scene.add_entity(EntityType::Hatch(Box::new(square_hatch(5))));
     let identity = codec::types::Transform::identity();
     scene
         .create_block_from_entities(&[h], "LOGO", &identity, &identity)
@@ -100,7 +100,7 @@ fn block_internal_hatch_reaches_export() {
 fn pattern_hatch_uses_stored_line_spacing() {
     let mut scene = Scene::new();
     // Spacing 0.5; a big pattern_scale (10) that the catalog path would apply.
-    scene.add_entity(EntityType::Hatch(ansi31_stored(0.5, 10.0)));
+    scene.add_entity(EntityType::Hatch(Box::new(ansi31_stored(0.5, 10.0))));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();
@@ -143,7 +143,7 @@ fn far_from_origin_pattern_hatch_still_fills() {
     // the perpendicular index is |k| ≈ 4000·sin45°/0.3 ≈ 9400, well past the
     // 4096 clamp on both ends; the old absolute-index clamp inverts the range
     // (k_lo > k_hi) there and emits nothing.
-    scene.add_entity(EntityType::Hatch(ansi31_stored_at(0.3, 1.0, 4000.0, 0.0)));
+    scene.add_entity(EntityType::Hatch(Box::new(ansi31_stored_at(0.3, 1.0, 4000.0, 0.0))));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();
@@ -188,7 +188,7 @@ fn textbox_boundary_path_is_not_filled() {
     let mut tb = rect_path(0.0, 0.0, 200.0, 50.0);
     tb.flags = BoundaryPathFlags::from_bits(8 | 1); // TEXTBOX + EXTERNAL
     hatch.paths.push(tb);
-    scene.add_entity(EntityType::Hatch(hatch));
+    scene.add_entity(EntityType::Hatch(Box::new(hatch)));
     scene.populate_hatches_from_document();
 
     let hatches = scene.paper_plot_hatches();

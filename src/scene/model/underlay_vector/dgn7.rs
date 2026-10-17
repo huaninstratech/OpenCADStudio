@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use super::model::{
-    arc_cubics, bspline_points, dgn_color_table, paths_bounds, scaled_elements, DgnCollector,
-    DgnElement, DgnGeom, DgnImport, Path, PathBuilder, Segment, Sheet, SubPath, Text,
+    arc_cubics, bspline_points, dgn_color_table, paths_bounds, scaled_elements, By, DgnCollector,
+    DgnColor, DgnElement, DgnGeom, DgnImport, Path, PathBuilder, Segment, Sheet, SubPath, Text,
     DGN_DEFAULT_COLORS,
 };
 
@@ -47,6 +47,42 @@ fn vax_double(b: &[u8], at: usize) -> Option<f64> {
 /// The file is a V7 design file: it opens with a design file header.
 pub fn is_v7(bytes: &[u8]) -> bool {
     bytes.len() > 1256 && (bytes[1] & 0x7f) == 9 && (bytes[0] & 0x3f) == 8
+}
+
+/// A 3D design file: the header element's 3D flag. Its points have a z,
+/// and planar elements carry their plane as a quaternion.
+fn is_3d(bytes: &[u8]) -> bool {
+    bytes[0] & 0x40 != 0
+}
+
+/// The rows of the rotation a 3D element's quaternion (w, x, y, z as
+/// signed 1.31 fractions) stands for: the element's own x, y and z axes.
+fn quaternion_axes(e: &[u8], at: usize) -> Option<[[f64; 3]; 3]> {
+    let q = |k: usize| int32(e, at + 4 * k).map(|v| v as f64 / 2_147_483_648.0);
+    let (w, x, y, z) = (q(0)?, q(1)?, q(2)?, q(3)?);
+    // The rotation matrix's columns are the axes.
+    let m = [
+        [x * x - y * y - z * z + w * w, 2.0 * (z * w + x * y), 2.0 * (x * z - y * w)],
+        [2.0 * (x * y - z * w), -x * x + y * y - z * z + w * w, 2.0 * (x * w + y * z)],
+        [2.0 * (x * z + y * w), 2.0 * (y * z - x * w), -x * x - y * y + z * z + w * w],
+    ];
+    Some([0, 1, 2].map(|c| [m[0][c], m[1][c], m[2][c]]))
+}
+
+/// A cell name in Radix-50: two words of three characters each.
+fn radix50(e: &[u8], at: usize) -> String {
+    const SET: &[u8] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ$.?0123456789";
+    let mut name = String::new();
+    for k in 0..2 {
+        let Some(mut word) = uint16(e, at + 2 * k).map(usize::from) else { break };
+        let mut chars = [0u8; 3];
+        for c in chars.iter_mut().rev() {
+            *c = SET.get(word % 40).copied().unwrap_or(b' ');
+            word /= 40;
+        }
+        name.extend(chars.iter().map(|c| char::from(*c)));
+    }
+    name.trim().to_string()
 }
 
 struct Units {
@@ -136,11 +172,18 @@ struct Instance {
     origin: [f64; 2],
 }
 
+/// How deep cells inside cells are read.
+const MAX_CELL_DEPTH: usize = 16;
+
 /// Reads a run of elements into raw geometry: plain elements, complex
-/// chains and shapes (joined), B-splines, text and shared cell instances.
-fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
+/// chains and shapes (joined), B-splines, text, cells and shared cell
+/// instances. In a 3D file (`d3`) points have a z and planar elements their
+/// plane; the drawn geometry is their plan.
+fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
     let mut raw = Raw::default();
-    let mut spline: Option<(usize, usize, [u8; 3], f64)> = None;
+    // An open B-spline curve: order, pole count, colour, closed, and the
+    // header as the element it imports as.
+    let mut spline: Option<(usize, usize, [u8; 3], bool, DgnElement)> = None;
     let mut knots: Vec<f64> = Vec::new();
     // A complex shape or chain collects its components into one path.
     let mut complex: Option<(
@@ -203,31 +246,82 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
         }
     };
     let mut collect = DgnCollector::default();
-    for e in run {
+    let mut index = 0;
+    while index < run.len() {
+        let e = run[index];
+        index += 1;
         let kind = e[1] & 0x7f;
         if e[1] & 0x80 != 0 || e.len() < 36 {
             continue;
+        }
+        // An element that is no component ends the complex elements still
+        // open.
+        if e[0] & 0x80 == 0 {
+            collect.close();
         }
         let symbology = uint16(e, 34).unwrap_or(0);
         let color = colors[(symbology >> 8) as usize];
         let element = |geom: DgnGeom| DgnElement {
             level: level(e) as u32,
-            color: Some(color),
-            weight: Some(((symbology >> 3) & 31) as u32),
-            style: Some((symbology & 7) as u32),
+            color: By::Own(DgnColor {
+                index: (symbology >> 8) as u32,
+                table: color,
+                rgb: color,
+            }),
+            weight: By::Own(((symbology >> 3) & 31) as u32),
+            style: By::Own((symbology & 7) as u32),
             geom,
+            filled: fill_index(e).is_some(),
         };
         // One pixel wide, as V8 models draw: the element weight is a
         // lineweight, not shown while lineweights are off.
         let stroke = Some((color, -1.0));
         let fill = fill_index(e).map(|i| colors[i as usize]);
-        let int_pt =
-            |i: usize| -> Option<[f64; 2]> { Some([int32(e, i)? as f64, int32(e, i + 4)? as f64]) };
+        // A point as the file holds it: two whole UORs, or three in 3D.
+        let pt3 = |i: usize| -> Option<[f64; 3]> {
+            Some([
+                int32(e, i)? as f64,
+                int32(e, i + 4)? as f64,
+                if d3 { int32(e, i + 8)? as f64 } else { 0.0 },
+            ])
+        };
+        let plan = |p: [f64; 3]| [p[0], p[1]];
+        let step = if d3 { 12 } else { 8 };
         match kind {
-            // A text node: its count of text components.
+            // A cell: its components follow as complex elements, as many as
+            // its total length (36, the words after its first 38 bytes)
+            // covers; they are already placed, so the cell keeps them as
+            // they are. Nesting past `MAX_CELL_DEPTH` is left out.
+            2 => {
+                let total = 38 + uint16(e, 36).unwrap_or(0) as usize * 2;
+                let mut left = total.saturating_sub(e.len());
+                let start = index;
+                while left > 0 && index < run.len() && run[index][0] & 0x80 != 0 {
+                    left = left.saturating_sub(run[index].len());
+                    index += 1;
+                }
+                if depth >= MAX_CELL_DEPTH {
+                    continue;
+                }
+                let inner = read_run(&run[start..index], colors, d3, depth + 1);
+                raw.paths.extend(inner.paths);
+                raw.texts.extend(inner.texts);
+                raw.instances.extend(inner.instances);
+                collect.push(element(DgnGeom::CellGroup {
+                    name: radix50(e, 38),
+                    parts: inner.elements,
+                }));
+            }
+            // A text node: its count of text components, justification
+            // (45), line spacing (46) and origin (62, or 74 in 3D).
             7 => collect.open(
                 uint16(e, 38).unwrap_or(0) as usize,
-                element(DgnGeom::TextNode(Vec::new())),
+                element(DgnGeom::TextNode {
+                    lines: Vec::new(),
+                    origin: pt3(if d3 { 74 } else { 62 }),
+                    just: e.get(45).copied().unwrap_or(0),
+                    line_spacing: int32(e, 46).map(|v| v as f64),
+                }),
             ),
             12 | 14 => {
                 let n = uint16(e, 38).unwrap_or(0) as usize;
@@ -243,8 +337,9 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                 }
             }
             3 => {
-                if let (Some(a), Some(b)) = (int_pt(36), int_pt(44)) {
-                    collect.push(element(DgnGeom::Line(a, b)));
+                if let (Some(a3), Some(b3)) = (pt3(36), pt3(36 + step)) {
+                    let (a, b) = (plan(a3), plan(b3));
+                    collect.push(element(DgnGeom::Line(a3, b3)));
                     push(
                         &mut raw,
                         &mut complex,
@@ -261,15 +356,79 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
             }
             4 | 6 | 11 => {
                 let n = uint16(e, 36).unwrap_or(0) as usize;
-                let pts: Vec<[f64; 2]> = (0..n).filter_map(|k| int_pt(38 + k * 8)).collect();
+                let pts3: Vec<[f64; 3]> = (0..n).filter_map(|k| pt3(38 + k * step)).collect();
+                let pts: Vec<[f64; 2]> = pts3.iter().map(|p| plan(*p)).collect();
                 if pts.len() >= 2 {
-                    collect.push(element(DgnGeom::Points(pts.clone())));
+                    collect.push(element(DgnGeom::Points(pts3)));
                     push(
                         &mut raw,
                         &mut complex,
                         polyline(&pts, kind == 6, stroke, if kind == 6 { fill } else { None }),
                     );
                 }
+            }
+            // 3D ellipses and arcs: the axes from the quaternion (52 or
+            // 60), the centre as three doubles after it.
+            15 | 16 if d3 => {
+                let at = if kind == 15 { 36 } else { 44 };
+                let q = at + 16;
+                let (Some(a), Some(b), Some(axes), Some(cx), Some(cy), Some(cz)) = (
+                    vax_double(e, at),
+                    vax_double(e, at + 8),
+                    quaternion_axes(e, q),
+                    vax_double(e, q + 16),
+                    vax_double(e, q + 24),
+                    vax_double(e, q + 32),
+                ) else {
+                    continue;
+                };
+                let (start, sweep) = if kind == 15 {
+                    (0.0, 360.0)
+                } else {
+                    let (Some(st), Some(sw)) = (int32(e, 36), int32(e, 40)) else { continue };
+                    let sw = sw as u32;
+                    let mut sweep = if sw & 0x8000_0000 != 0 {
+                        -((sw & 0x7fff_ffff) as f64)
+                    } else {
+                        sw as f64
+                    } / 360000.0;
+                    if sweep == 0.0 {
+                        sweep = 360.0;
+                    }
+                    (st as f64 / 360000.0, sweep)
+                };
+                let [x, y, _] = axes;
+                collect.push(element(DgnGeom::Arc {
+                    center: [cx, cy, cz],
+                    u: x.map(|c| c * a),
+                    v: y.map(|c| c * b),
+                    start: start.to_radians(),
+                    sweep: sweep.to_radians(),
+                }));
+                let pieces = arc_cubics(
+                    [cx, cy],
+                    a,
+                    b,
+                    x[1].atan2(x[0]),
+                    start.to_radians(),
+                    sweep.to_radians(),
+                );
+                let closed = sweep.abs() >= 360.0;
+                push(
+                    &mut raw,
+                    &mut complex,
+                    Path {
+                        subpaths: vec![SubPath {
+                            segments: pieces
+                                .into_iter()
+                                .map(|[a, b, c, d]| Segment::Cubic(a, b, c, d))
+                                .collect(),
+                            closed,
+                        }],
+                        stroke,
+                        fill: if closed { fill } else { None },
+                    },
+                );
             }
             15 | 16 => {
                 let arc = if kind == 15 {
@@ -312,9 +471,9 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                 let turn = (r as f64 / 360000.0).to_radians();
                 let (c, s) = (turn.cos(), turn.sin());
                 collect.push(element(DgnGeom::Arc {
-                    center: [ox, oy],
-                    u: [a * c, a * s],
-                    v: [-b * s, b * c],
+                    center: [ox, oy, 0.0],
+                    u: [a * c, a * s, 0.0],
+                    v: [-b * s, b * c, 0.0],
                     start: start.to_radians(),
                     sweep: sweep.to_radians(),
                 }));
@@ -344,16 +503,30 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                 );
             }
             17 => {
-                let (Some(width), Some(height), Some(rotation), Some(origin)) =
-                    (int32(e, 38), int32(e, 42), int32(e, 46), int_pt(50))
+                // 2D: rotation (46), origin (50), count (58), characters
+                // (60); 3D: quaternion (46), origin (62), count (74),
+                // characters (76).
+                let rotation = if d3 {
+                    quaternion_axes(e, 46).map(|[x, _, _]| (x[1].atan2(x[0]).to_degrees() * 360000.0).round() as i32)
+                } else {
+                    int32(e, 46)
+                };
+                let (origin_at, count_at) = if d3 { (62, 74) } else { (50, 58) };
+                let (Some(width), Some(height), Some(rotation), Some(origin3)) =
+                    (int32(e, 38), int32(e, 42), rotation, pt3(origin_at))
                 else {
                     continue;
                 };
-                let n = e.get(58).copied().unwrap_or(0) as usize;
-                let Some(chars) = e.get(60..60 + n) else {
+                let origin = plan(origin3);
+                let n = e.get(count_at).copied().unwrap_or(0) as usize;
+                let Some(chars) = e.get(count_at + 2..count_at + 2 + n) else {
                     continue;
                 };
-                let (height, width) = (height as f64 * 6.0 / 1000.0, width as f64 * 6.0 / 1000.0);
+                // Sizes in whole UORs (the multipliers are 1000/6 of one).
+                let (height, width) = (
+                    (height as f64 * 6.0 / 1000.0).round(),
+                    (width as f64 * 6.0 / 1000.0).round(),
+                );
                 let text = Text {
                     text: String::from_utf8_lossy(chars)
                         .trim_end_matches('\0')
@@ -365,26 +538,36 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                     color,
                     font: "txt".to_string(),
                 };
+                // A V7 font is drawn monospaced: the text is as long as its
+                // characters times their width.
                 collect.push(element(DgnGeom::Text {
                     text: text.text.clone(),
-                    origin,
+                    origin: origin3,
                     height,
                     width_factor: text.width_factor,
+                    length: text.text.chars().count() as f64 * width,
                     rotation: text.rotation,
+                    just: e[37],
                     font: Some(e[36] as u32),
+                    style: None,
                 }));
                 raw.texts.push(text);
             }
             27 => {
-                // B-spline curve header: order, pole count.
-                let order = ((e.get(40).copied().unwrap_or(0) & 0x0f) + 2) as usize;
+                // B-spline curve header: order and closure (40), pole count
+                // (42), knot count (44); the curve imports with the header's
+                // level and symbology.
+                let flags = e.get(40).copied().unwrap_or(0);
+                let order = ((flags & 0x0f) + 2) as usize;
                 let poles = uint16(e, 42).unwrap_or(0) as usize;
-                spline = Some((order, poles, color, -1.0));
-                knots.clear();
+                let header = element(DgnGeom::Chain(Vec::new()));
+                spline = Some((order, poles, color, flags & 0x80 != 0, header));
+                knots = vec![f64::NAN; uint16(e, 44).unwrap_or(0) as usize];
             }
             26 => {
-                // Interior knots as fractions of the parameter range.
-                let n = spline.map(|s| s.1.saturating_sub(s.0)).unwrap_or(0);
+                // Knots as fractions of the parameter range; a closed
+                // curve's list also holds its ends.
+                let n = knots.len();
                 knots = (0..n)
                     .filter_map(|k| int32(e, 36 + k * 4))
                     .map(|v| v as u32 as f64 / 2_147_483_648.0)
@@ -392,11 +575,17 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
             }
             21 => {
                 let n = uint16(e, 36).unwrap_or(0) as usize;
-                let poles: Vec<[f64; 2]> = (0..n).filter_map(|k| int_pt(38 + k * 8)).collect();
-                if let Some((order, count, color, width)) = spline.take() {
+                let poles3: Vec<[f64; 3]> = (0..n).filter_map(|k| pt3(38 + k * step)).collect();
+                let poles: Vec<[f64; 2]> = poles3.iter().map(|p| plan(*p)).collect();
+                if let Some((order, count, color, closed, header)) = spline.take() {
                     if poles.len() == count && count >= order {
-                        let interior = if knots.len() == count - order {
-                            knots.clone()
+                        let stored: Vec<f64> = knots
+                            .iter()
+                            .copied()
+                            .filter(|k| *k > 1e-9 && *k < 1.0 - 1e-6)
+                            .collect();
+                        let interior = if stored.len() == count - order {
+                            stored
                         } else {
                             (1..=count - order)
                                 .map(|k| k as f64 / (count - order + 1) as f64)
@@ -407,13 +596,18 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                         full.extend(vec![1.0; order]);
                         let pts = bspline_points(order, &poles, &full, 24 * count);
                         collect.push(DgnElement {
-                            color: Some(color),
-                            ..element(DgnGeom::Points(pts.clone()))
+                            geom: DgnGeom::Spline {
+                                degree: order - 1,
+                                knots: full,
+                                poles: poles3.clone(),
+                                closed,
+                            },
+                            ..header
                         });
                         push(
                             &mut raw,
                             &mut complex,
-                            polyline(&pts, false, Some((color, width)), None),
+                            polyline(&pts, false, Some((color, -1.0)), None),
                         );
                     }
                 }
@@ -430,21 +624,32 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]]) -> Raw {
                             .to_string()
                     })
                     .unwrap_or_default();
+                // A 3D instance holds a 3×3 matrix (its plan part and the z
+                // scale are used) and a z.
+                let (r1, zz) = if d3 { (100, 140) } else { (92, 0) };
                 let (Some(m0), Some(m1), Some(m2), Some(m3), Some(ox), Some(oy)) = (
                     vax_double(e, 76),
                     vax_double(e, 84),
-                    vax_double(e, 92),
-                    vax_double(e, 100),
+                    vax_double(e, r1),
+                    vax_double(e, r1 + 8),
                     le_i32(e, 148),
                     le_i32(e, 152),
                 ) else {
                     continue;
                 };
+                let (oz, z_scale) = if d3 {
+                    (
+                        le_i32(e, 156).unwrap_or(0) as f64,
+                        vax_double(e, zz).filter(|z| *z != 0.0).unwrap_or(1.0),
+                    )
+                } else {
+                    (0.0, 1.0)
+                };
                 collect.push(element(DgnGeom::Cell {
                     name: name.clone(),
                     m: [m0, m1, m2, m3],
-                    origin: [ox as f64, oy as f64],
-                    z_scale: 1.0,
+                    origin: [ox as f64, oy as f64, oz],
+                    z_scale,
                 }));
                 raw.instances.push(Instance {
                     name,
@@ -647,14 +852,14 @@ pub fn model(bytes: &[u8], hidden: &[String]) -> Option<Sheet> {
             while j < all.len() && all[j][0] & 0x80 != 0 {
                 j += 1;
             }
-            defs.insert(name, read_run(&all[i + 1..j], &colors));
+            defs.insert(name, read_run(&all[i + 1..j], &colors, is_3d(bytes), 0));
             i = j;
             continue;
         }
         top.push(e);
         i += 1;
     }
-    let raw = read_run(&top, &colors);
+    let raw = read_run(&top, &colors, is_3d(bytes), 0);
     let per_unit = u.uor_per_sub * u.sub_per_master;
     let m: Affine = [
         1.0 / per_unit,
@@ -721,7 +926,7 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
             while j < all.len() && all[j][0] & 0x80 != 0 {
                 j += 1;
             }
-            let def = read_run(&all[i + 1..j], &colors).elements;
+            let def = read_run(&all[i + 1..j], &colors, is_3d(bytes), 0).elements;
             cells.push((name, scaled_elements(&def, s, [0.0, 0.0])));
             i = j;
             continue;
@@ -729,7 +934,7 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
         top.push(e);
         i += 1;
     }
-    let raw = read_run(&top, &colors);
+    let raw = read_run(&top, &colors, is_3d(bytes), 0);
     let levels = (0..64u32)
         .map(|l| {
             let name = names.get(&(l as u8)).cloned().unwrap_or_else(|| l.to_string());
@@ -743,5 +948,6 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
         sub_per_master: u.sub_per_master,
         unit_names: (unit_name(bytes, 1120), unit_name(bytes, 1122)),
         v7: true,
+        ..Default::default()
     })
 }

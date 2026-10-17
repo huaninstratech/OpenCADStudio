@@ -575,6 +575,16 @@ impl OpenCADStudio {
                     return task;
                 }
             }
+            result @ CmdResult::EditBlockAuthoring { .. } => {
+                return self.handle_authoring_edit(result);
+            }
+            result @ (CmdResult::PlaceBlockAction { .. }
+            | CmdResult::EvaluateBlockParameter { .. }) => {
+                return self.handle_block_action_result(result);
+            }
+            result @ CmdResult::PlaceBlockSingleParameter { .. } => {
+                return self.handle_place_block_single_parameter(result);
+            }
             result @ CmdResult::PlaceBlockOrientationParameter { .. } => {
                 return self.handle_place_block_orientation_parameter(result);
             }
@@ -653,6 +663,11 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = None;
                 self.tabs[i].snap_result = None;
                 return self.run_dgn_import(i, request);
+            }
+            CmdResult::TdsImport(request) => {
+                self.tabs[i].active_cmd = None;
+                self.tabs[i].snap_result = None;
+                self.run_tds_import(i, request);
             }
             CmdResult::PdfImportFile(import) => {
                 self.tabs[i].scene.clear_preview_wire();

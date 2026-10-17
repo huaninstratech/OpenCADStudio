@@ -63,10 +63,6 @@ pub fn view_window<'a>(
             report.issues_found().to_string(),
         ),
         metric(
-            crate::tr!("recovery", "entities-removed"),
-            report.removed_total().to_string(),
-        ),
-        metric(
             crate::tr!("recovery", "references-checked"),
             report.references_checked.to_string(),
         ),
@@ -75,16 +71,6 @@ pub fn view_window<'a>(
     .width(Fill);
 
     let mut details = column![].spacing(6);
-    if report.referenced_entities_removed > 0 {
-        details = details.push(
-            text(format!(
-                "{}: {}",
-                crate::tr!("recovery", "referenced-entities-removed"),
-                report.referenced_entities_removed
-            ))
-            .size(11),
-        );
-    }
     if report.references_missing > 0 || report.references_failed > 0 {
         details = details.push(
             text(format!(

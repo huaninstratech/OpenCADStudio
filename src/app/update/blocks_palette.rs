@@ -424,17 +424,24 @@ impl OpenCADStudio {
         let i = self.active_tab;
         self.push_undo_snapshot(i, "INSERT");
         self.merge_dependencies(i, &deps);
+        let apps = crate::app::command_driver::clipboard::eed_app_map(
+            &self.tabs[i].scene.document,
+            &deps,
+        );
         let mut created = Vec::new();
         for def in &deps.blocks {
             let scene = &mut self.tabs[i].scene;
+            let mut entities = def.entities.clone();
+            for entity in &mut entities {
+                crate::app::command_driver::clipboard::remap_eed_apps(entity, &apps);
+            }
             if redefine && def.name.eq_ignore_ascii_case(name) {
-                let entities = def.entities.clone();
                 if let Err(err) = scene.redefine_block_raw(&def.name, def.base_point, entities) {
                     self.command_line.push_error(&err);
                     return Err(err);
                 }
             } else if scene.document.block_records.get(&def.name).is_none() {
-                scene.define_block_raw(&def.name, def.base_point, def.entities.clone());
+                scene.define_block_raw(&def.name, def.base_point, entities);
                 created.push(def);
             }
         }

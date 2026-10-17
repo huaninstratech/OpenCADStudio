@@ -137,6 +137,8 @@ impl OpenCADStudio {
             return Some("Open a block in the Block Editor before placing a parameter.");
         };
         match kind.to_ascii_uppercase().as_str() {
+            "BASEPOINT"|"BASE"|"B" => crate::scene::block_basepoint::placement_error(&tab.scene.document,session.br_handle),
+            "LOOKUP"|"K" => crate::scene::block_lookup::placement_error(&tab.scene.document,session.br_handle),
             "POINT" | "P" | "" => crate::scene::block_point_parameter::placement_error(
                 &tab.scene.document,
                 session.br_handle,
@@ -151,7 +153,7 @@ impl OpenCADStudio {
             "VISIBILITY" | "V" => {
                 visibility::placement_error(&tab.scene.document, session.br_handle)
             }
-            _ => Some("Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility."),
+            _ => Some("Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility, Lookup, Basepoint."),
         }
     }
 
@@ -389,11 +391,38 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
         match cmd {
+            cmd if cmd == "BACTION"
+                || cmd.starts_with("BACTION ")
+                || cmd == "BACTIONTOOL"
+                || cmd.starts_with("BACTIONTOOL ") =>
+            {
+                Some(
+                    self.start_block_action(
+                        cmd.split_once(' ').map_or("", |(_, args)| args.trim()),
+                    ),
+                )
+            }
+            cmd if cmd == "BLOOKUPTABLE" || cmd.starts_with("BLOOKUPTABLE ") => {
+                Some(self.open_lookup_table(cmd.strip_prefix("BLOOKUPTABLE").unwrap().trim()))
+            }
             cmd if cmd == "BPARAMETER" || cmd.starts_with("BPARAMETER ") => {
                 let Some(block) = self.visibility_block(i, "BPARAMETER") else {
                     return Some(Task::none());
                 };
                 let parameter_type = cmd.strip_prefix("BPARAMETER").unwrap().trim();
+                if let Some(kind) =
+                    crate::modules::block_editor::single_parameter::Kind::parse(parameter_type)
+                {
+                    let command =
+                        crate::modules::block_editor::single_parameter::SingleParameterCommand::new(
+                            self.tabs[i].id,
+                            block,
+                            kind,
+                        );
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
+                    return Some(Task::none());
+                }
                 if let Some(kind) =
                     crate::scene::block_orientation_parameter::Kind::parse(parameter_type)
                 {
@@ -428,7 +457,7 @@ impl OpenCADStudio {
                 {
                     self.command_line.push_error(
                         crate::t!(
-                            "Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility."
+                            "Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility, Lookup, Basepoint."
                         )
                         .as_ref(),
                     );

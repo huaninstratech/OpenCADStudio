@@ -696,7 +696,7 @@ fn dynamic_dimension_follow_points(
     target.attachment_point = base.attachment_point;
     target.line_spacing_style = base.line_spacing_style;
     target.line_spacing_factor = base.line_spacing_factor;
-    *dimension = rebuilt;
+    *dimension = *rebuilt;
     true
 }
 
@@ -794,7 +794,7 @@ fn dynamic_dimension_follow_radial(
     let Some(codec::EntityType::Dimension(mut rebuilt)) = rebuilt else {
         return false;
     };
-    let unchanged = match (&*dimension, &rebuilt) {
+    let unchanged = match (&*dimension, &*rebuilt) {
         (Dimension::Radius(old), Dimension::Radius(new)) => {
             same(old.angle_vertex, new.angle_vertex)
                 && same(old.definition_point, new.definition_point)
@@ -808,7 +808,7 @@ fn dynamic_dimension_follow_radial(
     if unchanged {
         return false;
     }
-    match &mut rebuilt {
+    match &mut *rebuilt {
         Dimension::Radius(new) => new.leader_length = leader,
         Dimension::Diameter(new) => new.leader_length = leader,
         _ => {}
@@ -821,7 +821,7 @@ fn dynamic_dimension_follow_radial(
     target.attachment_point = base.attachment_point;
     target.line_spacing_style = base.line_spacing_style;
     target.line_spacing_factor = base.line_spacing_factor;
-    *dimension = rebuilt;
+    *dimension = *rebuilt;
     true
 }
 
@@ -881,7 +881,7 @@ fn dynamic_dimension_follow_angle(
     target.attachment_point = base.attachment_point;
     target.line_spacing_style = base.line_spacing_style;
     target.line_spacing_factor = base.line_spacing_factor;
-    *dimension = rebuilt;
+    *dimension = *rebuilt;
     true
 }
 
@@ -2264,10 +2264,14 @@ impl super::Scene {
                 });
                 let measured = points.filter(|_| !angular).map(|(first, second)| {
                     let delta = second - first;
-                    let axis = match self.document.get_entity(*dimension) {
-                        Some(codec::EntityType::Dimension(codec::entities::Dimension::Linear(
-                            linear,
-                        ))) => Some((linear.rotation.cos(), linear.rotation.sin())),
+                    let axis = match self
+                        .document
+                        .get_entity(*dimension)
+                        .and_then(crate::entities::dimension::as_dimension)
+                    {
+                        Some(codec::entities::Dimension::Linear(linear)) => {
+                            Some((linear.rotation.cos(), linear.rotation.sin()))
+                        }
                         _ => None,
                     };
                     match (constraint.kind, axis) {
@@ -2605,7 +2609,7 @@ impl super::Scene {
             // line, which breaks around the text, so the text is centred on
             // it rather than lifted above it.
             let radial = matches!(
-                dimension,
+                &**dimension,
                 codec::entities::Dimension::Radius(_) | codec::entities::Dimension::Diameter(_)
             );
             let centred = !radial || ov::int(xdata, ov::DIMTAD) == Some(0);
@@ -2615,7 +2619,7 @@ impl super::Scene {
             // The reference draws dynamic distance text horizontally; an
             // angle's text keeps its style's alignment.
             let angular = matches!(
-                dimension,
+                &**dimension,
                 codec::entities::Dimension::Angular2Ln(_)
                     | codec::entities::Dimension::Angular3Pt(_)
             );

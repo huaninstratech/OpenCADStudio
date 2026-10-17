@@ -138,7 +138,9 @@ impl JoggedRadiusDimensionCommand {
         );
 
         CmdResult::CommitDimension {
-            entity: plane.place_entity(EntityType::Dimension(Dimension::LargeRadial(dimension))),
+            entity: plane.place_entity(EntityType::Dimension(Box::new(Dimension::LargeRadial(
+                dimension,
+            )))),
             association,
             preserve_base_style: false,
             continue_command: false,

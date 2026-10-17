@@ -101,7 +101,7 @@ fn push_fixture_entities(doc: &mut CadDocument, quick: bool) -> Vec<Handle> {
         d.definition_point = Vector3::new(x + 5.0, y + 3.0, 0.0);
         d.base.text_middle_point = Vector3::new(x + 5.0, y + 4.0, 0.0);
         handles.push(
-            doc.add_entity(EntityType::Dimension(Dimension::Linear(d)))
+            doc.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(d))))
                 .unwrap(),
         );
     }

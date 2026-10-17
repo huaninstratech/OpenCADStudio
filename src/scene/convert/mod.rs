@@ -1,5 +1,6 @@
 pub mod acad_to_render;
 pub mod acis_export;
+pub mod acis_import;
 pub mod acis_kernel;
 pub mod dgn_linestyle;
 pub mod proxy_graphics;

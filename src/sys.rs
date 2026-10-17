@@ -809,6 +809,18 @@ pub fn set_file_dia(on: bool) {
     FILE_DIA.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A file the next PDF import picker returns without showing itself (set
+/// by automation, used once).
+static PDF_IMPORT_PICK: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn set_pdf_import_pick(path: std::path::PathBuf) {
+    *PDF_IMPORT_PICK.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+pub fn take_pdf_import_pick() -> Option<std::path::PathBuf> {
+    PDF_IMPORT_PICK.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// The file type ATTACH's picker was last left on (1-based; 7 = Drawing).
 static ATTACH_FILTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
 

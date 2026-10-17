@@ -1489,12 +1489,14 @@ impl OpenCADStudio {
             if let Some((anno_field, insert_after)) = anno {
                 let is_anno = crate::scene::annotative::is_annotative(doc, entity)
                     || match entity {
-                        codec::EntityType::Dimension(codec::entities::Dimension::Arc(
-                            dimension,
-                        )) => crate::scene::annotative::dim_style_is_annotative(
-                            doc,
-                            &dimension.base.style_name,
-                        ),
+                        codec::EntityType::Dimension(dimension)
+                            if matches!(**dimension, codec::entities::Dimension::Arc(_)) =>
+                        {
+                            crate::scene::annotative::dim_style_is_annotative(
+                                doc,
+                                &dimension.base().style_name,
+                            )
+                        }
                         codec::EntityType::Tolerance(_) => {
                             crate::scene::annotative::annotation_style_is_annotative(doc, entity)
                         }
@@ -1530,7 +1532,9 @@ impl OpenCADStudio {
                             "annotative",
                             yes_no_choice(t.is_annotative || is_anno),
                         ),
-                        codec::EntityType::Dimension(codec::entities::Dimension::Arc(_)) => {
+                        codec::EntityType::Dimension(dimension)
+                            if matches!(**dimension, codec::entities::Dimension::Arc(_)) =>
+                        {
                             set_row(
                                 &mut sections,
                                 "annotative",
@@ -1683,10 +1687,14 @@ impl OpenCADStudio {
                 format!("{} ({})", t!("Surface"), t!("Extrusion"))
             }
             // The reference names an angular dimension by its kind.
-            codec::EntityType::Dimension(codec::entities::Dimension::Angular2Ln(_)) => {
+            codec::EntityType::Dimension(dimension)
+                if matches!(**dimension, codec::entities::Dimension::Angular2Ln(_)) =>
+            {
                 t!("Angular Dimension").into_owned()
             }
-            codec::EntityType::Dimension(codec::entities::Dimension::Angular3Pt(_)) => {
+            codec::EntityType::Dimension(dimension)
+                if matches!(**dimension, codec::entities::Dimension::Angular3Pt(_)) =>
+            {
                 t!("3 Point Angular Dimension").into_owned()
             }
             codec::EntityType::Underlay(underlay) => match underlay.underlay_type {
@@ -1719,22 +1727,14 @@ impl OpenCADStudio {
                     title
                 } else {
                     use codec::entities::Dimension;
-                    match entity {
-                        codec::EntityType::Dimension(Dimension::Aligned(_)) => {
-                            t!("Aligned Dimensional Constraint")
-                        }
-                        codec::EntityType::Dimension(Dimension::Angular2Ln(_)) => {
-                            t!("Angular Dimension (Dynamic)")
-                        }
-                        codec::EntityType::Dimension(Dimension::Angular3Pt(_)) => {
+                    match crate::entities::dimension::as_dimension(entity) {
+                        Some(Dimension::Aligned(_)) => t!("Aligned Dimensional Constraint"),
+                        Some(Dimension::Angular2Ln(_)) => t!("Angular Dimension (Dynamic)"),
+                        Some(Dimension::Angular3Pt(_)) => {
                             t!("3 Point Angular Dimension (Dynamic)")
                         }
-                        codec::EntityType::Dimension(Dimension::Radius(_)) => {
-                            t!("Radius Dimensional Constraint")
-                        }
-                        codec::EntityType::Dimension(Dimension::Diameter(_)) => {
-                            t!("Diameter Dimensional Constraint")
-                        }
+                        Some(Dimension::Radius(_)) => t!("Radius Dimensional Constraint"),
+                        Some(Dimension::Diameter(_)) => t!("Diameter Dimensional Constraint"),
                         _ => t!("Linear Dimensional Constraint"),
                     }
                     .into_owned()
@@ -2475,6 +2475,45 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                     }
                 }
             };
+            if selected.is_empty() {
+                if let Some(item) = self.tabs[i].selected_authoring.and_then(|handle| {
+                    let session = self.tabs[i].active_block_edit_session()?;
+                    crate::scene::block_authoring::edit::items(
+                        &self.tabs[i].scene.document,
+                        session.br_handle,
+                    )
+                    .into_iter()
+                    .find(|item| item.handle == handle)
+                }) {
+                    use crate::scene::model::object::{PropSection, PropValue, Property};
+                    panel.title = item.name;
+                    panel.sections = vec![PropSection {
+                        title: crate::t!("Geometry").into_owned(),
+                        props: item
+                            .grips
+                            .into_iter()
+                            .map(|(part, point)| Property {
+                                label: crate::t!(match part {
+                                    crate::scene::block_authoring::edit::Part::Point => "Position",
+                                    crate::scene::block_authoring::edit::Part::Base => "Base point",
+                                    crate::scene::block_authoring::edit::Part::End => "End point",
+                                    crate::scene::block_authoring::edit::Part::Reference =>
+                                        "Reference point",
+                                    crate::scene::block_authoring::edit::Part::Label(0) =>
+                                        "Label position",
+                                    _ => "Second label position",
+                                })
+                                .into_owned(),
+                                field: "authoring_grip_position",
+                                value: PropValue::ReadOnly(format!(
+                                    "{:.4}, {:.4}, {:.4}",
+                                    point.x, point.y, point.z
+                                )),
+                            })
+                            .collect(),
+                    }];
+                }
+            }
             // Precompute the focused-id → field-key map for O(1) lookups on
             // `PropSyncActive`; derived from `sections`, so rebuild it here.
             panel.field_key_by_id = crate::ui::properties::build_field_key_map(&panel.sections);
@@ -2743,7 +2782,7 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
                 // scale are available.
                 if let codec::EntityType::Dimension(dim) = contextual.as_ref() {
                     if matches!(
-                        dim,
+                        &**dim,
                         codec::entities::Dimension::Linear(_)
                             | codec::entities::Dimension::Aligned(_)
                     ) && !dim.base().text_user_positioned
@@ -2780,13 +2819,17 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
                         }
                     }
                 }
-                let dynamic_angle = match contextual.as_ref() {
-                    codec::EntityType::Dimension(
-                        dim @ (codec::entities::Dimension::Angular2Ln(_)
-                        | codec::entities::Dimension::Angular3Pt(_)),
-                    ) if self.tabs[i].scene.is_dynamic_dimension(handle) => Some(dim),
-                    _ => None,
-                };
+                let contextual_dimension =
+                    crate::entities::dimension::as_dimension(contextual.as_ref());
+                let dynamic_angle = contextual_dimension
+                    .filter(|dim| {
+                        matches!(
+                            dim,
+                            codec::entities::Dimension::Angular2Ln(_)
+                                | codec::entities::Dimension::Angular3Pt(_)
+                        )
+                    })
+                    .filter(|_| self.tabs[i].scene.is_dynamic_dimension(handle));
                 if let Some(dim) = dynamic_angle {
                     // A dynamic angle shows a triangle at each end of its arc
                     // pointing away from it, and squares at the arc point and
@@ -2882,6 +2925,8 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         // Append the dynamic-block visibility (lookup) grip, if the lone
         // selection is a visibility-parametric block reference.
         self.refresh_visibility_grip(wo);
+        self.refresh_test_action_grips(wo);
+        self.refresh_authoring_grips(wo);
     }
 
     pub(super) fn property_target_handles(&self, i: usize) -> Vec<Handle> {
@@ -3060,8 +3105,8 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
     ) -> Option<Handle> {
         let i = self.active_tab;
         let tracks_dimension_chain = matches!(
-            &entity,
-            codec::EntityType::Dimension(
+            crate::entities::dimension::as_dimension(&entity),
+            Some(
                 codec::entities::Dimension::Linear(_)
                     | codec::entities::Dimension::Aligned(_)
                     | codec::entities::Dimension::Angular2Ln(_)

@@ -21,7 +21,7 @@ impl OpenCADStudio {
         });
         let label = self.history_label_from_active_cmd(i, "MVIEW");
         let pending = self.begin_undo(i, label, 1, true);
-        let handle = self.commit_entity_handle(codec::EntityType::Viewport(viewport));
+        let handle = self.commit_entity_handle(codec::EntityType::Viewport(Box::new(viewport)));
         if let (Some(handle), Some(saved)) = (handle, saved_view) {
             if let Some(codec::EntityType::Viewport(viewport)) =
                 self.tabs[i].scene.document.get_entity_mut(handle)
@@ -244,7 +244,8 @@ impl OpenCADStudio {
         viewport.id = 2;
         viewport.clip_boundary_handle = clip_handle;
         viewport.status.non_rectangular_clipping = !clip_handle.is_null();
-        let viewport_handle = self.commit_entity_handle(codec::EntityType::Viewport(viewport));
+        let viewport_handle =
+            self.commit_entity_handle(codec::EntityType::Viewport(Box::new(viewport)));
         if let Some(viewport_handle) = viewport_handle {
             if !created_boundary {
                 let before = self.tabs[i]

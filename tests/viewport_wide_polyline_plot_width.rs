@@ -43,7 +43,7 @@ fn viewport_projection_scales_wide_polyline_band_width() {
     viewport.view_center = Vector3::new(50.0, 0.0, 0.0);
     viewport.id = 2;
     viewport.status.is_on = true;
-    scene.add_entity(EntityType::Viewport(viewport));
+    scene.add_entity(EntityType::Viewport(Box::new(viewport)));
 
     let (_paper, model) = scene.plot_wire_groups(None);
     let band = model

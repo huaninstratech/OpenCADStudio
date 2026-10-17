@@ -335,6 +335,8 @@ pub(crate) fn create(
 pub(crate) struct Graphic {
     pub lines: Vec<[Vector3; 2]>,
     pub round_grips: Vec<Vector3>,
+    pub base_grips: Vec<Vector3>,
+    pub lookup_grips: Vec<Vector3>,
     pub dimensions: Vec<[Vector3; 2]>,
     pub labels: Vec<(Vector3, String)>,
     pub grips: Vec<(Vector3, bool)>, // Linear uses a direction arrow; others a square.

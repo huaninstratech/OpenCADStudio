@@ -145,13 +145,17 @@ impl CadCommand for DimJogLineCommand {
     }
 
     fn on_entity_pick(&mut self, handle: Handle, _point: DVec3) -> CmdResult {
-        let Some(EntityType::Dimension(dimension @ (Dimension::Linear(_) | Dimension::Aligned(_)))) =
-            self.picked_entity.take()
-        else {
+        let Some(EntityType::Dimension(dimension)) = self.picked_entity.take() else {
             return CmdResult::ReportError(
                 t!("DIMJOGLINE: select a linear or aligned dimension.").into_owned(),
             );
         };
+        let dimension = *dimension;
+        if !matches!(dimension, Dimension::Linear(_) | Dimension::Aligned(_)) {
+            return CmdResult::ReportError(
+                t!("DIMJOGLINE: select a linear or aligned dimension.").into_owned(),
+            );
+        }
         if handle.is_null() {
             return CmdResult::NeedPoint;
         }

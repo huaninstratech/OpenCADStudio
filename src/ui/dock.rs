@@ -1097,8 +1097,8 @@ pub fn title_bar<'a>(id: PanelId, title: String, chrome: Chrome) -> Element<'a, 
 }
 
 /// [`title_bar`] with a pallet's own control (a menu button) before the pin
-/// and close. A floating pallet has no title bar, so the control then sits
-/// alone at the top right.
+/// and close, shown like them only while the bar is hovered. A floating
+/// pallet has no title bar, so the control then sits alone at the top right.
 pub fn title_bar_with<'a>(
     id: PanelId,
     title: String,
@@ -1113,16 +1113,17 @@ pub fn title_bar_with<'a>(
             None => Space::new().width(0).height(0).into(),
         };
     }
-    // The pin and close only show while the pointer is over the bar; the
-    // fixed height keeps the bar from jumping when they appear.
+    // The pallet's control, pin and close only show while the pointer is
+    // over the bar; the fixed height keeps the bar from jumping when they
+    // appear.
     let mut bar = row![text(title).size(12), Space::new().width(Length::Fill)]
         .spacing(3)
         .height(Length::Fixed(TITLE_BUTTON_H))
         .align_y(iced::Center);
-    if let Some(extra) = extra {
-        bar = bar.push(extra);
-    }
     if chrome.title_hovered {
+        if let Some(extra) = extra {
+            bar = bar.push(extra);
+        }
         bar = bar
             .push(pin_button(
                 id,

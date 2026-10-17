@@ -39,10 +39,8 @@ impl OpenCADStudio {
         let delta_safe = self.delta_add_safe(i, &entity);
         let pending = self.begin_undo(i, label, 1, delta_safe);
         let is_associative_dimension = matches!(
-            entity,
-            codec::EntityType::Dimension(
-                codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_)
-            )
+            crate::entities::dimension::as_dimension(&entity),
+            Some(codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_))
         );
         let association_enabled = self.tabs[i].scene.document.header.dimension_associativity == 2;
         let committed = if preserve_commit_layer {
@@ -257,10 +255,8 @@ impl OpenCADStudio {
         };
         let pending = self.begin_undo(i, label, 1, delta_safe);
         let is_associative_dimension = matches!(
-            entity,
-            codec::EntityType::Dimension(
-                codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_)
-            )
+            crate::entities::dimension::as_dimension(&entity),
+            Some(codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_))
         );
         let association_enabled = self.tabs[i].scene.document.header.dimension_associativity == 2;
         let committed = if preserve_commit_layer {
@@ -324,8 +320,8 @@ impl OpenCADStudio {
         let label = self.history_label_from_active_cmd(i, "DIMENSION");
         let association_mode = self.tabs[i].scene.document.header.dimension_associativity;
         let single_source_dimension = matches!(
-            &entity,
-            codec::EntityType::Dimension(codec::entities::Dimension::Ordinate(_))
+            crate::entities::dimension::as_dimension(&entity),
+            Some(codec::entities::Dimension::Ordinate(_))
         );
         // A dimension placed on the sheet but measuring model geometry
         // through a viewport carries the compensation as a negative

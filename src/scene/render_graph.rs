@@ -621,6 +621,10 @@ pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
         .iter()
         .find(|record| record.name.eq_ignore_ascii_case(block_name))
         .map(|record| {
+            if let Some((_, parameter)) = super::block_basepoint::parameter(document, record.handle)
+            {
+                return parameter.point;
+            }
             document
                 .get_entity(record.block_entity_handle)
                 .and_then(|entity| match entity {

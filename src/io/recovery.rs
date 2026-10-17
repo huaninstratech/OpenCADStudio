@@ -24,8 +24,6 @@ pub struct RecoveryReport {
     pub source_sha256: Option<String>,
     pub read_stats: Option<codec::ReadStats>,
     pub entities_scanned: usize,
-    pub entities_removed: usize,
-    pub referenced_entities_removed: usize,
     pub parser_errors_recovered: usize,
     pub diagnostics: Vec<(String, String)>,
     pub references_checked: usize,
@@ -54,8 +52,6 @@ impl RecoveryReport {
         source_sha256: Option<String>,
         read_stats: Option<codec::ReadStats>,
         entities_scanned: usize,
-        entities_removed: usize,
-        referenced_entities_removed: usize,
         references: &[XrefInfo],
         notifications: &codec::notification::NotificationCollection,
         save_as_required: bool,
@@ -163,8 +159,6 @@ impl RecoveryReport {
             source_sha256,
             read_stats,
             entities_scanned,
-            entities_removed,
-            referenced_entities_removed,
             parser_errors_recovered,
             diagnostics,
             references_checked: references.len(),
@@ -211,8 +205,6 @@ impl RecoveryReport {
                 .unwrap_or(0),
             read_stats,
             entities_scanned: 0,
-            entities_removed: 0,
-            referenced_entities_removed: 0,
             diagnostics: Vec::new(),
             references_checked: 0,
             references_loaded: 0,
@@ -233,17 +225,11 @@ impl RecoveryReport {
         }
     }
 
-    pub fn removed_total(&self) -> usize {
-        self.entities_removed
-            .saturating_add(self.referenced_entities_removed)
-    }
-
     pub fn issues_found(&self) -> usize {
         self.parser_errors_recovered
             .saturating_add(self.references_recovered)
             .saturating_add(self.references_failed)
             .saturating_add(self.references_missing)
-            .saturating_add(self.removed_total())
             .saturating_add(usize::from(self.error.is_some()))
     }
 
@@ -315,11 +301,6 @@ impl RecoveryReport {
             ));
         }
         lines.push(format!("Entities scanned: {}", self.entities_scanned));
-        lines.push(format!("Entities removed: {}", self.entities_removed));
-        lines.push(format!(
-            "Referenced entities removed: {}",
-            self.referenced_entities_removed
-        ));
         lines.push(format!(
             "Parser errors recovered: {}",
             self.parser_errors_recovered
@@ -580,7 +561,7 @@ fn structured_diagnostic_line(diagnostic: &codec::ReadDiagnostic) -> String {
 fn reader_revision() -> String {
     include_str!("../../Cargo.toml")
         .lines()
-        .find(|line| line.trim_start().starts_with("opencadcodec = { git ="))
+        .find(|line| line.trim_start().starts_with("codec = ") && line.contains("opencadcodec.git"))
         .and_then(|line| line.split("rev = \"").nth(1))
         .and_then(|value| value.split('"').next())
         .filter(|value| !value.is_empty())

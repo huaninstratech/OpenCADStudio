@@ -886,7 +886,7 @@ impl OpenCADStudio {
                     .filter(|br| dwg_picked.iter().any(|(key, _)| *key == br.handle.value()))
                     .map(|br| br.handle)
                     .collect();
-                let (infos, _dropped) = crate::io::xref::resolve_xrefs_for_keys(
+                let infos = crate::io::xref::resolve_xrefs_for_keys(
                     &mut self.tabs[i].scene.document,
                     &base_dir,
                     &handles,
@@ -1093,7 +1093,7 @@ impl OpenCADStudio {
             self.tabs[i].xref_unloaded.remove(key);
             self.tabs[i].xref_stat_cache.remove(key);
         }
-        let (infos, _dropped) =
+        let infos =
             crate::io::xref::resolve_xrefs(&mut self.tabs[i].scene.document, &base_dir);
         let fresh = crate::io::xref::collect_entries_with_prev(
             &self.tabs[i].scene.document,

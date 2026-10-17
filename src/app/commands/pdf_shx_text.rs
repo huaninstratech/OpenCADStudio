@@ -288,13 +288,14 @@ impl OpenCADStudio {
             mtext.height = line.height;
             mtext.rectangle_width = 0.0;
             mtext.attachment_point = codec::entities::AttachmentPoint::BottomLeft;
+            mtext.drawing_direction = codec::entities::DrawingDirection::ByStyle;
             mtext.style = line.font;
             mtext.common.layer = if settings.current_layer {
                 current_layer.clone()
             } else {
                 line.layer
             };
-            scene.add_entity(codec::EntityType::MText(mtext));
+            scene.add_entity(codec::EntityType::MText(Box::new(mtext)));
             erase.extend(line.handles);
         }
         erase.sort();

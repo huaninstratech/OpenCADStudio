@@ -341,7 +341,7 @@ impl QdimCommand {
         ]);
         (
             self.plane
-                .place_entity(EntityType::Dimension(Dimension::Linear(dimension))),
+                .place_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension)))),
             association,
         )
     }
@@ -366,7 +366,7 @@ impl QdimCommand {
         dimension.refresh_measurement();
         (
             self.plane
-                .place_entity(EntityType::Dimension(Dimension::Ordinate(dimension))),
+                .place_entity(EntityType::Dimension(Box::new(Dimension::Ordinate(dimension)))),
             DimensionAssociationInput::Explicit(vec![point.sources.first().copied()]),
         )
     }
@@ -405,7 +405,7 @@ impl QdimCommand {
                     dimension.base.text_user_positioned = true;
                     dimension.leader_length = chord.distance(text);
                     dimension.base.actual_measurement = dimension.measurement();
-                    EntityType::Dimension(Dimension::Radius(dimension))
+                    EntityType::Dimension(Box::new(Dimension::Radius(dimension)))
                 } else {
                     let opposite = center - direction * radius;
                     let mut dimension = DimensionDiameter::new(v3(chord), v3(opposite));
@@ -415,7 +415,7 @@ impl QdimCommand {
                     dimension.base.text_user_positioned = true;
                     dimension.leader_length = chord.distance(text);
                     dimension.base.actual_measurement = dimension.measurement();
-                    EntityType::Dimension(Dimension::Diameter(dimension))
+                    EntityType::Dimension(Box::new(Dimension::Diameter(dimension)))
                 };
                 (self.plane.place_entity(entity), association)
             })
@@ -680,7 +680,7 @@ fn preview_entity(index: usize, entity: &EntityType) -> Vec<WireModel> {
         return Vec::new();
     };
     let mut lines: Vec<Vec<[f64; 3]>> = Vec::new();
-    match dimension {
+    match &**dimension {
         Dimension::Linear(value) => {
             let first = d3(value.first_point);
             let second = d3(value.second_point);

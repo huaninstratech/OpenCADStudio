@@ -232,7 +232,7 @@ impl AngularDimensionCommand {
     }
 
     fn commit(&self, dimension: Dimension) -> CmdResult {
-        let entity = self.plane.place_entity(EntityType::Dimension(dimension));
+        let entity = self.plane.place_entity(EntityType::Dimension(Box::new(dimension)));
         CmdResult::CommitDimension {
             entity,
             association: DimensionAssociationInput::Explicit(self.source_refs.clone()),
@@ -1242,7 +1242,7 @@ pub(crate) fn angular_two_line_entity(
     dim.base.insertion_point = dim.dimension_arc;
     dim.base.actual_measurement = dim.measurement_degrees();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text);
-    Some(EntityType::Dimension(Dimension::Angular2Ln(dim)))
+    Some(EntityType::Dimension(Box::new(Dimension::Angular2Ln(dim))))
 }
 
 /// A three-point angular dimension (vertex, two points, arc point), for a
@@ -1261,7 +1261,7 @@ pub(crate) fn angular_three_point_entity(
     dim.base.insertion_point = dim.definition_point;
     dim.base.actual_measurement = dim.measurement_degrees();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text);
-    Some(EntityType::Dimension(Dimension::Angular3Pt(dim)))
+    Some(EntityType::Dimension(Box::new(Dimension::Angular3Pt(dim))))
 }
 
 fn v3(point: DVec3) -> Vector3 {

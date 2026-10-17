@@ -26,7 +26,7 @@ fn text_and_dim_reach_pdf_export() {
     // A linear dimension — its measurement value is synthesized as SDF text too,
     // and dimension text is what #385 was actually filed about.
     let dim = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(40.0, 0.0, 0.0));
-    let dim_h = scene.add_entity(EntityType::Dimension(Dimension::Linear(dim)));
+    let dim_h = scene.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dim))));
 
     let wires = scene.entity_wires();
 

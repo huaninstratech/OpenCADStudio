@@ -11,6 +11,9 @@ pub(crate) mod block_metadata;
 pub mod block_service;
 pub mod block_visibility;
 pub(crate) mod block_authoring;
+pub(crate) mod block_basepoint;
+pub(crate) mod block_lookup;
+pub(crate) mod block_actions;
 pub(crate) mod block_point_parameter;
 pub(crate) mod block_distance_parameter;
 pub(crate) mod block_orientation_parameter;
@@ -62,6 +65,7 @@ mod layout;
 mod limits;
 mod modify;
 pub(crate) use modify::remap_copied_reactors;
+pub(crate) use modify::inverse_affine;
 mod mspace;
 pub mod named_parameters;
 mod page_setup;
@@ -1207,6 +1211,20 @@ pub(crate) fn valid_block_name(name: &str) -> bool {
         })
 }
 
+/// `raw` made fit to name a table entry (a block, layer, style or view):
+/// characters [`valid_block_name`] refuses become `_`, the name is cut to
+/// 255 characters, and `fallback` stands in when nothing is left. For names
+/// that come from outside files.
+pub(crate) fn sanitized_table_name(raw: &str, fallback: &str) -> String {
+    let name: String = raw
+        .trim()
+        .chars()
+        .map(|c| if valid_block_name(c.encode_utf8(&mut [0; 4])) { c } else { '_' })
+        .take(255)
+        .collect();
+    block_service::validate_block_name(&name).unwrap_or_else(|_| fallback.to_string())
+}
+
 /// Pre-built entity caches returned by [`build_derived_caches`].
 /// Produced in the file-load background task so the UI thread only assigns.
 #[derive(Debug, Clone)]
@@ -1224,12 +1242,6 @@ pub struct DerivedCaches {
     /// Prepared during file open so entity selection/deselection never scans
     /// the complete object store on the UI thread.
     pub object_data: crate::entities::object_data::ObjectDataCache,
-    /// Number of entities removed by the corrupt-entity guard during load.
-    /// Reported back to the UI so the user knows when a file had parser-junk
-    /// entities silently dropped.
-    pub corrupt_dropped: usize,
-    /// Corrupt entities dropped while resolving referenced drawings.
-    pub xref_dropped: usize,
     /// XREF resolution results produced by the loader worker. Keeping these in
     /// the open bundle prevents parsing and merging references on the UI thread.
     pub xrefs: Vec<crate::io::xref::XrefInfo>,
@@ -1526,8 +1538,6 @@ fn build_derived_caches_impl(
         meshes,
         block_meshes,
         object_data,
-        corrupt_dropped: 0,
-        xref_dropped: 0,
         xrefs: Vec::new(),
         prepared_geometry: None,
         timings: OpenTimings::default(),
@@ -4979,7 +4989,7 @@ impl Scene {
         fit_sheet_viewport(&mut vp, min_lim, max_lim);
         if let Ok(handle) = self
             .document
-            .add_entity_to_layout(EntityType::Viewport(vp), layout_name)
+            .add_entity_to_layout(EntityType::Viewport(Box::new(vp)), layout_name)
         {
             if let Some(ObjectType::Layout(l)) = self.document.objects.get_mut(&layout_handle) {
                 l.viewports.retain(|candidate| *candidate != handle);
@@ -5050,7 +5060,7 @@ impl Scene {
         viewport.status = codec::entities::ViewportStatusFlags::default_on();
         if let Ok(handle) = self
             .document
-            .add_entity_to_layout(EntityType::Viewport(viewport), layout_name)
+            .add_entity_to_layout(EntityType::Viewport(Box::new(viewport)), layout_name)
         {
             // The reference zooms the new viewport to the model's extents
             // with a margin of under one percent.
@@ -13870,7 +13880,7 @@ mod journal_tests {
         let mut annotative = MText::new();
         annotative.value = "annotative".to_string();
         annotative.is_annotative = true;
-        let annotative = s.add_entity(EntityType::MText(annotative));
+        let annotative = s.add_entity(EntityType::MText(Box::new(annotative)));
 
         let before_points = s.geometry_epoch;
         s.invalidate_point_dependencies();
@@ -14185,7 +14195,7 @@ mod journal_tests {
         scene.document.layers.add_or_replace(Layer::new("Shadows"));
         let mut hatch = Hatch::new();
         hatch.common.layer = "Shadows".to_string();
-        let handle = scene.add_entity(EntityType::Hatch(hatch));
+        let handle = scene.add_entity(EntityType::Hatch(Box::new(hatch)));
         let model = scene.model_space_block_handle();
         assert_eq!(
             scene
@@ -15515,7 +15525,7 @@ mod layout_cache_tests {
         vp.height = 100.0;
         let handle = scene
             .document
-            .add_entity_to_layout(codec::EntityType::Viewport(vp), "P1")
+            .add_entity_to_layout(codec::EntityType::Viewport(Box::new(vp)), "P1")
             .unwrap();
         assert!(scene.set_viewport_scale_named_for(handle, "1:50").is_some());
         assert!(scene.active_viewport.is_none());

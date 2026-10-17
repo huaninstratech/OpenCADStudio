@@ -991,7 +991,10 @@ impl OpenCADStudio {
                             match self.tabs[i]
                                 .scene
                                 .document
-                                .add_entity_to_layout(codec::EntityType::Viewport(vp), &layout_name)
+                                .add_entity_to_layout(
+                                    codec::EntityType::Viewport(Box::new(vp)),
+                                    &layout_name,
+                                )
                             {
                                 Ok(handle) => {
                                     self.tabs[i].scene.auto_fit_viewport(handle);
@@ -2198,7 +2201,7 @@ mod tests {
         locked_hatch.common.layer = "LOCKED_LAYER".into();
         let h_locked_hatch = app.tabs[i]
             .scene
-            .add_entity_clone(EntityType::Hatch(locked_hatch));
+            .add_entity_clone(EntityType::Hatch(Box::new(locked_hatch)));
 
         let h_line = app.tabs[i]
             .scene

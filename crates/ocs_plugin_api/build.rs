@@ -1240,8 +1240,8 @@ fn generate_version_info(out_dir: &Path) {
     let opencadcodec = lockfile
         .packages
         .iter()
-        .find(|p| p.name.as_str() == "opencadcodec")
-        .expect("opencadcodec package in Cargo.lock");
+        .find(|p| p.name.as_str() == "acadrust")
+        .expect("codec package (acadrust) in Cargo.lock");
 
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let rustc_version = Command::new(rustc)

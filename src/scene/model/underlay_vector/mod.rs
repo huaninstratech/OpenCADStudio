@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use codec::entities::UnderlayType;
 
-pub use model::{scaled_elements, DgnElement, DgnGeom, DgnImport, Path, Segment, Sheet, SubPath};
+pub use model::{
+    scaled_elements, By, DgnColor, DgnElement, DgnGeom, DgnImport, DgnReference, Path, Segment,
+    Sheet, SubPath, P3,
+};
 
 use super::pdf_raster::{source_bytes, PdfPage};
 
@@ -32,6 +35,17 @@ pub fn dgn_import(path: &str, item: &str) -> Option<DgnImport> {
         dgn7::import(&bytes)
     } else {
         dgn8::import(&bytes, item)
+    }
+}
+
+/// The models DGNIMPORT offers: a V7 file's one model, a V8 file's design
+/// models (sheet models are not imported).
+pub fn dgn_import_models(path: &str) -> Option<Vec<String>> {
+    let bytes = source_bytes(path)?;
+    if dgn7::is_v7(&bytes) {
+        dgn7::model_names(&bytes)
+    } else {
+        dgn8::design_model_names(&bytes)
     }
 }
 

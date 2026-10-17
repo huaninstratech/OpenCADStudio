@@ -277,12 +277,8 @@ fn read_outcome_from_bytes(
 /// `base_dir`, and populate each xref block with entities from the
 /// referenced file.
 ///
-/// Returns a list of [`XrefInfo`] describing each xref block found, plus the
-/// number of corrupt xref entities dropped during merge. Purging happens
-/// inline as each xref's entities are merged — xref content is parser output
-/// just like the host doc, so it gets the same corrupt-entity guard. Folding
-/// it in here avoids a second full-document `entities()` walk after resolve.
-pub fn resolve_xrefs(doc: &mut CadDocument, base_dir: &Path) -> (Vec<XrefInfo>, usize) {
+/// Returns a list of [`XrefInfo`] describing each xref block found.
+pub fn resolve_xrefs(doc: &mut CadDocument, base_dir: &Path) -> Vec<XrefInfo> {
     resolve_xrefs_with_filter(doc, base_dir, None, None)
 }
 
@@ -295,7 +291,7 @@ pub fn resolve_xrefs_for_keys(
     doc: &mut CadDocument,
     base_dir: &Path,
     keys: &HashSet<Handle>,
-) -> (Vec<XrefInfo>, usize) {
+) -> Vec<XrefInfo> {
     resolve_xrefs_with_filter(doc, base_dir, None, Some(keys))
 }
 
@@ -308,7 +304,7 @@ pub fn resolve_xrefs_with_progress(
     doc: &mut CadDocument,
     base_dir: &Path,
     progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
-) -> (Vec<XrefInfo>, usize) {
+) -> Vec<XrefInfo> {
     resolve_xrefs_with_filter(doc, base_dir, progress, None)
 }
 
@@ -317,7 +313,7 @@ fn resolve_xrefs_with_filter(
     base_dir: &Path,
     progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
     only: Option<&HashSet<Handle>>,
-) -> (Vec<XrefInfo>, usize) {
+) -> Vec<XrefInfo> {
     // Auto-resolve every xref — frustum + LOD culling keep GPU cost bounded.
     let xref_entries: Vec<(String, String, Handle)> = doc
         .block_records
@@ -432,7 +428,6 @@ fn resolve_xrefs_with_filter(
     // Phase 2 — merge each parsed xref into the host document, in the original
     // block order (par_iter preserves it), so handle allocation is deterministic.
     let mut result = Vec::with_capacity(parsed.len());
-    let mut dropped = 0usize;
     #[allow(unused_mut, unused_variables)]
     for (
         merge_index,
@@ -468,19 +463,7 @@ fn resolve_xrefs_with_filter(
                         .iter()
                         .map(|diagnostic| diagnostic.message.clone()),
                 );
-                let invalid = super::purge_corrupt_entities(&mut outcome.document);
-                if invalid > 0 {
-                    diagnostics.push(format!(
-                        "normal read found {invalid} structurally invalid reference records"
-                    ));
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if source_sha256.is_none() {
-                        source_sha256 = resolved.as_ref().and_then(|path| {
-                            super::stable_sha256_file(path, initial_fingerprint.as_ref())
-                        });
-                    }
-                }
-                if recovered || invalid > 0 {
+                if recovered {
                     (XrefStatus::Failed, diagnostics, Some(outcome.stats))
                 } else {
                     // Reload is replacement, never append. Keep the prior merge
@@ -502,7 +485,7 @@ fn resolve_xrefs_with_filter(
                     let _ = unload_reference(doc, br_handle.value());
                     remove_pipe_symbols(doc, &block_name);
                     ensure_block_entities(doc, &block_name);
-                    dropped += merge_xref_into_block(doc, &block_name, br_handle, outcome.document);
+                    merge_xref_into_block(doc, &block_name, br_handle, outcome.document);
                     if visretain {
                         restore_dependent_layers(doc, &block_name, kept_layers);
                     }
@@ -533,7 +516,7 @@ fn resolve_xrefs_with_filter(
         }
     }
 
-    (result, dropped)
+    result
 }
 
 /// Underlay files named by a relative (or moved) path: read them from where
@@ -1218,13 +1201,12 @@ fn copy_xref_sortents(
 /// — which doesn't know about the xref's layers — and silently falls
 /// back to WHITE / 1 px line weight. AutoCAD's BIND command uses the
 /// same naming scheme.
-/// Returns the number of corrupt entities skipped during the merge.
 fn merge_xref_into_block(
     doc: &mut CadDocument,
     xref_block_name: &str,
     br_handle: Handle,
     xref_doc: CadDocument,
-) -> usize {
+) {
     let prefix = xref_block_name;
 
     // Carry the xref's INSUNITS onto the host BlockRecord. Used at INSERT
@@ -1264,7 +1246,7 @@ fn merge_xref_into_block(
     // ── Entities (shared helper) ────────────────────────────────────────
     // The unremapped-handle count is ignored on the load path (BIND reports
     // it per bind).
-    let (dropped, _, entity_handle_map) = merge_source_entities(doc, &xref_doc, br_handle, &maps);
+    let (_, entity_handle_map) = merge_source_entities(doc, &xref_doc, br_handle, &maps);
 
     // ── Draw-order overrides (shared helper) ──────────────────────────────
     copy_xref_sortents(
@@ -1274,7 +1256,6 @@ fn merge_xref_into_block(
         &maps.br_handles,
         &entity_handle_map,
     );
-    dropped
 }
 
 /// Source entities in display order: each block record's `entity_handles`
@@ -1308,26 +1289,18 @@ fn ordered_source_entities(xref_doc: &CadDocument) -> Vec<(Handle, EntityType)> 
 
 /// Merge one source doc's entities into `target`, routing model-space content
 /// into `target_br` and nested-block content into its imported counterpart
-/// (`maps.br_handles`). Returns corrupt-drop count, unremapped-handle count,
-/// and the old→new entity handle map for the sortents copy.
+/// (`maps.br_handles`). Returns the unremapped-handle count and the old→new
+/// entity handle map for the sortents copy.
 fn merge_source_entities(
     target: &mut CadDocument,
     source: &CadDocument,
     target_br: Handle,
     maps: &XrefSymbolMaps,
-) -> (usize, usize, HashMap<Handle, Handle>) {
+) -> (usize, HashMap<Handle, Handle>) {
     let source_ms_handle = source.header.model_space_block_handle;
     let mut entity_handle_map: HashMap<Handle, Handle> = HashMap::default();
-    let mut dropped = 0usize;
     let mut unremapped = 0usize;
     for (old_h, mut entity) in ordered_source_entities(source) {
-        // Drop parser-garbage entities (bad normals / vertex counts / inf
-        // coords) before they enter the host doc — they trigger huge
-        // allocations and unbounded recursion in the wire pipeline.
-        if super::is_entity_corrupt(&entity) {
-            dropped += 1;
-            continue;
-        }
         // Remap every symbol reference so the host's resolver hits the copies
         // just imported (load path ignores the unremapped count; BIND reports
         // it per bind).
@@ -1351,7 +1324,7 @@ fn merge_source_entities(
             entity_handle_map.insert(old_h, new_h);
         }
     }
-    (dropped, unremapped, entity_handle_map)
+    (unremapped, entity_handle_map)
 }
 
 fn is_sentinel_linetype(name: &str) -> bool {
@@ -2170,8 +2143,7 @@ fn merge_bound_doc(
         taken,
     };
     let maps = import_xref_symbols(target, source, &mut naming);
-    let (_, unremapped, entity_handle_map) =
-        merge_source_entities(target, source, target_br, &maps);
+    let (unremapped, entity_handle_map) = merge_source_entities(target, source, target_br, &maps);
     copy_xref_sortents(
         target,
         source,
@@ -2970,7 +2942,7 @@ mod tests {
         // 3. Targeted reload: back to Loaded.
         let mut handles = HashSet::default();
         handles.insert(doc.block_records.get("MID").unwrap().handle);
-        let (infos, _) = resolve_xrefs_for_keys(&mut doc, &dir, &handles);
+        let infos = resolve_xrefs_for_keys(&mut doc, &dir, &handles);
         assert!(infos.iter().any(|i| i.name == "MID"));
         let listed = collect_entries_with_prev(&doc, &dir, &empty, &no_prev);
         assert!(listed
@@ -3336,7 +3308,7 @@ mod tests {
                 // Hatch (pattern names have no table — preserved verbatim).
                 let mut hatch = codec::entities::Hatch::new();
                 hatch.pattern.name = "ANSI31".to_string();
-                doc.add_entity(codec::EntityType::Hatch(hatch)).unwrap();
+                doc.add_entity(codec::EntityType::Hatch(Box::new(hatch))).unwrap();
                 // Dim-style reference via a tolerance entity.
                 doc.dim_styles
                     .add(codec::tables::DimStyle::new("ARCH"))

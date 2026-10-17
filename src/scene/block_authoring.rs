@@ -1,4 +1,6 @@
 //! Shared native graph construction for Block Editor authoring objects.
+pub(crate) mod graph;
+pub(crate) mod edit;
 use codec::objects::{
     BlockEvalExpression, BlockEvalValue, DynamicBlockData, DynamicBlockObject, ObjectType,
 };
@@ -217,6 +219,31 @@ pub(super) fn append(
     expressions: [Handle; 4],
 ) {
     append_components(document, handle, slots, &expressions, &[2, 3]);
+}
+
+/// Basepoint parameters and action objects can be standalone expressions.
+pub(super) fn append_single(
+    document: &mut CadDocument,
+    handle: Handle,
+    slots: Slots,
+    expression: Handle,
+) {
+    let ObjectType::DynamicBlock(object) = document.objects.get_mut(&handle).unwrap() else {
+        unreachable!()
+    };
+    let DynamicBlockData::EvaluationGraph(graph) = &mut object.data else {
+        unreachable!()
+    };
+    graph.nodes.push(codec::objects::BlockEvaluationNode {
+        id: slots.node,
+        next_id: slots.eval,
+        expression,
+        edge_flags: 32,
+        node_data: [-1; 4],
+        active_cycles: None,
+    });
+    graph.first_node_id = slots.eval;
+    graph.first_node_id_copy = slots.eval;
 }
 
 /// Append a parameter and grip, followed by its location/state expressions.

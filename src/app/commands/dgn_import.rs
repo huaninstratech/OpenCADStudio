@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
-use crate::modules::insert::dgn_import::{self, DgnImportCommand, DgnImportRequest};
+use crate::io::model_import::ModelFormat;
+use crate::modules::insert::dgn_import::{
+    self, DgnImportCommand, DgnImportRequest, ExistingReference, ReferenceMode,
+};
 use crate::ui::window::import_dialogs::{
     unsupported_reason, DgnImportState, ImportDialogMsg, ImportFileState, Support, FORMATS,
 };
@@ -18,7 +21,7 @@ const RECENT: usize = 5;
 
 /// Picks a file and registers its bytes (the web build reads them only
 /// here); `None` when the picker is cancelled.
-async fn pick(title: String, filters: Vec<(String, Vec<String>)>) -> Option<String> {
+pub(super) async fn pick(title: String, filters: Vec<(String, Vec<String>)>) -> Option<String> {
     let mut dialog = crate::sys::file_dialog().set_title(title.as_str());
     for (name, extensions) in &filters {
         let extensions: Vec<&str> = extensions.iter().map(String::as_str).collect();
@@ -53,7 +56,7 @@ fn exists(path: &str) -> bool {
 
 /// Whether the file is a DGN model DGNIMPORT reads.
 fn is_dgn(path: &str) -> bool {
-    crate::scene::model::underlay_vector::item_names(codec::entities::UnderlayType::Dgn, path)
+    crate::scene::model::underlay_vector::dgn_import_models(path)
         .and_then(|models| models.into_iter().next())
         .is_some_and(|model| crate::scene::model::underlay_vector::dgn_import(path, &model).is_some())
 }
@@ -62,6 +65,9 @@ fn is_dgn(path: &str) -> bool {
 enum Route {
     Pdf,
     Dgn,
+    Model(ModelFormat),
+    Wmf,
+    Tds,
 }
 
 /// The importer for `path` chosen as `format` (an index of [`FORMATS`]; `None`
@@ -75,6 +81,22 @@ fn route(path: &str, format: Option<usize>) -> Result<Route, String> {
     }
     let ext = extension(path);
     let by_extension = f.is_none_or(|f| f.support == Support::ByExtension);
+    // The chosen format, or the one whose patterns name the extension.
+    let named = if by_extension {
+        FORMATS
+            .iter()
+            .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)))
+    } else {
+        f
+    };
+    match named.map(|f| f.name) {
+        Some("ACIS") => return Ok(Route::Model(ModelFormat::Sat)),
+        Some("STEP") => return Ok(Route::Model(ModelFormat::Step)),
+        Some("IGES") => return Ok(Route::Model(ModelFormat::Iges)),
+        Some("Metafile") => return Ok(Route::Wmf),
+        Some("3D Studio") => return Ok(Route::Tds),
+        _ => {}
+    }
     let pdf = if by_extension { ext == "pdf" } else { f.is_some_and(|f| f.name == "PDF Files") };
     if pdf {
         return Ok(Route::Pdf);
@@ -111,8 +133,8 @@ impl OpenCADStudio {
                 Some(Task::none())
             }
             ("IMPORT", true) => {
-                use crate::command::{CadCommand, ValuePromptCommand};
-                let command = ValuePromptCommand::new("_IMPORTFILE", "Enter import file name:");
+                use crate::command::{CadCommand, FreeTextValuePromptCommand};
+                let command = FreeTextValuePromptCommand::new("_IMPORTFILE", "Enter import file name:");
                 self.command_line.push_info(&command.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(command));
                 Some(Task::none())
@@ -158,28 +180,38 @@ impl OpenCADStudio {
 
     /// The DGN Import window for a file; an error when it is no DGN model.
     pub(in crate::app) fn open_dgn_import_dialog(&mut self, path: &str) -> Result<(), String> {
-        use crate::scene::model::underlay_vector::{dgn_import, item_names};
-        let models = item_names(codec::entities::UnderlayType::Dgn, path).unwrap_or_default();
+        use crate::scene::model::underlay_vector::{dgn_import, dgn_import_models};
+        let models = dgn_import_models(path).unwrap_or_default();
         let Some(import) = models.first().and_then(|m| dgn_import(path, m)) else {
             return Err(crate::t!("Invalid or unsupported DGN file.").into_owned());
         };
-        // The options chosen last stay when the file is changed.
+        // The options chosen last (DGNIMPORTMODE and the kept import
+        // settings when the window opens) stay when the file is changed.
         let previous = self.import_dialogs.dgn.take();
+        let saved = dgn_import::settings();
         let keep = |f: fn(&DgnImportState) -> bool, default: bool| {
             previous.as_ref().map_or(default, f)
         };
         self.import_dialogs.dgn = Some(DgnImportState {
             path: path.to_string(),
             version: if import.v7 { "V7" } else { "V8" },
+            // Sheet models are not imported.
             models: crate::ui::window::pdf_dialogs::item_thumbs(
                 codec::entities::UnderlayType::Dgn,
                 path,
-            ),
+            )
+            .into_iter()
+            .filter(|m| models.contains(&m.label))
+            .collect(),
             model: 0,
-            current_drawing: keep(|s| s.current_drawing, false),
-            prefix_duplicates: keep(|s| s.prefix_duplicates, false),
+            current_drawing: keep(|s| s.current_drawing, saved.mode != 0),
+            prefix_duplicates: keep(|s| s.prefix_duplicates, saved.mode == 2),
             sub_units: keep(|s| s.sub_units, false),
-            explode_text_nodes: keep(|s| s.explode_text_nodes, false),
+            explode_text_nodes: keep(|s| s.explode_text_nodes, saved.explode_text_nodes),
+            references: previous.as_ref().map_or(saved.references, |s| s.references),
+            existing_reference: previous
+                .as_ref()
+                .map_or(saved.existing_reference, |s| s.existing_reference),
             units: import.unit_names.clone(),
             mapping_tab: previous.as_ref().map_or(0, |s| s.mapping_tab),
             mapping: [0, 1, 2, 3].map(|tab| dgn_import::mapping_rows(&import, tab)),
@@ -217,6 +249,24 @@ impl OpenCADStudio {
                 }
                 self.dispatch_command(&format!("-DGNIMPORT {path}"))
             }
+            Ok(Route::Model(format)) => {
+                self.remember_import(path);
+                let i = self.active_tab;
+                self.import_model(i, path, format)
+            }
+            Ok(Route::Wmf) => {
+                self.remember_import(path);
+                let i = self.active_tab;
+                self.import_wmf(i, path, false)
+            }
+            // The options window opens whatever FILEDIA is.
+            Ok(Route::Tds) => {
+                self.remember_import(path);
+                if let Err(error) = self.open_tds_import_dialog(path) {
+                    self.command_line.push_error(&error);
+                }
+                Task::none()
+            }
             Err(error) => {
                 self.command_line.push_error(&error);
                 Task::none()
@@ -232,6 +282,7 @@ impl OpenCADStudio {
                     "dgn" => crate::t!(
                         "Imports a DGN model as drawing objects: levels as layers, cells as blocks."
                     ),
+                    "3ds" => std::borrow::Cow::Owned(crate::tr!("import-3ds", "help")),
                     _ => crate::t!(
                         "Imports a file of the chosen format with the format's importer."
                     ),
@@ -324,7 +375,80 @@ impl OpenCADStudio {
                             self.command_line.push_error(&error);
                         }
                     }
+                    Ok(Route::Model(kind)) => {
+                        self.remember_import(&path);
+                        self.close_active_modal();
+                        return self.import_model(i, &path, kind);
+                    }
+                    Ok(Route::Wmf) => {
+                        self.remember_import(&path);
+                        self.close_active_modal();
+                        return self.import_wmf(i, &path, false);
+                    }
+                    Ok(Route::Tds) => {
+                        self.remember_import(&path);
+                        self.close_active_modal();
+                        if let Err(error) = self.open_tds_import_dialog(&path) {
+                            self.command_line.push_error(&error);
+                        }
+                    }
                 }
+            }
+            // ── 3D Studio Import ─────────────────────────────────────────
+            ImportDialogMsg::TdsChange => {
+                let title = crate::t!("Import File").into_owned();
+                let filters = vec![("3D Studio (*.3ds)".to_string(), vec!["3ds".to_string()])];
+                return Task::perform(pick(title, filters), |path| {
+                    Message::ImportDialog(ImportDialogMsg::TdsPicked(path))
+                });
+            }
+            ImportDialogMsg::TdsPicked(Some(path)) => {
+                if let Err(error) = self.open_tds_import_dialog(&path) {
+                    self.command_line.push_error(&error);
+                }
+            }
+            ImportDialogMsg::TdsPicked(None) => {}
+            ImportDialogMsg::TdsCheck(k, on) => {
+                if let Some(c) = self.import_dialogs.tds.as_mut().and_then(|s| s.checked.get_mut(k)) {
+                    *c = on;
+                }
+            }
+            ImportDialogMsg::TdsAll | ImportDialogMsg::TdsClear => {
+                let on = matches!(message, ImportDialogMsg::TdsAll);
+                if let Some(s) = self.import_dialogs.tds.as_mut() {
+                    s.checked.iter_mut().for_each(|c| *c = on);
+                }
+            }
+            ImportDialogMsg::TdsFilter(k) => {
+                if let Some(s) = self.import_dialogs.tds.as_mut() {
+                    s.filter = k.min(4);
+                }
+            }
+            ImportDialogMsg::TdsSearch(text) => {
+                if let Some(s) = self.import_dialogs.tds.as_mut() {
+                    s.search = text;
+                }
+            }
+            ImportDialogMsg::TdsLayers(k) => {
+                if let Some(s) = self.import_dialogs.tds.as_mut() {
+                    s.layers = k.min(3);
+                }
+            }
+            ImportDialogMsg::TdsMulti(k) => {
+                if let Some(s) = self.import_dialogs.tds.as_mut() {
+                    s.multi = k.min(3);
+                }
+            }
+            ImportDialogMsg::TdsOk => {
+                let Some(state) = self.import_dialogs.tds.take() else {
+                    return Task::none();
+                };
+                if !state.checked.iter().any(|c| *c) {
+                    self.import_dialogs.tds = Some(state);
+                    return Task::none();
+                }
+                self.close_active_modal();
+                return self.start_tds_import(i, state);
             }
             // ── DGN Import ───────────────────────────────────────────────
             ImportDialogMsg::DgnChange => return self.pick_dgn_file(),
@@ -366,6 +490,16 @@ impl OpenCADStudio {
                     s.explode_text_nodes = on;
                 }
             }
+            ImportDialogMsg::DgnReferences(mode) => {
+                if let Some(s) = self.import_dialogs.dgn.as_mut() {
+                    s.references = mode;
+                }
+            }
+            ImportDialogMsg::DgnExisting(choice) => {
+                if let Some(s) = self.import_dialogs.dgn.as_mut() {
+                    s.existing_reference = choice;
+                }
+            }
             ImportDialogMsg::DgnMappingTab(tab) => {
                 if let Some(s) = self.import_dialogs.dgn.as_mut() {
                     s.mapping_tab = tab.min(3);
@@ -386,7 +520,22 @@ impl OpenCADStudio {
                     explode_text_nodes: s.explode_text_nodes,
                     current_drawing: s.current_drawing,
                     prefix_duplicates: s.prefix_duplicates,
+                    references: s.references,
+                    existing_reference: s.existing_reference,
                 };
+                // The window's choices become DGNIMPORTMODE and the kept
+                // settings the command line imports with.
+                dgn_import::set_settings(dgn_import::DgnImportSettings {
+                    mode: match (s.current_drawing, s.prefix_duplicates) {
+                        (false, _) => 0,
+                        (true, false) => 1,
+                        (true, true) => 2,
+                    },
+                    explode_text_nodes: s.explode_text_nodes,
+                    references: s.references,
+                    existing_reference: s.existing_reference,
+                });
+                self.save_config();
                 self.close_active_modal();
                 return self.run_dgn_import(i, request);
             }
@@ -394,7 +543,8 @@ impl OpenCADStudio {
         Task::none()
     }
 
-    /// The import: into a new drawing (or the current one), one undo step.
+    /// The import: into a new drawing (or the current one), one undo step;
+    /// then the model's reference attachments as the request says.
     pub(in crate::app) fn run_dgn_import(&mut self, i: usize, request: DgnImportRequest) -> Task<Message> {
         let Some(import) =
             crate::scene::model::underlay_vector::dgn_import(&request.path, &request.model)
@@ -413,84 +563,34 @@ impl OpenCADStudio {
             self.active_tab
         };
         self.push_undo_snapshot(i, "DGNIMPORT");
-        let stem = std::path::Path::new(&request.path.replace('\\', "/"))
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let scene = &mut self.tabs[i].scene;
-        // In the current drawing, names it already has keep the existing
-        // definitions, or are imported under the file's name as prefix.
-        let prefix = (request.current_drawing && request.prefix_duplicates)
-            .then(|| format!("{stem}$0$"));
-        let rename = |taken: bool, name: &str| match &prefix {
-            Some(p) if taken && name != "0" => format!("{p}{name}"),
-            _ => name.to_string(),
+        let naming = if !request.current_drawing {
+            Naming::Number
+        } else if request.prefix_duplicates {
+            let stem = std::path::Path::new(&request.path.replace('\\', "/"))
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let prefix = format!("{stem} - {}$0$", request.model);
+            Naming::Prefix(dgn_import::symbol_name(&prefix))
+        } else {
+            Naming::Keep
         };
-        let mut layers: HashMap<String, String> = HashMap::new();
-        for (name, color) in &converted.layers {
-            let target = rename(scene.document.layers.contains(name), name);
-            if !scene.document.layers.contains(&target) {
-                let mut layer = codec::tables::Layer::new(target.as_str());
-                layer.handle = scene.document.allocate_handle();
-                layer.color = *color;
-                let _ = scene.document.layers.add(layer);
+        let layers = place_converted(&mut self.tabs[i].scene, converted, &naming);
+        if request.references != ReferenceMode::Ignore {
+            let k = if request.sub_units { import.sub_per_master } else { 1.0 };
+            // A reference is placed on the model's default level.
+            let layer = import
+                .levels
+                .get(&64)
+                .map(|l| dgn_import::symbol_name(&l.0))
+                .unwrap_or_else(|| "0".to_string());
+            let layer = layers.get(&layer).cloned().unwrap_or(layer);
+            for reference in &import.references {
+                self.attach_dgn_reference(i, &request, reference, k, &layer);
             }
-            layers.insert(name.clone(), target);
-        }
-        let mut styles: HashMap<String, String> = HashMap::new();
-        for (name, font) in &converted.styles {
-            let target = rename(scene.document.text_styles.contains(name), name);
-            if !scene.document.text_styles.contains(&target) {
-                let mut style = codec::tables::TextStyle::new(target.as_str());
-                style.handle = scene.document.allocate_handle();
-                style.font_file = font.clone();
-                let _ = scene.document.text_styles.add(style);
-            }
-            styles.insert(name.clone(), target);
-        }
-        let mut blocks: HashMap<String, String> = HashMap::new();
-        for (name, _) in &converted.blocks {
-            let taken = scene.document.block_records.get(name).is_some();
-            blocks.insert(name.clone(), rename(taken, name));
-        }
-        let fix = |mut entity: codec::EntityType| {
-            let common = entity.common_mut();
-            if let Some(layer) = layers.get(&common.layer) {
-                common.layer = layer.clone();
-            }
-            match &mut entity {
-                codec::EntityType::Text(t) => {
-                    if let Some(s) = styles.get(&t.style) {
-                        t.style = s.clone();
-                    }
-                }
-                codec::EntityType::MText(t) => {
-                    if let Some(s) = styles.get(&t.style) {
-                        t.style = s.clone();
-                    }
-                }
-                codec::EntityType::Insert(insert) => {
-                    if let Some(b) = blocks.get(&insert.block_name) {
-                        insert.block_name = b.clone();
-                    }
-                }
-                _ => {}
-            }
-            entity
-        };
-        for (name, entities) in converted.blocks {
-            let target = &blocks[&name];
-            if scene.document.block_records.get(target).is_some() {
-                continue;
-            }
-            let entities = entities.into_iter().map(&fix).collect();
-            let _ = scene.define_block_from_owned_entities(entities, target, glam::DVec3::ZERO);
-        }
-        for entity in converted.entities {
-            scene.add_entity(fix(entity));
         }
         if !request.current_drawing {
-            scene.fit_all();
+            self.tabs[i].scene.fit_all();
         }
         self.tabs[i].dirty = true;
         self.command_line.push_output("Regenerating model.");
@@ -498,4 +598,249 @@ impl OpenCADStudio {
         self.refresh_properties();
         task
     }
+
+    /// One reference attachment: its file translated to "<file>-<model>.dwg"
+    /// beside it and attached as the external reference "<file> - <model>",
+    /// or the file attached as a DGN underlay, at the attachment's place.
+    fn attach_dgn_reference(
+        &mut self,
+        i: usize,
+        request: &DgnImportRequest,
+        reference: &crate::scene::model::underlay_vector::DgnReference,
+        units: f64,
+        layer: &str,
+    ) {
+        use crate::scene::model::underlay_vector::{dgn_import, dgn_import_models};
+        let host_dir = std::path::Path::new(&request.path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        // A relative name is beside the host file; failing that, the file
+        // of that name in the host's folder.
+        let named = std::path::Path::new(&reference.file.replace('\\', "/")).to_path_buf();
+        let joined = host_dir.join(&named);
+        let file = if joined.is_file() {
+            joined
+        } else {
+            host_dir.join(named.file_name().unwrap_or_default())
+        };
+        let path = file.to_string_lossy().into_owned();
+        if crate::scene::model::pdf_raster::source_bytes(&path).is_none() {
+            return;
+        }
+        let Some(model) = (if reference.model.is_empty() {
+            dgn_import_models(&path).and_then(|m| m.into_iter().next())
+        } else {
+            Some(reference.model.clone())
+        }) else {
+            return;
+        };
+        // Sub units scale the placement and the size alike.
+        let origin = glam::DVec3::from_array(reference.origin) * units;
+        let scale = reference.scale * units;
+        if request.references == ReferenceMode::Underlay {
+            let mut placed = crate::modules::insert::pdf_attach::underlays_for_pages(
+                codec::entities::UnderlayType::Dgn,
+                std::slice::from_ref(&model),
+                origin,
+                scale,
+                reference.rotation,
+            );
+            let scene = &mut self.tabs[i].scene;
+            for (page, mut entity) in placed.drain(..) {
+                let definition = crate::modules::insert::pdf_attach::ensure_underlay_definition(
+                    &mut scene.document,
+                    codec::entities::UnderlayType::Dgn,
+                    &path,
+                    &page,
+                );
+                if let codec::EntityType::Underlay(underlay) = &mut entity {
+                    underlay.definition_handle = definition;
+                }
+                entity.common_mut().layer = layer.to_string();
+                scene.add_entity(entity);
+            }
+            return;
+        }
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // The model name comes from the file: made a plain file name so the
+        // drawing is written in the reference's folder.
+        let model_name = dgn_import::symbol_name(&model);
+        let target = file.with_file_name(format!("{stem}-{model_name}.dwg"));
+        // ponytail: "Prompt to overwrite" asks nothing and keeps the existing
+        // drawing, like "Do not overwrite"; add a confirmation if wanted.
+        let write = !target.is_file() || request.existing_reference == ExistingReference::Overwrite;
+        if write {
+            let Some(source) = dgn_import(&path, &model) else {
+                return;
+            };
+            let mut scene = crate::scene::Scene::new();
+            let converted = dgn_import::convert(&source, false, request.explode_text_nodes);
+            place_converted(&mut scene, converted, &Naming::Number);
+            if let Err(error) = crate::io::save(&scene.document, &target) {
+                self.command_line.push_error(&error);
+                return;
+            }
+        }
+        let xref = crate::modules::insert::xattach::XrefAttachRequest {
+            path: target.to_string_lossy().into_owned(),
+            overlay: false,
+            path_type: crate::io::xref_model::Pathtype::Relative,
+        };
+        let name = dgn_import::symbol_name(&format!("{stem} - {model}"));
+        let full = crate::modules::insert::xattach::resolve_xref_store_path(&xref.path, None);
+        self.command_line
+            .push_output(&format!("Attach Xref \"{name}\": {full}"));
+        let host = self.tabs[i].current_path.clone();
+        let block = crate::modules::insert::xattach::prepare_named_xref_definition(
+            &mut self.tabs[i].scene,
+            &xref,
+            host.as_deref(),
+            &name,
+        );
+        if host.is_none() {
+            self.tabs[i].xref_relative_on_save.insert(block.clone());
+        }
+        self.command_line
+            .push_output(&format!("\"{name}\" loaded: {full}"));
+        let mut insert = codec::entities::Insert::new(
+            block,
+            codec::types::Vector3::new(origin.x, origin.y, origin.z),
+        )
+        .with_scale(scale, scale, scale)
+        .with_rotation(reference.rotation);
+        insert.common.layer = layer.to_string();
+        insert.common.linetype = "Continuous".to_string();
+        self.tabs[i]
+            .scene
+            .add_entity(codec::EntityType::Insert(insert));
+        self.refresh_xref_manager();
+    }
+}
+
+/// How imported names meet the names a drawing already has: a new drawing
+/// numbers a clashing layer "<name>_1" and a clashing block or text style
+/// "<name>1" (layer 0 and the Standard style are shared); the current
+/// drawing either keeps its own definitions or prefixes every imported name
+/// (layers 0 and Defpoints excepted).
+enum Naming {
+    Number,
+    Keep,
+    Prefix(String),
+}
+
+impl Naming {
+    fn name(&self, kind: char, name: &str, taken: &dyn Fn(&str) -> bool) -> String {
+        match self {
+            Naming::Keep => name.to_string(),
+            Naming::Prefix(p) => {
+                let shared = kind == 'l'
+                    && (name == "0" || name.eq_ignore_ascii_case("Defpoints"));
+                if shared {
+                    name.to_string()
+                } else {
+                    format!("{p}{name}")
+                }
+            }
+            Naming::Number => {
+                let shared = (kind == 'l' && name == "0")
+                    || (kind == 's' && name.eq_ignore_ascii_case("Standard"));
+                if shared || !taken(name) {
+                    return name.to_string();
+                }
+                let sep = if kind == 'l' { "_" } else { "" };
+                (1..)
+                    .map(|n| format!("{name}{sep}{n}"))
+                    .find(|n| !taken(n))
+                    .unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// Adds converted objects to a drawing under the naming rule; returns the
+/// layer names as placed.
+fn place_converted(
+    scene: &mut crate::scene::Scene,
+    converted: dgn_import::Converted,
+    naming: &Naming,
+) -> HashMap<String, String> {
+    let mut layers: HashMap<String, String> = HashMap::new();
+    for (name, color) in &converted.layers {
+        let doc = &scene.document;
+        let taken = |n: &str| doc.layers.iter().any(|l| l.name.eq_ignore_ascii_case(n));
+        let target = naming.name('l', name, &taken);
+        if !scene.document.layers.iter().any(|l| l.name.eq_ignore_ascii_case(&target)) {
+            let mut layer = codec::tables::Layer::new(target.as_str());
+            layer.handle = scene.document.allocate_handle();
+            layer.color = *color;
+            let _ = scene.document.layers.add(layer);
+        }
+        layers.insert(name.clone(), target);
+    }
+    let mut styles: HashMap<String, String> = HashMap::new();
+    for (name, font) in &converted.styles {
+        let doc = &scene.document;
+        let taken = |n: &str| doc.text_styles.iter().any(|s| s.name.eq_ignore_ascii_case(n));
+        let target = naming.name('s', name, &taken);
+        if !scene.document.text_styles.iter().any(|s| s.name.eq_ignore_ascii_case(&target)) {
+            let mut style = codec::tables::TextStyle::new(target.as_str());
+            style.handle = scene.document.allocate_handle();
+            style.font_file = font.clone();
+            let _ = scene.document.text_styles.add(style);
+        }
+        styles.insert(name.clone(), target);
+    }
+    let mut blocks: HashMap<String, String> = HashMap::new();
+    let mut claimed: Vec<String> = Vec::new();
+    for (name, _) in &converted.blocks {
+        let doc = &scene.document;
+        let taken = |n: &str| {
+            doc.block_records.iter().any(|b| b.name.eq_ignore_ascii_case(n))
+                || claimed.iter().any(|c| c.eq_ignore_ascii_case(n))
+        };
+        let target = naming.name('b', name, &taken);
+        claimed.push(target.clone());
+        blocks.insert(name.clone(), target);
+    }
+    let fix = |mut entity: codec::EntityType| {
+        let common = entity.common_mut();
+        if let Some(layer) = layers.get(&common.layer) {
+            common.layer = layer.clone();
+        }
+        match &mut entity {
+            codec::EntityType::Text(t) => {
+                if let Some(s) = styles.get(&t.style) {
+                    t.style = s.clone();
+                }
+            }
+            codec::EntityType::MText(t) => {
+                if let Some(s) = styles.get(&t.style) {
+                    t.style = s.clone();
+                }
+            }
+            codec::EntityType::Insert(insert) => {
+                if let Some(b) = blocks.get(&insert.block_name) {
+                    insert.block_name = b.clone();
+                }
+            }
+            _ => {}
+        }
+        entity
+    };
+    for (name, entities) in converted.blocks {
+        let target = &blocks[&name];
+        if scene.document.block_records.get(target).is_some() {
+            continue;
+        }
+        let entities = entities.into_iter().map(&fix).collect();
+        let _ = scene.define_block_from_owned_entities(entities, target, glam::DVec3::ZERO);
+    }
+    for entity in converted.entities {
+        scene.add_entity(fix(entity));
+    }
+    layers
 }

@@ -2389,7 +2389,7 @@ impl OpenCADStudio {
                     Vector3::new(mv.center.x - mv.target.x, mv.center.y - mv.target.y, 0.0);
                 vp.view_height = mv.height;
                 vp.custom_scale = scale;
-                scene.add_entity(codec::EntityType::Viewport(vp));
+                scene.add_entity(codec::EntityType::Viewport(Box::new(vp)));
                 // A paper-space named view of the same name frames it.
                 let mut named = codec::tables::View::new(title.as_str());
                 named.handle = scene.document.allocate_handle();

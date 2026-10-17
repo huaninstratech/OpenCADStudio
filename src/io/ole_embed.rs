@@ -168,7 +168,7 @@ pub fn add_embedded_image(
 ) -> Result<codec::Handle, String> {
     let (upper_left, lower_right) = corners_from_placement(origin, width, image.aspect());
     let ole = build_embedded_ole(image, upper_left, lower_right);
-    doc.add_entity(codec::EntityType::Ole2Frame(ole))
+    doc.add_entity(codec::EntityType::Ole2Frame(Box::new(ole)))
         .map_err(|e| e.to_string())
 }
 

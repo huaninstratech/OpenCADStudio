@@ -1349,6 +1349,9 @@ impl Scene {
                 .map_err(|e| e.to_string())?;
             entity_handles.push(handle);
         }
+        // Solids, surfaces and meshes of a definition draw through their
+        // instanced block meshes, which only a tessellation pass creates.
+        self.refresh_meshes_for_handles(&entity_handles);
         // Block defns don't render on their own, but the geometry cache must
         // pick up the new definition so the interactive insert can preview it.
         self.bump_geometry();
@@ -1391,12 +1394,14 @@ impl Scene {
         block_end.common.owner_handle = br_handle;
         let _ = self.document.add_entity(EntityType::BlockEnd(block_end));
 
+        let mut added = Vec::new();
         for mut entity in entities {
             Self::reset_clone_subhandles(&mut self.document, &mut entity);
             entity.common_mut().handle = Handle::NULL;
             entity.common_mut().owner_handle = br_handle;
-            let _ = self.document.add_entity(entity);
+            added.extend(self.document.add_entity(entity).ok());
         }
+        self.refresh_meshes_for_handles(&added);
         self.bump_geometry();
     }
 
@@ -1446,18 +1451,21 @@ impl Scene {
             })
             .map(|e| e.common().handle)
             .collect();
-        for h in owned {
-            self.document.remove_entity(h);
+        for h in &owned {
+            self.document.remove_entity(*h);
         }
         if let Some(EntityType::Block(block)) = self.document.get_entity_mut(block_handle) {
             block.base_point = base_point;
         }
+        // The old contents' meshes go with them; the new ones are built.
+        let mut changed = owned;
         for mut entity in entities {
             Self::reset_clone_subhandles(&mut self.document, &mut entity);
             entity.common_mut().handle = Handle::NULL;
             entity.common_mut().owner_handle = br_handle;
-            let _ = self.document.add_entity(entity);
+            changed.extend(self.document.add_entity(entity).ok());
         }
+        self.refresh_meshes_for_handles(&changed);
         self.bump_geometry();
         Ok(())
     }
@@ -3206,7 +3214,7 @@ impl Scene {
         if let Some(origin) = model.pattern_origin {
             dxf.record_pattern_origin(Vector2::new(origin[0], origin[1]));
         }
-        let mut entity = EntityType::Hatch(dxf);
+        let mut entity = EntityType::Hatch(Box::new(dxf));
 
         if let Some(layer) = layer {
             entity.as_entity_mut().set_layer(layer.to_string());

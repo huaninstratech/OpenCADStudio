@@ -113,7 +113,7 @@ impl CadCommand for PasteSpecCommand {
         mtext.style = self.style.clone();
         mtext.attachment_point = AttachmentPoint::TopLeft;
         mtext.rectangle_width = 0.0;
-        CmdResult::CommitAndExit(self.plane.place_entity(EntityType::MText(mtext)))
+        CmdResult::CommitAndExit(self.plane.place_entity(EntityType::MText(Box::new(mtext))))
     }
 
     fn on_enter(&mut self) -> CmdResult {

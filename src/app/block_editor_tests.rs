@@ -59,6 +59,565 @@ fn feed(app: &mut OpenCADStudio, text: &str) {
     let _ = app.update(Message::CommandSubmit);
 }
 
+#[test]
+fn authoring_edit_basepoint_attribute_relocation_undo_and_cancel() {
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let i = app.active_tab;
+    let _ = app.run_command_line("BPARAMETER BASEPOINT 2,3");
+    let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let handle = crate::scene::block_basepoint::parameter(&app.tabs[i].scene.document, def)
+        .unwrap()
+        .0;
+    let mut attribute = codec::entities::AttributeEntity::new("TAG".into(), "value".into());
+    attribute.insertion_point = Vector3::new(7., 8., 0.);
+    let EntityType::Insert(insert) = app.tabs[i]
+        .scene
+        .document
+        .get_entity_mut(reference)
+        .unwrap()
+    else {
+        panic!()
+    };
+    insert.attributes.push(attribute);
+    let before = app.tabs[i].scene.document.clone();
+    let result = crate::command::CmdResult::EditBlockAuthoring {
+        document: app.tabs[i].id,
+        definition: def,
+        handle,
+        part: crate::scene::block_authoring::edit::Part::Point,
+        position: glam::DVec3::new(4., 6., 0.),
+    };
+    let _ = app.handle_authoring_edit(result);
+    assert_ne!(
+        app.tabs[i].scene.document.get_entity(reference),
+        before.get_entity(reference)
+    );
+    app.undo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, before);
+    app.redo_steps(1);
+    assert_ne!(
+        app.tabs[i].scene.document.get_entity(reference),
+        before.get_entity(reference)
+    );
+    app.tabs[i].selected_authoring = Some(handle);
+    app.refresh_properties();
+    let id = app.tabs[i].selected_grips[0].id;
+    assert!(app.start_authoring_grip(handle, id));
+    let after = app.tabs[i].scene.document.clone();
+    let depth = app.tabs[i].history.undo_stack.len();
+    let _ = app.update(Message::CommandEscape);
+    assert_eq!(app.tabs[i].scene.document, after);
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
+    let _ = app.update(Message::CommandEscape);
+    assert_eq!(app.tabs[i].selected_authoring, None);
+}
+
+#[test]
+fn authoring_edit_mouse_selection_endpoint_label_marker_history_and_reopen() {
+    use crate::scene::block_authoring::edit::{self, Part};
+    use crate::scene::block_actions::{self as actions, Kind};
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let i = app.active_tab;
+    let _ = app.run_command_line("BPARAMETER LINEAR 2,2 6,2 4,3");
+    let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let p = actions::parameters(&app.tabs[i].scene.document, def, Kind::Move)[0].clone();
+    let targets = members(&app);
+    let a = actions::create(
+        &mut app.tabs[i].scene.document,
+        def,
+        Kind::Move,
+        p.handle,
+        &targets,
+        glam::DVec3::new(5., 5., 0.),
+    )
+    .unwrap();
+    app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600., 900.);
+    app.tabs[i].scene.camera.borrow_mut().fit_to_bounds_f64(
+        glam::DVec3::new(-1., -1., 0.),
+        glam::DVec3::new(10., 7., 0.),
+        1600. / 900.,
+    );
+    let click = |app: &mut OpenCADStudio, point: Vector3| {
+        let scene = &app.tabs[app.active_tab].scene;
+        let (w, h) = scene.selection.borrow().view.vp_size;
+        let b = scene.active_model_tile_bounds(w, h);
+        let s = scene
+            .camera
+            .borrow()
+            .project(
+                glam::DVec3::new(point.x, point.y, point.z),
+                iced::Rectangle {
+                    x: 0.,
+                    y: 0.,
+                    width: b.width,
+                    height: b.height,
+                },
+            )
+            .unwrap();
+        let _ = app.update(Message::ViewportLeftPressAt(iced::Point::new(
+            s.x + b.x,
+            s.y + b.y,
+        )));
+        let _ = app.update(Message::ViewportLeftRelease);
+    };
+    click(&mut app, Vector3::new(4., 3., 0.));
+    assert_eq!(app.tabs[i].selected_authoring, Some(p.handle));
+    assert_eq!(app.tabs[i].selected_grips.len(), 3);
+    let before = app.tabs[i].scene.document.clone();
+    let depth = app.tabs[i].history.undo_stack.len();
+    click(&mut app, Vector3::new(6., 2., 0.));
+    assert_eq!(
+        app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+        Some("BEDITGRIP")
+    );
+    feed(&mut app, "8,2");
+    assert!(app.tabs[i].active_cmd.is_none());
+    assert_eq!(
+        actions::parameters(&app.tabs[i].scene.document, def, Kind::Move)[0].end,
+        glam::DVec3::new(8., 2., 0.)
+    );
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+    app.undo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, before);
+    app.redo_steps(1);
+    let label = edit::items(&app.tabs[i].scene.document, def)
+        .into_iter()
+        .find(|i| i.handle == p.handle)
+        .unwrap()
+        .grips
+        .into_iter()
+        .find(|(p, _)| *p == Part::Label(0))
+        .unwrap()
+        .1;
+    click(&mut app, label);
+    feed(&mut app, "5,4");
+    let graphic = edit::items(&app.tabs[i].scene.document, def)
+        .into_iter()
+        .find(|i| i.handle == p.handle)
+        .unwrap();
+    assert_eq!(graphic.graphic.labels[0].0, Vector3::new(5., 4., 0.));
+    let _ = app.update(Message::CommandEscape);
+    click(&mut app, Vector3::new(5., 5., 0.));
+    assert_eq!(app.tabs[i].selected_authoring, Some(a));
+    click(&mut app, Vector3::new(5., 5., 0.));
+    feed(&mut app, "7,5");
+    let action = actions::actions(&app.tabs[i].scene.document, def);
+    assert_eq!(action[0].1.display_location, Vector3::new(7., 5., 0.));
+    assert_eq!(action[0].1.dependencies, targets);
+    let _ = app.dispatch_command("BSAVE");
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+    assert!(app.tabs[i]
+        .selected_grips
+        .iter()
+        .all(|g| !super::block_authoring_edit::is_editor_grip(g.id)));
+    // Persisted native coordinates, rather than session-only display positions.
+    use std::io::Cursor;
+    let bytes = codec::DwgWriter::write_to_vec(&app.tabs[i].scene.document).unwrap();
+    let loaded = codec::DwgReader::from_stream(Cursor::new(bytes))
+        .read()
+        .unwrap();
+    assert_eq!(
+        actions::parameters(&loaded, def, Kind::Move)[0].end,
+        glam::DVec3::new(8., 2., 0.)
+    );
+    assert_eq!(
+        actions::actions(&loaded, def)[0].1.display_location,
+        Vector3::new(7., 5., 0.)
+    );
+    app.tabs[i].scene.document = loaded;
+    begin(&mut app, reference);
+    click(&mut app, Vector3::new(8., 2., 0.));
+    assert_eq!(app.tabs[i].selected_authoring, Some(p.handle));
+}
+
+#[test]
+fn block_actions_mouse_selection_waits_for_enter_for_move_and_scale() {
+    use crate::scene::block_actions::{self as actions, Kind};
+    for (kind, command) in [(Kind::Move, "BACTION MOVE"), (Kind::Scale, "BACTION SCALE")] {
+        let (mut app, reference) = fixture();
+        begin(&mut app, reference);
+        let source = app.active_tab;
+        let _ = app.run_command_line("CIRCLE 0.5,0.5 0.2");
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 2,0 1,-0.2");
+        let definition = app.tabs[source]
+            .active_block_edit_session()
+            .unwrap()
+            .br_handle;
+        app.tabs[source].scene.selection.borrow_mut().view.vp_size = (1600., 900.);
+        app.tabs[source]
+            .scene
+            .camera
+            .borrow_mut()
+            .fit_to_bounds_f64(
+                glam::DVec3::new(-0.5, -0.5, 0.),
+                glam::DVec3::new(2.5, 1.5, 0.),
+                1600. / 900.,
+            );
+        let _ = app.dispatch_command(command);
+        let click = |app: &mut OpenCADStudio, point: [f64; 3], modifiers: &str| {
+            let scene = &app.tabs[app.active_tab].scene;
+            let (vw, vh) = scene.selection.borrow().view.vp_size;
+            let tile = scene.active_model_tile_bounds(vw, vh);
+            let screen = scene
+                .camera
+                .borrow()
+                .project(
+                    glam::DVec3::from_array(point),
+                    iced::Rectangle {
+                        x: 0.,
+                        y: 0.,
+                        width: tile.width,
+                        height: tile.height,
+                    },
+                )
+                .unwrap();
+            let cursor = iced::Point::new(screen.x + tile.x, screen.y + tile.y);
+            let previous = (app.ctrl_down, app.shift_down);
+            app.ctrl_down = modifiers.contains("ctrl");
+            app.shift_down = modifiers.contains("shift");
+            let _ = app.update(Message::ViewportLeftPressAt(cursor));
+            let _ = app.update(Message::ViewportLeftRelease);
+            (app.ctrl_down, app.shift_down) = previous;
+        };
+        click(&mut app, [2., 0., 0.], "");
+        assert!(app.tabs[source]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .is_selection_gathering());
+        feed(&mut app, ""); // Empty selection does not cancel or advance.
+        assert!(app.tabs[source]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .is_selection_gathering());
+        for (point, modifiers, count) in [
+            ([0.5, 0., 0.], "", 1),
+            ([0.5, 0.7, 0.], "", 2),
+            ([0.5, 0., 0.], "shift", 1),
+            ([0.5, 0., 0.], "", 2),
+        ] {
+            click(&mut app, point, modifiers);
+            assert!(
+                app.tabs[source]
+                    .active_cmd
+                    .as_ref()
+                    .unwrap()
+                    .is_selection_gathering(),
+                "every mouse pick/removal stays in object selection"
+            );
+            assert_eq!(app.tabs[source].scene.selected.len(), count);
+            assert!(actions::actions(&app.tabs[source].scene.document, definition).is_empty());
+        }
+        feed(&mut app, "");
+        assert!(!app.tabs[source]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .is_selection_gathering());
+        click(&mut app, [1.5, 1., 0.], "");
+        assert!(app.tabs[source].active_cmd.is_none());
+        let authored = actions::actions(&app.tabs[source].scene.document, definition);
+        assert_eq!(authored.len(), 1);
+        assert_eq!(authored[0].2, kind);
+        assert_eq!(authored[0].1.dependencies.len(), 2);
+        let original = app.tabs[source].scene.document.clone();
+        let _ = app.dispatch_command("BTESTBLOCK");
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600., 900.);
+        app.tabs[i].scene.camera.borrow_mut().fit_to_bounds_f64(
+            glam::DVec3::new(-0.5, -0.5, 0.),
+            glam::DVec3::new(4.5, 1.5, 0.),
+            1600. / 900.,
+        );
+        click(&mut app, [0.5, 0., 0.], "");
+        click(&mut app, [2., 0., 0.], "");
+        assert_eq!(
+            app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+            Some("BTESTBLOCK")
+        );
+        click(&mut app, [4., 0., 0.], "");
+        assert!(app.tabs[i].active_cmd.is_none());
+        let circle = app.tabs[i]
+            .scene
+            .document
+            .entities_in_block("EDIT_ME")
+            .find_map(|e| {
+                if let EntityType::Circle(c) = e {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let (center, radius) = if kind == Kind::Move {
+            (Vector3::new(2.5, 0.5, 0.), 0.2)
+        } else {
+            (Vector3::new(1., 1., 0.), 0.4)
+        };
+        // Mouse projection uses f32 screen coordinates; allow sub-pixel roundoff.
+        assert!(
+            (circle.center - center).length() < 1e-5,
+            "{kind:?}: actual {:?}, expected {center:?}",
+            circle.center
+        );
+        assert!((circle.radius - radius).abs() < 1e-5);
+        assert_eq!(app.tabs[source].scene.document, original);
+    }
+}
+
+#[test]
+fn block_actions_command_selection_cancel_undo_and_test_block_isolation() {
+    use crate::scene::block_actions::{self as actions, Kind};
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let source = app.active_tab;
+    let _ = app.run_command_line("BPARAMETER LINEAR 0,0 10,0 5,2");
+    let definition = app.tabs[source]
+        .active_block_edit_session()
+        .unwrap()
+        .br_handle;
+    let p =
+        actions::parameters(&app.tabs[source].scene.document, definition, Kind::Move)[0].clone();
+    let targets = members(&app);
+    let before = app.tabs[source].scene.document.clone();
+    let depth = app.tabs[source].history.undo_stack.len();
+    let _ = app.dispatch_command("BACTION MOVE");
+    feed(&mut app, &p.name);
+    assert!(app.tabs[source]
+        .active_cmd
+        .as_ref()
+        .unwrap()
+        .is_selection_gathering());
+    let _ = app.feed_command(crate::command::StepInput::SelectionComplete(
+        targets.clone(),
+    ));
+    let _ = app.update(Message::CommandEscape);
+    assert_eq!(app.tabs[source].scene.document, before);
+    assert_eq!(app.tabs[source].history.undo_stack.len(), depth);
+    for kind in ["Move", "Scale"] {
+        let _ = app.dispatch_command(&format!("BACTION {kind}"));
+        feed(&mut app, &p.name);
+        let _ = app.feed_command(crate::command::StepInput::SelectionComplete(
+            targets.clone(),
+        ));
+        assert!(app.tabs[source]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .is_selection_gathering());
+        let _ = app.feed_command(crate::command::StepInput::Enter);
+        feed(&mut app, "3,4");
+        assert!(app.tabs[source].active_cmd.is_none());
+    }
+    assert_eq!(
+        actions::actions(&app.tabs[source].scene.document, definition).len(),
+        2
+    );
+    assert_eq!(app.tabs[source].history.undo_stack.len(), depth + 2);
+    app.undo_steps(1);
+    assert_eq!(
+        actions::actions(&app.tabs[source].scene.document, definition).len(),
+        1
+    );
+    app.redo_steps(1);
+    assert_eq!(
+        actions::actions(&app.tabs[source].scene.document, definition).len(),
+        2
+    );
+    let original = app.tabs[source].scene.document.clone();
+    let _ = app.dispatch_command("BTESTBLOCK");
+    let test = app.active_tab;
+    let insert = app.tabs[test].block_test.as_ref().unwrap().insert;
+    app.tabs[test].selected_handle = Some(insert);
+    app.refresh_test_action_grips([0.; 3]);
+    let grip = app.tabs[test].selected_grips.last().unwrap().id;
+    assert!(app.start_test_action_grip(insert, grip));
+    feed(&mut app, "20,5");
+    let EntityType::Line(line) = app.tabs[test]
+        .scene
+        .document
+        .get_entity(targets[0])
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(line.start, Vector3::new(20., 0., 0.));
+    assert_eq!(line.end, Vector3::new(22., 0., 0.));
+    assert_eq!(app.tabs[source].scene.document, original);
+    app.undo_steps(1);
+    let EntityType::Line(line) = app.tabs[test]
+        .scene
+        .document
+        .get_entity(targets[0])
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(line.start, Vector3::ZERO);
+    app.redo_steps(1);
+    let EntityType::Line(line) = app.tabs[test]
+        .scene
+        .document
+        .get_entity(targets[0])
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(line.start, Vector3::new(20., 0., 0.));
+    app.tabs[test]
+        .scene
+        .document
+        .add_entity(EntityType::Insert(Insert::new(
+            "EDIT_ME",
+            Vector3::new(50., 0., 0.),
+        )))
+        .unwrap();
+    let shared_before = app.tabs[test].scene.document.clone();
+    let id = app.tabs[test].id;
+    let _ = app.handle_block_action_result(crate::command::CmdResult::EvaluateBlockParameter {
+        document: id,
+        definition,
+        parameter: p.handle,
+        position: glam::DVec3::new(30., 0., 0.),
+    });
+    assert_eq!(
+        app.tabs[test].scene.document, shared_before,
+        "shared references are refused rather than silently modified together"
+    );
+    let _ = app.dispatch_command("BCLOSETESTBLOCK");
+    assert_eq!(app.active_tab, source);
+    assert_eq!(app.tabs[source].scene.document, original);
+}
+
+#[test]
+fn block_actions_rejected_outside_editor_preserve_running_command_and_stale_results_are_inert() {
+    use crate::scene::block_actions::Kind;
+    let (mut app, reference) = fixture();
+    let i = app.active_tab;
+    let _ = app.dispatch_command("LINE");
+    let before = app.tabs[i].scene.document.clone();
+    let _ = app.dispatch_command("BACTION MOVE");
+    assert_eq!(app.tabs[i].active_cmd.as_ref().unwrap().name(), "LINE");
+    assert_eq!(app.tabs[i].scene.document, before);
+    let _ = app.update(Message::CommandEscape);
+    begin(&mut app, reference);
+    let _ = app.run_command_line("BPARAMETER POINT 2,3 4,5");
+    let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let p = crate::scene::block_actions::parameters(&app.tabs[i].scene.document, def, Kind::Move)
+        [0]
+    .handle;
+    let before = app.tabs[i].scene.document.clone();
+    let _ = app.handle_block_action_result(crate::command::CmdResult::PlaceBlockAction {
+        document: app.tabs[i].id + 1,
+        definition: def,
+        kind: Kind::Move,
+        parameter: p,
+        targets: members(&app),
+        location: glam::DVec3::ZERO,
+    });
+    assert_eq!(app.tabs[i].scene.document, before);
+    let _ = app.dispatch_command("LINE");
+    let _ = app.dispatch_command("BACTION SCALE");
+    assert_eq!(app.tabs[i].active_cmd.as_ref().unwrap().name(), "LINE");
+}
+
+#[test]
+fn block_actions_test_reference_transform_visibility_and_noop_history() {
+    use crate::scene::block_actions::{self as actions, Kind};
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let source = app.active_tab;
+    let _ = app.run_command_line("BPARAMETER POINT 2,3 4,5");
+    let _ = app.run_command_line("BPARAMETER VISIBILITY 8,8");
+    let _ = app.run_command_line("BPARAMETER BASEPOINT 1,2");
+    let definition = app.tabs[source]
+        .active_block_edit_session()
+        .unwrap()
+        .br_handle;
+    let p =
+        actions::parameters(&app.tabs[source].scene.document, definition, Kind::Move)[0].clone();
+    let targets = members(&app);
+    let _ = app.dispatch_command("BACTION MOVE");
+    feed(&mut app, &p.name);
+    let _ = app.feed_command(crate::command::StepInput::SelectionComplete(targets));
+    let _ = app.feed_command(crate::command::StepInput::Enter);
+    feed(&mut app, "4,6");
+    let _ = app.dispatch_command("BTESTBLOCK");
+    let i = app.active_tab;
+    let insert = app.tabs[i].block_test.as_ref().unwrap().insert;
+    let depth = app.tabs[i].history.undo_stack.len();
+    let id = app.tabs[i].id;
+    let EntityType::Insert(ins) = app.tabs[i].scene.document.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let current_world = actions::v(
+        crate::scene::render_graph::insert_transform(&app.tabs[i].scene.document, ins)
+            .apply(actions::native(p.end)),
+    );
+    let _ = app.handle_block_action_result(crate::command::CmdResult::EvaluateBlockParameter {
+        document: id,
+        definition,
+        parameter: p.handle,
+        position: current_world,
+    });
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
+    // Existing visibility UI creates a per-reference anonymous definition.
+    app.apply_visibility_state(insert, 0);
+    app.finish_pending_history(i);
+    let EntityType::Insert(ins) = app.tabs[i].scene.document.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let after_world = actions::v(
+        crate::scene::render_graph::insert_transform(&app.tabs[i].scene.document, ins)
+            .apply(actions::native(p.end)),
+    );
+    assert_eq!(
+        after_world, current_world,
+        "visibility representation retains the native Basepoint anchor"
+    );
+    let EntityType::Insert(ins) = app.tabs[i].scene.document.get_entity_mut(insert).unwrap() else {
+        panic!()
+    };
+    ins.insert_point = Vector3::new(100., 200., 0.);
+    ins.rotation = std::f64::consts::FRAC_PI_2;
+    ins.set_x_scale(2.);
+    ins.set_y_scale(3.);
+    let EntityType::Insert(ins) = app.tabs[i].scene.document.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let name = ins.block_name.clone();
+    assert_ne!(name, "EDIT_ME");
+    let world = actions::v(
+        crate::scene::render_graph::insert_transform(&app.tabs[i].scene.document, ins)
+            .apply(Vector3::new(12., 13., 0.)),
+    );
+    let before = app.tabs[i].scene.document.clone();
+    let _ = app.handle_block_action_result(crate::command::CmdResult::EvaluateBlockParameter {
+        document: id,
+        definition,
+        parameter: p.handle,
+        position: world,
+    });
+    let anon = app.tabs[i]
+        .scene
+        .document
+        .entities_in_block(&name)
+        .find_map(|e| {
+            if let EntityType::Line(l) = e {
+                Some(l)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!((anon.start.x - 10.).abs() < 1e-9 && (anon.start.y - 10.).abs() < 1e-9);
+    app.undo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, before);
+}
+
 fn authored_points(app: &OpenCADStudio) -> Vec<codec::objects::BlockPointParameter> {
     let tab = &app.tabs[app.active_tab];
     let definition = tab
@@ -96,6 +655,201 @@ fn orientation_parameter_count(app: &OpenCADStudio) -> usize {
         .unwrap()
         .handle;
     crate::scene::block_orientation_parameter::parameters(&tab.scene.document, definition).len()
+}
+
+#[test]
+fn lookup_basepoint_placement_history_test_block_and_saved_parent_undo() {
+    use crate::scene::{block_basepoint, block_lookup, render_graph};
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let i = app.active_tab;
+    let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let members_before = members(&app);
+    let _ = app.run_command_line("BPARAMETER BASEPOINT 3,4");
+    let (handle, p) = block_basepoint::parameter(&app.tabs[i].scene.document, definition).unwrap();
+    assert_eq!(p.point, Vector3::new(3.0, 4.0, 0.0));
+    let depth = app.tabs[i].history.undo_stack.len();
+    assert_eq!(depth, 1);
+    let _ = app.run_command_line("BPARAMETER BASEPOINT 3,4");
+    assert_eq!(
+        app.tabs[i].history.undo_stack.len(),
+        depth,
+        "same anchor is a no-op"
+    );
+    let _ = app.run_command_line("BPARAMETER BASEPOINT 5,6");
+    assert_eq!(
+        block_basepoint::parameter(&app.tabs[i].scene.document, definition)
+            .unwrap()
+            .0,
+        handle
+    );
+    app.undo_steps(1);
+    assert_eq!(
+        block_basepoint::parameter(&app.tabs[i].scene.document, definition)
+            .unwrap()
+            .1
+            .point,
+        Vector3::new(3.0, 4.0, 0.0)
+    );
+    app.redo_steps(1);
+    let _ = app.dispatch_command("BPARAMETER");
+    feed(&mut app, "K");
+    feed(&mut app, "2,2");
+    assert_eq!(
+        block_lookup::parameters(&app.tabs[i].scene.document, definition).len(),
+        1
+    );
+    assert_eq!(
+        members(&app),
+        members_before,
+        "authoring objects are not drawing entities"
+    );
+    let before_test = app.tabs[i].scene.document.clone();
+    let _ = app.dispatch_command("BTESTBLOCK");
+    let doc = &app.tabs[app.active_tab].scene.document;
+    let insert = doc
+        .entities()
+        .find_map(|e| match e {
+            EntityType::Insert(i) => Some(i),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        (render_graph::insert_transform(doc, insert).apply(Vector3::new(5.0, 6.0, 0.0))
+            - insert.insert_point)
+            .length()
+            < 1e-9
+    );
+    let _ = app.dispatch_command("BCLOSETESTBLOCK");
+    assert_eq!(app.tabs[i].scene.document, before_test);
+    let _ = app.dispatch_command("BSAVE");
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+    assert!(block_basepoint::parameter(&app.tabs[i].scene.document, definition).is_some());
+    app.undo_steps(1);
+    assert!(block_basepoint::parameter(&app.tabs[i].scene.document, definition).is_none());
+    app.redo_steps(1);
+    assert!(block_basepoint::parameter(&app.tabs[i].scene.document, definition).is_some());
+}
+
+fn lookup_editor_fixture() -> (OpenCADStudio, Handle, Handle) {
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let _ = app.run_command_line("BPARAMETER LINEAR 0,0 2,0 0,1");
+    let _ = app.run_command_line("BPARAMETER LOOKUP 1,1");
+    let i = app.active_tab;
+    let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let parameter =
+        crate::scene::block_lookup::parameters(&app.tabs[i].scene.document, definition)[0].0;
+    (app, definition, parameter)
+}
+fn edit_lookup(app: &mut OpenCADStudio) {
+    use crate::ui::window::block_lookup::Action as A;
+    let _ = app.update(Message::BlockLookup(A::Property(0)));
+    let _ = app.update(Message::BlockLookup(A::AddProperty));
+    let _ = app.update(Message::BlockLookup(A::AddRow));
+    let _ = app.update(Message::BlockLookup(A::Cell(0, 1, "Small".into())));
+}
+#[test]
+fn lookup_editor_cancel_apply_one_undo_and_stale_guard() {
+    use crate::ui::window::block_lookup::Action as A;
+    use crate::scene::block_lookup;
+    let (mut app, definition, parameter) = lookup_editor_fixture();
+    let i = app.active_tab;
+    let before = app.tabs[i].scene.document.clone();
+    let depth = app.tabs[i].history.undo_stack.len();
+    for cancel in [Message::CloseModal, Message::CommandEscape] {
+        let _ = app.dispatch_command("BLOOKUPTABLE");
+        edit_lookup(&mut app);
+        assert_eq!(app.tabs[i].scene.document, before, "draft is isolated");
+        let _ = app.update(cancel);
+        assert!(app.block_lookup.is_none());
+        assert_eq!(app.tabs[i].scene.document, before);
+        assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
+    }
+    let _ = app.dispatch_command("BLOOKUPTABLE");
+    let _ = app.update(Message::BlockLookup(A::Apply));
+    assert_eq!(
+        app.tabs[i].history.undo_stack.len(),
+        depth,
+        "unchanged OK is a no-op"
+    );
+    let _ = app.dispatch_command("BLOOKUPTABLE");
+    edit_lookup(&mut app);
+    let _ = app.update(Message::BlockLookup(A::Audit));
+    assert!(app.block_lookup.as_ref().unwrap().error.is_none());
+    let _ = app.update(Message::BlockLookup(A::Apply));
+    assert!(app.block_lookup.is_none());
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+    assert_eq!(
+        block_lookup::table(&app.tabs[i].scene.document, definition, parameter)
+            .unwrap()
+            .unwrap()
+            .1
+            .expressions,
+        vec!["2", "Small"]
+    );
+    let saved = app.tabs[i].scene.document.clone();
+    app.undo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, before);
+    app.redo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, saved);
+    let _ = app.dispatch_command("BLOOKUPTABLE Lookup1");
+    let _ = app.update(Message::BlockLookup(A::Cell(0, 1, "Changed".into())));
+    app.tabs[i].scene.bump_geometry();
+    let _ = app.update(Message::BlockLookup(A::Apply));
+    assert!(app
+        .block_lookup
+        .as_ref()
+        .unwrap()
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("changed"));
+    assert_eq!(app.tabs[i].scene.document, saved);
+    let _ = app.update(Message::CloseModal);
+}
+
+#[test]
+fn lookup_editor_multiple_tables_apply_atomically_and_parameter_cancel_is_clean() {
+    use crate::ui::window::block_lookup::Action as A;
+    let (mut app, definition, _) = lookup_editor_fixture();
+    let i = app.active_tab;
+    let _ = app.run_command_line("BPARAMETER LOOKUP 3,3");
+    let before = app.tabs[i].scene.document.clone();
+    let depth = app.tabs[i].history.undo_stack.len();
+    for kind in ["BASEPOINT", "LOOKUP"] {
+        let _ = app.dispatch_command(&format!("BPARAMETER {kind}"));
+        let _ = app.update(Message::CommandEscape);
+        assert_eq!(app.tabs[i].scene.document, before);
+        assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
+    }
+    let _ = app.dispatch_command("BLOOKUPTABLE");
+    edit_lookup(&mut app);
+    let _ = app.update(Message::BlockLookup(A::Select(1)));
+    edit_lookup(&mut app);
+    let _ = app.update(Message::BlockLookup(A::Cell(0, 0, "NaN".into())));
+    let _ = app.update(Message::BlockLookup(A::Apply));
+    assert!(app.block_lookup.as_ref().unwrap().error.is_some());
+    assert_eq!(app.tabs[i].scene.document, before);
+    let _ = app.update(Message::BlockLookup(A::Cell(0, 0, "5".into())));
+    let _ = app.update(Message::BlockLookup(A::Apply));
+    assert!(app.block_lookup.is_none());
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+    for (h, _) in crate::scene::block_lookup::parameters(&app.tabs[i].scene.document, definition) {
+        assert!(
+            crate::scene::block_lookup::table(&app.tabs[i].scene.document, definition, h)
+                .unwrap()
+                .is_some()
+        );
+    }
+    app.undo_steps(1);
+    assert_eq!(app.tabs[i].scene.document, before);
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+    let _ = app.dispatch_command("LINE");
+    for cmd in ["BPARAMETER BASEPOINT", "BPARAMETER LOOKUP", "BLOOKUPTABLE"] {
+        let _ = app.dispatch_command(cmd);
+        assert_eq!(app.tabs[i].active_cmd.as_ref().unwrap().name(), "LINE");
+    }
 }
 
 #[test]

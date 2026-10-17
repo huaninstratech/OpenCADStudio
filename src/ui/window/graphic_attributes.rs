@@ -1429,7 +1429,12 @@ pub fn view<'a>(
         crate::ui::dock::title_bar_with(
             PanelId::GraphicAttributes,
             crate::t!("Graphic Attributes").into_owned(),
-            chrome,
+            // Keep the bar's controls up while the menu hangs off them, so
+            // moving into the menu does not hide its button and close it.
+            crate::ui::dock::Chrome {
+                title_hovered: chrome.title_hovered || open_menu == Some(Menu::Header),
+                ..chrome
+            },
             Some(header_menu(
                 side,
                 open_menu == Some(Menu::Header),

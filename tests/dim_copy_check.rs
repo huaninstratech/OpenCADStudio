@@ -28,7 +28,7 @@ fn copy_dimension_duplicates_its_block() {
     // A linear dimension whose drawn geometry is that baked block.
     let mut dim = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
     dim.base.block_name = "*D0".to_string();
-    let dim_h = scene.add_entity(EntityType::Dimension(Dimension::Linear(dim)));
+    let dim_h = scene.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dim))));
 
     // Copy the dimension by (0, 50).
     let copies = scene.copy_entities(

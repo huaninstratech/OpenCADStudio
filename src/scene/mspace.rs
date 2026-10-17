@@ -285,7 +285,7 @@ mod viewport_zoom_tests {
         viewport.width = 100.0;
         viewport.height = 100.0;
         viewport.view_height = 200.0;
-        let handle = scene.add_entity(EntityType::Viewport(viewport));
+        let handle = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
         scene.active_viewport = Some(handle);
 
         let view_height = |scene: &Scene| match scene.document.get_entity(handle) {
@@ -337,7 +337,7 @@ mod clip_tests {
         viewport.height = 20.0;
         viewport.clip_boundary_handle = clip;
         viewport.status.non_rectangular_clipping = true;
-        let viewport = scene.add_entity(EntityType::Viewport(viewport));
+        let viewport = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
         for (x, y, inside) in [
             (2.0, 2.0, true),
             (8.0, 2.0, true),

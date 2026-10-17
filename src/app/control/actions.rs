@@ -109,7 +109,10 @@ pub(super) const NAMES: &[&str] = &[
     "view_background",
     "image_adjust",
     "import_file_dialog",
+    "pdf_import_pick",
+    "pdf_import_dialog",
     "dgn_import_dialog",
+    "tds_import_dialog",
     "refedit_dialog",
     "pdf_shx_settings",
     "pdf_layer_toggle",
@@ -2164,6 +2167,40 @@ impl OpenCADStudio {
                     _ => return Err(bad()),
                 }
             }
+            // The file the next PDF import picker returns, without showing
+            // it (value: the path).
+            "pdf_import_pick" => {
+                crate::sys::set_pdf_import_pick(string(req, "value")?.into());
+                return Ok(Task::none());
+            }
+            // The Import PDF window, one field per call: "page=<n>" (1-based),
+            // "on_screen=0|1" (insertion point asked after OK), "scale=<value>",
+            // "rotation=0|90|180|270", "ok" or "cancel".
+            "pdf_import_dialog" => {
+                use crate::ui::window::pdf_dialogs::{PdfDialogMsg as P, RotationChoice};
+                if self.active_modal != Some(crate::app::ModalKind::PdfImportFile) {
+                    return Err(failure("no_dialog", "The Import PDF window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    return Ok(Task::done(Message::CloseModal));
+                }
+                Message::PdfDialog(match key {
+                    "ok" => P::ImportOk,
+                    "page" => P::ImportPageText(value.to_string()),
+                    "on_screen" => P::ImportInsertOnScreen(value == "1"),
+                    "scale" => P::ImportScale(value.to_string()),
+                    "rotation" => P::ImportRotation(
+                        RotationChoice::ALL
+                            .into_iter()
+                            .find(|r| value.trim().parse() == Ok(r.0))
+                            .ok_or_else(bad)?,
+                    ),
+                    _ => return Err(bad()),
+                })
+            }
             // The Import File window, one field per call: "path=<file>",
             // "format=<index or name>", "search=<text>", "filter=all|supported",
             // "recent=<n>", "ok" or "cancel".
@@ -2198,9 +2235,49 @@ impl OpenCADStudio {
                     _ => return Err(bad()),
                 })
             }
+            // The 3D Studio Import window, one field per call: "check=<name>"
+            // and "uncheck=<name>" (the object's name, or "Global Settings"),
+            // "all", "clear", "filter=all|mesh|light|camera|general",
+            // "search=<text>", "layers=object|material|color|single",
+            // "multi=ask|split|first|none", "path=<file>" (as Change… picks
+            // it), "ok" or "cancel".
+            "tds_import_dialog" => {
+                use crate::ui::window::import_dialogs::ImportDialogMsg as I;
+                if self.active_modal != Some(crate::app::ModalKind::TdsImport) {
+                    return Err(failure("no_dialog", "The 3D Studio Import window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let bad = || failure("invalid_value", spec);
+                if key == "cancel" {
+                    return Ok(Task::done(Message::CloseModal));
+                }
+                let pick = |options: &[&str]| options.iter().position(|o| *o == value).ok_or_else(bad);
+                Message::ImportDialog(match key {
+                    "ok" => I::TdsOk,
+                    "all" => I::TdsAll,
+                    "clear" => I::TdsClear,
+                    "check" | "uncheck" => {
+                        let k = self
+                            .import_dialogs
+                            .tds
+                            .as_ref()
+                            .and_then(|s| s.objects.iter().position(|(name, _, _)| name.eq_ignore_ascii_case(value)))
+                            .ok_or_else(bad)?;
+                        I::TdsCheck(k, key == "check")
+                    }
+                    "filter" => I::TdsFilter(pick(&["all", "mesh", "light", "camera", "general"])?),
+                    "search" => I::TdsSearch(value.to_string()),
+                    "layers" => I::TdsLayers(pick(&["object", "material", "color", "single"])?),
+                    "multi" => I::TdsMulti(pick(&["ask", "split", "first", "none"])?),
+                    "path" => I::TdsPicked(Some(value.to_string())),
+                    _ => return Err(bad()),
+                })
+            }
             // The DGN Import window, one field per call: "path=<file>" (as
             // Change… picks it), "model=<n>", "target=new|current",
             // "conflict=prefix|ignore", "units=master|sub", "explode=on|off",
+            // "references=translate|ignore|underlay", "existing=prompt|overwrite|keep",
             // "mapping=layer|linetype|lineweight|color", "ok" or "cancel".
             "dgn_import_dialog" => {
                 use crate::ui::window::import_dialogs::ImportDialogMsg as I;
@@ -2238,6 +2315,18 @@ impl OpenCADStudio {
                         _ => return Err(bad()),
                     }),
                     "explode" => I::DgnExplode(on(value)?),
+                    "references" => I::DgnReferences(match value {
+                        "translate" => crate::modules::insert::dgn_import::ReferenceMode::Translate,
+                        "ignore" => crate::modules::insert::dgn_import::ReferenceMode::Ignore,
+                        "underlay" => crate::modules::insert::dgn_import::ReferenceMode::Underlay,
+                        _ => return Err(bad()),
+                    }),
+                    "existing" => I::DgnExisting(match value {
+                        "prompt" => crate::modules::insert::dgn_import::ExistingReference::Prompt,
+                        "overwrite" => crate::modules::insert::dgn_import::ExistingReference::Overwrite,
+                        "keep" => crate::modules::insert::dgn_import::ExistingReference::Keep,
+                        _ => return Err(bad()),
+                    }),
                     "mapping" => I::DgnMappingTab(match value {
                         "layer" => 0,
                         "linetype" => 1,

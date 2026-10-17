@@ -10,12 +10,13 @@
 //   2 text objects created
 //
 // The strokes are clustered into characters, the characters into text lines
-// and the lines into groups (lines of one size stacked together). Each line
-// is matched against the glyphs of the fonts to compare, in list order: a
-// group converts with the first font (or, with "Use best matching font", the
-// best) whose share of recognised characters reaches the threshold. Every
-// recognised line becomes a bottom-left MTEXT in a style named after the font;
-// the geometry of its recognised characters is erased.
+// and the lines into groups (text blocks: lines of one size stacked close
+// together, or side by side). Each line is matched against the glyphs of the
+// fonts to compare, in list order: a group converts with the first font (or,
+// with "Use best matching font", the best) whose share of recognised objects
+// reaches the threshold. Every recognised line becomes a bottom-left MTEXT in
+// a style named after the font, a group's lines top down; the geometry of its
+// recognised characters is erased.
 
 use codec::Handle;
 use glam::DVec3;
@@ -119,23 +120,27 @@ pub fn set_settings(mut settings: ShxTextSettings) {
 
 /// What `Face::resolve` loads for a listed font: an added file as it is; a
 /// font name's .shx next to the drawing (`drawing` is its path) or in the
-/// fonts folder; else the name, which the built-in stroke fonts answer.
-pub fn resolve_font(name: &str, drawing: Option<&str>) -> String {
+/// fonts folder; else the embedded stroke font of that very name. Nothing
+/// otherwise: no alias stand-in and no TrueType face — measured, a listed
+/// font without its .shx file is not compared at all ("-  0%").
+pub fn resolve_font(name: &str, drawing: Option<&str>) -> Option<String> {
     if name.to_ascii_lowercase().ends_with(".shx") && std::path::Path::new(name).is_file() {
-        return name.to_string();
+        return Some(name.to_string());
     }
-    let file = format!("{}.shx", font_label(name));
+    let label = font_label(name);
+    let file = format!("{label}.shx");
     let base = drawing.map(std::path::Path::new).and_then(|p| p.parent());
     crate::io::resolve_image_file(&file, base)
         .or_else(|| {
             crate::io::font_repo::local_font_file(&file).map(|p| p.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| font_label(name))
+        .or_else(|| crate::scene::text::lff::is_embedded_font(&label).then_some(label))
 }
 
 // ── Recognition ────────────────────────────────────────────────────────────
 
 /// One curve of the selection, flattened to world XY.
+#[derive(Clone)]
 pub struct Stroke {
     pub handle: Handle,
     pub layer: String,
@@ -364,8 +369,21 @@ struct FontShapes {
 const STEP: f64 = 0.04;
 /// Largest mean distance (in text heights) of a recognised character.
 /// The geometry of a font matches its glyphs within a few thousandths; a
+/// circle read as the 0 of simplex (as the reference reads it) at 0.0121; a
 /// look-alike glyph of another font (txt's O as a D) from about 0.015.
-const MATCH_TOLERANCE: f64 = 0.012;
+const MATCH_TOLERANCE: f64 = 0.013;
+
+/// The characters compared: printable ASCII, then Latin-1 and Latin
+/// Extended (°, ±, accented letters), Greek, Cyrillic and the diameter sign
+/// ⌀ (U+2205, what the reference reads %%c as) — those a font has a glyph of
+/// its own for.
+fn compared_chars() -> impl Iterator<Item = char> {
+    (0x21u32..=0x7e)
+        .chain(0xa1..=0x24f)
+        .chain(0x370..=0x4ff)
+        .chain([0x2205])
+        .filter_map(char::from_u32)
+}
 
 fn font_shapes(spec: &str) -> Option<FontShapes> {
     let face = Face::resolve(spec);
@@ -378,10 +396,10 @@ fn font_shapes(spec: &str) -> Option<FontShapes> {
         })
         .filter(|h| *h > 0.0)?;
     let mut glyphs = Vec::new();
-    // ponytail: printable ASCII only; symbols (°, ±, Ø, Greek) left as geometry.
-    for code in 0x21u8..=0x7e {
-        let ch = code as char;
-        let Some(g) = face.glyph(ch) else { continue };
+    // A character the font lacks is no candidate (the text fallback would
+    // offer another font's glyph for it).
+    for ch in compared_chars() {
+        let Some(g) = face.own_glyph(ch) else { continue };
         let strokes: Vec<Vec<P>> = g
             .strokes
             .iter()
@@ -502,7 +520,7 @@ fn lines_of(strokes: &[Stroke], pieces: Vec<Piece>) -> Vec<Line> {
     };
     let mut parent: Vec<usize> = (0..pieces.len()).collect();
     let tallest = boxes.iter().map(|b| b.h()).fold(0.0f64, f64::max);
-    x_sweep(&boxes, |_| 2.2 * tallest, |a, b| {
+    x_sweep(&boxes, |_| 2.0 * tallest, |a, b| {
         if !comparable(a, b) {
             return;
         }
@@ -511,8 +529,9 @@ fn lines_of(strokes: &[Stroke], pieces: Vec<Piece>) -> Vec<Line> {
         if overlap < 0.3 * ba.h().min(bb.h()) {
             return;
         }
+        // Measured: two words 1.8 heights apart are one line, 2.2 apart two.
         let gap = (ba.min[0].max(bb.min[0]) - ba.max[0].min(bb.max[0])).max(0.0);
-        if gap <= 2.2 * ba.h().max(bb.h()) {
+        if gap <= 2.0 * ba.h().max(bb.h()) {
             union(&mut parent, a, b);
         }
     });
@@ -535,7 +554,12 @@ fn lines_of(strokes: &[Stroke], pieces: Vec<Piece>) -> Vec<Line> {
         let mut best: Option<(f64, usize)> = None;
         for j in 0..pieces.len() {
             let sj = boxes[j].size();
-            if j == i || si >= 0.35 * sj || !boxes[i].near(&boxes[j], sj) {
+            // A frame or a border around the text is no character to join.
+            if j == i
+                || si >= 0.35 * sj
+                || (alone[j] && sj > 20.0 * si)
+                || !boxes[i].near(&boxes[j], sj)
+            {
                 continue;
             }
             let mut d = f64::INFINITY;
@@ -601,21 +625,31 @@ fn lines_of(strokes: &[Stroke], pieces: Vec<Piece>) -> Vec<Line> {
     lines
 }
 
-/// Lines of one size stacked close together.
+/// Lines of one text block (a group). Lines side by side (their bands touch
+/// or nearly: rotated text breaks into such lines at its spaces) join when
+/// they are close; lines stacked above each other when they are of one size
+/// and no more than twice the smaller line's height apart. Measured: lines
+/// two heights apart are one block, 2.5 apart two; 4.6 high under 5 one
+/// block, 4 high under 5 (two heights apart) two.
 fn groups_of(lines: &[Line]) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..lines.len()).collect();
     for a in 0..lines.len() {
         for b in a + 1..lines.len() {
             let (la, lb) = (&lines[a], &lines[b]);
-            let h = la.height.max(lb.height);
-            if h <= 0.0 || la.height.min(lb.height) < 0.85 * h {
+            let (small, large) = (la.height.min(lb.height), la.height.max(lb.height));
+            if small <= 0.0 {
                 continue;
             }
             let x_gap = (la.bbox.min[0].max(lb.bbox.min[0]) - la.bbox.max[0].min(lb.bbox.max[0]))
                 .max(0.0);
             let y_gap = (la.bbox.min[1].max(lb.bbox.min[1]) - la.bbox.max[1].min(lb.bbox.max[1]))
                 .max(0.0);
-            if x_gap <= 2.0 * h && y_gap <= 3.2 * h {
+            let joins = if y_gap <= 0.5 * small {
+                small >= 0.35 * large && x_gap <= 2.0 * small
+            } else {
+                small >= 0.85 * large && x_gap <= 2.0 * large && y_gap <= 2.0 * small
+            };
+            if joins {
                 union(&mut parent, a, b);
             }
         }
@@ -625,10 +659,10 @@ fn groups_of(lines: &[Line]) -> Vec<Vec<usize>> {
         groups.entry(find(&mut parent, i)).or_default().push(i);
     }
     let mut out: Vec<Vec<usize>> = groups.into_values().collect();
-    // In the order the geometry was drawn.
+    // In the order the geometry was drawn; a block's lines top down.
     out.sort_by_key(|g| g.iter().map(|l| lines[*l].first).min().unwrap_or(0));
     for g in &mut out {
-        g.sort_by_key(|l| lines[*l].first);
+        g.sort_by(|a, b| lines[*b].bbox.max[1].total_cmp(&lines[*a].bbox.max[1]));
     }
     out
 }
@@ -638,7 +672,8 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
         return None;
     }
     v.sort_by(|a, b| a.total_cmp(b));
-    Some(v[v.len() / 2])
+    // The lower middle: round letters overshoot the cap height.
+    Some(v[(v.len() - 1) / 2])
 }
 
 /// Height the reference gives a line that has nothing with a height in it
@@ -649,6 +684,10 @@ struct LineMatch {
     /// Recognised glyph per character (None: not recognised).
     glyphs: Vec<Option<usize>>,
     height: f64,
+    /// The created text's height: the mean of the characters' sizes, a
+    /// round letter's overshoot included (measured: nine letters 4.996 and
+    /// an O 5.138 high read 5.0102).
+    text_height: f64,
     width_factor: f64,
 }
 
@@ -667,7 +706,9 @@ fn match_line(line: &Line, font: &FontShapes) -> LineMatch {
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         let best = scored.first().map_or(f64::INFINITY, |b| b.1);
-        scored.retain(|(_, d)| *d <= (1.3 * best + 0.01).min(0.12));
+        // Wide enough to keep the 0 of a lone circle among the rounder
+        // readings (° and o fit it closer when they are compared).
+        scored.retain(|(_, d)| *d <= (1.3 * best + 0.015).min(0.12));
         first.push(scored);
     }
     // The line's scale: the one most characters agree with through one of
@@ -690,32 +731,39 @@ fn match_line(line: &Line, font: &FontShapes) -> LineMatch {
             .filter_map(|(ci, hs)| {
                 hs.iter()
                     .filter(|(_, h)| (h / s - 1.0).abs() <= 0.06)
-                    .min_by(|a, b| (a.1 / s - 1.0).abs().total_cmp(&(b.1 / s - 1.0).abs()))
+                    // Readings of one height (0 / O) go to the lower code.
+                    .min_by(|a, b| {
+                        (a.1 / s - 1.0)
+                            .abs()
+                            .total_cmp(&(b.1 / s - 1.0).abs())
+                            .then(font.glyphs[a.0].ch.cmp(&font.glyphs[b.0].ch))
+                    })
                     .map(|(gi, _)| (ci, *gi))
             })
             .collect()
     };
-    // On a tie the taller reading wins: a lone round shape is an O at cap
-    // height rather than an o.
+    // On a tie the reading at cap height wins: a lone round shape is an O
+    // (or a 0) rather than an o, a row of bars I rather than |.
     let mut support: Vec<(usize, usize)> = Vec::new();
-    let mut support_scale = f64::INFINITY;
+    let mut support_cap = f64::INFINITY;
     for hs in &hyps {
-        for (_, h) in hs {
+        for (gi, h) in hs {
             let votes = agree(*h);
+            let cap = (font.glyphs[*gi].bbox.h() - 1.0).abs();
             if votes.len() > support.len()
-                || (votes.len() == support.len() && *h < support_scale * 0.94)
+                || (votes.len() == support.len() && cap < support_cap - 0.05)
             {
                 support = votes;
-                support_scale = *h;
+                support_cap = cap;
             }
         }
     }
-    let height = median(
-        support
-            .iter()
-            .map(|(ci, gi)| line.chars[*ci].bbox.h() / font.glyphs[*gi].bbox.h())
-            .collect(),
-    );
+    let sizes: Vec<f64> = support
+        .iter()
+        .map(|(ci, gi)| line.chars[*ci].bbox.h() / font.glyphs[*gi].bbox.h())
+        .collect();
+    let text_height = sizes.iter().sum::<f64>() / sizes.len().max(1) as f64;
+    let height = median(sizes);
     let Some(height) = height.filter(|h| *h > 0.0) else {
         // Nothing with a height: the reference's flat-line height, flat
         // glyphs (a dash) taken as they are. Anything else here (a frame
@@ -737,6 +785,7 @@ fn match_line(line: &Line, font: &FontShapes) -> LineMatch {
         return LineMatch {
             glyphs,
             height: FLAT_LINE_HEIGHT,
+            text_height: FLAT_LINE_HEIGHT,
             width_factor: 1.0,
         };
     };
@@ -766,7 +815,7 @@ fn match_line(line: &Line, font: &FontShapes) -> LineMatch {
         .iter()
         .map(|c| {
             let samples = sample(&c.geometry, step);
-            let mut best: Option<(usize, f64)> = None;
+            let mut scores: Vec<(usize, f64)> = Vec::new();
             for (gi, g) in font.glyphs.iter().enumerate() {
                 let gh = g.bbox.h() * height;
                 let gw = g.bbox.w() * height * width_factor;
@@ -791,16 +840,22 @@ fn match_line(line: &Line, font: &FontShapes) -> LineMatch {
                     })
                     .collect();
                 let d = chamfer(&samples, &c.geometry, &sample(&placed, step), &placed) / height;
-                if best.is_none_or(|(_, bd)| d < bd) {
-                    best = Some((gi, d));
-                }
+                scores.push((gi, d));
             }
-            best.filter(|(_, d)| *d <= MATCH_TOLERANCE).map(|(gi, _)| gi)
+            // Look-alikes (H and Greek Eta, y and a Cyrillic u drawn from
+            // another font) go to the lowest code, Latin before the rest.
+            let least = scores.iter().map(|(_, d)| *d).fold(f64::INFINITY, f64::min);
+            scores
+                .iter()
+                .find(|(_, d)| *d <= least + 0.003)
+                .filter(|(_, d)| *d <= MATCH_TOLERANCE)
+                .map(|(gi, _)| *gi)
         })
         .collect();
     LineMatch {
         glyphs,
         height,
+        text_height,
         width_factor,
     }
 }
@@ -852,6 +907,26 @@ fn line_text(line: &Line, m: &LineMatch, font: &FontShapes) -> Option<(String, B
     Some((value, ink))
 }
 
+/// The strokes of `strokes` but those of an object (a frame, a border line)
+/// whose extents' diagonal is more than five times the mean diagonal of the
+/// selected objects: such an object is no character and joins no group.
+/// Measured: with a 200 × 100 frame among 66 text curves a line 39 long
+/// still becomes "-" and one 39.2 long is left; twice the drawing, 78 and
+/// 78.4; one text line alone (the line counted in), five times the mean.
+fn without_oversized(strokes: &[Stroke]) -> Vec<Stroke> {
+    let mut boxes: std::collections::HashMap<Handle, BBox> = Default::default();
+    for s in strokes {
+        boxes.entry(s.handle).or_insert_with(BBox::empty).union(&BBox::of(&s.points));
+    }
+    let diagonal = |b: &BBox| b.w().hypot(b.h());
+    let mean = boxes.values().map(diagonal).sum::<f64>() / boxes.len().max(1) as f64;
+    strokes
+        .iter()
+        .filter(|s| diagonal(&boxes[&s.handle]) <= 5.0 * mean)
+        .cloned()
+        .collect()
+}
+
 fn percent(recognised: usize, total: usize) -> u32 {
     if total == 0 {
         0
@@ -861,12 +936,14 @@ fn percent(recognised: usize, total: usize) -> u32 {
 }
 
 /// Recognise the text in `strokes` with the fonts of `settings`; `resolve`
-/// turns a listed font into what `Face::resolve` loads.
+/// turns a listed font into what `Face::resolve` loads (`None`: the font
+/// is not available and is not compared).
 pub fn recognize(
     strokes: &[Stroke],
     settings: &ShxTextSettings,
-    resolve: impl Fn(&str) -> String,
+    resolve: impl Fn(&str) -> Option<String>,
 ) -> Recognition {
+    let strokes = &without_oversized(strokes);
     let pieces = pieces_of(strokes);
     let lines = lines_of(strokes, pieces);
     let groups = groups_of(&lines);
@@ -874,22 +951,39 @@ pub fn recognize(
         .fonts
         .iter()
         .filter(|f| f.enabled)
-        .filter_map(|f| font_shapes(&resolve(&f.name)).map(|shapes| (f.name.clone(), shapes)))
+        .filter_map(|f| {
+            let spec = resolve(&f.name)?;
+            font_shapes(&spec).map(|shapes| (f.name.clone(), shapes))
+        })
         .collect();
     let mut out = Recognition {
         groups: Vec::new(),
         lines: Vec::new(),
     };
     for group in groups {
-        let total: usize = group.iter().map(|l| lines[*l].chars.len()).sum();
+        let chars: usize = group.iter().map(|l| lines[*l].chars.len()).sum();
+        // The share is of the selected objects a font recognises (measured:
+        // 9 of 14 curves read 64%, 12 of 15 read 80%), not of characters.
+        let objects = |recognised: &dyn Fn(usize, usize) -> bool| -> usize {
+            let mut handles: Vec<Handle> = group
+                .iter()
+                .enumerate()
+                .flat_map(|(k, l)| {
+                    lines[*l].chars.iter().enumerate().map(move |(c, ch)| (k, c, ch))
+                })
+                .filter(|(k, c, _)| recognised(*k, *c))
+                .flat_map(|(_, _, ch)| ch.strokes.iter().map(|s| strokes[*s].handle))
+                .collect();
+            handles.sort();
+            handles.dedup();
+            handles.len()
+        };
+        let total = objects(&|_, _| true);
         let mut best: Option<(usize, u32, Vec<LineMatch>)> = None;
         let mut chosen: Option<(usize, u32, Vec<LineMatch>)> = None;
         for (fi, (_, shapes)) in fonts.iter().enumerate() {
             let matches: Vec<LineMatch> = group.iter().map(|l| match_line(&lines[*l], shapes)).collect();
-            let recognised: usize = matches
-                .iter()
-                .map(|m| m.glyphs.iter().filter(|g| g.is_some()).count())
-                .sum();
+            let recognised = objects(&|k, c| matches[k].glyphs[c].is_some());
             let pct = percent(recognised, total);
             if pct >= u32::from(settings.threshold) && !settings.best_font {
                 chosen = Some((fi, pct, matches));
@@ -901,7 +995,7 @@ pub fn recognize(
         }
         // A lone shape no font recognises (a frame, a boundary) is not text:
         // it is no group.
-        if chosen.is_none() && total == 1 && best.as_ref().is_none_or(|(_, pct, _)| *pct == 0) {
+        if chosen.is_none() && chars == 1 && best.as_ref().is_none_or(|(_, pct, _)| *pct == 0) {
             continue;
         }
         if chosen.is_none()
@@ -934,7 +1028,7 @@ pub fn recognize(
                     out.lines.push(TextLine {
                         value,
                         insertion: ink.min,
-                        height: m.height,
+                        height: m.text_height,
                         font: font_label(spec),
                         font_spec: spec.clone(),
                         layer: strokes[line.first].layer.clone(),

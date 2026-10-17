@@ -869,7 +869,7 @@ pub(crate) fn constraint_from_associative_dimension(
         Some(ParametricRef::whole(*reference.xrefs.first()?))
     };
     let measurement = DrivingValue::Literal(dimension.measurement());
-    match dimension {
+    match &**dimension {
         Dimension::Aligned(_) => Some((
             ConstraintKind::Distance,
             vec![point(0)?, point(1)?],
@@ -921,7 +921,7 @@ pub(crate) fn radial_extension_points(
     let EntityType::Dimension(dimension_entity) = document.get_entity(dimension)? else {
         return None;
     };
-    let target_point = match dimension_entity {
+    let target_point = match &**dimension_entity {
         Dimension::Radius(radius) => radius.definition_point,
         Dimension::Diameter(diameter) => diameter.angle_vertex,
         Dimension::LargeRadial(radial) => radial.chord_point,
@@ -1009,7 +1009,7 @@ impl Scene {
         else {
             return;
         };
-        let radial_data = match dimension_entity {
+        let radial_data = match &**dimension_entity {
             Dimension::Radius(radius) => Some((
                 radius.angle_vertex,
                 radius.measurement(),
@@ -1223,7 +1223,7 @@ impl Scene {
         };
         // Radial references identify a circle/arc and angle, rather than a vertex.
         let radial_dimension = matches!(
-            dimension_entity,
+            &**dimension_entity,
             Dimension::Radius(_) | Dimension::Diameter(_) | Dimension::LargeRadial(_)
         );
         if radial_dimension {
@@ -1383,7 +1383,7 @@ impl Scene {
         let Some(EntityType::Dimension(entity)) = self.document.get_entity(dimension) else {
             return Vec::new();
         };
-        match entity {
+        match &**entity {
             // A radial dimension's single reference describes the point where
             // the leader meets the circle.
             Dimension::Radius(radius) => vec![radius.definition_point],
@@ -1458,17 +1458,15 @@ impl Scene {
         let measurement_supported = !association.trans_space
             || self.document.get_entity(dimension).is_some_and(|entity| {
                 matches!(
-                    entity,
-                    EntityType::Dimension(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
+                    crate::entities::dimension::as_dimension(entity),
+                    Some(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
                 ) || persisted_measurement_scale(&self.document, entity).is_some()
             });
         let measurement_supported = measurement_supported
             && self.document.get_entity(dimension).is_some_and(|entity| {
                 if !matches!(
-                    entity,
-                    EntityType::Dimension(
-                        Dimension::Radius(_) | Dimension::Diameter(_) | Dimension::LargeRadial(_)
-                    )
+                    crate::entities::dimension::as_dimension(entity),
+                    Some(Dimension::Radius(_) | Dimension::Diameter(_) | Dimension::LargeRadial(_))
                 ) {
                     return true;
                 }
@@ -1652,7 +1650,7 @@ impl Scene {
         let Some(EntityType::Dimension(entity)) = self.document.get_entity(dimension) else {
             return Vec::new();
         };
-        let radial_data = match entity {
+        let radial_data = match &**entity {
             Dimension::Radius(radius) => Some((
                 radius.angle_vertex,
                 radius.measurement(),
@@ -1850,8 +1848,8 @@ impl Scene {
                 continue;
             };
             let angular = matches!(
-                &before,
-                EntityType::Dimension(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
+                crate::entities::dimension::as_dimension(&before),
+                Some(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
             );
             let measurement_scale = if let Some(frame) = map.frame.filter(|_| !angular) {
                 let Some(mut scale) = persisted_measurement_scale(&self.document, &before) else {
@@ -1874,7 +1872,7 @@ impl Scene {
             else {
                 continue;
             };
-            match dimension {
+            match &mut **dimension {
                 Dimension::Linear(linear) => {
                     // The sheet annotation the user placed — the dimension
                     // line's standoff and, when they dragged it, the text — is
@@ -2104,7 +2102,7 @@ impl Scene {
                     arc.base.actual_measurement = arc.measurement();
                 }
             }
-            let measurement = match &*dimension {
+            let measurement = match &**dimension {
                 Dimension::Linear(linear) => linear_measurement(linear),
                 _ => dimension.measurement(),
             };
@@ -2155,8 +2153,12 @@ impl Scene {
         refreshed
     }
     pub(crate) fn sync_diameter_association_angle(&mut self, dimension: Handle) {
-        let chord = match self.document.get_entity(dimension) {
-            Some(EntityType::Dimension(Dimension::Diameter(diameter))) => diameter.angle_vertex,
+        let chord = match self
+            .document
+            .get_entity(dimension)
+            .and_then(crate::entities::dimension::as_dimension)
+        {
+            Some(Dimension::Diameter(diameter)) => diameter.angle_vertex,
             _ => return,
         };
 
@@ -2247,9 +2249,9 @@ mod tests {
             Vector3::ZERO,
             5.0,
         )));
-        let dimension = scene.add_entity(EntityType::Dimension(Dimension::Diameter(
+        let dimension = scene.add_entity(EntityType::Dimension(Box::new(Dimension::Diameter(
             DimensionDiameter::new(Vector3::new(5.0, 0.0, 0.0), Vector3::new(-5.0, 0.0, 0.0)),
-        )));
+        ))));
         scene.attach_dimension_association(dimension, vec![Some(circle)]);
         let association = scene
             .document
@@ -2270,8 +2272,10 @@ mod tests {
             .expect("diameter association");
 
         scene.begin_undo_recording();
-        let Some(EntityType::Dimension(Dimension::Diameter(diameter))) =
-            scene.document.get_entity_mut(dimension)
+        let Some(Dimension::Diameter(diameter)) = scene
+            .document
+            .get_entity_mut(dimension)
+            .and_then(crate::entities::dimension::as_dimension_mut)
         else {
             panic!("diameter dimension");
         };

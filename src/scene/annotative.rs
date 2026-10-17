@@ -322,7 +322,7 @@ pub fn supports_annotation_context(entity: &EntityType) -> bool {
         | EntityType::Tolerance(_)
         | EntityType::Hatch(_) => true,
         EntityType::Dimension(dimension) => {
-            !matches!(dimension, codec::entities::Dimension::Arc(_))
+            !matches!(&**dimension, codec::entities::Dimension::Arc(_))
         }
         _ => false,
     }

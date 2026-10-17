@@ -638,7 +638,7 @@ pub(crate) fn build_entity(
             if let Some(style) = text_style_field(spec, document)? {
                 mtext.style = style;
             }
-            EntityType::MText(mtext)
+            EntityType::MText(Box::new(mtext))
         }
         "INSERT" => {
             let block = spec["block"].as_str().unwrap_or("");
@@ -724,7 +724,7 @@ pub(crate) fn build_entity(
             let mut path = BoundaryPath::external();
             path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(vertices, true)));
             hatch.paths.push(path);
-            EntityType::Hatch(hatch)
+            EntityType::Hatch(Box::new(hatch))
         }
         other => {
             return Err(failure(

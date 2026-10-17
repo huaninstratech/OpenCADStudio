@@ -50,6 +50,7 @@ impl OpenCADStudio {
             Some(K::PdfImportFile) => crate::t!("Import PDF").into_owned(),
             Some(K::ImportFile) => crate::t!("Import File").into_owned(),
             Some(K::DgnImport) => crate::t!("DGN Import").into_owned(),
+            Some(K::TdsImport) => crate::tr!("import-3ds", "title"),
             Some(K::XrefAttach) => crate::t!("Attach External Reference").into_owned(),
             Some(K::WriteBlock) => crate::t!("Write Block").into_owned(),
             Some(K::GeometricTolerance) => crate::t!("Geometric Tolerance").into_owned(),
@@ -87,6 +88,7 @@ impl OpenCADStudio {
             Some(K::BlockEditChanges) => crate::t!("Block Editor").into_owned(),
             Some(K::BlockEditPicker) => crate::t!("Edit Block Definition").into_owned(),
             Some(K::BlockVisibility) => crate::t!("Visibility States").into_owned(),
+            Some(K::BlockLookup) => crate::t!("Property Lookup Table").into_owned(),
             Some(K::BlockSaveAs) => crate::t!("Save Block As").into_owned(),
             Some(K::PointStyle) => crate::tr!("modal", "point-style"),
             Some(K::AttributeEditor) => crate::tr!("modal", "attribute-editor"),
@@ -522,6 +524,12 @@ impl OpenCADStudio {
                     crate::ui::window::block_edit_picker::view(state, flow)
                 })
             }
+            super::super::ModalKind::BlockLookup => {
+                let state = self.block_lookup.as_ref()?;
+                sized_flow(ex, 940, 600, |flow| {
+                    crate::ui::window::block_lookup::view(state, flow)
+                })
+            }
             super::super::ModalKind::BlockVisibility => {
                 let state = self.block_visibility.as_ref()?;
                 sized_flow(ex, 580, 470, |flow| {
@@ -611,6 +619,12 @@ impl OpenCADStudio {
                 let recent = &self.import_dialogs.recent;
                 sized_flow(ex, 960, 620, |flow| {
                     crate::ui::window::import_dialogs::view_import_file(state, recent, flow)
+                })
+            }
+            super::super::ModalKind::TdsImport => {
+                let state = self.import_dialogs.tds.as_ref()?;
+                sized_flow(ex, 860, 560, |flow| {
+                    crate::ui::window::import_dialogs::view_tds_import(state, flow)
                 })
             }
             super::super::ModalKind::DgnImport => {

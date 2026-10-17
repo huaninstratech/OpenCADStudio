@@ -292,6 +292,22 @@ fn face_id_weighted(family: &str, weight: fontdb::Weight) -> Option<fontdb::ID> 
     fonts().db.lock().unwrap().query(&query)
 }
 
+/// The file name (lower case) of the installed face of exactly `family` —
+/// no stand-in family — in the bold and italic asked for, or `None`.
+pub fn face_file(family: &str, bold: bool, italic: bool) -> Option<String> {
+    let db = fonts().db.lock().unwrap();
+    let id = db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight: if bold { fontdb::Weight::BOLD } else { fontdb::Weight::NORMAL },
+        style: if italic { fontdb::Style::Italic } else { fontdb::Style::Normal },
+        ..Default::default()
+    })?;
+    match &db.face(id)?.source {
+        fontdb::Source::File(path) => Some(path.file_name()?.to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
 /// Borrow the raw face bytes for `family` and run `f` over them. The byte slice
 /// is only valid inside the closure, so callers extract everything they need
 /// (e.g. flattened glyph outlines) before returning. `index` is the face index

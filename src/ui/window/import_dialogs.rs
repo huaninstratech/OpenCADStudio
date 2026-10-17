@@ -1,6 +1,8 @@
 //! Import File (IMPORT: the format first, then the file, routed to the
-//! format's importer) and DGN Import (DGNIMPORT: model, target drawing,
-//! conversion units and the mapping setup's effect on the file).
+//! format's importer), DGN Import (DGNIMPORT: model, target drawing,
+//! conversion units and the mapping setup's effect on the file) and 3D Studio
+//! Import (the objects of a .3ds file to bring in, their layers and what a
+//! mesh with several materials becomes).
 
 use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Space};
 use iced::{Background, Border, Element, Fill, Length, Theme};
@@ -32,8 +34,21 @@ pub enum ImportDialogMsg {
     DgnPrefix(bool),
     DgnSub(bool),
     DgnExplode(bool),
+    DgnReferences(crate::modules::insert::dgn_import::ReferenceMode),
+    DgnExisting(crate::modules::insert::dgn_import::ExistingReference),
     DgnMappingTab(usize),
     DgnOk,
+    // 3D Studio Import
+    TdsChange,
+    TdsPicked(Option<String>),
+    TdsCheck(usize, bool),
+    TdsAll,
+    TdsClear,
+    TdsFilter(usize),
+    TdsSearch(String),
+    TdsLayers(usize),
+    TdsMulti(usize),
+    TdsOk,
     Help(&'static str),
 }
 
@@ -50,10 +65,6 @@ pub enum Support {
     Yes,
     /// Any file: the importer follows the file's extension.
     ByExtension,
-    /// SAT: ACIS bodies are read only inside drawings.
-    AcisSolverOnly,
-    /// STEP: written by STEPOUT, not read.
-    ExportOnly,
     No,
 }
 
@@ -87,9 +98,9 @@ pub const FORMATS: [ImportFormat; 21] = [
     format("PDF Files", "*.pdf", &["pdf"], 0, Support::Yes),
     format("MicroStation DGN", "*.dgn", &["dgn"], 0, Support::Yes),
     format("All DGN Files", "*.*", &["*"], 0, Support::Yes),
-    format("Metafile", "*.wmf", &["wmf"], 0, Support::No),
-    format("3D Studio", "*.3ds", &["3ds"], 1, Support::No),
-    format("ACIS", "*.sat", &["sat"], 1, Support::AcisSolverOnly),
+    format("Metafile", "*.wmf", &["wmf"], 0, Support::Yes),
+    format("3D Studio", "*.3ds", &["3ds"], 1, Support::Yes),
+    format("ACIS", "*.sat", &["sat"], 1, Support::Yes),
     format(
         "CATIA V4",
         "*.model; *.session; *.exp; *.dlv3",
@@ -104,7 +115,7 @@ pub const FORMATS: [ImportFormat; 21] = [
         1,
         Support::No,
     ),
-    format("IGES", "*.igs; *.iges", &["igs", "iges"], 1, Support::No),
+    format("IGES", "*.igs; *.iges", &["igs", "iges"], 1, Support::Yes),
     format("Inventor", "*.ipt; *.iam", &["ipt", "iam"], 1, Support::No),
     format("JT", "*.jt", &["jt"], 1, Support::No),
     format("NX", "*.prt", &["prt"], 1, Support::No),
@@ -121,7 +132,7 @@ pub const FORMATS: [ImportFormat; 21] = [
         1,
         Support::No,
     ),
-    format("STEP", "*.ste; *.stp; *.step", &["ste", "stp", "step"], 1, Support::ExportOnly),
+    format("STEP", "*.ste; *.stp; *.step", &["ste", "stp", "step"], 1, Support::Yes),
     format("All Files", "*.*", &["*"], 2, Support::ByExtension),
 ];
 
@@ -142,6 +153,8 @@ pub struct DgnImportState {
     pub prefix_duplicates: bool,
     pub sub_units: bool,
     pub explode_text_nodes: bool,
+    pub references: crate::modules::insert::dgn_import::ReferenceMode,
+    pub existing_reference: crate::modules::insert::dgn_import::ExistingReference,
     /// Master and sub unit names.
     pub units: (String, String),
     pub mapping_tab: usize,
@@ -150,11 +163,29 @@ pub struct DgnImportState {
     pub mapping: [Vec<(String, String)>; 4],
 }
 
-/// Both windows' working copies and the files imported this session.
+/// The objects of a 3D Studio file and the import's choices.
+pub struct TdsImportState {
+    pub path: String,
+    /// "Global Settings" first, then the file's objects by name: each name,
+    /// its kind (Mesh, Light, Camera or Global) and the materials it uses.
+    pub objects: Vec<(String, &'static str, usize)>,
+    pub materials: usize,
+    pub checked: Vec<bool>,
+    /// 0 all, 1 meshes, 2 lights, 3 cameras, 4 global.
+    pub filter: usize,
+    pub search: String,
+    /// 0 by object, 1 by material, 2 by object colour, 3 single layer.
+    pub layers: usize,
+    /// 0 always ask, 1 split by material, 2 first material, 3 no material.
+    pub multi: usize,
+}
+
+/// The windows' working copies and the files imported this session.
 #[derive(Default)]
 pub struct ImportDialogs {
     pub file: Option<ImportFileState>,
     pub dgn: Option<DgnImportState>,
+    pub tds: Option<TdsImportState>,
     pub recent: Vec<String>,
 }
 
@@ -178,13 +209,10 @@ fn badge<'a>(support: Support) -> Element<'a, Message> {
     let (label, tone) = match support {
         Support::Yes => (t!("Supported"), 0),
         Support::ByExtension => (t!("By extension"), 2),
-        Support::AcisSolverOnly => (t!("ACIS solver available"), 1),
-        Support::ExportOnly => (t!("Export only"), 1),
         Support::No => (t!("None"), 2),
     };
     let color = move |theme: &Theme| match tone {
         0 => theme.palette().success.base.color,
-        1 => AMBER,
         _ => theme.palette().background.base.text.scale_alpha(0.55),
     };
     container(
@@ -210,10 +238,6 @@ fn badge<'a>(support: Support) -> Element<'a, Message> {
 pub fn unsupported_reason(support: Support) -> Option<std::borrow::Cow<'static, str>> {
     match support {
         Support::Yes | Support::ByExtension => None,
-        Support::AcisSolverOnly => Some(t!(
-            "ACIS bodies are read only inside drawings; SAT files cannot be imported."
-        )),
-        Support::ExportOnly => Some(t!("STEP files are only written (STEPOUT), not read.")),
         Support::No => Some(t!("OpenCAD Studio has no importer for this format.")),
     }
 }
@@ -425,6 +449,212 @@ pub fn view_import_file<'a>(
     .into()
 }
 
+/// One choice out of a few, as buttons stacked one above the other.
+fn stacked<'a>(options: Vec<(String, bool, Message)>) -> Element<'a, Message> {
+    let buttons = options.into_iter().map(|(label, on, message)| {
+        button(text(label).size(11).width(Fill))
+            .on_press(message)
+            .style(button_style(on))
+            .padding([5, 10])
+            .width(Fill)
+            .into()
+    });
+    container(iced::widget::Column::with_children(buttons.collect::<Vec<_>>()).spacing(2))
+        .padding(2)
+        .width(Fill)
+        .style(well_style)
+        .into()
+}
+
+/// The kind of a 3D Studio object in the window's words.
+fn tds_kind(kind: &str) -> String {
+    match kind {
+        "Mesh" => crate::tr!("import-3ds", "mesh"),
+        "Light" => crate::tr!("import-3ds", "light"),
+        "Camera" => crate::tr!("import-3ds", "camera"),
+        _ => crate::tr!("import-3ds", "general"),
+    }
+}
+
+pub fn view_tds_import<'a>(
+    state: &'a TdsImportState,
+    sizing: crate::ui::modal::ModalSizing,
+) -> Element<'a, Message> {
+    let top = container(
+        row![
+            container(text(file_name(&state.path)).size(12))
+                .padding([4, 10])
+                .style(|theme: &Theme| container::Style {
+                    border: Border {
+                        width: 1.0,
+                        radius: 12.0.into(),
+                        color: theme.palette().primary.base.color,
+                    },
+                    ..Default::default()
+                }),
+            text(crate::tr!("import-3ds", "summary", objects = (state.objects.len().saturating_sub(1) as i64), materials = (state.materials as i64)))
+            .size(11)
+            .style(muted_style)
+            .width(Fill),
+            button(text(crate::tr!("import-3ds", "change")).size(11))
+                .on_press(msg(ImportDialogMsg::TdsChange))
+                .style(button::text)
+                .padding([4, 6]),
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+    )
+    .padding([8, 12])
+    .width(Fill)
+    .style(crate::ui::window::pdf_dialogs::card_style);
+
+    let kinds = ["", "Mesh", "Light", "Camera", "Global"];
+    let mut filters = row![].spacing(4).align_y(iced::Center);
+    for (k, label) in [crate::tr!("import-3ds", "all"), crate::tr!("import-3ds", "mesh"), crate::tr!("import-3ds", "light"), crate::tr!("import-3ds", "camera"), crate::tr!("import-3ds", "general")]
+        .into_iter()
+        .enumerate()
+    {
+        filters = filters.push(chip(label, state.filter == k, msg(ImportDialogMsg::TdsFilter(k))));
+    }
+    let search = state.search.trim().to_lowercase();
+    let mut rows = column![row![
+        Space::new().width(Length::Fixed(22.0)),
+        text(crate::tr!("import-3ds", "name")).size(11).style(muted_style).width(Fill),
+        text(crate::tr!("import-3ds", "type")).size(11).style(muted_style).width(Length::Fixed(150.0)),
+    ]]
+    .spacing(2);
+    for (k, (name, kind, materials)) in state.objects.iter().enumerate() {
+        let global = *kind == "Global";
+        if state.filter != 0 && kinds[state.filter] != *kind {
+            continue;
+        }
+        if !search.is_empty() && !name.to_lowercase().contains(&search) {
+            continue;
+        }
+        let shown_name = if global { crate::tr!("import-3ds", "global") } else { name.clone() };
+        let shown_kind = if global {
+            String::new()
+        } else if *kind == "Mesh" {
+            format!("{} · {}", tds_kind(kind), crate::tr!("import-3ds", "materials", n = (*materials as i64)))
+        } else {
+            tds_kind(kind)
+        };
+        let on = state.checked.get(k).copied().unwrap_or(false);
+        rows = rows.push(
+            row![
+                iced::widget::checkbox(on)
+                    .on_toggle(move |v| msg(ImportDialogMsg::TdsCheck(k, v)))
+                    .size(14),
+                text(shown_name).size(12).width(Fill),
+                text(shown_kind).size(11).style(muted_style).width(Length::Fixed(150.0)),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        );
+    }
+    let objects = card(
+        crate::tr!("import-3ds", "objects"),
+        column![
+            row![
+                filters,
+                Space::new().width(Fill),
+                text_input(crate::tr!("import-3ds", "search").as_ref(), &state.search)
+                    .on_input(|s| msg(ImportDialogMsg::TdsSearch(s)))
+                    .size(11)
+                    .padding([4, 8])
+                    .width(Length::Fixed(170.0))
+                    .style(field_style),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            container(scrollable(rows).height(Length::Fixed(300.0)))
+                .padding(6)
+                .width(Fill)
+                .style(well_style),
+            row![
+                button(text(crate::tr!("import-3ds", "select-all")).size(11))
+                    .on_press(msg(ImportDialogMsg::TdsAll))
+                    .style(button_style(false))
+                    .padding([4, 10]),
+                button(text(crate::tr!("import-3ds", "clear")).size(11))
+                    .on_press(msg(ImportDialogMsg::TdsClear))
+                    .style(button_style(false))
+                    .padding([4, 10]),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8),
+    );
+    let layer_notes = [
+        crate::tr!("import-3ds", "note-object"),
+        crate::tr!("import-3ds", "note-material"),
+        crate::tr!("import-3ds", "note-color"),
+        crate::tr!("import-3ds", "note-single"),
+    ];
+    let layers = card(
+        crate::tr!("import-3ds", "layers"),
+        column![
+            stacked(
+                [crate::tr!("import-3ds", "by-object"), crate::tr!("import-3ds", "by-material"), crate::tr!("import-3ds", "by-color"), crate::tr!("import-3ds", "single")]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, label)| (label, state.layers == k, msg(ImportDialogMsg::TdsLayers(k))))
+                    .collect()
+            ),
+            text(layer_notes[state.layers.min(3)].clone()).size(11).style(muted_style),
+        ]
+        .spacing(8),
+    );
+    let multi = card(
+        crate::tr!("import-3ds", "multi"),
+        stacked(
+            [
+                crate::tr!("import-3ds", "ask"),
+                crate::tr!("import-3ds", "split"),
+                crate::tr!("import-3ds", "first"),
+                crate::tr!("import-3ds", "none"),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(k, label)| (label, state.multi == k, msg(ImportDialogMsg::TdsMulti(k))))
+            .collect(),
+        ),
+    );
+    let any = state.checked.iter().any(|c| *c);
+    let mut actions = row![
+        button(text("?").size(12))
+            .on_press(msg(ImportDialogMsg::Help("3ds")))
+            .style(button_style(false))
+            .padding([5, 11]),
+        Space::new().width(Fill),
+    ]
+    .spacing(6)
+    .align_y(iced::Center);
+    if !any {
+        actions = actions.push(text(crate::tr!("import-3ds", "reason")).size(11).style(muted_style));
+    }
+    actions = actions
+        .push(dialog_button(crate::tr!("import-3ds", "cancel"), Message::CloseModal, false))
+        .push(dialog_button_styled_opt(
+            crate::tr!("import-3ds", "import"),
+            any.then(|| msg(ImportDialogMsg::TdsOk)),
+            button::primary,
+        ));
+    column![
+        top,
+        row![
+            container(objects).width(Length::FillPortion(3)),
+            column![layers, multi].spacing(10).width(Length::FillPortion(2)),
+        ]
+        .spacing(10),
+        actions,
+    ]
+    .spacing(10)
+    .padding([10, 12])
+    .width(sizing.width)
+    .into()
+}
+
 pub fn view_dgn_import<'a>(
     state: &'a DgnImportState,
     sizing: crate::ui::modal::ModalSizing,
@@ -564,21 +794,49 @@ pub fn view_dgn_import<'a>(
         ]
         .spacing(8),
     );
-    // The DGN readers do not read reference attachments, so their handling
-    // is shown but cannot be chosen.
+    use crate::modules::insert::dgn_import::{ExistingReference as E, ReferenceMode as R};
+    let translate = state.references == R::Translate;
     let references = card(
         t!("External DGN references").into_owned(),
         column![
             segmented(vec![
-                (t!("Bind as block / xref").into_owned(), false, None),
-                (t!("Ignore").into_owned(), true, None),
-                (t!("Attach as DGN underlay").into_owned(), false, None),
+                (
+                    t!("Bind as block / xref").into_owned(),
+                    translate,
+                    Some(msg(ImportDialogMsg::DgnReferences(R::Translate)))
+                ),
+                (
+                    t!("Ignore").into_owned(),
+                    state.references == R::Ignore,
+                    Some(msg(ImportDialogMsg::DgnReferences(R::Ignore)))
+                ),
+                (
+                    t!("Attach as DGN underlay").into_owned(),
+                    state.references == R::Underlay,
+                    Some(msg(ImportDialogMsg::DgnReferences(R::Underlay)))
+                ),
             ]),
-            text(t!("Reference attachments of DGN files are not read; they are left out."))
-                .size(11)
+            text(t!("When the translated drawing exists"))
+                .size(10)
                 .style(muted_style),
+            segmented(
+                [
+                    (t!("Prompt to overwrite"), E::Prompt),
+                    (t!("Overwrite without prompting"), E::Overwrite),
+                    (t!("Do not overwrite"), E::Keep),
+                ]
+                .into_iter()
+                .map(|(label, value)| {
+                    (
+                        label.into_owned(),
+                        translate && state.existing_reference == value,
+                        translate.then(|| msg(ImportDialogMsg::DgnExisting(value))),
+                    )
+                })
+                .collect()
+            ),
         ]
-        .spacing(8),
+        .spacing(6),
     );
     let tabs = [t!("Layer"), t!("Linetype"), t!("Lineweight"), t!("Color")];
     let mut table = column![row![

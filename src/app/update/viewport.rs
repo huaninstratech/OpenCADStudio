@@ -31,6 +31,115 @@ const UCS_ICON_PICK_PX: f32 = 10.0;
 /// Pixel half-width for clicking an icon arm (line segment).
 const UCS_ICON_ARM_PX: f32 = 6.0;
 
+/// Decide whether a selection press has become a drag. A fast mouse
+/// movement alone must not turn the first click of a click-click rectangle
+/// into a lasso. Hold-to-lasso gets the normal dwell; PICKDRAG=1 keeps its
+/// deliberate immediate rectangular-drag shortcut.
+fn selection_drag_should_start(dist2: f32, held_ms: u128, pick_drag_rect: bool) -> bool {
+    const MIN_DIST2: f32 = 12.0 * 12.0;
+    const RECT_FAST_DIST2: f32 = 24.0 * 24.0;
+    dist2 > MIN_DIST2
+        && (held_ms >= POLY_START_DELAY_MS || (pick_drag_rect && dist2 > RECT_FAST_DIST2))
+}
+
+/// For a short selection click, use the actual mouse-down position even if
+/// the user starts moving immediately. Commands and active drag gestures
+/// continue using the live cursor position.
+fn selection_click_position(
+    last: Point,
+    pressed: Option<Point>,
+    is_click: bool,
+    no_command: bool,
+) -> Point {
+    if is_click && no_command {
+        pressed.unwrap_or(last)
+    } else {
+        last
+    }
+}
+
+#[cfg(test)]
+mod selection_gesture_priority_tests {
+    use super::*;
+
+    #[test]
+    fn fast_first_click_never_becomes_a_lasso_solely_from_cursor_speed() {
+        assert!(!selection_drag_should_start(25.0 * 25.0, 20, false));
+        assert!(!selection_drag_should_start(120.0 * 120.0, 80, false));
+        assert!(!selection_drag_should_start(500.0 * 500.0, POLY_START_DELAY_MS - 1, false));
+        assert!(selection_drag_should_start(25.0 * 25.0, POLY_START_DELAY_MS, false));
+        assert!(!selection_drag_should_start(11.0 * 11.0, POLY_START_DELAY_MS + 500, false));
+    }
+
+    #[test]
+    fn pickdrag_rectangle_keeps_its_fast_drag_shortcut() {
+        assert!(selection_drag_should_start(25.0 * 25.0, 20, true));
+        assert!(!selection_drag_should_start(23.0 * 23.0, 20, true));
+        assert!(selection_drag_should_start(13.0 * 13.0, POLY_START_DELAY_MS, true));
+    }
+
+    #[test]
+    fn quick_selection_click_anchors_where_the_button_went_down() {
+        let start = Point::new(100.0, 100.0);
+        let moved = Point::new(190.0, 135.0);
+        assert_eq!(selection_click_position(moved, Some(start), true, true), start);
+        // During a command or a genuine press-drag, use the moving cursor.
+        assert_eq!(selection_click_position(moved, Some(start), true, false), moved);
+        assert_eq!(selection_click_position(moved, Some(start), false, true), moved);
+        assert_eq!(selection_click_position(moved, None, true, true), moved);
+    }
+}
+
+/// Snapper coordinates are local to the active pane, while the overlay
+/// consumes canvas coordinates. Apply the same translation to the visible
+/// snap glyph and both Extension guide origins.
+fn snap_pixels_to_canvas(hit: &mut crate::snap::SnapResult, pane: iced::Rectangle) {
+    let translate = |point: &mut Point| {
+        point.x += pane.x;
+        point.y += pane.y;
+    };
+    translate(&mut hit.screen);
+    if let Some(base) = hit.extension_base.as_mut() {
+        translate(base);
+    }
+    if let Some(base) = hit.extension_base2.as_mut() {
+        translate(base);
+    }
+}
+
+#[cfg(test)]
+mod extension_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn translates_extension_anchors_with_the_snap_marker() {
+        let mut hit = crate::snap::SnapResult {
+            world: glam::DVec3::ZERO,
+            screen: Point::new(150.0, 75.0),
+            snap_type: crate::snap::SnapType::Extension,
+            tangent_obj: None,
+            extension_base: Some(Point::new(100.0, 150.0)),
+            extension_base2: Some(Point::new(75.0, 200.0)),
+            extension_origin: None,
+            extension_dir: None,
+            viewport: None,
+            source: None,
+            secondary_source: None,
+            model_point: None,
+        };
+        let pane = iced::Rectangle {
+            x: 32.0,
+            y: 56.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        snap_pixels_to_canvas(&mut hit, pane);
+        assert_eq!(hit.screen, Point::new(182.0, 131.0));
+        assert_eq!(hit.extension_base, Some(Point::new(132.0, 206.0)));
+        assert_eq!(hit.extension_base2, Some(Point::new(107.0, 256.0)));
+    }
+}
+
 fn pt_pt_d2(a: Point, b: Point) -> f32 {
     (a.x - b.x).powi(2) + (a.y - b.y).powi(2)
 }
@@ -880,7 +989,11 @@ impl OpenCADStudio {
                 .copied()
                 .zip(self.tabs[i].selected_grips.iter())
                 .filter(|(owner, grip)| self.tabs[i].hot_grips.contains(&(*owner, grip.id)))
-                .filter(|(_, grip)| grip.id != crate::app::visibility::VIS_GRIP_ID)
+                .filter(|(_, grip)| {
+                    grip.id != crate::app::visibility::VIS_GRIP_ID
+                        && !crate::app::block_actions::is_test_grip(grip.id)
+                        && !crate::app::block_authoring_edit::is_editor_grip(grip.id)
+                })
                 .map(|(owner, grip)| GripTarget {
                     handle: owner,
                     grip_id: grip.id,
@@ -902,7 +1015,11 @@ impl OpenCADStudio {
                 .iter()
                 .copied()
                 .zip(self.tabs[i].selected_grips.iter())
-                .filter(|(_, grip)| grip.id != crate::app::visibility::VIS_GRIP_ID)
+                .filter(|(_, grip)| {
+                    grip.id != crate::app::visibility::VIS_GRIP_ID
+                        && !crate::app::block_actions::is_test_grip(grip.id)
+                        && !crate::app::block_authoring_edit::is_editor_grip(grip.id)
+                })
                 .filter(|(_, grip)| (grip.world - world).length_squared() <= epsilon_sq)
                 .map(|(owner, grip)| GripTarget {
                     handle: owner,
@@ -1044,6 +1161,8 @@ impl OpenCADStudio {
                 // hover grip-menu.
                 if self.grip_popup.is_none()
                     && grip_id != crate::app::visibility::VIS_GRIP_ID
+                    && !crate::app::block_actions::is_test_grip(grip_id)
+                    && !crate::app::block_authoring_edit::is_editor_grip(grip_id)
                     && self
                         .grip_hover
                         .as_ref()
@@ -1374,17 +1493,12 @@ impl OpenCADStudio {
                 .left_press_time
                 .map(|t| Instant::now().duration_since(t).as_millis())
                 .unwrap_or(u128::MAX);
-            // Selection gestures need a wider dead zone than ordinary
-            // pointer clicks. In particular, a quick press/release with
-            // residual mouse motion must not start a freeform lasso.
-            // Keep the existing delay and reserve immediate dragging for
-            // an unmistakable movement (24 px); after the delay, require
-            // at least 12 px. Grip editing follows its separate path.
-            const SELECTION_DRAG_MIN_PX2: f32 = 12.0 * 12.0;
-            const SELECTION_DRAG_FAST_PX2: f32 = 24.0 * 24.0;
-            let dragged = dist2 > SELECTION_DRAG_MIN_PX2
-                && (elapsed_ms >= POLY_START_DELAY_MS
-                    || dist2 > SELECTION_DRAG_FAST_PX2);
+            // In default PICKDRAG=0, cursor speed must never promote a
+            // quick click into a lasso. The 250 ms press dwell distinguishes
+            // an intentional hold-drag from a fast click-move-click box.
+            // PICKDRAG=1 retains fast press-drag rectangular selection;
+            // grip dragging is handled separately.
+            let dragged = selection_drag_should_start(dist2, elapsed_ms, self.pick_drag_rect);
             if !sel.input.left_dragging && dragged {
                 sel.input.left_dragging = true;
                 if self.pick_drag_rect {
@@ -1896,8 +2010,7 @@ impl OpenCADStudio {
                 snap_hit.map(|s| s.world).unwrap_or(raw)
             };
             if let Some(s) = self.tabs[i].snap_result.as_mut() {
-                s.screen.x += tile_b.x;
-                s.screen.y += tile_b.y;
+                snap_pixels_to_canvas(s, tile_b);
             }
 
             if axis_lock.is_none()
@@ -2959,11 +3072,11 @@ impl OpenCADStudio {
                 }
             }
 
-            // Snap glyph is positioned in canvas space; shift the
-            // tile-local snap screen point back to the full canvas.
+            // Move Extension's acquired endpoints along with the snap glyph.
+            // Previously only s.screen moved to canvas pixels, leaving the
+            // dashed Extension line offset from the actual endpoint.
             if let Some(s) = self.tabs[i].snap_result.as_mut() {
-                s.screen.x += tile_b.x;
-                s.screen.y += tile_b.y;
+                snap_pixels_to_canvas(s, tile_b);
             }
 
             // Give the command the current UCS + Ctrl state before it
@@ -2984,8 +3097,11 @@ impl OpenCADStudio {
                         None
                     }
                 });
-                if let Some(cmd) = self.tabs[i].active_cmd.as_mut() {
+                let tab = &mut self.tabs[i];
+                if let Some(cmd) = tab.active_cmd.as_mut() {
                     p.extend(cmd.on_preview_wires_with_tangent(effective, live_tangent));
+                    let entities = cmd.preview_entities(&tab.scene.document, effective);
+                    p.extend(tab.scene.wires_for_entities(&entities));
                 }
                 p
             } else if needs_entity && deferred_command_hover {
@@ -3497,18 +3613,7 @@ impl OpenCADStudio {
         let world = snap_hit.map(|s| s.world).unwrap_or(raw);
         self.tabs[i].snap_result = snap_hit;
         if let Some(s) = self.tabs[i].snap_result.as_mut() {
-            // Snap marker and its extension anchors are pane-local; lift them to
-            // absolute canvas px.
-            s.screen.x += tile_b.x;
-            s.screen.y += tile_b.y;
-            if let Some(base) = s.extension_base.as_mut() {
-                base.x += tile_b.x;
-                base.y += tile_b.y;
-            }
-            if let Some(base) = s.extension_base2.as_mut() {
-                base.x += tile_b.x;
-                base.y += tile_b.y;
-            }
+            snap_pixels_to_canvas(s, tile_b);
         }
 
         use codec::types::Vector3;
@@ -4062,6 +4167,12 @@ impl OpenCADStudio {
                         self.grip_popup = None;
                         return Task::none();
                     }
+                    if self.start_test_action_grip(handle, grip_id) {
+                        return Task::none();
+                    }
+                    if self.start_authoring_grip(handle, grip_id) {
+                        return Task::none();
+                    }
                     if self.shift_down {
                         let key = (handle, grip_id);
                         if !self.tabs[i].hot_grips.remove(&key) {
@@ -4178,6 +4289,10 @@ impl OpenCADStudio {
                 self.refresh_properties();
                 return Task::none();
             }
+        }
+
+        if edit_cam.is_none() && self.pick_authoring_object(p, bounds) {
+            return Task::none();
         }
 
         // Ctrl+click on a composite solid picks the solid of it under the
@@ -4311,11 +4426,18 @@ impl OpenCADStudio {
 
         let (p, is_click, is_down) = {
             let sel = self.tabs[i].scene.selection.borrow();
-            let p = match sel.input.last_move_pos {
+            let last = match sel.input.last_move_pos {
                 Some(p) => p,
                 None => return Task::none(),
             };
-            (p, !sel.input.left_dragging, sel.input.left_down)
+            let is_click = !sel.input.left_dragging;
+            let p = selection_click_position(
+                last,
+                sel.input.left_press_pos,
+                is_click,
+                self.tabs[i].active_cmd.is_none(),
+            );
+            (p, is_click, sel.input.left_down)
         };
 
         // Grip editing: click-move-click (plus legacy press-drag).

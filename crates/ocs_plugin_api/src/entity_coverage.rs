@@ -3583,7 +3583,7 @@ mod tests {
     #[test]
     fn unsupported_canvas_kind_has_typed_snapshot_fields() {
         use crate::host::codec;
-        let hatch = codec::EntityType::Hatch(codec::entities::Hatch::default());
+        let hatch = codec::EntityType::Hatch(Box::new(codec::entities::Hatch::default()));
         let snapshot = entity_snapshot(&hatch).unwrap();
         let fields = snapshot
             .get("Hatch")
@@ -3713,7 +3713,7 @@ mod tests {
     #[test]
     fn canvas_layer_patch_preserves_unmapped_hatch_fields() {
         use crate::host::codec;
-        let hatch = codec::EntityType::Hatch(codec::entities::Hatch::default());
+        let hatch = codec::EntityType::Hatch(Box::new(codec::entities::Hatch::default()));
         let patched = patch_canvas_layer(&hatch, "HATCHES").unwrap();
         assert_eq!(patched.common().layer, "HATCHES");
         assert_eq!(hatch.common().layer, "0");
@@ -3809,13 +3809,13 @@ mod tests {
             }));
         }
         hatch.paths.push(path);
-        let entity = codec::EntityType::Hatch(hatch.clone());
+        let entity = codec::EntityType::Hatch(Box::new(hatch.clone()));
         validate_new_canvas_entity(&entity).unwrap();
 
         let mut invalid = hatch.clone();
         invalid.paths.clear();
         assert!(
-            validate_new_canvas_entity(&codec::EntityType::Hatch(invalid))
+            validate_new_canvas_entity(&codec::EntityType::Hatch(Box::new(invalid)))
                 .unwrap_err()
                 .contains("at least one boundary path")
         );
@@ -3824,7 +3824,7 @@ mod tests {
         invalid.is_solid = false;
         invalid.pattern_scale = 0.0;
         assert!(
-            validate_new_canvas_entity(&codec::EntityType::Hatch(invalid))
+            validate_new_canvas_entity(&codec::EntityType::Hatch(Box::new(invalid)))
                 .unwrap_err()
                 .contains("greater than zero")
         );
@@ -3841,13 +3841,13 @@ mod tests {
         associative.paths[0].boundary_handles.push(boundary);
         validate_canvas_entity_references(
             &document,
-            &codec::EntityType::Hatch(associative.clone()),
+            &codec::EntityType::Hatch(Box::new(associative.clone())),
         )
         .unwrap();
         associative.paths[0].boundary_handles[0] = codec::Handle::new(u64::MAX);
         assert!(validate_canvas_entity_references(
             &document,
-            &codec::EntityType::Hatch(associative),
+            &codec::EntityType::Hatch(Box::new(associative)),
         )
         .unwrap_err()
         .contains("does not exist"));

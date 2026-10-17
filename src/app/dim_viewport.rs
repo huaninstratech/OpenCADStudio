@@ -352,7 +352,7 @@ impl OpenCADStudio {
 
 fn is_angular_dimension(entity: &EntityType) -> bool {
     matches!(
-        entity,
-        EntityType::Dimension(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
+        crate::entities::dimension::as_dimension(entity),
+        Some(Dimension::Angular2Ln(_) | Dimension::Angular3Pt(_))
     )
 }
