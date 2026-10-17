@@ -54,3 +54,9 @@ scripts/*.exe
 
 # macOS Finder metadata
 .DS_Store
+
+# local scratch that keeps getting swept into commits
+/OpenCADStudio-v*.msi
+/_testlog.txt
+/main.exe
+/q*.json
