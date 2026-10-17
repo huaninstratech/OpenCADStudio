@@ -4,9 +4,9 @@
 use super::util::*;
 use super::{format_size, VIEWCUBE_HIT_SIZE};
 use crate::app::helpers::{
-    axis_lock_apply, axis_lock_capture, drafting_axes, drafting_constrain,
-    drafting_constrain_3d, parse_coord, polar_constrain_if_near, polar_constrain_near,
-    ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind,
+    axis_lock_apply, axis_lock_capture, drafting_axes, drafting_constrain, drafting_constrain_3d,
+    parse_coord, polar_constrain_if_near, polar_constrain_near, ucs_rotate_vec, ucs_to_wcs,
+    ucs_z_axis, CoordKind,
 };
 use crate::app::{Message, OpenCADStudio, POLY_START_DELAY_MS};
 use crate::modules::ModuleEvent;
@@ -66,26 +66,51 @@ mod selection_gesture_priority_tests {
     fn fast_first_click_never_becomes_a_lasso_solely_from_cursor_speed() {
         assert!(!selection_drag_should_start(25.0 * 25.0, 20, false));
         assert!(!selection_drag_should_start(120.0 * 120.0, 80, false));
-        assert!(!selection_drag_should_start(500.0 * 500.0, POLY_START_DELAY_MS - 1, false));
-        assert!(selection_drag_should_start(25.0 * 25.0, POLY_START_DELAY_MS, false));
-        assert!(!selection_drag_should_start(11.0 * 11.0, POLY_START_DELAY_MS + 500, false));
+        assert!(!selection_drag_should_start(
+            500.0 * 500.0,
+            POLY_START_DELAY_MS - 1,
+            false
+        ));
+        assert!(selection_drag_should_start(
+            25.0 * 25.0,
+            POLY_START_DELAY_MS,
+            false
+        ));
+        assert!(!selection_drag_should_start(
+            11.0 * 11.0,
+            POLY_START_DELAY_MS + 500,
+            false
+        ));
     }
 
     #[test]
     fn pickdrag_rectangle_keeps_its_fast_drag_shortcut() {
         assert!(selection_drag_should_start(25.0 * 25.0, 20, true));
         assert!(!selection_drag_should_start(23.0 * 23.0, 20, true));
-        assert!(selection_drag_should_start(13.0 * 13.0, POLY_START_DELAY_MS, true));
+        assert!(selection_drag_should_start(
+            13.0 * 13.0,
+            POLY_START_DELAY_MS,
+            true
+        ));
     }
 
     #[test]
     fn quick_selection_click_anchors_where_the_button_went_down() {
         let start = Point::new(100.0, 100.0);
         let moved = Point::new(190.0, 135.0);
-        assert_eq!(selection_click_position(moved, Some(start), true, true), start);
+        assert_eq!(
+            selection_click_position(moved, Some(start), true, true),
+            start
+        );
         // During a command or a genuine press-drag, use the moving cursor.
-        assert_eq!(selection_click_position(moved, Some(start), true, false), moved);
-        assert_eq!(selection_click_position(moved, Some(start), false, true), moved);
+        assert_eq!(
+            selection_click_position(moved, Some(start), true, false),
+            moved
+        );
+        assert_eq!(
+            selection_click_position(moved, Some(start), false, true),
+            moved
+        );
         assert_eq!(selection_click_position(moved, None, true, true), moved);
     }
 }
@@ -2016,11 +2041,11 @@ impl OpenCADStudio {
             if axis_lock.is_none()
                 && otrack_hit.is_none()
                 && !snap_hit.is_some_and(|s| {
-                        !matches!(
-                            s.snap_type,
-                            crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
-                        )
-                    })
+                    !matches!(
+                        s.snap_type,
+                        crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
+                    )
+                })
             {
                 let base = grip.origin_world;
                 let ucs_xf = self.tabs[i].ucs_xform();
@@ -2866,8 +2891,7 @@ impl OpenCADStudio {
                         !self.tabs[i].snap_result.is_some_and(|s| {
                             !matches!(
                                 s.snap_type,
-                                crate::snap::SnapType::Grid
-                                    | crate::snap::SnapType::Extension
+                                crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
                             )
                         })
                     }) {
@@ -2886,7 +2910,10 @@ impl OpenCADStudio {
                             if let Some(base) = self.last_point {
                                 if self.ortho_mode {
                                     let px = crate::scene::pick::hit_test::world_to_screen(
-                                        cursor_world, view_rot, eye, bounds,
+                                        cursor_world,
+                                        view_rot,
+                                        eye,
+                                        bounds,
                                     );
                                     let (locked, locked_3d) = self.ortho_constrain_point(
                                         i,
@@ -2925,9 +2952,7 @@ impl OpenCADStudio {
                     && self.tabs[i].active_ucs.is_none()
                     && !uses_command_cursor_plane
                     && !ortho_locked_3d
-                    && !snap_keeps_elevation(
-                        self.tabs[i].snap_result.map(|s| s.snap_type),
-                    )
+                    && !snap_keeps_elevation(self.tabs[i].snap_result.map(|s| s.snap_type))
                 {
                     pt.z = 0.0;
                 }
@@ -4782,10 +4807,7 @@ impl OpenCADStudio {
                             // The cursor pixel, recovered from its pick-plane
                             // point, is what the 3D axis dominance measures.
                             let px = crate::scene::pick::hit_test::world_to_screen(
-                                raw,
-                                view_rot,
-                                eye,
-                                bounds,
+                                raw, view_rot, eye, bounds,
                             );
                             // A 3D Z lock commits off the plane on purpose;
                             // the clamp above only governs un-constrained picks.
@@ -5657,7 +5679,9 @@ properties={:.1}ms picked={}",
                                 // same element climbs to its assembly parent.
                                 let mut ifc_storey_expand: Option<String> = None;
                                 let handle = if !self.shift_down && !self.select_remove_mode {
-                                    let (resolved, storey) = self.tabs[i].scene.ifc_select_at_level(handle, self.ifc_select_level);
+                                    let (resolved, storey) = self.tabs[i]
+                                        .scene
+                                        .ifc_select_at_level(handle, self.ifc_select_level);
                                     ifc_storey_expand = storey;
                                     resolved
                                 } else {

@@ -1,6 +1,6 @@
+use super::*;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::plot_style::PlotStyleTableExt as _;
-use super::*;
 use crate::scene::model::object::PropValue;
 
 fn control_color(value: &Value) -> Result<codec::types::Color, Value> {
@@ -1518,7 +1518,10 @@ impl OpenCADStudio {
             // `select_objects`.
             "block_def_dialog" => {
                 if self.block_definition.is_none() {
-                    return Err(failure("no_dialog", "The Block Definition dialog is not open"));
+                    return Err(failure(
+                        "no_dialog",
+                        "The Block Definition dialog is not open",
+                    ));
                 }
                 let value = string(req, "value")?;
                 let (key, v) = value.split_once('=').unwrap_or((value, ""));
@@ -2244,7 +2247,10 @@ impl OpenCADStudio {
             "tds_import_dialog" => {
                 use crate::ui::window::import_dialogs::ImportDialogMsg as I;
                 if self.active_modal != Some(crate::app::ModalKind::TdsImport) {
-                    return Err(failure("no_dialog", "The 3D Studio Import window is not open"));
+                    return Err(failure(
+                        "no_dialog",
+                        "The 3D Studio Import window is not open",
+                    ));
                 }
                 let spec = string(req, "value")?;
                 let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
@@ -2252,7 +2258,8 @@ impl OpenCADStudio {
                 if key == "cancel" {
                     return Ok(Task::done(Message::CloseModal));
                 }
-                let pick = |options: &[&str]| options.iter().position(|o| *o == value).ok_or_else(bad);
+                let pick =
+                    |options: &[&str]| options.iter().position(|o| *o == value).ok_or_else(bad);
                 Message::ImportDialog(match key {
                     "ok" => I::TdsOk,
                     "all" => I::TdsAll,
@@ -2262,7 +2269,11 @@ impl OpenCADStudio {
                             .import_dialogs
                             .tds
                             .as_ref()
-                            .and_then(|s| s.objects.iter().position(|(name, _, _)| name.eq_ignore_ascii_case(value)))
+                            .and_then(|s| {
+                                s.objects
+                                    .iter()
+                                    .position(|(name, _, _)| name.eq_ignore_ascii_case(value))
+                            })
                             .ok_or_else(bad)?;
                         I::TdsCheck(k, key == "check")
                     }
@@ -2323,7 +2334,9 @@ impl OpenCADStudio {
                     }),
                     "existing" => I::DgnExisting(match value {
                         "prompt" => crate::modules::insert::dgn_import::ExistingReference::Prompt,
-                        "overwrite" => crate::modules::insert::dgn_import::ExistingReference::Overwrite,
+                        "overwrite" => {
+                            crate::modules::insert::dgn_import::ExistingReference::Overwrite
+                        }
                         "keep" => crate::modules::insert::dgn_import::ExistingReference::Keep,
                         _ => return Err(bad()),
                     }),

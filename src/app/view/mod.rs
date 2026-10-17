@@ -48,12 +48,12 @@ impl iced::widget::canvas::Program<Message> for ViewportPickSurface {
             }
             // A pan or orbit keeps following the pointer past the viewport
             // edge; the mouse area only reports it inside.
-            Mouse::CursorMoved { position } if *middle_drag && !cursor.is_over(bounds) => Some(
-                Action::publish(Message::ViewportMove(iced::Point::new(
+            Mouse::CursorMoved { position } if *middle_drag && !cursor.is_over(bounds) => {
+                Some(Action::publish(Message::ViewportMove(iced::Point::new(
                     position.x - bounds.x,
                     position.y - bounds.y,
-                ))),
-            ),
+                ))))
+            }
             Mouse::ButtonReleased(Button::Middle) if *middle_drag => {
                 *middle_drag = false;
                 (!cursor.is_over(bounds)).then(|| Action::publish(Message::ViewportMiddleRelease))
@@ -556,8 +556,7 @@ impl OpenCADStudio {
                 // Grid + coloured axis lines follow the UCS and the snap angle
                 // only; the isometric plane is a drawing aid and must not
                 // rotate them (they have to keep matching the UCS icon).
-                let (ux, uy, uz) =
-                    super::helpers::grid_axes(ux, uy, uz, self.snap_angle_deg);
+                let (ux, uy, uz) = super::helpers::grid_axes(ux, uy, uz, self.snap_angle_deg);
                 (o, (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()))
             };
             // The first paper frame spends seconds in this block and `grid`
@@ -3507,16 +3506,16 @@ fn pane_mouse_area<'a>(idx: usize) -> Element<'a, Message> {
             .width(Fill)
             .height(Fill),
     ))
-        .on_move(move |p| Message::PaneMove(idx, p))
-        .on_press(Message::PanePress(idx))
-        .on_release(Message::PaneRelease(idx))
-        .on_right_press(Message::PaneRightPress(idx))
-        .on_right_release(Message::PaneRightRelease(idx))
-        .on_middle_press(Message::PaneMiddlePress(idx))
-        .on_middle_release(Message::PaneMiddleRelease(idx))
-        .on_scroll(move |d| Message::PaneScroll(idx, d))
-        .on_exit(Message::ViewportExit)
-        .into()
+    .on_move(move |p| Message::PaneMove(idx, p))
+    .on_press(Message::PanePress(idx))
+    .on_release(Message::PaneRelease(idx))
+    .on_right_press(Message::PaneRightPress(idx))
+    .on_right_release(Message::PaneRightRelease(idx))
+    .on_middle_press(Message::PaneMiddlePress(idx))
+    .on_middle_release(Message::PaneMiddleRelease(idx))
+    .on_scroll(move |d| Message::PaneScroll(idx, d))
+    .on_exit(Message::ViewportExit)
+    .into()
 }
 
 const START_ACTION_RADIUS: f32 = 6.0;
@@ -4015,15 +4014,14 @@ fn start_page_content<'a>(
                 .height(Fill)
                 .into()
         }
-        StartLayout::WithoutVideos => {
-            iced::widget::row![recent, welcome, discussions_panel]
-                .spacing(16)
-                .height(Fill)
-                .into()
-        }
-        StartLayout::WithoutVideosAndDiscussions => {
-            iced::widget::row![recent, welcome].spacing(16).height(Fill).into()
-        }
+        StartLayout::WithoutVideos => iced::widget::row![recent, welcome, discussions_panel]
+            .spacing(16)
+            .height(Fill)
+            .into(),
+        StartLayout::WithoutVideosAndDiscussions => iced::widget::row![recent, welcome]
+            .spacing(16)
+            .height(Fill)
+            .into(),
         StartLayout::RecentAndWelcome => iced::widget::row![recent, welcome]
             .spacing(16)
             .height(Fill)

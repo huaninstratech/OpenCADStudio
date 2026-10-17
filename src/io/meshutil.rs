@@ -84,7 +84,9 @@ pub fn ear_clip(outer: &[[f64; 2]], holes: &[&[[f64; 2]]]) -> Vec<[[f64; 2]; 3]>
     let mut holes_sorted: Vec<&[[f64; 2]]> = holes.iter().copied().collect();
     holes_sorted.sort_by(|a, b| {
         let max_x = |p: &[[f64; 2]]| p.iter().map(|q| q[0]).fold(f64::NEG_INFINITY, f64::max);
-        max_x(b).partial_cmp(&max_x(a)).unwrap_or(std::cmp::Ordering::Equal)
+        max_x(b)
+            .partial_cmp(&max_x(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     for hole in holes_sorted {
         if hole.len() < 3 {
@@ -156,8 +158,7 @@ pub fn ear_clip(outer: &[[f64; 2]], holes: &[&[[f64; 2]]]) -> Vec<[[f64; 2]; 3]>
             .map(|i| [outer[0], outer[i], outer[i + 1]])
             .collect();
     }
-    tris
-        .into_iter()
+    tris.into_iter()
         .map(|tri| [ring[tri[0]], ring[tri[1]], ring[tri[2]]])
         .collect()
 }
@@ -175,9 +176,7 @@ fn clip_ring(ring: &[[f64; 2]]) -> Vec<[usize; 3]> {
     let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
         (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
     };
-    let close = |p: [f64; 2], q: [f64; 2]| {
-        (p[0] - q[0]).abs() < 1e-9 && (p[1] - q[1]).abs() < 1e-9
-    };
+    let close = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).abs() < 1e-9 && (p[1] - q[1]).abs() < 1e-9;
     let eps = 1e-12;
     let mut tris = Vec::with_capacity(n.saturating_sub(2));
     let mut guard = 0usize;
@@ -281,10 +280,8 @@ pub fn feature_edges(verts: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
             max[k] = max[k].max(v);
         }
     }
-    let diag = ((max[0] - min[0]).powi(2)
-        + (max[1] - min[1]).powi(2)
-        + (max[2] - min[2]).powi(2))
-    .sqrt();
+    let diag =
+        ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2) + (max[2] - min[2]).powi(2)).sqrt();
     let cell = (diag / 1e7).max(1e-9);
     let key = |p: [f32; 3]| -> [i64; 3] {
         [
@@ -423,8 +420,14 @@ mod tests {
                 (tri[0][0] + tri[1][0] + tri[2][0]) / 3.0,
                 (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0,
             ];
-            assert!(point_in_loops(centroid, &[&outer, &hole]), "centroid {centroid:?}");
-            assert!(!point_in_polygon(centroid, &hole), "centroid {centroid:?} inside hole");
+            assert!(
+                point_in_loops(centroid, &[&outer, &hole]),
+                "centroid {centroid:?}"
+            );
+            assert!(
+                !point_in_polygon(centroid, &hole),
+                "centroid {centroid:?} inside hole"
+            );
         }
     }
 

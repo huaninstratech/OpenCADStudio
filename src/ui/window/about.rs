@@ -244,9 +244,11 @@ pub fn view_window(sizing: crate::ui::modal::ModalSizing) -> Element<'static, Me
     // Credit to the upstream project this build is based on.
     const ORIGINAL_REPO: &str = "https://github.com/HakanSeven12/OpenCADStudio";
     let origin = button(
-        text(t!("Original project: https://github.com/HakanSeven12/OpenCADStudio"))
-            .size(11)
-            .style(muted_style),
+        text(t!(
+            "Original project: https://github.com/HakanSeven12/OpenCADStudio"
+        ))
+        .size(11)
+        .style(muted_style),
     )
     .on_press(Message::OpenUrl(ORIGINAL_REPO.to_string()))
     .style(button::text)

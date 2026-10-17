@@ -1,6 +1,6 @@
 //! Shared native graph construction for Block Editor authoring objects.
-pub(crate) mod graph;
 pub(crate) mod edit;
+pub(crate) mod graph;
 use codec::objects::{
     BlockEvalExpression, BlockEvalValue, DynamicBlockData, DynamicBlockObject, ObjectType,
 };

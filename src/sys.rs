@@ -622,18 +622,16 @@ struct ProgressVtbl {
         u32,
         *const core::ffi::c_void,
     ) -> windows_sys::core::HRESULT,
-    StopProgressDialog: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_sys::core::HRESULT,
+    StopProgressDialog:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_sys::core::HRESULT,
     SetTitle: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_sys::core::PCWSTR,
     ) -> windows_sys::core::HRESULT,
     SetAnimation: usize,
     HasUserCancelled: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
-    SetProgress: unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        u32,
-        u32,
-    ) -> windows_sys::core::HRESULT,
+    SetProgress:
+        unsafe extern "system" fn(*mut core::ffi::c_void, u32, u32) -> windows_sys::core::HRESULT,
     SetProgress64: usize,
     SetLine: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -818,7 +816,10 @@ pub fn set_pdf_import_pick(path: std::path::PathBuf) {
 }
 
 pub fn take_pdf_import_pick() -> Option<std::path::PathBuf> {
-    PDF_IMPORT_PICK.lock().unwrap_or_else(|e| e.into_inner()).take()
+    PDF_IMPORT_PICK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
 }
 
 /// The file type ATTACH's picker was last left on (1-based; 7 = Drawing).

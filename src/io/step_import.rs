@@ -71,7 +71,11 @@ impl Cursor<'_> {
             while self.s.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
                 self.i += 1;
             }
-            if self.s.get(self.i..).is_some_and(|rest| rest.starts_with(b"/*")) {
+            if self
+                .s
+                .get(self.i..)
+                .is_some_and(|rest| rest.starts_with(b"/*"))
+            {
                 match self.s[self.i + 2..].windows(2).position(|w| w == b"*/") {
                     Some(end) => self.i += end + 4,
                     None => self.i = self.s.len(),
@@ -223,7 +227,11 @@ impl Doc {
     fn colour(&self, p: &P) -> Option<Rgb> {
         let (kind, params) = self.simple(p.reference()?)?;
         match kind {
-            "COLOUR_RGB" => Some([params.get(1)?.num()?, params.get(2)?.num()?, params.get(3)?.num()?]),
+            "COLOUR_RGB" => Some([
+                params.get(1)?.num()?,
+                params.get(2)?.num()?,
+                params.get(3)?.num()?,
+            ]),
             "DRAUGHTING_PRE_DEFINED_COLOUR" => Some(match params.first()?.text()? {
                 "red" => [1.0, 0.0, 0.0],
                 "green" => [0.0, 1.0, 0.0],
@@ -250,7 +258,9 @@ impl Doc {
                 P::List(items) | P::Typed(items) => stack.extend(items.iter().rev()),
                 P::Ref(id) if !seen.contains(id) => {
                     seen.push(*id);
-                    let Some((kind, params)) = self.simple(*id) else { continue };
+                    let Some((kind, params)) = self.simple(*id) else {
+                        continue;
+                    };
                     match kind {
                         "FILL_AREA_STYLE_COLOUR" => {
                             if let Some(c) = params.get(1).and_then(|c| self.colour(c)) {
@@ -262,7 +272,9 @@ impl Doc {
                                 return Some(c);
                             }
                         }
-                        "CURVE_STYLE" => curve = curve.or_else(|| params.get(3).and_then(|c| self.colour(c))),
+                        "CURVE_STYLE" => {
+                            curve = curve.or_else(|| params.get(3).and_then(|c| self.colour(c)))
+                        }
                         _ => stack.extend(params.iter().rev()),
                     }
                 }
@@ -297,7 +309,11 @@ impl Doc {
     fn point(&self, p: &P) -> Option<[f64; 3]> {
         let (_, params) = self.simple(p.reference()?)?;
         let c = params.get(1)?.list();
-        Some([c.first()?.num()?, c.get(1)?.num()?, c.get(2).and_then(P::num).unwrap_or(0.0)])
+        Some([
+            c.first()?.num()?,
+            c.get(1)?.num()?,
+            c.get(2).and_then(P::num).unwrap_or(0.0),
+        ])
     }
     fn direction(&self, p: &P) -> Option<[f64; 3]> {
         self.point(p)
@@ -305,13 +321,20 @@ impl Doc {
     fn placement(&self, p: &P) -> Option<Plane> {
         let (_, params) = self.simple(p.reference()?)?;
         let origin = self.point(params.get(1)?)?;
-        let z = params.get(2).and_then(|d| self.direction(d)).unwrap_or([0.0, 0.0, 1.0]);
+        let z = params
+            .get(2)
+            .and_then(|d| self.direction(d))
+            .unwrap_or([0.0, 0.0, 1.0]);
         let x = params
             .get(3)
             .and_then(|d| self.direction(d))
             .filter(|x| Vec3::from(*x).cross(Vec3::from(z)).length() > 1e-9)
             // Any axis off the normal; the plane squares it up.
-            .unwrap_or(if z[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] });
+            .unwrap_or(if z[0].abs() < 0.9 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.0, 1.0, 0.0]
+            });
         Plane::orthonormal(origin, x, z)
     }
 
@@ -368,8 +391,12 @@ impl Doc {
                 minor_radius: params.get(3)?.num()?,
             }),
             "POLYLINE" => {
-                let points: Option<Vec<_>> =
-                    params.get(1)?.list().iter().map(|q| self.point(q)).collect();
+                let points: Option<Vec<_>> = params
+                    .get(1)?
+                    .list()
+                    .iter()
+                    .map(|q| self.point(q))
+                    .collect();
                 Curve3::Nurbs(NurbsCurve3::new(1, points?, Vec::new(), None)?)
             }
             _ => return None,
@@ -379,17 +406,28 @@ impl Doc {
     fn spline_curve(&self, id: u64) -> Option<NurbsCurve3> {
         // The simple form carries everything after its name; the complex
         // form splits it over parts that have no name.
-        let (degree, points, mults, knots, weights) =
-            if let Some(p) = self.part(id, "B_SPLINE_CURVE_WITH_KNOTS").filter(|p| p.len() >= 9) {
-                (&p[1], &p[2], &p[6], &p[7], None)
-            } else {
-                let base = self.part(id, "B_SPLINE_CURVE")?;
-                let with = self.part(id, "B_SPLINE_CURVE_WITH_KNOTS")?;
-                let weights = self.part(id, "RATIONAL_B_SPLINE_CURVE").and_then(|w| w.first());
-                (base.first()?, base.get(1)?, with.first()?, with.get(1)?, weights)
-            };
+        let (degree, points, mults, knots, weights) = if let Some(p) = self
+            .part(id, "B_SPLINE_CURVE_WITH_KNOTS")
+            .filter(|p| p.len() >= 9)
+        {
+            (&p[1], &p[2], &p[6], &p[7], None)
+        } else {
+            let base = self.part(id, "B_SPLINE_CURVE")?;
+            let with = self.part(id, "B_SPLINE_CURVE_WITH_KNOTS")?;
+            let weights = self
+                .part(id, "RATIONAL_B_SPLINE_CURVE")
+                .and_then(|w| w.first());
+            (
+                base.first()?,
+                base.get(1)?,
+                with.first()?,
+                with.get(1)?,
+                weights,
+            )
+        };
         let points: Option<Vec<_>> = points.list().iter().map(|q| self.point(q)).collect();
-        let weights: Option<Vec<f64>> = weights.map(|w| w.list().iter().filter_map(P::num).collect());
+        let weights: Option<Vec<f64>> =
+            weights.map(|w| w.list().iter().filter_map(P::num).collect());
         let degree = degree.num()? as usize;
         let points = points?;
         let knots = Self::knots(mults, knots, degree)?;
@@ -443,7 +481,9 @@ impl Doc {
         } else {
             let base = self.part(id, "B_SPLINE_SURFACE")?;
             let with = self.part(id, "B_SPLINE_SURFACE_WITH_KNOTS")?;
-            let weights = self.part(id, "RATIONAL_B_SPLINE_SURFACE").and_then(|w| w.first());
+            let weights = self
+                .part(id, "RATIONAL_B_SPLINE_SURFACE")
+                .and_then(|w| w.first());
             (
                 base.first()?,
                 base.get(1)?,
@@ -467,7 +507,14 @@ impl Doc {
                 .collect()
         });
         let (ud, vd) = (ud.num()? as usize, vd.num()? as usize);
-        NurbsSurface3::new(ud, vd, rows?, Self::knots(um, uk, ud)?, Self::knots(vm, vk, vd)?, weights)
+        NurbsSurface3::new(
+            ud,
+            vd,
+            rows?,
+            Self::knots(um, uk, ud)?,
+            Self::knots(vm, vk, vd)?,
+            weights,
+        )
     }
 }
 
@@ -574,7 +621,9 @@ impl Assembly<'_> {
     fn shell(&mut self, p: &P) -> Option<Vec<FaceSpec>> {
         let mut id = p.reference()?;
         let mut flip = false;
-        if self.doc.kind(id) == "ORIENTED_CLOSED_SHELL" || self.doc.kind(id) == "ORIENTED_OPEN_SHELL" {
+        if self.doc.kind(id) == "ORIENTED_CLOSED_SHELL"
+            || self.doc.kind(id) == "ORIENTED_OPEN_SHELL"
+        {
             let (_, params) = self.doc.simple(id)?;
             flip = !params.get(3).is_none_or(P::truth);
             id = params.get(2)?.reference()?;
@@ -592,7 +641,11 @@ impl Assembly<'_> {
 /// A 3×4 placement: the columns are the x, y and z axes and the origin.
 pub type Placement = [[f64; 4]; 3];
 
-const IDENTITY: Placement = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+const IDENTITY: Placement = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
 
 /// A body with the colours the file shows it in.
 pub struct StepBody {
@@ -699,7 +752,11 @@ fn item_bodies(doc: &Doc, id: u64) -> Vec<StepBody> {
                 bodies.push(StepBody {
                     body: assembly.build.body,
                     colour,
-                    faces: assembly.faces.iter().map(|face| doc.styles.get(face).copied()).collect(),
+                    faces: assembly
+                        .faces
+                        .iter()
+                        .map(|face| doc.styles.get(face).copied())
+                        .collect(),
                 });
             }
         }
@@ -722,7 +779,8 @@ pub(super) fn compose(a: &Placement, b: &Placement) -> Placement {
     let mut out = [[0.0; 4]; 3];
     for r in 0..3 {
         for c in 0..4 {
-            out[r][c] = (0..3).map(|k| a[r][k] * b[k][c]).sum::<f64>() + if c == 3 { a[r][3] } else { 0.0 };
+            out[r][c] =
+                (0..3).map(|k| a[r][k] * b[k][c]).sum::<f64>() + if c == 3 { a[r][3] } else { 0.0 };
         }
     }
     out
@@ -782,7 +840,9 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
             continue;
         };
         for unit in units.first().map(P::list).unwrap_or_default() {
-            let Some(unit) = unit.reference() else { continue };
+            let Some(unit) = unit.reference() else {
+                continue;
+            };
             if doc.part(unit, "LENGTH_UNIT").is_some() {
                 unit_mm = unit_size(&doc, unit).unwrap_or(1.0);
             } else if doc.part(unit, "PLANE_ANGLE_UNIT").is_some() {
@@ -799,8 +859,11 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
             if doc.kind(id) != kind {
                 continue;
             }
-            let Some((_, params)) = doc.simple(id) else { continue };
-            let (Some(styles), Some(item)) = (params.get(1), params.get(2).and_then(P::reference)) else {
+            let Some((_, params)) = doc.simple(id) else {
+                continue;
+            };
+            let (Some(styles), Some(item)) = (params.get(1), params.get(2).and_then(P::reference))
+            else {
                 continue;
             };
             if let Some(colour) = doc.style_colour(styles) {
@@ -818,14 +881,21 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
             .filter(|&id| doc.kind(id) == kind)
             .collect()
     };
-    let param = |id: u64, k: usize| doc.simple(id).and_then(|(_, p)| p.get(k)).and_then(P::reference);
+    let param = |id: u64, k: usize| {
+        doc.simple(id)
+            .and_then(|(_, p)| p.get(k))
+            .and_then(P::reference)
+    };
 
     // Product definitions and the name of the product each defines.
     let definitions: Vec<u64> = ids
         .iter()
         .copied()
         .filter(|&id| {
-            matches!(doc.kind(id), "PRODUCT_DEFINITION" | "PRODUCT_DEFINITION_WITH_ASSOCIATED_DOCUMENTS")
+            matches!(
+                doc.kind(id),
+                "PRODUCT_DEFINITION" | "PRODUCT_DEFINITION_WITH_ASSOCIATED_DOCUMENTS"
+            )
         })
         .collect();
     let product_name = |definition: u64| -> String {
@@ -860,7 +930,10 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         let Some(("SHAPE_REPRESENTATION_RELATIONSHIP", params)) = doc.simple(*id) else {
             continue;
         };
-        if let (Some(a), Some(b)) = (params.get(2).and_then(P::reference), params.get(3).and_then(P::reference)) {
+        if let (Some(a), Some(b)) = (
+            params.get(2).and_then(P::reference),
+            params.get(3).and_then(P::reference),
+        ) {
             linked.entry(a).or_default().push(b);
             linked.entry(b).or_default().push(a);
         }
@@ -888,7 +961,12 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
     let mut used_items: Vec<u64> = Vec::new();
     for &definition in &definitions {
         let mut bodies = Vec::new();
-        for rep in shape_of.get(&definition).and_then(|pds| reps_of_shape.get(pds)).into_iter().flatten() {
+        for rep in shape_of
+            .get(&definition)
+            .and_then(|pds| reps_of_shape.get(pds))
+            .into_iter()
+            .flatten()
+        {
             for item in items_of(*rep) {
                 if !used_items.contains(&item) {
                     let found = item_bodies(&doc, item);
@@ -920,11 +998,14 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
             .get(&occurrence)
             .and_then(|pds| {
                 ids.iter().copied().find(|&id| {
-                    doc.kind(id) == "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION" && param(id, 1) == Some(*pds)
+                    doc.kind(id) == "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"
+                        && param(id, 1) == Some(*pds)
                 })
             })
             .and_then(|cdsr| param(cdsr, 0))
-            .and_then(|relation| doc.part(relation, "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION"))
+            .and_then(|relation| {
+                doc.part(relation, "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION")
+            })
             .and_then(|p| p.first()?.reference())
             .and_then(|transformation| {
                 let (_, t) = doc.simple(transformation)?;
@@ -949,7 +1030,10 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         loose_bodies.extend(item_bodies(&doc, id));
     }
     if !loose_bodies.is_empty() {
-        let name = definitions.first().map(|d| product_name(*d)).unwrap_or_default();
+        let name = definitions
+            .first()
+            .map(|d| product_name(*d))
+            .unwrap_or_default();
         component.push(false);
         products.push(StepProduct {
             name,
@@ -959,7 +1043,9 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
     }
 
     let roots = (0..products.len())
-        .filter(|&k| !component[k] && (!products[k].bodies.is_empty() || !products[k].children.is_empty()))
+        .filter(|&k| {
+            !component[k] && (!products[k].bodies.is_empty() || !products[k].children.is_empty())
+        })
         .collect();
     Some(StepModel {
         unit_mm,

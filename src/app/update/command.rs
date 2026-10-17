@@ -3089,16 +3089,17 @@ impl OpenCADStudio {
                     if self.tabs[i].scene.is_layer_locked(handle) {
                         continue;
                     }
-                    let annotative = self.tabs[i]
-                        .scene
-                        .document
-                        .get_entity(handle)
-                        .is_some_and(|entity| {
-                            crate::scene::annotative::is_annotative(
-                                &self.tabs[i].scene.document,
-                                entity,
-                            )
-                        });
+                    let annotative =
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .get_entity(handle)
+                            .is_some_and(|entity| {
+                                crate::scene::annotative::is_annotative(
+                                    &self.tabs[i].scene.document,
+                                    entity,
+                                )
+                            });
                     if !annotative {
                         continue;
                     }

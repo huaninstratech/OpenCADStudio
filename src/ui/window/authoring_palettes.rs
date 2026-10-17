@@ -6,7 +6,7 @@ use crate::ui::dock::{self, Chrome, PanelId, VerticalLabel};
 use crate::ui::icons;
 use crate::ui::ribbon::{tooltip_content, tooltip_style};
 use iced::widget::{
-    button, canvas, column, container, rule, row, scrollable, stack, text, tooltip, Space,
+    button, canvas, column, container, row, rule, scrollable, stack, text, tooltip, Space,
 };
 use iced::{Background, Border, Element, Fill, Theme};
 

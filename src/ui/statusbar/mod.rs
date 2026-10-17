@@ -938,7 +938,9 @@ fn ifc_select_pill(level: crate::app::IfcSelectLevel) -> Element<'static, Messag
     })
     .collect();
     let root = tip(
-        container(text(label.to_string()).size(11)).padding([4, 8]).into(),
+        container(text(label.to_string()).size(11))
+            .padding([4, 8])
+            .into(),
         "IFC hierarchical selection: which level a click selects".into(),
     );
     crate::ui::statusbar::status_menu::menu_bar(root, entries, 170.0)

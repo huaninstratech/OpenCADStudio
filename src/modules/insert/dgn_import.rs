@@ -79,7 +79,9 @@ pub struct Converted {
 /// A DGN weight (0-31) as a lineweight (1/100 mm), as the Standard mapping
 /// converts it.
 pub fn lineweight_of(weight: u32) -> i16 {
-    const TABLE: [i16; 15] = [0, 13, 30, 40, 53, 70, 80, 100, 106, 120, 140, 158, 158, 158, 200];
+    const TABLE: [i16; 15] = [
+        0, 13, 30, 40, 53, 70, 80, 100, 106, 120, 140, 158, 158, 158, 200,
+    ];
     TABLE.get(weight as usize).copied().unwrap_or(211)
 }
 
@@ -214,7 +216,9 @@ fn to_ocs(normal: P3, p: P3) -> Vector3 {
 /// True when every point is at the first one's z.
 fn flat(points: &[P3]) -> bool {
     let z = points.first().map_or(0.0, |p| p[2]);
-    points.iter().all(|p| (p[2] - z).abs() <= 1e-9 * z.abs().max(1.0))
+    points
+        .iter()
+        .all(|p| (p[2] - z).abs() <= 1e-9 * z.abs().max(1.0))
 }
 
 /// The points as a polyline: at one z a 2D polyline at that elevation
@@ -421,7 +425,9 @@ fn color_code(color: By<crate::scene::model::underlay_vector::DgnColor>) -> u16 
 /// the first time.
 fn text_style(geom: &DgnGeom, import: &DgnImport, styles: &mut Vec<(String, String)>) -> String {
     match geom {
-        DgnGeom::Text { style: Some(id), .. } => match import.text_styles.iter().find(|(i, _)| i == id) {
+        DgnGeom::Text {
+            style: Some(id), ..
+        } => match import.text_styles.iter().find(|(i, _)| i == id) {
             Some((_, name)) if !name.eq_ignore_ascii_case("Standard") => {
                 let name = symbol_name(name);
                 if !styles.iter().any(|s| s.0 == name) {
@@ -462,7 +468,11 @@ fn text_entity(geom: &DgnGeom, style: &str) -> Option<EntityType> {
     let mut t = Text::with_value(text.clone(), v3(*origin))
         .with_height(*height)
         .with_rotation(rotation.rem_euclid(std::f64::consts::TAU));
-    t.width_factor = if *width_factor > 0.0 { *width_factor } else { 1.0 };
+    t.width_factor = if *width_factor > 0.0 {
+        *width_factor
+    } else {
+        1.0
+    };
     t.style = style.to_string();
     let (h, v) = just_parts(*just);
     if (h, v) != (0, 2) {
@@ -589,7 +599,11 @@ fn mtext_of_node(
             m.rectangle_height = None;
         }
         None => {
-            let last = lines.iter().filter_map(text_line).last().map_or(first, |l| l.1);
+            let last = lines
+                .iter()
+                .filter_map(text_line)
+                .last()
+                .map_or(first, |l| l.1);
             m.line_spacing_style = LineSpacingStyle::AtLeast;
             m.line_spacing_factor = 1.0;
             m.rectangle_height = Some(height + dot(sub(first, last), up).max(0.0));
@@ -616,7 +630,10 @@ fn arc_entity(center: P3, u: P3, v: P3, start: f64, sweep: f64) -> Vec<EntityTyp
             circle.normal = v3(normal);
             return vec![EntityType::Circle(circle)];
         }
-        let (a0, a1) = (ocs_angle(normal, at(start)), ocs_angle(normal, at(start + sweep)));
+        let (a0, a1) = (
+            ocs_angle(normal, at(start)),
+            ocs_angle(normal, at(start + sweep)),
+        );
         // The arc runs counter-clockwise about its normal.
         let ccw = (sweep > 0.0) != flipped;
         let (from, to) = if ccw { (a0, a1) } else { (a1, a0) };
@@ -645,9 +662,17 @@ fn arc_entity(center: P3, u: P3, v: P3, start: f64, sweep: f64) -> Vec<EntityTyp
             (u, lv / lu, Box::new(|t: f64| -t))
         }
     } else if ccw {
-        (v, lu / lv, Box::new(|t: f64| t - std::f64::consts::FRAC_PI_2))
+        (
+            v,
+            lu / lv,
+            Box::new(|t: f64| t - std::f64::consts::FRAC_PI_2),
+        )
     } else {
-        (v, lu / lv, Box::new(|t: f64| std::f64::consts::FRAC_PI_2 - t))
+        (
+            v,
+            lu / lv,
+            Box::new(|t: f64| std::f64::consts::FRAC_PI_2 - t),
+        )
     };
     let mut e = Ellipse::from_center_axes(v3(center), v3(major), ratio);
     e.normal = v3(normal);
@@ -665,9 +690,17 @@ fn arc_entity(center: P3, u: P3, v: P3, start: f64, sweep: f64) -> Vec<EntityTyp
 fn insert_entity(block: String, m: [f64; 4], origin: P3, z_scale: f64) -> EntityType {
     let det = m[0] * m[3] - m[1] * m[2];
     let mirrored = det < 0.0;
-    let m = if mirrored { [-m[0], -m[1], m[2], m[3]] } else { m };
+    let m = if mirrored {
+        [-m[0], -m[1], m[2], m[3]]
+    } else {
+        m
+    };
     let sx = m[0].hypot(m[2]);
-    let sy = if sx > 0.0 { (m[0] * m[3] - m[1] * m[2]) / sx } else { 1.0 };
+    let sy = if sx > 0.0 {
+        (m[0] * m[3] - m[1] * m[2]) / sx
+    } else {
+        1.0
+    };
     let (point, z) = if mirrored {
         (Vector3::new(-origin[0], origin[1], -origin[2]), -z_scale)
     } else {
@@ -877,7 +910,11 @@ impl<'a> Converter<'a> {
                 self.elements(parts, true, copy, depth + 1)
             }
             DgnGeom::CellGroup { name, parts } => {
-                let base = if name.is_empty() { "AnonymousCell" } else { name.as_str() };
+                let base = if name.is_empty() {
+                    "AnonymousCell"
+                } else {
+                    name.as_str()
+                };
                 let block = self.unique(&block_name(base));
                 let entities = self.elements(parts, false, copy, depth + 1);
                 self.out.blocks.push((block.clone(), entities));
@@ -946,7 +983,11 @@ impl<'a> Converter<'a> {
 /// definition's name and a number), made before the blocks that place it. V8 cells are blocks placed as they
 /// are. A V8 file's levels all become layers, in its level table's order.
 pub fn convert(import: &DgnImport, sub_units: bool, explode_text_nodes: bool) -> Converted {
-    let k = if sub_units { import.sub_per_master } else { 1.0 };
+    let k = if sub_units {
+        import.sub_per_master
+    } else {
+        1.0
+    };
     let scale = |elements: &[DgnElement]| {
         crate::scene::model::underlay_vector::scaled_elements(elements, k, [0.0, 0.0])
     };
@@ -1082,11 +1123,7 @@ pub struct DgnImportSettings {
 static SETTINGS: std::sync::Mutex<Option<DgnImportSettings>> = std::sync::Mutex::new(None);
 
 pub fn settings() -> DgnImportSettings {
-    SETTINGS
-        .lock()
-        .ok()
-        .and_then(|s| *s)
-        .unwrap_or_default()
+    SETTINGS.lock().ok().and_then(|s| *s).unwrap_or_default()
 }
 
 pub fn set_settings(mut settings: DgnImportSettings) {
@@ -1138,8 +1175,10 @@ impl DgnImportCommand {
         if path.is_empty() {
             return CmdResult::NeedPoint;
         }
-        let models = crate::scene::model::underlay_vector::dgn_import_models(&path)
-            .filter(|m| !m.is_empty() && crate::scene::model::underlay_vector::dgn_import(&path, &m[0]).is_some());
+        let models = crate::scene::model::underlay_vector::dgn_import_models(&path).filter(|m| {
+            !m.is_empty()
+                && crate::scene::model::underlay_vector::dgn_import(&path, &m[0]).is_some()
+        });
         let Some(models) = models else {
             return CmdResult::ReportError("Invalid or unsupported DGN file.".to_string());
         };
@@ -1156,7 +1195,11 @@ impl DgnImportCommand {
             self.step = Step::ListModels;
             return CmdResult::NeedPoint;
         }
-        let name = if text.is_empty() { self.models[0].as_str() } else { text };
+        let name = if text.is_empty() {
+            self.models[0].as_str()
+        } else {
+            text
+        };
         match self.models.iter().find(|m| m.eq_ignore_ascii_case(name)) {
             Some(found) => {
                 self.model = found.clone();
@@ -1264,14 +1307,12 @@ impl CadCommand for DgnImportCommand {
             }
             Step::Conversion => self.accept_conversion(text),
             Step::Mapping => self.accept_mapping(text),
-            Step::ListMappings => {
-                match self.list(text, &["Standard"], Step::Mapping) {
-                    CmdResult::ReportMeasurement(lines) => {
-                        CmdResult::ReportMeasurement(format!("Import mapping setups:\n{lines}"))
-                    }
-                    other => other,
+            Step::ListMappings => match self.list(text, &["Standard"], Step::Mapping) {
+                CmdResult::ReportMeasurement(lines) => {
+                    CmdResult::ReportMeasurement(format!("Import mapping setups:\n{lines}"))
                 }
-            }
+                other => other,
+            },
         })
     }
 

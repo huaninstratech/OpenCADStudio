@@ -790,20 +790,14 @@ fn extension_guide_tip(
     snapped: Point,
     acquired_direction: Option<Point>,
 ) -> Option<(Point, Point)> {
-    let delta = acquired_direction.unwrap_or(Point::new(
-        snapped.x - base.x,
-        snapped.y - base.y,
-    ));
+    let delta = acquired_direction.unwrap_or(Point::new(snapped.x - base.x, snapped.y - base.y));
     let len = delta.x.hypot(delta.y);
     if !len.is_finite() || len <= 1e-3 {
         return None;
     }
     let u = Point::new(delta.x / len, delta.y / len);
     let along = (snapped.x - base.x) * u.x + (snapped.y - base.y) * u.y;
-    let tip = Point::new(
-        base.x + u.x * (along + 18.0),
-        base.y + u.y * (along + 18.0),
-    );
+    let tip = Point::new(base.x + u.x * (along + 18.0), base.y + u.y * (along + 18.0));
     Some((u, tip))
 }
 
@@ -1771,12 +1765,10 @@ impl canvas::Program<Message> for SelectionCanvas {
                 let acquired = self.snap_ext_dir.or_else(|| {
                     self.otrack_lines.iter().find_map(|&(origin, tip)| {
                         let offset = (origin.x - base.x).hypot(origin.y - base.y);
-                        (offset <= 2.0)
-                            .then_some(Point::new(tip.x - origin.x, tip.y - origin.y))
+                        (offset <= 2.0).then_some(Point::new(tip.x - origin.x, tip.y - origin.y))
                     })
                 });
-                extension_guide_tip(base, sp, acquired)
-                    .map(|(unit, tip)| (base, unit, tip))
+                extension_guide_tip(base, sp, acquired).map(|(unit, tip)| (base, unit, tip))
             });
             let guide_dash = canvas::Stroke {
                 line_dash: canvas::LineDash {
@@ -1804,10 +1796,7 @@ impl canvas::Program<Message> for SelectionCanvas {
                         let dy = sp.y - base.y;
                         let len = dx.hypot(dy);
                         if len > 1e-3 {
-                            let tip = Point::new(
-                                sp.x + dx / len * 18.0,
-                                sp.y + dy / len * 18.0,
-                            );
+                            let tip = Point::new(sp.x + dx / len * 18.0, sp.y + dy / len * 18.0);
                             if let Some((a, b)) = clip_seg(base, tip, bounds) {
                                 frame.stroke(&canvas::Path::line(a, b), guide_dash.clone());
                             }

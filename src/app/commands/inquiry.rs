@@ -863,8 +863,10 @@ impl OpenCADStudio {
                     .collect();
 
                 if prop.is_empty() {
-                    self.command_line
-                        .push_info(crate::t!("Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE|ANNOTATIVE <value>").as_ref());
+                    self.command_line.push_info(
+                        crate::t!("Usage: QSELECT TYPE|LAYER|COLOR|LINETYPE|ANNOTATIVE <value>")
+                            .as_ref(),
+                    );
                 } else if matches!(prop.as_str(), "ANNOTATIVE")
                     && !annotative_want
                     && !annotative_reject

@@ -7,16 +7,16 @@
 //   cache   — block-definition and property caches
 pub mod annotative;
 pub mod assoc_array;
-pub(crate) mod block_metadata;
-pub mod block_service;
-pub mod block_visibility;
+pub(crate) mod block_actions;
 pub(crate) mod block_authoring;
 pub(crate) mod block_basepoint;
-pub(crate) mod block_lookup;
-pub(crate) mod block_actions;
-pub(crate) mod block_point_parameter;
 pub(crate) mod block_distance_parameter;
+pub(crate) mod block_lookup;
+pub(crate) mod block_metadata;
 pub(crate) mod block_orientation_parameter;
+pub(crate) mod block_point_parameter;
+pub mod block_service;
+pub mod block_visibility;
 pub mod cache;
 pub mod compare;
 pub mod convert;
@@ -64,8 +64,8 @@ mod hatch_boundary;
 mod layout;
 mod limits;
 mod modify;
-pub(crate) use modify::remap_copied_reactors;
 pub(crate) use modify::inverse_affine;
+pub(crate) use modify::remap_copied_reactors;
 mod mspace;
 pub mod named_parameters;
 mod page_setup;
@@ -1219,7 +1219,13 @@ pub(crate) fn sanitized_table_name(raw: &str, fallback: &str) -> String {
     let name: String = raw
         .trim()
         .chars()
-        .map(|c| if valid_block_name(c.encode_utf8(&mut [0; 4])) { c } else { '_' })
+        .map(|c| {
+            if valid_block_name(c.encode_utf8(&mut [0; 4])) {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(255)
         .collect();
     block_service::validate_block_name(&name).unwrap_or_else(|_| fallback.to_string())
@@ -2449,7 +2455,6 @@ pub struct Scene {
     pub ifc_handle_by_guid: HashMap<String, Handle>,
     /// Spatial model tree from the last IFC import.
     pub ifc_tree: Vec<crate::io::ifc::IfcTreeNode>,
-
 
     /// GPU render data for raster images (RasterImage entities), keyed by handle.
     pub images: HashMap<Handle, ImageModel>,
@@ -6260,9 +6265,8 @@ impl Scene {
                 _ => None,
             })
             .unwrap_or(self.annotation_scale as f64);
-        let ratio =
-            crate::scene::annotative::text_context_ratio(&self.document, handle, scale)
-                .unwrap_or(1.0);
+        let ratio = crate::scene::annotative::text_context_ratio(&self.document, handle, scale)
+            .unwrap_or(1.0);
         Some(model_per_paper / ratio)
     }
 
@@ -6325,7 +6329,6 @@ impl Scene {
             self.bump_geometry();
         }
     }
-
 
     /// Resolve a named annotation scale to a real `Scale` object handle,
     /// materializing the object from the scale list when the drawing names the
@@ -11847,8 +11850,11 @@ impl Scene {
 
         // The model-space annotation-scale toggle collapses model-side builds
         // to "as drawn" before anything downstream sees the arguments.
-        let (anno_scale_override, annotation_scale_handle) =
-            self.annotation_display_args(block_handle, anno_scale_override, annotation_scale_handle);
+        let (anno_scale_override, annotation_scale_handle) = self.annotation_display_args(
+            block_handle,
+            anno_scale_override,
+            annotation_scale_handle,
+        );
 
         // Skip diagnostic clock reads when PERF is disabled.
         let perf = crate::perf::enabled();

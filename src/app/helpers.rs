@@ -716,10 +716,7 @@ mod grid_axes_tests {
     #[test]
     fn grid_axes_stay_on_the_ucs_under_isometric_drafting() {
         // The drawing-aid pair does rotate onto the isoplane…
-        assert_eq!(
-            drafting_angles(true, IsoPlane::Left, 0.0),
-            [90.0, 150.0]
-        );
+        assert_eq!(drafting_angles(true, IsoPlane::Left, 0.0), [90.0, 150.0]);
         let (ix, _, _) = drafting_axes(X, Y, Z, true, IsoPlane::Left, 0.0);
         assert!(close(ix, Y), "isoplane X' = {ix:?}, want vertical Y");
 
@@ -831,11 +828,7 @@ mod drafting_constrain_3d_tests {
         } else {
             Vec3::Z
         };
-        let view = Mat4::look_at_rh(
-            Vec3::ZERO,
-            (target - eye).as_vec3(),
-            up,
-        );
+        let view = Mat4::look_at_rh(Vec3::ZERO, (target - eye).as_vec3(), up);
         let proj = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 10_000.0);
         proj * view
     }

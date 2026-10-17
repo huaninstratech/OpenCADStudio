@@ -1,6 +1,6 @@
-use crate::io::plot_style::PlotStyleTableExt as _;
 use super::{ArrowKey, Message, OpenCADStudio, TextEntryMode};
 use crate::command::CadCommand;
+use crate::io::plot_style::PlotStyleTableExt as _;
 use crate::scene::VIEWCUBE_DRAW_PX;
 use crate::ui::PropertiesPanel;
 use iced::time::Instant;
@@ -1797,9 +1797,9 @@ impl OpenCADStudio {
                 )
             }
             Message::MissingFontsDismiss => {
-            if self.missing_fonts_downloading {
-                return Task::none();
-            }
+                if self.missing_fonts_downloading {
+                    return Task::none();
+                }
                 let missing = self.missing_fonts.take().unwrap_or_default();
                 for name in &missing {
                     self.suppressed_missing_fonts
@@ -1824,20 +1824,18 @@ impl OpenCADStudio {
                     return Task::none();
                 }
                 let undo = self.begin_text_style_undo(i, "Replace missing fonts", &names);
-                let replaced =
-                    crate::io::font_repo::substitute_missing_fonts(
-                        &mut self.tabs[i].scene.document,
-                        &names,
-                    );
+                let replaced = crate::io::font_repo::substitute_missing_fonts(
+                    &mut self.tabs[i].scene.document,
+                    &names,
+                );
                 self.tabs[i].dirty = true;
                 self.tabs[i]
                     .scene
                     .invalidate_text_style_dependencies_many(&names);
                 self.commit_text_style_undo(i, undo);
                 for (style, old) in &replaced {
-                    self.command_line.push_output(
-                        crate::tf!("FONT  {old} → txt (style '{style}')").as_ref(),
-                    );
+                    self.command_line
+                        .push_output(crate::tf!("FONT  {old} → txt (style '{style}')").as_ref());
                 }
                 Task::none()
             }
@@ -2529,12 +2527,10 @@ impl OpenCADStudio {
 
             Message::IfcDataWriteFinished(path, result) => {
                 match result {
-                    Ok(()) => self.command_line.push_output(
-                        &format!("IFCDATA: report written to {}", path.display()),
-                    ),
-                    Err(error) => {
-                        self.command_line.push_error(&format!("IFCDATA: {error}"))
-                    }
+                    Ok(()) => self
+                        .command_line
+                        .push_output(&format!("IFCDATA: report written to {}", path.display())),
+                    Err(error) => self.command_line.push_error(&format!("IFCDATA: {error}")),
                 }
                 Task::none()
             }
@@ -2544,7 +2540,10 @@ impl OpenCADStudio {
                 async {
                     crate::sys::file_dialog()
                         .set_title("Import IFC / STEP / OBJ Model")
-                        .add_filter("Mesh Models", &["ifc", "IFC", "step", "stp", "STEP", "STP", "obj", "OBJ"])
+                        .add_filter(
+                            "Mesh Models",
+                            &["ifc", "IFC", "step", "stp", "STEP", "STP", "obj", "OBJ"],
+                        )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                         .await
@@ -2578,12 +2577,10 @@ impl OpenCADStudio {
             Message::IfcExportPath(None) => Task::none(),
             Message::IfcExportFinished(path, result) => {
                 match result {
-                    Ok(()) => self.command_line.push_output(
-                        &format!("EXPORTIFC: model written to {}", path.display()),
-                    ),
-                    Err(error) => {
-                        self.command_line.push_error(&format!("EXPORTIFC: {error}"))
-                    }
+                    Ok(()) => self
+                        .command_line
+                        .push_output(&format!("EXPORTIFC: model written to {}", path.display())),
+                    Err(error) => self.command_line.push_error(&format!("EXPORTIFC: {error}")),
                 }
                 Task::none()
             }
@@ -2594,8 +2591,7 @@ impl OpenCADStudio {
 
             Message::IfcTreeSelect(guid) => {
                 let i = self.active_tab;
-                let Some(handle) = self.tabs[i].scene.ifc_handle_by_guid.get(&guid).copied()
-                else {
+                let Some(handle) = self.tabs[i].scene.ifc_handle_by_guid.get(&guid).copied() else {
                     return Task::none();
                 };
                 self.tabs[i].scene.deselect_all();
@@ -4780,7 +4776,9 @@ impl OpenCADStudio {
 
             // CATIA navigation: the left button pressed during a middle drag
             // turns the drag into an orbit instead of starting a pick.
-            Message::ViewportLeftPressAt(_) | Message::ViewportLeftPress | Message::PanePress(_)
+            Message::ViewportLeftPressAt(_)
+            | Message::ViewportLeftPress
+            | Message::PanePress(_)
                 if self.navigation_style == crate::app::settings::NavigationStyle::Catia
                     && self.tabs[self.active_tab]
                         .scene
@@ -9605,12 +9603,14 @@ impl OpenCADStudio {
 
             Message::ToggleDynamicUcs => {
                 self.dynamic_ucs = !self.dynamic_ucs;
-                self.command_line.push_output(if self.dynamic_ucs {
-                    crate::t!("Dynamic UCS: on")
-                } else {
-                    crate::t!("Dynamic UCS: off")
-                }
-                .as_ref());
+                self.command_line.push_output(
+                    if self.dynamic_ucs {
+                        crate::t!("Dynamic UCS: on")
+                    } else {
+                        crate::t!("Dynamic UCS: off")
+                    }
+                    .as_ref(),
+                );
                 self.persist_settings_if_changed();
                 Task::none()
             }
@@ -9990,9 +9990,7 @@ impl OpenCADStudio {
                 // Closing the attribute manager is its Cancel: live changes
                 // are taken back.
                 if self.active_modal == Some(super::ModalKind::AttMan) {
-                    return self.on_attman(
-                        crate::ui::window::attman_dialog::AttManMsg::Cancel,
-                    );
+                    return self.on_attman(crate::ui::window::attman_dialog::AttManMsg::Cancel);
                 }
                 if matches!(
                     self.active_modal,

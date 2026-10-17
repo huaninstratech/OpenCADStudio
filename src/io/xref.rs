@@ -3308,7 +3308,8 @@ mod tests {
                 // Hatch (pattern names have no table — preserved verbatim).
                 let mut hatch = codec::entities::Hatch::new();
                 hatch.pattern.name = "ANSI31".to_string();
-                doc.add_entity(codec::EntityType::Hatch(Box::new(hatch))).unwrap();
+                doc.add_entity(codec::EntityType::Hatch(Box::new(hatch)))
+                    .unwrap();
                 // Dim-style reference via a tolerance entity.
                 doc.dim_styles
                     .add(codec::tables::DimStyle::new("ARCH"))

@@ -43,7 +43,11 @@ fn parameters(text: &str, delimiter: char, terminator: char) -> Vec<P> {
             i += 1;
         }
         if i > start && matches!(chars.get(i), Some('H' | 'h')) {
-            let count: usize = chars[start..i].iter().collect::<String>().parse().unwrap_or(0);
+            let count: usize = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
             let body: String = chars.iter().skip(i + 1).take(count).collect();
             i = i.saturating_add(1).saturating_add(count);
             out.push(P::Str(body));
@@ -55,7 +59,10 @@ fn parameters(text: &str, delimiter: char, terminator: char) -> Vec<P> {
             {
                 i += 1;
             }
-            let raw: String = chars[start..i].iter().collect::<String>().replace(['D', 'd'], "E");
+            let raw: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .replace(['D', 'd'], "E");
             out.push(P::Num(raw.trim().parse().unwrap_or(0.0)));
         }
         while chars.get(i).is_some_and(|c| *c == ' ') {
@@ -93,7 +100,11 @@ type Matrix = super::step_import::Placement;
 /// A transformation matrix entity's (124) matrix.
 fn matrix_of(entity: &Entity) -> Matrix {
     let v = |k: usize| entity.params.get(k).map_or(0.0, P::num);
-    [[v(1), v(2), v(3), v(4)], [v(5), v(6), v(7), v(8)], [v(9), v(10), v(11), v(12)]]
+    [
+        [v(1), v(2), v(3), v(4)],
+        [v(5), v(6), v(7), v(8)],
+        [v(9), v(10), v(11), v(12)],
+    ]
 }
 
 impl Doc {
@@ -117,7 +128,9 @@ impl Doc {
             8 => [255, 255, 255],
             n if n < 0 => match self.entities.get(&(-n as usize)).filter(|e| e.kind == 314) {
                 Some(e) => [1, 2, 3].map(|k| {
-                    (e.params.get(k).map_or(0.0, P::num) * 2.55).round().clamp(0.0, 255.0) as u8
+                    (e.params.get(k).map_or(0.0, P::num) * 2.55)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
                 }),
                 None => return Color::ByLayer,
             },
@@ -157,11 +170,15 @@ impl Doc {
 
     /// `entity`'s placement applied to a point it defines.
     fn place(&self, entity: &Entity) -> impl Fn([f64; 3]) -> [f64; 3] {
-        let m = (entity.transform != 0).then(|| self.matrix(entity.transform)).flatten();
+        let m = (entity.transform != 0)
+            .then(|| self.matrix(entity.transform))
+            .flatten();
         let scale = self.scale;
         move |p| {
             let p = match m {
-                Some(m) => [0, 1, 2].map(|r| m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3]),
+                Some(m) => {
+                    [0, 1, 2].map(|r| m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3])
+                }
                 None => p,
             };
             p.map(|c| c * scale)
@@ -187,7 +204,10 @@ impl Doc {
                 let x = place([v(2) + 1.0, v(3), v(1)]);
                 let y = place([v(2), v(3) + 1.0, v(1)]);
                 let start = place([v(4), v(5), v(1)]);
-                let radius = (0..3).map(|k| (start[k] - centre[k]).powi(2)).sum::<f64>().sqrt();
+                let radius = (0..3)
+                    .map(|k| (start[k] - centre[k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
                 Curve3::Circle(Circle3 {
                     plane: Plane::orthonormal(
                         centre,
@@ -197,7 +217,11 @@ impl Doc {
                                 [x[0] - centre[0], x[1] - centre[1], x[2] - centre[2]],
                                 [y[0] - centre[0], y[1] - centre[1], y[2] - centre[2]],
                             );
-                            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+                            [
+                                a[1] * b[2] - a[2] * b[1],
+                                a[2] * b[0] - a[0] * b[2],
+                                a[0] * b[1] - a[1] * b[0],
+                            ]
                         },
                     )?,
                     radius,
@@ -346,7 +370,12 @@ impl Assembly<'_> {
             return Some(v);
         }
         let entity = self.doc.get(list).filter(|e| e.kind == 502)?;
-        let n = key.1.checked_sub(1)?.checked_mul(3)?.checked_add(2)?.min(entity.params.len());
+        let n = key
+            .1
+            .checked_sub(1)?
+            .checked_mul(3)?
+            .checked_add(2)?
+            .min(entity.params.len());
         let p = |k: usize| entity.params.get(k).map(P::num);
         let point = self.doc.place(entity)([p(n)?, p(n + 1)?, p(n + 2)?]);
         let v = self.build.vertex(point);
@@ -360,7 +389,12 @@ impl Assembly<'_> {
             return Some(e);
         }
         let entity = self.doc.get(list).filter(|e| e.kind == 504)?;
-        let n = key.1.checked_sub(1)?.checked_mul(5)?.checked_add(2)?.min(entity.params.len());
+        let n = key
+            .1
+            .checked_sub(1)?
+            .checked_mul(5)?
+            .checked_add(2)?
+            .min(entity.params.len());
         let p = |k: usize| entity.params.get(k).map(P::num);
         let curve = self.doc.curve(p(n)?)?;
         let start = self.vertex(p(n + 1)?, p(n + 2)?)?;
@@ -373,7 +407,11 @@ impl Assembly<'_> {
     /// The vertex at a point, shared with one already there.
     fn corner(&mut self, point: [f64; 3]) -> VertexKey {
         let tolerance = self.doc.resolution;
-        if let Some((_, v)) = self.corners.iter().find(|(p, _)| distance(*p, point) <= tolerance) {
+        if let Some((_, v)) = self
+            .corners
+            .iter()
+            .find(|(p, _)| distance(*p, point) <= tolerance)
+        {
             return *v;
         }
         let v = self.build.vertex(point);
@@ -382,7 +420,10 @@ impl Assembly<'_> {
     }
 
     /// A loop along curve pieces, in their order.
-    fn curve_ring(&mut self, pieces: Vec<(Curve3, [f64; 3], [f64; 3])>) -> Option<Vec<(EdgeKey, bool)>> {
+    fn curve_ring(
+        &mut self,
+        pieces: Vec<(Curve3, [f64; 3], [f64; 3])>,
+    ) -> Option<Vec<(EdgeKey, bool)>> {
         let mut ring = Vec::new();
         for (curve, from, to) in pieces {
             if distance(from, to) <= self.doc.resolution && matches!(curve, Curve3::Line(_)) {
@@ -403,9 +444,14 @@ impl Assembly<'_> {
         let mut pieces = Vec::new();
         for (k, (axis, at)) in sides.into_iter().enumerate() {
             let (a, b) = (corners[k], corners[(k + 1) % 4]);
-            let (from, to) = (surface.point_at_knot(a.0, a.1), surface.point_at_knot(b.0, b.1));
+            let (from, to) = (
+                surface.point_at_knot(a.0, a.1),
+                surface.point_at_knot(b.0, b.1),
+            );
             let middle = surface.point_at_knot(0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
-            if distance(from, middle) <= self.doc.resolution && distance(to, middle) <= self.doc.resolution {
+            if distance(from, middle) <= self.doc.resolution
+                && distance(to, middle) <= self.doc.resolution
+            {
                 continue;
             }
             pieces.push((Curve3::Nurbs(surface.isocurve(axis, at)?), from, to));
@@ -419,8 +465,12 @@ impl Assembly<'_> {
     fn orient(&self, surface: &Surface, ring: &mut [(EdgeKey, bool)], outer: bool) {
         let mut uv = Vec::new();
         for (edge, forward) in ring.iter() {
-            let Some(edge) = self.build.body.edges.get(*edge) else { return };
-            let Some(curve) = self.build.body.curves.get(edge.curve) else { return };
+            let Some(edge) = self.build.body.edges.get(*edge) else {
+                return;
+            };
+            let Some(curve) = self.build.body.curves.get(edge.curve) else {
+                return;
+            };
             let (t0, t1) = (edge.start_parameter, edge.end_parameter);
             for k in 0..8 {
                 let s = k as f64 / 8.0;
@@ -450,11 +500,21 @@ impl Assembly<'_> {
         // A count can be no more than the parameters there are.
         let count = (v(3) as usize).min(entity.params.len());
         let (surface_at, outer, holes): (f64, Option<f64>, Vec<f64>) = match entity.kind {
-            144 => (v(1), (v(2) != 0.0).then(|| v(4)), (0..count).map(|k| v(5 + k)).collect()),
-            143 => (v(2), (count > 0).then(|| v(4)), (1..count).map(|k| v(4 + k)).collect()),
+            144 => (
+                v(1),
+                (v(2) != 0.0).then(|| v(4)),
+                (0..count).map(|k| v(5 + k)).collect(),
+            ),
+            143 => (
+                v(2),
+                (count > 0).then(|| v(4)),
+                (1..count).map(|k| v(4 + k)).collect(),
+            ),
             _ => return None,
         };
-        let Surface::Nurbs(nurbs) = self.doc.surface(surface_at)? else { return None };
+        let Surface::Nurbs(nurbs) = self.doc.surface(surface_at)? else {
+            return None;
+        };
         let surface = Surface::Nurbs(nurbs.clone());
         let mut first = match outer {
             Some(boundary) => {
@@ -484,11 +544,14 @@ impl Assembly<'_> {
         let mut ring = Vec::new();
         let mut at = 2;
         for _ in 0..p(1)? as usize {
-            let (kind, list, index, agrees, pcurves) = (p(at)?, p(at + 1)?, p(at + 2)?, p(at + 3)?, p(at + 4)?);
+            let (kind, list, index, agrees, pcurves) =
+                (p(at)?, p(at + 1)?, p(at + 2)?, p(at + 3)?, p(at + 4)?);
             if kind == 0.0 {
                 ring.push((self.edge(list, index)?, agrees != 0.0));
             }
-            at = at.saturating_add(5).saturating_add((pcurves as usize).saturating_mul(2));
+            at = at
+                .saturating_add(5)
+                .saturating_add((pcurves as usize).saturating_mul(2));
         }
         Some(ring)
     }
@@ -545,7 +608,9 @@ pub fn read(bytes: &[u8], drawing_mm: Option<f64>) -> Option<IgesModel> {
         if line.len() < 73 {
             continue;
         }
-        let Some(section) = line.get(72..73).and_then(|s| s.chars().next()) else { continue };
+        let Some(section) = line.get(72..73).and_then(|s| s.chars().next()) else {
+            continue;
+        };
         sections.entry(section).or_default().push(line);
     }
     let directory = sections.get(&'D')?;
@@ -575,14 +640,22 @@ pub fn read(bytes: &[u8], drawing_mm: Option<f64>) -> Option<IgesModel> {
         10 => 10.0,
         11 => 0.000_025_4,
         3 => match globals.get(14) {
-            Some(P::Str(name)) if name.eq_ignore_ascii_case("IN") || name.eq_ignore_ascii_case("INCH") => 25.4,
+            Some(P::Str(name))
+                if name.eq_ignore_ascii_case("IN") || name.eq_ignore_ascii_case("INCH") =>
+            {
+                25.4
+            }
             Some(P::Str(name)) if name.eq_ignore_ascii_case("FT") => 304.8,
             Some(P::Str(name)) if name.eq_ignore_ascii_case("M") => 1000.0,
             Some(P::Str(name)) if name.eq_ignore_ascii_case("CM") => 10.0,
             _ => 1.0,
         },
         _ => 1.0,
-    } * globals.get(12).map(P::num).filter(|s| *s > 0.0).map_or(1.0, |s| 1.0 / s);
+    } * globals
+        .get(12)
+        .map(P::num)
+        .filter(|s| *s > 0.0)
+        .map_or(1.0, |s| 1.0 / s);
 
     let parameter_lines: HashMap<usize, &str> = sections
         .get(&'P')
@@ -621,8 +694,15 @@ pub fn read(bytes: &[u8], drawing_mm: Option<f64>) -> Option<IgesModel> {
             },
         );
     }
-    let scale = drawing_mm.filter(|mm| *mm > 0.0).map_or(1.0, |mm| unit_mm / mm);
-    let resolution = globals.get(18).map(P::num).filter(|r| *r > 0.0).unwrap_or(1e-6) * scale;
+    let scale = drawing_mm
+        .filter(|mm| *mm > 0.0)
+        .map_or(1.0, |mm| unit_mm / mm);
+    let resolution = globals
+        .get(18)
+        .map(P::num)
+        .filter(|r| *r > 0.0)
+        .unwrap_or(1e-6)
+        * scale;
     let doc = Doc {
         entities,
         scale,
@@ -640,7 +720,9 @@ pub fn read(bytes: &[u8], drawing_mm: Option<f64>) -> Option<IgesModel> {
     for number in solids {
         let entity = &doc.entities[&number];
         let v = |k: usize| entity.params.get(k).map(P::num);
-        let Some((shell, agrees)) = v(1).zip(v(2)) else { continue };
+        let Some((shell, agrees)) = v(1).zip(v(2)) else {
+            continue;
+        };
         let mut assembly = Assembly {
             doc: &doc,
             build: Builder::new(),

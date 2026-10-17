@@ -273,7 +273,11 @@ fn page_number(token: &str) -> Option<usize> {
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(token.parse::<u64>().map_or(i32::MAX as u64, |n| n.min(i32::MAX as u64)) as usize)
+    Some(
+        token
+            .parse::<u64>()
+            .map_or(i32::MAX as u64, |n| n.min(i32::MAX as u64)) as usize,
+    )
 }
 
 pub struct PdfImportCommand {
@@ -617,9 +621,9 @@ impl CadCommand for PdfImportCommand {
             Step::Scale => match token.parse::<f64>() {
                 Ok(v) => self.scale(v),
                 Err(_) if token.is_empty() => self.scale(1.0),
-                Err(_) => CmdResult::ReportError(
-                    "Requires numeric distance or second point.".to_string(),
-                ),
+                Err(_) => {
+                    CmdResult::ReportError("Requires numeric distance or second point.".to_string())
+                }
             },
             Step::Rotation => match token.parse::<f64>() {
                 Ok(v) => self.rotation(v.to_radians()),
@@ -1106,7 +1110,13 @@ fn curve_of(points: &[[f64; 2]], bulges: &[f64], closed: bool, z: f64) -> Option
                 first.radius,
             ))
         } else {
-            arc(first.center, first.radius, points[0], points[n - 1], turn > 0.0)
+            arc(
+                first.center,
+                first.radius,
+                points[0],
+                points[n - 1],
+                turn > 0.0,
+            )
         });
     }
     if bulges.iter().any(|b| *b != 0.0) || segs < CURVE_MIN_SEGMENTS {
@@ -1120,7 +1130,13 @@ fn curve_of(points: &[[f64; 2]], bulges: &[f64], closed: bool, z: f64) -> Option
                 .filter(|p| ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() <= ARC_TOLERANCE * r)
                 .count();
             if enough(inliers) {
-                return Some(arc(c, r, points[0], points[n - 1], sweep_sign(points, c) > 0.0));
+                return Some(arc(
+                    c,
+                    r,
+                    points[0],
+                    points[n - 1],
+                    sweep_sign(points, c) > 0.0,
+                ));
             }
         }
     }
@@ -1456,8 +1472,7 @@ pub fn convert(
                                                 bulges,
                                                 closed,
                                             };
-                                            if settings.join || stroke.straight() || stroke.closed
-                                            {
+                                            if settings.join || stroke.straight() || stroke.closed {
                                                 strokes.push(stroke);
                                             } else {
                                                 // Join off: each arc apart, straight runs
@@ -1645,7 +1660,9 @@ pub fn convert(
     }
     // In drawing order (the sort is stable: a subpath's pieces keep theirs).
     curves.sort_by_key(|(order, _)| *order);
-    result.entities.extend(curves.into_iter().map(|(_, entity)| entity));
+    result
+        .entities
+        .extend(curves.into_iter().map(|(_, entity)| entity));
     result.layers = layer_colors;
     for image in &result.images {
         if !result.layers.iter().any(|(n, _)| *n == image.layer) {

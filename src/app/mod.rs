@@ -8,20 +8,20 @@ pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub use automation::{export_headless, export_pdf_headless, serve};
 mod annotation_data;
+mod block_actions;
+mod block_authoring_edit;
 mod block_editor;
 #[cfg(test)]
 mod block_editor_tests;
-mod block_save_as;
-mod block_visibility;
 mod block_lookup;
-mod block_actions;
-mod block_authoring_edit;
 mod block_properties;
 #[cfg(test)]
 mod block_properties_tests;
+mod block_save_as;
 mod block_test;
 #[cfg(test)]
 mod block_test_tests;
+mod block_visibility;
 mod command_driver;
 pub(crate) use command_driver::{
     copy_to_clipboard_kernel, define_block_raw_doc, paste_entities_kernel, PasteSpace,

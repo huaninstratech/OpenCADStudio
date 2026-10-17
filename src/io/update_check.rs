@@ -5,8 +5,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 const RELEASES_API: &str =
     "https://api.github.com/repos/huaninstratech/OpenCADStudio/releases/latest";
-pub const RELEASES_PAGE: &str =
-    "https://github.com/huaninstratech/OpenCADStudio/releases/latest";
+pub const RELEASES_PAGE: &str = "https://github.com/huaninstratech/OpenCADStudio/releases/latest";
 
 /// Give release assets time to propagate before offering an update.
 #[cfg(not(target_arch = "wasm32"))]

@@ -117,7 +117,11 @@ pub fn export_pdf_headless(inputs: &[std::path::PathBuf]) -> i32 {
             }
             let _ = tx.send(Event::File(
                 index as u32 + 1,
-                input.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                input
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
             ));
             let output = input.with_extension("pdf");
             match export_pdf_one(input, &output) {
@@ -2258,7 +2262,9 @@ mod tests {
         dimension.definition_point = Vector3::new(0.0, 5.0, 0.0);
         dimension.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
         document
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))))
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))))
             .unwrap();
         crate::modules::draw::modify::explode::bake_dimension_blocks(&mut document);
 
@@ -2281,7 +2287,9 @@ mod tests {
         dimension.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
         app.tabs[app.active_tab]
             .scene
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))));
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))));
         let path = std::env::temp_dir().join(format!(
             "ocs_verified_dimension_{}_{}.dwg",
             std::process::id(),
@@ -2319,7 +2327,9 @@ mod tests {
         let i = app.active_tab;
         app.tabs[i]
             .scene
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))));
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))));
         let path = std::env::temp_dir().join(format!(
             "ocs_verified_dimension_follow_up_{}_{}.dwg",
             std::process::id(),
@@ -3488,7 +3498,11 @@ mod tests {
                 assert_eq!(br.entity_handles.len(), 2, "{ctx}: owned children");
                 assert!(!br.is_layout(), "{ctx}: layout flag after reload");
                 // Document-level queries count definition-owned inserts too.
-                assert_eq!(count_type(app, "Insert"), inserts, "{ctx}: refs after reload");
+                assert_eq!(
+                    count_type(app, "Insert"),
+                    inserts,
+                    "{ctx}: refs after reload"
+                );
             };
             check(&mut app, &format!("{ext}: round trip 1"), 3);
 
@@ -3525,7 +3539,11 @@ mod tests {
                 Some(codec::EntityType::Insert(_))
             );
             assert!(nested_child_is_insert, "{ext}: nested child is an Insert");
-            assert_eq!(count_type(&mut app, "Insert"), 4, "{ext}: NESTED ref + 2 MARK refs + NESTED child");
+            assert_eq!(
+                count_type(&mut app, "Insert"),
+                4,
+                "{ext}: NESTED ref + 2 MARK refs + NESTED child"
+            );
 
             assert_eq!(
                 app.automation_op(&format!(r#"{{"op":"save","path":"{p}"}}"#))["ok"],
@@ -3637,8 +3655,11 @@ mod tests {
             };
             check(&mut app, &format!("{ext}: before save"));
 
-            let path = std::env::temp_dir()
-                .join(format!("ocs_probe_clone_{}.{}", std::process::id(), ext));
+            let path = std::env::temp_dir().join(format!(
+                "ocs_probe_clone_{}.{}",
+                std::process::id(),
+                ext
+            ));
             let _ = std::fs::remove_file(&path);
             let p = path.to_string_lossy().replace('\\', "\\\\");
             assert_eq!(
@@ -3945,8 +3966,7 @@ mod tests {
             // Deterministically simulate an intentional hold-to-lasso.
             // A fast click+move must no longer activate a lasso just
             // because the cursor crossed the old 24 px shortcut.
-            let held_since =
-                iced::time::Instant::now() - std::time::Duration::from_millis(260);
+            let held_since = iced::time::Instant::now() - std::time::Duration::from_millis(260);
             app.tabs[i]
                 .scene
                 .selection
@@ -4003,7 +4023,10 @@ mod tests {
         let _ = app.update(Message::ViewportMove(moved));
         {
             let sel = app.tabs[i].scene.selection.borrow();
-            assert!(!sel.input.left_dragging, "fast first click must win over lasso");
+            assert!(
+                !sel.input.left_dragging,
+                "fast first click must win over lasso"
+            );
             assert!(!sel.gesture.poly_active, "the lasso must not arm");
         }
         let _ = app.update(Message::ViewportLeftRelease);
@@ -4061,7 +4084,9 @@ mod tests {
         let mut dst_mtext = MText::new();
         dst_mtext.value = "DSTM".into();
         dst_mtext.height = 2.0;
-        let dst_mtext_h = app.tabs[i].scene.add_entity(EntityType::MText(Box::new(dst_mtext)));
+        let dst_mtext_h = app.tabs[i]
+            .scene
+            .add_entity(EntityType::MText(Box::new(dst_mtext)));
 
         // Drive the interactive command exactly as the viewport does:
         // phase 1 source pick, phase 2 destination selection.

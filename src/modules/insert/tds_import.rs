@@ -100,7 +100,10 @@ impl CadCommand for TdsMaterialCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let text = text.trim();
         if self.choosing {
-            if text.is_empty() || text.eq_ignore_ascii_case("None") || text.eq_ignore_ascii_case("N") {
+            if text.is_empty()
+                || text.eq_ignore_ascii_case("None")
+                || text.eq_ignore_ascii_case("N")
+            {
                 return Some(self.answer(MultiMaterial::Material(None)));
             }
             let found = self

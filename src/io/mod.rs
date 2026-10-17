@@ -13,25 +13,25 @@ pub mod fbx;
 pub mod file_association;
 pub mod font_repo;
 pub(crate) mod fs_access;
+pub mod ifc;
+pub mod ifc_write;
 pub mod iges_import;
 pub mod line_read;
 pub mod linetypes;
+pub mod meshutil;
 pub mod model_import;
 pub mod obj;
 pub mod ole_embed;
 pub mod paper_catalog;
 pub mod patterns;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod single_instance;
-pub mod ifc;
-pub mod ifc_write;
-pub mod meshutil;
 pub mod pdf_export;
 pub mod plot;
 pub mod plot_device;
 pub mod plot_style;
 pub mod print_to_printer;
 pub mod recovery;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod single_instance;
 pub mod spf;
 pub mod step;
 pub mod step_read;
@@ -44,9 +44,9 @@ pub mod tds_import;
 pub mod thumbnail;
 pub mod update_check;
 pub mod visual_styles;
-pub mod wmf_import;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod web_recent;
+pub mod wmf_import;
 // Registered on every target so the pure helpers (and their tests) compile on
 // the native host; the OPFS half inside is wasm-only.
 pub(crate) mod web_autosave;
@@ -1373,9 +1373,7 @@ fn network_path(path: &Path) -> bool {
     match prefix.kind() {
         Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
         Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
-            let mut root: Vec<u16> = format!("{}:\\", letter as char)
-                .encode_utf16()
-                .collect();
+            let mut root: Vec<u16> = format!("{}:\\", letter as char).encode_utf16().collect();
             root.push(0);
             unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
         }
@@ -2007,7 +2005,9 @@ mod network_path_tests {
 
     #[test]
     fn unc_paths_never_mmap() {
-        assert!(network_path(Path::new(r"\\hd159\usbshare1\Cutting Plan Sample\u.dwg")));
+        assert!(network_path(Path::new(
+            r"\\hd159\usbshare1\Cutting Plan Sample\u.dwg"
+        )));
         assert!(network_path(Path::new(r"\\?\UNC\server\share\u.dwg")));
         assert!(network_path(Path::new(r"\\localhost\C$\data\u.dwg")));
     }
@@ -2874,8 +2874,10 @@ mod dimension_arrow_save_tests {
         dimension.definition_point = Vector3::new(0.0, 20.0, 0.0);
         dimension.base.definition_point = dimension.definition_point;
         dimension.base.text_middle_point = Vector3::new(50.0, 20.0, 0.0);
-        doc.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))))
-            .unwrap();
+        doc.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+            dimension,
+        ))))
+        .unwrap();
         doc
     }
 

@@ -137,7 +137,11 @@ struct Player {
 
 impl Player {
     fn at(&self, x: f64, y: f64) -> Vector3 {
-        Vector3::new((x - self.origin[0]) * self.scale[0], (y - self.origin[1]) * self.scale[1], 0.0)
+        Vector3::new(
+            (x - self.origin[0]) * self.scale[0],
+            (y - self.origin[1]) * self.scale[1],
+            0.0,
+        )
     }
 
     fn polyline(&mut self, points: &[[f64; 2]], closed: bool, width: f64, rgb: [u8; 3]) {
@@ -219,7 +223,10 @@ fn arc_points(bounds: [f64; 4], start: [f64; 2], end: [f64; 2]) -> Vec<[f64; 2]>
     let [left, top, right, bottom] = bounds.map(|v| v as i64);
     let (cx, cy) = ((left + right).div_euclid(2), (top + bottom).div_euclid(2));
     let (rx, ry) = ((right - left).abs() / 2, (bottom - top).abs() / 2);
-    let (from, to) = (radial_angle(bounds, start[0], start[1]), radial_angle(bounds, end[0], end[1]));
+    let (from, to) = (
+        radial_angle(bounds, start[0], start[1]),
+        radial_angle(bounds, end[0], end[1]),
+    );
     let (start_angle, end_angle) = match (from, to) {
         (None, None) => return Vec::new(),
         (None, to) => (0.0, to),
@@ -245,7 +252,9 @@ fn arc_points(bounds: [f64; 4], start: [f64; 2], end: [f64; 2]) -> Vec<[f64; 2]>
         // Up to the end.
         Some(to) if to > start_angle => (first..).take_while(|k| under(k, to)).collect(),
         // Round to a whole turn, then from zero up to the end.
-        Some(to) => (first..=ARC_STEPS).chain((0..).take_while(|k| under(k, to))).collect(),
+        Some(to) => (first..=ARC_STEPS)
+            .chain((0..).take_while(|k| under(k, to)))
+            .collect(),
         // Round to a whole turn.
         None => (first..=ARC_STEPS).collect(),
     };
@@ -361,13 +370,16 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
     for (function, p) in &records {
         let s = |k: usize| p.get(k).map(|w| *w as i16 as f64).unwrap_or(0.0);
         let points = |from: usize, count: usize| -> Vec<[f64; 2]> {
-            (0..count).map(|k| [s(from + 2 * k), s(from + 2 * k + 1)]).collect()
+            (0..count)
+                .map(|k| [s(from + 2 * k), s(from + 2 * k + 1)])
+                .collect()
         };
-        let create = |table: &mut Vec<Option<Object>>, object: Object| {
-            match table.iter().position(Option::is_none) {
-                Some(slot) => table[slot] = Some(object),
-                None => table.push(Some(object)),
-            }
+        let create = |table: &mut Vec<Option<Object>>, object: Object| match table
+            .iter()
+            .position(Option::is_none)
+        {
+            Some(slot) => table[slot] = Some(object),
+            None => table.push(Some(object)),
         };
         match function {
             // CREATEPENINDIRECT
@@ -376,7 +388,10 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 Object::Pen(Pen {
                     null: p.first().is_some_and(|style| style & 0x0f == 5),
                     width: s(1),
-                    rgb: colorref(p.get(3).copied().unwrap_or(0), p.get(4).copied().unwrap_or(0)),
+                    rgb: colorref(
+                        p.get(3).copied().unwrap_or(0),
+                        p.get(4).copied().unwrap_or(0),
+                    ),
                 }),
             ),
             // CREATEBRUSHINDIRECT
@@ -384,7 +399,10 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 &mut table,
                 Object::Brush(Brush {
                     null: p.first() == Some(&1),
-                    rgb: colorref(p.get(1).copied().unwrap_or(0), p.get(2).copied().unwrap_or(0)),
+                    rgb: colorref(
+                        p.get(1).copied().unwrap_or(0),
+                        p.get(2).copied().unwrap_or(0),
+                    ),
                 }),
             ),
             // CREATEFONTINDIRECT: height, width, escapement, ... face at
@@ -422,7 +440,12 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 }
             }
             // SETTEXTCOLOR
-            0x0209 => text_rgb = colorref(p.first().copied().unwrap_or(0), p.get(1).copied().unwrap_or(0)),
+            0x0209 => {
+                text_rgb = colorref(
+                    p.first().copied().unwrap_or(0),
+                    p.get(1).copied().unwrap_or(0),
+                )
+            }
             // MOVETO, LINETO (y, x)
             0x0214 => current = [s(1), s(0)],
             0x0213 => {

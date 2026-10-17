@@ -3962,8 +3962,12 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             shadow_sampler: &self.shadow_sampler,
         };
         let frame = frame_bind_group(device, &self.frame_bgl, &self.uniform_buffer, &views);
-        let selection =
-            frame_bind_group(device, &self.frame_bgl, &self.selection_uniform_buffer, &views);
+        let selection = frame_bind_group(
+            device,
+            &self.frame_bgl,
+            &self.selection_uniform_buffer,
+            &views,
+        );
         self.uniform_bind_group = frame;
         self.selection_uniform_bind_group = selection;
     }
@@ -4005,7 +4009,11 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         selection.transparency_enable = 1.0;
         uniforms.highlight_widen = 0.0;
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        queue.write_buffer(&self.selection_uniform_buffer, 0, bytemuck::bytes_of(&selection));
+        queue.write_buffer(
+            &self.selection_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&selection),
+        );
     }
 
     pub fn upload_background_images(

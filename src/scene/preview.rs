@@ -443,9 +443,7 @@ impl Scene {
             let Some(e) = self.document.get_entity(eh) else {
                 continue;
             };
-            if matches!(e, EntityType::Block(_) | EntityType::BlockEnd(_))
-                || e.common().invisible
-            {
+            if matches!(e, EntityType::Block(_) | EntityType::BlockEnd(_)) || e.common().invisible {
                 continue;
             }
             out.extend(self.tessellate_one(e));

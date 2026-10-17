@@ -68,13 +68,39 @@ pub struct IfcExtrusionParams {
 /// covers arbitrary outlines: only the extrusion depth stays editable.
 #[derive(Clone, Debug)]
 pub enum IfcProfile {
-    Rectangle { x: f64, y: f64 },
-    Circle { radius: f64 },
-    CircleHollow { radius: f64, thickness: f64 },
-    RectangleHollow { x: f64, y: f64, thickness: f64 },
-    Trapezium { bottom: f64, top: f64, height: f64, offset: f64 },
-    IShape { width: f64, depth: f64, web: f64, flange: f64 },
-    LShape { depth: f64, width: f64, thickness: f64 },
+    Rectangle {
+        x: f64,
+        y: f64,
+    },
+    Circle {
+        radius: f64,
+    },
+    CircleHollow {
+        radius: f64,
+        thickness: f64,
+    },
+    RectangleHollow {
+        x: f64,
+        y: f64,
+        thickness: f64,
+    },
+    Trapezium {
+        bottom: f64,
+        top: f64,
+        height: f64,
+        offset: f64,
+    },
+    IShape {
+        width: f64,
+        depth: f64,
+        web: f64,
+        flange: f64,
+    },
+    LShape {
+        depth: f64,
+        width: f64,
+        thickness: f64,
+    },
     Points,
 }
 
@@ -96,19 +122,33 @@ impl IfcProfile {
                 rows.push(("ydim", "Profile height (Y)", *y));
                 rows.push(("thickness", "Wall thickness", *thickness));
             }
-            IfcProfile::Trapezium { bottom, top, height, offset } => {
+            IfcProfile::Trapezium {
+                bottom,
+                top,
+                height,
+                offset,
+            } => {
                 rows.push(("bottom", "Bottom width", *bottom));
                 rows.push(("top", "Top width", *top));
                 rows.push(("pheight", "Profile height", *height));
                 rows.push(("poffset", "Top offset", *offset));
             }
-            IfcProfile::IShape { width, depth, web, flange } => {
+            IfcProfile::IShape {
+                width,
+                depth,
+                web,
+                flange,
+            } => {
                 rows.push(("iwidth", "Flange width", *width));
                 rows.push(("idepth", "Section depth", *depth));
                 rows.push(("web", "Web thickness", *web));
                 rows.push(("flange", "Flange thickness", *flange));
             }
-            IfcProfile::LShape { depth, width, thickness } => {
+            IfcProfile::LShape {
+                depth,
+                width,
+                thickness,
+            } => {
                 rows.push(("ldepth", "Leg depth", *depth));
                 rows.push(("lwidth", "Leg width", *width));
                 rows.push(("thickness", "Leg thickness", *thickness));
@@ -121,11 +161,31 @@ impl IfcProfile {
     pub fn set(&mut self, key: &str, value: f64) -> bool {
         let positive = value > 0.0;
         match (key, self) {
-            ("xdim", IfcProfile::Rectangle { x, .. } | IfcProfile::RectangleHollow { x, .. }) if positive => *x = value,
-            ("ydim", IfcProfile::Rectangle { y, .. } | IfcProfile::RectangleHollow { y, .. }) if positive => *y = value,
-            ("radius", IfcProfile::Circle { radius } | IfcProfile::CircleHollow { radius, .. }) if positive => *radius = value,
-            ("thickness", IfcProfile::CircleHollow { radius, thickness }) if positive && value < *radius => *thickness = value,
-            ("thickness", IfcProfile::RectangleHollow { x, y, thickness }) if positive && value < x.min(*y) => *thickness = value,
+            ("xdim", IfcProfile::Rectangle { x, .. } | IfcProfile::RectangleHollow { x, .. })
+                if positive =>
+            {
+                *x = value
+            }
+            ("ydim", IfcProfile::Rectangle { y, .. } | IfcProfile::RectangleHollow { y, .. })
+                if positive =>
+            {
+                *y = value
+            }
+            ("radius", IfcProfile::Circle { radius } | IfcProfile::CircleHollow { radius, .. })
+                if positive =>
+            {
+                *radius = value
+            }
+            ("thickness", IfcProfile::CircleHollow { radius, thickness })
+                if positive && value < *radius =>
+            {
+                *thickness = value
+            }
+            ("thickness", IfcProfile::RectangleHollow { x, y, thickness })
+                if positive && value < x.min(*y) =>
+            {
+                *thickness = value
+            }
             ("bottom", IfcProfile::Trapezium { bottom, .. }) if positive => *bottom = value,
             ("top", IfcProfile::Trapezium { top, .. }) if positive => *top = value,
             ("pheight", IfcProfile::Trapezium { height, .. }) if positive => *height = value,
@@ -226,8 +286,9 @@ struct Reader<'a> {
     /// triangles in the representation's own coordinates. Assembly-heavy
     /// models instance the same brep tens of thousands of times; without
     /// this cache every instance re-tessellates from scratch.
-    mapped_cache:
-        std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<Vec<[[f64; 3]; 3]>>>>>,
+    mapped_cache: std::sync::Mutex<
+        std::collections::HashMap<u64, Option<std::sync::Arc<Vec<[[f64; 3]; 3]>>>>,
+    >,
 }
 
 /// Parse an IFC file into meshes plus extracted element records.
@@ -420,14 +481,9 @@ fn parse_ifc_impl(
 fn build_model_tree(records: &[IfcElementRecord]) -> Vec<IfcTreeNode> {
     // Nesting: elements whose parent is another *element* (assembly chains)
     // become children; only top-level elements hang directly off a storey.
-    let by_guid: std::collections::HashMap<&str, &IfcElementRecord> = records
-        .iter()
-        .map(|r| (r.guid.as_str(), r))
-        .collect();
-    fn nest<'a>(
-        rec: &'a IfcElementRecord,
-        records: &'a [IfcElementRecord],
-    ) -> IfcTreeNode {
+    let by_guid: std::collections::HashMap<&str, &IfcElementRecord> =
+        records.iter().map(|r| (r.guid.as_str(), r)).collect();
+    fn nest<'a>(rec: &'a IfcElementRecord, records: &'a [IfcElementRecord]) -> IfcTreeNode {
         let children = records
             .iter()
             .filter(|r| r.parent_guid.as_deref() == Some(rec.guid.as_str()))
@@ -617,7 +673,11 @@ fn element_display_name(ent: &super::spf::Ent, type_name: &str) -> String {
 }
 
 /// Display label for a spatial structure entity, cached per id.
-fn container_label(spf: &Spf, id: u64, cache: &mut std::collections::HashMap<u64, String>) -> String {
+fn container_label(
+    spf: &Spf,
+    id: u64,
+    cache: &mut std::collections::HashMap<u64, String>,
+) -> String {
     if let Some(name) = cache.get(&id) {
         return name.clone();
     }
@@ -672,16 +732,26 @@ impl<'a> Reader<'a> {
                     }
                 }
             } else if ent.is("IFCMATERIALDEFINITIONREPRESENTATION") {
-                let Some(material) = ent.ref_id(3) else { continue };
+                let Some(material) = ent.ref_id(3) else {
+                    continue;
+                };
                 let Some(reps) = ent.list(2) else { continue };
                 for rep in reps {
                     let Some(rep_id) = rep.as_ref() else { continue };
-                    let Some(rep_ent) = self.spf.get(rep_id) else { continue };
+                    let Some(rep_ent) = self.spf.get(rep_id) else {
+                        continue;
+                    };
                     // IfcStyledRepresentation keeps styled items at slot 3.
-                    let Some(items) = rep_ent.list(3) else { continue };
+                    let Some(items) = rep_ent.list(3) else {
+                        continue;
+                    };
                     for item in items {
-                        let Some(item_id) = item.as_ref() else { continue };
-                        let Some(styled) = self.spf.get(item_id) else { continue };
+                        let Some(item_id) = item.as_ref() else {
+                            continue;
+                        };
+                        let Some(styled) = self.spf.get(item_id) else {
+                            continue;
+                        };
                         if !styled.is("IFCSTYLEDITEM") {
                             continue;
                         }
@@ -699,18 +769,16 @@ impl<'a> Reader<'a> {
     /// breadth-first until a surface style (then its rendering/shading
     /// component) shows up.
     fn styles_colour(&self, styles: Option<&Val>) -> Option<[f32; 4]> {
-        let mut queue: Vec<u64> = styles?
-            .as_list()?
-            .iter()
-            .filter_map(Val::as_ref)
-            .collect();
+        let mut queue: Vec<u64> = styles?.as_list()?.iter().filter_map(Val::as_ref).collect();
         let mut steps = 0usize;
         while let Some(id) = queue.pop() {
             steps += 1;
             if steps > 64 {
                 break;
             }
-            let Some(ent) = self.spf.get(id) else { continue };
+            let Some(ent) = self.spf.get(id) else {
+                continue;
+            };
             if ent.is("IFCSURFACESTYLE") {
                 for sub in ent.list(1).unwrap_or(&[]) {
                     let Some(sub_id) = sub.as_ref() else { continue };
@@ -743,8 +811,12 @@ impl<'a> Reader<'a> {
         }
         let ent = self.spf.get(ent_id)?;
         if ent.is("IFCSURFACESTYLERENDERING") || ent.is("IFCSURFACESTYLESHADING") {
-            let Some(colour_id) = ent.ref_id(0) else { return None };
-            let Some(colour) = self.spf.get(colour_id) else { return None };
+            let Some(colour_id) = ent.ref_id(0) else {
+                return None;
+            };
+            let Some(colour) = self.spf.get(colour_id) else {
+                return None;
+            };
             let mut rgba = colour_rgb(colour)?;
             // IfcSurfaceStyleRendering attribute 1 is Transparency
             // (0 = opaque), in both IFC2X3 and IFC4.
@@ -790,11 +862,15 @@ impl<'a> Reader<'a> {
             rep.args.len().saturating_sub(1)
         };
         for item in rep.list(items_idx)? {
-            let Some(item_id) = item.as_ref() else { continue };
+            let Some(item_id) = item.as_ref() else {
+                continue;
+            };
             if let Some(colour) = self.colors.get(&item_id) {
                 return Some(*colour);
             }
-            let Some(item_ent) = self.spf.get(item_id) else { continue };
+            let Some(item_ent) = self.spf.get(item_id) else {
+                continue;
+            };
             if item_ent.is("IFCMAPPEDITEM") {
                 let mapped_rep = item_ent
                     .ref_id(0)
@@ -817,7 +893,8 @@ impl<'a> Reader<'a> {
     /// Material display name for an element, for the property report.
     fn material_name(&self, element_id: u64) -> Option<String> {
         let material_id = self.materials.get(&element_id)?;
-        self.spf.get(*material_id)
+        self.spf
+            .get(*material_id)
             .and_then(|m| m.str(0))
             .map(|s| s.to_string())
     }
@@ -869,7 +946,9 @@ impl<'a> Reader<'a> {
             let mut chain = vec![container_label(self.spf, *structure, &mut names)];
             let mut cursor = *structure;
             for _ in 0..4 {
-                let Some(parent) = self.parents.get(&cursor) else { break };
+                let Some(parent) = self.parents.get(&cursor) else {
+                    break;
+                };
                 chain.push(container_label(self.spf, *parent, &mut names));
                 cursor = *parent;
             }
@@ -881,7 +960,9 @@ impl<'a> Reader<'a> {
         for ent in self.spf.iter() {
             if ent.is("IFCRELDEFINESBYPROPERTIES") {
                 let Some(defs) = ent.list(4) else { continue };
-                let Some(definition) = ent.ref_id(5) else { continue };
+                let Some(definition) = ent.ref_id(5) else {
+                    continue;
+                };
                 for object in defs.iter().filter_map(Val::as_ref) {
                     self.prop_defs.entry(object).or_default().push(definition);
                 }
@@ -935,11 +1016,7 @@ impl<'a> Reader<'a> {
             }
             let type_name = ent.ty().trim_start_matches("IFC").to_string();
             let name = element_display_name(ent, &type_name);
-            let storey = self
-                .container
-                .get(&ent.id)
-                .cloned()
-                .unwrap_or_default();
+            let storey = self.container.get(&ent.id).cloned().unwrap_or_default();
             let mut props: Vec<(String, String, String)> = Vec::new();
             if let Some(defs) = self.prop_defs.get(&ent.id) {
                 for def in defs {
@@ -950,11 +1027,7 @@ impl<'a> Reader<'a> {
                 let type_ent = self.spf.get(*type_id);
                 if let Some(type_ent) = type_ent {
                     let type_label = type_ent.str(2).unwrap_or(type_ent.ty());
-                    props.push((
-                        "Type".into(),
-                        "Type name".into(),
-                        type_label.to_string(),
-                    ));
+                    props.push(("Type".into(), "Type name".into(), type_label.to_string()));
                 }
                 if let Some(sets) = self.type_props.get(type_id) {
                     for set in sets {
@@ -976,14 +1049,20 @@ impl<'a> Reader<'a> {
         elements
     }
 
-    fn collect_property_set(&self, def: Option<&super::spf::Ent>, props: &mut Vec<(String, String, String)>) {
+    fn collect_property_set(
+        &self,
+        def: Option<&super::spf::Ent>,
+        props: &mut Vec<(String, String, String)>,
+    ) {
         let Some(def) = def else { return };
         if def.is("IFCPROPERTYSET") {
             let set_name = def.str(2).unwrap_or("Property set").to_string();
             let Some(items) = def.list(4) else { return };
             for item in items {
                 let Some(id) = item.as_ref() else { continue };
-                let Some(prop) = self.spf.get(id) else { continue };
+                let Some(prop) = self.spf.get(id) else {
+                    continue;
+                };
                 if prop.is("IFCPROPERTYSINGLEVALUE") {
                     let name = prop.str(0).unwrap_or("");
                     let value = self.value_string(prop.get(2));
@@ -1039,10 +1118,7 @@ impl<'a> Reader<'a> {
                     || q.is("IFCQUANTITYNUMBER");
                 if is_quantity {
                     let name = q.str(0).unwrap_or("");
-                    let value = q
-                        .num(3)
-                        .map(format_measure)
-                        .unwrap_or_else(|| "-".into());
+                    let value = q.num(3).map(format_measure).unwrap_or_else(|| "-".into());
                     props.push((set_name.clone(), name.to_string(), value));
                 }
             }
@@ -1124,7 +1200,11 @@ impl<'a> Reader<'a> {
             .and_then(|id| self.direction(id))
             .map(|d| glam::DVec3::new(d[0], d[1], d[2]))
             .unwrap_or(glam::DVec3::Z);
-        let z = if z.length() < 1e-9 { glam::DVec3::Z } else { z.normalize() };
+        let z = if z.length() < 1e-9 {
+            glam::DVec3::Z
+        } else {
+            z.normalize()
+        };
         let x0 = axis
             .ref_id(2)
             .and_then(|id| self.direction(id))
@@ -1193,10 +1273,18 @@ impl<'a> Reader<'a> {
         }
         let spf: &'a Spf = self.spf;
         let Some(rep) = spf.get(rep_id) else { return };
-        let items_idx = if rep.is("IFCSHAPEREPRESENTATION") { 3 } else { rep.args.len().saturating_sub(1) };
-        let Some(items) = rep.list(items_idx) else { return };
+        let items_idx = if rep.is("IFCSHAPEREPRESENTATION") {
+            3
+        } else {
+            rep.args.len().saturating_sub(1)
+        };
+        let Some(items) = rep.list(items_idx) else {
+            return;
+        };
         for item in items {
-            let Some(item_id) = item.as_ref() else { continue };
+            let Some(item_id) = item.as_ref() else {
+                continue;
+            };
             // IfcProductRepresentation lists nested representations rather
             // than shape items — recurse into those.
             let nested = spf
@@ -1211,13 +1299,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn mesh_item(
-        &self,
-        item_id: u64,
-        xform: &glam::DMat4,
-        depth: usize,
-        sink: &mut TriSink,
-    ) {
+    fn mesh_item(&self, item_id: u64, xform: &glam::DMat4, depth: usize, sink: &mut TriSink) {
         if depth > MAX_ITEM_DEPTH {
             return;
         }
@@ -1226,7 +1308,9 @@ impl<'a> Reader<'a> {
         if ent.is("IFCEXTRUDEDAREASOLID") {
             self.mesh_extrusion(ent, xform, sink);
         } else if ent.is("IFCFACETEDBREP") || ent.is("IFCBREPWITHVOIDS") {
-            let Some(shell_id) = ent.ref_id(0) else { return };
+            let Some(shell_id) = ent.ref_id(0) else {
+                return;
+            };
             self.mesh_connected_face_set(shell_id, xform, sink);
         } else if ent.is("IFCSHELLBASEDSURFACEMODEL") {
             if let Some(shells) = ent.list(0) {
@@ -1259,8 +1343,12 @@ impl<'a> Reader<'a> {
         sink: &mut TriSink,
     ) {
         let spf: &'a Spf = self.spf;
-        let Some(source_id) = ent.ref_id(0) else { return };
-        let Some(source) = spf.get(source_id) else { return };
+        let Some(source_id) = ent.ref_id(0) else {
+            return;
+        };
+        let Some(source) = spf.get(source_id) else {
+            return;
+        };
         if !source.is("IFCREPRESENTATIONMAP") {
             return;
         }
@@ -1355,9 +1443,15 @@ impl<'a> Reader<'a> {
     /// IfcExtrudedAreaSolid: sweep the profile along a direction.
     fn mesh_extrusion(&self, ent: &super::spf::Ent, parent: &glam::DMat4, sink: &mut TriSink) {
         let spf: &'a Spf = self.spf;
-        let Some(profile_id) = ent.ref_id(0) else { return };
-        let Some(profile) = spf.get(profile_id) else { return };
-        let Some(mut loops) = self.profile_loops(profile) else { return };
+        let Some(profile_id) = ent.ref_id(0) else {
+            return;
+        };
+        let Some(profile) = spf.get(profile_id) else {
+            return;
+        };
+        let Some(mut loops) = self.profile_loops(profile) else {
+            return;
+        };
         // Profile placement (origin + in-plane rotation), applied to every ring.
         if let Some(pos_id) = profile.ref_id(2) {
             if let Some(pos) = spf.get(pos_id) {
@@ -1470,32 +1564,18 @@ impl<'a> Reader<'a> {
             "IFCRECTANGLEPROFILEDEF" | "IFCRECTANGLEHOLLOWPROFILEDEF" => {
                 let x = profile.num(3).unwrap_or(0.0) / 2.0;
                 let y = profile.num(4).unwrap_or(0.0) / 2.0;
-                let mut loops = vec![vec![
-                    [-x, -y],
-                    [x, -y],
-                    [x, y],
-                    [-x, y],
-                ]];
+                let mut loops = vec![vec![[-x, -y], [x, -y], [x, y], [-x, y]]];
                 if ty.ends_with("HOLLOWPROFILEDEF") {
                     let t = profile.num(5).unwrap_or(0.0);
                     let ix = (x - t).max(0.0);
                     let iy = (y - t).max(0.0);
-                    loops.push(vec![
-                        [-ix, -iy],
-                        [ix, -iy],
-                        [ix, iy],
-                        [-ix, iy],
-                    ]);
+                    loops.push(vec![[-ix, -iy], [ix, -iy], [ix, iy], [-ix, iy]]);
                 }
                 Some(loops)
             }
             "IFCCIRCLEPROFILEDEF" => {
                 let r = profile.num(3).unwrap_or(0.0);
-                Some(vec![sample_circle(
-                    [0.0, 0.0],
-                    r.max(0.0),
-                    36,
-                )])
+                Some(vec![sample_circle([0.0, 0.0], r.max(0.0), 36)])
             }
             "IFCCIRCLEHOLLOWPROFILEDEF" => {
                 let r = profile.num(3).unwrap_or(0.0);
@@ -1661,11 +1741,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn find_first_extrusion(
-        &self,
-        rep_id: u64,
-        depth: usize,
-    ) -> Option<&super::spf::Ent> {
+    fn find_first_extrusion(&self, rep_id: u64, depth: usize) -> Option<&super::spf::Ent> {
         if depth > MAX_ITEM_DEPTH {
             return None;
         }
@@ -1677,7 +1753,9 @@ impl<'a> Reader<'a> {
         };
         for item in rep.list(items_idx)? {
             let Some(id) = item.as_ref() else { continue };
-            let Some(ent) = self.spf.get(id) else { continue };
+            let Some(ent) = self.spf.get(id) else {
+                continue;
+            };
             if ent.is("IFCEXTRUDEDAREASOLID") {
                 return Some(ent);
             }
@@ -1732,7 +1810,11 @@ impl<'a> Reader<'a> {
                         let k = (i.max(1) - 1) as usize;
                         pts.get(k).copied().unwrap_or([0.0, 0.0])
                     };
-                    let (a, m, b) = (pick(indices[0].as_i64()?), pick(indices[1].as_i64()?), pick(indices[2].as_i64()?));
+                    let (a, m, b) = (
+                        pick(indices[0].as_i64()?),
+                        pick(indices[1].as_i64()?),
+                        pick(indices[2].as_i64()?),
+                    );
                     append_arc(&mut out, a, m, b, 12);
                 } else {
                     for v in indices.iter().skip(1) {
@@ -1773,25 +1855,36 @@ impl<'a> Reader<'a> {
     /// IfcFacetedBrep / shell-based models: a connected face set of polygon
     /// loops. Advanced (curved) faces inside IFC shells fall back to their
     /// loop polygons — a coarse but useful outline.
-    fn mesh_connected_face_set(
-        &self,
-        shell_id: u64,
-        xform: &glam::DMat4,
-        sink: &mut TriSink,
-    ) {
-        let Some(shell) = self.spf.get(shell_id) else { return };
+    fn mesh_connected_face_set(&self, shell_id: u64, xform: &glam::DMat4, sink: &mut TriSink) {
+        let Some(shell) = self.spf.get(shell_id) else {
+            return;
+        };
         let Some(faces) = shell.list(0) else { return };
         for face in faces {
-            let Some(face_id) = face.as_ref() else { continue };
-            let Some(face_ent) = self.spf.get(face_id) else { continue };
-            let Some(bounds) = face_ent.list(0) else { continue };
+            let Some(face_id) = face.as_ref() else {
+                continue;
+            };
+            let Some(face_ent) = self.spf.get(face_id) else {
+                continue;
+            };
+            let Some(bounds) = face_ent.list(0) else {
+                continue;
+            };
             let mut loops: Vec<Vec<[f64; 3]>> = Vec::new();
             for bound in bounds {
-                let Some(bound_ref) = bound.as_ref() else { continue };
-                let Some(bound_ent) = self.spf.get(bound_ref) else { continue };
+                let Some(bound_ref) = bound.as_ref() else {
+                    continue;
+                };
+                let Some(bound_ent) = self.spf.get(bound_ref) else {
+                    continue;
+                };
                 let flip = matches!(bound_ent.get(1), Some(Val::Enum(e)) if e.as_str() == "F");
-                let Some(loop_id) = bound_ent.ref_id(0) else { continue };
-                let Some(loop_ent) = self.spf.get(loop_id) else { continue };
+                let Some(loop_id) = bound_ent.ref_id(0) else {
+                    continue;
+                };
+                let Some(loop_ent) = self.spf.get(loop_id) else {
+                    continue;
+                };
                 let mut pts: Vec<[f64; 3]> = if loop_ent.is("IFCPOLYLOOP") {
                     loop_ent
                         .list(0)
@@ -1825,19 +1918,28 @@ impl<'a> Reader<'a> {
     /// Walk an IfcEdgeLoop through oriented edge curves (lines/arcs) to 3D
     /// points — used by IFC files that carry B-rep style loops.
     fn edge_loop_points(&self, loop_ent: &super::spf::Ent) -> Vec<[f64; 3]> {
-        let Some(oriented) = loop_ent.list(0) else { return Vec::new() };
+        let Some(oriented) = loop_ent.list(0) else {
+            return Vec::new();
+        };
         let mut pts: Vec<[f64; 3]> = Vec::new();
         for oedge in oriented {
             let Some(oid) = oedge.as_ref() else { continue };
-            let Some(oent) = self.spf.get(oid) else { continue };
+            let Some(oent) = self.spf.get(oid) else {
+                continue;
+            };
             // IfcOrientedEdge(Edge, Orientation): .F. walks the edge backwards.
-            let forward =
-                !matches!(oent.get(1), Some(Val::Enum(e)) if e.as_str() == "F");
-            let Some(edge_id) = oent.ref_id(0) else { continue };
-            let Some(edge) = self.spf.get(edge_id) else { continue };
+            let forward = !matches!(oent.get(1), Some(Val::Enum(e)) if e.as_str() == "F");
+            let Some(edge_id) = oent.ref_id(0) else {
+                continue;
+            };
+            let Some(edge) = self.spf.get(edge_id) else {
+                continue;
+            };
             let v0 = edge.ref_id(0).and_then(|id| self.vertex_point(id));
             let v1 = edge.ref_id(1).and_then(|id| self.vertex_point(id));
-            let (Some(a), Some(b)) = (v0, v1) else { continue };
+            let (Some(a), Some(b)) = (v0, v1) else {
+                continue;
+            };
             let (a, b) = if forward { (a, b) } else { (b, a) };
             if pts
                 .last()
@@ -1867,7 +1969,9 @@ impl<'a> Reader<'a> {
         sink: &mut TriSink,
     ) {
         let Some(list_id) = ent.ref_id(0) else { return };
-        let Some(list) = self.spf.get(list_id) else { return };
+        let Some(list) = self.spf.get(list_id) else {
+            return;
+        };
         let Some(coords) = list.list(0) else { return };
         let vertices: Vec<[f64; 3]> = coords
             .iter()
@@ -1899,14 +2003,14 @@ impl<'a> Reader<'a> {
             let pick = |raw: &Val| -> Option<[f64; 3]> {
                 let i = raw.as_i64()? - 1;
                 let i = i.max(0) as usize;
-                let i = if pn.is_empty() { i } else { pn.get(i).copied().unwrap_or(0) };
+                let i = if pn.is_empty() {
+                    i
+                } else {
+                    pn.get(i).copied().unwrap_or(0)
+                };
                 vertices.get(i).copied()
             };
-            let (Some(a), Some(b), Some(c)) = (
-                pick(&idx[0]),
-                pick(&idx[1]),
-                pick(&idx[2]),
-            ) else {
+            let (Some(a), Some(b), Some(c)) = (pick(&idx[0]), pick(&idx[1]), pick(&idx[2])) else {
                 continue;
             };
             push_tri(sink, xform, a, b, c);
@@ -1920,7 +2024,9 @@ impl<'a> Reader<'a> {
         sink: &mut TriSink,
     ) {
         let Some(list_id) = ent.ref_id(0) else { return };
-        let Some(list) = self.spf.get(list_id) else { return };
+        let Some(list) = self.spf.get(list_id) else {
+            return;
+        };
         let Some(coords) = list.list(0) else { return };
         let vertices: Vec<[f64; 3]> = coords
             .iter()
@@ -1945,8 +2051,12 @@ impl<'a> Reader<'a> {
             .unwrap_or_default();
         let Some(faces) = ent.list(2) else { return };
         for face in faces {
-            let Some(face_id) = face.as_ref() else { continue };
-            let Some(face_ent) = self.spf.get(face_id) else { continue };
+            let Some(face_id) = face.as_ref() else {
+                continue;
+            };
+            let Some(face_ent) = self.spf.get(face_id) else {
+                continue;
+            };
             let pick_index = |raw: i64| -> Option<usize> {
                 let i = (raw.max(1) - 1) as usize;
                 if pn.is_empty() {
@@ -1955,7 +2065,9 @@ impl<'a> Reader<'a> {
                     pn.get(i).copied()
                 }
             };
-            let Some(indexes) = face_ent.list(0) else { continue };
+            let Some(indexes) = face_ent.list(0) else {
+                continue;
+            };
             let outer: Vec<[f64; 3]> = indexes
                 .iter()
                 .filter_map(Val::as_i64)
@@ -1968,7 +2080,9 @@ impl<'a> Reader<'a> {
             let mut loops = vec![outer];
             if let Some(voids) = face_ent.list(1) {
                 for void in voids {
-                    let Some(void_indexes) = void.as_list() else { continue };
+                    let Some(void_indexes) = void.as_list() else {
+                        continue;
+                    };
                     let ring: Vec<[f64; 3]> = void_indexes
                         .iter()
                         .filter_map(Val::as_i64)
@@ -2060,7 +2174,10 @@ pub fn rebuild_extrusion(
             [-x / 2.0, y / 2.0],
         ]],
         IfcProfile::RectangleHollow { x, y, thickness } => {
-            let (ix, iy) = ((x - thickness).max(0.0) / 2.0, (y - thickness).max(0.0) / 2.0);
+            let (ix, iy) = (
+                (x - thickness).max(0.0) / 2.0,
+                (y - thickness).max(0.0) / 2.0,
+            );
             vec![
                 vec![
                     [-x / 2.0, -y / 2.0],
@@ -2068,12 +2185,7 @@ pub fn rebuild_extrusion(
                     [x / 2.0, y / 2.0],
                     [-x / 2.0, y / 2.0],
                 ],
-                vec![
-                    [-ix, -iy],
-                    [ix, -iy],
-                    [ix, iy],
-                    [-ix, iy],
-                ],
+                vec![[-ix, -iy], [ix, -iy], [ix, iy], [-ix, iy]],
             ]
         }
         IfcProfile::Circle { radius } => vec![sample_circle([0.0, 0.0], *radius, 36)],
@@ -2081,16 +2193,30 @@ pub fn rebuild_extrusion(
             sample_circle([0.0, 0.0], *radius, 36),
             sample_circle([0.0, 0.0], (*radius - thickness).max(0.0), 36),
         ],
-        IfcProfile::Trapezium { bottom, top, height, offset } => vec![vec![
+        IfcProfile::Trapezium {
+            bottom,
+            top,
+            height,
+            offset,
+        } => vec![vec![
             [-bottom / 2.0, -height / 2.0],
             [bottom / 2.0, -height / 2.0],
             [offset + top / 2.0, height / 2.0],
             [offset - top / 2.0, height / 2.0],
         ]],
-        IfcProfile::IShape { width, depth, web, flange } => {
+        IfcProfile::IShape {
+            width,
+            depth,
+            web,
+            flange,
+        } => {
             vec![i_shaped(*width, *depth, *web, *flange)]
         }
-        IfcProfile::LShape { depth, width, thickness } => vec![vec![
+        IfcProfile::LShape {
+            depth,
+            width,
+            thickness,
+        } => vec![vec![
             [-width / 2.0, -depth / 2.0],
             [width / 2.0, -depth / 2.0],
             [width / 2.0, -depth / 2.0 + thickness],
@@ -2102,7 +2228,13 @@ pub fn rebuild_extrusion(
         IfcProfile::Points => params.outline.clone()?,
     };
     let mut sink = TriSink::default();
-    Reader::sweep_rings(&loops, &params.world, params.dir_world, params.depth, &mut sink);
+    Reader::sweep_rings(
+        &loops,
+        &params.world,
+        params.dir_world,
+        params.depth,
+        &mut sink,
+    );
     if sink.tris.is_empty() {
         return None;
     }
@@ -2250,7 +2382,11 @@ fn sink_to_mesh(sink: &TriSink, name: &str, color: [f32; 4], scale: f64) -> Mesh
         let nf = [(n.x / len) as f32, (n.y / len) as f32, (n.z / len) as f32];
         let base = verts.len() as u32;
         for p in [a, b, c] {
-            verts.push([(p.x * scale) as f32, (p.y * scale) as f32, (p.z * scale) as f32]);
+            verts.push([
+                (p.x * scale) as f32,
+                (p.y * scale) as f32,
+                (p.z * scale) as f32,
+            ]);
             normals.push(nf);
         }
         indices.push(base);
@@ -2326,11 +2462,23 @@ END-ISO-10303-21;
         // Wall sits at (1000, 2000, 0) and is 400 tall after the profile's
         // 400 Y-dimension gets extruded 3000 along Z… profile XY: 200 wide,
         // 400 deep, 3000 high.
-        let max_z = mesh.verts.iter().map(|v| v[2]).fold(f32::NEG_INFINITY, f32::max);
-        let min_z = mesh.verts.iter().map(|v| v[2]).fold(f32::INFINITY, f32::min);
+        let max_z = mesh
+            .verts
+            .iter()
+            .map(|v| v[2])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_z = mesh
+            .verts
+            .iter()
+            .map(|v| v[2])
+            .fold(f32::INFINITY, f32::min);
         assert!((max_z - 3000.0).abs() < 1.0, "max z {max_z}");
         assert!(min_z.abs() < 1.0, "min z {min_z}");
-        let element = result.elements.iter().find(|e| e.name == "Wall A").expect("element");
+        let element = result
+            .elements
+            .iter()
+            .find(|e| e.name == "Wall A")
+            .expect("element");
         assert_eq!(element.storey, "Demo / Plot / Tower / Floor 1");
         assert!(element
             .props
@@ -2356,8 +2504,8 @@ END-ISO-10303-21;
     #[test]
     #[ignore]
     fn parses_the_generated_medium_fixture() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts/testdata/medium.ifc");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/testdata/medium.ifc");
         let Ok(bytes) = std::fs::read(&path) else {
             eprintln!("fixture missing at {} — generate it first", path.display());
             return;
@@ -2391,9 +2539,7 @@ mod tmp_diag {
         let t1 = std::time::Instant::now();
         let result = super::parse_ifc(&bytes).expect("import");
         let t2 = std::time::Instant::now();
-        let mapped = spf
-            .of_type("IFCMAPPEDITEM")
-            .count();
+        let mapped = spf.of_type("IFCMAPPEDITEM").count();
         println!(
             "size={}MB spf_parse={:.1}s full_import={:.1}s meshes={} elements={} mapped={}",
             bytes.len() / 1048576,

@@ -113,7 +113,11 @@ fn dropping_on_a_pallets_top_or_bottom_half_stacks_above_or_below_it() {
     );
     assert_eq!(
         app.dock.left[0].panels,
-        vec![PanelId::Properties, PanelId::BlockPalette, PanelId::ModelTree]
+        vec![
+            PanelId::Properties,
+            PanelId::BlockPalette,
+            PanelId::ModelTree
+        ]
     );
     assert!(app.dock.right.is_empty());
     // The bottom half of a pallet stacks below it.
@@ -133,7 +137,11 @@ fn dropping_on_a_pallets_top_or_bottom_half_stacks_above_or_below_it() {
     );
     assert_eq!(
         app.dock.left[0].panels,
-        vec![PanelId::Properties, PanelId::ModelTree, PanelId::BlockPalette]
+        vec![
+            PanelId::Properties,
+            PanelId::ModelTree,
+            PanelId::BlockPalette
+        ]
     );
 }
 

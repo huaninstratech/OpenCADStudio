@@ -623,7 +623,11 @@ impl Scene {
         let camera = self.camera.borrow();
         let height = 2.0 * f64::from(camera.ortho_size());
         let pixel = self.world_per_pixel().map_or(0.0, f64::from);
-        ([camera.target.x, camera.target.y], [height * aspect, height], pixel)
+        (
+            [camera.target.x, camera.target.y],
+            [height * aspect, height],
+            pixel,
+        )
     }
 
     /// Aspect ratio of the active camera's actual render rectangle. Model
@@ -1762,8 +1766,8 @@ impl Scene {
             {
                 continue;
             }
-            let is_infinite =
-                entity.is_some_and(|entity| matches!(entity, EntityType::XLine(_) | EntityType::Ray(_)));
+            let is_infinite = entity
+                .is_some_and(|entity| matches!(entity, EntityType::XLine(_) | EntityType::Ray(_)));
             if is_infinite {
                 infinite_base.extend(
                     wire.key_vertices
@@ -1807,7 +1811,10 @@ impl Scene {
             None,
         ) {
             if let Some([x0, y0, z0, x1, y1, z1]) = set.instance_aabb {
-                fold!(Some((glam::DVec3::new(x0, y0, z0), glam::DVec3::new(x1, y1, z1))));
+                fold!(Some((
+                    glam::DVec3::new(x0, y0, z0),
+                    glam::DVec3::new(x1, y1, z1)
+                )));
             }
         }
 

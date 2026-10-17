@@ -115,8 +115,8 @@ fn authoring_edit_basepoint_attribute_relocation_undo_and_cancel() {
 
 #[test]
 fn authoring_edit_mouse_selection_endpoint_label_marker_history_and_reopen() {
-    use crate::scene::block_authoring::edit::{self, Part};
     use crate::scene::block_actions::{self as actions, Kind};
+    use crate::scene::block_authoring::edit::{self, Part};
     let (mut app, reference) = fixture();
     begin(&mut app, reference);
     let i = app.active_tab;
@@ -751,8 +751,8 @@ fn edit_lookup(app: &mut OpenCADStudio) {
 }
 #[test]
 fn lookup_editor_cancel_apply_one_undo_and_stale_guard() {
-    use crate::ui::window::block_lookup::Action as A;
     use crate::scene::block_lookup;
+    use crate::ui::window::block_lookup::Action as A;
     let (mut app, definition, parameter) = lookup_editor_fixture();
     let i = app.active_tab;
     let before = app.tabs[i].scene.document.clone();
@@ -2908,7 +2908,7 @@ fn visibility_parameter_placement_rejects_duplicates_stale_context_and_nonfinite
 
 #[test]
 fn visibility_parameter_placement_preserves_an_opaque_authoring_graph() {
-    use codec::objects::{DynamicBlockObject, DynamicBlockData, ObjectType};
+    use codec::objects::{DynamicBlockData, DynamicBlockObject, ObjectType};
     let (mut app, reference) = fixture();
     let i = app.active_tab;
     let doc = &mut app.tabs[i].scene.document;

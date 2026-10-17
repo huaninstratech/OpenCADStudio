@@ -9,16 +9,15 @@ mod content_browser;
 pub(crate) mod create_block;
 mod design_center;
 pub(crate) mod dgn_import;
-pub(crate) mod tds_import;
 pub(crate) mod edit_block;
 mod ifc_data;
-mod landxml;
-mod open_obj;
 mod ifc_import;
 pub(crate) mod image_transparency;
 pub(crate) mod insert_block;
+mod landxml;
 pub mod minsert;
 mod mview_block;
+mod open_obj;
 pub(crate) mod pc_attach;
 pub(crate) mod pc_crop;
 pub(crate) mod pc_extract;
@@ -31,6 +30,7 @@ pub(crate) mod picker;
 mod snap_underlays;
 pub(crate) mod solid3d_cmds;
 mod step_import;
+pub(crate) mod tds_import;
 mod underlay_layers;
 pub(crate) mod wblock;
 pub(crate) mod xadjust;
@@ -205,9 +205,7 @@ impl CadModule for InsertModule {
                             icon: IconKind::Svg(include_bytes!(
                                 "../../../assets/icons/options_tool.svg"
                             )),
-                            event: ModuleEvent::Command(
-                                "PDFSHXTEXT;SETTINGS".to_string(),
-                            ),
+                            event: ModuleEvent::Command("PDFSHXTEXT;SETTINGS".to_string()),
                         }),
                         RibbonItem::LargeTool(ToolDef {
                             id: "TXT2MTXT",

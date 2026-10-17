@@ -1290,7 +1290,9 @@ fn t2m_switch<'a>(
     row![
         switch,
         name,
-        text(hint).size(11).style(if enabled { muted_style } else { dim }),
+        text(hint)
+            .size(11)
+            .style(if enabled { muted_style } else { dim }),
     ]
     .spacing(8)
     .align_y(iced::Center)
@@ -1373,14 +1375,16 @@ pub fn view_txt2mtxt_settings<'a>(
                 Some(PdfDialogMsg::T2mCombine),
             ),
             column![
-                text(crate::tr!("txt2mtxt", "order")).size(11).style(muted_style),
+                text(crate::tr!("txt2mtxt", "order"))
+                    .size(11)
+                    .style(muted_style),
                 t2m_order(s.select_order, s.combine),
             ]
             .spacing(6)
             .padding(iced::Padding::ZERO.left(44)),
             text(crate::tr!("txt2mtxt", "combine-note"))
-            .size(11)
-            .style(muted_style),
+                .size(11)
+                .style(muted_style),
         ]
         .spacing(8),
     );
@@ -1391,7 +1395,8 @@ pub fn view_txt2mtxt_settings<'a>(
                 crate::tr!("txt2mtxt", "wrap"),
                 crate::tr!("txt2mtxt", "wrap-hint"),
                 s.word_wrap,
-                s.combine.then_some(PdfDialogMsg::T2mWrap as fn(bool) -> PdfDialogMsg),
+                s.combine
+                    .then_some(PdfDialogMsg::T2mWrap as fn(bool) -> PdfDialogMsg),
             ),
             t2m_switch(
                 crate::tr!("txt2mtxt", "uniform"),
@@ -1420,7 +1425,9 @@ pub fn view_txt2mtxt_settings<'a>(
     let preview = container(
         row![
             column![
-                text(crate::tr!("txt2mtxt", "selected")).size(11).style(muted_style),
+                text(crate::tr!("txt2mtxt", "selected"))
+                    .size(11)
+                    .style(muted_style),
                 t2m_sample(sample, false, 190.0)
             ]
             .spacing(4),

@@ -447,9 +447,21 @@ mod windows_impl {
         set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".ifc"), "")?;
         set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".step"), "")?;
         set_string(&format!(r"{APP_BASE}\SupportedTypes"), Some(".stp"), "")?;
-        set_string(r"Software\Classes\.ifc\OpenWithProgids", Some("OpenCADStudio.IFC"), "")?;
-        set_string(r"Software\Classes\.step\OpenWithProgids", Some("OpenCADStudio.STEP"), "")?;
-        set_string(r"Software\Classes\.stp\OpenWithProgids", Some("OpenCADStudio.STEP"), "")?;
+        set_string(
+            r"Software\Classes\.ifc\OpenWithProgids",
+            Some("OpenCADStudio.IFC"),
+            "",
+        )?;
+        set_string(
+            r"Software\Classes\.step\OpenWithProgids",
+            Some("OpenCADStudio.STEP"),
+            "",
+        )?;
+        set_string(
+            r"Software\Classes\.stp\OpenWithProgids",
+            Some("OpenCADStudio.STEP"),
+            "",
+        )?;
         set_string(r"Software\Classes\.ifc", None, "OpenCADStudio.IFC")?;
         set_string(r"Software\Classes\.step", None, "OpenCADStudio.STEP")?;
         set_string(r"Software\Classes\.stp", None, "OpenCADStudio.STEP")?;
@@ -466,12 +478,36 @@ mod windows_impl {
             Some("ApplicationDescription"),
             "2D/3D CAD application for DWG and DXF drawings.",
         )?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".dwg"), "OpenCADStudio.DWG")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".dxf"), "OpenCADStudio.DXF")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".bak"), "OpenCADStudio.BAK")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".ifc"), "OpenCADStudio.IFC")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".step"), "OpenCADStudio.STEP")?;
-        set_string(&format!(r"{CAP}\FileAssociations"), Some(".stp"), "OpenCADStudio.STEP")?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".dwg"),
+            "OpenCADStudio.DWG",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".dxf"),
+            "OpenCADStudio.DXF",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".bak"),
+            "OpenCADStudio.BAK",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".ifc"),
+            "OpenCADStudio.IFC",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".step"),
+            "OpenCADStudio.STEP",
+        )?;
+        set_string(
+            &format!(r"{CAP}\FileAssociations"),
+            Some(".stp"),
+            "OpenCADStudio.STEP",
+        )?;
         set_string(
             r"Software\RegisteredApplications",
             Some("Open CAD Studio"),

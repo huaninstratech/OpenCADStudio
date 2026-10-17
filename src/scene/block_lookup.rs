@@ -1,4 +1,5 @@
 //! Native Lookup parameter and property-table authoring.
+use super::block_authoring::graph;
 use super::block_authoring::{self as authoring, *};
 use codec::objects::{
     BlockAction, BlockElement, BlockEvalValue, BlockGrip, BlockGripExpression, BlockLookupAction,
@@ -9,7 +10,6 @@ use codec::{
     types::{Transform, Vector3},
     CadDocument, Handle,
 };
-use super::block_authoring::graph;
 #[cfg(test)]
 mod tests;
 

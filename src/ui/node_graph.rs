@@ -151,9 +151,9 @@ impl ObjectKind {
             ObjectKind::Text => {
                 EntityType::Text(e::Text::with_value("Text", origin).with_height(2.5))
             }
-            ObjectKind::MText => {
-                EntityType::MText(Box::new(e::MText::with_value("MText", origin).with_height(2.5)))
-            }
+            ObjectKind::MText => EntityType::MText(Box::new(
+                e::MText::with_value("MText", origin).with_height(2.5),
+            )),
         }
     }
 }

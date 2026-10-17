@@ -1,13 +1,13 @@
 //! `file` arms and helpers, split out of the original `update.rs` (#mechanical decomposition).
 
 #![allow(unused_imports)]
-use crate::io::plot_style::PlotStyleTableExt as _;
 use super::util::*;
 use super::{format_size, VIEWCUBE_HIT_SIZE};
 use crate::app::helpers::{
     parse_coord, polar_constrain_near, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind,
 };
 use crate::app::{Message, OpenCADStudio, POLY_START_DELAY_MS};
+use crate::io::plot_style::PlotStyleTableExt as _;
 use crate::modules::ModuleEvent;
 use crate::scene::model::object::GripApply;
 use crate::scene::pick::grip::{find_hit_grip, find_hit_grip_paper, find_hit_grip_rte, GripEdit};
@@ -683,10 +683,12 @@ fn plot_entity_layers(
     hatches: &[crate::scene::model::hatch_model::HatchModel],
     wipeouts: &[crate::scene::model::hatch_model::HatchModel],
 ) -> std::collections::HashMap<codec::Handle, String> {
-    let names = wires
-        .iter()
-        .map(|wire| wire.name.as_str())
-        .chain(hatches.iter().chain(wipeouts).map(|hatch| hatch.name.as_str()));
+    let names = wires.iter().map(|wire| wire.name.as_str()).chain(
+        hatches
+            .iter()
+            .chain(wipeouts)
+            .map(|hatch| hatch.name.as_str()),
+    );
     let mut layers = std::collections::HashMap::new();
     for name in names {
         let Some(handle) = crate::scene::Scene::handle_from_wire_name(name) else {
@@ -2903,11 +2905,7 @@ impl OpenCADStudio {
             }
             for tri in mesh.indices.chunks_exact(3) {
                 // Polyface indices are 1-based.
-                pm.add_triangle(
-                    tri[0] as i16 + 1,
-                    tri[1] as i16 + 1,
-                    tri[2] as i16 + 1,
-                );
+                pm.add_triangle(tri[0] as i16 + 1, tri[1] as i16 + 1, tri[2] as i16 + 1);
             }
             codec::EntityType::PolyfaceMesh(pm)
         } else {
@@ -2924,24 +2922,28 @@ impl OpenCADStudio {
     }
 
     /// Bounding-box centre of a flat vertex list, for edit anchoring.
-fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
-    if verts.is_empty() {
-        return None;
-    }
-    let mut min = [f64::INFINITY; 3];
-    let mut max = [f64::NEG_INFINITY; 3];
-    for p in verts {
-        for k in 0..3 {
-            let v = p[k] as f64;
-            min[k] = min[k].min(v);
-            max[k] = max[k].max(v);
+    fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
+        if verts.is_empty() {
+            return None;
         }
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for p in verts {
+            for k in 0..3 {
+                let v = p[k] as f64;
+                min[k] = min[k].min(v);
+                max[k] = max[k].max(v);
+            }
+        }
+        Some([
+            (min[0] + max[0]) / 2.0,
+            (min[1] + max[1]) / 2.0,
+            (min[2] + max[2]) / 2.0,
+        ])
     }
-    Some([(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0, (min[2] + max[2]) / 2.0])
-}
 
-/// Round-trip export: collect the imported/edited IFC elements (semantic
-/// records + current meshes + XDATA properties) and write IFC4 text.
+    /// Round-trip export: collect the imported/edited IFC elements (semantic
+    /// records + current meshes + XDATA properties) and write IFC4 text.
     pub(in crate::app) fn on_ifc_export(&mut self) -> Task<Message> {
         let i = self.active_tab;
         if self.tabs[i].scene.ifc_elements.is_empty() {
@@ -2968,10 +2970,13 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
         let i = self.active_tab;
         let mut elements = Vec::new();
         for (handle, record) in &self.tabs[i].scene.ifc_elements {
-            let Some(set) = self.tabs[i].scene.meshes.get(handle) else { continue };
-            let Some(mesh) = set.lods.first() else { continue };
-            let props: Vec<(String, String, String)> = self
-                .tabs[i]
+            let Some(set) = self.tabs[i].scene.meshes.get(handle) else {
+                continue;
+            };
+            let Some(mesh) = set.lods.first() else {
+                continue;
+            };
+            let props: Vec<(String, String, String)> = self.tabs[i]
                 .scene
                 .document
                 .get_entity(*handle)
@@ -2985,9 +2990,7 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                         .filter_map(|rec| {
                             let text = |idx: usize| -> Option<String> {
                                 rec.values.get(idx).and_then(|value| match value {
-                                    codec::xdata::XDataValue::String(text) => {
-                                        Some(text.clone())
-                                    }
+                                    codec::xdata::XDataValue::String(text) => Some(text.clone()),
                                     _ => None,
                                 })
                             };
@@ -3059,7 +3062,11 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
     /// rewrite the resident PolyfaceMesh.
     pub(in crate::app) fn on_ifc_edit(&mut self, key: String, value: f64) -> Task<Message> {
         let i = self.active_tab;
-        let Some(handle) = self.tabs[i].scene.selected_handles_in_order().last().copied()
+        let Some(handle) = self.tabs[i]
+            .scene
+            .selected_handles_in_order()
+            .last()
+            .copied()
         else {
             self.command_line
                 .push_error("IFCEDIT: select an IFC element first.");
@@ -3103,24 +3110,25 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
         let params = record.params.clone();
         // Keep the element where it stands: anchor the rebuilt mesh to the
         // current bounding-box centre and slide the stored placement along.
-        let old_center = self
-            .tabs[i]
+        let old_center = self.tabs[i]
             .scene
             .meshes
             .get(&handle)
             .and_then(|s| s.lods.first())
             .and_then(|m| Self::ifc_mesh_center(&m.verts));
-        let color = self
-            .tabs[i]
+        let color = self.tabs[i]
             .scene
             .meshes
             .get(&handle)
             .and_then(|s| s.lods.first())
             .map(|m| m.color)
             .unwrap_or([0.72, 0.72, 0.78, 1.0]);
-        let Some(mut new_mesh) =
-            crate::io::ifc::rebuild_extrusion(params.as_ref().expect("params present"), &name, color, 1.0)
-        else {
+        let Some(mut new_mesh) = crate::io::ifc::rebuild_extrusion(
+            params.as_ref().expect("params present"),
+            &name,
+            color,
+            1.0,
+        ) else {
             self.command_line
                 .push_error("IFCEDIT: this element's shape cannot be regenerated.");
             return Task::none();
@@ -3160,8 +3168,9 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
         self.tabs[i].scene.meshes.insert(handle, set);
         self.tabs[i].dirty = true;
         self.refresh_properties();
-        self.command_line
-            .push_output(&format!("IFCEDIT: {key} set to {value:.1} mm; element rebuilt."));
+        self.command_line.push_output(&format!(
+            "IFCEDIT: {key} set to {value:.1} mm; element rebuilt."
+        ));
         Task::none()
     }
 
@@ -3219,21 +3228,15 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                 let undo_worthwhile = import.meshes.len() <= 20_000;
                 let mut guid_handles: Vec<(String, codec::Handle)> = Vec::new();
                 // GUID → property rows, attached to each entity as XDATA.
-                let props_by_guid: std::collections::HashMap<
-                    &str,
-                    &[(String, String, String)],
-                > = import
-                    .elements
-                    .iter()
-                    .map(|e| (e.guid.as_str(), e.props.as_slice()))
-                    .collect();
+                let props_by_guid: std::collections::HashMap<&str, &[(String, String, String)]> =
+                    import
+                        .elements
+                        .iter()
+                        .map(|e| (e.guid.as_str(), e.props.as_slice()))
+                        .collect();
                 for out in import.meshes {
-                    let props = props_by_guid
-                        .get(out.guid.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    let (entity, mut set) =
-                        Self::build_mesh_import(out.mesh, &out.guid, props);
+                    let props = props_by_guid.get(out.guid.as_str()).copied().unwrap_or(&[]);
+                    let (entity, mut set) = Self::build_mesh_import(out.mesh, &out.guid, props);
                     set.edge_verts = out.edges.0;
                     set.edge_verts_low = out.edges.1;
                     let handle = self.tabs[i].scene.add_entity(entity);
@@ -3275,11 +3278,13 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                     import.elements.len(),
                 ));
                 for warning in import.warnings.iter().take(3) {
-                    self.command_line.push_info(&format!("IMPORTIFC: note: {warning}"));
+                    self.command_line
+                        .push_info(&format!("IMPORTIFC: note: {warning}"));
                 }
                 if !import.elements.is_empty() {
-                    self.command_line
-                        .push_info("IFCDATA: run this command to export the property report as CSV.");
+                    self.command_line.push_info(
+                        "IFCDATA: run this command to export the property report as CSV.",
+                    );
                 }
             }
         }
@@ -3322,7 +3327,9 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
     ) -> Task<Message> {
         self.opening = None;
         match result {
-            Err(error) => self.command_line.push_error(&format!("IMPORTSTEP: {error}")),
+            Err(error) => self
+                .command_line
+                .push_error(&format!("IMPORTSTEP: {error}")),
             Ok(import) => {
                 let Some(i) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
                     self.command_line
@@ -3352,7 +3359,8 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
                     import.products,
                 ));
                 for warning in import.warnings.iter().take(3) {
-                    self.command_line.push_info(&format!("IMPORTSTEP: note: {warning}"));
+                    self.command_line
+                        .push_info(&format!("IMPORTSTEP: note: {warning}"));
                 }
             }
         }
@@ -3379,8 +3387,9 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
             }
             Ok(csv) => {
                 let rows = csv.lines().count().saturating_sub(1);
-                self.command_line
-                    .push_output(&format!("IFCDATA: extracted {rows} property rows; choose where to save the CSV."));
+                self.command_line.push_output(&format!(
+                    "IFCDATA: extracted {rows} property rows; choose where to save the CSV."
+                ));
                 Task::perform(
                     async {
                         crate::sys::file_dialog()
@@ -5657,8 +5666,7 @@ fn ifc_mesh_center(verts: &[[f32; 3]]) -> Option<[f64; 3]> {
             ps.flags.use_standard_scale = false;
             ps.scale_numerator = 1.0;
             ps.scale_denominator = page_unit_mm;
-            ps.standard_scale_factor =
-                stored_scale_factor(1.0 / page_unit_mm, ps.paper_units);
+            ps.standard_scale_factor = stored_scale_factor(1.0 / page_unit_mm, ps.paper_units);
         } else if d.fit_to_paper {
             ps.set_scale_to_fit();
             // The commercial application marks fitted plots with the

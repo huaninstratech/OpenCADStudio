@@ -535,7 +535,10 @@ impl<'a> Parser<'a> {
                     Ok(Val::Enum(name))
                 }
             }
-            Some(c) => Err(format!("unexpected character {:?} in a value at byte {}", c as char, self.pos)),
+            Some(c) => Err(format!(
+                "unexpected character {:?} in a value at byte {}",
+                c as char, self.pos
+            )),
         }
     }
 
@@ -640,7 +643,9 @@ impl<'a> Parser<'a> {
                         let hi = self.bump();
                         let lo = self.bump();
                         let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
-                        if let (Some(hv), Some(lv)) = (digit(hi.unwrap_or(b'0')), digit(lo.unwrap_or(b'0'))) {
+                        if let (Some(hv), Some(lv)) =
+                            (digit(hi.unwrap_or(b'0')), digit(lo.unwrap_or(b'0')))
+                        {
                             let byte_val = hv * 16 + lv;
                             if (0x20..0x7f).contains(&byte_val) {
                                 out.push(byte_val as char);
@@ -748,7 +753,10 @@ mod tests {
         let ctx = spf.get(ctx_id).expect("contexts");
         assert!(ctx.is("IFCGEOMETRICREPRESENTATIONCONTEXT"));
         assert_eq!(ctx.int(2), Some(3));
-        let origin = ctx.ent(&spf, 4).and_then(|p| p.ent(&spf, 0)).expect("origin");
+        let origin = ctx
+            .ent(&spf, 4)
+            .and_then(|p| p.ent(&spf, 0))
+            .expect("origin");
         assert_eq!(origin.ty(), "IFCCARTESIANPOINT");
         assert_eq!(origin.list(0).unwrap().len(), 3);
     }

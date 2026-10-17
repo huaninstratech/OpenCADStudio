@@ -52,9 +52,12 @@ fn push_nodes<'a>(
 fn row_for_node<'a>(node: &'a IfcTreeNode, indent: f32) -> Element<'a, Message> {
     let label = text(node.label.clone()).size(11);
     let padded = |extra: u16, content: iced::widget::Text<'a>| {
-        container(content)
-            .width(Fill)
-            .padding(iced::Padding { top: 2.0, right: extra as f32, bottom: 2.0, left: 4.0 + indent })
+        container(content).width(Fill).padding(iced::Padding {
+            top: 2.0,
+            right: extra as f32,
+            bottom: 2.0,
+            left: 4.0 + indent,
+        })
     };
     match node.leaf_guid.as_ref() {
         Some(guid) => {

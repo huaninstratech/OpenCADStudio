@@ -589,11 +589,21 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         }
         ("GET", ["entities"]) => {
             let mut request_json = json!({"op":"query"});
-            if let Some(v) = request.param("type") { request_json["type"] = json!(v); }
-            if let Some(v) = request.param("layer") { request_json["layer"] = json!(v); }
-            if let Some(v) = request.param("detail") { request_json["detail"] = json!(v); }
-            if let Some(v) = request.numeric_param("offset") { request_json["offset"] = json!(v); }
-            if let Some(v) = request.numeric_param("limit") { request_json["limit"] = json!(v); }
+            if let Some(v) = request.param("type") {
+                request_json["type"] = json!(v);
+            }
+            if let Some(v) = request.param("layer") {
+                request_json["layer"] = json!(v);
+            }
+            if let Some(v) = request.param("detail") {
+                request_json["detail"] = json!(v);
+            }
+            if let Some(v) = request.numeric_param("offset") {
+                request_json["offset"] = json!(v);
+            }
+            if let Some(v) = request.numeric_param("limit") {
+                request_json["limit"] = json!(v);
+            }
             if let Some(v) = request.param("fields") {
                 request_json["fields"] = json!(v.split(',').collect::<Vec<_>>());
             }
@@ -682,7 +692,11 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             fields: json!({"handles":[handle], "app": app_name, "data": []}),
             created: 200,
         },
-        ("POST", ["blocks"]) => Plan::Mutate { op: "block_define".into(), fields: body, created: 201 },
+        ("POST", ["blocks"]) => Plan::Mutate {
+            op: "block_define".into(),
+            fields: body,
+            created: 201,
+        },
         ("DELETE", ["blocks", name]) => {
             // `?force=true` mirrors the control op: it erases the referencing
             // inserts instead of refusing a referenced definition.
@@ -693,25 +707,52 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             {
                 fields["force"] = json!(true);
             }
-            Plan::Mutate { op: "block_delete".into(), fields, created: 200 }
+            Plan::Mutate {
+                op: "block_delete".into(),
+                fields,
+                created: 200,
+            }
         }
-        ("POST", ["file-identity"]) =>
-            Plan::Mutate { op: "file_identity".into(), fields: body, created: 200 },
-        ("POST", ["plot"]) => Plan::Mutate { op: "plot".into(), fields: body, created: 200 },
-        ("POST", ["wblock"]) => Plan::Mutate { op: "wblock".into(), fields: body, created: 200 },
-        ("POST", ["images"]) => Plan::Mutate { op: "embed_image".into(), fields: body, created: 201 },
+        ("POST", ["file-identity"]) => Plan::Mutate {
+            op: "file_identity".into(),
+            fields: body,
+            created: 200,
+        },
+        ("POST", ["plot"]) => Plan::Mutate {
+            op: "plot".into(),
+            fields: body,
+            created: 200,
+        },
+        ("POST", ["wblock"]) => Plan::Mutate {
+            op: "wblock".into(),
+            fields: body,
+            created: 200,
+        },
+        ("POST", ["images"]) => Plan::Mutate {
+            op: "embed_image".into(),
+            fields: body,
+            created: 201,
+        },
         ("POST", ["commands"]) => {
             // Mutate: the "run" op requires a document_id; the Run path never stamps
             // one and would always answer "document_required".
-            Plan::Mutate { op: "run".into(), fields: json!({"cmd": body["cmd"]}), created: 200 }
-        },
+            Plan::Mutate {
+                op: "run".into(),
+                fields: json!({"cmd": body["cmd"]}),
+                created: 200,
+            }
+        }
         ("POST", ["undo"]) | ("POST", ["redo"]) => {
             let op = if rest == ["undo"] { "undo" } else { "redo" };
             // Mutate (not Run): the undo/redo ops require a document_id and the Run
             // path never stamps one — Run would always answer "document_required" no
             // matter what the caller sends. Mutate stamps the cached id and
             // refresh-retries, exactly like every other mutation route.
-            Plan::Mutate { op: op.into(), fields: json!({}), created: 200 }
+            Plan::Mutate {
+                op: op.into(),
+                fields: json!({}),
+                created: 200,
+            }
         }
         ("POST", ["save"]) => {
             // Same as undo/redo: route through Mutate so the cached document_id is
@@ -721,7 +762,11 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             if let Some(path) = body["path"].as_str() {
                 fields["path"] = json!(path);
             }
-            Plan::Mutate { op: "save".into(), fields, created: 200 }
+            Plan::Mutate {
+                op: "save".into(),
+                fields,
+                created: 200,
+            }
         }
         ("GET", ["layers"]) => Plan::Run {
             request: json!({"op":"layers"}),
@@ -733,11 +778,22 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         },
         ("GET", ["records"]) => {
             let mut request_json = json!({"op":"records"});
-            if let Some(v) = request.param("collection") { request_json["collection"] = json!(v); }
-            if let Some(v) = request.param("type") { request_json["type"] = json!(v); }
-            if let Some(v) = request.numeric_param("offset") { request_json["offset"] = json!(v); }
-            if let Some(v) = request.numeric_param("limit") { request_json["limit"] = json!(v); }
-            Plan::Run { request: request_json, created: 200 }
+            if let Some(v) = request.param("collection") {
+                request_json["collection"] = json!(v);
+            }
+            if let Some(v) = request.param("type") {
+                request_json["type"] = json!(v);
+            }
+            if let Some(v) = request.numeric_param("offset") {
+                request_json["offset"] = json!(v);
+            }
+            if let Some(v) = request.numeric_param("limit") {
+                request_json["limit"] = json!(v);
+            }
+            Plan::Run {
+                request: request_json,
+                created: 200,
+            }
         }
         ("GET", ["openapi"]) => Plan::Local(
             200,

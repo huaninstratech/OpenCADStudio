@@ -1093,8 +1093,7 @@ impl OpenCADStudio {
             self.tabs[i].xref_unloaded.remove(key);
             self.tabs[i].xref_stat_cache.remove(key);
         }
-        let infos =
-            crate::io::xref::resolve_xrefs(&mut self.tabs[i].scene.document, &base_dir);
+        let infos = crate::io::xref::resolve_xrefs(&mut self.tabs[i].scene.document, &base_dir);
         let fresh = crate::io::xref::collect_entries_with_prev(
             &self.tabs[i].scene.document,
             &base_dir,

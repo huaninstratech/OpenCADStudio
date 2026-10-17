@@ -24,7 +24,9 @@ pub struct Imported {
 
 /// File units over drawing units; one where the drawing is unitless.
 fn ratio(file_mm: f64, drawing_mm: Option<f64>) -> f64 {
-    drawing_mm.filter(|mm| *mm > 0.0).map_or(1.0, |mm| file_mm / mm)
+    drawing_mm
+        .filter(|mm| *mm > 0.0)
+        .map_or(1.0, |mm| file_mm / mm)
 }
 
 /// A block name from a product's, with the characters names cannot hold
@@ -155,7 +157,8 @@ fn step_blocks(model: crate::io::step_import::StepModel, scale: f64) -> Imported
                 .bodies
                 .iter()
                 .filter_map(|body| {
-                    let faces: Vec<Option<Color>> = body.faces.iter().map(|c| c.map(step_colour)).collect();
+                    let faces: Vec<Option<Color>> =
+                        body.faces.iter().map(|c| c.map(step_colour)).collect();
                     painted_body_entity(&body.body, body.colour.map(step_colour), &faces, false)
                 })
                 .collect();
@@ -174,7 +177,11 @@ fn step_blocks(model: crate::io::step_import::StepModel, scale: f64) -> Imported
             (names[k].clone(), entities)
         })
         .collect();
-    let identity = [[scale, 0.0, 0.0, 0.0], [0.0, scale, 0.0, 0.0], [0.0, 0.0, scale, 0.0]];
+    let identity = [
+        [scale, 0.0, 0.0, 0.0],
+        [0.0, scale, 0.0, 0.0],
+        [0.0, 0.0, scale, 0.0],
+    ];
     Imported {
         blocks,
         entities: model
@@ -207,7 +214,9 @@ pub fn read(format: ModelFormat, bytes: &[u8], drawing_mm: Option<f64>) -> Optio
                 blocks: Vec::new(),
                 entities: solids
                     .chain(sheets)
-                    .filter_map(|((body, color), sheet)| painted_body_entity(body, Some(*color), &[], sheet))
+                    .filter_map(|((body, color), sheet)| {
+                        painted_body_entity(body, Some(*color), &[], sheet)
+                    })
                     .collect(),
             }
         }

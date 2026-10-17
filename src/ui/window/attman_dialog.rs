@@ -367,7 +367,10 @@ pub fn color_label(color: codec::types::Color) -> String {
 
 pub fn parse_color(label: &str) -> Option<codec::types::Color> {
     use codec::types::Color as C;
-    match COLORS.iter().position(|c| c.eq_ignore_ascii_case(label.trim())) {
+    match COLORS
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(label.trim()))
+    {
         Some(0) => Some(C::ByLayer),
         Some(1) => Some(C::ByBlock),
         Some(i) => Some(C::Index(i as u8 - 1)),
@@ -382,8 +385,8 @@ pub fn parse_color(label: &str) -> Option<codec::types::Color> {
 
 /// The lineweights the Properties tab offers, in 1/100 mm.
 const LINEWEIGHTS: [i16; 24] = [
-    0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158,
-    200, 211,
+    0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200,
+    211,
 ];
 
 pub fn lineweight_label(lw: codec::types::LineWeight) -> String {
@@ -619,7 +622,9 @@ fn table<'a>(state: &'a AttManState, columns: &[Column], emphasize: bool) -> Ele
                 let mut style = button::text(theme, status);
                 style.text_color = palette.background.base.text;
                 style.background = if chosen {
-                    Some(Background::Color(palette.primary.base.color.scale_alpha(0.18)))
+                    Some(Background::Color(
+                        palette.primary.base.color.scale_alpha(0.18),
+                    ))
                 } else if matches!(status, button::Status::Hovered) {
                     Some(Background::Color(palette.background.strong.color))
                 } else {
@@ -661,7 +666,11 @@ fn edit_card<'a>(state: &'a AttManState, row_: &'a AttManRow) -> Element<'a, Mes
                 )
             };
             let fields = column![
-                field_row(t!("Tag").into_owned(), &state.drafts.tag, Some(AttManMsg::Tag)),
+                field_row(
+                    t!("Tag").into_owned(),
+                    &state.drafts.tag,
+                    Some(AttManMsg::Tag)
+                ),
                 field_row(
                     t!("Prompt").into_owned(),
                     &def.prompt,
@@ -872,12 +881,7 @@ pub fn view<'a>(
         chips = chips.push(pill(label, on, Some(msg(AttManMsg::Block(index)))));
     }
     let counts = state.current_block().map_or(String::new(), |b| {
-        crate::tf!(
-            "In drawing: {} · in model space: {}",
-            b.found,
-            b.in_space
-        )
-        .into_owned()
+        crate::tf!("In drawing: {} · in model space: {}", b.found, b.in_space).into_owned()
     });
     let blocks_card = panel(
         row![
@@ -933,7 +937,8 @@ pub fn view<'a>(
         icon_button(
             ICON_UP,
             std::f32::consts::PI,
-            at.filter(|i| i + 1 < count).map(|_| msg(AttManMsg::MoveDown)),
+            at.filter(|i| i + 1 < count)
+                .map(|_| msg(AttManMsg::MoveDown)),
             false
         ),
         icon_button(

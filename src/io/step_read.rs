@@ -40,7 +40,9 @@ impl StepImportResult {
         bytes: &[u8],
         progress: Option<&crate::io::OpenProgressState>,
     ) -> Result<StepImportResult, String> {
-        use crate::app::{OPEN_PHASE_CACHING, OPEN_PHASE_FINALIZING, OPEN_PHASE_PARSING, OPEN_PHASE_READING};
+        use crate::app::{
+            OPEN_PHASE_CACHING, OPEN_PHASE_FINALIZING, OPEN_PHASE_PARSING, OPEN_PHASE_READING,
+        };
         use std::sync::atomic::Ordering;
         let total = bytes.len();
         if let Some(p) = progress {
@@ -135,7 +137,10 @@ impl StepImportResult {
 
         let products = reader.names.len();
         let mut warnings = reader.warnings.into_inner().unwrap_or_default();
-        if spf.first_of_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE").is_some() {
+        if spf
+            .first_of_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE")
+            .is_some()
+        {
             warnings.push(
                 "assembly placement transforms are ignored; parts import at absolute coordinates"
                     .into(),
@@ -252,7 +257,9 @@ fn product_names(spf: &Spf) -> std::collections::HashMap<u64, String> {
         if !ent.is("SHAPE_DEFINITION_REPRESENTATION") {
             continue;
         }
-        let Some(rep_id) = ent.ref_id(1) else { continue };
+        let Some(rep_id) = ent.ref_id(1) else {
+            continue;
+        };
         let name = ent
             .ref_id(0)
             .and_then(|pds| spf.get(pds))
@@ -294,7 +301,9 @@ fn styled_colours(spf: &Spf) -> std::collections::HashMap<u64, [f32; 4]> {
             if steps > 64 {
                 break;
             }
-            let Some(style_ent) = spf.get(id) else { continue };
+            let Some(style_ent) = spf.get(id) else {
+                continue;
+            };
             if style_ent.is("COLOUR_RGB") {
                 colour = Some([
                     style_ent.num(1).unwrap_or(0.0) as f32,
@@ -346,10 +355,14 @@ impl<'a> Reader<'a> {
 
     fn mesh_shell(&self, shell_id: u64, sink: &mut TriSink) {
         let spf: &'a Spf = self.spf;
-        let Some(shell) = spf.get(shell_id) else { return };
+        let Some(shell) = spf.get(shell_id) else {
+            return;
+        };
         let Some(faces) = shell.list(1) else { return };
         for face in faces {
-            let Some(face_id) = face.as_ref() else { continue };
+            let Some(face_id) = face.as_ref() else {
+                continue;
+            };
             self.mesh_face(face_id, sink);
         }
     }
@@ -369,19 +382,31 @@ impl<'a> Reader<'a> {
             (face, bool_arg(face, 3).unwrap_or(true))
         };
         let Some(bounds) = inner.list(1) else { return };
-        let Some(geometry_id) = inner.ref_id(2) else { return };
-        let Some(surface) = spf.get(geometry_id) else { return };
+        let Some(geometry_id) = inner.ref_id(2) else {
+            return;
+        };
+        let Some(surface) = spf.get(geometry_id) else {
+            return;
+        };
 
         // Sample every bound's loop to a 3D polyline.
         let mut loops: Vec<Vec<[f64; 3]>> = Vec::new();
         let mut outer_flags: Vec<bool> = Vec::new();
         for bound in bounds {
-            let Some(bound_id) = bound.as_ref() else { continue };
-            let Some(bound) = spf.get(bound_id) else { continue };
+            let Some(bound_id) = bound.as_ref() else {
+                continue;
+            };
+            let Some(bound) = spf.get(bound_id) else {
+                continue;
+            };
             let is_outer = bound.is("FACE_OUTER_BOUND");
             let flip = matches!(bound.get(2), Some(Val::Enum(e)) if e.as_str() == "F");
-            let Some(loop_id) = bound.ref_id(1) else { continue };
-            let Some(loop_ent) = spf.get(loop_id) else { continue };
+            let Some(loop_id) = bound.ref_id(1) else {
+                continue;
+            };
+            let Some(loop_ent) = spf.get(loop_id) else {
+                continue;
+            };
             let mut pts: Vec<[f64; 3]> = if loop_ent.is("POLY_LOOP") {
                 loop_ent
                     .list(1)
@@ -392,7 +417,10 @@ impl<'a> Reader<'a> {
                             .collect()
                     })
                     .unwrap_or_default()
-            } else if loop_ent.is("EDGE_LOOP") || loop_ent.is("ORIENTED_PATH") || loop_ent.is("PATH") {
+            } else if loop_ent.is("EDGE_LOOP")
+                || loop_ent.is("ORIENTED_PATH")
+                || loop_ent.is("PATH")
+            {
                 self.edge_loop_points(loop_ent)
             } else {
                 Vec::new()
@@ -426,14 +454,24 @@ impl<'a> Reader<'a> {
     /// EDGE_LOOP → 3D polyline through the oriented edge curves.
     fn edge_loop_points(&self, loop_ent: &super::spf::Ent) -> Vec<[f64; 3]> {
         let spf: &'a Spf = self.spf;
-        let Some(edges) = loop_ent.list(1) else { return Vec::new() };
+        let Some(edges) = loop_ent.list(1) else {
+            return Vec::new();
+        };
         let mut pts: Vec<[f64; 3]> = Vec::new();
         for oriented in edges {
-            let Some(oriented_id) = oriented.as_ref() else { continue };
-            let Some(oriented) = spf.get(oriented_id) else { continue };
+            let Some(oriented_id) = oriented.as_ref() else {
+                continue;
+            };
+            let Some(oriented) = spf.get(oriented_id) else {
+                continue;
+            };
             let forward = !matches!(oriented.get(4), Some(Val::Enum(e)) if e.as_str() == "F");
-            let Some(edge_id) = oriented.ref_id(3) else { continue };
-            let Some(edge) = spf.get(edge_id) else { continue };
+            let Some(edge_id) = oriented.ref_id(3) else {
+                continue;
+            };
+            let Some(edge) = spf.get(edge_id) else {
+                continue;
+            };
             if !edge.is("EDGE_CURVE") {
                 continue;
             }
@@ -443,8 +481,12 @@ impl<'a> Reader<'a> {
             ) else {
                 continue;
             };
-            let Some(curve_id) = edge.ref_id(3) else { continue };
-            let Some(curve) = spf.get(curve_id) else { continue };
+            let Some(curve_id) = edge.ref_id(3) else {
+                continue;
+            };
+            let Some(curve) = spf.get(curve_id) else {
+                continue;
+            };
             let same_sense = bool_arg(edge, 4).unwrap_or(true);
             // Arc sweep follows the curve's own direction (same_sense); the
             // oriented-edge flag then flips the walked polyline as a whole.
@@ -597,7 +639,9 @@ impl<'a> Reader<'a> {
         same_sense: bool,
         sink: &mut TriSink,
     ) {
-        let Some(placement_id) = surface.ref_id(1) else { return };
+        let Some(placement_id) = surface.ref_id(1) else {
+            return;
+        };
         let frame = self.frame(placement_id);
         let flat = |p: [f64; 3]| -> [f64; 2] {
             let d = [
@@ -666,12 +710,12 @@ impl<'a> Reader<'a> {
             .iter()
             .map(|loop_pts| {
                 if let Some(project) = evaluation.projector() {
+                    loop_pts.iter().filter_map(|p| project(p)).collect()
+                } else {
                     loop_pts
                         .iter()
-                        .filter_map(|p| project(p))
+                        .map(|p| nearest_grid_uv(&grid, *p))
                         .collect()
-                } else {
-                    loop_pts.iter().map(|p| nearest_grid_uv(&grid, *p)).collect()
                 }
             })
             .collect();
@@ -724,7 +768,8 @@ impl<'a> Reader<'a> {
             .and_then(|d| norm3(d))
             .unwrap_or([1.0, 0.0, 0.0]);
         let z = glam::DVec3::new(z[0], z[1], z[2]);
-        let mut x = glam::DVec3::new(x0[0], x0[1], x0[2]) - z * z.dot(glam::DVec3::new(x0[0], x0[1], x0[2]));
+        let mut x = glam::DVec3::new(x0[0], x0[1], x0[2])
+            - z * z.dot(glam::DVec3::new(x0[0], x0[1], x0[2]));
         if x.length() < 1e-9 {
             x = if z.x.abs() < 0.9 {
                 z.cross(glam::DVec3::X)
@@ -1007,7 +1052,12 @@ impl SurfaceEval {
             } => {
                 let theta = *u0 + (*u1 - *u0) * un;
                 let h = *v0 + (*v1 - *v0) * vn;
-                Some(frame_point(frame, radius * theta.cos(), radius * theta.sin(), h))
+                Some(frame_point(
+                    frame,
+                    radius * theta.cos(),
+                    radius * theta.sin(),
+                    h,
+                ))
             }
             SurfaceEval::Cone {
                 frame,
@@ -1206,7 +1256,13 @@ fn angle_near(angle: f64, reference: f64) -> f64 {
 }
 
 /// Knot vector for curves/surfaces with multiplicities; uniform fallback.
-fn curve_knots(ent: &super::spf::Ent, mults_idx: usize, knots_idx: usize, n: usize, degree: usize) -> Vec<f64> {
+fn curve_knots(
+    ent: &super::spf::Ent,
+    mults_idx: usize,
+    knots_idx: usize,
+    n: usize,
+    degree: usize,
+) -> Vec<f64> {
     curve_knots_from(ent, mults_idx, knots_idx, n, degree)
 }
 
@@ -1460,7 +1516,11 @@ fn sink_to_mesh(sink: &TriSink, name: &str, color: [f32; 4], scale: f64) -> Mesh
         let nf = [(n.x / len) as f32, (n.y / len) as f32, (n.z / len) as f32];
         let base = verts.len() as u32;
         for p in [a, b, c] {
-            verts.push([(p.x * scale) as f32, (p.y * scale) as f32, (p.z * scale) as f32]);
+            verts.push([
+                (p.x * scale) as f32,
+                (p.y * scale) as f32,
+                (p.z * scale) as f32,
+            ]);
             normals.push(nf);
         }
         indices.extend([base, base + 1, base + 2]);
@@ -1533,7 +1593,11 @@ END-ISO-10303-21;
 
     #[test]
     fn deboor_at_ends_hits_control_points() {
-        let ctrl = vec![[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
+        let ctrl = vec![
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0, 1.0],
+        ];
         let knots = uniform_clamped_knots(3, 2);
         let start = deboor(&ctrl, 2, &knots, 0.0);
         assert!((start[0]).abs() < 1e-9 && (start[1]).abs() < 1e-9);

@@ -75,7 +75,11 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
             } else if explicit_shx {
                 // A missing .shx file draws with the stroke substitute of its
                 // name, never with an installed TrueType face (measured).
-                file.rsplit(['/', '\\']).next().unwrap_or(file).trim().to_string()
+                file.rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(file)
+                    .trim()
+                    .to_string()
             } else if let Some(family) = resolve_font_reference(file) {
                 // The file is installed, so its family is the face to draw with.
                 // Substituting a stroke font instead drops every letter that

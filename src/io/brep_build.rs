@@ -96,7 +96,9 @@ impl Builder {
     pub fn edge(&mut self, curve: Curve3, start: VertexKey, end: VertexKey) -> Option<EdgeKey> {
         let (a, b) = (self.point(start)?, self.point(end)?);
         let mut curve = match curve {
-            Curve3::Nurbs(nurbs) => kernel::brep::analytic_curve(&nurbs).unwrap_or(Curve3::Nurbs(nurbs)),
+            Curve3::Nurbs(nurbs) => {
+                kernel::brep::analytic_curve(&nurbs).unwrap_or(Curve3::Nurbs(nurbs))
+            }
             other => other,
         };
         let mut t0 = parameter(&curve, a)?;

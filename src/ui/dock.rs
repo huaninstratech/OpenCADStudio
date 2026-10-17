@@ -1427,7 +1427,11 @@ mod tests {
         assert!(state.right.is_empty(), "its old group disappears");
         assert_eq!(
             state.left[0].panels,
-            vec![PanelId::Properties, PanelId::BlockPalette, PanelId::ModelTree]
+            vec![
+                PanelId::Properties,
+                PanelId::BlockPalette,
+                PanelId::ModelTree
+            ]
         );
         assert_eq!(state.left[0].weights.len(), 3);
         // The group keeps its width.

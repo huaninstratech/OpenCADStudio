@@ -59,7 +59,11 @@ impl TdsScene {
     pub fn mesh_materials(&self, mesh: &TdsMesh) -> Vec<String> {
         let mut used: Vec<String> = Vec::new();
         for m in &self.materials {
-            if mesh.groups.iter().any(|(name, faces)| !faces.is_empty() && *name == m.name) {
+            if mesh
+                .groups
+                .iter()
+                .any(|(name, faces)| !faces.is_empty() && *name == m.name)
+            {
                 used.push(m.name.clone());
             }
         }
@@ -84,7 +88,9 @@ impl Reader<'_> {
         Some(u32::from_le_bytes(self.b.get(at..at + 4)?.try_into().ok()?))
     }
     fn f32(&self, at: usize) -> Option<f64> {
-        Some(f64::from(f32::from_le_bytes(self.b.get(at..at + 4)?.try_into().ok()?)))
+        Some(f64::from(f32::from_le_bytes(
+            self.b.get(at..at + 4)?.try_into().ok()?,
+        )))
     }
     fn point(&self, at: usize) -> Option<[f64; 3]> {
         Some([self.f32(at)?, self.f32(at + 4)?, self.f32(at + 8)?])
@@ -105,7 +111,9 @@ impl Reader<'_> {
         let mut out = Vec::new();
         let mut at = from;
         while at + 6 <= to {
-            let (Some(id), Some(len)) = (self.u16(at), self.u32(at + 2)) else { break };
+            let (Some(id), Some(len)) = (self.u16(at), self.u32(at + 2)) else {
+                break;
+            };
             let len = len as usize;
             if len < 6 || at + len > to {
                 break;
@@ -124,8 +132,14 @@ impl Reader<'_> {
                     continue;
                 }
                 return Some(match id {
-                    0x0011 | 0x0012 => [*self.b.get(start)?, *self.b.get(start + 1)?, *self.b.get(start + 2)?],
-                    _ => self.point(start)?.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
+                    0x0011 | 0x0012 => [
+                        *self.b.get(start)?,
+                        *self.b.get(start + 1)?,
+                        *self.b.get(start + 2)?,
+                    ],
+                    _ => self
+                        .point(start)?
+                        .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
                 });
             }
         }
@@ -210,14 +224,20 @@ fn read_mesh(r: &Reader<'_>, from: usize, to: usize) -> TdsMesh {
                 mesh.faces = (0..n)
                     .filter_map(|k| {
                         let at = s + 2 + 8 * k;
-                        Some([r.u16(at)? as usize, r.u16(at + 2)? as usize, r.u16(at + 4)? as usize])
+                        Some([
+                            r.u16(at)? as usize,
+                            r.u16(at + 2)? as usize,
+                            r.u16(at + 4)? as usize,
+                        ])
                     })
                     .collect();
                 for (id, gs, ge) in r.chunks(s + 2 + 8 * n, e) {
                     if id == 0x4130 {
                         let (name, at) = r.cstr(gs, ge);
                         let count = r.u16(at).unwrap_or(0) as usize;
-                        let faces = (0..count).filter_map(|k| r.u16(at + 2 + 2 * k).map(usize::from)).collect();
+                        let faces = (0..count)
+                            .filter_map(|k| r.u16(at + 2 + 2 * k).map(usize::from))
+                            .collect();
                         mesh.groups.push((name, faces));
                     }
                 }
@@ -309,7 +329,9 @@ fn polyfaces(mesh: &TdsMesh, faces: &[usize], compact: bool) -> Vec<PolyfaceMesh
         }
     }
     for &f in faces {
-        let Some(face) = mesh.faces.get(f) else { continue };
+        let Some(face) = mesh.faces.get(f) else {
+            continue;
+        };
         if face.iter().any(|v| *v >= mesh.vertices.len()) {
             continue;
         }
@@ -318,7 +340,11 @@ fn polyfaces(mesh: &TdsMesh, faces: &[usize], compact: bool) -> Vec<PolyfaceMesh
             out.push(std::mem::replace(&mut current, PolyfaceMesh::new()));
             index.clear();
         }
-        let ids = face.map(|v| *index.entry(v).or_insert_with(|| current.add_vertex(vertex(v))));
+        let ids = face.map(|v| {
+            *index
+                .entry(v)
+                .or_insert_with(|| current.add_vertex(vertex(v)))
+        });
         current.add_face(PolyfaceFace::triangle(ids[0], ids[1], ids[2]));
     }
     out.push(current);
@@ -353,7 +379,12 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                 let materials = scene.mesh_materials(mesh);
                 let all: Vec<usize> = (0..mesh.faces.len()).collect();
                 let pieces: Vec<(Option<String>, Vec<usize>)> = if materials.len() > 1 {
-                    match options.multi.get(name).cloned().unwrap_or(MultiMaterial::Split) {
+                    match options
+                        .multi
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(MultiMaterial::Split)
+                    {
                         MultiMaterial::Split => materials
                             .iter()
                             .map(|m| {
@@ -384,9 +415,10 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                     // are made fit to name a layer.
                     let layer = match options.layers {
                         LayerMode::ByObject => sanitized_table_name(&name.to_uppercase(), "0"),
-                        LayerMode::ByMaterial => {
-                            sanitized_table_name(&material.as_deref().unwrap_or("0").to_uppercase(), "0")
-                        }
+                        LayerMode::ByMaterial => sanitized_table_name(
+                            &material.as_deref().unwrap_or("0").to_uppercase(),
+                            "0",
+                        ),
                         LayerMode::ByObjectColor => match mesh.color {
                             Some(c) => format!("COLOR{c:02}"),
                             None => "COLORNONE".to_string(),
@@ -418,7 +450,7 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
             TdsObject::Light => {}
         }
     }
-    out.messages.push("3D Studio file import completed".to_string());
+    out.messages
+        .push("3D Studio file import completed".to_string());
     out
 }
-

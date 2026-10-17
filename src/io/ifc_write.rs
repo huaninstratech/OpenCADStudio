@@ -140,7 +140,9 @@ pub fn write_ifc(model: &IfcExportModel) -> Result<String, String> {
     let site_plc = w.emit(format!("IFCLOCALPLACEMENT($,{site_axis})"));
     guid_serial += 1;
     let g = step_string(&synthetic_guid(guid_serial));
-    let site = w.emit(format!("IFCSITE({g},$,'Site',$,$,{site_plc},$,$,$,$,$,$,$,$)"));
+    let site = w.emit(format!(
+        "IFCSITE({g},$,'Site',$,$,{site_plc},$,$,$,$,$,$,$,$)"
+    ));
 
     let building_axis = w.emit(format!("IFCAXIS2PLACEMENT3D({origin},$,$)"));
     let building_plc = w.emit(format!("IFCLOCALPLACEMENT({site_plc},{building_axis})"));
@@ -372,11 +374,19 @@ impl SpfWriter {
 /// a stray leading '#'; a missing `IFC` prefix is added before falling back.
 fn resolve_class(raw: &str) -> &'static str {
     let cleaned = raw.trim().trim_start_matches('#').to_ascii_uppercase();
-    if let Some(hit) = ELEMENT_CLASSES.iter().copied().find(|c| *c == cleaned.as_str()) {
+    if let Some(hit) = ELEMENT_CLASSES
+        .iter()
+        .copied()
+        .find(|c| *c == cleaned.as_str())
+    {
         return hit;
     }
     let prefixed = format!("IFC{cleaned}");
-    if let Some(hit) = ELEMENT_CLASSES.iter().copied().find(|c| *c == prefixed.as_str()) {
+    if let Some(hit) = ELEMENT_CLASSES
+        .iter()
+        .copied()
+        .find(|c| *c == prefixed.as_str())
+    {
         return hit;
     }
     "IFCBUILDINGELEMENTPROXY"
@@ -459,8 +469,7 @@ fn quantise(v: [f64; 3]) -> (i64, i64, i64) {
 /// (and for elements exported without one). Charset per the IFC spec:
 /// 0-9 A-Z a-z _ $.
 fn synthetic_guid(serial: u64) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+    const ALPHABET: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
     let mut chars = ['0'; 22];
     let mut v = serial;
     for slot in (0..22).rev() {
@@ -536,7 +545,12 @@ fn iso_utc_now() -> String {
         .unwrap_or(0);
     let (y, m, d) = civil_from_days((secs / 86_400) as i64);
     let rem = secs % 86_400;
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 /// Days since 1970-01-01 → (year, month, day) in the proleptic Gregorian
@@ -654,7 +668,10 @@ mod tests {
         );
 
         // The wall's representation chain reaches that brep.
-        let shape = wall.ref_id(6).and_then(|id| spf.get(id)).expect("product shape");
+        let shape = wall
+            .ref_id(6)
+            .and_then(|id| spf.get(id))
+            .expect("product shape");
         let repr = shape
             .list(2)
             .and_then(|l| l.first())

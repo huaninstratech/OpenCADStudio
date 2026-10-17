@@ -1731,38 +1731,42 @@ fn group_requires_preservation(document: &CadDocument, group: &Assoc2dConstraint
     // dynamic block's constraint parameter rather than a dimension, and
     // single edges of one polyline each held by a dependency of its own.
     let mut curves = Vec::new();
-    let unmodelled = group.actions.iter().any(|handle| match document.objects.get(handle) {
-        Some(ObjectType::Associative(AssociativeObject { data, .. })) => match data {
-            AssociativeData::Dependency(dependency) => {
-                document.objects.contains_key(&dependency.dependent_on)
-            }
-            AssociativeData::GeomDependency(geometry) => {
-                let curve = geometry.dependency.dependent_on;
-                let repeated = curves.contains(&curve);
-                curves.push(curve);
-                repeated
-            }
+    let unmodelled = group
+        .actions
+        .iter()
+        .any(|handle| match document.objects.get(handle) {
+            Some(ObjectType::Associative(AssociativeObject { data, .. })) => match data {
+                AssociativeData::Dependency(dependency) => {
+                    document.objects.contains_key(&dependency.dependent_on)
+                }
+                AssociativeData::GeomDependency(geometry) => {
+                    let curve = geometry.dependency.dependent_on;
+                    let repeated = curves.contains(&curve);
+                    curves.push(curve);
+                    repeated
+                }
+                _ => false,
+            },
             _ => false,
-        },
-        _ => false,
-    });
-    unmodelled || group.nodes.iter().any(|node| {
-        if matches!(node.data, AssocConstraintNodeData::RigidSet { .. }) {
-            return true;
-        }
-        if let Some(dependency) = geometry_dependency(&node.data) {
-            if dependency_entity(document, dependency, &node.data).is_none() {
+        });
+    unmodelled
+        || group.nodes.iter().any(|node| {
+            if matches!(node.data, AssocConstraintNodeData::RigidSet { .. }) {
                 return true;
             }
-        }
-        let class_name = node.class_name.to_ascii_uppercase();
-        class_name.ends_with("CONSTRAINT")
-            && constraint_kind(node).is_none()
-            && !matches!(
-                class_name.as_str(),
-                "ACEQUALCURVATURECONSTRAINT" | "ACEQUALHELPPARAMETERCONSTRAINT"
-            )
-    })
+            if let Some(dependency) = geometry_dependency(&node.data) {
+                if dependency_entity(document, dependency, &node.data).is_none() {
+                    return true;
+                }
+            }
+            let class_name = node.class_name.to_ascii_uppercase();
+            class_name.ends_with("CONSTRAINT")
+                && constraint_kind(node).is_none()
+                && !matches!(
+                    class_name.as_str(),
+                    "ACEQUALCURVATURECONSTRAINT" | "ACEQUALHELPPARAMETERCONSTRAINT"
+                )
+        })
 }
 
 fn work_plane_vector(work_plane: &[Vector3; 3], local: Vector3) -> Option<Vector3> {

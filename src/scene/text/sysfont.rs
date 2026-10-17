@@ -298,12 +298,22 @@ pub fn face_file(family: &str, bold: bool, italic: bool) -> Option<String> {
     let db = fonts().db.lock().unwrap();
     let id = db.query(&fontdb::Query {
         families: &[fontdb::Family::Name(family)],
-        weight: if bold { fontdb::Weight::BOLD } else { fontdb::Weight::NORMAL },
-        style: if italic { fontdb::Style::Italic } else { fontdb::Style::Normal },
+        weight: if bold {
+            fontdb::Weight::BOLD
+        } else {
+            fontdb::Weight::NORMAL
+        },
+        style: if italic {
+            fontdb::Style::Italic
+        } else {
+            fontdb::Style::Normal
+        },
         ..Default::default()
     })?;
     match &db.face(id)?.source {
-        fontdb::Source::File(path) => Some(path.file_name()?.to_string_lossy().to_ascii_lowercase()),
+        fontdb::Source::File(path) => {
+            Some(path.file_name()?.to_string_lossy().to_ascii_lowercase())
+        }
         _ => None,
     }
 }

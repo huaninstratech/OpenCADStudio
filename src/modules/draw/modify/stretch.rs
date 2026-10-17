@@ -65,8 +65,11 @@ pub fn stretch_entity(
             let Some(mut world) = crate::entities::curve::lwpolyline_world_xy(p) else {
                 return false;
             };
-            let before: Vec<[f64; 2]> =
-                world.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+            let before: Vec<[f64; 2]> = world
+                .vertices
+                .iter()
+                .map(|v| [v.location.x, v.location.y])
+                .collect();
             for v in &mut world.vertices {
                 if in_win(v.location.x, v.location.y) {
                     v.location.x += dx;
@@ -75,8 +78,11 @@ pub fn stretch_entity(
                 }
             }
             if stretched {
-                let after: Vec<[f64; 2]> =
-                    world.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+                let after: Vec<[f64; 2]> = world
+                    .vertices
+                    .iter()
+                    .map(|v| [v.location.x, v.location.y])
+                    .collect();
                 let closed = world.is_closed;
                 for (k, v) in world.vertices.iter_mut().enumerate() {
                     v.bulge = held_bulge(v.bulge, &before, &after, k, closed);
@@ -85,8 +91,11 @@ pub fn stretch_entity(
             }
         }
         codec::EntityType::Polyline2D(p) => {
-            let before: Vec<[f64; 2]> =
-                p.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+            let before: Vec<[f64; 2]> = p
+                .vertices
+                .iter()
+                .map(|v| [v.location.x, v.location.y])
+                .collect();
             for v in &mut p.vertices {
                 if in_win(v.location.x, v.location.y) {
                     v.location.x += dx;
@@ -95,8 +104,11 @@ pub fn stretch_entity(
                 }
             }
             if stretched {
-                let after: Vec<[f64; 2]> =
-                    p.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+                let after: Vec<[f64; 2]> = p
+                    .vertices
+                    .iter()
+                    .map(|v| [v.location.x, v.location.y])
+                    .collect();
                 let closed = p.is_closed();
                 for (k, v) in p.vertices.iter_mut().enumerate() {
                     v.bulge = held_bulge(v.bulge, &before, &after, k, closed);
@@ -296,7 +308,11 @@ fn held_bulge(bulge: f64, before: &[[f64; 2]], after: &[[f64; 2]], k: usize, clo
 
 /// Stretch an arc by its ends: both in the window move it whole; one moves
 /// that end while the arc keeps its height over the new chord.
-fn stretch_arc(arc: &mut codec::entities::Arc, in_win: &dyn Fn(f64, f64) -> bool, delta: DVec3) -> bool {
+fn stretch_arc(
+    arc: &mut codec::entities::Arc,
+    in_win: &dyn Fn(f64, f64) -> bool,
+    delta: DVec3,
+) -> bool {
     use codec::types::{Matrix3, Vector3};
     let ocs = Matrix3::arbitrary_axis(arc.normal);
     let end = |angle: f64| {
@@ -568,7 +584,11 @@ impl CadCommand for StretchCommand {
         }
     }
 
-    fn preview_entities(&mut self, document: &codec::CadDocument, pt: DVec3) -> Vec<codec::EntityType> {
+    fn preview_entities(
+        &mut self,
+        document: &codec::CadDocument,
+        pt: DVec3,
+    ) -> Vec<codec::EntityType> {
         let Step::Target { base } = &self.step else {
             return Vec::new();
         };

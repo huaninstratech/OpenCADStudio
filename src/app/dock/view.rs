@@ -431,11 +431,9 @@ impl OpenCADStudio {
                 chrome,
             ),
             crate::ui::dock::PanelId::NodeGraph => tab.graph.panel(width, chrome),
-            crate::ui::dock::PanelId::ModelTree => crate::ui::window::ifc_tree::view(
-                &tab.scene.ifc_tree,
-                width,
-                chrome.auto_collapse,
-            ),
+            crate::ui::dock::PanelId::ModelTree => {
+                crate::ui::window::ifc_tree::view(&tab.scene.ifc_tree, width, chrome.auto_collapse)
+            }
             crate::ui::dock::PanelId::Count => crate::ui::window::count_palette::view(
                 &self.count_palette,
                 tab.count.as_ref(),

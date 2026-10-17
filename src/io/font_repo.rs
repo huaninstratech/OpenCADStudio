@@ -429,10 +429,7 @@ mod tests {
         // After the swap every own style resolves, so the prompt must not
         // fire for them again. The xref-dependent style (which Skip must not
         // rewrite — it belongs to the referenced drawing) is still flagged.
-        assert_eq!(
-            missing_shx_fonts(&doc),
-            vec!["also_gone.shx".to_string()]
-        );
+        assert_eq!(missing_shx_fonts(&doc), vec!["also_gone.shx".to_string()]);
         let _ = std::fs::remove_file(dir.join("vntime.shx"));
     }
 }
