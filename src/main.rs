@@ -157,6 +157,18 @@ fn main() -> iced::Result {
             std::process::exit(code);
         }
 
+        // Plain GUI run without --http: host the same loopback REST channel
+        // on the default port, so automation can reach the editor a person
+        // opened from the desktop shortcut without a special launch (the
+        // descriptor under automation/ carries the port and token). Every
+        // headless mode has already returned above, so this can never hijack
+        // --serve, --export or the plugin runner; a busy port (a second
+        // editor whose files were handed off) just leaves the first editor
+        // serving.
+        if args.http.is_none() {
+            rest::set_gui_http_default_port();
+        }
+
         // Single instance: a double-clicked drawing belongs as a tab in the
         // editor that is already open, not in a second copy of the app.
         //

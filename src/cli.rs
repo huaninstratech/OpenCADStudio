@@ -90,7 +90,10 @@ pub struct Cli {
     #[arg(help = crate::t!("TCP port for --serve (defaults to stdin/stdout).").into_owned(), long_help = None)]
     pub port: Option<u16>,
 
-    /// Expose the headless automation API as a REST HTTP server on this port.
+    /// Expose the automation API as a REST HTTP server on this port. Without
+    /// it the editor still serves the default port on loopback (see
+    /// automation/http.json for the live port and token); with it and no
+    /// FILE, a headless server takes over the process.
     #[arg(long, value_name = "PORT")]
     #[arg(help = crate::t!("Serve the automation API over REST on http://127.0.0.1:PORT").into_owned(), long_help = None)]
     pub http: Option<u16>,

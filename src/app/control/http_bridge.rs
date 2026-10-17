@@ -4,7 +4,10 @@
 //! query, everything the headless server does — aimed at the drawing the
 //! person at the screen is working on, plus the two interactive operations
 //! only this process can answer (`getpoint`, `user_select`: the person
-//! picks, and the HTTP connection is the thing that waits). Routes resolve
+//! picks, and the HTTP connection is the thing that waits). Plain launches
+//! (no `--http`) serve the same bridge on the built-in default port
+//! ([`rest::DEFAULT_HTTP_PORT`]), so shortcut-started editors stay reachable;
+//! the channel announces itself in `automation/http.json`. Routes resolve
 //! through the same `rest::plan` table as the headless server; requests are
 //! forwarded into the GUI's automation queue (`Envelope`, exactly like the
 //! native bridge in `transport`) and the JSON response is written back over
@@ -19,7 +22,7 @@ use iced::futures::{channel::mpsc, Stream};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,11 +30,24 @@ use std::time::Duration;
 /// iced runtime boots, so the subscription worker sees it on first run.
 /// Zero means "no channel" (plain GUI runs).
 static GUI_HTTP_PORT: AtomicU16 = AtomicU16::new(0);
+/// Whether the served port is the built-in default (`main` calls
+/// [`set_gui_http_default_port`]) rather than an explicit `--http` choice.
+/// A bind failure then means "another editor is already serving it" — a
+/// normal state, not a launch mistake — and the descriptor records it so
+/// clients can tell a permanent port from an ad-hoc one.
+static GUI_HTTP_DEFAULT: AtomicBool = AtomicBool::new(false);
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Called from `main` before the GUI boots.
 pub fn set_gui_http_port(port: u16) {
     GUI_HTTP_PORT.store(port, Ordering::SeqCst);
+}
+
+/// Called from `main` before the GUI boots for plain launches: same channel,
+/// built-in default port.
+pub fn set_gui_http_default_port(port: u16) {
+    GUI_HTTP_DEFAULT.store(true, Ordering::SeqCst);
+    set_gui_http_port(port);
 }
 
 pub(in crate::app) fn subscribe() -> iced::Subscription<Envelope> {
@@ -44,12 +60,60 @@ fn worker() -> impl Stream<Item = Envelope> {
         if port != 0 {
             std::thread::spawn(move || {
                 if let Err(error) = listen(sender, port, Arc::new(AtomicU16::new(0))) {
-                    eprintln!("--http (GUI): cannot serve 127.0.0.1:{port}: {error}");
+                    if GUI_HTTP_DEFAULT.load(Ordering::SeqCst) {
+                        eprintln!(
+                            "REST: default port 127.0.0.1:{port} is busy ({error}); \
+                             another editor is probably already serving it. \
+                             Pass --http PORT for a private channel."
+                        );
+                    } else {
+                        eprintln!("--http (GUI): cannot serve 127.0.0.1:{port}: {error}");
+                    }
                 }
             });
         }
         iced::futures::future::pending::<()>().await;
     })
+}
+
+/// Loopback discovery for plain launches: write the port, session token and
+/// pid of the live channel to `automation/http.json`, so a script reaches the
+/// editor a person opened from the shortcut without `--http` or a preset
+/// `OCS_API_TOKEN`. Same folder and trust model as the native bridge
+/// descriptors (`control::transport`); MCP session discovery skips files it
+/// cannot parse as a session descriptor (`mcp::descriptors`), so the fixed
+/// name is safe there. Failures stay silent: the channel works, discovery is
+/// best-effort.
+fn announce_http_descriptor(port: u16) {
+    use std::io::Write;
+    let Some(dir) = crate::config::config_dir().map(|dir| dir.join("automation")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let descriptor = json!({
+        "protocol": 1,
+        "pid": std::process::id(),
+        "port": port,
+        "token": rest::api_token(),
+        "default": GUI_HTTP_DEFAULT.load(Ordering::SeqCst),
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(dir.join("http.json")) {
+        let _ = writeln!(file, "{descriptor}");
+    }
 }
 
 fn listen(
@@ -60,6 +124,7 @@ fn listen(
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     bound_port.store(listener.local_addr()?.port(), Ordering::SeqCst);
     eprintln!("OpenCADStudio GUI REST listening on http://127.0.0.1:{port}/api/v1");
+    announce_http_descriptor(port);
     rest::announce_token();
     // One thread per connection: a `getpoint` or `user_select` request stays
     // open until the person answers, and must not block the other reads

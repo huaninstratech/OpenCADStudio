@@ -84,13 +84,27 @@ const ENVELOPE_OPS: &[&str] = &[
     "getpoint",
 ];
 
+/// The port the loopback REST channel serves when `--http` is omitted: plain
+/// launches (desktop shortcut, double-clicked drawing) still expose the API
+/// to local automation, and the descriptor under `automation/http.json`
+/// carries the live port and token. An explicit `--http PORT` always wins.
+pub const DEFAULT_HTTP_PORT: u16 = 7931;
+
 /// Loopback REST channel hosted by the GUI process: `OpenCADStudio.exe
 /// "<file>" --http <port>` boots the editor with a bridge that forwards
 /// requests into the live app (see `app::control::http_bridge`), so a client
 /// can read what the person at the screen selected. `--http` without files
-/// keeps the headless server above.
+/// keeps the headless server above. Without `--http` the GUI hosts the same
+/// bridge on [`DEFAULT_HTTP_PORT`].
 pub fn set_gui_http_port(port: u16) {
     crate::app::control::http_bridge::set_gui_http_port(port);
+}
+
+/// Hosts the GUI bridge on [`DEFAULT_HTTP_PORT`] and marks the channel as the
+/// built-in default, so a busy port reads as "another editor owns it" rather
+/// than a launch mistake.
+pub fn set_gui_http_default_port() {
+    crate::app::control::http_bridge::set_gui_http_default_port(DEFAULT_HTTP_PORT);
 }
 
 /// Failure codes worth one state refresh + retry (the request never started).
