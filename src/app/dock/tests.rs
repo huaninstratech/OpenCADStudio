@@ -95,8 +95,8 @@ fn dropping_on_a_pallets_top_or_bottom_half_stacks_above_or_below_it() {
     let mut app = dock_app();
     let id = PanelId::BlockPalette;
     assert_eq!(app.dock.location(id), Some((DockSide::Right, 0)));
-    // The left group stacks Properties above the Model Tree; y=300 lands on
-    // the bottom half of Properties.
+    // The left group's lone Properties spans the full edge height, so
+    // y=300 lands on its top half.
     let target = drag_panel(
         &mut app,
         id,
@@ -108,16 +108,12 @@ fn dropping_on_a_pallets_top_or_bottom_half_stacks_above_or_below_it() {
         Some(DropTarget::Join {
             side: DockSide::Left,
             group: 0,
-            index: 1
+            index: 0
         })
     );
     assert_eq!(
         app.dock.left[0].panels,
-        vec![
-            PanelId::Properties,
-            PanelId::BlockPalette,
-            PanelId::ModelTree
-        ]
+        vec![PanelId::BlockPalette, PanelId::Properties]
     );
     assert!(app.dock.right.is_empty());
     // The bottom half of a pallet stacks below it.
@@ -132,16 +128,13 @@ fn dropping_on_a_pallets_top_or_bottom_half_stacks_above_or_below_it() {
         Some(DropTarget::Join {
             side: DockSide::Left,
             group: 0,
-            index: 3
+            index: 2
         })
     );
+    // Dropped past Properties, the dragged pallet lands below it.
     assert_eq!(
         app.dock.left[0].panels,
-        vec![
-            PanelId::Properties,
-            PanelId::ModelTree,
-            PanelId::BlockPalette
-        ]
+        vec![PanelId::Properties, PanelId::BlockPalette]
     );
 }
 
@@ -816,11 +809,11 @@ fn layers_ribbon_button_opens_the_pallet_without_staying_highlighted() {
 #[test]
 fn dock_double_clicks_float_and_dock_panels() {
     use crate::app::config::DockSide;
-    use crate::ui::dock::{DockGroup, DockMsg, PanelId};
+    use crate::ui::dock::{DockMsg, PanelId};
     let mut app = dock_app();
     let _ = app.on_dock(DockMsg::FloatOut(PanelId::Properties));
-    // The Model Tree keeps its left-edge slot.
-    assert_eq!(app.dock.left, vec![DockGroup::single(PanelId::ModelTree)]);
+    // Floating the only left-edge pallet empties the edge.
+    assert!(app.dock.left.is_empty());
     let f = app.dock.float_rect(PanelId::Properties).expect("floating");
     assert!(f.x > 0.0, "floats clear of the left edge");
     let _ = app.on_dock(DockMsg::DockTo(PanelId::Properties, DockSide::Right));

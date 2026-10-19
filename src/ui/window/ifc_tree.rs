@@ -3,15 +3,16 @@
 // it in the viewport; the panel is empty until an IFC import populates it.
 
 use iced::widget::{button, column, container, text};
-use iced::{Background, Border, Element, Fill, Theme};
+use iced::{Background, Element, Fill, Theme};
 
 use crate::app::Message;
 use crate::io::ifc::IfcTreeNode;
+use crate::ui::dock::{self, Chrome, PanelId};
 
 const INDENT: f32 = 14.0;
 
-pub fn view<'a>(tree: &'a [IfcTreeNode], width: f32, auto_collapse: bool) -> Element<'a, Message> {
-    let _ = (width, auto_collapse);
+pub fn view<'a>(tree: &'a [IfcTreeNode], width: f32, chrome: Chrome) -> Element<'a, Message> {
+    let title_bar = dock::title_bar(PanelId::ModelTree, "IFC Model Tree".to_string(), chrome);
     let mut content = column![].spacing(0).width(Fill);
     if tree.is_empty() {
         content = content.push(
@@ -25,14 +26,7 @@ pub fn view<'a>(tree: &'a [IfcTreeNode], width: f32, auto_collapse: bool) -> Ele
         }
     }
     let body: Element<'_, Message> = container(content).width(Fill).padding([6, 8]).into();
-    column![
-        container(text("IFC Model Tree".to_string()).size(12))
-            .width(Fill)
-            .padding([6, 10]),
-        body
-    ]
-    .width(Fill)
-    .into()
+    dock::frame(title_bar, body, width)
 }
 
 fn push_nodes<'a>(

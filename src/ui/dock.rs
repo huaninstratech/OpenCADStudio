@@ -451,10 +451,9 @@ pub struct DockState {
 impl Default for DockState {
     fn default() -> Self {
         Self {
-            left: vec![DockGroup::stack(vec![
-                PanelId::Properties,
-                PanelId::ModelTree,
-            ])],
+            // The IFC Model Tree takes no default slot; it opens on demand
+            // (the edge strip's + menu) like the other occasional pallets.
+            left: vec![DockGroup::single(PanelId::Properties)],
             right: vec![DockGroup::single(PanelId::BlockPalette)],
             shown: (0, 0),
             auto_hide: (false, false),
@@ -1320,6 +1319,8 @@ mod tests {
             state.location(PanelId::BlockPalette),
             Some((DockSide::Right, 0))
         );
+        // The IFC Model Tree takes no default slot; it opens on demand.
+        assert_eq!(state.location(PanelId::ModelTree), None);
     }
 
     #[test]
@@ -1340,8 +1341,8 @@ mod tests {
             state.location(PanelId::Properties),
             Some((DockSide::Right, 0))
         );
-        // It no longer occupies the left edge (the Model Tree stays there).
-        assert_eq!(state.left, vec![DockGroup::single(PanelId::ModelTree)]);
+        // It no longer occupies the left edge (which is now empty).
+        assert!(state.left.is_empty());
         assert_eq!(state.right.len(), 2);
     }
 
@@ -1422,18 +1423,14 @@ mod tests {
     fn join_group_stacks_and_shows_the_group() {
         let mut state = DockState::default();
         state.set_group_width(DockSide::Left, 0, 320.0);
-        // Between Properties and the Model Tree in the left group.
+        // Below Properties in the left group.
         assert!(state.join_group(PanelId::BlockPalette, DockSide::Left, 0, 1));
         assert!(state.right.is_empty(), "its old group disappears");
         assert_eq!(
             state.left[0].panels,
-            vec![
-                PanelId::Properties,
-                PanelId::BlockPalette,
-                PanelId::ModelTree
-            ]
+            vec![PanelId::Properties, PanelId::BlockPalette]
         );
-        assert_eq!(state.left[0].weights.len(), 3);
+        assert_eq!(state.left[0].weights.len(), 2);
         // The group keeps its width.
         assert_eq!(state.group_width(DockSide::Left, 0), 320.0);
         // Moving it above Properties keeps it in the group.
@@ -1473,10 +1470,7 @@ mod tests {
         state.join_group(PanelId::BlockPalette, DockSide::Left, 0, 1);
         assert!(state.dock(PanelId::BlockPalette, DockSide::Left, 1));
         assert_eq!(state.left.len(), 2);
-        assert_eq!(
-            state.left[0].panels,
-            vec![PanelId::Properties, PanelId::ModelTree]
-        );
+        assert_eq!(state.left[0].panels, vec![PanelId::Properties]);
         assert_eq!(state.left[1].panels, vec![PanelId::BlockPalette]);
         assert_eq!(state.shown(DockSide::Left), 1);
         assert!(state.show_group_of(PanelId::Properties));
@@ -1503,16 +1497,10 @@ mod tests {
         assert!(!state.move_group(DockSide::Left, 1, DockSide::Left, 1));
         assert!(!state.move_group(DockSide::Left, 1, DockSide::Left, 2));
         assert!(state.move_group(DockSide::Left, 0, DockSide::Left, 3));
-        assert_eq!(
-            state.left[2].panels,
-            vec![PanelId::Properties, PanelId::ModelTree]
-        );
+        assert_eq!(state.left[2].panels, vec![PanelId::Properties]);
         assert_eq!(state.shown(DockSide::Left), 2, "the moved group shows");
         assert!(state.move_group(DockSide::Left, 2, DockSide::Right, 0));
-        assert_eq!(
-            state.right[0].panels,
-            vec![PanelId::Properties, PanelId::ModelTree]
-        );
+        assert_eq!(state.right[0].panels, vec![PanelId::Properties]);
         assert_eq!(state.left.len(), 2);
         assert!(state.shown(DockSide::Left) < 2);
     }
@@ -1537,8 +1525,8 @@ mod tests {
     fn group_width_is_its_own_once_set() {
         let mut state = DockState::default();
         state.join_group(PanelId::Browser, DockSide::Left, 0, 1);
-        // Unset: the widest pallet (ModelTree 260 > Properties 250 > Browser 230).
-        assert_eq!(state.group_width(DockSide::Left, 0), 260.0);
+        // Unset: the widest pallet (Properties 250 > Browser 230).
+        assert_eq!(state.group_width(DockSide::Left, 0), 250.0);
         state.set_group_width(DockSide::Left, 0, 333.0);
         assert_eq!(state.group_width(DockSide::Left, 0), 333.0);
         // Pallet widths are untouched; other groups keep theirs.
@@ -1549,7 +1537,7 @@ mod tests {
         state.set_group_width(DockSide::Left, 0, 10.0);
         assert_eq!(state.group_width(DockSide::Left, 0), DOCK_MIN_W);
         state.reset_group_width(DockSide::Left, 0);
-        assert_eq!(state.group_width(DockSide::Left, 0), 260.0);
+        assert_eq!(state.group_width(DockSide::Left, 0), 250.0);
     }
 
     #[test]

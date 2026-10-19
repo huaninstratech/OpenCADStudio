@@ -4949,7 +4949,9 @@ impl OpenCADStudio {
             render_mode_preview: None,
             show_properties: true,
             ifc_select_level: IfcSelectLevel::Object,
-            show_ifc_tree: true,
+            // The IFC Model Tree starts closed; it opens on demand from the
+            // dock's + menu rather than taking a default slot.
+            show_ifc_tree: false,
             show_layers: false,
             show_graphic_attributes: false,
             graphic_attributes: Default::default(),
