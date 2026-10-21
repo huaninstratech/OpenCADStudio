@@ -599,6 +599,18 @@ pub fn adapt_mtext_paragraphs(
 
     let entity_height = entity_height.max(1e-6);
     let doc = parse_mtext(s, true);
+    // Paragraph indents and tab stops: the extended `\pxi…;` form measures
+    // them in text heights, the bare `\pi…;` form (older editors and
+    // text-to-MTEXT converters, which centre each line with it) in drawing
+    // units. (#1918)
+    let bare_p = s
+        .match_indices("\\p")
+        .any(|(i, _)| matches!(s.as_bytes().get(i + 2), Some(b'i' | b'l' | b'r' | b't')));
+    let para_unit = if bare_p && !s.contains("\\px") {
+        1.0
+    } else {
+        entity_height
+    };
 
     fn map_align(a: MTextParagraphAlignment) -> Option<ParagraphAlign> {
         match a {
@@ -669,18 +681,16 @@ pub fn adapt_mtext_paragraphs(
         }
         let (align, indent_first, indent_left, indent_right, tab_stops) =
             if has_own_props(props) || carried.is_none() {
-                // `\pxi…,l…,r…,t…;` values are multiples of the text height,
-                // not drawing units, and the first-line indent is relative to
-                // the left indent (a numbered list's hanging indent is
-                // `i-1.5,l1.5`: number at the margin, wrapped lines 1.5 h in).
-                // Taken raw they were a fraction of a unit — no indent at all —
-                // so every wrapped list line snapped back to the margin.
-                let left = props.left_margin.unwrap_or(0.0) as f32 * entity_height;
+                // Values are in `para_unit`, and the first-line indent is
+                // relative to the left indent (a numbered list's hanging
+                // indent is `i-1.5,l1.5`: number at the margin, wrapped lines
+                // 1.5 units in).
+                let left = props.left_margin.unwrap_or(0.0) as f32 * para_unit;
                 let v = (
                     props.alignment.and_then(map_align),
-                    left + props.first_line_indent.unwrap_or(0.0) as f32 * entity_height,
+                    left + props.first_line_indent.unwrap_or(0.0) as f32 * para_unit,
                     left,
-                    props.right_margin.unwrap_or(0.0) as f32 * entity_height,
+                    props.right_margin.unwrap_or(0.0) as f32 * para_unit,
                     props
                         .tab_stops
                         .iter()
@@ -695,7 +705,7 @@ pub fn adapt_mtext_paragraphs(
                                 }
                             };
                             TabStop {
-                                position: ts.position() as f32 * entity_height,
+                                position: ts.position() as f32 * para_unit,
                                 kind,
                             }
                         })
@@ -1173,19 +1183,19 @@ pub fn atom_width(atom: &LayoutAtom, entity_h: f32, base_wf: f32, base_font: &st
 
 /// Cursor position after a `\t` atom: advance to the next user-defined tab
 /// stop that lies past `cur_x`, falling back to a 4-em default grid when no
-/// stop is reached.
+/// stop is reached. `cur_x` and the stops are measured from the column's left
+/// edge, not from the paragraph indent: a hanging list `i-3,l3,t3` puts the
+/// text after `1.<tab>` at 3, in line with its wrapped lines. (#1918)
 pub fn next_tab_position(
     cur_x: f32,
     tab_stops: &[TabStop],
     indent_left: f32,
     entity_h: f32,
 ) -> f32 {
-    let local = cur_x - indent_left;
-    for ts in tab_stops {
-        if ts.position > local + 1e-4 {
-            return indent_left + ts.position;
-        }
+    if let Some(ts) = tab_stops.iter().find(|ts| ts.position > cur_x + 1e-4) {
+        return ts.position;
     }
+    let local = cur_x - indent_left;
     let default_interval = entity_h * 4.0;
     let n = (local / default_interval).floor() + 1.0;
     indent_left + n * default_interval
@@ -1251,7 +1261,7 @@ pub fn wrap_paragraph(
             }
             AtomKind::Tab => {
                 let start_x = line_start_x(subline_idx);
-                let local = cur_w + start_x - indent_left;
+                let local = cur_w + start_x;
                 let is_align = tab_stops
                     .iter()
                     .find(|ts| ts.position > local + 1e-4)
@@ -2800,11 +2810,11 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                     // than just advancing the pen. Decimal places the first `.`
                     // on the stop; right the field's end; center its middle.
                     //
-                    // Stop positions are relative to the paragraph's own left
-                    // edge, so measure against `box_left` (the column's left,
-                    // which `cursor_x` already carries) — not the raw indent, or
-                    // a second column's tabs miss every stop and shoot off right.
-                    let tab_base = box_left + sub.indent_left;
+                    // Stop positions are measured from `box_left` (the column's
+                    // left, which `cursor_x` already carries) — not the raw
+                    // indent, or a second column's tabs miss every stop and
+                    // shoot off right.
+                    let tab_base = box_left;
                     let local = cursor_x - tab_base;
                     let stop = sub
                         .tab_stops
@@ -2863,8 +2873,13 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                             cursor_x = sx - offset;
                         }
                         _ => {
-                            cursor_x =
-                                next_tab_position(cursor_x, &sub.tab_stops, tab_base, entity_h);
+                            cursor_x = tab_base
+                                + next_tab_position(
+                                    local,
+                                    &sub.tab_stops,
+                                    sub.indent_left,
+                                    entity_h,
+                                );
                         }
                     }
                 }
@@ -3294,6 +3309,52 @@ mod v_anchor_tests {
             layout.line_widths.iter().all(|w| *w <= 30.0 + 1e-3),
             "no wrapped line may overshoot the column: {:?}",
             layout.line_widths
+        );
+    }
+
+    /// A bare `\pi…;` list measures in drawing units and its tab stop from the
+    /// column edge: the text after `1.<tab>` lines up with its wrapped lines.
+    #[test]
+    fn bare_p_hanging_list_aligns_on_its_tab_stop() {
+        use crate::entities::text_support::{
+            layout_mtext, MTextRenderOpts, MTextVAnchor, ResolvedTextStyle,
+        };
+        let style = ResolvedTextStyle {
+            font_name: "Standard".to_string(),
+            width_factor: 1.0,
+            oblique_angle: 0.0,
+            is_backward: false,
+            is_upside_down: false,
+            is_vertical: false,
+        };
+        let layout = layout_mtext(&MTextRenderOpts {
+            columns: Default::default(),
+            value: "\\pi-36,l36,t36;1.\tAAA BBB CCC DDD EEE FFF GGG HHH III JJJ",
+            insertion: [0.0, 0.0, 0.0],
+            height: 12.0,
+            rect_w: 200.0,
+            rotation: 0.0,
+            style: &style,
+            attach_h_anchor: 0.0,
+            v_anchor: MTextVAnchor::Top,
+            line_spacing_factor: 1.0,
+            exact_line_spacing: false,
+            rectangle_height: 0.0,
+            vertical_text: false,
+            want_glyph_boxes: false,
+        });
+        let first = &layout.strokes[1];
+        let wrapped = layout
+            .strokes
+            .iter()
+            .find(|s| s.origin[1] < first.origin[1] - 1.0)
+            .expect("the list item must wrap");
+        assert!(layout.strokes[0].origin[0].abs() < 1e-3);
+        assert!((first.origin[0] - 36.0).abs() < 1e-3, "{:?}", first.origin);
+        assert!(
+            (wrapped.origin[0] - 36.0).abs() < 1e-3,
+            "{:?}",
+            wrapped.origin
         );
     }
 

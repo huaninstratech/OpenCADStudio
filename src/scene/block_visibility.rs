@@ -90,7 +90,7 @@ pub fn parameter(document: &CadDocument, definition: Handle) -> Option<&BlockVis
 }
 
 /// Store an edited parameter in the document and its lookup view.
-fn store(document: &mut CadDocument, parameter: BlockVisibilityParameter) {
+pub(crate) fn store(document: &mut CadDocument, parameter: BlockVisibilityParameter) {
     document
         .block_visibility_params
         .insert(parameter.handle, parameter.clone());
@@ -468,6 +468,13 @@ impl Scene {
     /// again with its current state. Returns the copy's name; a reference
     /// already showing its own copy, or not dynamic, gets `None`.
     pub fn visibility_representation(&mut self, insert: Handle) -> Option<String> {
+        let definition = self.document.dynamic_definition_for_insert(insert)?;
+        parameter(&self.document, definition)?;
+        self.dynamic_representation(insert)
+    }
+
+    /// Isolate an evaluated dynamic reference, including copies sharing a representation.
+    pub(crate) fn dynamic_representation(&mut self, insert: Handle) -> Option<String> {
         let Some(EntityType::Insert(reference)) = self.document.get_entity(insert) else {
             return None;
         };
@@ -477,7 +484,6 @@ impl Scene {
             .get(&reference.block_name)?
             .handle;
         let definition = self.document.dynamic_definition_for_insert(insert)?;
-        parameter(&self.document, definition)?;
         let direct = source == definition;
         let shared = || {
             self.document.entities().any(|entity| {
@@ -525,18 +531,35 @@ impl Scene {
         // The reference: AcDbBlockRepresentation / AcDbRepData names the
         // definition it was evaluated from.
         let holder = self.document.ensure_extension_dictionary(insert);
-        let representation = self.document.allocate_handle();
+        let existing = match self.document.objects.get(&holder) {
+            Some(ObjectType::Dictionary(d)) => d
+                .entries
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("AcDbBlockRepresentation"))
+                .map(|(_, handle)| *handle),
+            _ => None,
+        };
+        let representation = existing.unwrap_or_else(|| self.document.allocate_handle());
         let data = self.document.allocate_handle();
-        let mut dictionary = codec::objects::Dictionary::new();
-        dictionary.handle = representation;
-        dictionary.owner = holder;
-        dictionary.reactors.push(holder);
-        dictionary.add_entry("AcDbRepData", data);
-        self.document
-            .objects
-            .insert(representation, ObjectType::Dictionary(dictionary));
-        if let Some(ObjectType::Dictionary(holder)) = self.document.objects.get_mut(&holder) {
-            holder.add_entry("AcDbBlockRepresentation", representation);
+        if existing.is_none() {
+            let mut dictionary = codec::objects::Dictionary::new();
+            dictionary.handle = representation;
+            dictionary.owner = holder;
+            dictionary.reactors.push(holder);
+            self.document
+                .objects
+                .insert(representation, ObjectType::Dictionary(dictionary));
+            if let Some(ObjectType::Dictionary(holder)) = self.document.objects.get_mut(&holder) {
+                holder.add_entry("AcDbBlockRepresentation", representation);
+            }
+        }
+        if let Some(ObjectType::Dictionary(dictionary)) =
+            self.document.objects.get_mut(&representation)
+        {
+            dictionary
+                .entries
+                .retain(|(key, _)| !key.eq_ignore_ascii_case("AcDbRepData"));
+            dictionary.add_entry("AcDbRepData", data);
         }
         let mut link = dynamic(
             data,

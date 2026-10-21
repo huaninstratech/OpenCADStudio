@@ -16,6 +16,7 @@ pub(crate) mod fs_access;
 pub mod ifc;
 pub mod ifc_write;
 pub mod iges_import;
+pub mod iges_surfaces;
 pub mod line_read;
 pub mod linetypes;
 pub mod meshutil;
@@ -41,6 +42,7 @@ pub mod step_import;
 pub mod stl;
 pub mod svg_export;
 pub mod tds_import;
+pub mod tds_legacy;
 pub mod thumbnail;
 pub mod update_check;
 pub mod visual_styles;
@@ -803,6 +805,9 @@ async fn load_web_bytes(
     fix_viewport_status_flags(&mut doc);
     fix_current_style_names(&mut doc);
     crate::entities::field::local_header_dates(&mut doc);
+    // Opening is a field evaluation event (FIELDEVAL bit 1), as on the
+    // native open: object-property fields show the drawing's own state.
+    crate::entities::field::update_fields(&mut doc, 1, None);
     progress.set(crate::app::OPEN_PHASE_CACHING, 7000, 0, 1);
     if recovery_mode {
         repair_drawing(&mut doc);

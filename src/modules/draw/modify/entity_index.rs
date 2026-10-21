@@ -18,6 +18,14 @@ pub(super) struct ModifyEntityIndex {
 }
 
 impl ModifyEntityIndex {
+    pub(super) fn empty() -> Self {
+        Self {
+            by_handle: FxHashMap::default(),
+            tree: None,
+            unbounded: Vec::new(),
+        }
+    }
+
     pub(super) fn build(entities: &[EntityType]) -> Self {
         let mut by_handle = FxHashMap::default();
         let mut bounded = Vec::new();

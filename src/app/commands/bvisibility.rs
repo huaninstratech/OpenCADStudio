@@ -47,7 +47,7 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, &format!("{} parameter", kind.name()));
-        crate::scene::block_orientation_parameter::create(
+        let parameter = crate::scene::block_orientation_parameter::create(
             &mut self.tabs[i].scene.document,
             definition,
             kind,
@@ -64,7 +64,7 @@ impl OpenCADStudio {
         self.refresh_properties();
         self.command_line
             .push_output(crate::tf!("{} parameter placed.", crate::t!(kind.name())).as_ref());
-        Task::none()
+        self.finish_parameter_set_placement(i, parameter)
     }
 
     pub(in crate::app) fn handle_place_block_distance_parameter(
@@ -107,7 +107,7 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, &format!("{} parameter", kind.name()));
-        crate::scene::block_distance_parameter::create(
+        let parameter = crate::scene::block_distance_parameter::create(
             &mut self.tabs[i].scene.document,
             definition,
             kind,
@@ -124,7 +124,7 @@ impl OpenCADStudio {
         self.refresh_properties();
         self.command_line
             .push_output(crate::tf!("{} parameter placed.", crate::t!(kind.name())).as_ref());
-        Task::none()
+        self.finish_parameter_set_placement(i, parameter)
     }
 
     pub(in crate::app) fn point_parameter_placement_error(&self) -> Option<&'static str> {
@@ -192,7 +192,7 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, "Point parameter");
-        crate::scene::block_point_parameter::create(
+        let parameter = crate::scene::block_point_parameter::create(
             &mut self.tabs[i].scene.document,
             definition,
             codec::types::Vector3::new(location.x, location.y, location.z),
@@ -207,7 +207,7 @@ impl OpenCADStudio {
         self.refresh_properties();
         self.command_line
             .push_output(crate::t!("Point parameter placed.").as_ref());
-        Task::none()
+        self.finish_parameter_set_placement(i, parameter)
     }
 
     pub(in crate::app) fn visibility_placement_error(&self) -> Option<&'static str> {
@@ -247,7 +247,7 @@ impl OpenCADStudio {
         }
         self.push_undo_snapshot(i, "Visibility parameter");
         let document = &mut self.tabs[i].scene.document;
-        visibility::create(
+        let parameter = visibility::create(
             document,
             definition,
             codec::types::Vector3::new(location.x, location.y, location.z),
@@ -261,7 +261,7 @@ impl OpenCADStudio {
         self.command_line.push_output(
             crate::t!("Visibility parameter placed. Use BVSTATE to manage its states.").as_ref(),
         );
-        Task::none()
+        self.finish_parameter_set_placement(i, parameter)
     }
 
     /// The block open in the Block Editor, or an error naming `command`.
@@ -391,19 +391,51 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
         match cmd {
+            cmd if cmd == "BPARAMETERSET" || cmd.starts_with("BPARAMETERSET ") => {
+                let label = cmd.strip_prefix("BPARAMETERSET").unwrap().trim();
+                let Some(set) = crate::modules::block_editor::parameter_set::get(label) else {
+                    self.command_line
+                        .push_error(crate::t!("This Parameter Set is not supported yet.").as_ref());
+                    return Some(Task::none());
+                };
+                if let Some(error) = self.parameter_placement_error(set.parameter) {
+                    self.command_line.push_error(crate::t!(error).as_ref());
+                    return Some(Task::none());
+                }
+                self.tabs[i].pending_parameter_set_follow_up = Some(set.follow_up);
+                Some(self.dispatch_command(&format!("BPARAMETER {}", set.parameter)))
+            }
+            "BACTIONSET" => Some(self.start_block_action_set()),
+            "BASSOCIATE" => Some(self.start_block_action_association()),
+            cmd if cmd == "BACTIONBAR" || cmd.starts_with("BACTIONBAR ") => {
+                Some(self.start_action_bar_command(cmd.strip_prefix("BACTIONBAR").unwrap().trim()))
+            }
             cmd if cmd == "BACTION"
                 || cmd.starts_with("BACTION ")
                 || cmd == "BACTIONTOOL"
-                || cmd.starts_with("BACTIONTOOL ") =>
+                || cmd.starts_with("BACTIONTOOL ")
+                || cmd == "BARRAY"
+                || cmd.starts_with("BARRAY ") =>
             {
                 Some(
-                    self.start_block_action(
-                        cmd.split_once(' ').map_or("", |(_, args)| args.trim()),
-                    ),
+                    self.start_block_action(if cmd == "BARRAY" || cmd.starts_with("BARRAY ") {
+                        "ARRAY"
+                    } else {
+                        cmd.split_once(' ').map_or("", |(_, args)| args.trim())
+                    }),
                 )
             }
             cmd if cmd == "BLOOKUPTABLE" || cmd.starts_with("BLOOKUPTABLE ") => {
                 Some(self.open_lookup_table(cmd.strip_prefix("BLOOKUPTABLE").unwrap().trim()))
+            }
+            cmd if cmd == "BTABLE"
+                || cmd == "BPROPERTIESTABLE"
+                || cmd.starts_with("BPROPERTIESTABLE ") =>
+            {
+                Some(self.open_block_properties_table())
+            }
+            "RESETBLOCK" | "RESETBLOCK APPLY" => {
+                Some(self.reset_selected_block_references(cmd == "RESETBLOCK APPLY"))
             }
             cmd if cmd == "BPARAMETER" || cmd.starts_with("BPARAMETER ") => {
                 let Some(block) = self.visibility_block(i, "BPARAMETER") else {
@@ -583,6 +615,40 @@ impl OpenCADStudio {
                 Some(Task::none())
             }
             _ => None,
+        }
+    }
+
+    pub(in crate::app) fn finish_parameter_set_placement(
+        &mut self,
+        i: usize,
+        parameter: Handle,
+    ) -> Task<Message> {
+        match self.tabs[i].pending_parameter_set_follow_up.take() {
+            Some(follow_up @ ("XY_MOVE_BOX_SET" | "XY_STRETCH_BOX_SET")) => {
+                let kind = if follow_up == "XY_MOVE_BOX_SET" {
+                    crate::scene::block_actions::Kind::Move
+                } else {
+                    crate::scene::block_actions::Kind::Stretch
+                };
+                self.tabs[i].pending_xy_box_set = Some((parameter, kind, 0));
+                self.start_xy_box_set_action(parameter, kind, 0)
+            }
+            Some(follow_up @ ("MOVE_PAIR" | "STRETCH_PAIR")) => {
+                let kind = if follow_up == "MOVE_PAIR" {
+                    crate::scene::block_actions::Kind::Move
+                } else {
+                    crate::scene::block_actions::Kind::Stretch
+                };
+                self.tabs[i].pending_action_pair = Some((parameter, kind, 0));
+                self.start_parameter_pair_action(parameter, kind, 0)
+            }
+            Some(command) if command.starts_with("BACTION ") => self
+                .start_block_action_for_parameter(
+                    command.trim_start_matches("BACTION "),
+                    parameter,
+                ),
+            Some(command) => self.dispatch_command(command),
+            None => Task::none(),
         }
     }
 }

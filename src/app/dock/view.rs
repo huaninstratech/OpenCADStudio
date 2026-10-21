@@ -410,9 +410,20 @@ impl OpenCADStudio {
                     self.visibility_placement_error(),
                     self.point_parameter_placement_error(),
                     self.parameter_placement_error("FLIP"),
-                    self.lookup_table_error(),
+                    if self.block_editor_preferences.action_bars {
+                        Some("Use the Lookup parameter action bar, or set BACTIONBARMODE to 0.")
+                    } else {
+                        self.lookup_table_error()
+                    },
+                    self.properties_table_error(),
                     self.action_error(Some(crate::scene::block_actions::Kind::Move)),
                     self.action_error(Some(crate::scene::block_actions::Kind::Scale)),
+                    self.action_error(Some(crate::scene::block_actions::Kind::Rotate)),
+                    self.action_error(Some(crate::scene::block_actions::Kind::Flip)),
+                    self.action_error(Some(crate::scene::block_actions::Kind::Stretch)),
+                    self.action_error(Some(crate::scene::block_actions::Kind::PolarStretch)),
+                    self.action_error(Some(crate::scene::block_actions::Kind::Array)),
+                    self.parameter_placement_error("LINEAR"),
                 )
             }
             crate::ui::dock::PanelId::BlockPalette => {

@@ -358,7 +358,7 @@ fn segmented<'a, T: Copy + PartialEq + 'a>(
 }
 
 /// A switch shown as a chip: filled with a tick while on.
-fn chip<'a>(label: String, on: bool, message: Message) -> Element<'a, Message> {
+pub(crate) fn chip<'a>(label: String, on: bool, message: Message) -> Element<'a, Message> {
     // The tick is an SVG: the web build's font has no check-mark glyph.
     let mut content = row![].spacing(4).align_y(iced::Center);
     if on {

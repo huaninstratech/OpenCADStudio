@@ -4,6 +4,8 @@
 
 pub mod entity_labels;
 pub mod external;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod grip_points;
 pub mod host;
 pub mod marketplace;
 pub mod registry;
@@ -52,6 +54,14 @@ fn errors() -> &'static std::sync::Mutex<Vec<String>> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn drain_errors() -> Vec<String> {
     std::mem::take(&mut *errors().lock().unwrap())
+}
+
+/// Queue one line for the command-line history from plugin paths that cannot
+/// route through [`guard`] directly (e.g. out-of-process event-delivery
+/// failures). Surfaced by [`drain_errors`] on the next update tick.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn push_guard_error(line: String) {
+    errors().lock().unwrap().push(line);
 }
 
 #[cfg(test)]

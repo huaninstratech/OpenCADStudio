@@ -785,6 +785,8 @@ impl OpenCADStudio {
     /// dangling from the previous `last_point` until the user actually
     /// moves the mouse. See #32.
     pub(in crate::app) fn refresh_active_cmd_preview(&mut self, i: usize) {
+        let perf_preview = crate::perf::enabled();
+        let preview_started = perf_preview.then(Instant::now);
         if self.tabs[i].active_cmd.is_none() {
             return;
         }
@@ -798,17 +800,43 @@ impl OpenCADStudio {
             }
         }
         let cur = self.tabs[i].last_cursor_world;
+        let compute_started = perf_preview.then(Instant::now);
         let tab = &mut self.tabs[i];
+        // Selection-hover previews are maintained by the viewport move path.
+        // A generic command refresh (for example SnapDwellTick) has no hovered
+        // entity and would replace MATCHPROP's persistent source glow with an
+        // empty rubber-band. Preserve the current overlay; seed the source glow
+        // only if phase 2 began before any move had produced one.
+        let selection_hover_preview = tab
+            .active_cmd
+            .as_ref()
+            .is_some_and(|command| command.selection_hover_preview_enabled());
+        if selection_hover_preview {
+            if tab.scene.preview_wires.is_empty() {
+                if let Some(preview) = tab
+                    .active_cmd
+                    .as_ref()
+                    .and_then(|command| command.selection_hover_preview(&tab.scene, None))
+                {
+                    tab.scene.set_command_preview_hatches(preview.hatches);
+                    tab.scene.set_preview_wires(preview.wires);
+                }
+            }
+            return;
+        }
         let previews = tab
             .active_cmd
             .as_mut()
             .map(|c| {
                 let mut wires = c.on_preview_wires(cur);
+                wires.extend(c.persistent_preview_wires());
                 let entities = c.preview_entities(&tab.scene.document, cur);
                 wires.extend(tab.scene.wires_for_entities(&entities));
                 wires
             })
             .unwrap_or_default();
+        let preview_count = previews.len();
+        let compute_ms = crate::perf::elapsed_ms(compute_started);
         let preview_hidden = self.tabs[i]
             .active_cmd
             .as_ref()
@@ -818,6 +846,12 @@ impl OpenCADStudio {
             .scene
             .set_command_preview_hidden(&preview_hidden);
         self.tabs[i].scene.set_preview_wires(previews);
+        let total_ms = crate::perf::elapsed_ms(preview_started);
+        if total_ms >= 1.0 || compute_ms >= 1.0 {
+            crate::perf_record!(
+                "[perf] command-preview total={total_ms:.2}ms compute={compute_ms:.2}ms wires={preview_count}",
+            );
+        }
     }
 }
 

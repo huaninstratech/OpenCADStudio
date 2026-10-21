@@ -4,11 +4,14 @@ use super::*;
 impl Scene {
     /// Collect model-space wires projected into paper space for all (or one specific)
     /// user viewports.  `only_vp = Some(h)` restricts output to that viewport.
+    /// `plot` adds the edges of 3-D meshes, which the screen draws on the GPU
+    /// and the plot must draw as wires; such a set is not cached.
     pub(super) fn viewport_content_wires(
         &self,
         paper_block: Handle,
         only_vp: Option<Handle>,
         exclude_vp: Option<Handle>,
+        plot: bool,
     ) -> Vec<WireModel> {
         use codec::entities::Viewport;
 
@@ -37,7 +40,7 @@ impl Scene {
             let vp_handle = vp.common.handle;
 
             // ── Fast path: return cached projected wires ──────────────────
-            {
+            if !plot {
                 let cache = self.paper_projected_cache.borrow();
                 if let Some((cached_epoch, ref wires)) = cache.get(&vp_handle) {
                     if *cached_epoch == self.geometry_epoch {
@@ -84,7 +87,14 @@ impl Scene {
             // path wants the full-fidelity (no-LOD-stub) wire list,
             // regardless of paper zoom.
             let model_wires = self.model_wires_for_viewport_arc(vp_handle, 0.0);
-            let model_wires = crate::scene::model::instance_model::expand_stubs(&model_wires);
+            let mut model_wires = crate::scene::model::instance_model::expand_stubs(&model_wires);
+            if plot {
+                let frozen: HashSet<Handle> = vp.frozen_layers.iter().copied().collect();
+                let meshes = self.meshes_for_viewport(vp_handle, &frozen);
+                let view = (cam_frame.rotation * glam::Vec3::Z).as_dvec3().to_array();
+                let mesh_wires = self.mesh_plot_wires(&meshes, view, Some(vp_handle));
+                model_wires.to_mut().extend(mesh_wires);
+            }
 
             // ── Project and clip wires into viewport ──────────────────────
             let vp_x0 = pcx - hw;
@@ -216,6 +226,36 @@ impl Scene {
                     .collect::<Vec<_>>()
                 };
 
+                // Fills (2-D solids, wide and thickened polyline bands, 3-D
+                // faces) project triangle by triangle and are clipped to the
+                // viewport; the clipped convex polygon is re-fanned.
+                let mut projected_fill: Vec<[f32; 3]> = Vec::new();
+                for (ti, tri) in wire.fill_tris.chunks_exact(3).enumerate() {
+                    let corner = |k: usize| {
+                        let low = wire.fill_tris_low.get(ti * 3 + k).copied();
+                        let low = low.unwrap_or([0.0; 3]);
+                        let p = proj_abs(
+                            tri[k][0] as f64 + low[0] as f64,
+                            tri[k][1] as f64 + low[1] as f64,
+                            tri[k][2] as f64 + low[2] as f64,
+                        );
+                        [p[0], p[1]]
+                    };
+                    let corners = [corner(0), corner(1), corner(2)];
+                    if corners
+                        .iter()
+                        .any(|p| !p[0].is_finite() || !p[1].is_finite())
+                    {
+                        continue;
+                    }
+                    let clipped = clip_polygon_to_rect(&corners, vp_x0, vp_y0, vp_x1, vp_y1);
+                    for k in 1..clipped.len().saturating_sub(1) {
+                        for p in [clipped[0], clipped[k], clipped[k + 1]] {
+                            projected_fill.push([p[0], p[1], pcz]);
+                        }
+                    }
+                }
+
                 // Fast AABB pre-reject.
                 let any_near = projected_pts.iter().any(|&[x, y, _]| {
                     x.is_finite()
@@ -242,7 +282,8 @@ impl Scene {
                 // A text-only wire (TEXT / MTEXT carry no stroke `points` since
                 // text went SDF-only) has nothing to pre-reject on, so gate both
                 // rejections on the glyphs too or it never reaches the sheet.
-                if !any_near && !aabb_hits && projected_text.is_empty() {
+                if !any_near && !aabb_hits && projected_text.is_empty() && projected_fill.is_empty()
+                {
                     continue;
                 }
 
@@ -257,7 +298,7 @@ impl Scene {
                     vp_y1,
                     pcz,
                 );
-                if clipped.is_empty() && projected_text.is_empty() {
+                if clipped.is_empty() && projected_text.is_empty() && projected_fill.is_empty() {
                     continue;
                 }
 
@@ -275,10 +316,12 @@ impl Scene {
                     pmxx = pmxx.max(x);
                     pmxy = pmxy.max(y);
                 }
-                // Glyphs count towards the paper AABB as well — a text-only wire
-                // would otherwise stay UNBOUNDED and never pick.
-                for v in &projected_text {
-                    let (x, y) = (v.pos[0] + v.pos_low[0], v.pos[1] + v.pos_low[1]);
+                // Glyphs and fills count towards the paper AABB as well — a
+                // text-only wire would otherwise stay UNBOUNDED and never pick.
+                let glyphs = projected_text
+                    .iter()
+                    .map(|v| (v.pos[0] + v.pos_low[0], v.pos[1] + v.pos_low[1]));
+                for (x, y) in glyphs.chain(projected_fill.iter().map(|p| (p[0], p[1]))) {
                     if x.is_finite() && y.is_finite() {
                         pmnx = pmnx.min(x);
                         pmny = pmny.min(y);
@@ -347,6 +390,8 @@ impl Scene {
                     out.pattern_stations.clear();
                 }
                 out.text_verts = projected_text;
+                out.fill_tris = projected_fill;
+                out.fill_tris_low = Vec::new();
                 // Searchable runs ride the same projection through the shared
                 // helper (origin map + height/advance scale), then cull by
                 // run-rect overlap — a run straddling the viewport edge is
@@ -411,9 +456,11 @@ impl Scene {
             }
 
             // Store in cache, then extend result.
-            self.paper_projected_cache
-                .borrow_mut()
-                .insert(vp_handle, (self.geometry_epoch, projected.clone()));
+            if !plot {
+                self.paper_projected_cache
+                    .borrow_mut()
+                    .insert(vp_handle, (self.geometry_epoch, projected.clone()));
+            }
             result.extend(projected);
         }
 
@@ -729,6 +776,103 @@ impl Scene {
     /// because their normal tessellation is a `Contour`, not `Lines`.
     pub(crate) fn clip_boundary_polygon(&self, handle: Handle, z: f32) -> Vec<[f32; 3]> {
         clip_boundary_polygon_for_document(&self.document, handle, z)
+    }
+
+    /// Plot wires for 3-D solids, surfaces and regions, which draw on screen as
+    /// GPU meshes and so are absent from the wire set: their feature edges
+    /// (triangle edges when a mesh has none) plus the silhouettes seen along
+    /// `view`, in absolute WCS, coloured and weighted like their entity.
+    pub(crate) fn mesh_plot_wires(
+        &self,
+        meshes: &[MeshLodSet],
+        view: [f64; 3],
+        viewport: Option<Handle>,
+    ) -> Vec<WireModel> {
+        use codec::types::Vector3;
+        let mut wires = Vec::new();
+        for set in meshes {
+            let Some(handle) = set.entity_handle() else {
+                continue;
+            };
+            let place = |p: [f64; 3]| -> [f64; 3] {
+                set.instance_transform.map_or(p, |xform| {
+                    let q = xform.apply(Vector3::new(p[0], p[1], p[2]));
+                    [q.x, q.y, q.z]
+                })
+            };
+            let ds = |high: [f32; 3], low: Option<&[f32; 3]>| -> [f64; 3] {
+                let low = low.copied().unwrap_or([0.0; 3]);
+                std::array::from_fn(|i| high[i] as f64 + low[i] as f64)
+            };
+            let mut points: Vec<[f64; 3]> = Vec::new();
+            let mut segment = |a: [f64; 3], b: [f64; 3]| {
+                points.extend([place(a), place(b), [f64::NAN; 3]]);
+            };
+            let (edges, edges_low) = set.geometry_edges();
+            if edges.len() >= 2 {
+                for (i, pair) in edges.chunks_exact(2).enumerate() {
+                    let a = ds(pair[0], edges_low.get(2 * i));
+                    let b = ds(pair[1], edges_low.get(2 * i + 1));
+                    segment(a, b);
+                }
+            } else if let Some(mesh) = set.geometry_lods().first() {
+                let vertex = |i: u32| {
+                    let i = i as usize;
+                    ds(mesh.verts[i], mesh.verts_low.get(i))
+                };
+                for tri in mesh.indices.chunks_exact(3) {
+                    for k in 0..3 {
+                        segment(vertex(tri[k]), vertex(tri[(k + 1) % 3]));
+                    }
+                }
+            }
+            // Silhouettes of curved faces depend on the view, so they are not
+            // in the edge list: a cylinder seen side-on needs its two outlines.
+            let generators = set
+                .instance_source
+                .as_ref()
+                .map_or(set.curved_gens.as_slice(), |source| {
+                    source.curved_gens.as_slice()
+                });
+            for generator in generators {
+                // A block instance's source is block-local: place it first, so
+                // the contour is taken against the world view direction.
+                let placed = set.instance_transform.and_then(|xform| {
+                    let origin = xform.apply(Vector3::ZERO);
+                    let axes = [Vector3::UNIT_X, Vector3::UNIT_Y, Vector3::UNIT_Z]
+                        .map(|axis| xform.apply_rotation(axis))
+                        .map(|v| [v.x, v.y, v.z]);
+                    kernel::brep::mesh::transform_silhouette_affine(
+                        &generator.source,
+                        axes,
+                        [origin.x, origin.y, origin.z],
+                    )
+                });
+                if set.instance_transform.is_some() && placed.is_none() {
+                    continue;
+                }
+                let source = placed.as_ref().unwrap_or(&generator.source);
+                for pair in kernel::brep::mesh::silhouette(source, view).chunks_exact(2) {
+                    points.extend([pair[0], pair[1], [f64::NAN; 3]]);
+                }
+            }
+            if points.is_empty() {
+                continue;
+            }
+            let color = set.display_color().unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let mut wire = WireModel::solid_f64(handle.value().to_string(), points, color, false);
+            if let Some(entity) = self.document.get_entity(handle) {
+                wire.line_weight_px =
+                    view::render::render_style_for_viewport(&self.document, entity, viewport).3;
+                wire.plot_visible = self
+                    .document
+                    .layers
+                    .get(&entity.common().layer)
+                    .is_none_or(|layer| layer.is_plottable);
+            }
+            wires.push(wire);
+        }
+        wires
     }
 }
 

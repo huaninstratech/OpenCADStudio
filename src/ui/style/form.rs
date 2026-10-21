@@ -96,6 +96,19 @@ pub fn button_style(accent: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 /// Text field: base background, neutral border that turns primary on focus.
 pub fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    field_style_with_radius(theme, status, 3.0)
+}
+
+/// Shared text-field styling with a caller-selected corner radius.
+///
+/// The default dialog radius is 3px. A small number of compact dialogs use
+/// 4px; they can preserve that visual choice without duplicating the palette
+/// and focus-border logic.
+pub fn field_style_with_radius(
+    theme: &Theme,
+    status: text_input::Status,
+    radius: f32,
+) -> text_input::Style {
     let palette = theme.palette();
     let border = match status {
         text_input::Status::Focused { .. } => palette.primary.base.color,
@@ -106,7 +119,7 @@ pub fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Sty
         border: Border {
             color: border,
             width: 1.0,
-            radius: 3.0.into(),
+            radius: radius.into(),
         },
         icon: palette.background.base.text,
         placeholder: palette.background.base.text.scale_alpha(0.48),

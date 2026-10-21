@@ -30,9 +30,11 @@ const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// changes, so schema drift (new params, renamed tools) is always a conscious,
 /// reviewed edit — and clients can detect a stale bridge by comparing digests.
 ///
-/// `block_delete` gained its optional `force` parameter.
+/// `block_delete` gained its optional `force` parameter. With API v11
+/// `grip_drag` became optional-`handle` (built-in entity grips) plus optional
+/// `plugin` (dragging a plugin-declared custom grip, routed to its owner).
 #[cfg(test)]
-const TOOL_SCHEMA_DIGEST: &str = "d15005e14fc00154501db5d261cb9febae1bcc61f6d9b850e91b7fd1879c3b8e";
+const TOOL_SCHEMA_DIGEST: &str = "91c033e86dce097b581c87f1066bcd4d43dbbe34f6acec62995820afacb8f82e";
 const MAX_REQUEST: usize = 1_048_576;
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 3_600_000;
@@ -724,6 +726,10 @@ fn exchange(
         timeout,
     )
     .map_err(CallError::infra)?;
+    // One request line in, one reply line out: Nagle + the GUI's delayed ACK
+    // would hold every reply's tail segment for ~200 ms per round. Matches
+    // the GUI-side set_nodelay on the accepted stream (control/transport).
+    let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(timeout))
         .map_err(CallError::infra)?;
@@ -3100,7 +3106,14 @@ pub fn run() {
             }
         };
         if let Some(response) = response {
-            if writeln!(output, "{response}")
+            // Serialize once: write_fmt on a Value Display streams every
+            // JSON token through the (line-buffered) stdout lock as its own
+            // write, so big replies pay hundreds of pipe writes. One String
+            // + one write_all produces the identical bytes.
+            let mut response_line = response.to_string();
+            response_line.push('\n');
+            if output
+                .write_all(response_line.as_bytes())
                 .and_then(|_| output.flush())
                 .is_err()
             {

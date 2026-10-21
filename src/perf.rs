@@ -5,12 +5,14 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-const MAX_LINES: usize = 500;
+const MAX_LINES: usize = 2_000;
 
 static UI_ENABLED: AtomicBool = AtomicBool::new(false);
 static ENV_ENABLED: OnceLock<bool> = OnceLock::new();
 static LINES: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 static POINTER_MOVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LAST_POINTER_MOVE: Mutex<Option<iced::time::Instant>> = Mutex::new(None);
+static FIRST_POINTER_MOVE: Mutex<Option<iced::time::Instant>> = Mutex::new(None);
 static SCROLL_ZOOMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static UPDATE_TIME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_FRAME_INSTANT: Mutex<Option<iced::time::Instant>> = Mutex::new(None);
@@ -25,8 +27,19 @@ fn lines() -> &'static Mutex<VecDeque<String>> {
 /// Record a pointer move event received in update.
 pub fn note_pointer_move() {
     if enabled() {
+        let now = iced::time::Instant::now();
         POINTER_MOVES.fetch_add(1, Ordering::Relaxed);
+        *LAST_POINTER_MOVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        let mut first = FIRST_POINTER_MOVE.lock().unwrap_or_else(|e| e.into_inner());
+        if first.is_none() {
+            *first = Some(now);
+        }
     }
+}
+
+/// Whether pointer movement is waiting to be attributed to the next rendered frame.
+pub fn has_pending_pointer_moves() -> bool {
+    POINTER_MOVES.load(Ordering::Relaxed) > 0
 }
 
 /// Record a zoom event received in update.
@@ -70,6 +83,24 @@ pub fn note_frame_render(encode_ms: f64) {
         return;
     }
     let moves = POINTER_MOVES.swap(0, Ordering::Relaxed);
+    let input_to_render_ms = if moves > 0 {
+        LAST_POINTER_MOVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|last_move| last_move.elapsed().as_secs_f64() * 1000.0)
+    } else {
+        None
+    };
+    let oldest_input_to_render_ms = if moves > 0 {
+        FIRST_POINTER_MOVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|first_move| first_move.elapsed().as_secs_f64() * 1000.0)
+    } else {
+        None
+    };
     let zooms = SCROLL_ZOOMS.swap(0, Ordering::Relaxed);
     let update_us = UPDATE_TIME_US.swap(0, Ordering::Relaxed);
     let mut guard = LAST_FRAME_INSTANT.lock().unwrap_or_else(|e| e.into_inner());
@@ -78,10 +109,28 @@ pub fn note_frame_render(encode_ms: f64) {
     if let Some(prev) = prev {
         let interval_ms = (now - prev).as_secs_f64() * 1000.0;
         let update_ms = update_us as f64 / 1000.0;
-        record(format_args!(
-            "[perf] frame-interval {:>7.1}ms moves_batched={:<3} zooms={:<2} update_batch={:.2}ms encode={:.2}ms",
-            interval_ms, moves, zooms, update_ms, encode_ms
-        ));
+        // Idle high-refresh rendering can produce hundreds of samples per second
+        // and evict the pointer measurements before the user copies the trace.
+        // Frame cadence is useful here only when it contains input activity.
+        if moves > 0 || zooms > 0 {
+            record(format_args!(
+                "[perf] frame-interval {:>7.1}ms moves_batched={:<3} zooms={:<2} update_batch={:.2}ms encode={:.2}ms",
+                interval_ms, moves, zooms, update_ms, encode_ms
+            ));
+        }
+    }
+    if let Some(latency_ms) = input_to_render_ms {
+        if let Some(oldest_ms) = oldest_input_to_render_ms {
+            record(format_args!(
+                "[perf] input-to-render {:>6.2}ms moves_batched={moves} oldest_input={oldest_ms:.2}ms",
+                latency_ms
+            ));
+        } else {
+            record(format_args!(
+                "[perf] input-to-render {:>6.2}ms moves_batched={moves}",
+                latency_ms
+            ));
+        }
     }
 }
 

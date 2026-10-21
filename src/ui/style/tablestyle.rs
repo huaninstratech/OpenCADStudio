@@ -332,6 +332,7 @@ fn input_row<'a>(
         text(label).size(11).style(muted_style).width(155),
         text_input(placeholder, value)
             .on_input(message)
+            .style(crate::ui::style::form::field_style)
             .size(11)
             .width(170),
     ]

@@ -435,6 +435,11 @@ pub(crate) fn reframe(
                 }
                 _ => continue,
             };
+            super::block_actions::reframe_value(
+                &mut native.parameter.element.eval,
+                native.definition_end_point.z,
+                transform,
+            );
             native.definition_base_point = transform.apply(native.definition_base_point);
             native.definition_end_point = transform.apply(native.definition_end_point);
             for point in [

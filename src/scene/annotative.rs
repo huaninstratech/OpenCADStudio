@@ -2015,29 +2015,7 @@ pub fn block_is_annotative(doc: &CadDocument, name: &str) -> bool {
 
 /// Whether an entity participates in annotation scaling.
 pub fn is_annotative(doc: &CadDocument, entity: &EntityType) -> bool {
-    // Per-object annotation context (works regardless of style).
-    if has_context_manager(doc, entity.common()) {
-        return true;
-    }
-    // Legacy annotative XDATA markers.
-    let xd = &entity.common().extended_data;
-    let standard_marker = xd
-        .get_record("AcadAnnotative")
-        .and_then(|record| {
-            record
-                .values
-                .iter()
-                .filter_map(|value| match value {
-                    codec::xdata::XDataValue::Integer16(value) => Some(*value),
-                    _ => None,
-                })
-                .last()
-        })
-        .is_some_and(|value| value != 0);
-    if standard_marker
-        || xd.get_record("AcAnnoPO").is_some()
-        || xd.get_record("AcAnnotativeData").is_some()
-    {
+    if object_is_annotative(doc, entity.common()) {
         return true;
     }
     // Annotative via the entity's own flag.
@@ -2051,4 +2029,31 @@ pub fn is_annotative(doc: &CadDocument, entity: &EntityType) -> bool {
         EntityType::MultiLeader(ml) => mleader_is_annotative(doc, ml),
         _ => false,
     }
+}
+
+/// Whether an object carries its own annotative state: a per-object
+/// annotation context or an annotative XDATA marker. Its style does not count.
+pub fn object_is_annotative(doc: &CadDocument, common: &EntityCommon) -> bool {
+    // Per-object annotation context (works regardless of style).
+    if has_context_manager(doc, common) {
+        return true;
+    }
+    // Legacy annotative XDATA markers.
+    let xd = &common.extended_data;
+    let standard_marker = xd
+        .get_record("AcadAnnotative")
+        .and_then(|record| {
+            record
+                .values
+                .iter()
+                .filter_map(|value| match value {
+                    codec::xdata::XDataValue::Integer16(value) => Some(*value),
+                    _ => None,
+                })
+                .last()
+        })
+        .is_some_and(|value| value != 0);
+    standard_marker
+        || xd.get_record("AcAnnoPO").is_some()
+        || xd.get_record("AcAnnotativeData").is_some()
 }

@@ -53,6 +53,54 @@ pub struct StatusMenuData<'a> {
     pub tooltip_hidden: bool,
 }
 
+/// Drawing/layout inputs used to build the status bar's layout and scale controls.
+pub struct StatusBarLayoutState<'a> {
+    pub layouts: Arc<Vec<String>>,
+    pub block_tabs: Vec<String>,
+    pub current_layout: &'a str,
+    pub active_block: Option<String>,
+    pub is_start: bool,
+    pub rename_state: Option<&'a (String, String)>,
+    pub viewport_scale: Option<f64>,
+    pub viewport_count: usize,
+    pub in_mspace: bool,
+    pub show_layout_tabs: bool,
+    pub annotation_scale: f32,
+    pub scale_pill_enabled: bool,
+    pub annotation_all_visible: bool,
+    pub annotation_auto_add: bool,
+    pub viewport_scale_synced: Option<bool>,
+    /// Display lock of the entered or selected viewports, `None` without one.
+    pub viewport_locked: Option<bool>,
+    pub lineweight_display: bool,
+}
+
+/// Drafting modes and document settings represented by status bar controls.
+pub struct StatusBarModes {
+    pub ortho_mode: bool,
+    pub polar_mode: bool,
+    pub polar_increment_deg: f32,
+    pub dyn_input: bool,
+    pub otrack: bool,
+    pub isometric_drafting: bool,
+    pub iso_plane: crate::app::settings::IsoPlane,
+    pub clean_screen: bool,
+    pub linear_format: i16,
+    pub isolation_active: bool,
+    pub transparency_display: bool,
+    pub quick_properties: bool,
+    pub selection_filter_active: bool,
+    pub selection_cycling: bool,
+}
+
+/// Cursor coordinate readout inputs.
+pub struct StatusBarReadout {
+    pub cursor_world: glam::DVec3,
+    pub coords_mode: i16,
+    pub last_point: Option<glam::DVec3>,
+    pub picking: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct StatusBar {
     #[allow(dead_code)]
@@ -69,64 +117,13 @@ impl StatusBar {
     pub fn view<'a>(
         &'a self,
         snapper: &'a Snapper,
-        ortho_mode: bool,
-        polar_mode: bool,
-        polar_increment_deg: f32,
-        dyn_input: bool,
-        otrack: bool,
-        isometric_drafting: bool,
-        iso_plane: crate::app::settings::IsoPlane,
-        layouts: Arc<Vec<String>>,
-        block_tabs: Vec<String>,
-        current_layout: &'a str,
-        active_block: Option<String>,
-        // Start/welcome view has no drawing to own layouts.
-        is_start: bool,
-        // If `Some((original, edit_value))`, the named tab shows a text input.
-        rename_state: Option<&'a (String, String)>,
-        // Scale of the first user viewport in the active paper layout.
-        viewport_scale: Option<f64>,
-        // Number of user viewports in the current paper layout (0 = model space).
-        viewport_count: usize,
-        // True when the user is editing inside a paper-space viewport (MSPACE).
-        in_mspace: bool,
-        // Whether the layout tabs (Model/Paper) are visible (LAYOUTTAB).
-        show_layout_tabs: bool,
-        // Current annotation scale for model space (1.0 = 1:1, 50.0 = 1:50, etc.).
-        annotation_scale: f32,
+        layout: StatusBarLayoutState<'a>,
+        modes: StatusBarModes,
+        readout: StatusBarReadout,
+        // Fork: IFC selection level feeding the select-level pill (upstream has no IFC).
         ifc_select_level: crate::app::IfcSelectLevel,
-        // True when the scale pill is interactive (always model space; paper space only when a viewport is active/selected).
-        scale_pill_enabled: bool,
-        annotation_all_visible: bool,
-        annotation_auto_add: bool,
-        // True when the annotation scale applies to model-space display.
+        // Fork: whether the annotation scale applies to model-space display.
         annotation_scale_modelspace: bool,
-        viewport_scale_synced: Option<bool>,
-        // LWDISPLAY header flag — controls lineweight visibility in the viewport.
-        lineweight_display: bool,
-        // Live cursor position in model coordinates, for the coordinate readout.
-        cursor_world: glam::DVec3,
-        // $COORDS readout mode: 0 = static (updates only on a pick), 1 = live
-        // absolute, 2 = polar (distance<angle from the last point while picking).
-        coords_mode: i16,
-        // The last committed point, for the static (0) and polar (2) readouts.
-        last_point: Option<glam::DVec3>,
-        // True while a command is prompting for a point (enables the polar readout).
-        picking: bool,
-        // True while clean-screen mode hides the ribbon and side panels.
-        clean_screen: bool,
-        // LUNITS — how lengths are written, for the units pill.
-        linear_format: i16,
-        // True when objects are hidden by Isolate / Hide.
-        isolation_active: bool,
-        // Whether entity transparency is shown (Transparency pill state).
-        transparency_display: bool,
-        // Whether the Quick Properties floating panel is enabled.
-        quick_properties: bool,
-        // True when the selection filter is excluding at least one type.
-        selection_filter_active: bool,
-        // Whether selection cycling is enabled.
-        selection_cycling: bool,
         // Which pills the user has chosen to show on the bar.
         config: &'a StatusBarConfig,
         menu_data: StatusMenuData<'a>,
@@ -144,6 +141,47 @@ impl StatusBar {
         gpu_status: &'a crate::scene::pipeline::GpuStatus,
         spacemouse: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
+        let StatusBarLayoutState {
+            layouts,
+            block_tabs,
+            current_layout,
+            active_block,
+            is_start,
+            rename_state,
+            viewport_scale,
+            viewport_count,
+            in_mspace,
+            show_layout_tabs,
+            annotation_scale,
+            scale_pill_enabled,
+            annotation_all_visible,
+            annotation_auto_add,
+            viewport_scale_synced,
+            viewport_locked,
+            lineweight_display,
+        } = layout;
+        let StatusBarModes {
+            ortho_mode,
+            polar_mode,
+            polar_increment_deg,
+            dyn_input,
+            otrack,
+            isometric_drafting,
+            iso_plane,
+            clean_screen,
+            linear_format,
+            isolation_active,
+            transparency_display,
+            quick_properties,
+            selection_filter_active,
+            selection_cycling,
+        } = modes;
+        let StatusBarReadout {
+            cursor_world,
+            coords_mode,
+            last_point,
+            picking,
+        } = readout;
         let StatusMenuData {
             layout_names,
             polar_custom_input,
@@ -445,6 +483,17 @@ impl StatusBar {
                             Message::SyncViewportAnnotationScale,
                         ),
                         t!("Viewport / Annotation Scale Sync"),
+                    )
+                    .into(),
+                );
+            }
+        }
+        if vis(StatusPill::VpLock) {
+            if let Some(locked) = viewport_locked {
+                pills.push(
+                    tip(
+                        toggle_pill(crate::ui::icons::LOCK, locked, Message::ToggleViewportLock),
+                        t!("Lock/Unlock Viewport"),
                     )
                     .into(),
                 );

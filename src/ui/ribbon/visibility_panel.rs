@@ -2,7 +2,7 @@
 use iced::widget::{button, column, container, pick_list, row, text, tooltip};
 use iced::{Element, Fill, Theme};
 
-use super::collapse::Panel;
+use super::collapse::{Level, Panel};
 use super::widgets::{make_icon, tool_btn_style, LARGE_ICON, LARGE_W, SMALL_ICON, TOOL_BAR_H};
 use crate::app::Message;
 use crate::modules::IconKind;
@@ -152,14 +152,11 @@ fn collapsed(tight: bool) -> Element<'static, Message> {
     .into()
 }
 
-pub(super) fn panel(context: Option<RibbonContext>) -> Panel<'static> {
-    Panel {
-        id: "Visibility".into(),
-        elements: [
-            view(context.clone(), false),
-            view(context, true),
-            collapsed(false),
-            collapsed(true),
-        ],
-    }
+pub(super) fn panel<'a>(context: Option<RibbonContext>) -> Panel<'a> {
+    Panel::deferred("Visibility", move |level| match level {
+        Level::Full => view(context.clone(), false),
+        Level::Compact => view(context.clone(), true),
+        Level::Collapsed => collapsed(false),
+        Level::Tight => collapsed(true),
+    })
 }

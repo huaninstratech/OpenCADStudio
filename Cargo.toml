@@ -1,6 +1,8 @@
 [package]
 name = "OpenCADStudio"
+
 version = "2026.51.1"
+
 edition = "2021"
 build = "build.rs"
 default-run = "OpenCADStudio"
@@ -37,10 +39,10 @@ rfd = "0.17"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-codec = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "cf3a040", features = ["serde"] }
-kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "2659c33", features = ["acis", "offset"] }
-kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "2659c33" }
-graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "800878a" }
+codec = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "14fdae5", features = ["serde"] }
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "9e4e24a", features = ["acis", "offset"] }
+kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "9e4e24a" }
+graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "373d1fd" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 # Shared SAVE serialization dispatch + web-worker wire format: one
 # implementation for the inline (fallback/native) path and the worker path.
@@ -75,6 +77,9 @@ rust-embed = "8"
 inventory = "0.3"
 rustc-hash = "2"
 sha2 = "0.10"
+# Encrypted PDF owner-password checks (already in the tree through other crates).
+md-5 = "0.10"
+aes = "0.8"
 fontdb = "0.23"
 ttf-parser = "0.25"
 # TrueType interpreter for hint-reliant ("tricky") fonts such as DFKai-SB and
@@ -213,6 +218,10 @@ strip = true
 
 [[bench]]
 name = "performance_benchmarks"
+harness = false
+
+[[bench]]
+name = "ribbon_layout_benchmark"
 harness = false
 
 [[bench]]

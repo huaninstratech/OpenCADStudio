@@ -3,10 +3,11 @@
 use crate::app::{Message, StyleKind};
 use crate::t;
 use crate::ui::style::common::muted_style;
+use crate::ui::style::form::field_style;
 use iced::widget::{
     button, canvas, checkbox, column, container, row, scrollable, text, text_input,
 };
-use iced::{mouse, Background, Border, Element, Length, Point, Rectangle, Theme};
+use iced::{mouse, Background, Element, Length, Point, Rectangle, Theme};
 use std::borrow::Cow;
 
 pub struct TextStyleView<'a> {
@@ -42,26 +43,6 @@ const BUILTIN_FONTS: &[&str] = &[
 fn primary_style(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
         color: Some(theme.palette().primary.base.color),
-    }
-}
-
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: if matches!(status, text_input::Status::Focused { .. }) {
-                palette.primary.base.color
-            } else {
-                palette.background.neutral.color
-            },
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
     }
 }
 

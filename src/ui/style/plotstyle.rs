@@ -3,7 +3,7 @@
 use crate::app::Message;
 use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::{hdivider, vsep};
+use crate::ui::style::form::{field_style, hdivider, vsep};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Background, Border, Element, Theme};
 use std::borrow::Cow;
@@ -59,26 +59,6 @@ fn btn_s(accent: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
             },
             ..Default::default()
         }
-    }
-}
-
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    let border = match status {
-        text_input::Status::Focused { .. } => palette.primary.base.color,
-        _ => palette.background.neutral.color,
-    };
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
     }
 }
 

@@ -91,9 +91,9 @@ Sovellus on allekirjoitettu ad hoc -allekirjoituksella, mutta Apple ei ole täll
 
 ## Kielet
 
-Open CAD Studio voi seurata järjestelmän kieltä tai käyttää jotakin näistä 22 käyttöliittymäkielestä:
+Open CAD Studio voi seurata järjestelmän kieltä tai käyttää jotakin näistä 23 käyttöliittymäkielestä:
 
-> Arabia · Brasilianportugali · Bulgaria · Tšekki · Hollanti · Englanti · Suomi · Ranska · Saksa · Kreikka · Hindi · Unkari · Italia · Japani · Korea · Lao · Puola · Venäjä · Yksinkertaistettu kiina · Espanja · Perinteinen kiina · Turkki
+> Arabia · Brasilianportugali · Bulgaria · Tšekki · Hollanti · Englanti · Suomi · Ranska · Saksa · Kreikka · Hindi · Unkari · Italia · Japani · Korea · Lao · Puola · Venäjä · Yksinkertaistettu kiina · Espanja · Perinteinen kiina · Turkki · Vietnam
 
 Vaihda kieli sovelluksen asetuksissa. Selainversio käyttää myös selaimen ensisijaista kielialuetta, kun **Järjestelmä** on valittu.
 

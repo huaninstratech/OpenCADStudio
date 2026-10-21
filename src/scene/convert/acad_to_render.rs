@@ -41,6 +41,32 @@ pub struct TextPlane {
     pub y_axis: [f64; 3],
 }
 
+/// The plane a run lies in when its entity's normal is not the drawing's
+/// Z axis: the run's origin (in the entity's object coordinates, at
+/// elevation `z`) and the object system's X and Y axes, in world space.
+/// `None` for a run in the XY plane, which is drawn as it is.
+pub fn ocs_text_plane(
+    normal: codec::types::Vector3,
+    origin: [f64; 2],
+    z: f64,
+) -> Option<TextPlane> {
+    if normal.x.abs() < 1e-12 && normal.y.abs() < 1e-12 && normal.z > 0.0 {
+        return None;
+    }
+    let m = codec::types::Matrix3::arbitrary_axis(normal);
+    let world = |v: codec::types::Vector3| {
+        let w = m * v;
+        [w.x, w.y, w.z]
+    };
+    let at = world(codec::types::Vector3::new(origin[0], origin[1], z));
+    Some(TextPlane {
+        origin: at,
+        scale_origin: at,
+        x_axis: world(codec::types::Vector3::new(1.0, 0.0, 0.0)),
+        y_axis: world(codec::types::Vector3::new(0.0, 1.0, 0.0)),
+    })
+}
+
 /// Per-run text-layout inputs needed to reproduce a run as SDF glyph quads.
 #[derive(Clone, Debug)]
 pub struct GlyphRun {

@@ -27,6 +27,17 @@ pub(crate) struct V4Connection {
     call_lock: Mutex<()>,
     next_id: AtomicU64,
     reader_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Identity of the plugin process on this connection. Served requests
+    /// attach it (custom-grip declarations key on it); empty until the
+    /// manifest is read, where no grip traffic can exist.
+    plugin_id: Mutex<String>,
+    /// Ids of custom-grip move requests issued without waiting (the coalescing
+    /// path, API v11): at most one per drag is ever in this set.
+    grip_moves_in_flight: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// Responses that arrived for requests nobody is waiting on (a grip move
+    /// answered between polls, or a late frame while another call runs).
+    /// Consumed first by the next [`V4Connection::call`], so no frame is lost.
+    deferred_responses: Mutex<VecDeque<(u64, HostResponse)>>,
 }
 
 impl V4Connection {
@@ -69,11 +80,19 @@ impl V4Connection {
             call_lock: Mutex::new(()),
             next_id: AtomicU64::new(1),
             reader_handle: Mutex::new(Some(handle)),
+            plugin_id: Mutex::new(String::new()),
+            grip_moves_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            deferred_responses: Mutex::new(VecDeque::new()),
         })
     }
 
     pub fn is_alive(&self) -> bool {
         self.shared.alive.load(Ordering::SeqCst)
+    }
+
+    /// Fix this connection's plugin identity once the manifest is read.
+    pub fn attach_plugin_id(&self, id: &str) {
+        *self.plugin_id.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string();
     }
 
     /// Send a host-to-plugin notification.
@@ -113,6 +132,20 @@ impl V4Connection {
         let timeout = request_timeout(kind);
         let deadline = Instant::now() + timeout;
 
+        // A coalesced grip move (API v11) may have been answered between
+        // polls; its response waits in `deferred_responses`. Consume ours
+        // there first so no frame is ever lost or misattributed.
+        {
+            let mut deferred_responses = self
+                .deferred_responses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(position) = deferred_responses.iter().position(|(rid, _)| *rid == id) {
+                let (_, payload) = deferred_responses.remove(position).unwrap();
+                return Ok(payload);
+            }
+        }
+
         {
             let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
             let stream = writer.as_mut().ok_or_else(|| {
@@ -136,8 +169,22 @@ impl V4Connection {
             }
             match incoming.recv_timeout(remaining) {
                 Ok(HostIncoming::Response { id: rid, payload }) if rid == id => return Ok(payload),
-                Ok(HostIncoming::Response { payload, .. }) => {
-                    return Err(PluginError::UnexpectedResponse(Box::new(payload)))
+                Ok(HostIncoming::Response { id: rid, payload }) => {
+                    if self
+                        .grip_moves_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&rid)
+                    {
+                        // The answer to an outstanding coalesced move: park it
+                        // for the poll instead of failing this call.
+                        self.deferred_responses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back((rid, payload));
+                        continue;
+                    }
+                    return Err(PluginError::UnexpectedResponse(Box::new(payload)));
                 }
                 Ok(HostIncoming::Request {
                     id: rid,
@@ -218,9 +265,22 @@ impl V4Connection {
                             .push_back((id, tab_id, payload));
                     }
                 }
-                Ok(HostIncoming::Response { .. }) => {
-                    // Responses without a matching active call should not
-                    // happen; drop them to avoid blocking the queue.
+                Ok(HostIncoming::Response { id, payload }) => {
+                    // The answer to an outstanding coalesced grip move waits
+                    // for its poll (API v11); anything else without a matching
+                    // active call should not happen — drop it to avoid
+                    // blocking the queue.
+                    if self
+                        .grip_moves_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&id)
+                    {
+                        self.deferred_responses
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back((id, payload));
+                    }
                     continue;
                 }
                 Err(mpsc::TryRecvError::Empty) => return Ok(()),
@@ -232,6 +292,164 @@ impl V4Connection {
         }
     }
 
+    /// Issue a custom-grip drag event WITHOUT waiting for the response (API
+    /// v11/v12; move, begin, settle and cancel alike). The app parks move
+    /// points and sends at most one move while another is unanswered, so a
+    /// slow plugin can never build a laggy queue — and the delivery can
+    /// never block the app loop; [`Self::poll_grip`] collects answers
+    /// (serving any nested plugin requests on the way) at pump ticks, with
+    /// the watchdog ([`Self::abandon`]) for plugins that never answer.
+    #[allow(clippy::result_large_err)]
+    pub fn send_grip_event(
+        &self,
+        tab_index: usize,
+        event: crate::host::CustomGripEvent,
+    ) -> Result<u64, PluginError> {
+        let _call_guard = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let stream = writer.as_mut().ok_or_else(|| {
+                PluginError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "V4 connection is shut down",
+                ))
+            })?;
+            send(
+                stream,
+                &HostToPluginV4::Request {
+                    id,
+                    payload: HostRequest::CustomGripEvent { tab_index, event },
+                },
+            )?;
+        }
+        self.grip_moves_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+        Ok(id)
+    }
+
+    /// Tear an untrusted plugin's connection down (API v12 watchdog): a
+    /// grip-event delivery that outlives its deadline must be abandoned —
+    /// the UI loop recovers, the drag ends as a cancel, an error line names
+    /// the plugin. The runner reaps the dead connection; no further frames
+    /// are read or written.
+    pub fn abandon(&self, reason: &str) {
+        self.shared.alive.store(false, Ordering::SeqCst);
+        // Dropping the writer half stops NEW frames; `alive=false` marks the
+        // connection semantically dead for every is-alive gate (dispatch,
+        // grip routing, reaping). The runner is reaped with the process; the
+        // reason travels via the host's error queue — the plugin process is
+        // not trusted to log anything.
+        let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
+        *writer = None;
+        let _ = reason;
+    }
+
+    /// Poll for the next outstanding custom-grip answer, serving any nested
+    /// plugin requests with `host` on the way (request-in-request over the
+    /// same multiplexed link). Nested COMMAND frames are REFUSED in this
+    /// context: a grip-event delivery must never inline-serve
+    /// `run_command`/`execute_command` — their execution needs the host
+    /// message loop the blocked delivery cannot pump (the UI-freeze wedge,
+    /// v11.1); the plugin gets an honest `Err` and proceeds data-plane or
+    /// replays commands at its own boundary. `Ok(None)` means "not answered
+    /// yet"; the poll never marks the connection dead and never blocks the
+    /// app for longer than `wait`.
+    #[allow(clippy::result_large_err)]
+    pub fn poll_grip(
+        &self,
+        host: &mut dyn HostApi,
+        wait: Duration,
+    ) -> Result<Option<(u64, HostResponse)>, PluginError> {
+        let _call_guard = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + wait;
+        // Deferred first: the answer may have arrived during a drain tick.
+        {
+            let in_flight: Vec<u64> = self
+                .grip_moves_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect();
+            let mut deferred_responses = self
+                .deferred_responses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(position) = deferred_responses
+                .iter()
+                .position(|(rid, _)| in_flight.contains(rid))
+            {
+                let Some((id, payload)) = deferred_responses.remove(position) else {
+                    unreachable!("position came from the same queue");
+                };
+                return Ok(Some((id, payload)));
+            }
+        }
+        let incoming = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match incoming.recv_timeout(remaining) {
+                Ok(HostIncoming::Response { id: rid, payload }) => {
+                    let mine = self
+                        .grip_moves_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&rid);
+                    if mine {
+                        return Ok(Some((rid, payload)));
+                    }
+                    // Not ours (a late frame for a future call): park it.
+                    self.deferred_responses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back((rid, payload));
+                }
+                Ok(HostIncoming::Request {
+                    id: rid,
+                    tab_id,
+                    payload,
+                }) => {
+                    if tab_id.is_none_or(|request_tab| request_tab == host.tab_id()) {
+                        self.respond_to_plugin_request_in_context(
+                            host,
+                            rid,
+                            payload,
+                            &mut |_| {},
+                            true,
+                        )?;
+                    } else {
+                        self.deferred
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back((rid, tab_id, payload));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.shared.alive.store(false, Ordering::SeqCst);
+                    return Err(PluginError::Runner("V4 reader thread disconnected".into()));
+                }
+            }
+        }
+    }
+
+    /// Whether a custom-grip delivery is still unanswered (used by the app to
+    /// keep the settle waiting for the last preview to land, and by the
+    /// watchdog to know what to abandon).
+    pub fn has_grip_move_in_flight(&self) -> bool {
+        !self
+            .grip_moves_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     fn respond_to_plugin_request(
         &self,
         host: &mut dyn HostApi,
@@ -239,7 +457,37 @@ impl V4Connection {
         payload: Box<PluginRequest>,
         on_start_interactive: &mut dyn FnMut(u64),
     ) -> Result<(), PluginError> {
-        let response = handle_plugin_request(host, *payload, on_start_interactive);
+        // Standard context: nested commands are allowed (the caller's own
+        // serve loop runs on a thread whose message loop keeps pumping —
+        // the dispatch path, drain ticks, and normal calls).
+        self.respond_to_plugin_request_in_context(host, id, payload, on_start_interactive, false)
+    }
+
+    /// Serve one nested plugin request, optionally in a GRIP-EVENT context
+    /// (API v12): command frames are refused there — their nested execution
+    /// needs the iced message loop, which a UI-thread grip delivery cannot
+    /// pump (the v11.1 UI-freeze wedge). The plugin gets an honest `Err`,
+    /// so its settle can proceed data-plane or report the boundary.
+    fn respond_to_plugin_request_in_context(
+        &self,
+        host: &mut dyn HostApi,
+        id: u64,
+        payload: Box<PluginRequest>,
+        on_start_interactive: &mut dyn FnMut(u64),
+        grip_event: bool,
+    ) -> Result<(), PluginError> {
+        let plugin_id = self
+            .plugin_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let response = handle_plugin_request(
+            host,
+            &plugin_id,
+            *payload,
+            on_start_interactive,
+            !grip_event,
+        );
         let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
         let stream = writer.as_mut().ok_or_else(|| {
             PluginError::Io(std::io::Error::new(
@@ -904,5 +1152,263 @@ mod tests {
         assert_eq!(result.output, Some("42".to_string()));
         runner.join().unwrap();
         restore_test_env();
+    }
+
+    /// Records the calls of a fake host so assertions can check the ORDER
+    /// of a settle's nested writes.
+    #[derive(Default)]
+    struct RecordingHost {
+        calls: StdMutex<Vec<&'static str>>,
+    }
+    impl HostApi for RecordingHost {
+        fn tab_index(&self) -> usize {
+            0
+        }
+        fn document(&self) -> &CadDocument {
+            panic!("not used")
+        }
+        fn document_mut(&mut self) -> &mut CadDocument {
+            panic!("not used")
+        }
+        fn document_reader(&self) -> Box<dyn DocumentReader + '_> {
+            Box::new(EmptyReader)
+        }
+        fn add_entity(&mut self, _entity: codec::EntityType) -> Handle {
+            self.calls.lock().unwrap().push("add_entity");
+            Handle::from(1u64)
+        }
+        fn bump_geometry(&mut self) {}
+        fn read_record(
+            &self,
+            _handle: Handle,
+            _app_name: &str,
+        ) -> Option<&codec::xdata::ExtendedDataRecord> {
+            None
+        }
+        fn write_record(
+            &mut self,
+            _handle: Handle,
+            _record: codec::xdata::ExtendedDataRecord,
+        ) -> bool {
+            false
+        }
+        fn remove_record(&mut self, _handle: Handle, _app_name: &str) -> bool {
+            false
+        }
+        fn push_undo(&mut self, _label: &str) {
+            self.calls.lock().unwrap().push("push_undo");
+        }
+        fn set_dirty(&mut self) {}
+        fn push_info(&mut self, _msg: &str) {}
+        fn push_output(&mut self, _msg: &str) {}
+        fn push_error(&mut self, _msg: &str) {}
+        fn start_interactive(&mut self, _command: Box<dyn crate::host::InteractiveCommand>) {}
+        fn plugin_state_any(&self, _plugin_id: &str) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            None
+        }
+        fn plugin_state_any_mut(
+            &mut self,
+            _plugin_id: &str,
+        ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+            None
+        }
+        fn ensure_plugin_state_any(
+            &mut self,
+            _plugin_id: &'static str,
+            _init: &mut dyn FnMut() -> Box<dyn std::any::Any + Send + Sync>,
+        ) -> Option<&mut (dyn std::any::Any + Send + Sync)> {
+            None
+        }
+    }
+
+    #[test]
+    fn custom_grip_settle_writes_through_nested_requests() {
+        // The out-of-process runner path (API v11/v12): the settle event is
+        // issued WITHOUT waiting (the v11.1 hardening — the UI loop never
+        // blocks); the plugin's write requests are served INLINE by the
+        // bounded poll on UI ticks (request-in-request over the multiplexed
+        // link), and the settle's answer concludes the exchange in order.
+        let (runner_end, host_end) = connect_pair();
+        let runner = thread::spawn(move || {
+            let mut stream = runner_end;
+            let frame = recv::<HostToPluginV4>(&mut stream).expect("settle frame");
+            let HostToPluginV4::Request {
+                id,
+                payload: HostRequest::CustomGripEvent { tab_index, event },
+            } = frame
+            else {
+                panic!("expected a CustomGripEvent request, got {frame:?}")
+            };
+            assert_eq!(tab_index, 0);
+            assert_eq!(event.phase, crate::host::CustomGripPhase::Settle);
+            // The plugin opens its one undo scope, then writes — exactly the
+            // consumer's settle shape — and each nested request is answered
+            // by the waiting host before the settle resolves.
+            for nested in [
+                PluginRequest::PushUndo {
+                    label: "CVI: PI radius".to_string(),
+                },
+                PluginRequest::AddEntity(codec::EntityType::Line(
+                    codec::entities::Line::from_points(
+                        codec::types::Vector3::new(0.0, 0.0, 0.0),
+                        codec::types::Vector3::new(3.0, 0.0, 0.0),
+                    ),
+                )),
+            ] {
+                send(
+                    &mut stream,
+                    &PluginToHostV4::Request {
+                        id: 5000 + id,
+                        tab_id: Some(0),
+                        payload: nested,
+                    },
+                )
+                .expect("nested send");
+                match recv::<HostToPluginV4>(&mut stream).expect("nested answer") {
+                    HostToPluginV4::Response { .. } => {}
+                    other => panic!("nested request answered inline, got {other:?}"),
+                }
+            }
+            // A nested COMMAND frame is refused in this context (the v11.1
+            // wedge): the plugin gets the honest Error, not a hang.
+            send(
+                &mut stream,
+                &PluginToHostV4::Request {
+                    id: 6000 + id,
+                    tab_id: Some(0),
+                    payload: PluginRequest::ExecuteCommand("CVI_REPLAY".to_string()),
+                },
+            )
+            .expect("nested command send");
+            match recv::<HostToPluginV4>(&mut stream).expect("command answer") {
+                HostToPluginV4::Response {
+                    id: _,
+                    payload: PluginResponse::Error(message),
+                } => {
+                    assert!(
+                        message.contains("refused during a custom-grip drag"),
+                        "the refusal must name the constraint, got: {message}"
+                    );
+                }
+                other => panic!("nested command must refuse, got {other:?}"),
+            }
+            send(
+                &mut stream,
+                &PluginToHostV4::Response {
+                    id,
+                    payload: HostResponse::CustomGrip(crate::host::CustomGripResponse {
+                        preview: Vec::new(),
+                        live_entities: Vec::new(),
+                    }),
+                },
+            )
+            .expect("settle answer");
+        });
+        let conn = V4Connection::new(host_end, Arc::new(|_, _| {})).expect("connection");
+        conn.attach_plugin_id("test.grip-points");
+        let mut host = RecordingHost::default();
+        let settle_id = conn
+            .send_grip_event(
+                0,
+                crate::host::CustomGripEvent {
+                    grip_id: 42,
+                    phase: crate::host::CustomGripPhase::Settle,
+                    point: [1.0, 2.0, 3.0],
+                    anchor: None,
+                },
+            )
+            .expect("the settle is issued without waiting");
+        // Bounded polls until the settle lands — the UI-shape loop.
+        let landed = loop {
+            match conn.poll_grip(&mut host, Duration::from_millis(200)) {
+                Ok(Some((id, response))) => break (id, response),
+                Ok(None) => continue,
+                Err(error) => panic!("poll failed: {error}"),
+            }
+        };
+        assert_eq!(landed.0, settle_id);
+        runner.join().expect("runner thread finished");
+        match landed.1 {
+            HostResponse::CustomGrip(resp) => {
+                assert!(resp.preview.is_empty());
+                assert!(resp.live_entities.is_empty());
+            }
+            other => panic!("unexpected settle answer: {other:?}"),
+        }
+        let calls = host.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["push_undo", "add_entity"],
+            "the settle's nested writes are served inline in call order; nested \
+             commands are refused, not executed"
+        );
+    }
+
+    #[test]
+    fn custom_grip_abandon_never_freezes_the_host() {
+        // The v11.1 watchdog shape: a plugin that never answers its settle
+        // costs the host nothing — the polls are bounded, the delivery is
+        // abandoned, the connection is torn down (is_alive false), and a
+        // follow-up call fails fast instead of hanging.
+        let (runner_end, host_end) = connect_pair();
+        // The runner receives the settle and answers NOTHING: it just holds
+        // the stream (a wedged or hostile plugin).
+        let runner = thread::spawn(move || {
+            let mut stream = runner_end;
+            let frame = recv::<HostToPluginV4>(&mut stream).expect("settle frame");
+            let HostToPluginV4::Request { id, .. } = frame else {
+                panic!("unexpected frame: {frame:?}")
+            };
+            // Block with the id held: keep the stream open, never respond.
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = id;
+        });
+        let conn = V4Connection::new(host_end, Arc::new(|_, _| {})).expect("connection");
+        conn.attach_plugin_id("test.grip-points");
+        let mut host = RecordingHost::default();
+        let start = Instant::now();
+        conn.send_grip_event(
+            0,
+            crate::host::CustomGripEvent {
+                grip_id: 1,
+                phase: crate::host::CustomGripPhase::Settle,
+                point: [0.0; 3],
+                anchor: None,
+            },
+        )
+        .expect("issued without waiting");
+        // A few bounded polls: each returns None quickly, never a block.
+        for _ in 0..3 {
+            let poll_start = Instant::now();
+            let landed = conn
+                .poll_grip(&mut host, Duration::from_millis(50))
+                .expect("poll never errors on silence");
+            assert!(landed.is_none());
+            // Well under the runner's one-second hold: a slow CI machine
+            // may overshoot 50 ms, a blocking poll would not return at all.
+            assert!(
+                poll_start.elapsed() < Duration::from_millis(900),
+                "the bounded poll stays bounded"
+            );
+        }
+        // The watchdog: abandon the delivery and tear the connection down.
+        conn.abandon("settle deadline exceeded");
+        assert!(!conn.is_alive(), "the connection is torn down");
+        // Follow-up deliveries fail fast (no writer, no hang).
+        let failed = conn.send_grip_event(
+            0,
+            crate::host::CustomGripEvent {
+                grip_id: 1,
+                phase: crate::host::CustomGripPhase::Cancel,
+                point: [0.0; 3],
+                anchor: None,
+            },
+        );
+        assert!(failed.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the whole exchange stays cheap — the wall-clock timeout never runs"
+        );
+        runner.join().expect("runner thread finished");
     }
 }

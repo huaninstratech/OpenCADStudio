@@ -37,6 +37,9 @@ fn remap_common(common: &mut EntityCommon, handles: &FxHashMap<Handle, Handle>) 
 }
 
 fn cloneable_object(object: &ObjectType) -> bool {
+    if let ObjectType::DynamicBlock(object) = object {
+        return !matches!(object.data, codec::objects::DynamicBlockData::Unknown);
+    }
     matches!(
         object,
         ObjectType::Dictionary(_)
@@ -49,6 +52,7 @@ fn cloneable_object(object: &ObjectType) -> bool {
             | ObjectType::FieldList(_)
             | ObjectType::PlaceHolder(_)
             | ObjectType::ImageDefinitionReactor(_)
+            | ObjectType::BlockVisibilityParameter(_)
             | ObjectType::XRecord(codec::objects::XRecord {
                 entries_complete: true,
                 ..
@@ -74,6 +78,11 @@ pub(super) fn copy_definition(
     target.text_styles = source.text_styles.clone();
     target.dim_styles = source.dim_styles.clone();
     target.app_ids = source.app_ids.clone();
+    for class in source.classes.iter() {
+        if !target.classes.contains(&class.dxf_name) {
+            target.classes.add_or_update(class.clone());
+        }
+    }
     let mut records = vec![(root.clone(), name.to_string())];
     let mut names = FxHashSet::default();
     names.insert(source_name.to_ascii_uppercase());
@@ -379,6 +388,47 @@ pub(super) fn copy_definition(
     for (old, mut object) in objects {
         let new = handles[&old];
         match &mut object {
+            ObjectType::DynamicBlock(object) => {
+                object.handle = new;
+                object.visit_handles_mut(&mut |handle| {
+                    if let Some(new) = handles.get(handle) {
+                        *handle = *new;
+                    }
+                });
+                if let codec::objects::DynamicBlockData::VisibilityParameter(parameter) =
+                    &object.data
+                {
+                    target
+                        .block_visibility_params
+                        .insert(new, parameter.clone());
+                }
+            }
+            ObjectType::BlockVisibilityParameter(parameter) => {
+                parameter.handle = new;
+                parameter.owner = handles
+                    .get(&parameter.owner)
+                    .copied()
+                    .unwrap_or(parameter.owner);
+                if let codec::objects::BlockEvalValue::Handle(handle) = &mut parameter.eval_value {
+                    *handle = handles.get(handle).copied().unwrap_or(*handle);
+                }
+                for handle in
+                    parameter
+                        .all_blocks
+                        .iter_mut()
+                        .chain(parameter.states.iter_mut().flat_map(|state| {
+                            state
+                                .visible_blocks
+                                .iter_mut()
+                                .chain(state.visible_params.iter_mut())
+                        }))
+                {
+                    *handle = handles.get(handle).copied().unwrap_or(*handle);
+                }
+                target
+                    .block_visibility_params
+                    .insert(new, parameter.clone());
+            }
             ObjectType::SortEntitiesTable(table) => {
                 let source_block = table.block_owner_handle;
                 let mut ordered: Vec<_> = source
@@ -494,6 +544,22 @@ pub(super) fn copy_definition(
         }
     }
     for (old, new) in &handles {
+        if let Some(data) = source.object_xdata(*old) {
+            for mut record in data.records().iter().cloned() {
+                for value in &mut record.values {
+                    if let codec::xdata::XDataValue::Handle(handle) = value {
+                        *handle = handles.get(handle).copied().unwrap_or(*handle);
+                    }
+                }
+                target.set_object_xdata_record(*new, record);
+            }
+        }
+        if let Some(definition) = source.block_representations.get(old) {
+            target.block_representations.insert(
+                *new,
+                handles.get(definition).copied().unwrap_or(*definition),
+            );
+        }
         if let Some(field) = source.fields.get(old) {
             let mut field = field.clone();
             field.handle = *new;
@@ -508,6 +574,10 @@ pub(super) fn copy_definition(
         if let Some(scale) = source.context_scales.get(old) {
             target.context_scales.insert(*new, *scale);
         }
+    }
+    for (record, name) in &records {
+        let definition = handles[&record.handle];
+        crate::scene::block_authoring::refresh_copied_identity(&mut target, definition, name);
     }
     Ok(DefinitionCopy {
         record: handles[&root.handle],

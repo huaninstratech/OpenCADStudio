@@ -17,7 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::{CommandSource, CommandStep, HostSettingValue};
+use crate::host::{
+    CommandSource, CommandStep, CustomGripEvent, CustomGripResponse, GripInfo, HostSettingValue,
+    PluginConstraint, PluginGrip, XRecordEntry, XRecordRead, XRecordUpdate,
+};
 use crate::manifest::ApiVersion;
 use crate::ribbon::owned::{OwnedEntityClasses, OwnedPluginManifest, OwnedRibbonGroup};
 
@@ -94,6 +97,14 @@ pub enum HostRequest {
         command_id: u64,
         pt: [f64; 3],
     },
+    /// V11: one drag event for a plugin-declared custom grip, delivered to
+    /// the owning plugin only. The runner passes the plugin a full HostApi
+    /// proxy, so the settle phase can perform writes (possibly nested, over
+    /// the multiplexed link) inside the plugin's own undo scope.
+    CustomGripEvent {
+        tab_index: usize,
+        event: CustomGripEvent,
+    },
 }
 
 /// Responses the plugin runner sends back for `HostRequest`.
@@ -107,6 +118,9 @@ pub enum HostResponse {
     Error(String),
     CodeExecutionResult(crate::host::ExecutionResult),
     PreviewWires(Vec<PreviewWire>),
+    /// V11: the owning plugin's answer to a custom-grip drag event: the
+    /// preview wire set that replaces its previous live preview.
+    CustomGrip(CustomGripResponse),
 }
 
 /// Requests the plugin runner sends to the host.
@@ -231,6 +245,51 @@ pub enum PluginRequest {
         handle: Handle,
         reference_only: bool,
     },
+    /// V11 (additive): enumerate an entity's built-in grips with viewport
+    /// parity.
+    EntityGrips {
+        handle: Handle,
+    },
+    /// V11 (additive): perform the one-undo-step grip edit an interactive
+    /// drag performs.
+    GripDrag {
+        handle: Handle,
+        grip_id: usize,
+        to: [f64; 3],
+    },
+    /// V11 (additive): declare (or clear) the calling plugin's custom grip
+    /// points. The declaring plugin's identity is attached by the host from
+    /// the serving process's own manifest, never from the frame.
+    SetPluginGrips {
+        grips: Vec<PluginGrip>,
+    },
+    /// V12 (additive): read specific entities by handle — cheap per-entity
+    /// reads for refresh passes, so a plugin that writes and re-reads never
+    /// re-clones the full document snapshot (the v11.1 per-boundary cost:
+    /// every write invalidated the session snapshot).
+    GetEntitiesBatch {
+        handles: Vec<Handle>,
+    },
+    /// V13 (additive): create a parametric constraint directly (the
+    /// interactive COINCIDENT/TANGENT machinery, no command line, no echo;
+    /// joins the caller's open plugin scope).
+    CreateConstraint {
+        constraint: PluginConstraint,
+    },
+    /// V13 (additive): read several XRecords in one round trip.
+    ReadXRecords {
+        reads: Vec<XRecordRead>,
+    },
+    /// V13 (additive): replace the entries of several XRecords in one
+    /// round trip (one shared undo composition).
+    UpdateXRecords {
+        updates: Vec<XRecordUpdate>,
+    },
+    /// V13 (additive): list a dictionary's XRecords with their entries in
+    /// one answer.
+    ListXRecordsWithEntries {
+        dictionary_path: Vec<String>,
+    },
 }
 
 /// Responses the host sends back for `PluginRequest`.
@@ -279,6 +338,22 @@ pub enum PluginResponse {
     XRecordNames(Result<Vec<String>, String>),
     /// V9 (additive): outcome of the reference-only designation.
     SetReferenceOnlyResult(Result<(), String>),
+    /// V11 (additive): an entity's built-in grip list.
+    EntityGripsResult(Result<Vec<GripInfo>, String>),
+    /// V11 (additive): outcome of a programmatic grip drag.
+    GripDragResult(Result<(), String>),
+    /// V11 (additive): outcome of a custom-grip declaration.
+    SetPluginGripsResult(Result<(), String>),
+    /// V12 (additive): per-entity reads by handle (None per unknown handle).
+    GetEntitiesBatchResult(Result<Vec<Option<EntityType>>, String>),
+    /// V13 (additive): outcome of a direct constraint creation.
+    CreateConstraintResult(Result<(), String>),
+    /// V13 (additive): batched XRecord reads (per-entry results).
+    ReadXRecordsResult(Result<Vec<Result<Vec<XRecordEntry>, String>>, String>),
+    /// V13 (additive): batched XRecord updates (per-entry results).
+    UpdateXRecordsResult(Result<Vec<Result<Handle, String>>, String>),
+    /// V13 (additive): dictionary XRecords with their entries.
+    ListXRecordsWithEntriesResult(Result<Vec<(String, Vec<XRecordEntry>)>, String>),
 }
 
 /// Messages sent from the host to the plugin runner.

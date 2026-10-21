@@ -160,6 +160,8 @@ pub struct DrawingPrefs {
 pub struct SelectionPrefs {
     /// PICKBOX, 0..=50.
     pub pick_box: i32,
+    /// APERTURE: object-snap capture radius in pixels.
+    pub aperture: i32,
     /// PICKADD: true = a click adds to the selection.
     pub pick_add: bool,
     /// PICKDRAG: true = press-drag draws a rectangle instead of a lasso.
@@ -1000,6 +1002,24 @@ pub fn view_window<'a>(
         ))
         .size(11)
         .width(sizing.width),
+        Space::new().height(10),
+        row![
+            text(crate::t!("Aperture size")).size(12).width(140),
+            slider(
+                crate::snap::MIN_OSNAP_RADIUS_PX as i32..=crate::snap::MAX_OSNAP_RADIUS_PX as i32,
+                selection.aperture,
+                Message::ApertureChanged,
+            )
+            .step(1)
+            .width(Fill),
+            text(selection.aperture.to_string()).size(11).width(44),
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+        Space::new().height(8),
+        text(crate::t!("How close, in pixels, the cursor must come to catch an object snap."))
+            .size(11)
+            .width(sizing.width),
         Space::new().height(24),
         text(crate::t!("Selection Modes")).size(15),
         Space::new().height(10),

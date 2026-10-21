@@ -485,6 +485,8 @@ const CODES: &[(&str, &str, &str)] = &[
     ("block_editor", "BEDIT", "BE"),
     ("block_editor", "BSAVE", "BS"),
     ("block_editor", "BTESTBLOCK", "TB"),
+    ("block_editor", "Close", "CL"),
+    ("block_editor", "BCLOSE", "BC"),
     ("draw", "Close", "TC"),
     ("draw", "BCLOSETESTBLOCK", "CT"),
     ("block_editor", "ATTDEF", "AD"),

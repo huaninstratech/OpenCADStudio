@@ -137,7 +137,7 @@ fn main() -> iced::Result {
         // Headless modes exit without ever creating a window.
         if let Some(port) = args.http {
             if args.files.is_empty() {
-                rest::serve(port);
+                rest::serve(port, args.read_only);
                 return Ok(());
             }
             // Files + --http: boot the GUI and host the loopback REST channel
@@ -148,7 +148,7 @@ fn main() -> iced::Result {
         }
         if args.serve {
             // `app::serve` reads --port itself from the raw args.
-            app::serve();
+            app::serve(args.read_only);
             return Ok(());
         }
         if let Some(io) = &args.export {

@@ -378,7 +378,7 @@ pub fn modal<'a>(
             .padding([0, 2]),
         )
         .on_press(Message::ModalResizeGrab)
-        .interaction(iced::mouse::Interaction::Grab);
+        .interaction(iced::mouse::Interaction::ResizingDiagonallyDown);
         body = body.push(
             container(resize)
                 .width(Length::Fill)

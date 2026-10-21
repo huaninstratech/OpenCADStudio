@@ -37,6 +37,11 @@ fn fonts() -> &'static SysFonts {
         let db = {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
+            // TrueType files dropped into the Fonts folder resolve like
+            // installed ones, as the folder's SHX fonts already do (#925).
+            if let Some(dir) = crate::io::font_repo::fonts_dir() {
+                db.load_fonts_dir(dir);
+            }
             db
         };
         #[cfg(target_arch = "wasm32")]

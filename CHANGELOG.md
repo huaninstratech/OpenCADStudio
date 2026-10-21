@@ -8,7 +8,8 @@
 
 | Release | Date | Highlights | Details |
 | :--- | :--- | :--- | :--- |
-| **[Unreleased](changelogs/unreleased.md)** | *2026-10-11 to Present* | Docking icon rails, block cycle protection & codec explosion, Web/WASM parity wave (in-place save, offline PWA, workers), MCP dynamic schemas & batch bindings | [changelogs/unreleased.md](changelogs/unreleased.md) |
+| **[Unreleased](changelogs/unreleased.md)** | *2026-10-18 to Present* | Dynamic block authoring follow-ups: Block Properties Table grips, row selection, and authoring preview fixes | [changelogs/unreleased.md](changelogs/unreleased.md) |
+| **[v2026.42](changelogs/v2026.42.md)** | *2026-10-18* | Dynamic block authoring, broad import support (DGN, PDF, STEP, IGES, SAT, WMF, 3DS), dockable palettes, web parity, and drafting/layout tools | [changelogs/v2026.42.md](changelogs/v2026.42.md) |
 | **[v2026.41](changelogs/v2026.41.md)** | *2026-10-11* | Sheet Set Manager (`SHEETSET`), `COUNT` command & live tables, associative `SWEEP`, RTL text, DimStyle per-end arrowheads (`DIMBLK1`/`DIMBLK2`), GPU options (Metal/OpenGL) | [changelogs/v2026.41.md](changelogs/v2026.41.md) |
 | **[v2026.40 / v2026.40.1](changelogs/v2026.40.md)** | *2026-10-05* | `FIELD` command & dialog, `ATTDEF` parity, Blocks palette, MCP DeepZoom pyramidal tiling & SoM visual ID stamps, DWF/DGN underlays, `DYNMODE`, embedded TrueType PDF, instant layer toggling | [changelogs/v2026.40.md](changelogs/v2026.40.md) |
 | **[v2026.39](changelogs/v2026.39.md)** | *2026-09-27* | Block creation & `WBLOCK` dialogs, Enter autocomplete, Python Host Model architecture, parametric constraints parity, `XCLIP` boundary clipping, trackpad pan/pinch, tessellation performance | [changelogs/v2026.39.md](changelogs/v2026.39.md) |
@@ -16,18 +17,23 @@
 
 ---
 
-## [Unreleased] - 2026-10-13
+## [Unreleased] - 2026-10-18
 
-> **Summary:** Overhaul of the workspace docking and layout system with Photoshop-style vertical icon rails and draggable tabs; deep hardening of block definitions against circular recursion and standard-compliant block explosion (`INSERT`/`MINSERT`); major Web/WASM platform parity wave including in-place saving via File System Access API, offline PWA support, and worker-routed operations; plus custom `.pat` and `.lin` pattern loading.
+> **Summary:** Continued dynamic block authoring with native Block Properties Table grips, reference-side row selection, and improved parameter editing and preview. See the [full Unreleased notes](changelogs/unreleased.md).
+
+## [v2026.42] - 2026-10-18
+
+> **Summary:** Major release bringing dynamic block authoring and evaluation, import workflows for DGN/PDF and additional 2D/3D formats, a modern docking and graphic-attributes workspace, web/PWA improvements, and a broad set of drafting, layout, automation, plugin, and file-compatibility updates.
 
 ### 🌟 Key Highlights
-* **Modernized Docking & Workspace System:** Photoshop-style collapsible vertical icon rails, auto-hide flyouts, draggable tab reordering, and independent floating palettes. *(Contributed by [@posnofa](https://github.com/posnofa) and [@MarcelP102](https://github.com/MarcelP102))*
-* **Block System Hardening & Safe Explosion:** Prevents circular/recursive block definitions and render loops. Delegates `INSERT`/`MINSERT` explosions to `opencadcodec`, restoring transformed `ATTDEF`s, correcting rotated arrays, and consolidating definition ops. *(Contributed by [@KarimJerbi](https://github.com/KarimJerbi))*
-* **MCP Extensibility & Schema Preflight:** Added side-effect-free preflight validation, on-demand entity creation schemas, batch parameter bindings, and specialist workflow guides. *(Contributed by [@KarimJerbi](https://github.com/KarimJerbi))*
-* **Major Web / WASM Platform Wave:** In-place local saving via File System Access API, offline PWA, crash recovery (`restore-all`), clipboard image pasting, worker-routed `WBLOCK`/`SAVEALL`/`ARCHIVE`, and in-browser PDF plotting. *(Contributed by [@posnofa](https://github.com/posnofa), [@HakanSeven12](https://github.com/HakanSeven12), and Claude Opus 5.5)*
-* **Custom Resources & Compatibility:** Loading for user `.pat` hatch and `.lin` linetype files, view backgrounds, and strict DWG reader compliance. *(Contributed by [@HakanSeven12](https://github.com/HakanSeven12) and [@ramox81](https://github.com/ramox81))*
+* **Dynamic Block Authoring:** Added the Block Editor workflow for native parameters and actions, including Move, Scale, Rotate, Flip, Stretch, Polar Stretch, Array, Visibility, Lookup tables, and Block Properties Tables. Evaluated references respond to definition and parameter changes. *(Contributed by [@KarimJerbi](https://github.com/KarimJerbi))*
+* **Import and Conversion:** Added `IMPORT`/`DGNIMPORT` workflows for DGN, 3D Studio, SAT/ACIS, STEP, IGES, and WMF, plus PDF geometry import and SHX text recognition. Improved STEP/IGES surfaces and colors, DGN cells and text, and reader hardening. *(Contributed by [@ramox81](https://github.com/ramox81), [@HakanSeven12](https://github.com/HakanSeven12), and [@sclMAX](https://github.com/sclMAX))*
+* **Workspace and Graphic Attributes:** Added dockable/floating palette groups, vertical icon rails, auto-hide behavior, draggable tabs, and a Graphic Attributes palette. *(Graphic Attributes palette contributed by [@MarcelP102](https://github.com/MarcelP102))*
+* **Web and File Workflows:** Added in-place browser saving, PWA offline use and recovery, worker-routed file operations, web plot preview, and expanded image handling. *(Contributed by [@afonsop](https://github.com/afonsop))*
+* **Drafting and Layout:** Added `-VIEW` presets, `DVIEW` twist, `MVSETUP`, `PUBLISH`, `TXT2MTXT`, `ATTMAN`, richer `REFEDIT`, layout viewport creation and copying, and improvements to selection, snapping, `STRETCH`, `TRIM`/`EXTEND`, and measurements. *(Contributed by [@ramox81](https://github.com/ramox81), [@HakanSeven12](https://github.com/HakanSeven12), and [@gianlucafiore](https://github.com/gianlucafiore))*
+* **Automation and Plugins:** Extended MCP preflight, dynamic entity schemas, batch bindings and specialist guides; added plugin reference-only entities and plugin-defined entity labels. *(Contributed by [@KarimJerbi](https://github.com/KarimJerbi), [@YsDirector](https://github.com/YsDirector), and [@schoeller](https://github.com/schoeller))*
 
-👉 **[View Full Unreleased Release Notes](changelogs/unreleased.md)**
+👉 **[View Full v2026.42 Release Notes](changelogs/v2026.42.md)**
 
 ---
 

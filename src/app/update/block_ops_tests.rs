@@ -1296,6 +1296,32 @@ fn locked_purge_removes_an_unreferenced_block_and_undo_restores_it() {
 }
 
 #[test]
+fn locked_purge_keeps_unresolved_xref_dependent_symbols() {
+    use codec::tables::{Layer, LineType, TextStyle};
+    let mut app = app();
+    let i = tab(&app);
+    let doc = &mut app.tabs[i].scene.document;
+    for name in ["Grid Plan|GRID", "Unused"] {
+        doc.layers.add(Layer::new(name)).unwrap();
+    }
+    doc.line_types
+        .add(LineType::new("Grid Plan|DASHED"))
+        .unwrap();
+    doc.text_styles
+        .add(TextStyle::new("Grid Plan|NOTES"))
+        .unwrap();
+    let _ = app.dispatch_command("PURGE ALL");
+    let doc = &app.tabs[i].scene.document;
+    assert!(doc.layers.get("Grid Plan|GRID").is_some());
+    assert!(doc.line_types.get("Grid Plan|DASHED").is_some());
+    assert!(doc.text_styles.get("Grid Plan|NOTES").is_some());
+    assert!(
+        doc.layers.get("Unused").is_none(),
+        "a plain unused layer still purges"
+    );
+}
+
+#[test]
 fn locked_purge_keeps_a_model_space_referenced_block() {
     let mut app = app();
     let model_space = fixture_model_space_reference(&mut app);

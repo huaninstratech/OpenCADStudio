@@ -79,6 +79,10 @@
     "title": "Open CAD Studio — Web",
     "loading": "Yükleniyor…"
   },
+  "vi-VN": {
+    "title": "Open CAD Studio — Web",
+    "loading": "Đang tải…"
+  },
   "zh-CN": {
     "title": "Open CAD Studio — Web",
     "loading": "正在加载…"

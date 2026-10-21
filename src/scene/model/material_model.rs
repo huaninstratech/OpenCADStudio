@@ -17,6 +17,9 @@ pub struct MeshMaterial {
     pub name: String,
     pub description: String,
     pub diffuse: [f32; 4],
+    /// The diffuse colour is the object's own (no colour of its own stored):
+    /// a block child taking an inherited material keeps its own colour.
+    pub diffuse_by_object: bool,
     pub ambient: [f32; 3],
     pub specular: [f32; 3],
     pub gloss: f32,
@@ -200,6 +203,7 @@ impl MeshMaterial {
             name: String::new(),
             description: String::new(),
             diffuse: color,
+            diffuse_by_object: true,
             ambient: [color[0], color[1], color[2]],
             specular: [0.08; 3],
             gloss: 0.5,
@@ -265,6 +269,8 @@ impl MeshMaterial {
                 diffuse[2],
                 entity_color[3] * opacity,
             ],
+            diffuse_by_object: material.diffuse_color.flag != 1
+                || material.diffuse_color.rgb.is_none(),
             ambient: [ambient[0], ambient[1], ambient[2]],
             specular: [specular[0], specular[1], specular[2]],
             gloss: material.specular_gloss_factor.clamp(0.0, 1.0) as f32,
@@ -300,6 +306,10 @@ impl MeshMaterial {
     }
 
     pub fn apply_to(&self, set: &mut super::mesh_model::MeshLodSet) {
+        // The material colours the faces; the edges keep the object's colour.
+        if set.edge_color.is_none() {
+            set.edge_color = set.display_color();
+        }
         if set.instance_source.is_some() {
             set.instance_color = Some(self.diffuse);
         } else {

@@ -115,7 +115,9 @@ impl OpenCADStudio {
             .trim()
             .parse::<f32>()
             .ok()
-            .filter(|v| v.is_finite() && (4.0..=40.0).contains(v));
+            .filter(|v| {
+                (crate::snap::MIN_OSNAP_RADIUS_PX..=crate::snap::MAX_OSNAP_RADIUS_PX).contains(v)
+            });
         let Some(aperture) = aperture else {
             self.command_line
                 .push_error("OSNAP capture radius must be between 4 and 40 pixels.");

@@ -386,6 +386,24 @@ impl Default for DataExtractionState {
                     category: "Geometry".into(),
                     checked: true,
                 },
+                ExtractionProperty {
+                    key: "position_x".into(),
+                    name: "Position X".into(),
+                    category: "Geometry".into(),
+                    checked: true,
+                },
+                ExtractionProperty {
+                    key: "position_y".into(),
+                    name: "Position Y".into(),
+                    category: "Geometry".into(),
+                    checked: true,
+                },
+                ExtractionProperty {
+                    key: "position_z".into(),
+                    name: "Position Z".into(),
+                    category: "Geometry".into(),
+                    checked: true,
+                },
             ],
             categories: ["General".to_string(), "Geometry".to_string()]
                 .into_iter()

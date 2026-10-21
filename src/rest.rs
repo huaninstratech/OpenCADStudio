@@ -116,8 +116,12 @@ pub(crate) const RETRYABLE: &[&str] = &[
     "session_changed",
 ];
 
-pub fn serve(port: u16) {
-    listen(OpenCADStudio::new(), port, Arc::new(AtomicU16::new(0)));
+pub fn serve(port: u16, read_only: bool) {
+    listen(
+        OpenCADStudio::new_headless(read_only),
+        port,
+        Arc::new(AtomicU16::new(0)),
+    );
 }
 
 /// The secret every TCP automation client presents: `OCS_API_TOKEN` when the

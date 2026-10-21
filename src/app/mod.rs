@@ -8,13 +8,18 @@ pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub use automation::{export_headless, export_pdf_headless, serve};
 mod annotation_data;
+mod block_action_bars;
 mod block_actions;
 mod block_authoring_edit;
+mod block_cycle_order;
 mod block_editor;
 #[cfg(test)]
 mod block_editor_tests;
+mod block_feedback;
+mod block_grip_set;
 mod block_lookup;
 mod block_properties;
+mod block_properties_table;
 #[cfg(test)]
 mod block_properties_tests;
 mod block_save_as;
@@ -116,8 +121,40 @@ pub struct HoverDwell {
     pub tab: usize,
 }
 
+/// Cursor dwell awaiting a deferred object-snap pass while a command is
+/// active. Refreshed on every move; `SnapDwellTick` runs the full snap
+/// (hit_test_wires + interaction_candidates_near + snapper.snap) once
+/// `last_move_at.elapsed()` crosses `SNAP_DWELL_MS`. Until then only a
+/// cheap ray-plane projection feeds the live preview so the cursor keeps
+/// following the pointer on large drawings. Once a settled snap is resolved,
+/// keep the gate armed but stop requesting ticks until the next pointer move.
+#[derive(Clone, Debug)]
+pub struct SnapDwell {
+    pub last_move_at: iced::time::Instant,
+    /// Last expensive discrete-snap preview pass. The crosshair still follows
+    /// every pointer event; this caps large-scene preview snapping to 60 Hz.
+    pub last_preview_snap_at: iced::time::Instant,
+    pub point: iced::Point,
+    pub tab: usize,
+    /// Coalesce pointer moves into one preview rebuild on the next frame.
+    pub preview_dirty: bool,
+    /// Whether the current settled pointer position already has a full snap.
+    pub snap_resolved: bool,
+}
+
+impl SnapDwell {
+    pub fn discrete_preview_due_at(&self, now: iced::time::Instant) -> bool {
+        now.duration_since(self.last_preview_snap_at)
+            >= std::time::Duration::from_millis(SNAP_PREVIEW_INTERVAL_MS as u64)
+    }
+}
+
 /// How long the cursor must sit still before the idle rollover pick runs.
 pub const HOVER_DWELL_MS: u128 = 500;
+/// How long the cursor must sit still before the active-command object-snap pass runs.
+pub const SNAP_DWELL_MS: u128 = 60;
+/// Maximum live discrete-snap preview rate while a drawing command is active.
+pub const SNAP_PREVIEW_INTERVAL_MS: u128 = 16;
 /// Dense resident sets also retain the previous rollover while moving; this
 /// threshold gates that extra redraw-avoidance behavior.
 pub const HOVER_DWELL_DENSE_WIRES: usize = 50_000;
@@ -607,7 +644,12 @@ pub(super) struct OpenCADStudio {
     block_save_as: Option<crate::ui::window::block_save_as::State>,
     block_visibility: Option<crate::ui::window::block_visibility::State>,
     block_lookup: Option<crate::ui::window::block_lookup::State>,
+    block_properties_table: Option<crate::ui::window::block_properties_table::State>,
     block_visibility_mode: bool,
+    block_editor_preferences: settings::BlockEditorPreferences,
+    block_editor_settings: Option<crate::ui::window::block_editor_settings::State>,
+    block_cycle_order: Option<crate::ui::window::block_cycle_order::State>,
+    block_dependency_cache: std::cell::RefCell<Option<block_feedback::DependencyCache>>,
     /// PDF dialogs' working copies; `None` while closed.
     pdf_attach: Option<crate::ui::window::pdf_dialogs::PdfAttachState>,
     point_cloud_attach: Option<crate::ui::window::pdf_dialogs::PointCloudAttachState>,
@@ -626,6 +668,8 @@ pub(super) struct OpenCADStudio {
     image_adjust: Option<crate::ui::window::pdf_dialogs::ImageAdjustState>,
     /// The Edit Reference dialog (REFEDIT).
     refedit_dialog: Option<crate::ui::window::refedit_dialog::RefEditDialogState>,
+    /// The Password Protected PDF window.
+    pdf_password: Option<crate::ui::window::pdf_password_dialog::PdfPasswordState>,
     pdf_shx_dialog: Option<crate::ui::window::pdf_shx_dialog::ShxSettingsState>,
     underlay_layers: Option<crate::ui::window::pdf_dialogs::UnderlayLayersState>,
     pdf_import_settings: Option<crate::modules::insert::pdf_import::PdfImportSettings>,
@@ -834,6 +878,10 @@ pub(super) struct OpenCADStudio {
     /// that is still blocked waiting for this request, so plugin dispatch is
     /// skipped for the length of the call.
     pub(crate) suppress_plugin_dispatch: bool,
+    /// Set while a plugin request drives commands (`run_command`,
+    /// `constraint_create`): their edits join the plugin's open `push_undo`
+    /// scope, which the message boundary after the request closes.
+    pub(crate) plugin_request_active: bool,
     pub constraint_bar_mode: i16,
     /// Minutes between autosaves to a `.sv$` recovery file (SAVETIME command);
     /// 0 disables autosave.
@@ -909,12 +957,28 @@ pub(super) struct OpenCADStudio {
     /// drifts away. The instant lets `ViewportMove` detect when the
     /// dwell crosses the popup-open threshold.
     grip_hover: Option<GripHover>,
+    /// Plugin-declared custom grip the cursor hovers (API v11); drives the
+    /// same hover highlight overlay the built-in grip hover uses.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_hover: Option<crate::plugin::grip_points::PluginGripHover>,
+    /// Delivery bookkeeping for the active custom-grip drag (API v12):
+    /// every out-of-process phase is issued without waiting and collected
+    /// at pump ticks — the UI loop never blocks on plugin answers.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_deliveries: crate::plugin::grip_points::PluginGripDeliveries,
+    /// The visual-only live-geometry phase of the active custom-grip drag
+    /// (API v12): stashed originals of the entities the plugin's move
+    /// answers are swapping in; restored byte-identically before the settle
+    /// (and on cancel), never a history step of their own.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_live_originals: Vec<(codec::Handle, codec::EntityType)>,
     /// Open multi-functional grip popup. Persists across mouse moves
     /// until dismissed (click outside, ESC, cursor leaves the grip).
     grip_popup: Option<GripPopup>,
     grip_pending: Option<GripPendingValue>,
     /// Open dynamic-block visibility-state dropdown.
     visibility_popup: Option<visibility::VisibilityPopup>,
+    table_popup: Option<visibility::TablePopup>,
     /// A leader line just added via the "Add Leader" grip menu whose arrow is
     /// being placed (follows the cursor). `(entity handle, new-arrow grip id)`.
     /// Esc before the placement click removes it again.
@@ -928,6 +992,10 @@ pub(super) struct OpenCADStudio {
     /// `HOVER_DWELL_MS`. Skipping the pick mid-stroke avoids the per-frame
     /// O(N) wire+hatch+mesh sweep that froze the cursor on large drawings.
     hover_dwell: Option<HoverDwell>,
+    /// Pending object-snap pass while a command is active. Each cursor
+    /// move stashes `(last_move_at, point, tab)` here; `SnapDwellTick`
+    /// runs the full snap once the cursor has been still for `SNAP_DWELL_MS`.
+    snap_dwell: Option<SnapDwell>,
     /// Constraint kind shown after the ordinary rollover dwell while the
     /// cursor remains over one of its viewport indicators.
     constraint_glyph_tooltip: Option<crate::scene::parametric_constraints::ConstraintKind>,
@@ -1260,6 +1328,12 @@ pub(super) struct OpenCADStudio {
     marketplace_status: String,
     /// PDSIZE text buffer for the Point Style (DDPTYPE) dialog.
     point_size_buf: String,
+    /// Tab that owns the staged Point Style edits, so OK cannot write to a
+    /// different document if the active tab changes while the dialog is open.
+    point_style_tab_id: Option<u64>,
+    /// Staged PDMODE selection; the document is changed only when the dialog
+    /// is accepted.
+    point_mode_buf: Option<i16>,
     /// Point Style size mode: `true` = relative to screen, `false` = absolute.
     /// Tracked separately from the PDSIZE sign so a size of 0 (sign-less) still
     /// remembers which radio is active.
@@ -1376,6 +1450,9 @@ pub(super) struct OpenCADStudio {
     // ── Plot Style Table ──────────────────────────────────────────────────
     /// Currently loaded CTB/STB table (None = no override).
     active_plot_style: Option<crate::io::plot_style::PlotStyleTable>,
+    /// Table state at Plot Style editor open / last save. Edits preview live,
+    /// but closing the editor restores this baseline until Save succeeds.
+    pub(super) plotstyle_panel_baseline: Option<Option<crate::io::plot_style::PlotStyleTable>>,
 
     // ── MLineStyle Dialog ─────────────────────────────────────────────────
     mlstyle_selected: String,
@@ -2280,6 +2357,7 @@ pub enum ModalKind {
     ViewBackground,
     ImageAdjust,
     RefEdit,
+    PdfPassword,
     PdfShxSettings,
     UnderlayLayers,
     PdfImportSettings,
@@ -2313,6 +2391,7 @@ pub enum ModalKind {
     BlockSaveAs,
     BlockVisibility,
     BlockLookup,
+    BlockPropertiesTable,
     SaveDialog,
     Recovery,
     /// Fonts referenced by the drawing are missing on this machine.
@@ -2332,6 +2411,8 @@ pub enum ModalKind {
     LayerDeleteWarning,
     Aliases,
     NamedParameters,
+    BlockEditorSettings,
+    BlockCycleOrder,
     ScaleManager,
     /// Add / remove the annotation scales a single selected object has a
     /// per-object representation for.
@@ -2355,6 +2436,8 @@ pub enum ModalKind {
     DgnImport,
     /// IMPORT's 3D Studio Import window.
     TdsImport,
+    /// A 3D Studio import set to ask: one mesh with several materials.
+    TdsMaterial,
     /// Web: a crash-recovery autosave snapshot newer than the drawing's last
     /// save awaits a restore/discard decision. Distinct from the corrupt-file
     /// `RecoveryPrompt` — nothing is wrong with the drawing itself.
@@ -2516,6 +2599,11 @@ pub enum Message {
     /// call (e.g. mutations from the Python REPL).
     #[cfg(not(target_arch = "wasm32"))]
     DrainPluginRequests,
+    /// A pump tick for the active custom-grip drag (API v11): collects at
+    /// most one outstanding move answer, sends the newest parked point when
+    /// the channel is free, and reschedules itself while the drag lives.
+    #[cfg(not(target_arch = "wasm32"))]
+    PluginGripPump,
     /// Web: periodic check for per-script fonts a drawing needs but hasn't
     /// fetched yet (#141). Native: never emitted.
     PollWebFonts,
@@ -2693,6 +2781,8 @@ pub enum Message {
     CursorSizeChanged(i32),
     /// Set PICKBOX from the Selection-page slider.
     PickBoxChanged(i32),
+    /// Set APERTURE (object-snap capture radius) from the Selection-page slider.
+    ApertureChanged(i32),
     /// Choose whether double-clicking a block starts BEDIT or REFEDIT.
     DoubleClickBlockRefeditChanged(bool),
     /// Choose whether double-clicking a block with attributes starts ATTEDIT.
@@ -2970,6 +3060,7 @@ pub enum Message {
     BlockSaveAsApply,
     BlockVisibility(crate::ui::window::block_visibility::Action),
     BlockLookup(crate::ui::window::block_lookup::Action),
+    BlockPropertiesTable(crate::ui::window::block_properties_table::Action),
     BlockEditPickerName(String),
     BlockEditPickerSelect(String),
     BlockEditPickerApply,
@@ -3351,6 +3442,8 @@ pub enum Message {
     /// pane-local (offset to canvas coords + focus in the handler).
     PaneMove(usize, Point),
     PanePress(usize),
+    /// Button-event position in pane-local coordinates.
+    PanePressAt(usize, Point),
     PaneRelease(usize),
     PaneRightPress(usize),
     PaneRightRelease(usize),
@@ -3378,6 +3471,7 @@ pub enum Message {
     /// User picked a dynamic-block visibility state — index into the
     /// visibility dropdown's items.
     VisibilityPick(usize),
+    TableRowPick(usize),
     /// Timer pulse while the cursor is dwelling on a grip; drives the
     /// dwell-to-popup transition without requiring further mouse motion.
     GripDwellTick,
@@ -3386,6 +3480,10 @@ pub enum Message {
     /// Timer pulse while a rollover hit-test is queued; fires when the
     /// cursor has been still long enough to safely run the pick.
     HoverDwellTick,
+    /// Timer pulse while a deferred object-snap pass is queued; fires when
+    /// the cursor has been still long enough for the full snap on large
+    /// drawings.
+    SnapDwellTick,
     /// Large projected interaction index finished preparing off the UI thread.
     InteractionIndexReady {
         tab_id: u64,
@@ -3454,6 +3552,8 @@ pub enum Message {
     /// Toggle whether the annotation scale applies to model-space display.
     ToggleAnnotationScaleModel,
     SyncViewportAnnotationScale,
+    /// Status bar: toggle the display lock of the entered or selected viewports.
+    ToggleViewportLock,
     /// Toggle the scale picker popup open/closed.
     ToggleScalePopup,
     /// Close the scale picker popup.
@@ -3930,6 +4030,17 @@ pub enum Message {
     /// Open the named-parameter editor, seeding rows from the active tab's
     /// `Scene::named_parameters`.
     NamedParametersOpen,
+    BlockEditorSettingsInput(usize, String),
+    BlockEditorSettingsReset,
+    BlockEditorSettingsApply,
+    BlockCycleSelect(usize),
+    BlockCycleEnable(usize, bool),
+    BlockCycleMove(usize, bool),
+    BlockCycleApply,
+    BlockActionBarSelect(codec::Handle),
+    BlockActionBarEdit(codec::Handle),
+    BlockActionBarMove(codec::Handle, iced::Vector),
+    BlockActionBarHide(codec::Handle),
     /// Live edit of the name or formula in row `idx`.
     NamedParametersInput {
         idx: usize,
@@ -4541,6 +4652,8 @@ pub enum Message {
     FieldDialog(crate::ui::window::field_dialog::FieldDialogMsg),
     /// An edit in the Edit Reference dialog.
     RefEditDialog(crate::ui::window::refedit_dialog::RefEditDialogMsg),
+    /// An edit in the Password Protected PDF window.
+    PdfPassword(crate::ui::window::pdf_password_dialog::PdfPasswordMsg),
     PdfShxDialog(crate::ui::window::pdf_shx_dialog::ShxDialogMsg),
     /// A click or search in the Point Cloud Manager.
     PcManager(crate::ui::window::pc_manager::PcManagerMsg),
@@ -4788,7 +4901,12 @@ impl OpenCADStudio {
             block_save_as: None,
             block_visibility: None,
             block_lookup: None,
+            block_properties_table: None,
             block_visibility_mode: false,
+            block_editor_preferences: settings::BlockEditorPreferences::default(),
+            block_editor_settings: None,
+            block_cycle_order: None,
+            block_dependency_cache: std::cell::RefCell::new(None),
             pdf_attach: None,
             point_cloud_attach: None,
             attdef_dialog: None,
@@ -4800,6 +4918,7 @@ impl OpenCADStudio {
             view_background: None,
             image_adjust: None,
             refedit_dialog: None,
+            pdf_password: None,
             pdf_shx_dialog: None,
             underlay_layers: None,
             pdf_import_settings: None,
@@ -4898,6 +5017,7 @@ impl OpenCADStudio {
             constraint_form_annotational: false,
             dim_constraint_last: "Aligned",
             suppress_plugin_dispatch: false,
+            plugin_request_active: false,
             constraint_bar_mode: 4095,
             savetime_min: 10,
             script_commands: true,
@@ -4926,12 +5046,20 @@ impl OpenCADStudio {
             dyn_user_reshaped: false,
             dyn_coord_absolute: false,
             grip_hover: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_hover: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_deliveries: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_live_originals: Vec::new(),
             grip_popup: None,
             grip_pending: None,
             visibility_popup: None,
+            table_popup: None,
             grip_add_provisional: None,
             grip_preview_handles: Vec::new(),
             hover_dwell: None,
+            snap_dwell: None,
             constraint_glyph_tooltip: None,
             grip_originals: Vec::new(),
             grip_history_originals: Vec::new(),
@@ -5069,6 +5197,8 @@ impl OpenCADStudio {
             plugin_readme_loading: rustc_hash::FxHashSet::default(),
             marketplace_status: String::new(),
             point_size_buf: String::new(),
+            point_style_tab_id: None,
+            point_mode_buf: None,
             point_size_relative: true,
             default_assoc_prompted: false,
             check_missing_fonts: true,
@@ -5154,6 +5284,7 @@ impl OpenCADStudio {
                 )
             })
             .ok(),
+            plotstyle_panel_baseline: None,
             // Color scheme (default: Oxocarbon)
             active_theme: Theme::Oxocarbon,
             ui_theme: config::UiThemeConfig::default(),

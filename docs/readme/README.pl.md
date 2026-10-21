@@ -91,9 +91,9 @@ Aplikacja jest podpisana ad hoc, ale obecnie nie jest notaryzowana przez Apple.
 
 ## Języki
 
-Open CAD Studio może korzystać z języka systemu lub jednego z 22 języków interfejsu:
+Open CAD Studio może korzystać z języka systemu lub jednego z 23 języków interfejsu:
 
-> Arabski · Portugalski brazylijski · Bułgarski · Czeski · Niderlandzki · Angielski · Fiński · Francuski · Niemiecki · Grecki · Hindi · Węgierski · Włoski · Japoński · Koreański · Laotański · Polski · Rosyjski · Chiński uproszczony · Hiszpański · Chiński tradycyjny · Turecki
+> Arabski · Portugalski brazylijski · Bułgarski · Czeski · Niderlandzki · Angielski · Fiński · Francuski · Niemiecki · Grecki · Hindi · Węgierski · Włoski · Japoński · Koreański · Laotański · Polski · Rosyjski · Chiński uproszczony · Hiszpański · Chiński tradycyjny · Turecki · Wietnamski
 
 Język zmienisz w ustawieniach aplikacji. Gdy wybrano **System**, wersja przeglądarkowa używa także preferowanych ustawień regionalnych przeglądarki.
 

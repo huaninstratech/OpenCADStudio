@@ -9,6 +9,7 @@ pub mod mesh_model;
 pub mod object;
 pub mod ole_pres;
 pub mod pdf_layers;
+pub mod pdf_password;
 pub mod pdf_raster;
 pub mod pdf_vector;
 pub mod point_cloud;

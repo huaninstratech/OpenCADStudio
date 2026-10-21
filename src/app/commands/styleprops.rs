@@ -284,6 +284,12 @@ impl OpenCADStudio {
                 // (nested blocks, layers, linetypes, styles), so those become
                 // purgeable on the next pass — repeat until a pass removes
                 // nothing, so one PURGE does what re-running it used to.
+                // Xref-dependent records (`Xref|Name`) belong to the xref and
+                // come back with its next reload, so they are never purged —
+                // also when the xref did not resolve and nothing in the host
+                // draws on them (#1929). Blocks get the same rule in
+                // `block_service::protected_reason`.
+                let xref_dependent = |name: &str, flagged: bool| flagged || name.contains('|');
                 let (mut n_layers, mut n_styles, mut n_lts, mut n_blocks) =
                     (0usize, 0usize, 0usize, 0usize);
                 let mut snapshot_pushed = false;
@@ -371,7 +377,9 @@ impl OpenCADStudio {
                             .layers
                             .iter()
                             .filter(|l| {
-                                l.name != "0" && !used_layers.contains(&l.name.to_uppercase())
+                                l.name != "0"
+                                    && !xref_dependent(&l.name, l.flags.xref_dependent)
+                                    && !used_layers.contains(&l.name.to_uppercase())
                             })
                             .map(|l| l.name.clone())
                             .collect()
@@ -390,6 +398,7 @@ impl OpenCADStudio {
                                 !s.name.is_empty()
                                     && !s.is_shape_file
                                     && !s.name.eq_ignore_ascii_case("Standard")
+                                    && !xref_dependent(&s.name, s.xref_dependent)
                                     && !used_text_styles.contains(&s.name.to_uppercase())
                                     && !linetype_styles.contains(&s.handle)
                             })
@@ -407,6 +416,7 @@ impl OpenCADStudio {
                             .iter()
                             .filter(|lt| {
                                 !standard.iter().any(|s| s.eq_ignore_ascii_case(&lt.name))
+                                    && !xref_dependent(&lt.name, lt.xref_dependent)
                                     && !used_linetypes.contains(&lt.name.to_uppercase())
                             })
                             .map(|lt| lt.name.clone())
@@ -1153,6 +1163,7 @@ impl OpenCADStudio {
                     | "SHORTCUTMENUDURATION"
                     | "CURSORSIZE"
                     | "PICKBOX"
+                    | "APERTURE"
                     | "HPASSOC"
                     | "COMMANDLINEOPACITY"
                     | "MENUBAR"
@@ -1169,6 +1180,7 @@ impl OpenCADStudio {
                     | "REGENMODE"
                     | "BLIPMODE"
                     | "SPLFRAME"
+                    | "CAMERADISPLAY"
                     | "DELOBJ"
                     | "SOLIDHIST"
                     | "SHOWHIST"
@@ -1321,6 +1333,8 @@ impl OpenCADStudio {
                     self.command_line.push_info("SETVAR (view): UCSFOLLOW");
                     self.command_line
                         .push_info(&super::blockvars::setvar_listing());
+                    self.command_line
+                        .push_info(&super::block_editor_vars::setvar_listing());
                     self.command_line.push_info(
                         crate::t!("SETVAR: CETRANSPARENCY LTSCALE CELTSCALE PDMODE PDSIZE TEXTSIZE ORTHOMODE FILLMODE MIRRTEXT FRAME IMAGEFRAME PDFFRAME WIPEOUTFRAME XCLIPFRAME POINTCLOUDCLIPFRAME ZOOMWHEEL ZOOMFACTOR SHORTCUTMENU SHORTCUTMENUDURATION CURSORSIZE PICKBOX CURSORTYPE SNAPANG TEXTFILL CLIPROMPTLINES COMMANDLINEFADETIME ATTREQ ATTDIA DIMASSOC DIMCONTINUEMODE CONSTRAINTSOLVEMODE CONSTRAINTINFER CONSTRAINTBARDISPLAY CONSTRAINTBARMODE CONSTRAINTNAMEFORMAT DYNCONSTRAINTDISPLAY DYNMODE ANGBASE ANGDIR SKETCHINC SKPOLY SKTOLERANCE DONUTID DONUTOD CENTEREXE CENTERLAYER CENTERLTYPE CENTERLTSCALE CENTERLTYPEFILE CENTERCROSSSIZE CENTERCROSSGAP CENTERMARKEXE COLORTHEME SELECTIONAREA SELECTIONAREAOPACITY SELECTIONEFFECT SELECTIONEFFECTCOLOR WINDOWSAREACOLOR CROSSINGAREACOLOR SELECTIONPREVIEW GRIPSIZE GRIPCOLOR GRIPHOT GRIPHOVER GRIPOBJLIMIT | CLAYER CELTYPE TEXTSTYLE (read-only)").as_ref(),
                     );
@@ -2415,7 +2429,11 @@ impl OpenCADStudio {
                                         self.zoom_factor = factor;
                                         Ok((format!("ZOOMFACTOR = {factor}"), true))
                                     }
-                                    _ => Err("SETVAR: integer from 3 to 500 required.".into()),
+                                    _ => Err(format!(
+                                        "SETVAR: integer from {} to {} required.",
+                                        crate::app::settings::ZOOM_FACTOR_MIN,
+                                        crate::app::settings::ZOOM_FACTOR_MAX
+                                    )),
                                 },
                                 None => Ok((format!("ZOOMFACTOR = {}", self.zoom_factor), false)),
                             },
@@ -2490,6 +2508,27 @@ impl OpenCADStudio {
                                 },
                                 None => Ok((format!("PICKBOX = {}", self.pick_box), false)),
                             },
+                            "APERTURE" => {
+                                let (min, max) = (
+                                    crate::snap::MIN_OSNAP_RADIUS_PX,
+                                    crate::snap::MAX_OSNAP_RADIUS_PX,
+                                );
+                                match &value {
+                                    Some(v) => match v.parse::<i32>() {
+                                        Ok(px) if (min as i32..=max as i32).contains(&px) => {
+                                            self.snapper.osnap_radius_px = px as f32;
+                                            Ok((format!("APERTURE = {px}"), true))
+                                        }
+                                        _ => Err(format!(
+                                            "SETVAR: integer from {min} to {max} required."
+                                        )),
+                                    },
+                                    None => Ok((
+                                        format!("APERTURE = {}", self.snapper.osnap_radius_px),
+                                        false,
+                                    )),
+                                }
+                            }
                             "MENUBAR" => match value.as_deref() {
                                 Some(v @ ("0" | "1")) => {
                                     self.show_menu_bar = v == "1";
@@ -2961,6 +3000,18 @@ impl OpenCADStudio {
                                 None => {
                                     Ok((format!("SPLFRAME = {}", h.spline_frame as i32), false))
                                 }
+                            },
+                            "CAMERADISPLAY" => match &value {
+                                Some(v) => parse_bool(v)
+                                    .map(|b| {
+                                        h.camera_display = b;
+                                        (format!("CAMERADISPLAY = {}", b as i32), true)
+                                    })
+                                    .ok_or_else(|| "SETVAR: 0 or 1 required.".into()),
+                                None => Ok((
+                                    format!("CAMERADISPLAY = {}", h.camera_display as i32),
+                                    false,
+                                )),
                             },
                             "DELOBJ" => match &value {
                                 Some(v) => v
@@ -3474,6 +3525,7 @@ impl OpenCADStudio {
                                         | "SHORTCUTMENUDURATION"
                                         | "CURSORSIZE"
                                         | "PICKBOX"
+                                        | "APERTURE"
                                         | "HPASSOC"
                                         | "COMMANDLINEOPACITY"
                                         | "MENUBAR"
@@ -3508,7 +3560,7 @@ impl OpenCADStudio {
                                 } else {
                                     self.tabs[i].dirty = true;
                                 }
-                                if name == "FILLMODE" {
+                                if name == "FILLMODE" || name == "CAMERADISPLAY" {
                                     self.tabs[i].scene.bump_geometry();
                                 }
                                 if matches!(name.as_str(), "PSLTSCALE" | "PLIMCHECK") {
@@ -4154,13 +4206,7 @@ impl OpenCADStudio {
                 }
             }
             cmd if cmd == "DDPTYPE" || cmd == "PTYPE" => {
-                // The dialog shows the magnitude; the sign (relative/absolute)
-                // is driven by the radio buttons. A positive PDSIZE is absolute;
-                // zero or negative is relative.
-                let pdsize = self.tabs[i].scene.document.header.point_display_size;
-                self.point_size_relative = pdsize <= 0.0;
-                self.point_size_buf = format!("{}", pdsize.abs());
-                self.active_modal = Some(super::super::ModalKind::PointStyle);
+                self.begin_point_style_dialog();
             }
             "LWDISPLAY" => {
                 use crate::command::ValuePromptCommand;
@@ -4463,21 +4509,21 @@ mod tests {
     fn setvar_zoomfactor_keeps_the_range_of_the_system_variable() {
         let mut app = fresh_app();
 
-        let _ = app.run_command_line("SETVAR ZOOMFACTOR 500");
-        assert_eq!(app.zoom_factor, 500);
+        let _ = app.run_command_line("SETVAR ZOOMFACTOR 200");
+        assert_eq!(app.zoom_factor, 200);
 
-        let _ = app.run_command_line("SETVAR ZOOMFACTOR 501");
+        let _ = app.run_command_line("SETVAR ZOOMFACTOR 201");
         assert_eq!(
-            app.zoom_factor, 500,
-            "501 is not a value the variable takes"
+            app.zoom_factor, 200,
+            "201 is not a value the variable takes"
         );
 
         let _ = app.run_command_line("SETVAR ZOOMFACTOR 2");
-        assert_eq!(app.zoom_factor, 500, "and neither is 2");
+        assert_eq!(app.zoom_factor, 200, "and neither is 2");
 
         // What the Options field reached is still reported here.
-        let _ = app.update(crate::app::Message::ZoomFactorInputChanged("250".into()));
-        assert_eq!(app.zoom_factor, 250);
+        let _ = app.update(crate::app::Message::ZoomFactorInputChanged("150".into()));
+        assert_eq!(app.zoom_factor, 150);
         let _ = app.run_command_line("SETVAR ZOOMFACTOR 60");
         assert_eq!(app.zoom_factor, 60);
     }

@@ -321,6 +321,7 @@ pub(super) const PROP_LW_ID: &str = "PROP_LW";
 
 // ── Style context (passed from Ribbon to render_large) ────────────────────
 
+#[derive(Clone, Copy)]
 pub(super) struct StyleContext<'a> {
     pub text_style_names: &'a [String],
     pub active_text_style: &'a str,

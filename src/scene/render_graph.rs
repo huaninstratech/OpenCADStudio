@@ -354,7 +354,7 @@ impl<'a> RenderSceneGraph<'a> {
                 .get(&handle.value())
                 .map_or(0.0, |depth| depth[0]);
             let context = InstanceContext::direct(direct_depth, viewport);
-            if !self.document_visible(entity) || !visible(entity, &context) {
+            if !self.document_visible(entity, false) || !visible(entity, &context) {
                 continue;
             }
             if let EntityType::Insert(insert) = entity {
@@ -412,7 +412,9 @@ impl<'a> RenderSceneGraph<'a> {
             .get(&root_handle.value())
             .map_or(0.0, |depth| depth[0]);
         let context = InstanceContext::direct(depth_base, self.viewport);
-        if self.document_visible(&entity) && visible(&entity, &context) {
+        // The caller has already shown the owning object; the placement itself
+        // is often synthetic (an arrowhead on layer 0), so layer 0 defers.
+        if self.document_visible(&entity, true) && visible(&entity, &context) {
             self.walk_insert_instances(&root_insert, scale_policy, &context, visible, leaf);
         }
     }
@@ -519,7 +521,7 @@ impl<'a> RenderSceneGraph<'a> {
                 self.annotation_scale_handle,
             );
             let entity = contextual.as_ref();
-            if !self.document_visible(entity) || !visible(entity, context) {
+            if !self.document_visible(entity, true) || !visible(entity, context) {
                 continue;
             }
             match entity {
@@ -584,7 +586,9 @@ impl<'a> RenderSceneGraph<'a> {
         }
     }
 
-    fn document_visible(&self, entity: &EntityType) -> bool {
+    /// `member`: the entity sits inside a block, where layer 0 defers to the
+    /// layer of the reference that places it.
+    fn document_visible(&self, entity: &EntityType, member: bool) -> bool {
         let common = entity.common();
         if common.invisible
             && !self
@@ -594,9 +598,8 @@ impl<'a> RenderSceneGraph<'a> {
             return false;
         }
         let layer = self.document.layers.get(&common.layer);
-        if layer
-            .map(|layer| layer.flags.off || layer.flags.frozen)
-            .unwrap_or(false)
+        if (member && block_member_layer_hidden(self.document, &common.layer))
+            || (!member && layer.is_some_and(|layer| layer.flags.off || layer.flags.frozen))
         {
             return false;
         }
@@ -613,6 +616,17 @@ impl<'a> RenderSceneGraph<'a> {
             self.all_visible,
         )
     }
+}
+
+/// Whether a block member on `layer` is hidden by its layer. Frozen layers
+/// hide it; layer 0 being off does not, since a member on layer 0 shows on the
+/// layer of the reference that places it, which the caller has checked.
+/// (#1916)
+pub(crate) fn block_member_layer_hidden(document: &CadDocument, layer: &str) -> bool {
+    document.layers.get(layer).is_some_and(|record| {
+        record.flags.frozen
+            || (record.flags.off && !crate::scene::view::render::is_effective_layer_zero(layer))
+    })
 }
 
 pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
@@ -1166,6 +1180,34 @@ mod tests {
 
         assert!((from_insert.x - 12.0).abs() < 1.0e-9);
         assert!((applied.x - 11.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn layer_zero_block_members_follow_the_reference_until_frozen() {
+        use codec::entities::Line;
+        use codec::tables::BlockRecord;
+        let mut document = CadDocument::new();
+        let mut record = BlockRecord::new("ARROW");
+        record.handle = document.allocate_handle();
+        let block = record.handle;
+        document.block_records.add(record).unwrap();
+        let mut line = Line::from_points(Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0));
+        line.common.owner_handle = block;
+        document.add_entity(EntityType::Line(line)).unwrap();
+        let leaves = |document: &CadDocument| {
+            let depths = rustc_hash::FxHashMap::default();
+            let graph = RenderSceneGraph::new(document, None, None, true, &depths);
+            let arrow = block_use_from_handle(document, block, BlockRole::ArrowHead, Vector3::ZERO)
+                .unwrap();
+            let mut count = 0;
+            graph.walk_block_use(&arrow, block, |_, _| true, |_, _| count += 1);
+            count
+        };
+
+        document.layers.get_mut("0").unwrap().flags.off = true;
+        assert_eq!(leaves(&document), 1);
+        document.layers.get_mut("0").unwrap().flags.frozen = true;
+        assert_eq!(leaves(&document), 0);
     }
 
     #[test]

@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use hayro::hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
-use hayro::hayro_syntax::Pdf;
 
 use super::pdf_raster::{register_derived_source, source_bytes};
 
@@ -21,15 +20,32 @@ pub struct PdfLayer {
     object: (i32, i32),
 }
 
-fn text_string(bytes: &[u8]) -> String {
-    if bytes.starts_with(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = bytes[2..]
+/// A PDF text string: UTF-16 with a byte-order mark (big-endian per the
+/// standard; some producers write little-endian), UTF-8 with its mark, else
+/// PDFDocEncoding read as Latin-1. Trailing NULs some producers append are
+/// dropped.
+pub(crate) fn text_string(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], le: bool| {
+        let units: Vec<u16> = rest
             .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .map(|c| {
+                let pair = [c[0], c[1]];
+                if le {
+                    u16::from_le_bytes(pair)
+                } else {
+                    u16::from_be_bytes(pair)
+                }
+            })
             .collect();
-        return String::from_utf16_lossy(&units);
-    }
-    bytes.iter().map(|&b| b as char).collect()
+        String::from_utf16_lossy(&units)
+    };
+    let text = match bytes {
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => bytes.iter().map(|&b| b as char).collect(),
+    };
+    text.trim_end_matches(char::from(0)).to_string()
 }
 
 /// The layers a PDF declares, in file order.
@@ -37,7 +53,7 @@ pub fn layers(path: &str) -> Vec<PdfLayer> {
     let Some(bytes) = source_bytes(path) else {
         return Vec::new();
     };
-    let Ok(pdf) = Pdf::new(bytes) else {
+    let Ok(pdf) = super::pdf_password::open(path, bytes) else {
         return Vec::new();
     };
     let xref = pdf.xref();
@@ -111,7 +127,8 @@ pub fn source_with_layers(path: &str, hidden: &[String]) -> String {
     if source_bytes(&key).is_some() {
         return key;
     }
-    let Some(updated) = source_bytes(path).and_then(|bytes| with_layer_config(&bytes, &all, &off))
+    let Some(updated) =
+        source_bytes(path).and_then(|bytes| with_layer_config(path, &bytes, &all, &off))
     else {
         return path.to_string();
     };
@@ -121,8 +138,13 @@ pub fn source_with_layers(path: &str, hidden: &[String]) -> String {
 
 /// The bytes with an incremental update whose catalog lists `off` layers
 /// as off in the default configuration and all others on.
-fn with_layer_config(bytes: &[u8], all: &[PdfLayer], off: &[&PdfLayer]) -> Option<Vec<u8>> {
-    let pdf = Pdf::new(Arc::new(bytes.to_vec())).ok()?;
+fn with_layer_config(
+    path: &str,
+    bytes: &[u8],
+    all: &[PdfLayer],
+    off: &[&PdfLayer],
+) -> Option<Vec<u8>> {
+    let pdf = super::pdf_password::open(path, Arc::new(bytes.to_vec())).ok()?;
     let xref = pdf.xref();
     let root = xref.root_id();
     let catalog = xref.get::<Dict<'_>>(root)?;

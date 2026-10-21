@@ -626,11 +626,36 @@ pub enum DgnGeom {
         just: u8,
         line_spacing: Option<f64>,
     },
-    /// A cell that is not shared: its name (empty when anonymous) and its
-    /// components, each with its own level and symbology.
+    /// A cell that is not shared: its name (empty when anonymous), its
+    /// origin and its components (already placed), each with its own level
+    /// and symbology.
     CellGroup {
         name: String,
+        origin: P3,
         parts: Vec<DgnElement>,
+    },
+    /// A dimension (V8, in the XY plane): its type (1 linear, 5 angle,
+    /// 11 radius, 12 diameter), its points, the dimension line's offset
+    /// from the last point (along `axes[1]`) and its x and y axes; `style`
+    /// is its dimension style's id.
+    Dimension {
+        kind: u8,
+        points: Vec<P3>,
+        offset: f64,
+        axes: [[f64; 2]; 2],
+        style: u32,
+    },
+    /// A note's leader (V8): its points, the arrow first, and its
+    /// dimension style's id.
+    Leader {
+        points: Vec<P3>,
+        style: u32,
+    },
+    /// A mesh (V8): its points and its face loops, each corner a 1-based
+    /// point number, negative when the edge from it to the next is hidden.
+    Mesh {
+        points: Vec<P3>,
+        loops: Vec<Vec<i32>>,
     },
     /// A shared cell instance: x' = m[0]·x + m[1]·y + origin.x,
     /// y' = m[2]·x + m[3]·y + origin.y.
@@ -645,12 +670,33 @@ pub enum DgnGeom {
 
 impl DgnGeom {
     /// The geometry through x' = s·x + t (lengths scaled by `s`).
-    pub fn scaled(&self, s: f64, t: [f64; 2]) -> DgnGeom {
-        let p = |q: P3| [q[0] * s + t[0], q[1] * s + t[1], q[2] * s];
+    pub fn scaled(&self, s: f64, t: P3) -> DgnGeom {
+        let p = |q: P3| [q[0] * s + t[0], q[1] * s + t[1], q[2] * s + t[2]];
         let v = |q: P3| [q[0] * s, q[1] * s, q[2] * s];
         match self {
             DgnGeom::Line(a, b) => DgnGeom::Line(p(*a), p(*b)),
             DgnGeom::Points(pts) => DgnGeom::Points(pts.iter().map(|q| p(*q)).collect()),
+            DgnGeom::Dimension {
+                kind,
+                points,
+                offset,
+                axes,
+                style,
+            } => DgnGeom::Dimension {
+                kind: *kind,
+                points: points.iter().map(|q| p(*q)).collect(),
+                offset: offset * s,
+                axes: *axes,
+                style: *style,
+            },
+            DgnGeom::Leader { points, style } => DgnGeom::Leader {
+                points: points.iter().map(|q| p(*q)).collect(),
+                style: *style,
+            },
+            DgnGeom::Mesh { points, loops } => DgnGeom::Mesh {
+                points: points.iter().map(|q| p(*q)).collect(),
+                loops: loops.clone(),
+            },
             DgnGeom::Arc {
                 center,
                 u,
@@ -676,8 +722,13 @@ impl DgnGeom {
                 closed: *closed,
             },
             DgnGeom::Chain(parts) => DgnGeom::Chain(parts.iter().map(|g| g.scaled(s, t)).collect()),
-            DgnGeom::CellGroup { name, parts } => DgnGeom::CellGroup {
+            DgnGeom::CellGroup {
+                name,
+                origin,
+                parts,
+            } => DgnGeom::CellGroup {
                 name: name.clone(),
+                origin: p(*origin),
                 parts: scaled_elements(parts, s, t),
             },
             DgnGeom::TextNode {
@@ -813,8 +864,12 @@ pub struct DgnImport {
     pub v7: bool,
     /// The model's reference attachments.
     pub references: Vec<DgnReference>,
-    /// The text style table (V8): each style's id and name.
-    pub text_styles: Vec<(u32, String)>,
+    /// The text style table (V8): each style's id, name and font file.
+    pub text_styles: Vec<(u32, String, String)>,
+    /// The dimension style table (V8): each style's id and name.
+    pub dim_styles: Vec<(u32, String)>,
+    /// A 3D V7 file.
+    pub three_d: bool,
 }
 
 /// A reference attachment of a DGN model: the file and model it shows and
@@ -831,7 +886,7 @@ pub struct DgnReference {
 }
 
 /// The elements through x' = s·x + t.
-pub fn scaled_elements(elements: &[DgnElement], s: f64, t: [f64; 2]) -> Vec<DgnElement> {
+pub fn scaled_elements(elements: &[DgnElement], s: f64, t: P3) -> Vec<DgnElement> {
     elements
         .iter()
         .map(|e| DgnElement {

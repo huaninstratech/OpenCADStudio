@@ -16,7 +16,7 @@ pub fn tool() -> ToolDef {
 use codec::Handle;
 use glam::DVec3;
 
-use crate::command::{CadCommand, CmdResult};
+use crate::command::{CadCommand, CmdResult, SelectionHoverPreview};
 use crate::scene::model::wire_model::WireModel;
 use crate::scene::Scene;
 
@@ -66,7 +66,7 @@ impl CadCommand for MatchPropCommand {
         if self.phase1_done() || handle.is_null() {
             return vec![];
         }
-        scene.fill_hover_preview_wires(handle)
+        scene.matchprop_source_highlight_wires(handle)
     }
 
     fn on_entity_pick(&mut self, handle: Handle, _pt: DVec3) -> CmdResult {
@@ -91,6 +91,37 @@ impl CadCommand for MatchPropCommand {
             dest: handles,
             src: self.src,
         }
+    }
+
+    fn selection_hover_preview_enabled(&self) -> bool {
+        self.phase1_done()
+    }
+
+    fn selection_hover_preview(
+        &self,
+        scene: &Scene,
+        hovered: Option<Handle>,
+    ) -> Option<SelectionHoverPreview> {
+        if !self.phase1_done() {
+            return None;
+        }
+
+        let mut preview = SelectionHoverPreview::default();
+        // The source is the property reference for the command's entire
+        // lifetime, so keep its glow through every destination application.
+        preview
+            .wires
+            .extend(scene.matchprop_source_highlight_wires(self.src));
+        if let Some(target) = hovered.filter(|target| *target != self.src) {
+            if let Some((mut wires, hatches)) = scene.matchprop_target_preview(self.src, target) {
+                preview
+                    .wires
+                    .extend(scene.matchprop_target_glow_wires(&wires));
+                preview.wires.append(&mut wires);
+                preview.hatches = hatches;
+            }
+        }
+        Some(preview)
     }
 
     fn on_enter(&mut self) -> CmdResult {

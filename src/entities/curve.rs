@@ -474,6 +474,20 @@ pub fn entity_with_lwpolyline_world_xy(entity: &EntityType) -> EntityType {
     }
 }
 
+/// Owned counterpart to [`entity_with_lwpolyline_world_xy`].
+///
+/// Modify commands already own their entity list. Keep non-polyline entities
+/// in place instead of cloning the entire drawing a second time while
+/// normalizing the small subset that needs it.
+pub fn entity_with_lwpolyline_world_xy_owned(entity: EntityType) -> EntityType {
+    match entity {
+        EntityType::LwPolyline(polyline) => lwpolyline_world_xy(&polyline)
+            .map(EntityType::LwPolyline)
+            .unwrap_or(EntityType::LwPolyline(polyline)),
+        entity => entity,
+    }
+}
+
 /// World-space wire points sampled by the kernel's angular policy.
 pub fn curve_points(curve: &PlanarCurve) -> Vec<[f64; 3]> {
     curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)

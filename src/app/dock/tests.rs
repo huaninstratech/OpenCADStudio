@@ -1249,10 +1249,167 @@ fn block_actions_palette_controls_require_compatible_parameters_and_start_comman
 }
 
 #[test]
+fn block_actions_set_ribbon_flyout_starts_action_selection_and_uses_preselected_marker() {
+    with_stack(|| {
+        use crate::scene::block_actions::{self as actions, Kind};
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BACTIONBARMODE 0");
+        let i = app.active_tab;
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 10,0 5,2");
+        let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+        let p = actions::parameters(&app.tabs[i].scene.document, def, Kind::Move)[0].handle;
+        let targets = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("AUTHOR")
+            .unwrap()
+            .entity_handles
+            .clone();
+        let a = actions::create(
+            &mut app.tabs[i].scene.document,
+            def,
+            Kind::Move,
+            p,
+            &targets,
+            glam::DVec3::new(3., 4., 0.),
+        )
+        .unwrap();
+        app.tabs[i].selected_authoring = Some(a);
+        app.ribbon
+            .set_collapse_mode(crate::ui::ribbon::CollapseMode::Collapsed);
+        // The top-level Manage tab has the same label as this panel opener.
+        // Open the existing panel, then click the new command in its real flyout.
+        let _ = app.update(Message::ToggleRibbonPanel("Manage".into()));
+        assert_eq!(app.ribbon.collapsed_open.as_deref(), Some("Manage"));
+        let messages = {
+            let mut simulator = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                VIEW_SIZE,
+                app.view_main(),
+            );
+            simulator
+                .click("Action Selection")
+                .expect("action selection in Manage flyout");
+            simulator.into_messages().collect::<Vec<_>>()
+        };
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(
+            app.tabs[i].active_cmd.as_ref().unwrap().name(),
+            "BACTIONSET"
+        );
+        assert!(app.tabs[i]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .contains("New/Add/Remove"));
+        let _ = app.feed_command(crate::command::StepInput::Enter);
+        assert!(app.tabs[i]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .is_selection_gathering());
+        let before = app.tabs[i].scene.document.clone();
+        let _ = app.update(Message::CommandEscape);
+        assert_eq!(app.tabs[i].scene.document, before);
+    });
+}
+
+#[test]
+fn block_actions_stretch_palette_requires_distance_parameter() {
+    with_stack(|| {
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        app.authoring_palette_tab = crate::ui::window::authoring_palettes::Tab::Actions;
+        let point = authoring_control(&app, "authoring-tool-stretch-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 10,0 5,2");
+        let point = authoring_control(&app, "authoring-tool-stretch-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .contains("Stretch"));
+    });
+}
+
+#[test]
+fn block_actions_array_palette_requires_distance_parameter() {
+    with_stack(|| {
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        app.authoring_palette_tab = crate::ui::window::authoring_palettes::Tab::Actions;
+        let point = authoring_control(&app, "authoring-tool-array-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        let _ = app.run_command_line("BPARAMETER POINT 0.5,0.5 0.7,0.7");
+        let point = authoring_control(&app, "authoring-tool-array-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 10,0 5,2");
+        let point = authoring_control(&app, "authoring-tool-array-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .contains("Array"));
+    });
+}
+
+#[test]
+fn block_actions_rotate_flip_palette_requires_matching_parameters() {
+    with_stack(|| {
+        use crate::ui::window::authoring_palettes::Tab;
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        let point = authoring_control(&app, Tab::Actions.widget_id());
+        authoring_click(&mut app, point);
+        for id in ["authoring-tool-rotate-action", "authoring-tool-flip-action"] {
+            let point = authoring_control(&app, id);
+            authoring_click(&mut app, point);
+            assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        }
+        let _ = app.run_command_line("BPARAMETER ROTATION 0,0 2 0");
+        let point = authoring_control(&app, "authoring-tool-flip-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        let point = authoring_control(&app, "authoring-tool-rotate-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .contains("Rotate"));
+        let _ = app.update(Message::CommandEscape);
+        let _ = app.run_command_line("BPARAMETER FLIP 0,0 2,0 -1,1");
+        let point = authoring_control(&app, "authoring-tool-flip-action");
+        authoring_click(&mut app, point);
+        assert!(app.tabs[app.active_tab]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .contains("Flip"));
+    });
+}
+
+#[test]
 fn lookup_basepoint_palette_and_table_dialog_real_controls() {
     with_stack(|| {
         use crate::ui::window::{authoring_palettes::Tab, block_lookup::Action as A};
         let mut app = authoring_app();
+        // The palette's lookup-table tool is for palette mode; with action
+        // bars on it points to the Lookup parameter's bar instead.
+        let _ = app.dispatch_command("BACTIONBARMODE 0");
         let _ = app.dispatch_command("BAUTHORPALETTE");
         for (id, point_text) in [
             ("authoring-tool-basepoint", "0.2,0.1"),
@@ -1304,6 +1461,80 @@ fn lookup_basepoint_palette_and_table_dialog_real_controls() {
         )
         .unwrap()
         .is_some());
+    });
+}
+
+#[test]
+fn block_properties_table_palette_dialog_authors_rows() {
+    with_stack(|| {
+        use crate::ui::window::{authoring_palettes::Tab, block_properties_table::Action as A};
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 1,0 0,0.3");
+        let point = authoring_control(&app, Tab::Actions.widget_id());
+        authoring_click(&mut app, point);
+        let point = authoring_control(&app, "authoring-tool-properties-table");
+        authoring_click(&mut app, point);
+        assert_eq!(
+            app.active_modal,
+            Some(crate::app::ModalKind::BlockPropertiesTable)
+        );
+        let _ = app.update(Message::BlockPropertiesTable(A::Property(0)));
+        let point = find_in_view(&app, "Add Property");
+        authoring_click(&mut app, point);
+        let point = find_in_view(&app, "Add Row");
+        authoring_click(&mut app, point);
+        assert_eq!(app.block_properties_table.as_ref().unwrap().rows.len(), 1);
+        let _ = app.update(Message::BlockPropertiesTable(A::Cell(0, 0, "2.5".into())));
+        let point = find_in_view(&app, "OK");
+        authoring_click(&mut app, point);
+        assert!(app.block_properties_table.is_none());
+        assert!(app.active_modal.is_none());
+        let i = app.active_tab;
+        let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+        let view =
+            crate::scene::block_properties_table::table(&app.tabs[i].scene.document, definition)
+                .unwrap()
+                .expect("the table was written");
+        assert_eq!(view.columns.len(), 1);
+        assert_eq!(view.rows, vec![vec![2.5]]);
+    });
+}
+
+#[test]
+fn block_properties_table_apply_writes_undo_once_and_stale_edits_stay_open() {
+    with_stack(|| {
+        use crate::ui::window::block_properties_table::Action as A;
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 1,0 0,0.3");
+        let i = app.active_tab;
+        let history = app.tabs[i].history.undo_stack.len();
+        let _ = app.dispatch_command("BPROPERTIESTABLE");
+        assert_eq!(
+            app.active_modal,
+            Some(crate::app::ModalKind::BlockPropertiesTable)
+        );
+        let _ = app.update(Message::BlockPropertiesTable(A::Property(0)));
+        let _ = app.update(Message::BlockPropertiesTable(A::AddProperty));
+        let _ = app.update(Message::BlockPropertiesTable(A::AddRow));
+        let _ = app.update(Message::BlockPropertiesTable(A::Apply));
+        assert!(app.block_properties_table.is_none());
+        assert_eq!(app.tabs[i].history.undo_stack.len(), history + 1);
+        let _ = app.dispatch_command("BPROPERTIESTABLE");
+        assert!(app.block_properties_table.is_some());
+        let _ = app.update(Message::BlockPropertiesTable(A::Apply));
+        assert!(app.block_properties_table.is_none());
+        assert_eq!(app.tabs[i].history.undo_stack.len(), history + 1);
+        let _ = app.dispatch_command("BPROPERTIESTABLE");
+        app.tabs[i].scene.bump_geometry();
+        let _ = app.update(Message::BlockPropertiesTable(A::AddRow));
+        let _ = app.update(Message::BlockPropertiesTable(A::Apply));
+        assert!(app.block_properties_table.is_some());
+        assert!(app.block_properties_table.as_ref().unwrap().error.is_some());
+        let _ = app.update(Message::CloseModal);
+        assert!(app.block_properties_table.is_none());
+        assert!(app.active_modal.is_none());
     });
 }
 
@@ -1431,7 +1662,7 @@ fn authoring_click(app: &mut OpenCADStudio, point: iced::Point) {
 }
 
 #[test]
-fn authoring_palettes_real_tabs_switch_catalogs_and_unavailable_rows_stay_inert() {
+fn authoring_palettes_real_tabs_start_supported_rows_without_placing_until_picked() {
     with_stack(|| {
         use crate::ui::window::authoring_palettes::Tab;
         let mut app = authoring_app();
@@ -1475,7 +1706,7 @@ fn authoring_palettes_real_tabs_switch_catalogs_and_unavailable_rows_stay_inert(
                     .active_cmd
                     .as_ref()
                     .map(|command| command.name()),
-                Some(if tab == Tab::Parameters {
+                Some(if matches!(tab, Tab::Parameters | Tab::ParameterSets) {
                     "BPARAMETER"
                 } else {
                     "LINE"

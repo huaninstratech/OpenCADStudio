@@ -21,6 +21,18 @@ use iced::time::Instant;
 use iced::{mouse, Point, Task};
 
 impl OpenCADStudio {
+    pub(in crate::app) fn selected_dimstyle_is_read_only(&self) -> bool {
+        let Some(style) = self.tabs[self.active_tab]
+            .scene
+            .document
+            .dim_styles
+            .get(&self.dimstyle_selected)
+        else {
+            return true;
+        };
+        style.xref_dependent || style.name.contains('|')
+    }
+
     pub(in crate::app) fn mlstyle_mut(
         &mut self,
         tab: usize,
@@ -364,6 +376,17 @@ impl OpenCADStudio {
     pub(in crate::app) fn apply_dimstyle_bufs(&mut self, tab: usize) {
         let doc = &mut self.tabs[tab].scene.document;
 
+        // Merged xref dimstyles are identified by their `xref|style` name.
+        // The codec's dependency bit is cleared during merge, so use the
+        // stable imported-name marker here as well as the DWG/DXF flag.
+        let selected_name = self.dimstyle_selected.clone();
+        let Some(selected) = doc.dim_styles.get(&selected_name) else {
+            return;
+        };
+        if selected.xref_dependent || selected.name.contains('|') {
+            return;
+        }
+
         let text_style_handle = doc
             .text_styles
             .get(&self.ds_dimtxsty)
@@ -499,6 +522,9 @@ impl OpenCADStudio {
     /// Update a single string buffer field.
 
     pub(in crate::app) fn apply_ds_edit(&mut self, field: crate::app::DsField, val: String) {
+        if self.selected_dimstyle_is_read_only() {
+            return;
+        }
         use crate::app::DsField::*;
         match field {
             Dimdle => self.ds_dimdle = val,
@@ -570,6 +596,9 @@ impl OpenCADStudio {
     /// Toggle a boolean buffer field.
 
     pub(in crate::app) fn apply_ds_toggle(&mut self, field: crate::app::DsField) {
+        if self.selected_dimstyle_is_read_only() {
+            return;
+        }
         use crate::app::DsField::*;
         match field {
             Dimsd1 => self.ds_dimsd1 = !self.ds_dimsd1,
@@ -1258,6 +1287,9 @@ impl OpenCADStudio {
     }
 
     pub(super) fn on_ds_set_handle(&mut self, field: &'static str, value: String) -> Task<Message> {
+        if self.selected_dimstyle_is_read_only() {
+            return Task::none();
+        }
         let i = self.active_tab;
         let name = self.dimstyle_selected.clone();
         let is_lt = matches!(
@@ -1354,6 +1386,87 @@ mod ds_set_handle_tests {
         assert_eq!(
             ds.dimblk2, hb,
             "picking the first arrowhead must not touch the second"
+        );
+    }
+
+    #[test]
+    fn xref_dimstyle_is_read_only_and_rejects_direct_edits() {
+        let mut app = app_with_arrow_blocks();
+        let i = app.active_tab;
+        let name = app.dimstyle_selected.clone();
+        let before = app.tabs[i]
+            .scene
+            .document
+            .dim_styles
+            .get(&name)
+            .unwrap()
+            .dimdle;
+        app.tabs[i]
+            .scene
+            .document
+            .dim_styles
+            .get_mut(&name)
+            .unwrap()
+            .xref_dependent = true;
+        assert!(app.selected_dimstyle_is_read_only());
+
+        app.ds_dimdle = "123".to_string();
+        app.apply_dimstyle_bufs(i);
+        let _ = app.on_ds_set_handle("dimblk1", "ARROW_A".to_string());
+
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .dim_styles
+                .get(&name)
+                .unwrap()
+                .dimdle,
+            before
+        );
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .dim_styles
+                .get(&name)
+                .unwrap()
+                .dimblk1,
+            codec::types::Handle::NULL
+        );
+    }
+
+    #[test]
+    fn merged_xref_dimstyle_name_is_read_only() {
+        let mut app = app_with_arrow_blocks();
+        let i = app.active_tab;
+        let old_name = app.dimstyle_selected.clone();
+        let mut style = app.tabs[i]
+            .scene
+            .document
+            .dim_styles
+            .get(&old_name)
+            .unwrap()
+            .clone();
+        style.dimdle = 7.0;
+        let before = style.dimdle;
+        app.tabs[i].scene.document.dim_styles.remove(&old_name);
+        style.name = "ARCH|Imported".to_string();
+        app.tabs[i].scene.document.dim_styles.add_or_replace(style);
+        app.dimstyle_selected = "ARCH|Imported".to_string();
+
+        assert!(app.selected_dimstyle_is_read_only());
+        app.ds_dimdle = "456".to_string();
+        app.apply_dimstyle_bufs(i);
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .dim_styles
+                .get("ARCH|Imported")
+                .unwrap()
+                .dimdle,
+            before
         );
     }
 }

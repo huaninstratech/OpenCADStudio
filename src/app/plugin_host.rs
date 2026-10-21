@@ -18,6 +18,52 @@ pub(crate) struct HostSession<'a> {
     doc_store: Option<DocumentSnapshotStore<DocumentViewData>>,
 }
 
+/// A plugin request that drives commands: sets `plugin_request_active` (the
+/// driven commands join the plugin's open undo scope) and optionally
+/// suppresses the command-line echo. Both reset on drop, so a panicking
+/// command cannot leave the host quiet or the scope joined.
+struct PluginRequest<'s, 'a> {
+    session: &'s mut HostSession<'a>,
+    was_active: bool,
+    quiet: bool,
+}
+
+impl<'s, 'a> PluginRequest<'s, 'a> {
+    fn new(session: &'s mut HostSession<'a>, quiet: bool) -> Self {
+        let was_active = std::mem::replace(&mut session.app.plugin_request_active, true);
+        if quiet {
+            session.app.command_line.begin_quiet_replay();
+        }
+        Self {
+            session,
+            was_active,
+            quiet,
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for PluginRequest<'_, 'a> {
+    type Target = HostSession<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.session
+    }
+}
+
+impl std::ops::DerefMut for PluginRequest<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.session
+    }
+}
+
+impl Drop for PluginRequest<'_, '_> {
+    fn drop(&mut self) {
+        if self.quiet {
+            self.session.app.command_line.end_quiet_replay();
+        }
+        self.session.app.plugin_request_active = self.was_active;
+    }
+}
+
 impl<'a> HostSession<'a> {
     pub(crate) fn new(app: &'a mut OpenCADStudio, tab: usize) -> Self {
         Self {
@@ -140,7 +186,8 @@ impl<'a> HostSession<'a> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let key = (self.tab_id(), self.app.tabs[self.tab].scene.geometry_epoch);
-            if self.app.last_plugin_document != Some(key) {
+            let key_changed = self.app.last_plugin_document != Some(key);
+            if key_changed {
                 v4_support::publish_drawing_changed(key.0, key.1);
                 // The plain `DocumentChanged` follows the same immediate
                 // publish contract (API v9): a plugin-initiated write settles
@@ -149,9 +196,34 @@ impl<'a> HostSession<'a> {
                 v4_support::publish_document_changed(key.1);
             }
             v4_support::publish_document_view_v4(self.tab_id(), doc);
+            if key_changed {
+                // API v13 dirty regions: the plugin-write boundary carries
+                // the touched identity set, so consumers visit only what
+                // changed (empty sets mean "walk everything").
+                self.publish_plugin_dirty_regions();
+            }
             self.app.last_plugin_document =
                 Some((self.tab_id(), self.app.tabs[self.tab].scene.geometry_epoch));
         }
+    }
+
+    /// Take this tab's accumulated dirty-region set and broadcast it as
+    /// `DocumentChangedRegions` (API v13). The plugin-write path's twin of
+    /// the message-boundary publisher in `update::mod`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_plugin_dirty_regions(&mut self) {
+        let tab = &mut self.app.tabs[self.tab];
+        let (entities, records) = tab.take_plugin_dirty();
+        v4_support::publish_document_changed_regions(
+            tab.id,
+            tab.scene.geometry_epoch,
+            entities,
+            records,
+        );
+    }
+
+    fn geometry_epoch(&self) -> u64 {
+        self.app.tabs[self.tab].scene.geometry_epoch
     }
 
     /// Plugin-driven edits refresh the app-side selection caches exactly
@@ -355,6 +427,7 @@ impl<'a> HostSession<'a> {
         if self.prepare_scripted_raster_image(&mut entity).is_err() {
             return Handle::NULL;
         }
+        let epoch = self.geometry_epoch();
         if self.normalize_scripted_entity(None, &mut entity).is_err() {
             return Handle::NULL;
         }
@@ -382,11 +455,13 @@ impl<'a> HostSession<'a> {
             {
                 return Handle::NULL;
             }
+            self.app.tabs[self.tab].mark_plugin_entity_dirty(handle, epoch);
             self.publish_document_view();
             return handle;
         }
         let handle = self.app.tabs[self.tab].scene.add_entity(entity);
         self.app.sync_registered_layers(self.tab);
+        self.app.tabs[self.tab].mark_plugin_entity_dirty(handle, epoch);
         self.publish_document_view();
         handle
     }
@@ -398,8 +473,12 @@ impl<'a> HostSession<'a> {
             // simply keeps its supplied (unnormalized) vertices.
             let _ = self.normalize_scripted_entity(None, entity);
         }
+        let epoch = self.geometry_epoch();
         let handles = self.app.tabs[self.tab].scene.add_entities(entities);
         self.app.sync_registered_layers(self.tab);
+        for handle in &handles {
+            self.app.tabs[self.tab].mark_plugin_entity_dirty(*handle, epoch);
+        }
         self.publish_document_view();
         handles
     }
@@ -410,7 +489,17 @@ impl<'a> HostSession<'a> {
 
     /// Replace the entity carrying `entity`'s handle in place, refreshing the
     /// scene's derived caches. Returns `false` when no entity has that handle.
-    pub fn update_entity(&mut self, mut entity: EntityType) -> bool {
+    pub fn update_entity(&mut self, entity: EntityType) -> bool {
+        let result_handle = entity.common().handle;
+        // API v13 dirty regions: mark BEFORE the write's boundary publish
+        // (the inner publishes immediately) so the region set is complete
+        // when the notification rides.
+        let epoch = self.geometry_epoch();
+        self.app.tabs[self.tab].mark_plugin_entity_dirty(result_handle, epoch);
+        self.update_entity_inner(entity)
+    }
+
+    fn update_entity_inner(&mut self, mut entity: EntityType) -> bool {
         let old = self.document().get_entity(entity.common().handle).cloned();
         if self
             .normalize_scripted_entity(old.as_ref(), &mut entity)
@@ -472,15 +561,41 @@ impl<'a> HostSession<'a> {
                 return Err(format!("entity {handle:?} is on a locked layer"));
             }
         }
+        // API v13 dirty regions: mark every entity BEFORE the batch below
+        // (the inner publishes immediately) so the region set is complete
+        // when the notification rides.
+        let epoch = self.geometry_epoch();
+        for entity in &entities {
+            self.app.tabs[self.tab].mark_plugin_entity_dirty(entity.common().handle, epoch);
+        }
         self.push_undo(label);
+        // The plain entities ride ONE batched scene write: a single
+        // update_entities_plugin call publishes one geometry bump for the
+        // whole set, so the parametric constraint solver (which runs on the
+        // bump) sees the FINAL state of every entity at once. A per-entity
+        // loop here would solve over each half-updated intermediate and the
+        // constrained neighbors would drag the result off the written
+        // geometry (the plugin settle drift the consumer walk caught:
+        // bonded elements written one by one landed ~1e0 off the records).
+        // Nested attributes keep their special replace path (they are not
+        // scene-model entities).
+        let mut plain = Vec::with_capacity(entities.len());
         for entity in entities {
-            // Validation above makes this infallible while the session owns
-            // the document exclusively.
-            let updated = match entity {
-                EntityType::AttributeEntity(attribute) => self.replace_nested_attribute(attribute),
-                entity => self.app.tabs[self.tab].scene.update_entity_plugin(entity),
-            };
-            assert!(updated);
+            match entity {
+                EntityType::AttributeEntity(attribute) => {
+                    // Validation above makes this infallible while the
+                    // session owns the document exclusively.
+                    assert!(self.replace_nested_attribute(attribute));
+                }
+                entity => plain.push(entity),
+            }
+        }
+        if !plain.is_empty() {
+            let expected = plain.len();
+            let moved = self.app.tabs[self.tab].scene.update_entities_plugin(plain);
+            // Validation above makes the batch infallible while the session
+            // owns the document exclusively.
+            assert_eq!(moved, expected);
         }
         self.app.sync_registered_layers(self.tab);
         self.set_dirty();
@@ -550,6 +665,14 @@ impl<'a> HostSession<'a> {
     /// sync. Returns `false` when the entity is absent or on a locked layer
     /// (which `erase_entities` refuses to remove).
     pub fn remove_entity(&mut self, handle: Handle) -> bool {
+        // API v13 dirty regions: mark before the boundary publish; a removed
+        // handle still rides the set (consumers detect its absence).
+        let epoch = self.geometry_epoch();
+        self.app.tabs[self.tab].mark_plugin_entity_dirty(handle, epoch);
+        self.remove_entity_inner(handle)
+    }
+
+    fn remove_entity_inner(&mut self, handle: Handle) -> bool {
         if self.document().get_entity(handle).is_none() {
             let Some(EntityType::AttributeEntity(attribute)) = self.nested_attribute(handle) else {
                 return false;
@@ -645,6 +768,10 @@ impl<'a> HostSession<'a> {
         if let Some(ah) = app_handle {
             xd.raw_dwg_eed.retain(|(a, _)| *a != ah);
         }
+        // API v13 dirty regions: the touched (entity, app) pair rides the
+        // boundary notification — marked BEFORE the publish that carries it.
+        let epoch = self.geometry_epoch();
+        self.app.tabs[self.tab].mark_plugin_record_dirty(handle, app, epoch);
         self.bump_geometry();
         self.set_dirty();
         self.publish_document_view();
@@ -1173,6 +1300,9 @@ impl<'a> HostSession<'a> {
 
     pub fn push_undo(&mut self, label: &str) {
         self.app.push_undo_snapshot(self.tab, label);
+        if let Some(pending) = self.app.tabs[self.tab].history.pending.as_mut() {
+            pending.plugin_owned = true;
+        }
     }
 
     pub fn set_dirty(&mut self) {
@@ -1518,6 +1648,17 @@ impl<'a> HostSession<'a> {
         &mut self,
         request: ocs_plugin_api::host::CommandRequest,
     ) -> Result<ocs_plugin_api::host::CommandOutcome, String> {
+        let quiet = matches!(
+            request,
+            ocs_plugin_api::host::CommandRequest::RunQuiet { .. }
+        );
+        PluginRequest::new(self, quiet).run_command_inner(request)
+    }
+
+    fn run_command_inner(
+        &mut self,
+        request: ocs_plugin_api::host::CommandRequest,
+    ) -> Result<ocs_plugin_api::host::CommandOutcome, String> {
         use crate::command::StepInput;
         use ocs_plugin_api::host::CommandRequest as R;
         if self.tab != self.app.active_tab {
@@ -1537,7 +1678,10 @@ impl<'a> HostSession<'a> {
         let modal_before = self.app.active_modal.is_some();
         self.app.command_line.unconsumed.clear();
         let task = match request {
-            R::Run { line } => {
+            // API v13: `RunQuiet` is `Run` with the command-line echo
+            // suppressed for the whole request (see `run_command`); errors
+            // still surface.
+            R::Run { line } | R::RunQuiet { line } => {
                 if line.trim().is_empty() {
                     return Err("a command line is empty".to_owned());
                 }
@@ -1618,7 +1762,9 @@ impl<'a> HostSession<'a> {
                         self.app.tabs[tab].scene.selected_handles_in_order(),
                     ),
                     R::Enter => StepInput::Enter,
-                    R::Run { .. } | R::Start { .. } | R::Cancel => unreachable!(),
+                    R::Run { .. } | R::Start { .. } | R::RunQuiet { .. } | R::Cancel => {
+                        unreachable!()
+                    }
                 };
                 self.app.feed_command(input)
             }
@@ -3088,6 +3234,9 @@ impl<'a> HostSession<'a> {
         record.raw_dwg_handle_bits = 0;
         record.raw_dwg_version = None;
         self.set_dirty();
+        // API v13 dirty regions — before the publish that carries them.
+        let epoch = self.geometry_epoch();
+        self.app.tabs[self.tab].mark_plugin_record_dirty(handle, "NOD".to_string(), epoch);
         self.publish_document_view();
         if own_scope {
             self.app.finish_pending_history(self.tab);
@@ -3217,6 +3366,236 @@ impl<'a> HostSession<'a> {
         if own_scope {
             self.app.finish_pending_history(self.tab);
         }
+        Ok(())
+    }
+
+    /// Enumerate an entity's built-in grips with viewport parity (API v11):
+    /// the same per-entity enumeration the selection cache builder produces —
+    /// whatever each entity module declares, generic over every entity type.
+    /// Reference-only entities and locked layers answer an empty list, the
+    /// same answer the viewport gives. This is a pure read: it opens no undo
+    /// scope, records nothing, and audits nothing.
+    pub fn entity_grips(
+        &self,
+        handle: Handle,
+    ) -> Result<Vec<ocs_plugin_api::host::GripInfo>, String> {
+        let grips = self.app.entity_grips_for(self.tab, handle)?;
+        Ok(grips
+            .into_iter()
+            .map(|grip| ocs_plugin_api::host::GripInfo {
+                grip_id: grip.id,
+                point: grip.world.to_array(),
+                moves_entity: grip.is_midpoint,
+                shape: format!("{:?}", grip.shape),
+                axis: grip.axis.map(|axis| axis.to_array()),
+            })
+            .collect())
+    }
+
+    /// Perform the grip edit an interactive drag performs (API v11): the ONE
+    /// shared pipeline (select → engage → move with snaps off → commit),
+    /// exactly one undo step labeled like the interactive grip step,
+    /// byte-exact restore on undo, refusal parity (unknown entity/grip,
+    /// reference-only, locked layer, point out of view).
+    pub fn grip_drag(
+        &mut self,
+        handle: Handle,
+        grip_id: usize,
+        to: [f64; 3],
+    ) -> Result<(), String> {
+        let task = self
+            .app
+            .perform_grip_drag(self.tab, handle, grip_id, to)
+            .map_err(|(code, message)| format!("grip drag failed ({code}): {message}"))?;
+        let _ = task;
+        Ok(())
+    }
+
+    /// Read specific entities by handle (API v12) — the live document's
+    /// current entity per handle, `None` for an unknown handle. The cheap
+    /// refresh-pass path: a plugin that writes and re-reads never needs the
+    /// invalidated full-document snapshot (the v11.1 per-boundary cost).
+    pub fn entities_batch(
+        &self,
+        handles: &[Handle],
+    ) -> Result<Vec<Option<codec::EntityType>>, String> {
+        if self.app.tabs.len() <= self.tab {
+            return Err(format!("tab {} does not exist", self.tab));
+        }
+        Ok(handles
+            .iter()
+            .map(|handle| self.document().get_entity(*handle).cloned())
+            .collect())
+    }
+
+    /// Create a parametric constraint directly (API v13): the SAME constraint
+    /// machinery the interactive COINCIDENT (`GCCOINCIDENT`) and TANGENT
+    /// (`TCONSTRAINT`) commands drive, reached without the command line — no
+    /// prompts, no echo — through the command driver's own apply path, so
+    /// validation, initial solve and undo composition behave identically.
+    /// Inside a plugin-opened `push_undo` scope the constraint joins that
+    /// scope (the entity-write contract); the re-bond a plugin composes of
+    /// writes + constraints is its single labeled step.
+    pub fn constraint_create(
+        &mut self,
+        constraint: ocs_plugin_api::host::PluginConstraint,
+    ) -> Result<(), String> {
+        if self.tab != self.app.active_tab {
+            return Err("constraints act on the active document; switch to it first".to_owned());
+        }
+        let tab = self.tab;
+        let to_pick =
+            |pick: &ocs_plugin_api::host::PluginConstraintPick| crate::command::CoincidentPick {
+                handle: pick.handle,
+                point: glam::DVec3::new(pick.point[0], pick.point[1], pick.point[2]),
+                whole_curve: pick.whole_curve,
+            };
+        let result = match constraint {
+            ocs_plugin_api::host::PluginConstraint::Coincident { first, second } => {
+                crate::command::CmdResult::AddCoincidentConstraint {
+                    first: to_pick(&first),
+                    second: to_pick(&second),
+                    multiple: false,
+                    label: "Coincident constraint",
+                }
+            }
+            ocs_plugin_api::host::PluginConstraint::Tangent { first, second } => {
+                // Resolve the picks the way the interactive TANGENT command
+                // does, against the live document and the tab's scope.
+                let scope = self.app.tabs[tab].current_parametric_scope();
+                let document = &self.app.tabs[tab].scene.document;
+                let resolve = |pick: &ocs_plugin_api::host::PluginConstraintPick,
+                               exclude: Option<Handle>| {
+                    let point =
+                        codec::types::Vector3::new(pick.point[0], pick.point[1], pick.point[2]);
+                    if pick.whole_curve {
+                        pick.handle.and_then(|handle| {
+                            crate::scene::parametric_constraints::parametric_curve_ref_for_pick(
+                                document, scope, handle, point,
+                            )
+                        })
+                    } else if let Some(handle) = pick.handle {
+                        crate::scene::parametric_constraints::nearest_parametric_point_on_entity(
+                            document, scope, handle, point,
+                        )
+                    } else {
+                        crate::scene::parametric_constraints::nearest_parametric_point(
+                            document, scope, point, exclude,
+                        )
+                    }
+                };
+                let first_ref = resolve(&first, None);
+                let second_ref = first_ref.and_then(|r| resolve(&second, Some(r.entity)));
+                let (Some(first), Some(second)) = (first_ref, second_ref) else {
+                    return Err(
+                        "tangent picks did not resolve to parametric references on the live \
+                         document; pick concrete points/curves of existing entities"
+                            .to_owned(),
+                    );
+                };
+                crate::command::CmdResult::AddTangentConstraint {
+                    first,
+                    second,
+                    label: "Tangent constraint",
+                }
+            }
+        };
+        // The driver's success feedback ("Coincident constraint applied") is
+        // interactive echo — the direct API path is quiet by contract
+        // (errors still surface; the gate is the same one RunQuiet uses).
+        let mut request = PluginRequest::new(self, true);
+        let task = request.app.apply_cmd_result(result);
+        request.app.drive_headless_task(task)
+    }
+
+    /// Read several XRecords in one call (API v13): per-entry results, `Err`
+    /// per missing path/name instead of failing the whole batch.
+    pub fn read_xrecords(
+        &self,
+        reads: &[ocs_plugin_api::host::XRecordRead],
+    ) -> Result<Vec<Result<Vec<ocs_plugin_api::host::XRecordEntry>, String>>, String> {
+        Ok(reads
+            .iter()
+            .map(|read| {
+                let path: Vec<&str> = read.dictionary_path.iter().map(|s| s.as_str()).collect();
+                self.read_xrecord(&path, &read.name)
+            })
+            .collect())
+    }
+
+    /// Replace the entries of several XRecords in one call (API v13): each
+    /// entry applies the single-update contract; the batch shares the
+    /// entity-write undo composition (inside a plugin-opened `push_undo`
+    /// scope it joins that scope).
+    pub fn update_xrecords(
+        &mut self,
+        updates: &[ocs_plugin_api::host::XRecordUpdate],
+    ) -> Result<Vec<Result<Handle, String>>, String> {
+        Ok(updates
+            .iter()
+            .map(|update| {
+                let path: Vec<&str> = update.dictionary_path.iter().map(|s| s.as_str()).collect();
+                self.update_xrecord(&path, &update.name, update.entries.clone())
+            })
+            .collect())
+    }
+
+    /// List a dictionary's XRecords WITH their entries in one call (API v13):
+    /// the discovery walk (list, then one read per record) collapses to a
+    /// single frame.
+    pub fn list_xrecords_with_entries(
+        &self,
+        dictionary_path: &[&str],
+    ) -> Result<Vec<(String, Vec<ocs_plugin_api::host::XRecordEntry>)>, String> {
+        let names = self.list_xrecords(dictionary_path)?;
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let entries = self
+                    .read_xrecord(dictionary_path, &name)
+                    .unwrap_or_default();
+                (name, entries)
+            })
+            .collect())
+    }
+
+    /// Declare (or clear) the calling plugin's custom grip points (API v11).
+    /// The whole batch REPLACES the plugin's previous set; the host applies
+    /// it as a diff keyed by grip id so an unchanged re-declare is near-free
+    /// (the pull model's message-boundary re-declare). Display-session state
+    /// only: nothing is persisted, nothing is host-interpreted, and the set
+    /// dies with the plugin's process.
+    ///
+    /// `plugin_id` is the identity the transport attached: over the plugin
+    /// IPC the host serves this with the speaking process's own manifest id
+    /// and refuses mismatches, so a plugin cannot declare grips in another
+    /// plugin's name; an in-process host (tests) registers the id it passes.
+    pub fn set_plugin_grips(
+        &mut self,
+        plugin_id: &str,
+        grips: Vec<ocs_plugin_api::host::PluginGrip>,
+    ) -> Result<(), String> {
+        let known = crate::plugin::grip_points::visibility(&self.app.disabled_plugins)(plugin_id);
+        if !known {
+            return Err(format!(
+                "plugin {plugin_id:?} is not a loaded, alive plugin; custom grips must be \
+                 declared by their owner"
+            ));
+        }
+        // Anchors accept ANY live entity handle — never a type restriction —
+        // and never add host-side movement semantics (the points are absolute).
+        for grip in &grips {
+            if let Some(anchor) = grip.anchor {
+                if self.document().get_entity(anchor).is_none() {
+                    return Err(format!(
+                        "grip {} anchors entity {anchor:?}, which does not exist",
+                        grip.grip_id
+                    ));
+                }
+            }
+        }
+        let tab = self.tab;
+        self.app.tabs[tab].plugin_grips.declare(plugin_id, grips)?;
         Ok(())
     }
 
@@ -3626,6 +4005,46 @@ impl HostApi for HostSession<'_> {
     fn set_reference_only(&mut self, handle: Handle, reference_only: bool) -> Result<(), String> {
         self.set_reference_only(handle, reference_only)
     }
+    fn entity_grips(&self, handle: Handle) -> Result<Vec<ocs_plugin_api::host::GripInfo>, String> {
+        self.entity_grips(handle)
+    }
+    fn grip_drag(&mut self, handle: Handle, grip_id: usize, to: [f64; 3]) -> Result<(), String> {
+        self.grip_drag(handle, grip_id, to)
+    }
+    fn set_plugin_grips(
+        &mut self,
+        plugin_id: &str,
+        grips: Vec<ocs_plugin_api::host::PluginGrip>,
+    ) -> Result<(), String> {
+        self.set_plugin_grips(plugin_id, grips)
+    }
+    fn entities_batch(&self, handles: &[Handle]) -> Result<Vec<Option<codec::EntityType>>, String> {
+        self.entities_batch(handles)
+    }
+    fn constraint_create(
+        &mut self,
+        constraint: ocs_plugin_api::host::PluginConstraint,
+    ) -> Result<(), String> {
+        self.constraint_create(constraint)
+    }
+    fn read_xrecords(
+        &self,
+        reads: &[ocs_plugin_api::host::XRecordRead],
+    ) -> Result<Vec<Result<Vec<ocs_plugin_api::host::XRecordEntry>, String>>, String> {
+        self.read_xrecords(reads)
+    }
+    fn update_xrecords(
+        &mut self,
+        updates: &[ocs_plugin_api::host::XRecordUpdate],
+    ) -> Result<Vec<Result<Handle, String>>, String> {
+        self.update_xrecords(updates)
+    }
+    fn list_xrecords_with_entries(
+        &self,
+        dictionary_path: &[&str],
+    ) -> Result<Vec<(String, Vec<ocs_plugin_api::host::XRecordEntry>)>, String> {
+        self.list_xrecords_with_entries(dictionary_path)
+    }
 }
 
 /// Bridges a plugin's [`InteractiveCommand`](ocs_plugin_api::host::InteractiveCommand)
@@ -3824,7 +4243,9 @@ impl crate::command::CadCommand for PluginProcessInteractiveAdapter {
     }
 }
 
-fn convert_preview_wires(
+/// Convert plugin-declared preview wires to scene wire models. Shared by the
+/// interactive-command previews and the custom-grip drag previews (API v11).
+pub(in crate::app) fn convert_preview_wires(
     raw_wires: Vec<ocs_plugin_api::host::PreviewWire>,
 ) -> Vec<crate::scene::model::wire_model::WireModel> {
     use crate::scene::model::wire_model::{TangentGeom, WireModel};

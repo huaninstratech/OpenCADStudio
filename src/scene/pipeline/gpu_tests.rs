@@ -304,11 +304,20 @@ fn bounded_gpu_uploads_preserve_geometry_and_instancing() {
     for (index, set) in repeated.iter_mut().enumerate() {
         set.instance_handle = Some(Handle::new(1000 + index as u64));
     }
-    let (mesh, total) = mesh_gpu::build_mesh_batch(&device, &queue, &repeated);
+    let (mut mesh, total) = mesh_gpu::build_mesh_batch(&device, &queue, &repeated);
     assert_eq!(mesh.len(), 2);
     assert_eq!(total, instance_count as u64);
     assert_eq!(mesh[0].vertex_buffer, mesh[1].vertex_buffer);
     assert_eq!(mesh[0].index_buffer, mesh[1].index_buffer);
+    // Same material and colour: one bind group, not one per chunk (#1727).
+    mesh_gpu::upload_chunk_material_bind_groups(
+        &device,
+        &queue,
+        &pipeline.mesh_material_bgl,
+        &mut mesh,
+    );
+    assert!(mesh[0].material_bind_group.is_some());
+    assert_eq!(mesh[0].material_bind_group, mesh[1].material_bind_group);
     assert_eq!(
         mesh.iter()
             .map(|chunk| chunk.instance_count as usize)

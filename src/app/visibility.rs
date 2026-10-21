@@ -22,6 +22,7 @@ use super::OpenCADStudio;
 /// Sentinel grip id for the visibility (lookup) grip, distinct from any
 /// entity's own grip ids so the click handler routes it to the dropdown.
 pub(super) const VIS_GRIP_ID: usize = usize::MAX;
+pub(super) const TABLE_GRIP_ID: usize = usize::MAX - 1;
 
 /// Resolved visibility info for the active tab's selected dynamic-block INSERT.
 #[derive(Clone, Debug)]
@@ -40,6 +41,20 @@ pub struct VisibilityPopup {
     pub current: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct TableGrip {
+    pub insert_handle: Handle,
+    pub current: Option<usize>,
+}
+#[derive(Clone, Debug)]
+pub struct TablePopup {
+    pub insert_handle: Handle,
+    pub anchor: iced::Point,
+    pub header: String,
+    pub rows: Vec<String>,
+    pub current: Option<usize>,
+}
+
 /// Block-local entity-handle lists for a dynamic definition and the anonymous
 /// block actually inserted, plus the state's visible-by-index set.
 struct StateMapping {
@@ -50,6 +65,193 @@ struct StateMapping {
 }
 
 impl OpenCADStudio {
+    pub(super) fn apply_table_row(&mut self, insert: Handle, row: usize) {
+        let i = self.active_tab;
+        if self.reject_locked_edit(i, insert) {
+            return;
+        }
+        let result = {
+            let doc = &self.tabs[i].scene.document;
+            let Some(def) = doc.dynamic_definition_for_insert(insert) else {
+                return;
+            };
+            let Ok(Some(view)) = crate::scene::block_properties_table::table(doc, def) else {
+                return;
+            };
+            crate::scene::block_actions::instance::evaluate_table_row(
+                doc,
+                insert,
+                &view.columns,
+                row,
+            )
+        };
+        match result {
+            Ok(Some(staged)) => {
+                self.push_undo_snapshot(i, "Block Properties Table row");
+                self.apply_action_document(i, staged);
+                self.tabs[i].scene.bump_geometry();
+                self.tabs[i].dirty = true;
+                self.finish_pending_history(i);
+                self.refresh_selected_grips();
+            }
+            Ok(None) => {}
+            Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+        }
+    }
+    pub(super) fn open_table_popup(&mut self, anchor: iced::Point) {
+        if let Some(grip) = &self.tabs[self.active_tab].table_grip {
+            let tab = &self.tabs[self.active_tab];
+            let doc = &tab.scene.document;
+            let Some(def) = doc.dynamic_definition_for_insert(grip.insert_handle) else {
+                return;
+            };
+            let Ok(Some(view)) = crate::scene::block_properties_table::table(doc, def) else {
+                return;
+            };
+            let parameters = crate::scene::block_actions::all_parameters(doc, def);
+            let header = view
+                .columns
+                .iter()
+                .map(|c| {
+                    let display = if c.connection_name.eq_ignore_ascii_case("UpdatedAngle") {
+                        crate::scene::block_orientation_parameter::parameters(doc, def)
+                            .into_iter()
+                            .find(|p| p.handle == c.handle)
+                            .map(|p| p.label)
+                    } else {
+                        crate::scene::block_distance_parameter::parameters(doc, def)
+                            .into_iter()
+                            .find(|p| p.handle == c.handle)
+                            .and_then(|p| p.labels.first().cloned())
+                    };
+                    display
+                        .filter(|n| !n.trim().is_empty())
+                        .or_else(|| {
+                            parameters
+                                .iter()
+                                .find(|p| p.handle == c.handle)
+                                .map(|p| p.name.clone())
+                        })
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| c.connection_name.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = view
+                .rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| format!("{v:.4}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .collect();
+            self.table_popup = Some(TablePopup {
+                insert_handle: grip.insert_handle,
+                anchor,
+                header,
+                rows,
+                current: grip.current,
+            });
+        }
+    }
+    pub(super) fn refresh_table_grip(&mut self, wo: [f64; 3]) {
+        let i = self.active_tab;
+        self.tabs[i].table_grip = None;
+        let Some(handle) = self.tabs[i].selected_handle else {
+            return;
+        };
+        if self.tabs[i].active_block_edit_session().is_some()
+            || self.tabs[i].scene.selected.len() != 1
+        {
+            return;
+        }
+        let doc = &self.tabs[i].scene.document;
+        let Some(def) = doc.dynamic_definition_for_insert(handle) else {
+            return;
+        };
+        let Ok(Some(view)) = crate::scene::block_properties_table::table(doc, def) else {
+            return;
+        };
+        if view.table.parameter.property_count <= 0 {
+            return;
+        }
+        let Some(EntityType::Insert(ins)) = doc.get_entity(handle) else {
+            return;
+        };
+        let graph =
+            crate::scene::block_properties_table::graph_handle(doc, def).unwrap_or(Handle::NULL);
+        let point = doc
+            .objects
+            .values()
+            .find_map(|value| match value {
+                codec::objects::ObjectType::DynamicBlock(obj) if obj.owner == graph => match &obj
+                    .data
+                {
+                    codec::objects::DynamicBlockData::PropertiesTableGrip(g) => Some(g.location),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(view.table.parameter.definition_point);
+        let wp = crate::scene::render_graph::insert_transform(doc, ins).apply(point);
+        let mut values = Vec::new();
+        let mut valid = true;
+        for column in &view.columns {
+            let params = crate::scene::block_actions::all_parameters(doc, def);
+            let Some(p) = params.iter().find(|p| p.handle == column.handle) else {
+                valid = false;
+                continue;
+            };
+            match crate::scene::block_actions::instance::value(doc, handle, p) {
+                Ok(crate::scene::block_actions::Value::Point(v)) => values.push(
+                    if column.connection_name.eq_ignore_ascii_case("UpdatedAngle") {
+                        (v.y - p.base.y)
+                            .atan2(v.x - p.base.x)
+                            .rem_euclid(std::f64::consts::TAU)
+                    } else {
+                        v.distance(p.base)
+                    },
+                ),
+                _ => {
+                    values.push(f64::NAN);
+                    valid = false;
+                }
+            }
+        }
+        let current = valid
+            .then(|| {
+                view.rows.iter().position(|row| {
+                    row.iter().zip(&values).zip(&view.columns).all(
+                        |((row_value, value), column)| {
+                            let difference =
+                                if column.connection_name.eq_ignore_ascii_case("UpdatedAngle") {
+                                    crate::scene::block_actions::angle_distance(*row_value, *value)
+                                } else {
+                                    (row_value - value).abs()
+                                };
+                            difference <= 1e-9
+                        },
+                    )
+                })
+            })
+            .flatten();
+        self.tabs[i].selected_grips.push(GripDef {
+            id: TABLE_GRIP_ID,
+            world: glam::DVec3::new(wp.x - wo[0], wp.y - wo[1], wp.z - wo[2]),
+            is_midpoint: false,
+            shape: GripShape::Triangle,
+            dir: None,
+            axis: None,
+        });
+        self.tabs[i].selected_grip_handles.push(handle);
+        self.tabs[i].table_grip = Some(TableGrip {
+            insert_handle: handle,
+            current,
+        });
+    }
+
     /// Compute the index sets needed to apply `state` of `param` (governing the
     /// dynamic definition `def_block`) to the anonymous block `anon_name`.
     ///
@@ -117,6 +319,36 @@ impl OpenCADStudio {
         })
     }
 
+    /// The visibility parameter of a dynamic-block reference as a Properties
+    /// row: the parameter's name, its states, and the one shown now.
+    pub(super) fn visibility_property(
+        doc: &codec::CadDocument,
+        handle: Handle,
+    ) -> Option<crate::scene::model::object::Property> {
+        let Some(EntityType::Insert(ins)) = doc.get_entity(handle) else {
+            return None;
+        };
+        let (def_block, param) = doc.dynamic_visibility_for_insert(handle)?;
+        let options: Vec<String> = param.states.iter().map(|s| s.name.clone()).collect();
+        let current = Self::current_visibility_state(doc, def_block, &ins.block_name, param);
+        // An unnamed parameter takes the name a new one gets in the file.
+        let label = if param.element_name.trim().is_empty() {
+            "Visibility1".to_string()
+        } else {
+            param.element_name.clone()
+        };
+        Some(crate::scene::model::object::Property {
+            label,
+            field: "dyn_visibility",
+            value: crate::scene::model::object::PropValue::Choice {
+                selected: current
+                    .and_then(|c| options.get(c).cloned())
+                    .unwrap_or_default(),
+                options,
+            },
+        })
+    }
+
     /// Recompute the visibility grip for the active tab's single selection and
     /// append it (as a Triangle grip) to `selected_grips`. Clears it when the
     /// selection is not a dynamic-block reference. `wo` is the world offset
@@ -136,6 +368,11 @@ impl OpenCADStudio {
             return;
         };
 
+        if param.property_info_count <= 0
+            && crate::scene::block_grips::config::count(doc, def_block, param.handle) == Some(0)
+        {
+            return;
+        }
         // `def_point` is a block-definition coordinate (see the codec's
         // BlockVisibilityParameter), so the grip follows the same base-point
         // convention as the rendered reference.

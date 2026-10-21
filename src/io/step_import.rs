@@ -659,6 +659,9 @@ pub struct StepBody {
 /// One product: its own bodies and where each of its components sits.
 pub struct StepProduct {
     pub name: String,
+    /// A representation of a file without products: the block is named
+    /// after the file and this entity number (`<file>-<number>`).
+    pub numbered: Option<u64>,
     pub bodies: Vec<StepBody>,
     /// Components: the product (an index into [`StepModel::products`]) and
     /// its placement in this one.
@@ -667,8 +670,12 @@ pub struct StepProduct {
 
 /// What a STEP file holds.
 pub struct StepModel {
-    /// Millimetres per file length unit.
-    pub unit_mm: f64,
+    /// Millimetres per file length unit; `None` when the file names no
+    /// length unit (its numbers are then taken as drawing units).
+    pub unit_mm: Option<f64>,
+    /// Solids that go straight into the drawing: those of a file without
+    /// products whose top representation places nothing else.
+    pub direct: Vec<StepBody>,
     pub products: Vec<StepProduct>,
     /// The products no other one is a component of.
     pub roots: Vec<usize>,
@@ -765,6 +772,30 @@ fn item_bodies(doc: &Doc, id: u64) -> Vec<StepBody> {
 }
 
 impl Doc {
+    /// Where a mapped item puts its representation: an axis placement, or
+    /// a Cartesian transformation operator (axes, origin, uniform scale).
+    fn target_frame(&self, id: u64) -> Option<Placement> {
+        if self.kind(id) != "CARTESIAN_TRANSFORMATION_OPERATOR_3D" {
+            return self.frame(id);
+        }
+        let (_, p) = self.simple(id)?;
+        let axis = |k: usize| p.get(k).and_then(|d| self.direction(d)).map(Vec3::from);
+        let x = axis(3)
+            .and_then(Vec3::normalize)
+            .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+        let z = axis(7)
+            .and_then(Vec3::normalize)
+            .unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+        let y = axis(4)
+            .and_then(Vec3::normalize)
+            .or_else(|| z.cross(x).normalize())
+            .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+        let o = p.get(5).and_then(|o| self.point(o)).unwrap_or([0.0; 3]);
+        let scale = p.get(6).and_then(P::num).unwrap_or(1.0);
+        let [x, y, z] = [x, y, z].map(|v| [v.x * scale, v.y * scale, v.z * scale]);
+        Some([0, 1, 2].map(|r| [x[r], y[r], z[r], o[r]]))
+    }
+
     /// An axis placement as a placement matrix.
     fn frame(&self, id: u64) -> Option<Placement> {
         let plane = self.placement(&P::Ref(id))?;
@@ -831,7 +862,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         styles: HashMap::new(),
     };
 
-    let mut unit_mm = 1.0;
+    let mut unit_mm = None;
     let mut angle = 1.0;
     let mut ids: Vec<u64> = doc.instances.keys().copied().collect();
     ids.sort_unstable();
@@ -844,7 +875,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
                 continue;
             };
             if doc.part(unit, "LENGTH_UNIT").is_some() {
-                unit_mm = unit_size(&doc, unit).unwrap_or(1.0);
+                unit_mm = Some(unit_size(&doc, unit).unwrap_or(1.0));
             } else if doc.part(unit, "PLANE_ANGLE_UNIT").is_some() {
                 angle = unit_size(&doc, unit).unwrap_or(1.0);
             }
@@ -912,6 +943,9 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
             .unwrap_or_default()
             .to_string()
     };
+    if definitions.is_empty() {
+        return Some(without_products(&doc, &ids, unit_mm));
+    }
     // The shape of a definition (or an occurrence), and the representations
     // attached to a shape.
     let shape_of: HashMap<u64, u64> = of_kind("PRODUCT_DEFINITION_SHAPE")
@@ -980,6 +1014,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         index.insert(definition, products.len());
         products.push(StepProduct {
             name: product_name(definition),
+            numbered: None,
             bodies,
             children: Vec::new(),
         });
@@ -1037,6 +1072,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         component.push(false);
         products.push(StepProduct {
             name,
+            numbered: None,
             bodies: loose_bodies,
             children: Vec::new(),
         });
@@ -1049,7 +1085,93 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         .collect();
     Some(StepModel {
         unit_mm,
+        direct: Vec::new(),
         products,
         roots,
     })
+}
+
+/// A file without products: each representation holding solids or placing
+/// other representations (mapped items) is a block, a mapped item an insert
+/// of the representation it maps. A top representation (one no other maps)
+/// that places nothing puts its solids straight into the drawing.
+fn without_products(doc: &Doc, ids: &[u64], unit_mm: Option<f64>) -> StepModel {
+    let param = |id: u64, k: usize| {
+        doc.simple(id)
+            .and_then(|(_, p)| p.get(k))
+            .and_then(P::reference)
+    };
+    let reps: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let kind = doc.kind(id);
+            kind.ends_with("REPRESENTATION") && kind != "SHAPE_DEFINITION_REPRESENTATION"
+        })
+        .collect();
+    let mut index: HashMap<u64, usize> = HashMap::new();
+    let mut products: Vec<StepProduct> = Vec::new();
+    let mut mapped: Vec<(usize, u64, Placement)> = Vec::new();
+    for &rep in &reps {
+        // The items list: the second parameter, or the first where an
+        // early writer left the name out.
+        let items: Vec<u64> = doc
+            .simple(rep)
+            .and_then(|(_, p)| p.iter().find(|v| matches!(v, P::List(_))))
+            .map(P::list)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(P::reference)
+            .collect();
+        let mut bodies = Vec::new();
+        for &item in &items {
+            if doc.kind(item) == "MAPPED_ITEM" {
+                // MAPPED_ITEM(name, map, target): the map's representation,
+                // moved from the map's origin to the target.
+                let Some(map) = param(item, 1) else { continue };
+                let Some(source) = param(map, 1) else {
+                    continue;
+                };
+                let from = param(map, 0).and_then(|o| doc.frame(o)).unwrap_or(IDENTITY);
+                let to = param(item, 2)
+                    .and_then(|t| doc.target_frame(t))
+                    .unwrap_or(IDENTITY);
+                mapped.push((products.len(), source, compose(&to, &invert(&from))));
+            } else {
+                bodies.extend(item_bodies(doc, item));
+            }
+        }
+        index.insert(rep, products.len());
+        products.push(StepProduct {
+            name: String::new(),
+            numbered: Some(rep),
+            bodies,
+            children: Vec::new(),
+        });
+    }
+    let mut component = vec![false; products.len()];
+    for (parent, source, placement) in mapped {
+        if let Some(&child) = index.get(&source) {
+            products[parent].children.push((child, placement));
+            component[child] = true;
+        }
+    }
+    let mut direct = Vec::new();
+    let mut roots = Vec::new();
+    for k in 0..products.len() {
+        if component[k] || (products[k].bodies.is_empty() && products[k].children.is_empty()) {
+            continue;
+        }
+        if products[k].children.is_empty() {
+            direct.append(&mut products[k].bodies);
+        } else {
+            roots.push(k);
+        }
+    }
+    StepModel {
+        unit_mm,
+        direct,
+        products,
+        roots,
+    }
 }

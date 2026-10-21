@@ -13,7 +13,7 @@ use crate::app::Message;
 use crate::io::xref_model::Pathtype;
 use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};
+use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio, LABEL_WIDTH};
 use crate::ui::window::block_definition::{group, labeled_checkbox};
 
 /// One edit in the dialog.
@@ -366,8 +366,12 @@ pub fn view_window<'a>(
         group(
             t!("Location").into_owned(),
             column![
-                read_only_field(t!("Found in:").into_owned(), &state.found_in, 92.0),
-                read_only_field(t!("Saved path:").into_owned(), &state.saved_path, 92.0),
+                read_only_field(t!("Found in:").into_owned(), &state.found_in, LABEL_WIDTH,),
+                read_only_field(
+                    t!("Saved path:").into_owned(),
+                    &state.saved_path,
+                    LABEL_WIDTH,
+                ),
             ]
             .spacing(5),
             Length::Shrink,
@@ -383,10 +387,11 @@ pub fn view_window<'a>(
         t!("Show Details")
     };
     let footer = row![
-        button(text(details_label).size(12))
-            .on_press(msg(XrefAttachMsg::Details(!state.details)))
-            .style(button::secondary)
-            .padding([6, 18]),
+        dialog_button(
+            details_label,
+            msg(XrefAttachMsg::Details(!state.details)),
+            false,
+        ),
         Space::new().width(Fill),
         dialog_button(t!("OK"), msg(XrefAttachMsg::Apply), true),
         dialog_button(t!("Cancel"), Message::CloseModal, false),

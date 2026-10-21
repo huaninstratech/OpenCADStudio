@@ -4,16 +4,6 @@ use crate::ui::style::common::muted_style as muted;
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
 use iced::{Background, Border, Element, Length, Theme};
 
-fn button_style(primary: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        if primary {
-            button::primary(theme, status)
-        } else {
-            button::secondary(theme, status)
-        }
-    }
-}
-
 pub fn view_window<'a>(
     layouts: &'a [(String, bool)],
     printer: Option<&'a str>,
@@ -61,10 +51,10 @@ pub fn view_window<'a>(
     };
 
     let mut pdf = button(text(t!("PDF")).size(11))
-        .style(button_style(false))
+        .style(button::secondary)
         .padding([5, 16]);
     let mut print = button(text(t!("Print")).size(11))
-        .style(button_style(true))
+        .style(button::primary)
         .padding([5, 18]);
     if selected > 0 {
         pdf = pdf.on_press(Message::PrintAllPdf);
@@ -94,11 +84,11 @@ pub fn view_window<'a>(
             row![
                 button(text(t!("Select all")).size(11))
                     .on_press(Message::PrintAllSelectAll)
-                    .style(button_style(false))
+                    .style(button::secondary)
                     .padding([4, 10]),
                 button(text(t!("Select none")).size(11))
                     .on_press(Message::PrintAllSelectNone)
-                    .style(button_style(false))
+                    .style(button::secondary)
                     .padding([4, 10]),
                 Space::new().width(Length::Fill),
                 text(summary).size(11).style(muted),
@@ -113,7 +103,7 @@ pub fn view_window<'a>(
                 Space::new().width(Length::Fill),
                 button(text(t!("Options…")).size(11))
                     .on_press(Message::PrintAllOptions)
-                    .style(button_style(false))
+                    .style(button::secondary)
                     .padding([5, 12]),
                 pdf,
                 print,

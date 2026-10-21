@@ -19,6 +19,7 @@
 
 use std::path::Path;
 
+use crate::io::pdf_export::adapt_to_paper;
 use crate::io::plot::{PlotImage, PlotOptions, PlotPage, PlotWire};
 use crate::io::plot_style::PlotStyleTable;
 use crate::scene::model::hatch_model::{HatchModel, HatchPattern};
@@ -354,7 +355,7 @@ fn emit_wire(
         }
     }
     if !color_overridden && (wire.aci != 0 || [r, g, b] == [1.0; 3]) {
-        [r, g, b] = adapt_text_color([r, g, b]);
+        [r, g, b] = adapt_to_paper([r, g, b]);
     }
     [r, g, b] = plotted_color([r, g, b], a, screening, options);
 
@@ -453,7 +454,7 @@ fn emit_wire_fills(
             }
         }
         if !color_overridden {
-            [r, g, b] = adapt_text_color([r, g, b]);
+            [r, g, b] = adapt_to_paper([r, g, b]);
         }
         [r, g, b] = plotted_color([r, g, b], a, screening, options);
     }
@@ -539,17 +540,7 @@ fn emit_hatch(
         && hatch.aci != 0
         && !(hatch.aci == 7 && matches!(hatch.pattern, HatchPattern::Solid))
     {
-        let is_light = r > 0.80
-            && g > 0.80
-            && b > 0.80
-            && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
-        let is_yellow = r > 0.80 && g > 0.70 && b < 0.30;
-        let is_cyan = r < 0.30 && g > 0.70 && b > 0.70;
-        if is_light || is_yellow {
-            [r, g, b] = [0.0, 0.0, 0.0];
-        } else if is_cyan {
-            [r, g, b] = [0.0, 0.15, 0.50];
-        }
+        [r, g, b] = adapt_to_paper([r, g, b]);
     }
     [r, g, b] = plotted_color([r, g, b], a, screening, options);
     let (wox, woy) = (hatch.world_origin[0], hatch.world_origin[1]);
@@ -607,7 +598,7 @@ fn emit_hatch(
 
     if let HatchPattern::Gradient { color2, .. } = &hatch.pattern {
         let second = plotted_color(
-            adapt_text_color([color2[0], color2[1], color2[2]]),
+            adapt_to_paper([color2[0], color2[1], color2[2]]),
             color2[3],
             screening,
             options,
@@ -680,8 +671,8 @@ fn emit_searchable_text(
         if run.text.is_empty() || run.height <= 0.0 || !run.height.is_finite() {
             continue;
         }
-        let rgb = ctb_color
-            .unwrap_or_else(|| adapt_text_color([run.color[0], run.color[1], run.color[2]]));
+        let rgb =
+            ctb_color.unwrap_or_else(|| adapt_to_paper([run.color[0], run.color[1], run.color[2]]));
         let [r, g, b] = plotted_color(rgb, run.color[3], screening, options);
         let (sx, sy) = map.apply(run.origin[0] + ox, run.origin[1] + oy);
         if !sx.is_finite() || !sy.is_finite() {
@@ -846,24 +837,6 @@ fn emit_image(
 }
 
 // ── Colour / dash / formatting helpers ─────────────────────────────────────
-
-/// White-sheet adaptation shared with the PDF backend: colours authored for
-/// the dark screen remap so they stay readable on white paper.
-fn adapt_text_color([r, g, b]: [f32; 3]) -> [f32; 3] {
-    let is_light = r > 0.80
-        && g > 0.80
-        && b > 0.80
-        && !crate::scene::convert::tess_util::is_authored_white([r, g, b]);
-    let is_yellow = r > 0.80 && g > 0.70 && b < 0.30;
-    let is_cyan = r < 0.30 && g > 0.70 && b > 0.70;
-    if is_light || is_yellow {
-        [0.0, 0.0, 0.0]
-    } else if is_cyan {
-        [0.0, 0.15, 0.50]
-    } else {
-        [r, g, b]
-    }
-}
 
 /// Screening/alpha blend towards white, mirroring `plotted_color` in PDF export.
 fn plotted_color(rgb: [f32; 3], alpha: f32, screening: f32, options: PlotOptions) -> [f32; 3] {

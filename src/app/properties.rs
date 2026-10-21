@@ -13,6 +13,29 @@ use codec::{Entity, EntityType, Handle};
 /// shows a count-only summary instead. Bulk edits still go through the ribbon.
 const MAX_PROP_AGGREGATE: usize = 2_000;
 
+fn property_choice_combos(
+    sections: &[crate::scene::model::object::PropSection],
+) -> rustc_hash::FxHashMap<String, iced::widget::combo_box::State<ui::properties::LocalizedChoice>>
+{
+    sections
+        .iter()
+        .flat_map(|section| section.props.iter())
+        .filter_map(|prop| match &prop.value {
+            PropValue::Choice { options, .. } => Some((
+                prop.field.to_string(),
+                iced::widget::combo_box::State::new(
+                    options
+                        .iter()
+                        .cloned()
+                        .map(ui::properties::LocalizedChoice::new)
+                        .collect(),
+                ),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Cap the total number of selection grips at
 /// [`crate::app::settings::MAX_SELECTED_GRIPS`], keeping entity order with
 /// non-midpoint (vertex/stretch) grips first. Below the cap both vecs are
@@ -913,6 +936,18 @@ impl OpenCADStudio {
                     let overrides =
                         crate::io::xref::layer_overrides(doc, &br.name, &br.xref_path, &base_dir);
                     xref_rows(&mut sections, ins, &br.xref_path, factor, overrides);
+                }
+                // A dynamic block's visibility states, picked like its grip.
+                let mut custom_properties = Vec::new();
+                custom_properties.extend(Self::visibility_property(doc, handle));
+                if let Some(row) = crate::scene::block_lookup::reference_property(doc, handle) {
+                    custom_properties.push(row);
+                }
+                if !custom_properties.is_empty() {
+                    sections.push(crate::scene::model::object::PropSection {
+                        title: t!("Custom").into_owned(),
+                        props: custom_properties,
+                    });
                 }
                 // An associative array's counts and spacings.
                 if let Some(array) = crate::scene::assoc_array::array_of_insert(doc, handle) {
@@ -2280,25 +2315,7 @@ impl OpenCADStudio {
                         block_definition: tab
                             .active_block_edit_session()
                             .map(|session| session.br_handle),
-                        choice_combos: sections
-                            .iter()
-                            .flat_map(|section| section.props.iter())
-                            .filter_map(|prop| match &prop.value {
-                                crate::scene::model::object::PropValue::Choice {
-                                    options, ..
-                                } => Some((
-                                    prop.field.to_string(),
-                                    iced::widget::combo_box::State::new(
-                                        options
-                                            .iter()
-                                            .cloned()
-                                            .map(ui::properties::LocalizedChoice::new)
-                                            .collect(),
-                                    ),
-                                )),
-                                _ => None,
-                            })
-                            .collect(),
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         layer_combo: iced::widget::combo_box::State::new(layer_names.clone()),
                         linetype_combo: iced::widget::combo_box::State::new(linetype_items.clone()),
@@ -2320,25 +2337,7 @@ impl OpenCADStudio {
                         prop_vertex,
                     );
                     ui::PropertiesPanel {
-                        choice_combos: sections
-                            .iter()
-                            .flat_map(|section| section.props.iter())
-                            .filter_map(|prop| match &prop.value {
-                                crate::scene::model::object::PropValue::Choice {
-                                    options, ..
-                                } => Some((
-                                    prop.field.to_string(),
-                                    iced::widget::combo_box::State::new(
-                                        options
-                                            .iter()
-                                            .cloned()
-                                            .map(ui::properties::LocalizedChoice::new)
-                                            .collect(),
-                                    ),
-                                )),
-                                _ => None,
-                            })
-                            .collect(),
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         title,
                         layer_combo: iced::widget::combo_box::State::new(layer_names.clone()),
@@ -2410,6 +2409,30 @@ impl OpenCADStudio {
                         .collect();
                     let t_local = t_arm.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                     let mut sections = aggregate_sections(&local_refs, &text_style_names);
+                    // A dimension's style groups (arrows, text, fit, units…)
+                    // come from the document-aware builder; the document-free
+                    // rows above would drop them all, so dimensions of one
+                    // style shared only the General rows. (#1917)
+                    if filtered
+                        .iter()
+                        .all(|(_, entity)| matches!(entity, EntityType::Dimension(_)))
+                    {
+                        sections = filtered
+                            .iter()
+                            .map(|(handle, entity)| {
+                                self.entity_property_sections(
+                                    i,
+                                    *handle,
+                                    entity,
+                                    &text_style_names,
+                                    annotation_scale_handle,
+                                    prop_vertex,
+                                )
+                                .0
+                            })
+                            .reduce(|merged, next| merge_sections(&merged, &next))
+                            .unwrap_or_default();
+                    }
                     if let (Some(t), Some(groups_ms), Some(filter_ms), Some(local_ms)) =
                         (t_arm, t_groups, t_filter, t_local)
                     {
@@ -2445,25 +2468,7 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                         retain_compact_solid_sections(&mut sections);
                     }
                     ui::PropertiesPanel {
-                        choice_combos: sections
-                            .iter()
-                            .flat_map(|section| section.props.iter())
-                            .filter_map(|prop| match &prop.value {
-                                crate::scene::model::object::PropValue::Choice {
-                                    options, ..
-                                } => Some((
-                                    prop.field.to_string(),
-                                    iced::widget::combo_box::State::new(
-                                        options
-                                            .iter()
-                                            .cloned()
-                                            .map(ui::properties::LocalizedChoice::new)
-                                            .collect(),
-                                    ),
-                                )),
-                                _ => None,
-                            })
-                            .collect(),
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         title: t!("%{count} objects selected", count = selected.len()).into_owned(),
                         selection_group_combo: iced::widget::combo_box::State::new(groups.clone()),
@@ -2490,13 +2495,16 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                     .find(|item| item.handle == handle)
                 }) {
                     use crate::scene::model::object::{PropSection, PropValue, Property};
-                    panel.title = item.name;
+                    panel.title = item.name.clone();
                     panel.sections = vec![PropSection {
                         title: crate::t!("Geometry").into_owned(),
-                        props: item
-                            .grips
-                            .into_iter()
-                            .map(|(part, point)| Property {
+                        props: std::iter::once(Property {
+                            label: crate::t!("Parameter name").into_owned(),
+                            field: "authoring_name",
+                            value: PropValue::PlainText(item.name.clone()),
+                        })
+                        .chain(item.grips.into_iter().map(|(part, point)| {
+                            Property {
                                 label: crate::t!(match part {
                                     crate::scene::block_authoring::edit::Part::Point => "Position",
                                     crate::scene::block_authoring::edit::Part::Base => "Base point",
@@ -2513,9 +2521,254 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                                     "{:.4}, {:.4}, {:.4}",
                                     point.x, point.y, point.z
                                 )),
-                            })
-                            .collect(),
+                            }
+                        }))
+                        .collect(),
                     }];
+                    if let Some(count) =
+                        self.tabs[i]
+                            .active_block_edit_session()
+                            .and_then(|session| {
+                                crate::scene::block_grips::config::count(
+                                    &self.tabs[i].scene.document,
+                                    session.br_handle,
+                                    item.handle,
+                                )
+                            })
+                    {
+                        panel.sections.push(PropSection {
+                            title: crate::t!("Grips").into_owned(),
+                            props: vec![Property {
+                                label: crate::t!("Number of grips").into_owned(),
+                                field: "authoring_grip_count",
+                                value: PropValue::EditText(count.to_string()),
+                            }],
+                        });
+                    }
+                    if let Some(base) = crate::scene::block_actions::options::base(
+                        &self.tabs[i].scene.document,
+                        item.handle,
+                    ) {
+                        let mut props = vec![Property {
+                            label: crate::t!("Dependent base point").into_owned(),
+                            field: "authoring_action_base_dependent",
+                            value: PropValue::BoolToggle {
+                                field: "authoring_action_base_dependent",
+                                value: base.dependent,
+                            },
+                        }];
+                        if !base.dependent {
+                            props.extend([
+                                Property {
+                                    label: crate::t!("Base X").into_owned(),
+                                    field: "authoring_action_base_x",
+                                    value: PropValue::EditText(base.base_point.x.to_string()),
+                                },
+                                Property {
+                                    label: crate::t!("Base Y").into_owned(),
+                                    field: "authoring_action_base_y",
+                                    value: PropValue::EditText(base.base_point.y.to_string()),
+                                },
+                            ]);
+                        }
+                        panel.sections.push(PropSection {
+                            title: crate::t!("Action base point").into_owned(),
+                            props,
+                        });
+                    }
+                    if let Some(offsets) = crate::scene::block_actions::options::offsets(
+                        &self.tabs[i].scene.document,
+                        item.handle,
+                    ) {
+                        panel.sections.push(PropSection {
+                            title: crate::t!("Action overrides").into_owned(),
+                            props: vec![
+                                Property {
+                                    label: crate::t!("Distance multiplier").into_owned(),
+                                    field: "authoring_action_multiplier",
+                                    value: PropValue::EditText(
+                                        offsets.distance_multiplier.to_string(),
+                                    ),
+                                },
+                                Property {
+                                    label: crate::t!("Angle offset (degrees)").into_owned(),
+                                    field: "authoring_action_angle",
+                                    value: PropValue::EditText(
+                                        offsets.angle_offset.to_degrees().to_string(),
+                                    ),
+                                },
+                            ],
+                        });
+                    }
+                    if let Some((chain_actions, value_sets)) =
+                        self.authoring_parameter_properties(item.handle)
+                    {
+                        panel.sections.push(PropSection {
+                            title: crate::t!("Behavior").into_owned(),
+                            props: vec![Property {
+                                label: crate::t!("Chain actions").into_owned(),
+                                field: "authoring_chain_actions_state",
+                                value: PropValue::ReadOnly(if chain_actions {
+                                    crate::t!("Enabled (unsupported)").into_owned()
+                                } else {
+                                    crate::t!("Disabled").into_owned()
+                                }),
+                            }],
+                        });
+                        if !value_sets.is_empty() {
+                            let mut props = Vec::new();
+                            for (key, label, value_set) in value_sets {
+                                let (
+                                    minimum_enabled,
+                                    maximum_enabled,
+                                    increment_enabled,
+                                    values_enabled,
+                                    minimum,
+                                    maximum,
+                                    increment,
+                                    values,
+                                ) = match key {
+                                    "linear_distance" => (
+                                        "authoring_set_linear_distance_minimum_enabled",
+                                        "authoring_set_linear_distance_maximum_enabled",
+                                        "authoring_set_linear_distance_increment_enabled",
+                                        "authoring_set_linear_distance_values_enabled",
+                                        "authoring_set_linear_distance_minimum",
+                                        "authoring_set_linear_distance_maximum",
+                                        "authoring_set_linear_distance_increment",
+                                        "authoring_set_linear_distance_values",
+                                    ),
+                                    "polar_distance" => (
+                                        "authoring_set_polar_distance_minimum_enabled",
+                                        "authoring_set_polar_distance_maximum_enabled",
+                                        "authoring_set_polar_distance_increment_enabled",
+                                        "authoring_set_polar_distance_values_enabled",
+                                        "authoring_set_polar_distance_minimum",
+                                        "authoring_set_polar_distance_maximum",
+                                        "authoring_set_polar_distance_increment",
+                                        "authoring_set_polar_distance_values",
+                                    ),
+                                    "polar_angle" => (
+                                        "authoring_set_polar_angle_minimum_enabled",
+                                        "authoring_set_polar_angle_maximum_enabled",
+                                        "authoring_set_polar_angle_increment_enabled",
+                                        "authoring_set_polar_angle_values_enabled",
+                                        "authoring_set_polar_angle_minimum",
+                                        "authoring_set_polar_angle_maximum",
+                                        "authoring_set_polar_angle_increment",
+                                        "authoring_set_polar_angle_values",
+                                    ),
+                                    "xy_x" => (
+                                        "authoring_set_xy_x_minimum_enabled",
+                                        "authoring_set_xy_x_maximum_enabled",
+                                        "authoring_set_xy_x_increment_enabled",
+                                        "authoring_set_xy_x_values_enabled",
+                                        "authoring_set_xy_x_minimum",
+                                        "authoring_set_xy_x_maximum",
+                                        "authoring_set_xy_x_increment",
+                                        "authoring_set_xy_x_values",
+                                    ),
+                                    "xy_y" => (
+                                        "authoring_set_xy_y_minimum_enabled",
+                                        "authoring_set_xy_y_maximum_enabled",
+                                        "authoring_set_xy_y_increment_enabled",
+                                        "authoring_set_xy_y_values_enabled",
+                                        "authoring_set_xy_y_minimum",
+                                        "authoring_set_xy_y_maximum",
+                                        "authoring_set_xy_y_increment",
+                                        "authoring_set_xy_y_values",
+                                    ),
+                                    "rotation_angle" => (
+                                        "authoring_set_rotation_angle_minimum_enabled",
+                                        "authoring_set_rotation_angle_maximum_enabled",
+                                        "authoring_set_rotation_angle_increment_enabled",
+                                        "authoring_set_rotation_angle_values_enabled",
+                                        "authoring_set_rotation_angle_minimum",
+                                        "authoring_set_rotation_angle_maximum",
+                                        "authoring_set_rotation_angle_increment",
+                                        "authoring_set_rotation_angle_values",
+                                    ),
+                                    _ => continue,
+                                };
+                                props.extend([
+                                    Property {
+                                        label: crate::tf!("Use {} minimum", crate::t!(label))
+                                            .into_owned(),
+                                        field: minimum_enabled,
+                                        value: PropValue::BoolToggle {
+                                            field: minimum_enabled,
+                                            value: value_set.flags & 1 != 0,
+                                        },
+                                    },
+                                    Property {
+                                        label: crate::tf!("Use {} maximum", crate::t!(label))
+                                            .into_owned(),
+                                        field: maximum_enabled,
+                                        value: PropValue::BoolToggle {
+                                            field: maximum_enabled,
+                                            value: value_set.flags & 2 != 0,
+                                        },
+                                    },
+                                    Property {
+                                        label: crate::tf!("Use {} increment", crate::t!(label))
+                                            .into_owned(),
+                                        field: increment_enabled,
+                                        value: PropValue::BoolToggle {
+                                            field: increment_enabled,
+                                            value: value_set.flags & 4 != 0,
+                                        },
+                                    },
+                                    Property {
+                                        label: crate::tf!(
+                                            "Use {} allowed-value list",
+                                            crate::t!(label)
+                                        )
+                                        .into_owned(),
+                                        field: values_enabled,
+                                        value: PropValue::BoolToggle {
+                                            field: values_enabled,
+                                            value: value_set.flags & 8 != 0,
+                                        },
+                                    },
+                                    Property {
+                                        label: crate::tf!("{} minimum", crate::t!(label))
+                                            .into_owned(),
+                                        field: minimum,
+                                        value: PropValue::EditText(value_set.minimum.to_string()),
+                                    },
+                                    Property {
+                                        label: crate::tf!("{} maximum", crate::t!(label))
+                                            .into_owned(),
+                                        field: maximum,
+                                        value: PropValue::EditText(value_set.maximum.to_string()),
+                                    },
+                                    Property {
+                                        label: crate::tf!("{} increment", crate::t!(label))
+                                            .into_owned(),
+                                        field: increment,
+                                        value: PropValue::EditText(value_set.increment.to_string()),
+                                    },
+                                    Property {
+                                        label: crate::tf!("{} allowed values", crate::t!(label))
+                                            .into_owned(),
+                                        field: values,
+                                        value: PropValue::EditText(
+                                            value_set
+                                                .values
+                                                .iter()
+                                                .map(ToString::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join(", "),
+                                        ),
+                                    },
+                                ]);
+                            }
+                            panel.sections.push(PropSection {
+                                title: crate::t!("Value Set").into_owned(),
+                                props,
+                            });
+                        }
+                    }
                 }
             }
             // Precompute the focused-id → field-key map for O(1) lookups on
@@ -2739,7 +2992,6 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         // as wire tessellation in wires_for_block). Only subtract in model space.
         let wo = if is_paper { [0.0f64; 3] } else { [0.0_f64; 3] };
         let (new_handle, new_grips, new_grip_handles) = {
-            let annotation_scale_handle = self.tabs[i].scene.displayed_annotation_scale_handle();
             let selected = self.tabs[i].scene.selected_entities();
             let single_handle = (selected.len() == 1
                 && !self.tabs[i].scene.is_layer_locked(selected[0].0)
@@ -2755,136 +3007,11 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
             } else {
                 selected
             };
-            for (handle, entity) in selected {
-                if self.tabs[i].scene.is_layer_locked(handle)
-                    || self.tabs[i].scene.is_reference_only(handle)
-                {
-                    continue;
-                }
-                let contextual = crate::scene::annotative::entity_for_annotation_context(
-                    &self.tabs[i].scene.document,
-                    entity,
-                    annotation_scale_handle,
-                );
-                let mut entity_grips = dispatch::grips(contextual.as_ref());
-                if let codec::EntityType::Insert(insert) = contextual.as_ref() {
-                    entity_grips = crate::entities::insert::visible_attribute_grips(
-                        &self.tabs[i].scene.document,
-                        insert,
-                        self.tabs[i].scene.annotation_scale,
-                    );
-                }
-                if crate::scene::model::solid_history::has_specialized_primitive_properties(
-                    &self.tabs[i].scene.document,
-                    handle,
-                ) {
-                    entity_grips.clear();
-                }
-                // Dimension::grips() cannot see the document, so an automatic dimension
-                // text grip cannot resolve its real DIMSTYLE/annotation-scaled position
-                // there. Correct it here, where both the document and displayed annotation
-                // scale are available.
-                if let codec::EntityType::Dimension(dim) = contextual.as_ref() {
-                    if matches!(
-                        &**dim,
-                        codec::entities::Dimension::Linear(_)
-                            | codec::entities::Dimension::Aligned(_)
-                    ) && !dim.base().text_user_positioned
-                    {
-                        let anno_scale = annotation_scale_handle
-                            .and_then(|handle| {
-                                match self.tabs[i].scene.document.objects.get(&handle) {
-                                    Some(codec::objects::ObjectType::Scale(scale)) => Some(
-                                        scale.inverse_factor()
-                                            / self.tabs[i].scene.annotation_scale_unit_factor(),
-                                    ),
-                                    _ => None,
-                                }
-                            })
-                            .unwrap_or(self.tabs[i].scene.annotation_scale as f64);
-
-                        if let Some(position) =
-                            crate::entities::dimension::dimension_text_grip_position(
-                                dim,
-                                &self.tabs[i].scene.document,
-                                anno_scale,
-                            )
-                        {
-                            // The text grip is the final native grip of Linear/Aligned dims.
-                            // While the text is still automatic, make this a point/stretch grip
-                            // rather than a midpoint-translate grip. That makes the first drag use
-                            // the displayed automatic position as its absolute starting point instead
-                            // of translating the stale DWG text_middle_point.
-                            if let Some(text_grip) = entity_grips.last_mut() {
-                                text_grip.world =
-                                    glam::DVec3::new(position.x, position.y, position.z);
-                                text_grip.is_midpoint = false;
-                            }
-                        }
-                    }
-                }
-                let contextual_dimension =
-                    crate::entities::dimension::as_dimension(contextual.as_ref());
-                let dynamic_angle = contextual_dimension
-                    .filter(|dim| {
-                        matches!(
-                            dim,
-                            codec::entities::Dimension::Angular2Ln(_)
-                                | codec::entities::Dimension::Angular3Pt(_)
-                        )
-                    })
-                    .filter(|_| self.tabs[i].scene.is_dynamic_dimension(handle));
-                if let Some(dim) = dynamic_angle {
-                    // A dynamic angle shows a triangle at each end of its arc
-                    // pointing away from it, and squares at the arc point and
-                    // the text — nothing on the sides.
-                    let (arc_id, text_id) =
-                        if matches!(dim, codec::entities::Dimension::Angular2Ln(_)) {
-                            (4, 5)
-                        } else {
-                            (3, 4)
-                        };
-                    if let Some(ends) = crate::entities::dimension::angular_arc_ends(dim) {
-                        entity_grips.retain(|grip| grip.id == arc_id || grip.id == text_id);
-                        for (point, away) in ends {
-                            entity_grips.insert(
-                                0,
-                                crate::entities::common::oriented_triangle_grip(
-                                    arc_id, point, away,
-                                ),
-                            );
-                        }
-                    }
-                } else if self.tabs[i].scene.is_dynamic_dimension(handle) {
-                    // A dynamic dimension shows the reference's grips: a
-                    // triangle at each constraint point aimed at the other
-                    // one, and the text square — no dimension line grip.
-                    let points: Vec<glam::DVec3> = entity_grips
-                        .iter()
-                        .filter(|grip| grip.id <= 1)
-                        .map(|grip| grip.world)
-                        .collect();
-                    entity_grips.retain(|grip| grip.id != 2);
-                    for grip in &mut entity_grips {
-                        if grip.id <= 1 {
-                            let other = points.get(1 - grip.id).copied().unwrap_or(grip.world);
-                            let dir = (other - grip.world).normalize_or(glam::DVec3::X);
-                            *grip = crate::entities::common::oriented_triangle_grip(
-                                grip.id, grip.world, dir,
-                            );
-                        }
-                    }
-                }
-                entity_grips.extend(crate::scene::model::solid_history::primitive_grips(
-                    &self.tabs[i].scene.document,
-                    handle,
-                ));
-                for mut grip in entity_grips {
-                    // Subtract in f64: at UTM magnitudes an f32 cast before
-                    // the offset costs ~1 unit and draws the grip off the wire.
-                    grip.world.x -= wo[0];
-                    grip.world.y -= wo[1];
-                    grip.world.z -= wo[2];
+            for (handle, _entity) in selected {
+                // entity_grips_for errs only for a missing tab/entity; inside
+                // the selection walk the entity exists, so a defensive empty
+                // keeps the cache build total.
+                for grip in self.entity_grips_for(i, handle).unwrap_or_default() {
                     handles.push(handle);
                     grips.push(grip);
                 }
@@ -2929,30 +3056,197 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         // Append the dynamic-block visibility (lookup) grip, if the lone
         // selection is a visibility-parametric block reference.
         self.refresh_visibility_grip(wo);
+        self.refresh_table_grip(wo);
         self.refresh_test_action_grips(wo);
         self.refresh_authoring_grips(wo);
+    }
+
+    /// Enumerate one entity's built-in grips exactly as the selection cache
+    /// builder and the interactive viewport produce them for that entity —
+    /// the ONE shared core behind the viewport's selection cache, the
+    /// plugin grip read (API v11) and the automation `grips` op.
+    ///
+    /// Generic over every entity type: the answer is whatever the entity's
+    /// own grip producers declare. Reference-only entities and entities on
+    /// locked layers answer an empty list — the same answer the viewport
+    /// would give (grips exist only for selected, unlocked, editable
+    /// entities). The selection-scale grip budget does NOT apply here: it
+    /// bounds the on-screen total for multi-selections, not the per-entity
+    /// universe.
+    pub(super) fn entity_grips_for(
+        &self,
+        i: usize,
+        handle: Handle,
+    ) -> Result<Vec<GripDef>, String> {
+        if self.tabs.len() <= i {
+            return Err(format!("tab {i} does not exist"));
+        }
+        let Some(entity) = self.tabs[i].scene.document.get_entity(handle) else {
+            return Err(format!("entity {handle} does not exist"));
+        };
+        if self.tabs[i].scene.is_layer_locked(handle)
+            || self.tabs[i].scene.is_reference_only(handle)
+        {
+            return Ok(Vec::new());
+        }
+        let annotation_scale_handle = self.tabs[i].scene.displayed_annotation_scale_handle();
+        // Paper-space entity coordinates are NOT offset by world_offset (same
+        // rule as wire tessellation in wires_for_block). Only subtract in
+        // model space.
+        let is_paper = self.tabs[i].scene.current_layout != "Model";
+        let wo = if is_paper { [0.0f64; 3] } else { [0.0_f64; 3] };
+
+        let contextual = crate::scene::annotative::entity_for_annotation_context(
+            &self.tabs[i].scene.document,
+            entity,
+            annotation_scale_handle,
+        );
+        let mut entity_grips = dispatch::grips(contextual.as_ref());
+        if let codec::EntityType::Insert(insert) = contextual.as_ref() {
+            entity_grips = crate::entities::insert::visible_attribute_grips(
+                &self.tabs[i].scene.document,
+                insert,
+                self.tabs[i].scene.annotation_scale,
+            );
+        }
+        if crate::scene::model::solid_history::has_specialized_primitive_properties(
+            &self.tabs[i].scene.document,
+            handle,
+        ) {
+            entity_grips.clear();
+        }
+        // Dimension::grips() cannot see the document, so an automatic dimension
+        // text grip cannot resolve its real DIMSTYLE/annotation-scaled position
+        // there. Correct it here, where both the document and displayed annotation
+        // scale are available.
+        if let codec::EntityType::Dimension(dim) = contextual.as_ref() {
+            if matches!(
+                &**dim,
+                codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_)
+            ) && !dim.base().text_user_positioned
+            {
+                let anno_scale = annotation_scale_handle
+                    .and_then(
+                        |handle| match self.tabs[i].scene.document.objects.get(&handle) {
+                            Some(codec::objects::ObjectType::Scale(scale)) => Some(
+                                scale.inverse_factor()
+                                    / self.tabs[i].scene.annotation_scale_unit_factor(),
+                            ),
+                            _ => None,
+                        },
+                    )
+                    .unwrap_or(self.tabs[i].scene.annotation_scale as f64);
+
+                if let Some(position) = crate::entities::dimension::dimension_text_grip_position(
+                    dim,
+                    &self.tabs[i].scene.document,
+                    anno_scale,
+                ) {
+                    // The text grip is the final native grip of Linear/Aligned
+                    // dims. While the text is still automatic, make this a
+                    // point/stretch grip rather than a midpoint-translate
+                    // grip. That makes the first drag use the displayed
+                    // automatic position as its absolute starting point instead
+                    // of translating the stale DWG text_middle_point.
+                    if let Some(text_grip) = entity_grips.last_mut() {
+                        text_grip.world = glam::DVec3::new(position.x, position.y, position.z);
+                        text_grip.is_midpoint = false;
+                    }
+                }
+            }
+        }
+        let contextual_dimension = crate::entities::dimension::as_dimension(contextual.as_ref());
+        let dynamic_angle = contextual_dimension
+            .filter(|dim| {
+                matches!(
+                    dim,
+                    codec::entities::Dimension::Angular2Ln(_)
+                        | codec::entities::Dimension::Angular3Pt(_)
+                )
+            })
+            .filter(|_| self.tabs[i].scene.is_dynamic_dimension(handle));
+        if let Some(dim) = dynamic_angle {
+            // A dynamic angle shows a triangle at each end of its arc
+            // pointing away from it, and squares at the arc point and
+            // the text — nothing on the sides.
+            let (arc_id, text_id) = if matches!(dim, codec::entities::Dimension::Angular2Ln(_)) {
+                (4, 5)
+            } else {
+                (3, 4)
+            };
+            if let Some(ends) = crate::entities::dimension::angular_arc_ends(dim) {
+                entity_grips.retain(|grip| grip.id == arc_id || grip.id == text_id);
+                for (point, away) in ends {
+                    entity_grips.insert(
+                        0,
+                        crate::entities::common::oriented_triangle_grip(arc_id, point, away),
+                    );
+                }
+            }
+        } else if self.tabs[i].scene.is_dynamic_dimension(handle) {
+            // A dynamic dimension shows the reference's grips: a
+            // triangle at each constraint point aimed at the other
+            // one, and the text square — no dimension line grip.
+            let points: Vec<glam::DVec3> = entity_grips
+                .iter()
+                .filter(|grip| grip.id <= 1)
+                .map(|grip| grip.world)
+                .collect();
+            entity_grips.retain(|grip| grip.id != 2);
+            for grip in &mut entity_grips {
+                if grip.id <= 1 {
+                    let other = points.get(1 - grip.id).copied().unwrap_or(grip.world);
+                    let dir = (other - grip.world).normalize_or(glam::DVec3::X);
+                    *grip =
+                        crate::entities::common::oriented_triangle_grip(grip.id, grip.world, dir);
+                }
+            }
+        }
+        entity_grips.extend(crate::scene::model::solid_history::primitive_grips(
+            &self.tabs[i].scene.document,
+            handle,
+        ));
+        for grip in &mut entity_grips {
+            // Subtract in f64: at UTM magnitudes an f32 cast before
+            // the offset costs ~1 unit and draws the grip off the wire.
+            grip.world.x -= wo[0];
+            grip.world.y -= wo[1];
+            grip.world.z -= wo[2];
+        }
+        Ok(entity_grips)
     }
 
     pub(super) fn property_target_handles(&self, i: usize) -> Vec<Handle> {
         // The node graph edits its own node's entity through the panel's
         // handlers, independent of the drawing selection.
-        if let Some(handle) = self.property_target_override {
-            return vec![handle];
-        }
-        let mut handles = self.tabs[i].properties.selected_handles();
-        if handles.is_empty() {
-            handles = self.tabs[i].properties.source_handles.clone();
-        }
-        if handles.is_empty() {
-            handles.extend(self.tabs[i].selected_handle);
-        }
-        handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
-        handles
+        self.resolve_property_targets(i, true, |scene, handle| !scene.is_layer_locked(handle))
     }
 
     /// The point clouds the Locked row applies to: locked ones too, unless
     /// their layer is locked.
     pub(super) fn point_cloud_lock_targets(&self, i: usize) -> Vec<Handle> {
+        self.resolve_property_targets(i, false, |scene, handle| {
+            scene.locked_layer_name(handle).is_none()
+        })
+    }
+
+    fn resolve_property_targets(
+        &self,
+        i: usize,
+        include_override: bool,
+        mut include: impl FnMut(&crate::scene::Scene, Handle) -> bool,
+    ) -> Vec<Handle> {
+        if include_override {
+            if let Some(handle) = self.property_target_override {
+                let scene = &self.tabs[i].scene;
+                return scene
+                    .document
+                    .get_entity(handle)
+                    .filter(|_| include(scene, handle))
+                    .map(|_| vec![handle])
+                    .unwrap_or_default();
+            }
+        }
         let mut handles = self.tabs[i].properties.selected_handles();
         if handles.is_empty() {
             handles = self.tabs[i].properties.source_handles.clone();
@@ -2960,7 +3254,10 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         if handles.is_empty() {
             handles.extend(self.tabs[i].selected_handle);
         }
-        handles.retain(|handle| self.tabs[i].scene.locked_layer_name(*handle).is_none());
+        let scene = &self.tabs[i].scene;
+        handles.retain(|handle| {
+            scene.document.get_entity(*handle).is_some() && include(scene, *handle)
+        });
         handles
     }
 
@@ -4675,6 +4972,37 @@ mod chprop_integration_tests {
                 .color,
             Color::Index(5)
         );
+    }
+
+    #[test]
+    fn property_target_resolvers_discard_stale_handles() {
+        let mut app = OpenCADStudio::new_for_test();
+        let i = app.active_tab;
+        let existing = line_handle(&mut app);
+        let stale = app.tabs[i].scene.document.allocate_handle();
+        app.tabs[i].properties.source_handles = vec![existing, stale];
+
+        assert_eq!(app.property_target_handles(i), vec![existing]);
+        assert_eq!(app.point_cloud_lock_targets(i), vec![existing]);
+
+        app.tabs[i].properties.source_handles = vec![stale];
+        assert!(app.property_target_handles(i).is_empty());
+        assert!(app.point_cloud_lock_targets(i).is_empty());
+
+        app.finish_pending_history(i);
+        let undo_before = app.tabs[i].history.undo_stack.len();
+        let color_before = app.tabs[i].scene.document.header.current_entity_color;
+        app.tabs[i].dirty = false;
+        let _ = app.update(crate::app::Message::PropColorChanged(
+            codec::types::Color::Index(9),
+        ));
+        app.finish_pending_history(i);
+        assert_eq!(app.tabs[i].history.undo_stack.len(), undo_before);
+        assert_eq!(
+            app.tabs[i].scene.document.header.current_entity_color,
+            color_before
+        );
+        assert!(!app.tabs[i].dirty);
     }
 
     /// Regression test for the CLI `CHPROP` command. Before Mission #15

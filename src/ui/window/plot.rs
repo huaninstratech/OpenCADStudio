@@ -706,6 +706,11 @@ fn section_label<'a>(s: Cow<'static, str>) -> Element<'a, Message> {
     form::section_label(s)
 }
 
+/// The inline page-setup rename field, focused when a rename starts.
+pub fn setup_rename_id() -> iced::widget::Id {
+    iced::widget::Id::new("page-setup-rename-input")
+}
+
 fn setup_row<'a>(
     name: &'a str,
     selected: &str,
@@ -713,13 +718,15 @@ fn setup_row<'a>(
     rename_buf: &'a str,
 ) -> Element<'a, Message> {
     if renaming == Some(name) {
+        // A text field has no content width: Fit collapsed it to a sliver.
         return text_input("", rename_buf)
+            .id(setup_rename_id())
             .on_input(|value| Message::PlotDlg(PlotDlgMsg::NameInput(value)))
             .on_submit(Message::PlotDlg(PlotDlgMsg::NameCommit))
             .style(form::field_style)
             .size(11)
             .padding([4, 8])
-            .width(Fit)
+            .width(Length::Fill)
             .into();
     }
     let is_selected = name == selected;

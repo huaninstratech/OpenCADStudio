@@ -192,11 +192,28 @@ impl Scene {
             }
         }
 
-        // Camera glyphs — one per perspective VIEW (created by the CAMERA
-        // command; VIEWMODE perspective bit). The camera sits at target +
-        // direction and looks back toward the target.
+        // Camera glyphs — one per perspective VIEW (VIEWMODE perspective
+        // bit), shown only while CAMERADISPLAY is 1. A view that already has
+        // a CAMERA entity is drawn by that entity. The camera sits at target
+        // + direction and looks back toward the target.
+        if !self.document.header.camera_display {
+            return;
+        }
+        let entity_views: std::collections::HashSet<_> = self
+            .document
+            .entities()
+            .filter_map(|entity| match entity {
+                codec::EntityType::Extended(extended) => match &extended.data {
+                    codec::entities::ExtendedEntityData::Camera { view_handle } => {
+                        Some(view_handle)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
         for view in self.document.views.iter() {
-            if !view.perspective {
+            if !view.perspective || entity_views.contains(&view.handle) {
                 continue;
             }
             let target = [view.target.x, view.target.y, view.target.z];

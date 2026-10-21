@@ -51,17 +51,17 @@ pub fn plugin_command_names(disabled: &rustc_hash::FxHashSet<String>) -> Vec<Str
 
 /// Dispatch `cmd` to a loaded external plugin (skipping disabled ones).
 /// Returns true if one handled it.
+///
+/// Deterministic boot (API v12 hardening): while a plugin runner is still in
+/// its boot window, an unhandled dispatch of a command a loaded plugin lists
+/// by exact name is retried a bounded number of times, healing spawn/
+/// handshake races; a command still refused after the retries gets a visible
+/// headline instead of a silent "unknown command".
 pub(crate) fn try_dispatch(app: &mut OpenCADStudio, tab: usize, cmd: &str) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use super::host::HostSession;
         let disabled = app.disabled_plugin_ids();
-        let result = {
-            let mut host = HostSession::new(app, tab);
-            crate::plugin::external::with_manager(|manager| {
-                manager.dispatch(&mut host, cmd, |id| disabled.contains(id))
-            })
-        };
+        let (handled, result) = dispatch_with_boot_retry(app, tab, cmd, &disabled);
         for id in result.dead_plugins {
             app.push_plugin_error(&format!("Plugin '{id}' process died; skipping dispatch"));
         }
@@ -78,13 +78,89 @@ pub(crate) fn try_dispatch(app: &mut OpenCADStudio, tab: usize, cmd: &str) -> bo
                 ),
             );
         }
-        return result.handled;
+        return handled;
     }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (app, tab, cmd);
         false
     }
+}
+
+/// One dispatch attempt against the live manager.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_once<'a>(
+    app: &'a mut OpenCADStudio,
+    tab: usize,
+    cmd: &str,
+    disabled: &rustc_hash::FxHashSet<String>,
+) -> (bool, ocs_plugin_api::process::DispatchResult) {
+    use super::host::HostSession;
+    let mut host = HostSession::new(app, tab);
+    let result = crate::plugin::external::with_manager(|manager| {
+        manager.dispatch(&mut host, cmd, |id| disabled.contains(id))
+    });
+    (result.handled, result)
+}
+
+/// The boot-race retry: when a runner has not attached its notification
+/// channel yet, a loaded plugin lists the typed verb by exact name, and the
+/// dispatch went unanswered with no error and no dead plugin, retry a
+/// bounded number of times — and give a persistent refusal a visible
+/// headline so the failure is never silent.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_with_boot_retry(
+    app: &mut OpenCADStudio,
+    tab: usize,
+    cmd: &str,
+    disabled: &rustc_hash::FxHashSet<String>,
+) -> (bool, ocs_plugin_api::process::DispatchResult) {
+    let (mut handled, mut result) = dispatch_once(app, tab, cmd, disabled);
+    if handled || !result.errors.is_empty() || !result.dead_plugins.is_empty() {
+        return (handled, result);
+    }
+    let booting_plugin_command = crate::plugin::external::with_manager(|manager| {
+        let booting = manager
+            .alive_ids()
+            .iter()
+            .any(|id| manager.notification_channel_attached(id) == Some(false));
+        booting
+            && manager
+                .command_names(|id| disabled.contains(id))
+                .iter()
+                .any(|name| name == cmd)
+    });
+    if !booting_plugin_command {
+        return (handled, result);
+    }
+    const RETRIES: usize = 2;
+    const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(120);
+    app.push_plugin_error(&format!(
+        "'{cmd}' is listed by a loaded plugin but was not handled yet; retrying \
+         ({RETRIES}x, {RETRY_PAUSE:?}) — a runner may still be finishing its boot handshake"
+    ));
+    for _ in 0..RETRIES {
+        std::thread::sleep(RETRY_PAUSE);
+        let disabled = app.disabled_plugin_ids();
+        let (again, retried) = dispatch_once(app, tab, cmd, &disabled);
+        handled = again;
+        // Keep the last result's diagnostics; started-commands surfaced above.
+        if retried.started.is_some() {
+            result.started = retried.started;
+        }
+        result.errors = retried.errors;
+        result.dead_plugins = retried.dead_plugins;
+        if handled {
+            break;
+        }
+    }
+    if !handled {
+        app.push_plugin_error(&format!(
+            "plugin command '{cmd}' is listed by its (alive) plugin but the dispatch still \
+             went unhandled; the runner may be wedged"
+        ));
+    }
+    (handled, result)
 }
 
 #[cfg(test)]

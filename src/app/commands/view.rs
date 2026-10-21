@@ -310,10 +310,12 @@ impl OpenCADStudio {
 
             "REPORT" => {
                 // Pre-fill the GitHub issue body with version + platform so
-                // reports arrive with the basics already filled in.
+                // reports arrive with the basics already filled in. The rule
+                // is `***`: text typed right above a `---` line turns into a
+                // Markdown heading.
                 let body = format!(
                     "<!-- Describe the issue and the steps to reproduce it. -->\n\n\n\
-                     ---\n- Open CAD Studio: v{}\n- Revision: {} ({}, {})\n- Platform: {}\n",
+                     ***\n- Open CAD Studio: v{}\n- Revision: {} ({}, {})\n- Platform: {}\n",
                     env!("OCS_FULL_VERSION"),
                     env!("OCS_GIT_REV"),
                     env!("OCS_COMMIT_DATE"),
@@ -368,6 +370,14 @@ impl OpenCADStudio {
 
             "PARAMETERS" => {
                 return Some(Task::done(Message::NamedParametersOpen));
+            }
+            "PARAMETERSCLOSE" => {
+                if self.active_modal == Some(crate::app::ModalKind::NamedParameters) {
+                    self.active_modal = None;
+                    self.named_parameter_editor_rows.clear();
+                    self.reset_modal_geometry();
+                }
+                return Some(Task::none());
             }
 
             // CUIEXPORT <path> — write the keyboard-shortcut customizations

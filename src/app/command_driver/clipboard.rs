@@ -158,11 +158,13 @@ impl OpenCADStudio {
         }
         let label = self.history_label_from_active_cmd(i, "TRIM");
         self.push_undo_snapshot(i, label);
+        let mut replaced_handles = Vec::with_capacity(replacements.len());
         for (handle, entities) in replacements {
             let new_handles = self.replace_command_entity(i, handle, entities);
-            if let Some(command) = self.tabs[i].active_cmd.as_mut() {
-                command.on_entity_replaced(handle, &new_handles);
-            }
+            replaced_handles.push((handle, new_handles));
+        }
+        if let Some(command) = self.tabs[i].active_cmd.as_mut() {
+            command.on_entities_replaced(&replaced_handles);
         }
         self.tabs[i].dirty = true;
         self.tabs[i].scene.clear_preview_wire();

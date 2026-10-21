@@ -14,3 +14,6 @@ crate-type = ["cdylib"]
 [dependencies]
 # The stable contract, with the runtime `host` surface (HostApi / BuiltinPlugin).
 ocs_plugin_api = { git = "https://github.com/HakanSeven12/OpenCADStudio", features = ["host"] }
+# Entity types for writes. MUST match the host's codec pin exactly
+# (the host's `codec` dependency in its Cargo.toml) or the host refuses.
+acadrust = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "14fdae5" }

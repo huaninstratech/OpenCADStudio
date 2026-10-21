@@ -441,34 +441,159 @@ pub(super) fn set_entity_tag(
 pub(crate) fn retag_members(document: &mut CadDocument, definition: Handle) {
     for handle in members(document, definition) {
         if let Some(id) = document.get_entity(handle).and_then(element_id) {
-            set_entity_tag(document, handle, element_tag(id, handle));
+            let tagged = document.get_entity(handle).is_some_and(|entity| {
+                element_id(entity) == Some(id)
+                    && entity
+                        .common()
+                        .extended_data
+                        .get_record(ELEMENT_TAG)
+                        .is_some_and(|record| {
+                            record
+                                .values
+                                .iter()
+                                .any(|v| matches!(v,XDataValue::Handle(h) if *h==handle))
+                        })
+            });
+            if !tagged {
+                set_entity_tag(document, handle, element_tag(id, handle));
+            }
         }
     }
+}
+
+/// A copied definition owns its identity even when its evaluation IDs are retained.
+pub(crate) fn refresh_copied_identity(document: &mut CadDocument, definition: Handle, name: &str) {
+    if !matches!(graph(document, definition), Ok(Some(_))) {
+        return;
+    }
+    let mut true_name = ExtendedDataRecord::new(TRUE_NAME);
+    true_name.add_value(XDataValue::String(name.to_owned()));
+    document.set_object_xdata_record(definition, true_name);
+    let mut guid = ExtendedDataRecord::new(GUID);
+    guid.add_value(XDataValue::String(new_guid()));
+    document.set_object_xdata_record(definition, guid);
+    retag_members(document, definition);
 }
 
 /// Give every object of the definition its element tag, numbering the new
 /// ones after the highest id in use, and record the next id on the block.
 pub(super) fn tag_members(document: &mut CadDocument, definition: Handle) {
     let members = members(document, definition);
+    let stored_next = document
+        .object_xdata(definition)
+        .and_then(|data| data.get_record(ELEMENT_TAG))
+        .and_then(|record| {
+            record.values.iter().find_map(|v| match v {
+                XDataValue::Integer32(n) => Some(*n),
+                _ => None,
+            })
+        })
+        .unwrap_or(0);
     let mut next = members
         .iter()
         .filter_map(|handle| document.get_entity(*handle).and_then(element_id))
         .max()
-        .map_or(0, |id| id + 1);
+        .map_or(0, |id| id.saturating_add(1))
+        .max(stored_next);
+    let mut checked = std::collections::BTreeSet::new();
+    let needs_ids = members.iter().any(|h| {
+        document.get_entity(*h).is_none_or(|e| {
+            element_id(e).is_none_or(|id| {
+                !checked.insert(id)
+                    || !e
+                        .common()
+                        .extended_data
+                        .get_record(ELEMENT_TAG)
+                        .is_some_and(|r| {
+                            r.values
+                                .iter()
+                                .any(|v| matches!(v,XDataValue::Handle(link) if link==h))
+                        })
+            })
+        })
+    });
+    if needs_ids {
+        // Undo can restore an older definition counter while evaluated copies
+        // still contain newer IDs. Never recycle any of those live identities.
+        let representations = document
+            .block_records
+            .iter()
+            .filter(|b| {
+                document
+                    .object_xdata(b.handle)
+                    .and_then(|d| d.get_record(REPRESENTATION_TAG))
+                    .is_some_and(|r| {
+                        r.values
+                            .iter()
+                            .any(|v| matches!(v,XDataValue::Handle(h) if *h==definition))
+                    })
+            })
+            .map(|b| b.handle)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(high) = document
+            .entities()
+            .filter(|e| representations.contains(&e.common().owner_handle))
+            .filter_map(element_id)
+            .max()
+        {
+            next = next.max(high.saturating_add(1));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
     for handle in members {
         let id = match document.get_entity(handle).and_then(element_id) {
-            Some(id) => id,
-            None => {
-                next += 1;
-                next - 1
+            Some(id)
+                if id >= 0
+                    && document
+                        .get_entity(handle)
+                        .unwrap()
+                        .common()
+                        .extended_data
+                        .get_record(ELEMENT_TAG)
+                        .is_some_and(|r| {
+                            r.values
+                                .iter()
+                                .any(|v| matches!(v,XDataValue::Handle(h) if *h==handle))
+                        })
+                    && seen.insert(id) =>
+            {
+                id
+            }
+            _ => {
+                let id = next;
+                next = next.saturating_add(1);
+                seen.insert(id);
+                id
             }
         };
-        set_entity_tag(document, handle, element_tag(id, handle));
+        let tagged = document.get_entity(handle).is_some_and(|entity| {
+            element_id(entity) == Some(id)
+                && entity
+                    .common()
+                    .extended_data
+                    .get_record(ELEMENT_TAG)
+                    .is_some_and(|record| {
+                        record
+                            .values
+                            .iter()
+                            .any(|v| matches!(v,XDataValue::Handle(h) if *h==handle))
+                    })
+        });
+        if !tagged {
+            set_entity_tag(document, handle, element_tag(id, handle));
+        }
     }
     let mut tag = ExtendedDataRecord::new(ELEMENT_TAG);
     tag.add_value(XDataValue::Integer16(1));
     tag.add_value(XDataValue::Integer32(next));
-    document.set_object_xdata_record(definition, tag);
+    if stored_next != next
+        || document
+            .object_xdata(definition)
+            .and_then(|d| d.get_record(ELEMENT_TAG))
+            .is_none()
+    {
+        document.set_object_xdata_record(definition, tag);
+    }
 }
 
 pub(super) fn new_guid() -> String {

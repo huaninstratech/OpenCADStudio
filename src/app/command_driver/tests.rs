@@ -87,6 +87,94 @@ mod command_replacement_tests {
 }
 
 #[cfg(test)]
+mod trim_extend_history_tests {
+    use super::super::*;
+    use crate::modules::draw::modify::trim::{ExtendCommand, TrimCommand};
+    use codec::entities::Line;
+    use codec::types::Vector3;
+
+    fn add_line(app: &mut OpenCADStudio, a: [f64; 2], b: [f64; 2]) -> Handle {
+        app.tabs[app.active_tab]
+            .scene
+            .add_entity(codec::EntityType::Line(Line::from_points(
+                Vector3::new(a[0], a[1], 0.0),
+                Vector3::new(b[0], b[1], 0.0),
+            )))
+    }
+
+    fn assert_line_exists(app: &OpenCADStudio, a: [f64; 2], b: [f64; 2]) {
+        assert!(
+            app.tabs[app.active_tab]
+                .scene
+                .document
+                .entities()
+                .any(|entity| {
+                    matches!(entity, codec::EntityType::Line(line)
+                if (line.start.x - a[0]).abs() < 1e-9
+                    && (line.start.y - a[1]).abs() < 1e-9
+                    && (line.end.x - b[0]).abs() < 1e-9
+                    && (line.end.y - b[1]).abs() < 1e-9)
+                }),
+            "line from {a:?} to {b:?} should exist"
+        );
+    }
+
+    #[test]
+    fn trim_replacement_survives_undo_and_redo() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let target = add_line(&mut app, [0.0, 0.0], [10.0, 0.0]);
+        let _boundary = add_line(&mut app, [6.0, -2.0], [6.0, 2.0]);
+        let all: Vec<_> = app.tabs[app.active_tab]
+            .scene
+            .document
+            .entities()
+            .cloned()
+            .collect();
+        app.tabs[app.active_tab].active_cmd = Some(Box::new(TrimCommand::new(all)));
+        let result = app.tabs[app.active_tab]
+            .active_cmd
+            .as_mut()
+            .unwrap()
+            .on_entity_pick(target, glam::DVec3::new(8.0, 0.0, 0.0));
+        let _ = app.apply_cmd_result(result);
+        assert_line_exists(&app, [0.0, 0.0], [6.0, 0.0]);
+
+        app.undo_active_tab();
+        assert_line_exists(&app, [0.0, 0.0], [10.0, 0.0]);
+        app.redo_active_tab();
+        assert_line_exists(&app, [0.0, 0.0], [6.0, 0.0]);
+    }
+
+    #[test]
+    fn extend_replacement_survives_undo_and_redo() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let target = add_line(&mut app, [0.0, 0.0], [4.0, 0.0]);
+        let _boundary = add_line(&mut app, [8.0, -2.0], [8.0, 2.0]);
+        let all: Vec<_> = app.tabs[app.active_tab]
+            .scene
+            .document
+            .entities()
+            .cloned()
+            .collect();
+        app.tabs[app.active_tab].active_cmd = Some(Box::new(ExtendCommand::new(all)));
+        let result = app.tabs[app.active_tab]
+            .active_cmd
+            .as_mut()
+            .unwrap()
+            .on_entity_pick(target, glam::DVec3::new(3.5, 0.0, 0.0));
+        let _ = app.apply_cmd_result(result);
+        assert_line_exists(&app, [0.0, 0.0], [8.0, 0.0]);
+
+        app.undo_active_tab();
+        assert_line_exists(&app, [0.0, 0.0], [4.0, 0.0]);
+        app.redo_active_tab();
+        assert_line_exists(&app, [0.0, 0.0], [8.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
 mod parametric_constraint_undo_tests {
     use super::super::*;
     use crate::scene::parametric_constraints::{ConstraintKind, ParametricRef, ParametricScope};

@@ -477,6 +477,23 @@ impl OpenCADStudio {
         self.control.pending.is_some()
     }
 
+    /// A client's `cancel`: Esc, repeated while a command is still active.
+    /// One Esc may only dismiss what sits in front of the command (an open
+    /// dialog, a popup, typed text) or step a command back a level, and the
+    /// client has no other way to finish the job. (#1930)
+    fn control_cancel(&mut self) -> Task<Message> {
+        let mut tasks = vec![self.update(Message::CommandEscape)];
+        // ponytail: fixed Esc budget; covers every overlay + step-back chain
+        // in the escape path today, raise it if a deeper chain appears.
+        for _ in 0..8 {
+            if self.tabs[self.active_tab].active_cmd.is_none() {
+                break;
+            }
+            tasks.push(self.update(Message::CommandEscape));
+        }
+        Task::batch(tasks)
+    }
+
     /// Mirror a real selection change into the automation event stream. The
     /// plugin host already publishes the V4 selection event; automation clients
     /// need the same signal instead of polling `state`.
@@ -776,7 +793,7 @@ impl OpenCADStudio {
                 // killed, so `cancel` ends the active command and closes the
                 // request as cancelled. (#1801)
                 if op == "cancel" {
-                    let task = self.update(Message::CommandEscape);
+                    let task = self.control_cancel();
                     if let Some(p) = self.control.pending.as_mut() {
                         p.cancelled = true;
                         p.pending = 0;
@@ -1116,7 +1133,7 @@ impl OpenCADStudio {
                     _ => return Err(failure("invalid_input", "Unknown input kind")),
                 }
             }
-            "cancel" => self.update(Message::CommandEscape),
+            "cancel" => self.control_cancel(),
             "undo" => self.update(Message::Undo),
             "redo" => self.update(Message::Redo),
             "select" => {
@@ -1177,6 +1194,9 @@ impl OpenCADStudio {
             "view_focus" => self.control_view_focus(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "save" => {
+                if let Some(refusal) = self.read_only_save_refusal() {
+                    return Err(refusal);
+                }
                 if self.tabs[i].block_test.is_some() {
                     return Err(failure(
                         "temporary_document",
@@ -1281,6 +1301,9 @@ impl OpenCADStudio {
             }
             #[cfg(not(target_arch = "wasm32"))]
             "save_verified" => {
+                if let Some(refusal) = self.read_only_save_refusal() {
+                    return Err(refusal);
+                }
                 let result = self.save_verified_request(req)?;
                 self.set_control_result(result);
                 Task::none()
@@ -2345,6 +2368,19 @@ mod tests {
         );
     }
     #[test]
+    fn cancel_ends_the_started_command() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let started = request(&mut app, json!({"op":"start","cmd":"PURGE"}));
+        assert_eq!(started["status"], "waiting_input", "{started}");
+        // A dialog left open by the load (missing fonts) takes the first Esc.
+        app.active_modal = Some(crate::app::ModalKind::MissingFonts);
+        let cancelled = request(&mut app, json!({"op":"cancel"}));
+        assert_eq!(cancelled["state"]["command"], Value::Null, "{cancelled}");
+        let next = request(&mut app, json!({"op":"start","cmd":"LINE"}));
+        assert_eq!(next["status"], "waiting_input", "{next}");
+    }
+    #[test]
     fn direct_user_input_takes_command_ownership() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
@@ -3078,8 +3114,8 @@ mod tests {
                 .all(|(channel, expected)| (channel - expected).abs() < 0.02)
         };
         assert!(
-            color_ops.iter().any(|c| near(c, [0.0, 0.15, 0.5])),
-            "unstyled cyan frame plots as the dark-blue print remap: {color_ops:?}"
+            color_ops.iter().any(|c| near(c, [0.0, 1.0, 1.0])),
+            "unstyled cyan frame keeps its colour on paper (#1926): {color_ops:?}"
         );
         assert!(
             color_ops.iter().any(|c| near(c, [1.0, 0.0, 0.0])),

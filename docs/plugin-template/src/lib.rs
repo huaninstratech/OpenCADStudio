@@ -4,7 +4,11 @@
 //! match. Build with `cargo build --release` and ship the resulting cdylib plus
 //! `plugin.toml` as GitHub Release assets (see `.github/workflows/release.yml`).
 
-use ocs_plugin_api::host::{BuiltinPlugin, HostApi};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use acadrust::entities::Point;
+use acadrust::xdata::{ExtendedDataRecord, XDataValue};
+use ocs_plugin_api::host::{BuiltinPlugin, HostApi, HostNotification};
 use ocs_plugin_api::manifest::{ApiVersion, PluginManifest};
 use ocs_plugin_api::ribbon::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
 
@@ -46,6 +50,10 @@ impl CadModule for MyModule {
     }
 }
 
+/// Last `DocumentChanged` epoch this plugin observed (test hook: the
+/// deterministic-boot notification test reads it through `MP_LAST_NOTIF`).
+static LAST_DOC_VERSION: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// The plugin entry point.
 struct MyPlugin;
 
@@ -62,7 +70,41 @@ impl BuiltinPlugin for MyPlugin {
                 host.push_info("Hello from My Plugin");
                 true
             }
+            // Test hook: report the last observed DocumentChanged epoch so a
+            // fresh-boot test can assert the notification channel attached
+            // deterministically (u64::MAX means none arrived yet).
+            "MP_LAST_NOTIF" => {
+                let version = LAST_DOC_VERSION.load(Ordering::SeqCst);
+                host.push_info(&format!("LAST_NOTIF {version}"));
+                true
+            }
+            // Test hook (API v13.1): the FIRST-WRITE-BOUNDARY shape — a
+            // dispatch whose nested write frames are served INLINE under the
+            // manager borrow held by the dispatch path (the boundary publish
+            // re-enters with_manager). The v13 AppHangB1 hang the consumer
+            // captured on CVI_ALIGN_BYPI was exactly this call.
+            "MP_WRITE" => {
+                let point = Point::from_coords(1.0, 2.0, 0.0);
+                let handle = host.add_entity(acadrust::EntityType::Point(point));
+                if !handle.is_null() {
+                    let _ = host.write_record(
+                        handle,
+                        ExtendedDataRecord {
+                            application_name: "MYPLUG".to_string(),
+                            values: vec![XDataValue::String("mp-write".to_string())],
+                        },
+                    );
+                }
+                host.push_info("MP_WRITE done");
+                true
+            }
             _ => false,
+        }
+    }
+
+    fn on_notification(&mut self, _command_id: Option<u64>, notification: HostNotification) {
+        if let HostNotification::DocumentChanged { version } = notification {
+            LAST_DOC_VERSION.store(version, Ordering::SeqCst);
         }
     }
 }

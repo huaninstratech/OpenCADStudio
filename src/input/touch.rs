@@ -6,8 +6,10 @@
 //! swiped up show the isometric view.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+// The browser has no std clock; iced's Instant reads the JS one there.
+use iced::time::Instant;
 use iced::touch;
 use iced::{Point, Vector};
 

@@ -24,6 +24,7 @@
   <summary xml:lang="pt-BR">Aplicativo CAD 2D/3D para desenhos DWG e DXF</summary>
   <summary xml:lang="ru-RU">Приложение 2D/3D CAD для чертежей DWG и DXF</summary>
   <summary xml:lang="tr-TR">DWG ve DXF çizimleri için 2D/3D CAD uygulaması</summary>
+  <summary xml:lang="vi-VN">Ứng dụng CAD 2D/3D cho bản vẽ DWG và DXF</summary>
   <summary xml:lang="zh-CN">用于 DWG 和 DXF 图形的 2D/3D CAD 应用程序</summary>
   <summary xml:lang="zh-TW">用於 DWG 與 DXF 圖面的 2D/3D CAD 應用程式</summary>
   <description>
@@ -47,6 +48,7 @@
     <p xml:lang="pt-BR">Crie e edite desenhos técnicos nos formatos DWG e DXF.</p>
     <p xml:lang="ru-RU">Создавайте и редактируйте технические чертежи в форматах DWG и DXF.</p>
     <p xml:lang="tr-TR">DWG ve DXF biçimlerinde teknik çizimler oluşturun ve düzenleyin.</p>
+    <p xml:lang="vi-VN">Tạo và chỉnh sửa bản vẽ kỹ thuật ở định dạng DWG và DXF.</p>
     <p xml:lang="zh-CN">创建和编辑 DWG 与 DXF 格式的技术图形。</p>
     <p xml:lang="zh-TW">建立及編輯 DWG 與 DXF 格式的技術圖面。</p>
   </description>
@@ -114,6 +116,9 @@
     <keyword xml:lang="tr-TR">Çizim</keyword>
     <keyword xml:lang="tr-TR">Tasarım</keyword>
     <keyword xml:lang="tr-TR">Mühendislik</keyword>
+    <keyword xml:lang="vi-VN">Bản vẽ</keyword>
+    <keyword xml:lang="vi-VN">Thiết kế</keyword>
+    <keyword xml:lang="vi-VN">Kỹ thuật</keyword>
     <keyword xml:lang="zh-CN">绘图</keyword>
     <keyword xml:lang="zh-CN">设计</keyword>
     <keyword xml:lang="zh-CN">工程学</keyword>

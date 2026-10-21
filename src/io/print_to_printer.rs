@@ -1557,9 +1557,24 @@ mod printer_properties_tests {
         assert!(result.is_ok(), "GDI print failed: {result:?}");
 
         // The spooled PDF must contain the black block: rasterise it and
-        // count clearly-dark pixels.
-        let page = crate::scene::model::pdf_raster::rasterize_page(&printed.to_string_lossy(), "1")
-            .expect("spooled output should rasterise");
+        // count clearly-dark pixels. The print-to-PDF driver writes the file
+        // through the spooler after the job is handed over, so give it time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let page = loop {
+            // Uncached: the page memo would keep a first, unfinished read.
+            let raster = crate::scene::model::pdf_raster::rasterize_page_at_dpi_uncached(
+                &printed.to_string_lossy(),
+                "1",
+                crate::scene::model::pdf_raster::DISPLAY_DPI,
+            );
+            match raster {
+                Some(page) => break page,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                None => panic!("spooled output should rasterise"),
+            }
+        };
         let dark = page
             .pixels
             .chunks_exact(4)

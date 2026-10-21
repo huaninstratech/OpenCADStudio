@@ -96,6 +96,13 @@ const ALIASES: &[(&str, &str)] = &[
     ("EXTFONT", "unicode"),
 ];
 
+/// Aliases that always mean the reference's *stroke* font and so never defer
+/// to an installed TrueType face of the same name: `txt`/`monotxt` are the DXF
+/// stroke text fonts, and a coincidental `Txt Regular` is not that font. The
+/// `installed_alias` escape hatch stays for aliases that genuinely name a
+/// TrueType face (ISOCPEUR, #1764).
+const STROKE_ALIASES: &[&str] = &["TXT", "MONOTXT"];
+
 /// The space advance of the reference's stroke fonts, in glyph units (cap
 /// height 9), measured from their text extents: the SHX names these LFF
 /// fonts stand in for keep the reference's word gaps.
@@ -529,11 +536,13 @@ pub fn is_builtin(name: &str) -> bool {
 /// draws with the stroke substitute, not the installed `.ttf` (measured).
 fn installed_alias(stem: &str, name: &str) -> bool {
     use crate::scene::text::sysfont;
+    let stem = stem.trim().to_ascii_uppercase();
     !is_shx_name(name)
+        && !STROKE_ALIASES.contains(&stem.as_str())
         && ALIASES.iter().any(|(alias, _)| *alias == stem)
         && (sysfont::family_for_file(name).is_some()
-            || sysfont::canonical_family_name(stem)
-                .is_some_and(|family| family.eq_ignore_ascii_case(stem)))
+            || sysfont::canonical_family_name(&stem)
+                .is_some_and(|family| family.eq_ignore_ascii_case(&stem)))
 }
 
 /// Whether `name` is written as an `.shx` file name.

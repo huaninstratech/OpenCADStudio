@@ -125,6 +125,11 @@ const MAX_HISTORY: usize = 64;
 #[derive(Clone)]
 pub struct CommandLine {
     pub input: String,
+    /// Depth of active QUIET MACHINE REPLAYS (`CommandRequest::RunQuiet`,
+    /// API v13): while > 0, `push` suppresses Command/Output/Info echo so a
+    /// plugin's constraint/SETVAR replays leave no machinery noise in the
+    /// user-visible history. Errors always surface.
+    pub(crate) quiet_replay: usize,
     /// Persistent literal-space mode (the `>` toggle button): while on, every
     /// line behaves as if it started with `>` — Space stays in the input
     /// instead of submitting. Saved in the user config.
@@ -202,6 +207,7 @@ pub struct CommandLine {
 impl Default for CommandLine {
     fn default() -> Self {
         Self {
+            quiet_replay: 0,
             input: String::new(),
             literal_spaces: false,
             history: Vec::new(),
@@ -456,7 +462,26 @@ impl CommandLine {
     pub fn push_info(&mut self, msg: &str) {
         self.push(EntryKind::Info, format_info(msg));
     }
+
+    /// Enter a quiet machine replay scope (API v13): command-line echo is
+    /// suppressed until the matching [`Self::end_quiet_replay`]. Depth-
+    /// counted so nested quiet replays unwind correctly; errors always
+    /// surface through `push_error`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn begin_quiet_replay(&mut self) {
+        self.quiet_replay = self.quiet_replay.saturating_add(1);
+    }
+
+    /// Leave one quiet machine replay scope (API v13).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn end_quiet_replay(&mut self) {
+        self.quiet_replay = self.quiet_replay.saturating_sub(1);
+    }
     fn push(&mut self, kind: EntryKind, text: String) {
+        if self.quiet_replay > 0 && !matches!(kind, EntryKind::Error) {
+            // A quiet machine replay (API v13) leaves no echo; errors pass.
+            return;
+        }
         self.history.push(HistoryEntry {
             kind,
             text,
@@ -1427,6 +1452,16 @@ mod tests {
     fn builtin_commands_still_match_with_an_empty_pool() {
         let m = ranked_matches("LINE", &[], &FxHashMap::default());
         assert!(m.iter().any(|c| c == "LINE"), "got {m:?}");
+    }
+
+    #[test]
+    fn submit_uppercases_only_the_command_verb() {
+        let mut line = CommandLine::new();
+        line.input = "open /home/u/My.dwg --PluginArg".to_string();
+        assert_eq!(
+            line.submit().as_deref(),
+            Some("OPEN /home/u/My.dwg --PluginArg")
+        );
     }
 
     #[test]

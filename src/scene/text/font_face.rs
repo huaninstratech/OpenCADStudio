@@ -284,6 +284,30 @@ mod tests {
         assert!(matches!(Face::resolve("romans.shx"), Face::Lff(_)));
     }
 
+    // `txt`/`monotxt` are the DXF *stroke* text fonts. An installed TrueType
+    // face that happens to share the name (e.g. "Txt Regular") is not that
+    // font and must never stand in for it, so the stroke substitute is drawn
+    // on every machine. The #1764 escape hatch (an installed copy of a real
+    // TrueType alias such as ISOCPEUR draws that face) stays for aliases that
+    // genuinely name one.
+    #[test]
+    fn stroke_aliases_ignore_a_same_named_true_type_face() {
+        for name in &["txt", "TXT", "monotxt", "MONOTXT"] {
+            assert!(
+                matches!(Face::resolve(name), Face::Lff(_)),
+                "{name} must resolve to the embedded stroke font"
+            );
+        }
+        // A stroke face still supplies its own Latin glyphs.
+        assert!(Face::resolve("txt").glyph('A').is_some());
+        // ISOCPEUR keeps the #1764 behaviour: Lff stand-in, or the installed
+        // TrueType face when one is present.
+        assert!(matches!(
+            Face::resolve("isocpeur"),
+            Face::Lff(_) | Face::Ttf { .. }
+        ));
+    }
+
     #[test]
     fn lff_falls_back_to_ttf_for_uncovered_glyph() {
         // A CJK ideograph is in no stroke font; with a stroke style selected it

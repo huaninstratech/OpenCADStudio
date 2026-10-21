@@ -138,6 +138,11 @@ pub trait BuiltinPlugin: Send + Sync {
     fn dispatch(&self, host: &mut dyn HostApi, cmd: &str) -> bool;
     fn on_load(&mut self, host: &mut dyn HostApi) {}
     fn entity_classes(&self) -> Option<&'static EntityClasses> {} // API v10
+    fn on_custom_grip_event(                                           // API v11
+        &mut self,
+        host: &mut dyn HostApi,
+        event: CustomGripEvent,
+    ) -> CustomGripResponse {}
 }
 ```
 
@@ -350,6 +355,201 @@ missing from the table, or mapped to an empty label falls back to the native
 type. Because labels are display text resolved from the loaded plugin, they
 are plugin-localizable and fixable without rewriting drawings — and
 `plugin.toml` (the pre-load discovery file) deliberately does not carry them.
+
+### Plugin grip surface (API v11, hardened in v12)
+
+Three additive surfaces, one rule: **plugin DECLARED, plugin OWNED**. The host
+renders, hit-tests and drags plugin-declared grip points, but it never
+interprets them — no entity change, constraint or record of its own ever
+follows from a custom grip. All semantics live in the declaring plugin.
+
+**1. Reading built-in grips.** `HostApi::entity_grips(handle)` enumerates an
+entity's grips with full viewport parity — the same per-entity enumeration the
+selection cache is built from (`shape` and field semantics match the
+automation `grips` read; `moves_entity` is the translate-grip flag). It is
+generic over every entity type: an arc answers its center / endpoints / its
+mid-arc radius grip, a spline its control points, and so on. Reference-only
+entities and locked layers answer an empty list — the same answer the
+viewport gives.
+
+**2. Programmatic grip edit.** `HostApi::grip_drag(handle, grip_id, to)`
+performs the same edit an interactive drag performs: the entity-typed grip
+modes, snaps/ortho/polar off for the move, exactly one undo step labeled like
+the interactive grip step ("GRIP"), byte-exact restore on undo, and the
+interactive path's refusals (unknown entity/grip, reference-only, locked
+layer, point out of view). The viewport, the automation `grip_drag` op and
+this method all drive ONE shared pipeline.
+
+**3. Plugin-declared custom grip points.**
+`HostApi::set_plugin_grips(plugin_id, grips)` declares (or, with an empty
+batch, clears) the calling plugin's grips: `grip_id` (a plugin-chosen stable
+id), `anchor` (any live entity handle — ownership scoping and hit-test
+legibility only), `point` (**absolute world** — the host never moves, offsets
+or auto-follows it when the anchor entity moves), `axis` (an optional
+hard-constrained drag direction), and `shape`. The declaration lifecycle:
+
+- **Session-only display state.** Nothing of a custom grip is persisted in
+  the drawing file; the plugin re-declares after its own notification
+  boundaries (the pull model — `on_notification` marks the safe refresh
+  points). Whole batches REPLACE the plugin's previous set, applied as a
+  diff keyed by `grip_id`: an unchanged re-declare costs nothing.
+- **The one-undo-step contract.** Drags ride the viewport's existing grip
+  drag lifecycle: press engages, the cursor streams move events, mouse-up
+  settles, Esc cancels. Move events are coalesced (at most one in flight,
+  superseded positions dropped); the plugin answers each with a
+  `CustomGripResponse` whose `preview` REPLACES its live preview wires — the
+  only feedback the host shows (no host ghost; the anchor entity never
+  moves by host action mid-drag). The settle event carries the final point
+  and gives the plugin its ONLY write window: from inside
+  `on_custom_grip_event` the plugin can read the document and write —
+  including opening its own `push_undo` scope — and a settled drag totals
+  exactly the plugin's one labeled undo step. The host records nothing of
+  its own; cancel means zero writes, zero undo steps, byte-identical
+  drawing. Every callback is panic-guarded: a buggy handler is contained and
+  reported, never fatal.
+- **Reference-only and locking.** Custom grips never render on reference-only
+  designated entities, never mutate entities through built-in paths, and
+  never bypass layer locks — the plugin's own settle writes go through the
+  same HostApi as any other plugin write. A grip coincident with
+  click-through (reference-only) geometry stays fully hittable and wins the
+  hit, because grips are tested before any wire pick.
+- **Visibility.** Always visible while the declaring plugin is loaded, alive
+  and not disabled (the same live-manager gating as the entity-class
+  labels), with hover highlighting through the same overlay the built-in
+  grips use, in a distinct accent. Death/unload removes the grip — and
+  nothing else. Hit-testing scales through a per-tab spatial grid with
+  viewport culling (never a linear scan per cursor move); per-plugin and
+  per-tab caps (4 096 / 16 384) keep the budget machinery honest — custom
+  grips are not subject to the selection grip budget.
+- **Ownership.** Over the plugin IPC the host attaches the speaking
+  process's own manifest id and refuses mismatches, so a plugin cannot
+  declare grips in another plugin's name — and only the declaring plugin
+  ever receives its grips' events. The declaration requires the V4
+  transport (the settle's nested writes ride the multiplexed link).
+- **Live geometry (v11.2).** A begin/move answer may also carry
+  `live_entities: Vec<(handle, entity)>` — the plugin-directed visual
+  channel, computed by the plugin exactly as the settle will commit it.
+  The host swaps those entities in through the same visual-only semantics
+  its own grip drags show: the elements visibly move, ZERO history steps
+  mid-drag, the originals are restored byte-identically before the settle,
+  and a cancel discards the phase untouched. The payload is capped at 256
+  entities per response (a larger set is refused with an error line); a
+  response carrying only `preview` behaves exactly as before.
+- **A plugin can never freeze the host (v11.1).** Every delivery — begin,
+  move, settle, cancel — is issued WITHOUT waiting and collected at pump
+  ticks (coalescing unchanged: at most one move in flight, newest point
+  delivered next). Nested COMMAND frames (`run_command` /
+  `execute_command`) are REFUSED inside grip deliveries with an honest
+  `Err`: their execution would need the host's message loop, which a
+  delivery on the UI thread cannot pump — the freeze the consumer's
+  settle-replay wedge exhibited. Every other nested request (reads,
+  `push_undo`, direct writes, `entities_batch`) keeps its full inline
+  serving, so the settle callback stays the plugin's complete write
+  window. A delivery that outlives its settle deadline is abandoned: the
+  plugin's connection is torn down, any partially-open scope is closed
+  (no dangling history), the drag ends as a cancel, and an error line
+  names the plugin. The UI loop keeps painting throughout — it never
+  waits on plugin answers.
+- **Cheap refresh reads (v11.1).** `entities_batch(&[handle])` answers
+  live per-entity reads so a write-then-reread refresh pass never re-clones
+  the invalidated full-document snapshot (the per-boundary quadratic the
+  consumer's live PI-marker pass hit). Prefer it in every refresh path.
+- **Live geometry never re-solves constraints (v13).** The visual phase
+  swaps entities through the restyled bump policy: no parametric solve, no
+  associative re-resolve — the plugin returns every affected entity
+  (markers included) exactly as the settle will commit, and bonded
+  partners never move by host action mid-drag. The consumer's captured
+  defect (radius 15 → 14.39 mid-drag, then its own settle drift gate
+  refused) is structurally gone; the elements follow the drag again.
+- **Constraints as HostApi (v13).** `constraint_create(PluginConstraint)`
+  creates coincident/tangent constraints through the interactive commands'
+  own machinery — no command line, no prompt echo, the solver behaves
+  identically — and joins the caller's open `push_undo` scope like every
+  other write (the driver's `begin_undo` no longer closes a plugin scope:
+  a re-bond composed of writes + constraints + command replays is the
+  plugin's ONE labeled step). `CommandRequest::RunQuiet` is the interim
+  twin for command replays that must stay silent: the same machinery as
+  `Run`, with the command-line echo suppressed (errors still surface).
+- **Deterministic notification attach (v13).** The runner acks
+  `PluginNotification::ChannelReady` at main-loop entry; the host defers a
+  process's boot-window broadcasts until the ack and flushes them then
+  (a grace window covers older runners that never ack, logged once). A
+  fresh boot's `DocumentChanged` can no longer race the runner's startup
+  and vanish — the silent 4-in-5 attach flake is closed by the same
+  determinism the dispatch table already has.
+- **Dirty regions (v13).** `DocumentChangedRegions` rides every boundary
+  notification next to `DocumentChanged`: the touched entity handles and
+  (entity, app) record pairs since the previous boundary. Boundary work is
+  O(changed), not O(store); empty sets mean "too much changed / unknown —
+  walk everything" (an honest degradation, never a wrong claim).
+- **Batched record walks (v13).** `read_xrecords`, `update_xrecords` and
+  `list_xrecords_with_entries` collapse the list-then-read/write-per-record
+  store walk into one frame per pass — the record-carrier twin of
+  `entities_batch`. With dirty regions, a boundary pass is 2–3 frames
+  instead of dozens.
+
+**MCP parity.** Plugin-declared grips appear in the automation `grips` read
+(each entry marked with its owning `plugin`), and `grip_drag` takes a `plugin`
+parameter to drag one: `{"op":"grip_drag","plugin":"opencad.civil_ifc",
+"grip_id":7,"point":[10,0,0]}` routes through the same live machinery — the
+consumer can drive declare → read → drag → settle end-to-end. MCP stays a
+thin view over the same internals; plugins themselves speak HostApi and IPC
+frames only, never the automation bridge.
+
+**Custom grips never carry host-side semantics.** The host stores a point, a
+shape and an axis — nothing else. What a grip *means* (an alignment's implied
+PI, a pipe endpoint, a widening handle) is entirely the declaring plugin's,
+resolved in its own `on_custom_grip_event` from the event's grip id and point.
+
+## HostApi vs MCP — the two surfaces
+
+The host exposes exactly two programmatic surfaces, and they are separate
+protocols over one shared pipeline: plugins speak **HostApi** (in-process or
+over the plugin IPC frames) and **never** the automation bridge; automation
+clients speak **MCP** (sessions, `session_id`, `request_id`) and never the
+plugin transport. Where both touch the same machinery — grip enumeration, the
+drag apply, hit-testing, the preview channel — they call the same internals,
+so their answers agree structurally (a drift test pins the grip read).
+
+Which surface carries what:
+
+| Capability | MCP op | HostApi |
+|---|---|---|
+| Built-in grip read / drag | `grips` / `grip_drag{handle,…}` | `entity_grips` / `grip_drag` |
+| Custom grip read / drag | `grips` → `plugin_grips` / `grip_drag{plugin,…}` | via `set_plugin_grips` + `on_custom_grip_event` |
+| Custom grip declaration | — (a view; only the owner declares) | `set_plugin_grips` |
+| Entity CRUD, blocks, text | `entities_*`, `block_*`, `text_replace` | `add/update/remove_entity`, `solid/table_operation` |
+| Selection | `select` (handles **and** type/vertex modes), selection sets | `selection` / `set_selection` (explicit handles) |
+| Undo | `undo`, `redo` — drives the user's stack | `push_undo` scopes, `update_entities_transaction` |
+| Commands | `run`, `start`, `input`, `cancel` | `run_command` (incl. the echo-free `RunQuiet`) |
+| Constraints | only command replays (with echo) | `constraint_create` (no command line, joins the caller's scope) |
+| Entity XDATA | `xdata_get` / `xdata_set` | `read_record` / `write_record` / `remove_record` |
+| NOD XRecords | — | `create/read/update/delete/list_xrecord` + the v13 batches |
+| Bulk data | `batch` (batched **ops**) | `entities_batch`, record batches (batched **data**) |
+| Notifications | `events` (the session journal) | `on_notification` (`DocumentChanged`, `DocumentChangedRegions`, …) |
+| Viewport automation | `click`, `pointer`, `getpoint`, `user_select`, `view_focus`, `capture` | — (a plugin's grip events are its gestures) |
+| Reference-only designation | — | `set_reference_only` |
+| Files | `new/open/save/save_verified/wblock/plot` | `document_path`, tab lifecycle |
+
+Semantic traps worth knowing before writing a consumer on either side:
+
+- **MCP `records` is not records.** It is the automation session's operation
+  journal; entity data lives in `entities`/`query`/`properties`/`xdata_get`.
+  A plugin's NOD XRecords (its real carrier) are HostApi-only — automation
+  must assert them through undo/audit/file, not direct reads.
+- **Undo is deliberately asymmetric.** Automation drives the user's stack
+  (`undo`/`redo`); plugins compose labeled `push_undo` scopes. A settled
+  custom-grip drag totals exactly the plugin's one labeled step, and a later
+  MCP `undo` pops it like any user step.
+- **`grip_id` namespaces differ but are labeled.** Built-ins are entity-local
+  indices; custom grips are plugin-chosen ids routed by `(plugin, id)`. The
+  MCP payload marks the owner so the two can never be confused.
+- **Selection scoping differs.** The MCP `grips` read reflects the current
+  selection's cached grips; `entity_grips` answers per handle, generically
+  over every entity type (boxed variants included), no selection needed.
+- **The never-interpret rule holds on both surfaces.** Even where MCP touches
+  custom grips it only routes; the sole writer of meaning is the owning
+  plugin, at settle, in its own scope.
 
 ---
 

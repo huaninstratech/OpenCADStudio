@@ -6,9 +6,15 @@ use crate::modules::parametric::ParametricModule;
 use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, ToolDef};
 
 pub mod action;
+pub(crate) mod action_bar;
+pub mod action_set;
+pub(crate) mod associate;
 pub mod distance_parameter;
+pub(crate) mod grip_set;
 pub mod orientation_parameter;
+pub mod parameter_set;
 pub mod point_parameter;
+pub mod reset;
 pub mod single_parameter;
 pub mod visibility_parameter;
 
@@ -34,62 +40,126 @@ impl CadModule for BlockEditorModule {
                     event: ModuleEvent::Command(id.to_string()),
                 })
             };
-            let mut groups = vec![
-                RibbonGroup {
-                    title: "Open and Save",
-                    tools: vec![
-                        command(
-                            "BEDIT",
-                            "Edit Block",
-                            include_bytes!("../../../assets/icons/edit_block.svg"),
-                        ),
-                        RibbonItem::LargeDropdown {
-                            id: "BLOCK_SAVE",
-                            label: "Save Block",
-                            icon: IconKind::Svg(include_bytes!("../../../assets/icons/mt_ok.svg")),
-                            items: vec![
-                                (
-                                    "BSAVE",
-                                    "Save Block",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/mt_ok.svg"
-                                    )),
-                                ),
-                                (
-                                    "BSAVEAS",
-                                    "Save Block As",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/ui/save.svg"
-                                    )),
-                                ),
-                            ],
-                            default: "BSAVE",
-                        },
-                        command(
-                            "BCLOSE",
-                            "Close Block Editor",
-                            include_bytes!("../../../assets/icons/mt_cancel.svg"),
-                        ),
-                        command(
-                            "BTESTBLOCK",
-                            "Test Block",
-                            include_bytes!("../../../assets/icons/edit_block.svg"),
-                        ),
-                    ],
-                },
-                RibbonGroup {
-                    title: "Attributes",
-                    tools: vec![command(
-                        "ATTDEF",
-                        "Attribute Definition",
-                        include_bytes!("../../../assets/icons/attdef.svg"),
-                    )],
-                },
-            ];
+            let mut groups = vec![RibbonGroup {
+                title: "Open and Save",
+                tools: vec![
+                    command(
+                        "BEDIT",
+                        "Edit Block",
+                        include_bytes!("../../../assets/icons/edit_block.svg"),
+                    ),
+                    RibbonItem::LargeDropdown {
+                        id: "BLOCK_SAVE",
+                        label: "Save Block",
+                        icon: IconKind::Svg(include_bytes!("../../../assets/icons/mt_ok.svg")),
+                        items: vec![
+                            (
+                                "BSAVE",
+                                "Save Block",
+                                IconKind::Svg(include_bytes!("../../../assets/icons/mt_ok.svg")),
+                            ),
+                            (
+                                "BSAVEAS",
+                                "Save Block As",
+                                IconKind::Svg(include_bytes!("../../../assets/icons/ui/save.svg")),
+                            ),
+                        ],
+                        default: "BSAVE",
+                    },
+                    command(
+                        "BTESTBLOCK",
+                        "Test Block",
+                        include_bytes!("../../../assets/icons/edit_block.svg"),
+                    ),
+                ],
+            }];
             // Parametric blocks are driven by the same constraints and
             // parameters as the Parametric tab.
             groups.extend(ParametricModule.ribbon_groups().iter().cloned());
+            // Keep the editor's constraint tools compact without changing the
+            // shared Parametric tab.
+            for group in &mut groups {
+                if group.title == "Geometric" {
+                    let mut compact = Vec::new();
+                    group.tools.retain(|item| {
+                        if let RibbonItem::LargeTool(tool) = item {
+                            if tool.id != "AUTOCONSTRAIN" {
+                                compact.push(tool.clone());
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                    let columns = compact.chunks(3).map(|column| column.to_vec()).collect();
+                    group.tools.insert(1, RibbonItem::ToolGrid { columns });
+                }
+                if group.title == "Dimensional" {
+                    for item in &mut group.tools {
+                        *item = match item.clone() {
+                            RibbonItem::LargeTool(tool) => RibbonItem::Tool(tool),
+                            RibbonItem::LargeDropdown {
+                                id,
+                                label,
+                                icon,
+                                items,
+                                default,
+                            } => RibbonItem::LabeledDropdown {
+                                id,
+                                label,
+                                icon,
+                                items,
+                                default,
+                            },
+                            other => other,
+                        };
+                    }
+                }
+            }
+            groups.push(RibbonGroup {
+                title: "Action Parameters",
+                tools: vec![
+                    command(
+                        "PARAMETERS",
+                        "Parameters Manager",
+                        include_bytes!("../../../assets/icons/constrain/parameters.svg"),
+                    ),
+                    command(
+                        "ATTDEF",
+                        "Attribute Definition",
+                        include_bytes!("../../../assets/icons/attdef.svg"),
+                    ),
+                ],
+            });
             if let Some(manage) = groups.iter_mut().find(|group| group.title == "Manage") {
+                manage.tools.retain(|item| {
+                    !matches!(item,
+                    RibbonItem::LargeTool(tool) if tool.id == "PARAMETERS")
+                });
+                manage.tools.push(command(
+                    "BESETTINGS",
+                    "Editor Settings",
+                    include_bytes!("../../../assets/icons/tool_palettes.svg"),
+                ));
+                manage.tools.push(command(
+                    "BGRIPSET",
+                    "Parameter Grips",
+                    include_bytes!("../../../assets/icons/ui/list.svg"),
+                ));
+                manage.tools.push(command(
+                    "BCYCLEORDER",
+                    "Grip Cycle Order",
+                    include_bytes!("../../../assets/icons/ui/list.svg"),
+                ));
+                manage.tools.push(command(
+                    "BACTIONSET",
+                    "Action Selection",
+                    include_bytes!("../../../assets/icons/blocks/select_objects.svg"),
+                ));
+                manage.tools.push(command(
+                    "BASSOCIATE",
+                    "Associate Action",
+                    include_bytes!("../../../assets/icons/blocks/select_objects.svg"),
+                ));
                 manage.tools.insert(
                     0,
                     command(
@@ -133,6 +203,14 @@ impl CadModule for BlockEditorModule {
                         event: ModuleEvent::Command("BVHIDE".into()),
                     }),
                 ],
+            });
+            groups.push(RibbonGroup {
+                title: "Close",
+                tools: vec![command(
+                    "BCLOSE",
+                    "Close Block Editor",
+                    include_bytes!("../../../assets/icons/mt_ok.svg"),
+                )],
             });
             groups
         })

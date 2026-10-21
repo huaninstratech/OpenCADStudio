@@ -135,8 +135,10 @@ fn elements(b: &[u8]) -> Vec<&[u8]> {
 /// The file's colour table (element type 5 on level 1): index i < 255 at
 /// 41 + 3i, the background (255) at 38.
 fn color_table(elements: &[&[u8]]) -> Option<Vec<[u8; 3]>> {
+    // A file with more than one colour table uses the last.
     elements
         .iter()
+        .rev()
         .find(|e| e[1] == 5 && e[0] & 0x3f == 1)
         .and_then(|e| dgn_color_table(e, 41))
 }
@@ -188,6 +190,48 @@ struct Instance {
 
 /// How deep cells inside cells are read.
 const MAX_CELL_DEPTH: usize = 16;
+
+/// The fractions of a UOR an element's coordinates carry past their whole
+/// values: the user linkage 0x51A9 (after the attribute index at 30) holds a
+/// count, a key word and that many signed 1/32768ths, one per coordinate in
+/// the element's point order.
+fn uor_fractions(e: &[u8]) -> Vec<f64> {
+    let mut at = 32 + 2 * uint16(e, 30).unwrap_or(0) as usize;
+    while let Some(h) = uint16(e, at) {
+        if h & 0x1000 == 0 || h == 0 {
+            break;
+        }
+        let words = (h & 0xff) as usize + 1;
+        if uint16(e, at + 2) == Some(0x51a9) {
+            let count = uint16(e, at + 4).unwrap_or(0) as usize;
+            if 4 + count <= words {
+                return (0..count)
+                    .filter_map(|k| e.get(at + 8 + 2 * k..at + 10 + 2 * k))
+                    .map(|w| i16::from_le_bytes([w[0], w[1]]) as f64 / 32768.0)
+                    .collect();
+            }
+        }
+        at += 2 * words;
+    }
+    Vec::new()
+}
+
+/// Single-byte text as code page 1252 reads it (a code it leaves
+/// undefined stands for itself).
+fn windows_1252(bytes: &[u8]) -> String {
+    const HIGH: [u32; 32] = [
+        0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013,
+        0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+    ];
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9F => char::from_u32(HIGH[(b - 0x80) as usize]).unwrap_or('\u{FFFD}'),
+            _ => char::from(b),
+        })
+        .collect()
+}
 
 /// Reads a run of elements into raw geometry: plain elements, complex
 /// chains and shapes (joined), B-splines, text, cells and shared cell
@@ -301,6 +345,19 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
         };
         let plan = |p: [f64; 3]| [p[0], p[1]];
         let step = if d3 { 12 } else { 8 };
+        // Point `k` of the element (at `at`) with its UOR fractions, when the
+        // element carries one for each coordinate of its `n` points.
+        let fractions = uor_fractions(e);
+        let dims = if d3 { 3 } else { 2 };
+        let vertex = |k: usize, at: usize, n: usize| -> Option<[f64; 3]> {
+            let mut p = pt3(at)?;
+            if fractions.len() == n * dims {
+                for (j, c) in p.iter_mut().take(dims).enumerate() {
+                    *c += fractions[k * dims + j];
+                }
+            }
+            Some(p)
+        };
         match kind {
             // A cell: its components follow as complex elements, as many as
             // its total length (36, the words after its first 38 bytes)
@@ -321,8 +378,11 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
                 raw.paths.extend(inner.paths);
                 raw.texts.extend(inner.texts);
                 raw.instances.extend(inner.instances);
+                // The origin: 84 (112 in 3D), after the range and the
+                // transformation.
                 collect.push(element(DgnGeom::CellGroup {
                     name: radix50(e, 38),
+                    origin: pt3(if d3 { 112 } else { 84 }).unwrap_or([0.0; 3]),
                     parts: inner.elements,
                 }));
             }
@@ -351,7 +411,7 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
                 }
             }
             3 => {
-                if let (Some(a3), Some(b3)) = (pt3(36), pt3(36 + step)) {
+                if let (Some(a3), Some(b3)) = (vertex(0, 36, 2), vertex(1, 36 + step, 2)) {
                     let (a, b) = (plan(a3), plan(b3));
                     collect.push(element(DgnGeom::Line(a3, b3)));
                     push(
@@ -370,7 +430,8 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
             }
             4 | 6 | 11 => {
                 let n = uint16(e, 36).unwrap_or(0) as usize;
-                let pts3: Vec<[f64; 3]> = (0..n).filter_map(|k| pt3(38 + k * step)).collect();
+                let pts3: Vec<[f64; 3]> =
+                    (0..n).filter_map(|k| vertex(k, 38 + k * step, n)).collect();
                 let pts: Vec<[f64; 2]> = pts3.iter().map(|p| plan(*p)).collect();
                 if pts.len() >= 2 {
                     collect.push(element(DgnGeom::Points(pts3)));
@@ -539,15 +600,11 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
                 let Some(chars) = e.get(count_at + 2..count_at + 2 + n) else {
                     continue;
                 };
-                // Sizes in whole UORs (the multipliers are 1000/6 of one).
-                let (height, width) = (
-                    (height as f64 * 6.0 / 1000.0).round(),
-                    (width as f64 * 6.0 / 1000.0).round(),
-                );
+                // Sizes in UORs (the multipliers are 1000/6 of one), not
+                // rounded.
+                let (height, width) = (height as f64 * 6.0 / 1000.0, width as f64 * 6.0 / 1000.0);
                 let text = Text {
-                    text: String::from_utf8_lossy(chars)
-                        .trim_end_matches('\0')
-                        .to_string(),
+                    text: windows_1252(chars).trim_end_matches('\0').to_string(),
                     origin,
                     height,
                     width_factor: if height > 0.0 { width / height } else { 1.0 },
@@ -791,6 +848,26 @@ fn level(e: &[u8]) -> u8 {
 fn level_names(all: &[&[u8]]) -> HashMap<u8, String> {
     let mut names = HashMap::new();
     for e in all.iter().filter(|e| e[1] & 0x7f == 66 && level(e) == 6) {
+        // The named-levels table: a count at 40, then 104-byte entries of
+        // the level number and its zero-terminated name (which may hold
+        // spaces, as "Level 1").
+        let byte = |at: usize| e.get(at).copied().unwrap_or(0);
+        let count = usize::from(u16::from_le_bytes([byte(40), byte(41)]));
+        if count > 0 && 42 + count * 104 <= e.len() {
+            for k in 0..count {
+                let at = 42 + k * 104;
+                let n = u16::from_le_bytes([e[at], e[at + 1]]);
+                let field = &e[at + 2..at + 104];
+                let len = field.iter().position(|c| *c == 0).unwrap_or(field.len());
+                let name: String = field[..len].iter().map(|&c| char::from(c)).collect();
+                if (1..=63).contains(&n) && !name.trim().is_empty() {
+                    names
+                        .entry(n as u8)
+                        .or_insert_with(|| name.trim().to_string());
+                }
+            }
+            continue;
+        }
         for j in 36..e.len().saturating_sub(3) {
             let n = u16::from_le_bytes([e[j], e[j + 1]]);
             if !(1..=63).contains(&n) || (j > 36 && e[j - 1] != 0) || names.contains_key(&(n as u8))
@@ -949,7 +1026,7 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
                 j += 1;
             }
             let def = read_run(&all[i + 1..j], &colors, is_3d(bytes), 0).elements;
-            cells.push((name, scaled_elements(&def, s, [0.0, 0.0])));
+            cells.push((name, scaled_elements(&def, s, [0.0; 3])));
             i = j;
             continue;
         }
@@ -967,7 +1044,9 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
         })
         .collect();
     Some(DgnImport {
-        elements: scaled_elements(&raw.elements, s, [-u.origin[0] * s, -u.origin[1] * s]),
+        dim_styles: Vec::new(),
+        three_d: is_3d(bytes),
+        elements: scaled_elements(&raw.elements, s, [-u.origin[0] * s, -u.origin[1] * s, 0.0]),
         cells,
         levels,
         sub_per_master: u.sub_per_master,

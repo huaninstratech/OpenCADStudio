@@ -93,9 +93,9 @@ Uygulama geçici imzaya sahiptir ancak şu anda Apple tarafından noterlenmemiş
 
 ## Diller
 
-Open CAD Studio sistem dilini izleyebilir veya şu 22 arayüz dilinden birini kullanabilir:
+Open CAD Studio sistem dilini izleyebilir veya şu 23 arayüz dilinden birini kullanabilir:
 
-> Arapça · Brezilya Portekizcesi · Bulgarca · Çekçe · Felemenkçe · İngilizce · Fince · Fransızca · Almanca · Yunanca · Hintçe · Macarca · İtalyanca · Japonca · Korece · Laoca · Lehçe · Rusça · Basitleştirilmiş Çince · İspanyolca · Geleneksel Çince · Türkçe
+> Arapça · Brezilya Portekizcesi · Bulgarca · Çekçe · Felemenkçe · İngilizce · Fince · Fransızca · Almanca · Yunanca · Hintçe · Macarca · İtalyanca · Japonca · Korece · Laoca · Lehçe · Rusça · Basitleştirilmiş Çince · İspanyolca · Geleneksel Çince · Türkçe · Vietnamca
 
 Dili uygulama ayarlarından değiştirin. **Sistem** seçildiğinde tarayıcı sürümü de tarayıcının tercih ettiği yerel ayarı kullanır.
 

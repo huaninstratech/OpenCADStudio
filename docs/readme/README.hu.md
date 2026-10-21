@@ -91,9 +91,9 @@ Az alkalmazás ad hoc aláírással rendelkezik, de az Apple jelenleg nem hitele
 
 ## Nyelvek
 
-Az Open CAD Studio követheti a rendszer nyelvét, vagy használhatja az alábbi 22 felületi nyelv egyikét:
+Az Open CAD Studio követheti a rendszer nyelvét, vagy használhatja az alábbi 23 felületi nyelv egyikét:
 
-> Arab · Brazil portugál · Bolgár · Cseh · Holland · Angol · Finn · Francia · Német · Görög · Hindi · Magyar · Olasz · Japán · Koreai · Lao · Lengyel · Orosz · Egyszerűsített kínai · Spanyol · Hagyományos kínai · Török
+> Arab · Brazil portugál · Bolgár · Cseh · Holland · Angol · Finn · Francia · Német · Görög · Hindi · Magyar · Olasz · Japán · Koreai · Lao · Lengyel · Orosz · Egyszerűsített kínai · Spanyol · Hagyományos kínai · Török · Vietnámi
 
 A nyelv az alkalmazás beállításaiban módosítható. **Rendszer** választásakor a böngészős változat is a böngésző előnyben részesített területi beállítását használja.
 

@@ -132,8 +132,47 @@ impl OpenCADStudio {
         tab.scene.sync_annotation_scale_from_header();
         tab.scene.rebuild_derived_caches();
         tab.scene.set_current_layout("Model".into());
+        let grip_points = {
+            let actions = crate::scene::block_actions::actions(&tab.scene.document, definition);
+            let transform = tab
+                .scene
+                .document
+                .get_entity(insert_handle)
+                .and_then(|entity| match entity {
+                    EntityType::Insert(insert) => Some(
+                        crate::scene::render_graph::insert_transform(&tab.scene.document, insert),
+                    ),
+                    _ => None,
+                });
+            match transform {
+                Some(transform) => {
+                    crate::scene::block_actions::all_parameters(&tab.scene.document, definition)
+                        .into_iter()
+                        .filter(|parameter| {
+                            parameter.grip != codec::Handle::NULL
+                                && actions
+                                    .iter()
+                                    .any(|(_, _, _, parameter_id)| *parameter_id == parameter.id)
+                        })
+                        .filter_map(|parameter| {
+                            let value =
+                                crate::scene::block_actions::value(&tab.scene.document, &parameter)
+                                    .ok()?;
+                            Some(crate::scene::block_actions::v(transform.apply(
+                                crate::scene::block_actions::native(
+                                    crate::scene::block_actions::grip_position(&parameter, value),
+                                ),
+                            )))
+                        })
+                        .collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            }
+        };
+        tab.scene.fit_all_with_extra_points(&grip_points);
         self.discard_block_tests(source_id);
         self.visibility_popup = None;
+        self.table_popup = None;
         self.grip_popup = None;
         self.grip_hover = None;
         self.tabs.push(tab);
@@ -145,7 +184,7 @@ impl OpenCADStudio {
         self.refresh_properties();
         self.ribbon.set_block_editing(false);
         self.ribbon.set_block_testing(true);
-        self.dispatch_command("ZOOM EXTENTS")
+        Task::none()
     }
 
     pub(super) fn close_block_test(&mut self, i: usize) -> Task<Message> {

@@ -596,6 +596,10 @@ pub(crate) fn point_cloud_frame_lines(entity: &ExtendedEntity) -> Option<Vec<[f6
 }
 
 fn camera_lines(document: &codec::CadDocument, view_handle: Handle) -> Vec<[f64; 3]> {
+    // CAMERADISPLAY 0 hides every camera glyph.
+    if !document.header.camera_display {
+        return Vec::new();
+    }
     let Some(view) = document
         .views
         .iter()

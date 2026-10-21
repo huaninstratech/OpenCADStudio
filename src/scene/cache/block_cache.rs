@@ -508,14 +508,6 @@ fn referenced_block_tree(doc: &CadDocument, root: &str, anno_scale: f32) -> Vec<
     seen.into_iter().collect()
 }
 
-/// True when `layer` is turned off or frozen — entities on it never render.
-fn layer_hidden(doc: &CadDocument, layer: &str) -> bool {
-    doc.layers
-        .get(layer)
-        .map(|l| l.flags.off || l.flags.frozen)
-        .unwrap_or(false)
-}
-
 fn nested_instance_transform(nref: &NestedRef, offset: [f64; 3]) -> Transform {
     if offset == [0.0; 3] {
         nref.xform.clone()
@@ -568,10 +560,11 @@ fn build_defn(
             continue;
         }
         // A sub-entity on a layer that is off or frozen must not render, same
-        // as a top-level entity on that layer. The defn cache is rebuilt on
+        // as a top-level entity on that layer — except that layer 0 being off
+        // leaves its members to the insert's layer. The defn cache is rebuilt on
         // every layer off/freeze toggle (bump_geometry bumps block_epoch), so
         // baking the visibility here stays in sync.
-        if layer_hidden(doc, &entity.common().layer) {
+        if crate::scene::render_graph::block_member_layer_hidden(doc, &entity.common().layer) {
             continue;
         }
         // Annotative scale representation: bake only the current scale's copy

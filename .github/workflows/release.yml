@@ -24,6 +24,7 @@ on:
         options:
           - all
           - snap
+          - macos
       # Rebuild an already-published release from the commit its tag points at.
       tag:
         description: Existing release tag to rebuild (optional)
@@ -38,6 +39,8 @@ env:
 
 jobs:
   build-appimage:
+    # `macos` rebuilds only the dmg of an existing release.
+    if: inputs.target != 'macos'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -198,7 +201,7 @@ jobs:
           release: edge
 
   build-windows:
-    if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all'
+    if: (github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all') && inputs.target != 'macos'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -385,7 +388,7 @@ jobs:
             --clobber --repo ${{ github.repository }}
 
   build-macos:
-    if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all'
+    if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all' || inputs.target == 'macos'
     runs-on: macos-14    # Apple Silicon (arm64) only
     permissions:
       contents: write
@@ -488,7 +491,17 @@ jobs:
           cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           cp DWG.icns DXF.icns "$APP/Contents/Resources/"
           # First-party Python scripting plugin. It remains out of process and
-          # uses the same API/toolchain as this host build.
+          # uses the same API/toolchain as this host build. Its own lock file
+          # has to name the codec the plugin API pins, and a codec bump that
+          # forgot it failed the --locked build (v2026.42); follow the pin
+          # here, which also lets an older tag be rebuilt.
+          cargo update -p acadrust --manifest-path plugins/opencad-python/Cargo.toml
+          # Stage with this workflow's own copy of the staging script: a
+          # rebuilt older tag may carry one that no longer reads its lock
+          # (v2026.42 looked for the codec under its pre-rename name).
+          git fetch --no-tags --depth=1 origin ${{ github.workflow_sha }}
+          git show FETCH_HEAD:plugins/opencad-python/tools/stage-bundled.sh \
+            > plugins/opencad-python/tools/stage-bundled.sh
           bash plugins/opencad-python/tools/stage-bundled.sh \
             "$APP/Contents/Resources/plugins/opencad.python" \
             --target aarch64-apple-darwin

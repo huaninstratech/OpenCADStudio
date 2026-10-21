@@ -14,7 +14,6 @@ use hayro::hayro_interpret::{
 };
 use hayro::hayro_syntax::content::ops::TypedInstruction;
 use hayro::hayro_syntax::object::Name;
-use hayro::hayro_syntax::Pdf;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 
 /// One segment of a path, in page inches.
@@ -91,6 +90,11 @@ pub struct PageVectors {
     pub images: Vec<PdfImage>,
     /// Paths, texts and images in the order the page draws them.
     pub order: Vec<Drawn>,
+    /// For each drawn item, how many optional-content sections (`/OC …
+    /// BDC`) had begun before it.
+    pub oc_marks: Vec<usize>,
+    /// Optional-content sections the page begins in all.
+    pub oc_sections: usize,
 }
 
 /// One drawn item: an index into `paths`, `texts` or `images`.
@@ -133,116 +137,228 @@ pub fn page_content(path: &str, page: &str) -> Option<PageVectors> {
 }
 
 /// A page's content split by PDF layer: `None` for what no layer holds,
-/// then each named layer that is not in `hidden`. Each layer's share is
-/// what the page shows with that layer alone on, less what it shows with
-/// every layer off.
-// ponytail: content in several layers at once (membership dictionaries) is
-// credited to the first layer that shows it.
+/// then each named layer that is not in `hidden`. Layers are taken by name
+/// (two groups of one name are one layer). An item belongs to the innermost
+/// layer that hides it: of the layers whose turning off removes it, the one
+/// that removes the least. What only several layers together decide
+/// (membership dictionaries) goes to the last of its layers that shows it alone.
 pub fn page_content_by_layer(
     path: &str,
     page: &str,
     hidden: &[String],
 ) -> Option<Vec<(Option<String>, PageVectors)>> {
+    use super::pdf_layers::source_with_layers;
     let layers = super::pdf_layers::layers(path);
     if layers.is_empty() {
         return Some(vec![(None, page_content(path, page)?)]);
     }
-    let names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
-    let base = page_content(&super::pdf_layers::source_with_layers(path, &names), page)?;
-    let key = |s: &dyn std::fmt::Debug| format!("{s:?}");
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for item in base
-        .paths
-        .iter()
-        .map(|p| key(p))
-        .chain(base.texts.iter().map(|t| key(t)))
-    {
-        *seen.entry(item).or_default() += 1;
-    }
-    let mut out = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for layer in &layers {
-        if hidden.contains(&layer.name) {
-            continue;
+        if !names.contains(&layer.name) {
+            names.push(layer.name.clone());
         }
-        let others: Vec<String> = names
-            .iter()
-            .filter(|n| **n != layer.name)
-            .cloned()
-            .collect();
-        let Some(mut only) =
-            page_content(&super::pdf_layers::source_with_layers(path, &others), page)
-        else {
-            continue;
-        };
-        let mut left = seen.clone();
-        let mut fresh = |item: String| match left.get_mut(&item) {
-            Some(n) if *n > 0 => {
-                *n -= 1;
-                false
-            }
-            _ => true,
-        };
-        only.paths.retain(|p| fresh(key(p)));
-        only.texts.retain(|t| fresh(key(t)));
-        only.images.retain(|i| !base.images.contains(i));
-        out.push((Some(layer.name.clone()), only));
     }
-    let mut base = base;
-    images_to_last_layer(path, page, &mut base, &mut out);
+    let read = |off: &[String]| page_content(&source_with_layers(path, off), page);
+    let shown = read(hidden)?;
+    let visible: Vec<&String> = names.iter().filter(|n| !hidden.contains(n)).collect();
+    // The group of each drawn item: 0 for no layer, else 1 + its index in
+    // `visible`. The reference puts an item on the layer whose section
+    // opened last before it (a section left keeps its layer current). When
+    // every section is read in order, that sequence decides; otherwise the
+    // layers are told apart by turning them off.
+    let sections = oc_section_layers(path, page).filter(|s| s.len() == shown.oc_sections);
+    let group_of: Vec<usize> = if let Some(sections) = sections {
+        let mut current: Vec<Option<String>> = Vec::with_capacity(sections.len() + 1);
+        current.push(None);
+        for section in sections {
+            let last = current.last().cloned().flatten();
+            current.push(section.or(last));
+        }
+        (0..shown.order.len())
+            .map(|k| {
+                let layer = shown.oc_marks.get(k).and_then(|m| current.get(*m)).cloned();
+                layer
+                    .flatten()
+                    .and_then(|l| visible.iter().position(|n| **n == l))
+                    .map_or(0, |n| n + 1)
+            })
+            .collect()
+    } else {
+        groups_by_removal(&shown, &names, &visible, hidden, &read)?
+    };
+    let mut groups: Vec<PageVectors> = (0..=visible.len())
+        .map(|_| PageVectors::default())
+        .collect();
+    for (drawn, g) in shown.order.iter().zip(group_of) {
+        let group = &mut groups[g];
+        match *drawn {
+            Drawn::Path(i) => {
+                group.order.push(Drawn::Path(group.paths.len()));
+                group.paths.push(shown.paths[i].clone());
+            }
+            Drawn::Text(i) => {
+                group.order.push(Drawn::Text(group.texts.len()));
+                group.texts.push(shown.texts[i].clone());
+            }
+            Drawn::Image(i) => {
+                group.order.push(Drawn::Image(group.images.len()));
+                group.images.push(shown.images[i].clone());
+            }
+        }
+    }
+    let mut groups = groups.into_iter();
+    let base = groups.next().unwrap_or_default();
+    let mut out: Vec<(Option<String>, PageVectors)> = visible
+        .iter()
+        .map(|n| Some((*n).clone()))
+        .zip(groups)
+        .collect();
     out.insert(0, (None, base));
     Some(out)
 }
 
-/// An image that no layer holds goes with the layer drawn last before it
-/// (with none before it, it stays unlayered): the page is read with every
-/// layer on for the drawing order.
-fn images_to_last_layer(
-    path: &str,
-    page: &str,
-    base: &mut PageVectors,
-    layered: &mut [(Option<String>, PageVectors)],
-) {
-    if base.images.is_empty() || layered.is_empty() {
-        return;
-    }
-    let Some(full) = page_content(&super::pdf_layers::source_with_layers(path, &[]), page) else {
-        return;
-    };
+/// The group of each item `shown` draws (as in [`page_content_by_layer`]),
+/// told apart by reading the page with layers turned off.
+fn groups_by_removal(
+    shown: &PageVectors,
+    names: &[String],
+    visible: &[&String],
+    hidden: &[String],
+    read: &dyn Fn(&[String]) -> Option<PageVectors>,
+) -> Option<Vec<usize>> {
     let key = |s: &dyn std::fmt::Debug| format!("{s:?}");
-    // Each layered path and text keyed once; the first layer holding it wins.
-    let mut owners: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (n, (_, pv)) in layered.iter().enumerate() {
-        for item in pv
-            .paths
-            .iter()
-            .map(|p| key(p))
-            .chain(pv.texts.iter().map(|t| key(t)))
-        {
-            owners.entry(item).or_insert(n);
+    // A path filled and stroked by one operator is keyed by its fill: a
+    // read that hides some layer's paths does not merge such pairs (see
+    // `merge_fill_and_stroke`), and its fill half must still match.
+    let path_key = |p: &PdfPath| match p.fill {
+        Some(_) if p.stroke.is_some() => key(&PdfPath {
+            stroke: None,
+            ..p.clone()
+        }),
+        _ => key(p),
+    };
+    let keys = |pv: &PageVectors| -> HashMap<String, usize> {
+        let mut out: HashMap<String, usize> = HashMap::new();
+        let texts = pv.texts.iter().map(|t| key(t));
+        for item in pv.paths.iter().map(path_key).chain(texts) {
+            *out.entry(item).or_default() += 1;
         }
+        out
+    };
+    let less = |a: &HashMap<String, usize>, b: &HashMap<String, usize>| {
+        a.iter()
+            .filter_map(|(k, n)| {
+                let left = n.saturating_sub(b.get(k).copied().unwrap_or(0));
+                (left > 0).then(|| (k.clone(), left))
+            })
+            .collect::<HashMap<String, usize>>()
+    };
+    let shown_keys = keys(shown);
+    let none_on = read(names)?;
+    let mut unlayered = keys(&none_on);
+    // What turning each layer off (as well) removes.
+    let mut removed: Vec<(HashMap<String, usize>, Vec<PdfImage>, usize)> = Vec::new();
+    for name in visible {
+        let mut off = hidden.to_vec();
+        off.push((*name).clone());
+        let (map, images) = match read(&off) {
+            Some(without) => {
+                let images: Vec<PdfImage> = shown
+                    .images
+                    .iter()
+                    .filter(|i| !without.images.contains(i))
+                    .cloned()
+                    .collect();
+                (less(&shown_keys, &keys(&without)), images)
+            }
+            None => (HashMap::new(), Vec::new()),
+        };
+        let size = map.values().sum::<usize>() + images.len();
+        removed.push((map, images, size));
     }
-    let owner = |item: String| owners.get(&item).copied();
-    let mut last: Option<usize> = None;
-    let mut moves: Vec<(usize, PdfImage)> = Vec::new();
-    for drawn in &full.order {
-        match *drawn {
-            Drawn::Path(i) => last = owner(key(&full.paths[i])).or(last),
-            Drawn::Text(i) => last = owner(key(&full.texts[i])).or(last),
-            Drawn::Image(i) => {
-                let image = &full.images[i];
-                if let Some(n) = layered.iter().position(|(_, pv)| pv.images.contains(image)) {
-                    last = Some(n);
-                } else if let (Some(n), Some(at)) =
-                    (last, base.images.iter().position(|b| b == image))
-                {
-                    moves.push((n, base.images.remove(at)));
-                }
+    // What each layer's removal holds, kept whole for nesting tests.
+    let holds: Vec<HashMap<String, usize>> =
+        removed.iter().map(|(map, _, _)| map.clone()).collect();
+    let image_group: Vec<usize> = shown
+        .images
+        .iter()
+        .map(|image| {
+            removed
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, images, _))| images.contains(image))
+                .min_by_key(|(_, (_, _, size))| *size)
+                .map_or(0, |(n, _)| n + 1)
+        })
+        .collect();
+    // What each layer shows alone, read only when needed.
+    let mut alone: Vec<Option<HashMap<String, usize>>> = vec![None; visible.len()];
+    let none_keys = unlayered.clone();
+    let mut owner_of = |item: String| -> Option<usize> {
+        if let Some(n) = unlayered.get_mut(&item).filter(|n| **n > 0) {
+            *n -= 1;
+            return None;
+        }
+        let best = removed
+            .iter()
+            .enumerate()
+            .filter(|(_, (map, _, _))| map.get(&item).is_some_and(|n| *n > 0))
+            .min_by_key(|(_, (_, _, size))| *size)
+            .map(|(n, _)| n);
+        if let Some(n) = best {
+            if let Some(count) = removed[n].0.get_mut(&item) {
+                *count -= 1;
+            }
+            return Some(n);
+        }
+        for (n, name) in visible.iter().enumerate().rev() {
+            if alone[n].is_none() {
+                let others: Vec<String> = names.iter().filter(|m| m != name).cloned().collect();
+                let only = read(&others).map(|pv| less(&keys(&pv), &none_keys));
+                alone[n] = Some(only.unwrap_or_default());
+            }
+            let count = alone[n].as_mut().and_then(|m| m.get_mut(&item));
+            if let Some(count) = count.filter(|c| **c > 0) {
+                *count -= 1;
+                return Some(n);
             }
         }
-    }
-    for (n, image) in moves {
-        layered[n].1.images.push(image);
-    }
+        None
+    };
+    // The layer an item lands on follows the reference's reading of the
+    // marked content: the layer last opened stays current. An item no layer
+    // holds goes with the layer of the item drawn before it, and an item of
+    // an outer layer drawn after an inner one closed stays on the inner one.
+    let mut last: Option<(usize, String)> = None;
+    let mut place = |owner: Option<usize>, item: String| -> usize {
+        let g = match (owner, &last) {
+            (None, Some((m, _))) => Some(*m),
+            (Some(n), Some((m, previous))) if *m != n && holds[n].contains_key(previous) => {
+                Some(*m)
+            }
+            (owner, _) => owner,
+        };
+        if let Some(g) = g {
+            last = Some((g, item));
+        }
+        g.map_or(0, |g| g + 1)
+    };
+    let group_of = shown
+        .order
+        .iter()
+        .map(|drawn| match *drawn {
+            Drawn::Path(i) => {
+                let item = path_key(&shown.paths[i]);
+                place(owner_of(item.clone()), item)
+            }
+            Drawn::Text(i) => {
+                let item = key(&shown.texts[i]);
+                place(owner_of(item.clone()), item)
+            }
+            Drawn::Image(i) => place(image_group[i].checked_sub(1), format!("image {i}")),
+        })
+        .collect();
+    Some(group_of)
 }
 
 fn read_page(path: &str, page: &str) -> Option<PageVectors> {
@@ -251,7 +367,7 @@ fn read_page(path: &str, page: &str) -> Option<PageVectors> {
 
 fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
     let bytes = super::pdf_raster::source_bytes(path)?;
-    let pdf = Pdf::new(bytes).ok()?;
+    let pdf = super::pdf_password::open(path, bytes).ok()?;
     let page_no = page.trim().parse::<usize>().ok()?;
     let page = pdf.pages().get(page_no.checked_sub(1)?)?;
     let (w, h) = page.render_dimensions();
@@ -272,16 +388,18 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
     };
     interpret_page(page, &mut context, &mut device);
     device.finish_text();
+    merge_fill_and_stroke(page, &mut device);
 
     // Base font names in the order the content stream selects them; glyph
     // fonts are matched to them in their order of first use.
     let mut names: Vec<String> = Vec::new();
+    let mut embedded: Vec<bool> = Vec::new();
     let mut ops = page.typed_operations();
     while let Some(op) = ops.next() {
         if let TypedInstruction::TextFont(font) = op {
-            let name = page
-                .resources()
-                .get_font(font.0)
+            let dict = page.resources().get_font(font.0);
+            let name = dict
+                .as_ref()
                 .and_then(|dict| dict.get::<Name>(b"BaseFont"))
                 .map(|name| String::from_utf8_lossy(&name).into_owned())
                 .unwrap_or_default();
@@ -291,6 +409,7 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
                 .unwrap_or(name);
             if !names.contains(&name) {
                 names.push(name);
+                embedded.push(dict.as_ref().is_some_and(font_is_embedded));
             }
         }
     }
@@ -304,12 +423,226 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
             .and_then(|i| names.get(i).cloned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Text".to_string());
+        // Capital height: an embedded font's own, the median capital (or
+        // digit) top so round letters' overshoot does not lift it; a font
+        // the file does not carry is taken at 0.72 of its size, as is a run
+        // with no capital or digit.
+        let own = index
+            .and_then(|i| embedded.get(i).copied())
+            .unwrap_or(false);
+        text.caps.sort_by(f64::total_cmp);
+        text.text.cap_height = match text.caps.get(text.caps.len() / 2) {
+            Some(top) if own => *top,
+            _ => 0.72 * text.em,
+        };
     }
     Some(PageVectors {
         paths: device.paths,
         texts: texts.into_iter().map(|t| t.text).collect(),
         images: device.images,
         order: device.order,
+        oc_marks: device.oc_marks,
+        oc_sections: device.oc_sections,
+    })
+}
+
+/// A path filled and stroked by one operator (`B`, `b*` …) is one path
+/// with both a fill and a stroke, as the reference reads it (its fill, at
+/// the stroke's weight). The interpreter draws such a path twice; the page's
+/// operators tell those pairs from a fill followed by a separate stroke of
+/// the same path. Nothing is merged when the drawn paths do not match the
+/// operators one for one (paths drawn by patterns or glyph procedures, or
+/// left out by a hidden layer).
+fn merge_fill_and_stroke(page: &hayro::hayro_syntax::page::Page<'_>, device: &mut Collector) {
+    let mut calls: Vec<usize> = Vec::new();
+    walk_operators(page, &mut |op, _| {
+        calls.push(match op {
+            TypedInstruction::StrokePath(_)
+            | TypedInstruction::CloseAndStrokePath(_)
+            | TypedInstruction::FillPathNonZero(_)
+            | TypedInstruction::FillPathNonZeroCompatibility(_)
+            | TypedInstruction::FillPathEvenOdd(_) => 1,
+            TypedInstruction::FillAndStrokeNonZero(_)
+            | TypedInstruction::FillAndStrokeEvenOdd(_)
+            | TypedInstruction::CloseFillAndStrokeNonZero(_)
+            | TypedInstruction::CloseFillAndStrokeEvenOdd(_) => 2,
+            _ => return,
+        });
+    });
+    if calls.iter().sum::<usize>() != device.path_calls.len() {
+        return;
+    }
+    let mut gone = vec![false; device.paths.len()];
+    let mut at = 0;
+    for count in calls {
+        if count == 2 {
+            let pair = (device.path_calls.get(at), device.path_calls.get(at + 1));
+            if let (Some(Some(f)), Some(Some(s))) = pair {
+                let (f, s) = (*f, *s);
+                if device.paths[f].fill.is_some()
+                    && device.paths[s].stroke.is_some()
+                    && device.paths[f].subpaths == device.paths[s].subpaths
+                {
+                    device.paths[f].stroke = device.paths[s].stroke;
+                    gone[s] = true;
+                }
+            }
+        }
+        at += count;
+    }
+    if !gone.contains(&true) {
+        return;
+    }
+    let mut new_index = vec![0usize; gone.len()];
+    let mut kept = Vec::new();
+    for (k, path) in std::mem::take(&mut device.paths).into_iter().enumerate() {
+        new_index[k] = kept.len();
+        if !gone[k] {
+            kept.push(path);
+        }
+    }
+    device.paths = kept;
+    let (mut order, mut marks) = (Vec::new(), Vec::new());
+    for (drawn, mark) in device.order.iter().zip(&device.oc_marks) {
+        match *drawn {
+            Drawn::Path(i) if gone[i] => continue,
+            Drawn::Path(i) => order.push(Drawn::Path(new_index[i])),
+            other => order.push(other),
+        }
+        marks.push(*mark);
+    }
+    device.order = order;
+    device.oc_marks = marks;
+}
+
+/// The layer each optional-content section of a page's own content stream
+/// opens, in order: a group's name; for a membership dictionary, its last
+/// group's when it is an object of its own, its first when written out in
+/// the resources (as the reference reads them); `None` when it names no
+/// group.
+fn oc_section_layers(path: &str, page: &str) -> Option<Vec<Option<String>>> {
+    use hayro::hayro_syntax::object::{Array, Dict, ObjectIdentifier};
+    let bytes = super::pdf_raster::source_bytes(path)?;
+    let pdf = super::pdf_password::open(path, bytes).ok()?;
+    let xref = pdf.xref();
+    let page = pdf
+        .pages()
+        .get(page.trim().parse::<usize>().ok()?.checked_sub(1)?)?;
+    let group_name = |dict: &Dict<'_>| {
+        dict.get::<hayro::hayro_syntax::object::String<'_>>(b"Name")
+            .map(|s| super::pdf_layers::text_string(s.as_bytes()))
+    };
+    let mut out = Vec::new();
+    walk_operators(&page, &mut |op, resources| {
+        let TypedInstruction::BeginMarkedContentWithProperties(bdc) = op else {
+            return;
+        };
+        if bdc.0.as_ref() != b"OC" {
+            return;
+        }
+        // A form's own properties, else the page's.
+        let properties = match bdc.1.clone().into_name() {
+            Some(n) if resources.properties.contains_key(n.as_ref()) => &resources.properties,
+            _ => &page.resources().properties,
+        };
+        let name = bdc.1.clone().into_name();
+        let indirect = name
+            .as_ref()
+            .and_then(|n| properties.get_ref(n.as_ref()))
+            .is_some();
+        let dict = name.and_then(|n| properties.get::<Dict<'_>>(n.as_ref()));
+        let layer = dict.and_then(|dict| {
+            if dict
+                .get::<Name<'_>>(b"Type")
+                .is_some_and(|t| t.as_ref() == b"OCMD")
+            {
+                let groups: Vec<Dict<'_>> = match dict.get::<Array<'_>>(b"OCGs") {
+                    Some(array) => array
+                        .raw_iter()
+                        .filter_map(|item| item.as_obj_ref())
+                        .filter_map(|r| xref.get::<Dict<'_>>(ObjectIdentifier::from(r)))
+                        .collect(),
+                    None => dict.get::<Dict<'_>>(b"OCGs").into_iter().collect(),
+                };
+                let group = if indirect {
+                    groups.last()
+                } else {
+                    groups.first()
+                };
+                group.and_then(group_name)
+            } else {
+                group_name(&dict)
+            }
+        });
+        out.push(layer);
+    });
+    Some(out)
+}
+
+/// Every operator of a page's content in the order the interpreter runs
+/// them, a form XObject's operators where it is drawn (with the resources
+/// they read names from).
+fn walk_operators<'a>(
+    page: &hayro::hayro_syntax::page::Page<'a>,
+    visit: &mut dyn FnMut(&TypedInstruction<'_, '_>, &hayro::hayro_syntax::page::Resources<'a>),
+) {
+    use hayro::hayro_syntax::content::TypedIter;
+    use hayro::hayro_syntax::object::Dict;
+    use hayro::hayro_syntax::page::Resources;
+    fn walk<'a>(
+        data: &[u8],
+        resources: &Resources<'a>,
+        depth: usize,
+        visit: &mut dyn FnMut(&TypedInstruction<'_, '_>, &Resources<'a>),
+    ) {
+        let mut ops = TypedIter::new(data);
+        while let Some(op) = ops.next() {
+            visit(&op, resources);
+            let TypedInstruction::XObject(x) = &op else {
+                continue;
+            };
+            // Nested forms are followed a few levels deep.
+            if depth >= 8 {
+                continue;
+            }
+            let Some(stream) = resources.get_x_object(&x.0) else {
+                continue;
+            };
+            if !stream
+                .dict()
+                .get::<Name<'_>>(b"Subtype")
+                .is_some_and(|t| t.as_ref() == b"Form")
+            {
+                continue;
+            }
+            let own = match stream.dict().get::<Dict<'_>>(b"Resources") {
+                Some(dict) => Resources::from_parent(dict, resources.clone()),
+                None => resources.clone(),
+            };
+            if let Ok(data) = stream.decoded() {
+                walk(&data, &own, depth + 1, visit);
+            }
+        }
+    }
+    if let Some(data) = page.page_stream() {
+        walk(data, page.resources(), 0, visit);
+    }
+}
+
+/// Whether a font dictionary carries its font program (for a composite
+/// font, its descendant's).
+fn font_is_embedded(dict: &hayro::hayro_syntax::object::Dict<'_>) -> bool {
+    use hayro::hayro_syntax::object::{Array, Dict};
+    let descriptor = dict.get::<Dict<'_>>(b"FontDescriptor").or_else(|| {
+        dict.get::<Array<'_>>(b"DescendantFonts")?
+            .iter::<Dict<'_>>()
+            .next()?
+            .get::<Dict<'_>>(b"FontDescriptor")
+    });
+    descriptor.is_some_and(|d| {
+        [&b"FontFile"[..], b"FontFile2", b"FontFile3"]
+            .iter()
+            .any(|key| d.contains_key(*key))
     })
 }
 
@@ -321,6 +654,8 @@ struct PendingText {
     em: f64,
     /// Tops of the capital letters seen so far, inches.
     caps: Vec<f64>,
+    /// Optional-content sections begun before the run.
+    oc: usize,
 }
 
 #[derive(Default)]
@@ -332,6 +667,12 @@ struct Collector {
     want_images: bool,
     images: Vec<PdfImage>,
     order: Vec<Drawn>,
+    oc_marks: Vec<usize>,
+    /// Each path the interpreter drew, in order: the index of the path it
+    /// became, `None` when left out.
+    path_calls: Vec<Option<usize>>,
+    /// Optional-content sections begun so far.
+    oc_sections: usize,
     /// The visible area, in inches: the page, then each clip path's box
     /// within the one before it (the last is the current one).
     visible: Vec<Rect>,
@@ -342,6 +683,7 @@ impl Collector {
         if let Some(text) = self.current.take() {
             if !text.text.text.trim().is_empty() {
                 self.order.push(Drawn::Text(self.texts.len()));
+                self.oc_marks.push(text.oc);
                 self.texts.push(text);
             }
         }
@@ -454,7 +796,9 @@ impl<'a> Device<'a> for Collector {
         paint: &Paint<'a>,
         mode: &PathDrawMode,
     ) {
-        self.finish_text();
+        // Graphics drawn between glyphs do not end a text run: the next
+        // glyph still joins it when it follows on along the baseline.
+        self.path_calls.push(None);
         let subpaths = subpaths(path, transform);
         if subpaths.is_empty() {
             return;
@@ -488,7 +832,11 @@ impl<'a> Device<'a> for Collector {
             }
             PathDrawMode::Fill(_) => (None, Some(rgb(paint))),
         };
+        if let Some(call) = self.path_calls.last_mut() {
+            *call = Some(self.paths.len());
+        }
         self.order.push(Drawn::Path(self.paths.len()));
+        self.oc_marks.push(self.oc_sections);
         self.paths.push(PdfPath {
             subpaths,
             stroke,
@@ -507,8 +855,12 @@ impl<'a> Device<'a> for Collector {
         transform: Affine,
         glyph_transform: Affine,
         paint: &Paint<'a>,
-        _: &GlyphDrawMode,
+        mode: &GlyphDrawMode,
     ) {
+        // Invisible text (render mode 3, as over a scan) is not drawn.
+        if matches!(mode, GlyphDrawMode::Invisible) {
+            return;
+        }
         let Glyph::Outline(outline) = glyph else {
             return;
         };
@@ -536,19 +888,28 @@ impl<'a> Device<'a> for Collector {
             self.font_order.push(key);
         }
         let bounds = outline.outline().bounding_box();
+        // Capitals and digits give the capital height.
         let glyph_top = text
             .chars()
-            .any(|c| c.is_uppercase())
+            .any(|c| c.is_uppercase() || c.is_ascii_digit())
             .then(|| bounds.y1 / 1000.0 * em);
         let origin = pt(origin);
-        let joins = self.current.as_ref().is_some_and(|run| {
-            run.font_key == key
-                && (run.em - em).abs() < 1e-6
-                && (run.text.rotation - rotation).abs() < 1e-6
-                && ((run.end[0] - origin[0]).powi(2) + (run.end[1] - origin[1]).powi(2)).sqrt()
-                    < 0.3 * em
+        // A glyph continues the run on its baseline (within half an em
+        // across it) when the gap along it is under an em, whatever its font
+        // or size; a gap of more than a few hundredths of an em reads as a
+        // space.
+        let gap = self.current.as_ref().and_then(|run| {
+            if (run.text.rotation - rotation).abs() >= 1e-6 {
+                return None;
+            }
+            let (c, s) = (rotation.cos(), rotation.sin());
+            let (dx, dy) = (origin[0] - run.end[0], origin[1] - run.end[1]);
+            let along = dx * c + dy * s;
+            let across = -dx * s + dy * c;
+            (across.abs() < 0.5 * run.em && along > -0.5 * run.em && along < run.em)
+                .then_some(along / run.em)
         });
-        if !joins {
+        if gap.is_none() {
             self.finish_text();
             self.current = Some(PendingText {
                 text: PdfText {
@@ -564,22 +925,26 @@ impl<'a> Device<'a> for Collector {
                 end: origin,
                 em,
                 caps: Vec::new(),
+                oc: self.oc_sections,
             });
         }
         if let Some(run) = self.current.as_mut() {
+            if gap.is_some_and(|g| g >= 0.15) && !run.text.text.ends_with(' ') {
+                run.text.text.push(' ');
+            }
             run.text.text.push_str(&text);
             if let Some(top) = glyph_top {
                 run.caps.push(top);
-                // Capital height: the median capital top, so round letters'
-                // overshoot (O, G) does not lift it.
-                let mut caps = run.caps.clone();
-                caps.sort_by(f64::total_cmp);
-                run.text.cap_height = caps[caps.len() / 2];
             }
             run.end = [origin[0] + adv_vec.x, origin[1] + adv_vec.y];
             run.text.width = ((run.end[0] - run.text.origin[0]).powi(2)
                 + (run.end[1] - run.text.origin[1]).powi(2))
             .sqrt();
+        }
+    }
+    fn begin_marked_content(&mut self, tag: &[u8], _: Option<i32>) {
+        if tag == b"OC" {
+            self.oc_sections += 1;
         }
     }
     fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine) {
@@ -630,6 +995,7 @@ impl<'a> Device<'a> for Collector {
         );
         if let Some(image) = decoded {
             self.order.push(Drawn::Image(self.images.len()));
+            self.oc_marks.push(self.oc_sections);
             self.images.push(image);
         }
     }

@@ -39,7 +39,7 @@ struct Item {
     aabb: Aabb,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Node {
     bounds: Aabb,
     /// Items stored at this node. Only populated when the node is a
@@ -52,7 +52,7 @@ struct Node {
     depth: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QuadTree {
     nodes: Vec<Node>,
     /// `handle → (node_idx, item_idx_within_node)` so removal/update

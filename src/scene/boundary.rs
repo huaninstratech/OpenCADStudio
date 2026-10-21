@@ -7,6 +7,7 @@ use kernel::geom2d::{
 };
 
 use crate::command::WorkingPlane;
+use crate::par::prelude::*;
 
 #[derive(Clone)]
 pub struct BoundarySource {
@@ -96,7 +97,10 @@ fn entity_boundary_source_on_plane(
 /// Finite extents of boundary segments, expanded by `tolerance` so clipped
 /// endpoints weld with the segments that produced the box. `None` when
 /// there is nothing finite to clip against.
-fn segments_bounds(segments: &[Line], tolerance: f64) -> Option<([f64; 2], [f64; 2])> {
+fn segments_bounds<'a>(
+    segments: impl IntoIterator<Item = &'a Line>,
+    tolerance: f64,
+) -> Option<([f64; 2], [f64; 2])> {
     let mut bounds: Option<([f64; 2], [f64; 2])> = None;
     for segment in segments {
         for point in [segment.start, segment.end] {
@@ -115,6 +119,14 @@ fn segments_bounds(segments: &[Line], tolerance: f64) -> Option<([f64; 2], [f64;
             [max[0] + tolerance, max[1] + tolerance],
         )
     })
+}
+
+fn needs_scene_boundary_sources(entity: &EntityType, plane: WorkingPlane, tolerance: f64) -> bool {
+    let curves = entity_curves_on_plane(entity, plane, tolerance);
+    curves.is_empty()
+        || curves
+            .iter()
+            .any(|curve| matches!(curve, Curve::Ray(_) | Curve::XLine(_)))
 }
 
 /// Tessellate live curves to finite segments. Bounded curves tessellate as
@@ -158,18 +170,30 @@ fn live_segments_for_curves(
 }
 
 fn hatch_path_seed(path: &codec::entities::BoundaryPath) -> Option<[f64; 2]> {
-    let mut ring = Vec::new();
+    // A clockwise arc edge tessellates counter-clockwise, so the edges are
+    // chained tip to tail instead of appended: appended, the reversed arc
+    // folds the ring and the seed lands in the neighbouring region.
+    let mut edges = Vec::with_capacity(path.edges.len());
     for edge in &path.edges {
         let curve = crate::entities::hatch::edge_curve(edge)?;
-        let points = curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
-        ring.extend(points.into_iter().skip(usize::from(!ring.is_empty())));
+        edges.push(curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE));
     }
+    let ring = super::entity::chain_path_edges(edges);
     if ring.len() < 3 {
         return None;
     }
+    // The largest triangle's centroid: a sliver along a tessellated arc can
+    // sit on the far side of the true curve, in the neighbouring region.
     let (points, triangles) = triangulate(&ring, &[]);
-    if let Some(triangle) = triangles.first() {
-        let [a, b, c] = triangle.map(|vertex| points[vertex]);
+    let corners = |triangle: &[usize; 3]| triangle.map(|vertex| points[vertex]);
+    let area = |[a, b, c]: [[f64; 2]; 3]| {
+        ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs()
+    };
+    if let Some(triangle) = triangles
+        .iter()
+        .max_by(|a, b| area(corners(a)).total_cmp(&area(corners(b))))
+    {
+        let [a, b, c] = corners(triangle);
         Some([(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0])
     } else {
         Some([
@@ -752,6 +776,23 @@ pub(crate) fn remap_hatch_associations(
 }
 
 impl Scene {
+    /// Each associative hatch among `handles` that names no source yet
+    /// takes the object just before it (its outline) as its source.
+    pub(crate) fn bind_outline_hatches(&mut self, handles: &[Handle]) {
+        for pair in handles.windows(2) {
+            let Some(EntityType::Hatch(hatch)) = self.document.get_entity_mut(pair[1]) else {
+                continue;
+            };
+            if hatch.is_associative
+                && hatch.paths.len() == 1
+                && hatch.paths[0].boundary_handles.is_empty()
+            {
+                hatch.paths[0].boundary_handles = vec![pair[0]];
+                self.associative_hatch_source_cache.borrow_mut().take();
+            }
+        }
+    }
+
     pub(crate) fn replace_hatch_association(
         &mut self,
         handle: Handle,
@@ -904,6 +945,8 @@ impl Scene {
         if changes.is_empty() {
             return Vec::new();
         }
+        let perf_refresh = crate::perf::enabled();
+        let refresh_started = perf_refresh.then(iced::time::Instant::now);
         let changed: rustc_hash::FxHashSet<_> = changes.iter().map(|(handle, _)| *handle).collect();
         let candidates: Vec<_> = self
             .associative_hatch_dependents(&changed)
@@ -919,105 +962,160 @@ impl Scene {
             })
             .collect();
 
+        // Hatches that share an OCS plane need the same scene-wide source map
+        // and clipping bounds. Building those inside the hatch loop rescans
+        // every resident wire once per affected hatch during a bulk MOVE.
+        let candidate_count = candidates.len();
+        let mut candidates_by_plane: rustc_hash::FxHashMap<[u64; 4], Vec<_>> =
+            rustc_hash::FxHashMap::default();
+        for candidate in candidates {
+            let hatch = &candidate.1;
+            let plane_key = [
+                hatch.normal.x.to_bits(),
+                hatch.normal.y.to_bits(),
+                hatch.normal.z.to_bits(),
+                hatch.elevation.to_bits(),
+            ];
+            candidates_by_plane
+                .entry(plane_key)
+                .or_default()
+                .push(candidate);
+        }
+        let plane_group_count = candidates_by_plane.len();
+        let mut source_scan_count = 0;
         let mut refreshed = Vec::new();
-        for (handle, mut hatch, seeds) in candidates {
-            let storage = crate::entities::curve::ocs_plane(hatch.normal, hatch.elevation);
+        for candidates in candidates_by_plane.into_values() {
+            let (_, sample_hatch, _) = candidates
+                .first()
+                .expect("plane group contains at least one hatch");
+            let storage =
+                crate::entities::curve::ocs_plane(sample_hatch.normal, sample_hatch.elevation);
             let plane = WorkingPlane::new(
                 glam::DVec3::from_array(storage.origin),
                 glam::DVec3::from_array(storage.x_axis),
                 glam::DVec3::from_array(storage.y_axis),
             );
-            let all_sources = self.boundary_sources_on_plane(plane, WELD_TOLERANCE);
-            let mut modified = false;
-            let mut association_changed = false;
-            for (index, path) in hatch.paths.iter_mut().enumerate() {
-                if !path
-                    .boundary_handles
+            // Native finite boundary curves can be refreshed directly from the
+            // associated entities. Scan the scene only when a changed path
+            // includes an unbounded or unsupported source that needs wire fallback.
+            let needs_scene_sources = candidates.iter().any(|(_, hatch, _)| {
+                hatch
+                    .paths
                     .iter()
-                    .any(|source| changed.contains(source))
-                {
-                    continue;
-                }
-                let old_count = path.boundary_handles.len();
-                path.boundary_handles
-                    .retain(|source| self.document.get_entity(*source).is_some());
-                if path.boundary_handles.is_empty() {
-                    path.flags.set_external(false);
-                }
-                association_changed |= path.boundary_handles.len() != old_count;
-                modified |= association_changed;
-                // Finite extents for clipping unbounded live sources (rays /
-                // construction lines) below. `all_sources` already went
-                // through the same clipping in `boundary_sources_on_plane`.
-                let all_segments: Vec<Line> = all_sources
-                    .values()
-                    .flat_map(|source| source.segments.iter().copied())
-                    .collect();
-                let clip_bounds = segments_bounds(&all_segments, WELD_TOLERANCE);
-                let sources: rustc_hash::FxHashMap<_, _> = path
-                    .boundary_handles
-                    .iter()
-                    .filter_map(|source| {
-                        // Associative boundaries are explicit document references.
-                        // During a grip drag their display wire can be preview-hidden,
-                        // so prefer the live entity geometry over the resident wire cache.
-                        let geometry = self
-                            .document
-                            .get_entity(*source)
-                            .and_then(|entity| {
-                                entity_boundary_source_on_plane(
-                                    entity,
-                                    plane,
-                                    WELD_TOLERANCE,
-                                    clip_bounds,
-                                )
-                            })
-                            .or_else(|| all_sources.get(source).cloned());
-
-                        geometry.map(|geometry| (*source, geometry))
+                    .filter(|path| {
+                        path.boundary_handles
+                            .iter()
+                            .any(|source| changed.contains(source))
                     })
-                    .collect();
-                let segments: Vec<_> = sources
-                    .values()
-                    .flat_map(|source| source.segments.iter().copied())
-                    .collect();
-                let faces = bounded_faces(&segments, Tolerance::new(WELD_TOLERANCE));
-                let Some(face) = matching_face(&faces, seeds.get(index).copied().flatten()) else {
-                    continue;
-                };
-                let exterior = [path.flags.is_outermost()];
-                if let Some(exact) = exact_hatch_paths(
-                    std::slice::from_ref(face),
-                    &exterior,
-                    &sources,
-                    WELD_TOLERANCE,
-                )
-                .into_iter()
-                .next()
-                {
-                    path.edges = exact.edges;
+                    .flat_map(|path| path.boundary_handles.iter())
+                    .filter_map(|source| self.document.get_entity(*source))
+                    .any(|entity| needs_scene_boundary_sources(entity, plane, WELD_TOLERANCE))
+            });
+            let all_sources = needs_scene_sources.then(|| {
+                source_scan_count += 1;
+                self.boundary_sources_on_plane(plane, WELD_TOLERANCE)
+            });
+            let clip_bounds = all_sources.as_ref().and_then(|sources| {
+                let segments = sources.values().flat_map(|source| &source.segments);
+                segments_bounds(segments, WELD_TOLERANCE)
+            });
+            for (handle, mut hatch, seeds) in candidates {
+                let mut modified = false;
+                let mut association_changed = false;
+                for (index, path) in hatch.paths.iter_mut().enumerate() {
+                    if !path
+                        .boundary_handles
+                        .iter()
+                        .any(|source| changed.contains(source))
+                    {
+                        continue;
+                    }
+                    let old_count = path.boundary_handles.len();
+                    path.boundary_handles
+                        .retain(|source| self.document.get_entity(*source).is_some());
+                    if path.boundary_handles.is_empty() {
+                        path.flags.set_external(false);
+                    }
+                    association_changed |= path.boundary_handles.len() != old_count;
+                    modified |= association_changed;
+                    let sources: rustc_hash::FxHashMap<_, _> = path
+                        .boundary_handles
+                        .iter()
+                        .filter_map(|source| {
+                            // Associative boundaries are explicit document references.
+                            // During a grip drag their display wire can be preview-hidden,
+                            // so prefer the live entity geometry over the resident wire cache.
+                            let geometry = self
+                                .document
+                                .get_entity(*source)
+                                .and_then(|entity| {
+                                    entity_boundary_source_on_plane(
+                                        entity,
+                                        plane,
+                                        WELD_TOLERANCE,
+                                        clip_bounds,
+                                    )
+                                })
+                                .or_else(|| {
+                                    all_sources
+                                        .as_ref()
+                                        .and_then(|sources| sources.get(source).cloned())
+                                });
+
+                            geometry.map(|geometry| (*source, geometry))
+                        })
+                        .collect();
+                    let segments: Vec<_> = sources
+                        .values()
+                        .flat_map(|source| source.segments.iter().copied())
+                        .collect();
+                    let faces = bounded_faces(&segments, Tolerance::new(WELD_TOLERANCE));
+                    let Some(face) = matching_face(&faces, seeds.get(index).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    let exterior = [path.flags.is_outermost()];
+                    if let Some(exact) = exact_hatch_paths(
+                        std::slice::from_ref(face),
+                        &exterior,
+                        &sources,
+                        WELD_TOLERANCE,
+                    )
+                    .into_iter()
+                    .next()
+                    {
+                        path.edges = exact.edges;
+                    }
+                    modified = true;
                 }
-                modified = true;
+                hatch.is_associative = hatch
+                    .paths
+                    .iter()
+                    .any(|path| !path.boundary_handles.is_empty());
+                if !modified {
+                    continue;
+                }
+                if association_changed {
+                    self.associative_hatch_source_cache.borrow_mut().take();
+                }
+                if self.is_recording_undo() {
+                    let before = self.document.get_entity_arc(handle);
+                    self.record_undo_before(handle, before);
+                }
+                if let Some(slot) = self.document.get_entity_mut(handle) {
+                    *slot = EntityType::Hatch(hatch);
+                    self.refresh_fill_model(handle);
+                    refreshed.push((handle, ChangeKind::Modified));
+                }
             }
-            hatch.is_associative = hatch
-                .paths
-                .iter()
-                .any(|path| !path.boundary_handles.is_empty());
-            if !modified {
-                continue;
-            }
-            if association_changed {
-                self.associative_hatch_source_cache.borrow_mut().take();
-            }
-            if self.is_recording_undo() {
-                let before = self.document.get_entity_arc(handle);
-                self.record_undo_before(handle, before);
-            }
-            if let Some(slot) = self.document.get_entity_mut(handle) {
-                *slot = EntityType::Hatch(hatch);
-                self.refresh_fill_model(handle);
-                refreshed.push((handle, ChangeKind::Modified));
-            }
+        }
+        let refresh_ms = crate::perf::elapsed_ms(refresh_started);
+        if perf_refresh && refresh_ms >= 1.0 {
+            crate::perf_record!(
+                "[perf] hatch-associative-refresh total={refresh_ms:.1}ms changed_sources={} candidate_hatches={candidate_count} planes={plane_group_count} source_scans={source_scan_count} refreshed={}",
+                changed.len(),
+                refreshed.len(),
+            );
         }
         refreshed
     }
@@ -1029,8 +1127,6 @@ impl Scene {
         plane: WorkingPlane,
         tolerance: f64,
     ) -> rustc_hash::FxHashMap<Handle, BoundarySource> {
-        let mut sources: rustc_hash::FxHashMap<Handle, BoundarySource> =
-            rustc_hash::FxHashMap::default();
         let wires = if let Some(viewport) = self.active_viewport {
             self.model_wires_for_viewport_arc(viewport, 0.0)
         } else if self.current_layout == "Model" {
@@ -1040,14 +1136,20 @@ impl Scene {
             self.paper_sheet_wires_arc()
         };
         let wires = crate::scene::model::instance_model::expand_stubs(&wires);
-        for wire in wires.iter() {
-            let Some(handle) = Self::handle_from_wire_name(&wire.name) else {
-                continue;
-            };
-            let segments = wire_segments_on_plane(wire, plane, tolerance);
-            if segments.is_empty() {
-                continue;
-            }
+        let wire_started = crate::perf::enabled().then(iced::time::Instant::now);
+        // Clip in parallel, merge per handle in order. `filter_map` + `collect`
+        // also exist on the sequential wasm32 shim; `fold`/`reduce` do not.
+        let clipped: Vec<_> = wires
+            .par_iter()
+            .filter_map(|wire| {
+                let handle = Self::handle_from_wire_name(&wire.name)?;
+                let segments = wire_segments_on_plane(wire, plane, tolerance);
+                (!segments.is_empty()).then_some((handle, segments))
+            })
+            .collect();
+        let mut sources: rustc_hash::FxHashMap<Handle, BoundarySource> =
+            rustc_hash::FxHashMap::default();
+        for (handle, segments) in clipped {
             sources
                 .entry(handle)
                 .or_insert_with(|| BoundarySource {
@@ -1057,6 +1159,7 @@ impl Scene {
                 .segments
                 .extend(segments);
         }
+        let wire_ms = crate::perf::elapsed_ms(wire_started);
         // Objects on a layer that is turned off (not frozen) still bound a
         // hatch, as in the reference: drawings switch off the layers that
         // close the regions to be hatched. They draw no wire, so they come
@@ -1086,17 +1189,19 @@ impl Scene {
         // Finite extents of the wire geometry, so rays and infinite
         // construction lines clip to something real instead of tessellating
         // to a unit stub (see `live_segments_for_curves`).
-        let all_wire_segments: Vec<Line> = sources
-            .values()
-            .flat_map(|source| source.segments.iter().copied())
-            .collect();
-        let bounds = segments_bounds(&all_wire_segments, tolerance);
+        let curves_started = crate::perf::enabled().then(iced::time::Instant::now);
+        let bounds = segments_bounds(
+            sources.values().flat_map(|source| &source.segments),
+            tolerance,
+        );
+        let mut curve_count = 0usize;
         for (&handle, source) in &mut sources {
             let curves = self
                 .document
                 .get_entity(handle)
                 .map(|entity| entity_curves_on_plane(entity, plane, tolerance))
                 .unwrap_or_default();
+            curve_count += curves.len();
 
             // Associative hatch regeneration must use the entity's live geometry,
             // not a potentially one-frame-old display wire. Grip edits and STRETCH
@@ -1117,6 +1222,15 @@ impl Scene {
                     })
                 });
             }
+        }
+        let curves_ms = crate::perf::elapsed_ms(curves_started);
+        if crate::perf::enabled() && (wire_ms >= 1.0 || curves_ms >= 1.0) {
+            crate::perf_record!(
+                "[perf] hatch-boundary-source wires={} sources={} curves={} parallel-wire-pass={wire_ms:.1}ms live-curves-and-bounds={curves_ms:.1}ms",
+                wires.len(),
+                sources.len(),
+                curve_count,
+            );
         }
         sources
     }
@@ -1257,6 +1371,80 @@ pub(crate) fn boundary_faces(
     bounded_faces(&segments, Tolerance::new(tolerance))
 }
 
+/// The faces a pick at `point` needs, built from the sources near it only.
+///
+/// The search box starts just past the nearest geometry and doubles until
+/// the innermost face holding the point lies inside it. A source that misses
+/// the box lies wholly outside it, so it cannot cut that face or sit in it
+/// as an island: the result matches `boundary_faces` over every source for
+/// this pick, without building the arrangement of the whole drawing (#1869).
+pub(crate) fn boundary_faces_around(
+    sources: &rustc_hash::FxHashMap<Handle, BoundarySource>,
+    point: [f64; 2],
+    tolerance: f64,
+) -> Vec<Vec<[f64; 2]>> {
+    let boxes: Vec<([f64; 2], [f64; 2], &BoundarySource)> = sources
+        .values()
+        .filter_map(|source| {
+            segments_bounds(&source.segments, tolerance).map(|(min, max)| (min, max, source))
+        })
+        .collect();
+    let Some((all_min, all_max)) =
+        boxes
+            .iter()
+            .map(|&(min, max, _)| (min, max))
+            .reduce(|(a_min, a_max), (b_min, b_max)| {
+                (
+                    [a_min[0].min(b_min[0]), a_min[1].min(b_min[1])],
+                    [a_max[0].max(b_max[0]), a_max[1].max(b_max[1])],
+                )
+            })
+    else {
+        return Vec::new();
+    };
+    let nearest = boxes
+        .iter()
+        .flat_map(|(_, _, source)| &source.segments)
+        .map(|segment| distance_to(&Curve::Line(*segment), point))
+        .fold(f64::INFINITY, f64::min);
+    let extent = (all_max[0] - all_min[0]).max(all_max[1] - all_min[1]);
+    let mut half = (nearest * 2.0).max(extent / 1024.0).max(tolerance * 4.0);
+    loop {
+        let (min, max) = (
+            [point[0] - half, point[1] - half],
+            [point[0] + half, point[1] + half],
+        );
+        let covers_all = min[0] <= all_min[0]
+            && min[1] <= all_min[1]
+            && max[0] >= all_max[0]
+            && max[1] >= all_max[1];
+        let segments: Vec<Line> = boxes
+            .iter()
+            .filter(|(lo, hi, _)| {
+                lo[0] <= max[0] && hi[0] >= min[0] && lo[1] <= max[1] && hi[1] >= min[1]
+            })
+            .flat_map(|(_, _, source)| source.segments.iter().copied())
+            .collect();
+        let faces = bounded_faces(&segments, Tolerance::new(tolerance));
+        let innermost = faces
+            .iter()
+            .filter(|face| contains(&face_curves(face), point, Tolerance::new(tolerance)))
+            .min_by(|a, b| signed_area(a).abs().total_cmp(&signed_area(b).abs()));
+        let settled = innermost.is_some_and(|face| {
+            face.iter().all(|p| {
+                p[0] > min[0] + tolerance
+                    && p[0] < max[0] - tolerance
+                    && p[1] > min[1] + tolerance
+                    && p[1] < max[1] - tolerance
+            })
+        });
+        if settled || covers_all {
+            return faces;
+        }
+        half *= 2.0;
+    }
+}
+
 #[cfg(test)]
 mod boundary_xline_tests {
     use super::*;
@@ -1266,6 +1454,41 @@ mod boundary_xline_tests {
             codec::types::Vector3::new(start[0], start[1], start[2]),
             codec::types::Vector3::new(end[0], end[1], end[2]),
         )))
+    }
+
+    #[test]
+    fn hatch_seed_stays_in_a_region_bounded_by_a_clockwise_arc() {
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, LineEdge};
+        use codec::types::Vector2;
+        // The part of a 50 x 30 rectangle right of a radius-20 circle at
+        // (25, 15), as HATCH stores it: three lines and a clockwise arc.
+        let x = 25.0 + 175f64.sqrt();
+        let line = |a: [f64; 2], b: [f64; 2]| {
+            BoundaryEdge::Line(LineEdge {
+                start: Vector2::new(a[0], a[1]),
+                end: Vector2::new(b[0], b[1]),
+            })
+        };
+        let angle = (15f64).atan2(x - 25.0);
+        let mut path = BoundaryPath::new();
+        path.edges = vec![
+            line([x, 0.0], [50.0, 0.0]),
+            line([50.0, 0.0], [50.0, 30.0]),
+            line([50.0, 30.0], [x, 30.0]),
+            BoundaryEdge::CircularArc(CircularArcEdge {
+                center: Vector2::new(25.0, 15.0),
+                radius: 20.0,
+                start_angle: std::f64::consts::TAU - angle,
+                end_angle: std::f64::consts::TAU + angle,
+                counter_clockwise: false,
+            }),
+        ];
+        let [sx, sy] = hatch_path_seed(&path).expect("a seed");
+        assert!(sx < 50.0 && (0.0..30.0).contains(&sy));
+        assert!(
+            (sx - 25.0).hypot(sy - 15.0) > 20.0,
+            "seed {sx},{sy} is inside the circle"
+        );
     }
 
     #[test]
@@ -1348,6 +1571,22 @@ mod boundary_xline_tests {
     }
 
     #[test]
+    fn finite_boundary_curves_skip_scene_scan_but_xlines_require_it() {
+        let plane = crate::command::WorkingPlane::default();
+        let line = EntityType::Line(codec::entities::Line::from_points(
+            codec::types::Vector3::new(0.0, 0.0, 0.0),
+            codec::types::Vector3::new(10.0, 0.0, 0.0),
+        ));
+        let xline = EntityType::XLine(codec::entities::XLine::new(
+            codec::types::Vector3::new(5.0, 0.0, 0.0),
+            codec::types::Vector3::new(0.0, 1.0, 0.0),
+        ));
+
+        assert!(!needs_scene_boundary_sources(&line, plane, WELD_TOLERANCE));
+        assert!(needs_scene_boundary_sources(&xline, plane, WELD_TOLERANCE));
+    }
+
+    #[test]
     fn xline_missing_the_geometry_contributes_no_face() {
         let mut scene = Scene::new();
         rect_edge(&mut scene, [0.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
@@ -1367,6 +1606,76 @@ mod boundary_xline_tests {
             faces.len(),
             1,
             "a distant xline must leave the single rectangle face alone"
+        );
+    }
+
+    #[test]
+    fn faces_around_a_pick_match_the_whole_drawing() {
+        // A 12×12 grid of rooms, one holding an island. Every wall runs the
+        // full grid, so each search box pulls in walls reaching far beyond it.
+        let mut segments = Vec::new();
+        for k in 0..=12 {
+            let k = k as f64 * 10.0;
+            segments.push(Line {
+                start: [0.0, k],
+                end: [120.0, k],
+            });
+            segments.push(Line {
+                start: [k, 0.0],
+                end: [k, 120.0],
+            });
+        }
+        let island = [[53.0, 53.0], [57.0, 53.0], [57.0, 57.0], [53.0, 57.0]];
+        for k in 0..4 {
+            segments.push(Line {
+                start: island[k],
+                end: island[(k + 1) % 4],
+            });
+        }
+        let sources: rustc_hash::FxHashMap<_, _> = segments
+            .into_iter()
+            .enumerate()
+            .map(|(k, line)| {
+                let source = BoundarySource {
+                    segments: vec![line],
+                    curves: vec![Curve::Line(line)],
+                };
+                (Handle::new(k as u64 + 1), source)
+            })
+            .collect();
+        let tolerance = 1.0e-6;
+        let innermost = |faces: &[Vec<[f64; 2]>], point: [f64; 2]| {
+            let mut found: Vec<_> = faces
+                .iter()
+                .filter(|face| contains(&face_curves(face), point, Tolerance::new(tolerance)))
+                .map(|face| (signed_area(face).abs(), face.clone()))
+                .collect();
+            found.sort_by(|a, b| a.0.total_cmp(&b.0));
+            found.first().map(|(area, _)| *area)
+        };
+        let islands = |faces: &[Vec<[f64; 2]>]| {
+            faces
+                .iter()
+                .filter(|face| (signed_area(face).abs() - 16.0).abs() < 1e-9)
+                .count()
+        };
+        let all = boundary_faces(&sources, tolerance);
+        for point in [
+            [51.0, 51.0],
+            [55.0, 55.0],
+            [5.0, 115.0],
+            [119.0, 1.0],
+            [200.0, 5.0],
+        ] {
+            let near = boundary_faces_around(&sources, point, tolerance);
+            assert_eq!(innermost(&near, point), innermost(&all, point), "{point:?}");
+            assert!(near.len() <= all.len());
+        }
+        let room = boundary_faces_around(&sources, [51.0, 51.0], tolerance);
+        assert_eq!(islands(&room), 1, "the island in the picked room is kept");
+        assert!(
+            room.len() < all.len() / 4,
+            "only the neighbourhood is built"
         );
     }
 }

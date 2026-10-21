@@ -22,6 +22,10 @@ pub enum Projection {
     Perspective,
 }
 
+/// Pixels Zoom Extents, All and Object add to the limiting axis of the view
+/// (3 on each side), in the view's own pixels.
+pub const EXTENTS_BORDER_PX: f32 = 6.0;
+
 #[derive(Clone)]
 pub struct Camera {
     /// World-space pivot point the camera orbits around. Kept in f64 so a far
@@ -637,7 +641,41 @@ impl Camera {
         self.fit_to_bounds_f64(min.as_dvec3(), max.as_dvec3(), aspect);
     }
 
+    /// Edge to edge, as Zoom Window frames its box.
     pub fn fit_to_bounds_f64(&mut self, min: DVec3, max: DVec3, aspect: f32) {
+        self.fit_to_bounds_bordered(min, max, aspect, None);
+    }
+
+    /// f32 form of [`Self::fit_to_bounds_bordered`].
+    pub fn fit_to_bounds_bordered_f32(
+        &mut self,
+        min: Vec3,
+        max: Vec3,
+        aspect: f32,
+        pixels: Option<(f32, f32)>,
+    ) {
+        self.fit_to_bounds_bordered(min.as_dvec3(), max.as_dvec3(), aspect, pixels);
+    }
+
+    /// Fit with the border Zoom Extents, All and Object leave: the box grows
+    /// on each axis by [`EXTENTS_BORDER_PX`] over that axis' pixel length, so
+    /// the limiting axis keeps 3 px on each side. `pixels` is the view's size
+    /// in pixels; `None` fits edge to edge.
+    pub fn fit_to_bounds_bordered(
+        &mut self,
+        min: DVec3,
+        max: DVec3,
+        aspect: f32,
+        pixels: Option<(f32, f32)>,
+    ) {
+        let grow = |px: f32| {
+            if px.is_finite() && px > 0.0 {
+                1.0 + EXTENTS_BORDER_PX / px
+            } else {
+                1.0
+            }
+        };
+        let (grow_x, grow_y) = pixels.map_or((1.0, 1.0), |(w, h)| (grow(w), grow(h)));
         self.target = (min + max) * 0.5;
         let corners = self.bounds_in_view(min, max);
         // Half-height the view needs so the box fits BOTH axes at the given
@@ -647,12 +685,13 @@ impl Camera {
         let a = aspect.max(0.01);
         let half_h = corners
             .iter()
-            .fold(0.0_f32, |m, c| m.max(c.y.abs()).max(c.x.abs() / a))
+            .fold(0.0_f32, |m, c| {
+                m.max(c.y.abs() * grow_y).max(c.x.abs() * grow_x / a)
+            })
             .max(1e-6);
         // `ortho_size` (the half-height) is `distance * tan(fov/2)`, so invert
-        // that to get the distance which just contains `half_h`, plus a small
-        // border margin.
-        self.distance = (half_h / (self.fov_y * 0.5).tan() * 1.1).max(1e-3);
+        // that to get the distance which just contains `half_h`.
+        self.distance = (half_h / (self.fov_y * 0.5).tan()).max(1e-3);
         self.fit_depth_to_bounds_f64(min, max);
     }
 
@@ -1039,7 +1078,7 @@ mod tests {
         let old = (max - min).length() * 1.5;
         let ratio = cam.distance / old;
         assert!(
-            (0.75..1.25).contains(&ratio),
+            (0.6..1.25).contains(&ratio),
             "flat framing drifted {ratio}x from the old rule (was {old}, now {})",
             cam.distance
         );

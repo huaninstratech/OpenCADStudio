@@ -532,6 +532,11 @@ fn dynamic_data_text(data: &DynamicBlockData) -> String {
             value.value_set.increment,
             value.value_set.values.len()
         ),
+        DynamicBlockData::PropertiesTable(value) => format!(
+            "{}; fields {}",
+            value.parameter.parameter.element.name,
+            value.fields.len()
+        ),
         DynamicBlockData::LookupParameter(value) => format!(
             "{}; {} index {}; description {}",
             value.parameter.parameter.element.name,

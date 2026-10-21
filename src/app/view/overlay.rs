@@ -1416,9 +1416,10 @@ fn context_menu_row_style(
 }
 
 /// One-shot snap override menu (Shift+RMB, #337): a cursor-anchored grid of
-/// snap ICONS only — the names show as hover tooltips. Picking one applies
-/// that snap to just the next point pick; the trailing MTP cell instead
-/// suspends the prompt for two picks and returns their midpoint.
+/// snap ICONS only — the names show as hover tooltips, with the letter that
+/// picks each from the keyboard. Picking one applies that snap to just the
+/// next point pick; the trailing MTP cell instead suspends the prompt for two
+/// picks and returns their midpoint.
 pub(super) fn snap_override_overlay(pos: iced::Point) -> Element<'static, Message> {
     const COLS: usize = 4;
 
@@ -1466,9 +1467,14 @@ pub(super) fn snap_override_overlay(pos: iced::Point) -> Element<'static, Messag
     let mut cells: Vec<Element<'static, Message>> =
         Vec::with_capacity(crate::snap::ALL_SNAP_MODES.len() + 1);
     for &(snap_type, _glyph, label) in crate::snap::ALL_SNAP_MODES {
+        // The tooltip teaches the letter that picks the cell from the keyboard.
+        let label = match crate::snap::override_menu_key(snap_type) {
+            Some(key) => format!("{} ({key})", t!(label)),
+            None => t!(label).into_owned(),
+        };
         cells.push(cell_icon(
             crate::ui::icons::osnap(snap_type),
-            label.to_string(),
+            label,
             Message::SnapOverridePick(snap_type),
         ));
     }

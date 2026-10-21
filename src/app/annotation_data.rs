@@ -25,6 +25,7 @@ struct ExtractionRecord {
     color: String,
     linetype: String,
     details: String,
+    position: Option<codec::types::Vector3>,
 }
 
 // ── In-session picked-file registries (web) ───────────────────────────────
@@ -165,6 +166,15 @@ impl ExtractionRecord {
             "color" => self.color.clone(),
             "linetype" => self.linetype.clone(),
             "details" => self.details.clone(),
+            "position_x" => self
+                .position
+                .map_or_else(String::new, |p| format!("{:.3}", p.x)),
+            "position_y" => self
+                .position
+                .map_or_else(String::new, |p| format!("{:.3}", p.y)),
+            "position_z" => self
+                .position
+                .map_or_else(String::new, |p| format!("{:.3}", p.z)),
             _ => String::new(),
         }
     }
@@ -637,6 +647,17 @@ fn entity_details(entity: &EntityType) -> String {
     }
 }
 
+/// The placement point the Properties palette shows as Position.
+fn entity_position(entity: &EntityType) -> Option<codec::types::Vector3> {
+    match entity {
+        EntityType::Text(value) => Some(crate::entities::text::position(value)),
+        EntityType::MText(value) => Some(value.insertion_point),
+        EntityType::Insert(value) => Some(value.insert_point),
+        EntityType::Point(value) => Some(value.location),
+        _ => None,
+    }
+}
+
 fn collect_records(
     doc: &CadDocument,
     allowed_handles: Option<&BTreeSet<Handle>>,
@@ -661,6 +682,7 @@ fn collect_records(
             color: entity.common().color.to_string(),
             linetype: entity.common().linetype.clone(),
             details: entity_details(entity),
+            position: entity_position(entity),
         });
     }
 }

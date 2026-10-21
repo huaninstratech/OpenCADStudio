@@ -32,8 +32,8 @@ use super::OpenCADStudio;
 /// a time (the document session persists across reconnects); every socket
 /// request carries `"token"` (see `rest::api_token`).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn serve() {
-    let mut app = OpenCADStudio::new();
+pub fn serve(read_only: bool) {
+    let mut app = OpenCADStudio::new_headless(read_only);
     match port_arg() {
         Some(port) => serve_socket(
             &mut app,
@@ -814,6 +814,28 @@ fn audit_ascii_dxf_references(path: &std::path::Path) -> Result<Value, String> {
 }
 
 impl OpenCADStudio {
+    /// A headless session. `read_only` is the `--read-only` launch flag,
+    /// which the GUI takes from its startup config instead. (#1928)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new_headless(read_only: bool) -> Self {
+        let mut app = Self::new();
+        app.read_only = read_only;
+        app
+    }
+
+    /// The refusal every automation write of the drawing gives in a
+    /// `--read-only` session, matching the GUI's SAVE / SAVEAS / SAVEALL.
+    pub(super) fn read_only_save_refusal(&self) -> Option<Value> {
+        self.read_only.then(|| {
+            json!({
+                "ok": false,
+                "status": "failed",
+                "code": "read_only",
+                "error": "Read-only session (--read-only): saving is disabled.",
+            })
+        })
+    }
+
     /// Handle one JSON request line and return the JSON response.
     #[cfg(any(test, not(target_arch = "wasm32")))]
     pub(crate) fn automation_op(&mut self, line: &str) -> Value {
@@ -1158,6 +1180,9 @@ impl OpenCADStudio {
                 json!({ "ok": true, "selected": self.tabs[i].scene.selected_entities().len() })
             }
             "save" => {
+                if let Some(refusal) = self.read_only_save_refusal() {
+                    return refusal;
+                }
                 if self.tabs[self.active_tab].block_test.is_some() {
                     return err("Test Block is temporary and cannot be saved.");
                 }
@@ -3927,6 +3952,8 @@ mod tests {
             let _ = app.run_command_line("LINE 0,0 10,10");
             app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
             let _ = app.run_command_line("ZOOM EXTENTS");
+            // Extents leave a 3-pixel border, so the window paths run 1 px
+            // inside the view edge to enclose the line.
             // Both directions. Crossing = a right → left diagonal sweep (the
             // freeform path may be degenerate — crossing counts hits).
             // Window = a left → right perimeter walk so the freeform ring
@@ -3936,11 +3963,11 @@ mod tests {
                 (0..=10)
                     .map(|k| {
                         let t = k as f32 / 10.0;
-                        (20.0 + t * 760.0, 20.0 + t * 560.0)
+                        (1.0 + t * 798.0, 1.0 + t * 598.0)
                     })
                     .collect()
             } else if add {
-                let (sx, sy, ex, ey) = (780.0f32, 580.0f32, 20.0f32, 20.0f32);
+                let (sx, sy, ex, ey) = (799.0f32, 599.0f32, 1.0f32, 1.0f32);
                 (0..=10)
                     .map(|k| {
                         let t = k as f32 / 10.0;
@@ -3949,14 +3976,14 @@ mod tests {
                     .collect()
             } else {
                 vec![
-                    (20.0, 20.0),
-                    (400.0, 20.0),
-                    (780.0, 20.0),
-                    (780.0, 300.0),
-                    (780.0, 580.0),
-                    (400.0, 580.0),
-                    (20.0, 580.0),
-                    (20.0, 300.0),
+                    (1.0, 1.0),
+                    (400.0, 1.0),
+                    (799.0, 1.0),
+                    (799.0, 300.0),
+                    (799.0, 599.0),
+                    (400.0, 599.0),
+                    (1.0, 599.0),
+                    (1.0, 300.0),
                 ]
             };
             let _ = app.update(Message::ViewportMove(iced::Point::new(
@@ -4118,6 +4145,51 @@ mod tests {
             }
             other => panic!("dest MTEXT missing: {other:?}"),
         }
+    }
+
+    #[test]
+    fn matchprop_source_glow_survives_preview_refresh_and_destination_apply() {
+        use crate::command::StepInput;
+        use codec::{entities::Line, types::Vector3, EntityType};
+
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+
+        let mut source = Line::new();
+        source.start = Vector3::new(0.0, 0.0, 0.0);
+        source.end = Vector3::new(20.0, 10.0, 0.0);
+        let source_h = app.tabs[i].scene.add_entity(EntityType::Line(source));
+
+        let mut destination = Line::new();
+        destination.start = Vector3::new(30.0, 0.0, 0.0);
+        destination.end = Vector3::new(40.0, 10.0, 0.0);
+        let destination_h = app.tabs[i].scene.add_entity(EntityType::Line(destination));
+
+        let _ = app.run_command_line("MATCHPROP");
+        let _ = app.feed_command(StepInput::EntityPick(source_h, glam::DVec3::ZERO));
+
+        app.refresh_active_cmd_preview(i);
+        assert!(
+            !app.tabs[i].scene.preview_wires.is_empty(),
+            "a generic preview refresh must seed the selected source glow"
+        );
+
+        let _ = app.feed_command(StepInput::SelectionComplete(vec![destination_h]));
+        assert!(
+            app.tabs[i].active_cmd.is_some(),
+            "MATCHPROP should remain active for additional destinations"
+        );
+        assert!(
+            !app.tabs[i].scene.preview_wires.is_empty(),
+            "applying one destination must immediately restore the source glow"
+        );
+
+        app.refresh_active_cmd_preview(i);
+        assert!(
+            !app.tabs[i].scene.preview_wires.is_empty(),
+            "later generic refreshes must not erase the source glow"
+        );
     }
 
     #[test]

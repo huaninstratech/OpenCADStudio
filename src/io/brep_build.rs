@@ -4,7 +4,9 @@
 //!
 //! Spline curves and surfaces that are exactly lines, circles, planes,
 //! spheres, cylinders, cones or tori are kept as those shapes: many systems write
-//! every one of them as a spline.
+//! every one of them as a spline. With [`Builder::closed_only`] only lines,
+//! planes and the shapes that close on themselves (a whole circle, a whole
+//! turn round an axis) are, the others staying splines.
 
 use std::f64::consts::TAU;
 
@@ -25,6 +27,9 @@ pub struct FaceSpec {
 
 pub struct Builder {
     pub body: Body,
+    /// Keep a spline circle, cylinder, cone, sphere or torus as that shape
+    /// only when it closes on itself (IGES).
+    pub closed_only: bool,
 }
 
 /// Whether a curve repeats, and over how long a parameter run.
@@ -76,7 +81,10 @@ fn reversed(curve: Curve3) -> Option<Curve3> {
 
 impl Builder {
     pub fn new() -> Self {
-        Self { body: Body::new() }
+        Self {
+            body: Body::new(),
+            closed_only: false,
+        }
     }
 
     pub fn vertex(&mut self, point: [f64; 3]) -> VertexKey {
@@ -96,9 +104,11 @@ impl Builder {
     pub fn edge(&mut self, curve: Curve3, start: VertexKey, end: VertexKey) -> Option<EdgeKey> {
         let (a, b) = (self.point(start)?, self.point(end)?);
         let mut curve = match curve {
-            Curve3::Nurbs(nurbs) => {
-                kernel::brep::analytic_curve(&nurbs).unwrap_or(Curve3::Nurbs(nurbs))
-            }
+            Curve3::Nurbs(nurbs) => match kernel::brep::analytic_curve(&nurbs) {
+                Some(line @ Curve3::Line(_)) => line,
+                Some(analytic) if !self.closed_only || nurbs.is_closed() => analytic,
+                _ => Curve3::Nurbs(nurbs),
+            },
             other => other,
         };
         let mut t0 = parameter(&curve, a)?;
@@ -163,8 +173,14 @@ impl Builder {
             for spec in faces {
                 let (surface, forward) = match spec.surface {
                     Surface::Nurbs(nurbs) => match kernel::brep::analytic_surface(&nurbs) {
-                        Some((analytic, agrees)) => (analytic, spec.forward == agrees),
-                        None => (Surface::Nurbs(nurbs), spec.forward),
+                        Some((analytic, agrees))
+                            if !self.closed_only
+                                || matches!(analytic, Surface::Plane(_))
+                                || nurbs.periodicity().contains(&true) =>
+                        {
+                            (analytic, spec.forward == agrees)
+                        }
+                        _ => (Surface::Nurbs(nurbs), spec.forward),
                     },
                     other => (other, spec.forward),
                 };

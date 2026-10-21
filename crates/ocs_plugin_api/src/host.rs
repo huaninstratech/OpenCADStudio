@@ -107,6 +107,39 @@ pub enum SolidBoolean {
     Intersect,
 }
 
+/// One pick of a [`PluginConstraint`]: the entity (or the point, for a
+/// free pick), the world point near the pick, and whether the whole curve
+/// (not a specific point on it) is meant. Resolution follows the interactive
+/// COINCIDENT/TANGENT pick logic (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginConstraintPick {
+    #[serde(default)]
+    pub handle: Option<Handle>,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub whole_curve: bool,
+}
+
+/// A parametric constraint created through [`HostApi::constraint_create`]
+/// (API v13, additive): the same constraint machinery the interactive
+/// COINCIDENT (`GCCOINCIDENT`) and TANGENT (`TCONSTRAINT`) commands drive,
+/// reached directly — no command line, no prompt echo, one undo step under
+/// the entity-write contract (inside a plugin-opened `push_undo` scope the
+/// constraint joins that scope).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PluginConstraint {
+    /// A coincident constraint between the two picks.
+    Coincident {
+        first: PluginConstraintPick,
+        second: PluginConstraintPick,
+    },
+    /// A tangency constraint between the two picks.
+    Tangent {
+        first: PluginConstraintPick,
+        second: PluginConstraintPick,
+    },
+}
+
 /// One step of driving an OCS command from a script (API v7, additive). The
 /// host runs the real command, so every tool behaves exactly as at the command
 /// line, and answers with where the command stands.
@@ -131,6 +164,13 @@ pub enum CommandRequest {
     Enter,
     /// Cancel the running command and close anything it left open.
     Cancel,
+    /// API v13 (additive): run a whole command line like [`Run`](Self::Run),
+    /// but with the COMMAND-LINE ECHO SUPPRESSED for the machine replay — no
+    /// prompts, no echo of internal machinery ("COINCIDENT Select first
+    /// point...", "SETVAR Bezeichnung der Variablen:"...). For plugin re-bond
+    /// and rebuild replays whose noise the user must not see; errors still
+    /// surface. The replay's undo composition is unchanged.
+    RunQuiet { line: String },
 }
 
 /// Where a command stands after a [`CommandRequest`].
@@ -405,6 +445,18 @@ pub enum HostNotification {
     DocumentOpened {
         tab_id: u64,
     },
+    /// V13 a document boundary settled, carrying the DIRTY REGION — the
+    /// identity set of what changed since the previous boundary: the touched
+    /// entity handles, and the (entity, app-name) pairs of touched XRecords.
+    /// Sent alongside [`HostNotification::DocumentChanged`] at every boundary;
+    /// boundary work can then be O(changed) instead of O(store). Older
+    /// plugins decode it through the `Unknown` passthrough. Discriminant 11.
+    DocumentChangedRegions {
+        tab_id: u64,
+        version: u64,
+        entities: Vec<Handle>,
+        records: Vec<(Handle, String)>,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -460,6 +512,18 @@ impl Serialize for HostNotification {
                 bytes.push(10);
                 bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
             }
+            HostNotification::DocumentChangedRegions {
+                tab_id,
+                version,
+                entities,
+                records,
+            } => {
+                bytes.push(11);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, entities).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, records).map_err(serde::ser::Error::custom)?;
+            }
             HostNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
         bytes.serialize(serializer)
@@ -506,6 +570,20 @@ impl<'de> Deserialize<'de> for HostNotification {
             10 => bincode::deserialize(rest)
                 .map(|tab_id| HostNotification::DocumentOpened { tab_id })
                 .map_err(serde::de::Error::custom),
+            11 => {
+                let (tab_id, version, entities, records): (
+                    u64,
+                    u64,
+                    Vec<Handle>,
+                    Vec<(Handle, String)>,
+                ) = bincode::deserialize(rest).map_err(serde::de::Error::custom)?;
+                Ok(HostNotification::DocumentChangedRegions {
+                    tab_id,
+                    version,
+                    entities,
+                    records,
+                })
+            }
             _ => Ok(HostNotification::Unknown(bytes)),
         }
     }
@@ -538,6 +616,14 @@ pub enum PluginNotification {
         status: String,
         message: String,
     },
+    /// V13 the runner's notification subscription is live: its main loop
+    /// entered and is draining host notifications. The host defers
+    /// boot-window broadcasts per process until this ack arrives (and flushes
+    /// them then), so a fresh boot's notifications can never race the
+    /// runner's startup — the notification-attach determinism the dispatch
+    /// table already has. Older hosts decode it through the `Unknown`
+    /// passthrough. Discriminant 7.
+    ChannelReady,
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -578,6 +664,7 @@ impl Serialize for PluginNotification {
                 bincode::serialize_into(&mut bytes, status).map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, message).map_err(serde::ser::Error::custom)?;
             }
+            PluginNotification::ChannelReady => bytes.push(7),
             PluginNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
         bytes.serialize(serializer)
@@ -616,6 +703,7 @@ impl<'de> Deserialize<'de> for PluginNotification {
             6 => bincode::deserialize(rest)
                 .map(|(status, message)| PluginNotification::ReplStatus { status, message })
                 .map_err(serde::de::Error::custom),
+            7 => Ok(PluginNotification::ChannelReady),
             _ => Ok(PluginNotification::Unknown(bytes)),
         }
     }
@@ -673,6 +761,33 @@ pub trait BuiltinPlugin: Send + Sync {
     /// vtable.
     fn entity_classes(&self) -> Option<&'static EntityClasses> {
         None
+    }
+
+    /// A drag event for one of this plugin's declared custom grips (API v11).
+    ///
+    /// The host calls this for the begin/move/settle/cancel phases of a drag
+    /// on a grip this plugin declared — and only for this plugin. `host` is a
+    /// full [`HostApi`] session: from inside the settle callback the plugin
+    /// can read the document/records and write — including opening its own
+    /// [`HostApi::push_undo`] scope — as the settle's only write window.
+    /// The settled drag totals exactly the plugin's one labeled undo step;
+    /// the host records none of its own.
+    ///
+    /// The returned [`CustomGripResponse::preview`] replaces the plugin's
+    /// live preview wire set; it is the only feedback the host shows during
+    /// the drag — the host draws no ghost and moves nothing. Cancel means
+    /// drop preview state with zero writes.
+    ///
+    /// The host guards this call: a panicking handler is contained and
+    /// reported, never fatal. The runner only calls this for plugins whose
+    /// exported `ocs_plugin_api_version` symbol reports API major 11 or
+    /// newer, so older cdylibs are never touched past their vtable.
+    fn on_custom_grip_event(
+        &mut self,
+        _host: &mut dyn HostApi,
+        _event: CustomGripEvent,
+    ) -> CustomGripResponse {
+        CustomGripResponse::default()
     }
 }
 
@@ -806,6 +921,134 @@ impl From<Vec<[f64; 3]>> for PreviewWire {
         Self::new(points)
     }
 }
+
+// ── Plugin grip surface (API v11, additive) ────────────────────────────────
+//
+// Three surfaces, one rule: plugin DECLARED, plugin OWNED. The host renders,
+// hit-tests and drags custom grips, but it never interprets them — every
+// semantic decision lives in the declaring plugin. The host applies no entity
+// mutation, constraint or record of its own when a custom grip settles; the
+// plugin learns of the drag through live [`CustomGripEvent`] frames, shows a
+// preview through the existing [`PreviewWire`] channel, and applies the settle
+// with its own HostApi writes inside its own [`HostApi::push_undo`] scope.
+
+/// One built-in grip of an entity as enumerated by
+/// [`HostApi::entity_grips`](HostApi::entity_grips) (API v11).
+///
+/// The shape and field semantics mirror the automation `grips` read: `grip_id`
+/// ist the entity-local grip index, `point` the grip's world position, and
+/// `moves_entity` true for translate grips (the same flag the interactive
+/// viewport uses to whole-entity moves).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GripInfo {
+    pub grip_id: usize,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub moves_entity: bool,
+    /// Debug name of the grip shape (e.g. `"Square"`).
+    pub shape: String,
+    /// Drag constraint direction, when the built-in grip declares one.
+    #[serde(default)]
+    pub axis: Option<[f64; 3]>,
+}
+
+/// Marker shape a plugin requests for a custom grip point (API v11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PluginGripShape {
+    #[default]
+    Square,
+    Circle,
+    Triangle,
+}
+
+/// A plugin-declared custom grip point (API v11).
+///
+/// The whole batch passed to
+/// [`set_plugin_grips`](HostApi::set_plugin_grips) REPLACES the declaring
+/// plugin's previous set; an empty batch clears it. Declaration is
+/// session-only display state: it is never written to the drawing file, and
+/// the plugin re-declares after its own notification boundaries
+/// (pull model — [`on_notification`](BuiltinPlugin::on_notification)).
+///
+/// `point` is an ABSOLUTE world point. The host never moves, offsets or
+/// auto-follows it when the `anchor` entity moves; an anchor exists for
+/// ownership scoping and hit-test legibility only. `axis`, when present,
+/// hard-constrains interactive drags to that direction line through the
+/// point; the drag events carry the projected point on the line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginGrip {
+    pub grip_id: u64,
+    #[serde(default)]
+    pub anchor: Option<Handle>,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub axis: Option<[f64; 3]>,
+    #[serde(default)]
+    pub shape: PluginGripShape,
+}
+
+/// Drag phase of a [`CustomGripEvent`] (API v11).
+///
+/// Move events are coalesced (at most one is in flight to the plugin;
+/// superseded cursor positions are dropped); the settle and cancel phases
+/// are never coalesced or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomGripPhase {
+    Begin,
+    Move,
+    Settle,
+    Cancel,
+}
+
+/// One drag event delivered to the owning plugin (API v11).
+///
+/// `point` is the CURRENT drag point: the projected cursor point with a
+/// hard-constrained axis, the point on the constraint line. The settle event
+/// carries the final point; cancel lets the plugin drop preview state with
+/// zero writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomGripEvent {
+    pub grip_id: u64,
+    pub phase: CustomGripPhase,
+    pub point: [f64; 3],
+    #[serde(default)]
+    pub anchor: Option<Handle>,
+}
+
+/// The plugin's answer to a [`CustomGripEvent`] (API v11, additive).
+///
+/// `preview` REPLACES the plugin's live preview wire set; analytical arcs
+/// and circles render GPU-smooth. The plugin's preview is the only
+/// host-invented live feedback — the host draws no ghost of its own and
+/// moves nothing on its own during the drag.
+///
+/// `live_entities` (API v12, additive) is the plugin-directed LIVE-GEOMETRY
+/// channel — the plugin-owned twin of what a built-in grip drag shows: the
+/// CURRENT geometry of every affected entity (`(handle, entity)` pairs,
+/// computed by the plugin from the drag point, exactly what the settle will
+/// commit). The host applies them during the drag through the same
+/// visual-only dynamic phase its own grip drags use — the elements visibly
+/// move, ZERO history steps are recorded mid-drag, the whole visual state is
+/// discarded byte-identically on cancel, and the settle RESTORES the
+/// originals before the plugin's authoritative writes land in its own one
+/// undo scope. The host still interprets nothing: the plugin computes and
+/// returns every affected entity's live geometry per move. A response
+/// carrying only `preview` behaves exactly as before — the drawing stays
+/// static except for the preview wires. The payload is capped at
+/// [`MAX_PLUGIN_LIVE_ENTITIES`] per response; a larger set answers with a
+/// refused delivery (headline in the error queue), never a freeze.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomGripResponse {
+    #[serde(default)]
+    pub preview: Vec<PreviewWire>,
+    #[serde(default)]
+    pub live_entities: Vec<(Handle, EntityType)>,
+}
+
+/// Per-response cap on live-geometry entities (API v12): the drag stays
+/// rubber-band smooth; wider chains should batch by kind (the plugin decides
+/// what must move) or co-design a lighter frame with the host.
+pub const MAX_PLUGIN_LIVE_ENTITIES: usize = 256;
 
 /// The outcome of an [`InteractiveCommand`] step.
 #[derive(Debug)]
@@ -1245,6 +1488,133 @@ pub trait HostApi {
     fn set_reference_only(&mut self, _handle: Handle, _reference_only: bool) -> Result<(), String> {
         Err("The reference-only designation is not supported by this host".to_owned())
     }
+
+    // ── Plugin grip surface (added in API v11; appended at the end to keep
+    // vtable indices stable for older plugins) ─────────────────────────────
+
+    /// Enumerate an entity's built-in grips (API v11, additive).
+    ///
+    /// Generic over every entity type: the answer is whatever the entity's
+    /// own grip producers define (an arc answers center / endpoints / its
+    /// mid-arc radius grip, a spline its control points, and so on), with
+    /// the same shape and field semantics the automation `grips` read and
+    /// the interactive viewport expose. Reference-only entities and entities
+    /// on locked layers answer an empty list — the same answer the viewport
+    /// would give. Fails when the handle does not address an entity.
+    fn entity_grips(&self, _handle: Handle) -> Result<Vec<GripInfo>, String> {
+        Err("Grip reads are not supported by this host".to_owned())
+    }
+
+    /// Perform the grip edit an interactive drag would perform (API v11,
+    /// additive).
+    ///
+    /// Drives exactly the machinery of the viewport drag: the entity-typed
+    /// grip modes, snaps and ortho/polar off for the move, one undo step
+    /// labeled like the interactive grip step, byte-exact restore on undo.
+    /// Refusal parity: fails for unknown handles/grip ids, reference-only
+    /// entities and locked layers.
+    fn grip_drag(&mut self, _handle: Handle, _grip_id: usize, _to: [f64; 3]) -> Result<(), String> {
+        Err("Programmatic grip drags are not supported by this host".to_owned())
+    }
+
+    /// Declare (or clear) the calling plugin's custom grip points (API v11,
+    /// additive, V4 transport only).
+    ///
+    /// The batch REPLACES the plugin's previous set; an empty batch clears
+    /// it. The host renders the points, hit-tests them with priority over
+    /// click-through (reference-only) geometry, and routes drags on them
+    /// back to the plugin as [`CustomGripEvent`]s — the host interprets
+    /// nothing. Declaration is session display state: nothing of it is
+    /// persisted in the drawing file, and the set dies with the plugin's
+    /// process. Only the declaring plugin ever receives its grips' events.
+    ///
+    /// `plugin_id` is fixed by the host transport: over the plugin IPC the
+    /// host attaches the serving process's own manifest id and refuses
+    /// mismatches, so a plugin cannot declare grips in another plugin's
+    /// name.
+    fn set_plugin_grips(
+        &mut self,
+        _plugin_id: &str,
+        _grips: Vec<PluginGrip>,
+    ) -> Result<(), String> {
+        Err("Plugin grip points are not supported by this host".to_owned())
+    }
+
+    /// Read specific entities by handle (API v12, additive).
+    ///
+    /// Cheap per-entity reads for refresh passes — the answer is the LIVE
+    /// document's current entity per handle (`None` for an unknown handle).
+    /// Use these instead of re-taking a document snapshot after writes: the
+    /// session snapshot is invalidated by every write, so read-after-write
+    /// loops through it re-clone the full document each time (the per-boundary
+    /// quadratic). Fails only when the tab does not exist.
+    fn entities_batch(&self, _handles: &[Handle]) -> Result<Vec<Option<EntityType>>, String> {
+        Err("Per-entity batch reads are not supported by this host".to_owned())
+    }
+
+    /// Create a parametric constraint directly (API v13, additive).
+    ///
+    /// The same constraint machinery the interactive COINCIDENT/TANGENT
+    /// commands drive, reached without the command line: no prompts, no echo,
+    /// the solver runs exactly as interactively. Undo composition follows the
+    /// entity-write contract — inside a plugin-opened `push_undo` scope the
+    /// constraint joins that scope (a re-bond composed of writes + constraints
+    /// is the plugin's single labeled step); with no scope open it is one
+    /// step of its own. A refusal records no undo step.
+    fn constraint_create(&mut self, _constraint: PluginConstraint) -> Result<(), String> {
+        Err("Constraint creation is not supported by this host".to_owned())
+    }
+
+    /// Read several XRecords in ONE round trip (API v13, additive).
+    ///
+    /// The batched twin of [`read_xrecord`](Self::read_xrecord): one frame
+    /// answers every entry (`Err` per missing path/name instead of failing
+    /// the whole batch). The consumer's store walk collapses from
+    /// list + one-read-per-record to one frame.
+    fn read_xrecords(
+        &self,
+        _reads: &[XRecordRead],
+    ) -> Result<Vec<Result<Vec<XRecordEntry>, String>>, String> {
+        Err("Batched XRecord reads are not supported by this host".to_owned())
+    }
+
+    /// Atomically replace the entries of several XRecords in ONE round trip
+    /// (API v13, additive). Each entry applies the single-update contract
+    /// (identity kept, verbatim raw payloads dropped, refusals change
+    /// nothing); the whole batch shares the entity-write undo contract —
+    /// inside a plugin-opened `push_undo` scope the batch joins that scope as
+    /// the plugin's single labeled step.
+    fn update_xrecords(
+        &mut self,
+        _updates: &[XRecordUpdate],
+    ) -> Result<Vec<Result<Handle, String>>, String> {
+        Err("Batched XRecord updates are not supported by this host".to_owned())
+    }
+
+    /// List the XRecord names under a dictionary path WITH their entries in
+    /// ONE answer (API v13, additive): most consumers' whole discovery walk
+    /// (list, then one read per record) becomes a single frame.
+    fn list_xrecords_with_entries(
+        &self,
+        _dictionary_path: &[&str],
+    ) -> Result<Vec<(String, Vec<XRecordEntry>)>, String> {
+        Err("XRecord listing with entries is not supported by this host".to_owned())
+    }
+}
+
+/// One XRecord addressed by dictionary path + name (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XRecordRead {
+    pub dictionary_path: Vec<String>,
+    pub name: String,
+}
+
+/// One XRecord update in a batch (API v13, additive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XRecordUpdate {
+    pub dictionary_path: Vec<String>,
+    pub name: String,
+    pub entries: Vec<XRecordEntry>,
 }
 
 /// Configuration properties for creating or modifying a layer.

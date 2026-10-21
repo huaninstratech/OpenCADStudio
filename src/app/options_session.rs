@@ -236,8 +236,8 @@ mod tests {
     #[test]
     fn the_zoom_factor_field_reaches_past_the_system_variable() {
         let mut app = app();
-        let _ = app.update(Message::ZoomFactorInputChanged("250".into()));
-        assert_eq!(app.zoom_factor, 250);
+        let _ = app.update(Message::ZoomFactorInputChanged("150".into()));
+        assert_eq!(app.zoom_factor, 150);
 
         let _ = app.update(Message::ZoomFactorInputChanged("600".into()));
         assert_eq!(app.zoom_factor, settings::ZOOM_FACTOR_MAX);

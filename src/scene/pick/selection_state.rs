@@ -67,6 +67,10 @@ impl SelectionGesture {
 #[derive(Clone, Default)]
 pub struct SelectionInput {
     pub last_move_pos: Option<Point>,
+    /// The pointer left the viewport (or an overlay above it took the
+    /// pointer). `last_move_pos` is kept for keyboard-driven input, but the
+    /// cursor glyphs are not drawn at that stale spot.
+    pub pointer_away: bool,
     pub left_down: bool,
     pub left_press_pos: Option<Point>,
     pub left_press_time: Option<Instant>,

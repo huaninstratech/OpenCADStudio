@@ -400,6 +400,53 @@ pub fn click_hit<'a, W: WireSource + ?Sized>(
         return Some(n);
     }
 
+    // SDF text renders as glyph quads, not strokes. Test those exact quads:
+    // block expansion may batch distant same-style text runs into one wire,
+    // whose union AABB includes empty space between them (#438). Real edges
+    // and fills above win; the area-only surfaces below (a paper viewport's
+    // interior, a wide band) must not swallow text drawn over them (#1889).
+    let mut best_area = f32::MAX;
+    let mut best_box: Option<&str> = None;
+    if let Some(glyphs) = wires.glyphs() {
+        for glyph in glyphs {
+            let Some(wire) = wires.source_wire(glyph.wire) else {
+                continue;
+            };
+            if wire.snap_only || wire.reference_only {
+                continue;
+            }
+            let start = glyph.start as usize;
+            let Some(vertices) = wire.text_verts.get(start..start + 6) else {
+                continue;
+            };
+            if let Some(area) = text_quad_hit_area(cursor, vertices, view_rot, eye, bounds) {
+                if area < best_area {
+                    best_area = area;
+                    best_box = Some(wire.name.as_str());
+                }
+            }
+        }
+    } else {
+        for wire in wires.iter() {
+            if wire.snap_only || wire.reference_only {
+                continue;
+            }
+            if wire.text_verts.is_empty() {
+                continue;
+            }
+            if let Some(area) = text_quad_hit_area(cursor, &wire.text_verts, view_rot, eye, bounds)
+            {
+                if area < best_area {
+                    best_area = area;
+                    best_box = Some(wire.name.as_str());
+                }
+            }
+        }
+    }
+    if best_box.is_some() {
+        return best_box;
+    }
+
     // No fill of this wire's own either. `pick_tris` closes the surfaces that
     // `points` only bounds: a thickness wall (drawn as four edges with nothing
     // between them) and a wide polyline's band (drawn, but by the hatch
@@ -463,53 +510,7 @@ pub fn click_hit<'a, W: WireSource + ?Sized>(
             }
         }
     }
-    if let Some((_, n)) = best_wall {
-        return Some(n);
-    }
-
-    // SDF text renders as glyph quads, not strokes. Test those exact quads:
-    // block expansion may batch distant same-style text runs into one wire,
-    // whose union AABB includes empty space between them (#438). Lowest
-    // priority — real edges and fills above always win.
-    let mut best_area = f32::MAX;
-    let mut best_box: Option<&str> = None;
-    if let Some(glyphs) = wires.glyphs() {
-        for glyph in glyphs {
-            let Some(wire) = wires.source_wire(glyph.wire) else {
-                continue;
-            };
-            if wire.snap_only || wire.reference_only {
-                continue;
-            }
-            let start = glyph.start as usize;
-            let Some(vertices) = wire.text_verts.get(start..start + 6) else {
-                continue;
-            };
-            if let Some(area) = text_quad_hit_area(cursor, vertices, view_rot, eye, bounds) {
-                if area < best_area {
-                    best_area = area;
-                    best_box = Some(wire.name.as_str());
-                }
-            }
-        }
-    } else {
-        for wire in wires.iter() {
-            if wire.snap_only || wire.reference_only {
-                continue;
-            }
-            if wire.text_verts.is_empty() {
-                continue;
-            }
-            if let Some(area) = text_quad_hit_area(cursor, &wire.text_verts, view_rot, eye, bounds)
-            {
-                if area < best_area {
-                    best_area = area;
-                    best_box = Some(wire.name.as_str());
-                }
-            }
-        }
-    }
-    best_box
+    best_wall.map(|(_, n)| n)
 }
 
 /// Like `click_hit` but returns every wire within the click threshold,

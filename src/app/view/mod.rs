@@ -22,40 +22,91 @@ use iced_aw::ContextMenu;
 #[derive(Debug, Clone, Copy)]
 struct ViewportPickSurface;
 
+#[derive(Default)]
+struct ViewportPointerState {
+    middle_drag: bool,
+    position: Option<iced::Point>,
+}
+
+impl ViewportPointerState {
+    fn event_cursor(
+        &mut self,
+        event: &iced::mouse::Event,
+        fallback: iced::mouse::Cursor,
+    ) -> iced::mouse::Cursor {
+        // iced passes the final window cursor to every event in a batch.
+        // Preserve event order: a press must see the preceding CursorMoved,
+        // never the cursor from a later move in that same batch.
+        match event {
+            iced::mouse::Event::CursorMoved { position } => self.position = Some(*position),
+            iced::mouse::Event::CursorLeft => self.position = None,
+            _ => {}
+        }
+        // An overlay can deliberately hide/levitate the base cursor. Retain
+        // that ownership even though we know a historical pointer position.
+        if !matches!(fallback, iced::mouse::Cursor::Available(_)) {
+            return fallback;
+        }
+        self.position
+            .map(iced::mouse::Cursor::Available)
+            .unwrap_or(fallback)
+    }
+}
+
+/// Pane-local point of a lone finger driving the cursor. Touch events stay
+/// uncaptured: the gesture handler listens to them as well.
+fn touch_cursor_move(event: &iced::Event, bounds: iced::Rectangle) -> Option<iced::Point> {
+    use iced::touch::Event as Touch;
+    match event {
+        iced::Event::Touch(
+            Touch::FingerPressed { position, .. } | Touch::FingerMoved { position, .. },
+        ) if bounds.contains(*position) => Some(iced::Point::new(
+            position.x - bounds.x,
+            position.y - bounds.y,
+        )),
+        _ => None,
+    }
+}
+
 impl iced::widget::canvas::Program<Message> for ViewportPickSurface {
-    /// Whether a middle-button drag began inside the viewport.
-    type State = bool;
+    type State = ViewportPointerState;
 
     fn update(
         &self,
-        middle_drag: &mut Self::State,
+        state: &mut Self::State,
         event: &iced::Event,
         bounds: iced::Rectangle,
         cursor: iced::mouse::Cursor,
     ) -> Option<iced::widget::canvas::Action<Message>> {
         use iced::mouse::{Button, Event as Mouse};
         use iced::widget::canvas::Action;
+        if let Some(local) = touch_cursor_move(event, bounds) {
+            return Some(Action::publish(Message::ViewportMove(local)));
+        }
         let iced::Event::Mouse(event) = event else {
             return None;
         };
+        let cursor = state.event_cursor(event, cursor);
         match event {
             Mouse::ButtonPressed(Button::Left) => cursor.position_in(bounds).map(|position| {
                 Action::publish(Message::ViewportLeftPressAt(position)).and_capture()
             }),
             Mouse::ButtonPressed(Button::Middle) => {
-                *middle_drag = cursor.is_over(bounds);
+                state.middle_drag = cursor.is_over(bounds);
                 None
             }
-            // A pan or orbit keeps following the pointer past the viewport
-            // edge; the mouse area only reports it inside.
-            Mouse::CursorMoved { position } if *middle_drag && !cursor.is_over(bounds) => {
+            // Motion comes from the event, not the final batch cursor, so the
+            // MouseArea around this canvas reports no moves of its own. Left
+            // uncaptured so it still tracks hover for `on_exit`. A middle
+            // drag keeps following the pointer past the viewport edge.
+            Mouse::CursorMoved { position } if cursor.is_over(bounds) || state.middle_drag => {
                 Some(Action::publish(Message::ViewportMove(iced::Point::new(
                     position.x - bounds.x,
                     position.y - bounds.y,
                 ))))
             }
-            Mouse::ButtonReleased(Button::Middle) if *middle_drag => {
-                *middle_drag = false;
+            Mouse::ButtonReleased(Button::Middle) if state.middle_drag => {
+                state.middle_drag = false;
                 (!cursor.is_over(bounds)).then(|| Action::publish(Message::ViewportMiddleRelease))
             }
             _ => None,
@@ -79,32 +130,38 @@ impl iced::widget::canvas::Program<Message> for ViewportPickSurface {
 struct PaneDragSurface(usize);
 
 impl iced::widget::canvas::Program<Message> for PaneDragSurface {
-    /// Whether a middle-button drag began inside this pane.
-    type State = bool;
+    type State = ViewportPointerState;
 
     fn update(
         &self,
-        middle_drag: &mut Self::State,
+        state: &mut Self::State,
         event: &iced::Event,
         bounds: iced::Rectangle,
         cursor: iced::mouse::Cursor,
     ) -> Option<iced::widget::canvas::Action<Message>> {
         use iced::mouse::{Button, Event as Mouse};
         use iced::widget::canvas::Action;
+        if let Some(local) = touch_cursor_move(event, bounds) {
+            return Some(Action::publish(Message::PaneMove(self.0, local)));
+        }
         let iced::Event::Mouse(event) = event else {
             return None;
         };
+        let cursor = state.event_cursor(event, cursor);
         match event {
+            Mouse::ButtonPressed(Button::Left) => cursor.position_in(bounds).map(|position| {
+                Action::publish(Message::PanePressAt(self.0, position)).and_capture()
+            }),
             Mouse::ButtonPressed(Button::Middle) => {
-                *middle_drag = cursor.is_over(bounds);
+                state.middle_drag = cursor.is_over(bounds);
                 None
             }
-            Mouse::CursorMoved { position } if *middle_drag && !cursor.is_over(bounds) => {
+            Mouse::CursorMoved { position } if cursor.is_over(bounds) || state.middle_drag => {
                 let local = iced::Point::new(position.x - bounds.x, position.y - bounds.y);
                 Some(Action::publish(Message::PaneMove(self.0, local)))
             }
-            Mouse::ButtonReleased(Button::Middle) if *middle_drag => {
-                *middle_drag = false;
+            Mouse::ButtonReleased(Button::Middle) if state.middle_drag => {
+                state.middle_drag = false;
                 (!cursor.is_over(bounds))
                     .then(|| Action::publish(Message::PaneMiddleRelease(self.0)))
             }
@@ -164,6 +221,9 @@ fn ui_font_changes() -> Subscription<Message> {
 
 /// Background used by drafting overlays in model or paper space.
 fn crosshair_background(tab: &DocumentTab, is_paper: bool) -> [f32; 4] {
+    if tab.active_block_edit_session().is_some() {
+        return [0.62, 0.62, 0.62, 1.0];
+    }
     if !is_paper {
         return tab.scene.bg_color;
     }
@@ -431,7 +491,12 @@ impl OpenCADStudio {
         mark("viewport_3d");
         let viewport_3d: Element<'_, Message> = if self.layout_settling && !tab.is_start {
             // Omit the shader and drafting overlays for the notice frame.
-            let bg = crosshair_background(tab, is_paper);
+            let in_block_editor = tab.active_block_edit_session().is_some();
+            let bg = if in_block_editor {
+                [0.62, 0.62, 0.62, 1.0]
+            } else {
+                crosshair_background(tab, is_paper)
+            };
             let lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
             let ink = if lum > 0.5 {
                 Color::from_rgba(0.0, 0.0, 0.0, 0.55)
@@ -626,7 +691,12 @@ impl OpenCADStudio {
                 .collect();
             let params_ms = crate::perf::elapsed_ms(t_params);
             let t_bg = crate::perf::enabled().then(iced::time::Instant::now);
-            let bg = crosshair_background(tab, is_paper);
+            let in_block_editor = tab.active_block_edit_session().is_some();
+            let bg = if in_block_editor {
+                [0.62, 0.62, 0.62, 1.0]
+            } else {
+                crosshair_background(tab, is_paper)
+            };
             let bg_ms = crate::perf::elapsed_ms(t_bg);
             if views_ms + params_ms + bg_ms >= 1.0 {
                 crate::perf_record!(
@@ -636,8 +706,17 @@ bg={bg_ms:.1}ms n={view_count}"
             }
             let bg_lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
             let grid_style = crate::ui::overlay::GridStyle {
-                opacity: self.model_space.grid_opacity,
+                opacity: if in_block_editor {
+                    38
+                } else {
+                    self.model_space.grid_opacity
+                },
                 bg_luminance: bg_lum,
+                color: if in_block_editor {
+                    [0.27, 0.48, 0.91]
+                } else {
+                    [0.80, 0.80, 0.80]
+                },
                 axes: self.grid_axes,
             };
             crate::ui::overlay::grid_overlay(grid, grid_style)
@@ -756,11 +835,45 @@ bg={bg_ms:.1}ms n={view_count}"
                             is_hot,
                             is_hovered,
                             dir,
+                            is_plugin: false,
+                            is_authoring: crate::app::block_authoring_edit::is_editor_grip(grip_id),
+                            is_dynamic: crate::app::block_actions::is_test_grip(grip_id)
+                                || grip_id == crate::app::visibility::VIS_GRIP_ID,
                         }
                     })
                     .collect()
             } else {
                 vec![]
+            };
+            // API v11: plugin-declared custom grips render in the same overlay
+            // layer with a distinct accent (always-visible display state of a
+            // live declaring plugin; hover highlighting through the same
+            // pipeline; the dragged grip is hot). Culling is the per-tab
+            // uniform grid's view-rect query, not a scan of every grip.
+            #[cfg(not(target_arch = "wasm32"))]
+            let grips = {
+                let mut grips = grips;
+                if !tab.plugin_grips.is_empty() {
+                    for (candidate, screen) in self.plugin_grips_in_view(i) {
+                        grips.push(crate::ui::overlay::GripMarker {
+                            pos: screen,
+                            shape: candidate.shape,
+                            is_hot: tab.active_plugin_grip.as_ref().is_some_and(|active| {
+                                active.plugin == candidate.plugin
+                                    && active.grip_id == candidate.grip_id
+                            }),
+                            is_hovered: self.plugin_grip_hover.as_ref().is_some_and(|hover| {
+                                hover.plugin == candidate.plugin
+                                    && hover.grip_id == candidate.grip_id
+                            }),
+                            dir: None,
+                            is_plugin: true,
+                            is_authoring: false,
+                            is_dynamic: false,
+                        });
+                    }
+                }
+                grips
             };
             let control_polygon = tab.selected_handle.and_then(|handle| {
                 let spline = match tab.scene.document.get_entity(handle) {
@@ -810,71 +923,72 @@ bg={bg_ms:.1}ms n={view_count}"
             // Rotation-only projection (view_proj_rte): the icon shows axis
             // DIRECTIONS only, so the full view_proj's huge UTM translation would
             // cancel catastrophically in f32 and make the tripod jitter.
-            let ucs_icons: Vec<crate::ui::overlay::UcsIconParams> = if !self.show_ucs_icon {
-                vec![]
-            } else if let Some((vp_cam, full)) = tab.scene.viewport_edit_frame((vw, vh)) {
-                let (_, ux, uy, uz) = tab.ucs_xform().axes();
-                let origin_screen = self
-                    .ucs_icon_at_origin
-                    .then(|| {
-                        vp_cam
-                            .project(tab.ucs_origin_world(), full)
-                            .map(|p| iced::Point::new(full.x + p.x, full.y + p.y))
-                    })
-                    .flatten();
-                vec![crate::ui::overlay::UcsIconParams {
-                    view_proj: vp_cam.view_proj_rte(full),
-                    bounds: full,
-                    axes: (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()),
-                    origin_screen,
-                    hover: self.ucs_icon_hover,
-                    selected: self.ucs_icon_selected,
-                }]
-            } else if !is_paper {
-                // One icon per Model pane — each at its own UCS origin, projected
-                // through that pane's camera at its pane rect. Only the active
-                // pane carries the interactive hover / selected grips.
-                let (_, ux, uy, uz) = tab.ucs_xform().axes();
-                let origin_w = tab.ucs_origin_world();
-                let active = tab.scene.active_model_tile.get();
-                let live = tab.scene.camera.borrow().clone();
-                tab.scene
-                    .model_tiles
-                    .borrow()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        let b = iced::Rectangle {
-                            x: t.rect.x * vw,
-                            y: t.rect.y * vh,
-                            width: (t.rect.width * vw).max(1.0),
-                            height: (t.rect.height * vh).max(1.0),
-                        };
-                        let cam = if i == active {
-                            live.clone()
-                        } else {
-                            t.camera.clone()
-                        };
-                        let origin_screen = self
-                            .ucs_icon_at_origin
-                            .then(|| {
-                                cam.project(origin_w, b)
-                                    .map(|p| iced::Point::new(b.x + p.x, b.y + p.y))
-                            })
-                            .flatten();
-                        crate::ui::overlay::UcsIconParams {
-                            view_proj: cam.view_proj_rte(b),
-                            bounds: b,
-                            axes: (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()),
-                            origin_screen,
-                            hover: i == active && self.ucs_icon_hover,
-                            selected: i == active && self.ucs_icon_selected,
-                        }
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
+            let ucs_icons: Vec<crate::ui::overlay::UcsIconParams> =
+                if !self.show_ucs_icon || tab.active_block_edit_session().is_some() {
+                    vec![]
+                } else if let Some((vp_cam, full)) = tab.scene.viewport_edit_frame((vw, vh)) {
+                    let (_, ux, uy, uz) = tab.ucs_xform().axes();
+                    let origin_screen = self
+                        .ucs_icon_at_origin
+                        .then(|| {
+                            vp_cam
+                                .project(tab.ucs_origin_world(), full)
+                                .map(|p| iced::Point::new(full.x + p.x, full.y + p.y))
+                        })
+                        .flatten();
+                    vec![crate::ui::overlay::UcsIconParams {
+                        view_proj: vp_cam.view_proj_rte(full),
+                        bounds: full,
+                        axes: (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()),
+                        origin_screen,
+                        hover: self.ucs_icon_hover,
+                        selected: self.ucs_icon_selected,
+                    }]
+                } else if !is_paper {
+                    // One icon per Model pane — each at its own UCS origin, projected
+                    // through that pane's camera at its pane rect. Only the active
+                    // pane carries the interactive hover / selected grips.
+                    let (_, ux, uy, uz) = tab.ucs_xform().axes();
+                    let origin_w = tab.ucs_origin_world();
+                    let active = tab.scene.active_model_tile.get();
+                    let live = tab.scene.camera.borrow().clone();
+                    tab.scene
+                        .model_tiles
+                        .borrow()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let b = iced::Rectangle {
+                                x: t.rect.x * vw,
+                                y: t.rect.y * vh,
+                                width: (t.rect.width * vw).max(1.0),
+                                height: (t.rect.height * vh).max(1.0),
+                            };
+                            let cam = if i == active {
+                                live.clone()
+                            } else {
+                                t.camera.clone()
+                            };
+                            let origin_screen = self
+                                .ucs_icon_at_origin
+                                .then(|| {
+                                    cam.project(origin_w, b)
+                                        .map(|p| iced::Point::new(b.x + p.x, b.y + p.y))
+                                })
+                                .flatten();
+                            crate::ui::overlay::UcsIconParams {
+                                view_proj: cam.view_proj_rte(b),
+                                bounds: b,
+                                axes: (ux.as_vec3(), uy.as_vec3(), uz.as_vec3()),
+                                origin_screen,
+                                hover: i == active && self.ucs_icon_hover,
+                                selected: i == active && self.ucs_icon_selected,
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
 
             // OST tracking points → screen positions, projected relative-to-eye
             // so they stay precise at UTM-scale coordinates (the full
@@ -1109,8 +1223,14 @@ bg={bg_ms:.1}ms n={view_count}"
                 );
                 let point = tab.scene.camera.borrow().project(location, vp_bounds)?;
                 let point = iced::Point::new(vp_bounds.x + point.x, vp_bounds.y + point.y);
-                (point.x.is_finite() && point.y.is_finite())
-                    .then(|| (point, parameter.name.clone(), vp_bounds))
+                (point.x.is_finite() && point.y.is_finite()).then(|| {
+                    (
+                        point,
+                        parameter.name.clone(),
+                        vp_bounds,
+                        tab.selected_authoring == Some(parameter.handle),
+                    )
+                })
             });
             let authoring_points =
                 tab.active_block_edit_session()
@@ -1120,7 +1240,7 @@ bg={bg_ms:.1}ms n={view_count}"
                             session.br_handle,
                         )
                         .into_iter()
-                        .filter_map(|(_, parameter)| {
+                        .filter_map(|(handle, parameter)| {
                             let project = |point: codec::types::Vector3| {
                                 let point = tab.scene.camera.borrow().project(
                                     glam::DVec3::new(point.x, point.y, point.z),
@@ -1135,6 +1255,7 @@ bg={bg_ms:.1}ms n={view_count}"
                                 project(parameter.definition_label_point)?,
                                 parameter.position_name.clone(),
                                 vp_bounds,
+                                tab.selected_authoring == Some(handle),
                             ))
                         })
                         .collect()
@@ -1143,6 +1264,14 @@ bg={bg_ms:.1}ms n={view_count}"
             let authoring_dimensions = tab
                 .active_block_edit_session()
                 .map(|session| {
+                    let action_handles: std::collections::HashSet<_> =
+                        crate::scene::block_actions::actions(
+                            &tab.scene.document,
+                            session.br_handle,
+                        )
+                        .into_iter()
+                        .map(|(handle, _, _, _)| handle)
+                        .collect();
                     crate::scene::block_distance_parameter::parameters(
                         &tab.scene.document,
                         session.br_handle,
@@ -1150,6 +1279,7 @@ bg={bg_ms:.1}ms n={view_count}"
                     .iter()
                     .map(|p| {
                         (
+                            p.handle,
                             crate::scene::block_distance_parameter::graphic(p),
                             p.native.definition_base_point,
                         )
@@ -1162,6 +1292,7 @@ bg={bg_ms:.1}ms n={view_count}"
                         .iter()
                         .map(|p| {
                             (
+                                p.handle,
                                 crate::scene::block_orientation_parameter::graphic(p),
                                 crate::scene::block_orientation_parameter::marker_tail(p),
                             )
@@ -1172,10 +1303,29 @@ bg={bg_ms:.1}ms n={view_count}"
                             &tab.scene.document,
                             session.br_handle,
                         )
-                        .map(|(_, p)| {
+                        .map(|(handle, p)| (handle, p.parameter.definition_point))
+                        .or_else(|| {
+                            let name = tab
+                                .scene
+                                .document
+                                .block_records
+                                .iter()
+                                .find(|record| record.handle == session.br_handle)?
+                                .name
+                                .as_str();
+                            Some((
+                                session.br_handle,
+                                crate::scene::render_graph::block_base_point(
+                                    &tab.scene.document,
+                                    name,
+                                ),
+                            ))
+                        })
+                        .map(|(handle, point)| {
                             let mut g = crate::scene::block_distance_parameter::Graphic::default();
-                            g.base_grips.push(p.parameter.definition_point);
-                            (g, p.parameter.definition_point)
+                            g.base_grips.push(point);
+                            g.labels.push((point, "Basepoint".into()));
+                            (handle, g, point)
                         }),
                     )
                     .chain(
@@ -1184,12 +1334,12 @@ bg={bg_ms:.1}ms n={view_count}"
                             session.br_handle,
                         )
                         .into_iter()
-                        .map(|(_, p)| {
+                        .map(|(handle, p)| {
                             let mut g = crate::scene::block_distance_parameter::Graphic::default();
                             g.lookup_grips.push(p.parameter.definition_point);
                             g.labels
                                 .push((p.parameter.definition_point, p.lookup_name.clone()));
-                            (g, p.parameter.definition_point)
+                            (handle, g, p.parameter.definition_point)
                         }),
                     )
                     .chain(
@@ -1198,15 +1348,30 @@ bg={bg_ms:.1}ms n={view_count}"
                             session.br_handle,
                         )
                         .into_iter()
-                        .map(|(_, action, _, _)| {
+                        .map(|(handle, action, _, _)| {
                             let mut g = crate::scene::block_distance_parameter::Graphic::default();
-                            g.grips.push((action.display_location, false));
-                            g.labels
-                                .push((action.display_location, action.element.name.clone()));
-                            (g, action.display_location)
+                            let frame = crate::scene::block_actions::frame_outline(
+                                &tab.scene.document,
+                                handle,
+                            );
+                            g.lines.extend(
+                                frame
+                                    .iter()
+                                    .zip(frame.iter().cycle().skip(1))
+                                    .take(frame.len())
+                                    .map(|(a, b)| [*a, *b]),
+                            );
+                            if !self.block_editor_preferences.action_bars {
+                                g.grips.push((action.display_location, false));
+                                g.labels
+                                    .push((action.display_location, action.element.name.clone()));
+                            } else if tab.selected_authoring != Some(handle) {
+                                g.lines.clear();
+                            }
+                            (handle, g, action.display_location)
                         }),
                     )
-                    .filter_map(|(graphic, marker_tail)| {
+                    .filter_map(|(handle, graphic, marker_tail)| {
                         let project = |p: codec::types::Vector3| {
                             let p = tab
                                 .scene
@@ -1241,6 +1406,8 @@ bg={bg_ms:.1}ms n={view_count}"
                             })
                             .collect::<Option<Vec<_>>>()?;
                         Some(crate::ui::overlay::AuthoringDimension {
+                            selected: tab.selected_authoring == Some(handle),
+                            is_action: action_handles.contains(&handle),
                             lines,
                             base_grips: graphic
                                 .base_grips
@@ -1302,6 +1469,14 @@ bg={bg_ms:.1}ms n={view_count}"
                     iso_plane: self.iso_plane,
                     snap_angle_deg: self.snap_angle_deg,
                     pick_pending: self.pending_pick_label().is_some(),
+                    matchprop_source_pick: tab
+                        .active_cmd
+                        .as_ref()
+                        .is_some_and(|c| c.name() == "MATCHPROP" && c.needs_entity_pick()),
+                    matchprop_pickbox: tab
+                        .active_cmd
+                        .as_ref()
+                        .is_some_and(|c| c.name() == "MATCHPROP"),
                     // An infinite-line preview runs along the arms; drop them
                     // so the preview stays visible (#1437). A command asking
                     // for objects shows the pickbox alone, so picking reads
@@ -1329,6 +1504,7 @@ bg={bg_ms:.1}ms n={view_count}"
                     grip_color: self.model_space.grip_color,
                     grip_hot: self.model_space.grip_hot,
                     grip_hover: self.model_space.grip_hover,
+                    grip_dynamic: self.block_editor_preferences.dynamic_grip_color,
                 },
                 constraint_glyphs,
                 constraint_glyph_selected,
@@ -1338,6 +1514,12 @@ bg={bg_ms:.1}ms n={view_count}"
                 authoring_visibility,
                 authoring_points,
                 authoring_dimensions,
+                crate::ui::overlay::authoring::AuthoringVisualOptions::new(
+                    &self.block_editor_preferences,
+                    &tab.scene.document,
+                    crosshair_background(tab, is_paper),
+                ),
+                self.block_feedback(vp_bounds),
             )
         };
 
@@ -1347,7 +1529,7 @@ bg={bg_ms:.1}ms n={view_count}"
                 .width(Fill)
                 .height(Fill),
         ))
-        .on_move(Message::ViewportMove)
+        // Moves come from the canvas (mouse and touch) in event order.
         // Left mouse presses are captured by the canvas with their exact
         // event-time position. MouseArea::on_press has no coordinate, so
         // queued cursor moves could otherwise make quick clicks use a stale
@@ -1368,7 +1550,14 @@ bg={bg_ms:.1}ms n={view_count}"
             b: desk_bg[2],
             a: desk_bg[3],
         };
-        let bg_color = if is_paper {
+        let bg_color = if tab.active_block_edit_session().is_some() {
+            Color {
+                r: 0.62,
+                g: 0.62,
+                b: 0.62,
+                a: 1.0,
+            }
+        } else if is_paper {
             desk_color
         } else {
             let c = tab.scene.bg_color;
@@ -1899,6 +2088,38 @@ bg={bg_ms:.1}ms n={view_count}"
                 }
             }
 
+            let (vw, vh) = tab.scene.selection.borrow().view.vp_size;
+            let bar_bounds = tab.scene.active_model_tile_bounds(vw, vh);
+            let bar_color = crate::ui::overlay::authoring::AuthoringVisualOptions::new(
+                &self.block_editor_preferences,
+                &tab.scene.document,
+                crosshair_background(tab, is_paper),
+            )
+            .action;
+            for (group, point, offset, width) in self.action_bar_layout(bar_bounds) {
+                let bar = crate::ui::window::block_action_bars::view(
+                    group,
+                    tab.selected_authoring,
+                    offset,
+                    width,
+                    tab.active_cmd.is_none(),
+                    bar_color,
+                );
+                viewport_stack = viewport_stack.push(position_canvas_overlay(point, bar));
+            }
+            if let Some(hover) = self.grip_hover.as_ref().filter(|hover| {
+                hover.started.elapsed().as_millis() >= 500 && self.grip_popup.is_none()
+            }) {
+                if let Some(tip) = self.dynamic_grip_tip(hover.handle, hover.grip_id) {
+                    let panel = container(text(tip).size(12))
+                        .padding(6)
+                        .style(container::bordered_box);
+                    viewport_stack = viewport_stack.push(position_canvas_overlay(
+                        iced::Point::new(hover.screen.x + 12.0, hover.screen.y + 16.0),
+                        panel.into(),
+                    ));
+                }
+            }
             if let Some(popup) = self.grip_popup.as_ref() {
                 if !tab.is_start {
                     let labels: Vec<String> = popup
@@ -2031,6 +2252,34 @@ bg={bg_ms:.1}ms n={view_count}"
                                     ..Default::default()
                                 }
                             });
+                    let anchor = iced::Point::new(popup.anchor.x + 12.0, popup.anchor.y + 12.0);
+                    viewport_stack =
+                        viewport_stack.push(position_canvas_overlay(anchor, panel.into()));
+                }
+            }
+            if let Some(popup) = self.table_popup.as_ref() {
+                if !tab.is_start {
+                    let mut col = column![text(popup.header.clone()).size(12)].spacing(2);
+                    for (idx, name) in popup.rows.iter().enumerate() {
+                        let mark: Element<'_, Message> = if popup.current == Some(idx) {
+                            crate::ui::icons::themed_check_cell(true)
+                        } else {
+                            Space::new().width(11).into()
+                        };
+                        col = col.push(
+                            button(
+                                row![container(mark).width(16), text(name).size(12)]
+                                    .spacing(2)
+                                    .align_y(iced::Center),
+                            )
+                            .on_press(Message::TableRowPick(idx))
+                            .padding([3, 10])
+                            .width(Fill),
+                        );
+                    }
+                    let panel =
+                        container(iced::widget::scrollable(col).height(iced::Length::Shrink))
+                            .padding(2);
                     let anchor = iced::Point::new(popup.anchor.x + 12.0, popup.anchor.y + 12.0);
                     viewport_stack =
                         viewport_stack.push(position_canvas_overlay(anchor, panel.into()));
@@ -2432,9 +2681,10 @@ bg={bg_ms:.1}ms n={view_count}"
 
         let main_ui = container({
             // Clean-screen mode drops the ribbon for a full-canvas view; the
-            // status bar stays so the mode can be toggled back off.
+            // menu bar and status bar stay so commands remain reachable and
+            // the mode can be toggled back off.
             let mut col = column![];
-            if !self.clean_screen && self.show_menu_bar {
+            if self.show_menu_bar {
                 col = col.push(crate::ui::menu_bar::view());
             }
             if !self.clean_screen && !self.ribbon_closed {
@@ -2525,42 +2775,49 @@ bg={bg_ms:.1}ms n={view_count}"
                     };
                     self.status_bar.view(
                         &self.snapper,
-                        self.ortho_mode,
-                        self.polar_mode,
-                        self.polar_increment_deg,
-                        self.dyn_input,
-                        self.snapper.otrack_enabled,
-                        self.isometric_drafting,
-                        self.iso_plane,
-                        layout_names,
-                        block_tabs,
-                        &tab.scene.current_layout,
-                        active_block,
-                        tab.is_start,
-                        self.layout_rename_state.as_ref(),
-                        tab.scene.first_viewport_scale(),
-                        tab.scene.viewport_count(),
-                        tab.scene.active_viewport.is_some(),
-                        self.show_layout_tabs,
-                        tab.scene.annotation_scale,
+                        crate::ui::statusbar::StatusBarLayoutState {
+                            layouts: layout_names,
+                            block_tabs,
+                            current_layout: &tab.scene.current_layout,
+                            active_block,
+                            is_start: tab.is_start,
+                            rename_state: self.layout_rename_state.as_ref(),
+                            viewport_scale: tab.scene.first_viewport_scale(),
+                            viewport_count: tab.scene.viewport_count(),
+                            in_mspace: tab.scene.active_viewport.is_some(),
+                            show_layout_tabs: self.show_layout_tabs,
+                            annotation_scale: tab.scene.annotation_scale,
+                            scale_pill_enabled,
+                            annotation_all_visible: tab.scene.annotation_all_visible(),
+                            annotation_auto_add: self.annotation_auto_scale > 0,
+                            viewport_scale_synced: tab.scene.viewport_annotation_scale_synced(),
+                            viewport_locked: tab.scene.viewports_display_locked(),
+                            lineweight_display: tab.scene.document.header.lineweight_display,
+                        },
+                        crate::ui::statusbar::StatusBarModes {
+                            ortho_mode: self.ortho_mode,
+                            polar_mode: self.polar_mode,
+                            polar_increment_deg: self.polar_increment_deg,
+                            dyn_input: self.dyn_input,
+                            otrack: self.snapper.otrack_enabled,
+                            isometric_drafting: self.isometric_drafting,
+                            iso_plane: self.iso_plane,
+                            clean_screen: self.clean_screen,
+                            linear_format: tab.scene.document.header.linear_unit_format,
+                            isolation_active: tab.scene.is_isolation_active(),
+                            transparency_display: tab.scene.transparency_display,
+                            quick_properties: self.quick_properties,
+                            selection_filter_active: tab.scene.selection_filter_active(),
+                            selection_cycling: self.selection_cycling,
+                        },
+                        crate::ui::statusbar::StatusBarReadout {
+                            cursor_world: cursor_coord,
+                            coords_mode,
+                            last_point: last_coord,
+                            picking,
+                        },
                         self.ifc_select_level,
-                        scale_pill_enabled,
-                        tab.scene.annotation_all_visible(),
-                        self.annotation_auto_scale > 0,
                         self.annotation_scale_modelspace,
-                        tab.scene.viewport_annotation_scale_synced(),
-                        tab.scene.document.header.lineweight_display,
-                        cursor_coord,
-                        coords_mode,
-                        last_coord,
-                        picking,
-                        self.clean_screen,
-                        tab.scene.document.header.linear_unit_format,
-                        tab.scene.is_isolation_active(),
-                        tab.scene.transparency_display,
-                        self.quick_properties,
-                        tab.scene.selection_filter_active(),
-                        self.selection_cycling,
                         &self.statusbar_config,
                         status_menu_data,
                         tab.scene
@@ -2830,6 +3087,15 @@ impl OpenCADStudio {
         // this `ViewportMove` alone never re-fires once the user stops.
         let hover_dwell = if self.hover_dwell.is_some() {
             window::frames().map(|_| Message::HoverDwellTick)
+        } else {
+            Subscription::none()
+        };
+        let snap_dwell = if self
+            .snap_dwell
+            .as_ref()
+            .is_some_and(|dwell| !dwell.snap_resolved || dwell.preview_dirty)
+        {
+            window::frames().map(|_| Message::SnapDwellTick)
         } else {
             Subscription::none()
         };
@@ -3163,6 +3429,7 @@ impl OpenCADStudio {
             layout_settle,
             grip_dwell,
             hover_dwell,
+            snap_dwell,
             nav_settle,
             gpu_probe,
             thumbnail_capture,
@@ -3506,7 +3773,6 @@ fn pane_mouse_area<'a>(idx: usize) -> Element<'a, Message> {
             .width(Fill)
             .height(Fill),
     ))
-    .on_move(move |p| Message::PaneMove(idx, p))
     .on_press(Message::PanePress(idx))
     .on_release(Message::PaneRelease(idx))
     .on_right_press(Message::PaneRightPress(idx))
@@ -4474,6 +4740,65 @@ pub(super) fn recent_files_panel<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rapid_drawing_batched_pointer_events_keep_the_position_before_each_press() {
+        use iced::mouse::{Button, Cursor, Event as Mouse};
+        use iced::widget::canvas::Program;
+        let bounds = iced::Rectangle {
+            x: 100.0,
+            y: 50.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        // iced supplies this final position for EVERY event in the batch.
+        let final_cursor = Cursor::Available(iced::Point::new(800.0, 500.0));
+        let mut viewport = ViewportPointerState::default();
+        let mut pane = ViewportPointerState::default();
+        for position in [
+            iced::Point::new(150.0, 100.0),
+            iced::Point::new(250.0, 200.0),
+        ] {
+            let event = iced::Event::Mouse(Mouse::CursorMoved { position });
+            let expected = iced::Point::new(position.x - bounds.x, position.y - bounds.y);
+            let (motion, _, _) = ViewportPickSurface
+                .update(&mut viewport, &event, bounds, final_cursor)
+                .unwrap()
+                .into_inner();
+            assert!(matches!(motion, Some(Message::ViewportMove(p)) if p == expected));
+            let (motion, _, _) = PaneDragSurface(2)
+                .update(&mut pane, &event, bounds, final_cursor)
+                .unwrap()
+                .into_inner();
+            assert!(matches!(motion, Some(Message::PaneMove(2, p)) if p == expected));
+            let press = iced::Event::Mouse(Mouse::ButtonPressed(Button::Left));
+            let (pick, _, status) = ViewportPickSurface
+                .update(&mut viewport, &press, bounds, final_cursor)
+                .unwrap()
+                .into_inner();
+            assert!(matches!(pick, Some(Message::ViewportLeftPressAt(p)) if p == expected));
+            assert_eq!(status, iced::event::Status::Captured);
+            let (pick, _, status) = PaneDragSurface(2)
+                .update(&mut pane, &press, bounds, final_cursor)
+                .unwrap()
+                .into_inner();
+            assert!(matches!(pick, Some(Message::PanePressAt(2, p)) if p == expected));
+            assert_eq!(status, iced::event::Status::Captured);
+        }
+        // Menus above the viewport must still suppress underlying picks.
+        let press = iced::Event::Mouse(Mouse::ButtonPressed(Button::Left));
+        for hidden in [
+            Cursor::Unavailable,
+            Cursor::Levitating(iced::Point::new(250.0, 200.0)),
+        ] {
+            assert!(ViewportPickSurface
+                .update(&mut viewport, &press, bounds, hidden)
+                .is_none());
+            assert!(PaneDragSurface(2)
+                .update(&mut pane, &press, bounds, hidden)
+                .is_none());
+        }
+    }
 
     #[test]
     fn test_crosshair_background_paper_space() {

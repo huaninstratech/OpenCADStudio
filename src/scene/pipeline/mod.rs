@@ -120,6 +120,9 @@ pub struct Pipeline {
     /// Same shader as wire_pipeline but depth_compare=Greater, depth_write_enabled=false.
     /// Used to draw ghost copies of selected wires through occluding geometry.
     wire_xray_pipeline: wgpu::RenderPipeline,
+    /// Sample-count-one preview pipeline composited after the cached scene blit.
+    wire_preview_overlay_pipeline: wgpu::RenderPipeline,
+    pub(in crate::scene) preview_overlay_direct: bool,
     circle_xray_pipeline: wgpu::RenderPipeline,
     ellipse_xray_pipeline: wgpu::RenderPipeline,
     block_wire_xray_pipeline: wgpu::RenderPipeline,
@@ -225,7 +228,7 @@ pub struct Pipeline {
     /// overlay — so its glyphs ride here, re-uploaded every frame like
     /// `gpu_preview_wires`, or the dragged text vanishes until release re-tesses
     /// it back into the base set (issue #316).
-    text_preview_gpu: Vec<text_gpu::TextGpu>,
+    pub(in crate::scene) text_preview_gpu: Vec<text_gpu::TextGpu>,
     /// Per-frame silhouette line lists from the kernel mesh and current view.
     silhouette_chunks: Vec<SilhouetteChunk>,
     silhouette_source_key: (usize, usize, u64),
@@ -311,9 +314,11 @@ pub struct Pipeline {
     /// Command-preview / interim / grip-drag overlay wires. Re-uploaded every
     /// frame they are present (small), drawn on top of the base wire pass — so
     /// a live drag never re-uploads the resident base buffer.
-    gpu_preview_wires: Vec<WireGpu>,
-    gpu_preview_circles: Vec<CircleGpu>,
-    gpu_preview_ellipses: Vec<EllipseGpu>,
+    pub(in crate::scene) gpu_preview_wires: Vec<WireGpu>,
+    /// Instanced geometry from INSERT previews must use its block GPU pipeline.
+    pub(in crate::scene) gpu_preview_block_wires: Vec<BlockWireGpu>,
+    pub(in crate::scene) gpu_preview_circles: Vec<CircleGpu>,
+    pub(in crate::scene) gpu_preview_ellipses: Vec<EllipseGpu>,
     /// Wipeout masks — solid fills rendered after wires in a separate pass via
     /// the legacy per-primitive `WipeoutGpu` renderer.
     gpu_wipeouts: Vec<WipeoutGpu>,
@@ -948,6 +953,36 @@ impl Pipeline {
             multiview_mask: None,
             cache: None,
         });
+        let wire_preview_overlay_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wire_preview_overlay.pipeline"),
+                layout: Some(&wire_layout),
+                vertex: wgpu::VertexState {
+                    module: &wire_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wire_mode.layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &wire_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
         let block_wire_buffers: &[wgpu::VertexBufferLayout<'_>] = if wire_mode.uses_storage() {
             &[wire_gpu::BlockWireInstance::layout()]
         } else {
@@ -2365,6 +2400,8 @@ impl Pipeline {
             wire_black_pipeline,
             block_wire_black_pipeline,
             wire_xray_pipeline,
+            wire_preview_overlay_pipeline,
+            preview_overlay_direct: false,
             circle_pipeline,
             circle_xray_pipeline,
             ellipse_pipeline,
@@ -2467,6 +2504,7 @@ impl Pipeline {
             gpu_selected_ellipses: vec![],
             gpu_selected_block_wires: vec![],
             gpu_preview_wires: vec![],
+            gpu_preview_block_wires: vec![],
             gpu_preview_circles: vec![],
             gpu_preview_ellipses: vec![],
             gpu_wipeouts: vec![],
@@ -3120,6 +3158,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
     ) {
         if wires.is_empty() {
             self.gpu_preview_wires.clear();
+            self.gpu_preview_block_wires.clear();
             self.gpu_preview_circles.clear();
             self.gpu_preview_ellipses.clear();
         } else {
@@ -3138,6 +3177,20 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                     self.wire_const_bgl.as_ref(),
                 )
             };
+            // The preview partitioner takes nested/block wires out of the
+            // ordinary buffer. Keep that geometry when STRETCH hides its source.
+            self.gpu_preview_block_wires = BlockWireGpu::from_wires(
+                device,
+                queue,
+                &partitioned.instanced,
+                depth_map,
+                None,
+                wire_gpu::BlockWireTarget {
+                    const_bgl: &self.block_wire_const_bgl,
+                    mode: self.block_wire_mode,
+                },
+                None,
+            );
             self.gpu_preview_circles = if partitioned.circle_instances.is_empty() {
                 vec![]
             } else {
@@ -3856,7 +3909,15 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         queue: &wgpu::Queue,
         hatches: &[HatchModel],
     ) {
+        let perf_started = crate::perf::enabled().then(iced::time::Instant::now);
         self.hatch_gpu.upload_preview(device, queue, hatches);
+        let elapsed_ms = crate::perf::elapsed_ms(perf_started);
+        if elapsed_ms >= 1.0 {
+            crate::perf_record!(
+                "[perf] hatch-preview-upload {elapsed_ms:.1}ms models={}",
+                hatches.len(),
+            );
+        }
     }
 
     pub fn upload_wipeouts(
@@ -4993,6 +5054,10 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 .iter()
                 .any(|wire| wire.instance_count > 0)
                 || self
+                    .gpu_preview_block_wires
+                    .iter()
+                    .any(|wire| wire.instance_count > 0)
+                || self
                     .gpu_preview_circles
                     .iter()
                     .any(|circle| circle.instance_count > 0)
@@ -5002,7 +5067,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                     .any(|ellipse| ellipse.instance_count > 0)
                 || !self.text_preview_gpu.is_empty();
 
-            if have_preview_overlay {
+            if have_preview_overlay && !self.preview_overlay_direct {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("preview_overlay.render_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5052,6 +5117,19 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                             0..6,
                             wire.first_instance..wire.first_instance + wire.instance_count,
                         );
+                    }
+                }
+
+                if self
+                    .gpu_preview_block_wires
+                    .iter()
+                    .any(|wire| wire.instance_count > 0)
+                {
+                    pass.set_pipeline(&self.block_wire_xray_pipeline);
+                    for wire in &self.gpu_preview_block_wires {
+                        if wire.instance_count > 0 {
+                            bind_and_draw_block_wire(&mut pass, wire);
+                        }
                     }
                 }
 
@@ -5289,6 +5367,57 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             pass.set_bind_group(0, &self.blit_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
+
+        // Simple line-command previews live above the cached base scene. The
+        // resolve texture therefore stays clean, and moving an endpoint only
+        // redraws these few instances plus the viewport blit.
+        if self.preview_overlay_direct && surface_dest.width > 0 && surface_dest.height > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview_wire_overlay.render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(
+                surface_dest.x as f32,
+                surface_dest.y as f32,
+                surface_dest.width as f32,
+                surface_dest.height as f32,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(
+                surface_clip.x,
+                surface_clip.y,
+                surface_clip.width,
+                surface_clip.height,
+            );
+            pass.set_pipeline(&self.wire_preview_overlay_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for wire in &self.gpu_preview_wires {
+                if wire.instance_count == 0 {
+                    continue;
+                }
+                if let Some(bg) = &wire.const_bind_group {
+                    pass.set_bind_group(1, bg.as_ref(), &[]);
+                }
+                pass.set_vertex_buffer(0, wire.instance_buffer.slice(..));
+                pass.draw(
+                    0..6,
+                    wire.first_instance..wire.first_instance + wire.instance_count,
+                );
+            }
+        }
     }
 
     /// Reset every cache key that describes this slot's uploaded content.
@@ -5372,6 +5501,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.gpu_selected_circles.clear();
         self.gpu_selected_ellipses.clear();
         self.gpu_preview_wires.clear();
+        self.gpu_preview_block_wires.clear();
         self.gpu_preview_circles.clear();
         self.gpu_preview_ellipses.clear();
         self.hatch_gpu.clear();

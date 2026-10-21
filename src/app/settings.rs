@@ -201,7 +201,7 @@ pub fn clamp_right_click_hold_ms(v: i32) -> i32 {
 /// else's to read.
 pub const ZOOM_FACTOR_MIN: i32 = 3;
 pub const ZOOM_FACTOR_SYSVAR_MAX: i32 = 100;
-pub const ZOOM_FACTOR_MAX: i32 = 500;
+pub const ZOOM_FACTOR_MAX: i32 = 200;
 
 /// Hold a ZOOMFACTOR inside the range the application can store, wherever it
 /// arrives from — the slider, the Options field, or a configuration file
@@ -215,11 +215,11 @@ pub fn clamp_zoom_factor(v: i32) -> i32 {
     v.clamp(ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX)
 }
 
-/// The `Camera::zoom` step one wheel notch means at `factor`. The default 60
-/// is one whole step, which is what makes 60 the setting that leaves the
-/// camera's own `ZOOM_STEP` untouched.
+/// The `Camera::zoom` step one wheel notch means at `factor`. Every 24 is one
+/// camera step, so the default 60 brings the view about a quarter nearer a
+/// notch and the system variable's top, 100, about a third (#1397).
 pub fn zoom_notch_steps(factor: i32) -> f32 {
-    factor as f32 / 60.0
+    factor as f32 / 24.0
 }
 
 /// How much nearer one wheel notch brings the view at `factor`, as a
@@ -434,9 +434,142 @@ pub const MAX_SELECTED_GRIPS: usize = 4096;
 /// The "settings" section of the consolidated config ([`crate::app::config`]).
 /// Field defaults mirror the app's in-code defaults so a missing key restores
 /// the value the app boots with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlockEditorPreferences {
+    pub locked: bool,
+    pub action_color: String,
+    pub parameter_color: String,
+    pub grip_color: String,
+    pub grip_size: u8,
+    pub parameter_size: u8,
+    pub parameter_font: String,
+    pub text_horizontal: bool,
+    pub dependency_highlight: bool,
+    pub value_markers: bool,
+    pub dynamic_grip_color: u8,
+    pub grip_tips: bool,
+    pub action_bars: bool,
+}
+
+impl Default for BlockEditorPreferences {
+    fn default() -> Self {
+        Self {
+            locked: false,
+            action_color: "7".into(),
+            parameter_color: "170".into(),
+            grip_color: "141".into(),
+            grip_size: 8,
+            parameter_size: 12,
+            parameter_font: "Simplex.shx".into(),
+            text_horizontal: true,
+            dependency_highlight: true,
+            value_markers: true,
+            dynamic_grip_color: 140,
+            grip_tips: true,
+            action_bars: true,
+        }
+    }
+}
+
+pub const BLOCK_DISPLAY_VARIABLES: &[(&str, &str)] = &[
+    ("BACTIONCOLOR", "Action color"),
+    ("BPARAMETERCOLOR", "Parameter color"),
+    ("BGRIPOBJCOLOR", "Grip color"),
+    ("BGRIPOBJSIZE", "Grip size (pixels)"),
+    ("BPARAMETERSIZE", "Parameter text size (pixels)"),
+    ("BPARAMETERFONT", "Parameter font"),
+    ("BPTEXTHORIZONTAL", "Keep parameter text horizontal"),
+    ("BDEPENDENCYHIGHLIGHT", "Highlight dependent geometry"),
+    ("BTMARKDISPLAY", "Show value-set markers"),
+    ("GRIPDYNCOLOR", "Dynamic grip color (index)"),
+    ("GRIPTIPS", "Show grip tips"),
+    ("BACTIONBARMODE", "Display actions in bars"),
+];
+
+impl BlockEditorPreferences {
+    pub(crate) fn display_variable(&self, name: &str) -> Option<String> {
+        Some(match name {
+            "BACTIONCOLOR" => self.action_color.clone(),
+            "BPARAMETERCOLOR" => self.parameter_color.clone(),
+            "BGRIPOBJCOLOR" => self.grip_color.clone(),
+            "BGRIPOBJSIZE" => self.grip_size.to_string(),
+            "BPARAMETERSIZE" => self.parameter_size.to_string(),
+            "BPARAMETERFONT" => self.parameter_font.clone(),
+            "BPTEXTHORIZONTAL" => u8::from(self.text_horizontal).to_string(),
+            "BDEPENDENCYHIGHLIGHT" => u8::from(self.dependency_highlight).to_string(),
+            "BTMARKDISPLAY" => u8::from(self.value_markers).to_string(),
+            "GRIPDYNCOLOR" => self.dynamic_grip_color.to_string(),
+            "GRIPTIPS" => u8::from(self.grip_tips).to_string(),
+            "BACTIONBARMODE" => u8::from(self.action_bars).to_string(),
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn set_display_variable(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), &'static str> {
+        match name {
+            "BACTIONCOLOR" | "BPARAMETERCOLOR" | "BGRIPOBJCOLOR" => {
+                let value = crate::ui::overlay::authoring::normalize_color(value)
+                    .ok_or("Use BYLAYER, BYBLOCK, an index from 1 to 255, or RGB:r,g,b.")?;
+                match name {
+                    "BACTIONCOLOR" => self.action_color = value,
+                    "BPARAMETERCOLOR" => self.parameter_color = value,
+                    _ => self.grip_color = value,
+                }
+            }
+            "BGRIPOBJSIZE" | "BPARAMETERSIZE" | "GRIPDYNCOLOR" => {
+                let value = value
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or("Enter an integer from 1 to 255.")?;
+                if name == "GRIPDYNCOLOR" {
+                    self.dynamic_grip_color = value;
+                } else if name == "BGRIPOBJSIZE" {
+                    self.grip_size = value;
+                } else {
+                    self.parameter_size = value;
+                }
+            }
+            "BPARAMETERFONT" => {
+                let value = value.trim().trim_matches('"');
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    return Err("Enter a font family, font file, or primary,bigfont pair.");
+                }
+                self.parameter_font = value.to_owned();
+            }
+            "BPTEXTHORIZONTAL"
+            | "BDEPENDENCYHIGHLIGHT"
+            | "BTMARKDISPLAY"
+            | "GRIPTIPS"
+            | "BACTIONBARMODE" => {
+                let value = match value {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("Enter 0 or 1."),
+                };
+                match name {
+                    "BPTEXTHORIZONTAL" => self.text_horizontal = value,
+                    "BDEPENDENCYHIGHLIGHT" => self.dependency_highlight = value,
+                    "BTMARKDISPLAY" => self.value_markers = value,
+                    "GRIPTIPS" => self.grip_tips = value,
+                    _ => self.action_bars = value,
+                }
+            }
+            _ => return Err("Unknown display variable."),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
+    pub block_editor: BlockEditorPreferences,
     pub spacemouse: crate::input::spacemouse::Preferences,
     pub dyn_input: bool,
     pub dyn_mode: i16,
@@ -457,6 +590,8 @@ pub struct UserSettings {
     pub cursor_size: i32,
     /// PICKBOX: normalized visible-box and click-aperture size.
     pub pick_box: i32,
+    /// APERTURE: object-snap capture radius in screen pixels.
+    pub aperture: f32,
     /// HPASSOC: new hatches follow their boundary objects.
     pub hatch_associative: bool,
     /// MENUBAR: the classic pull-down menus show above the ribbon.
@@ -953,6 +1088,7 @@ pub fn clamp_clipromptlines(v: i32) -> i32 {
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
+            block_editor: BlockEditorPreferences::default(),
             spacemouse: crate::input::spacemouse::Preferences::default(),
             dyn_input: true,
             dyn_mode: 3,
@@ -966,6 +1102,7 @@ impl Default for UserSettings {
             zoom_factor: 60,
             cursor_size: 5,
             pick_box: 3,
+            aperture: crate::snap::DEFAULT_OSNAP_RADIUS_PX,
             hatch_associative: true,
             show_menu_bar: false,
             ribbon_closed: false,
@@ -1083,12 +1220,13 @@ mod tests {
 
     /// The Options read-out has to say what a notch really does, or it is
     /// worse than no read-out. These are the percentages of the law in
-    /// `Camera::zoom`, which is where the number comes from: the default a
-    /// tenth of the distance, the top of the system variable's range a
-    /// sixth, and the top of the application's range a little over half.
+    /// `Camera::zoom`, which is where the number comes from: the default
+    /// close to a quarter of the distance, the top of the system variable's
+    /// range about a third, and the top of the application's range a little
+    /// over half.
     #[test]
     fn the_zoom_read_out_says_what_a_notch_does() {
-        for (factor, percent) in [(3, 0.53_f32), (60, 10.0), (100, 16.1), (500, 58.4)] {
+        for (factor, percent) in [(3, 1.31_f32), (60, 23.2), (100, 35.5), (200, 58.4)] {
             let shown = zoom_notch_percent(factor);
             assert!(
                 (shown - percent).abs() < 0.05,
@@ -1100,11 +1238,10 @@ mod tests {
         assert_eq!(zoom_notch_percent(0), zoom_notch_percent(ZOOM_FACTOR_MIN));
     }
 
-    /// The default is one whole step, which is the whole reason the camera's
-    /// base is the per-notch ratio and not something scaled.
+    /// The default stays 60, and 24 is one whole camera step.
     #[test]
     fn the_default_zoom_factor_is_one_step() {
-        assert_eq!(zoom_notch_steps(60), 1.0);
+        assert_eq!(zoom_notch_steps(24), 1.0);
         assert_eq!(UserSettings::default().zoom_factor, 60);
     }
 

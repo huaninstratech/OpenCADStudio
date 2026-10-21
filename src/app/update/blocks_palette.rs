@@ -306,6 +306,13 @@ impl OpenCADStudio {
             options.repeat = false;
         }
         let mut cmd = InsertBlockCommand::palette(name.to_string(), wires, &options);
+        if let Some(record) = self.tabs[i].scene.document.block_records.get(name) {
+            let doc = &self.tabs[i].scene.document;
+            cmd.set_insertion_points(
+                crate::scene::render_graph::block_base_point(doc, name),
+                crate::scene::block_grips::insertion_points(doc, record.handle),
+            );
+        }
         if let Some(point) = drop_at {
             cmd.set_point(point);
         }
@@ -696,6 +703,7 @@ impl OpenCADStudio {
         let mut user = Vec::new();
         let mut unnamed = 0;
         let mut units = rustc_hash::FxHashMap::default();
+        let mut insertion_points = rustc_hash::FxHashMap::default();
         for br in doc.block_records.iter() {
             if br.flags.is_xref
                 || br.name.eq_ignore_ascii_case("*Model_Space")
@@ -717,6 +725,13 @@ impl OpenCADStudio {
                 ),
             );
             user.push(br.name.clone());
+            insertion_points.insert(
+                br.name.to_ascii_uppercase(),
+                (
+                    crate::scene::render_graph::block_base_point(doc, &br.name),
+                    crate::scene::block_grips::insertion_points(doc, br.handle),
+                ),
+            );
         }
         user.sort_by_key(|n| n.to_ascii_uppercase());
         let search_path = std::env::current_dir()
@@ -727,6 +742,7 @@ impl OpenCADStudio {
             unnamed,
             units,
             search_path,
+            insertion_points,
         }
     }
 }

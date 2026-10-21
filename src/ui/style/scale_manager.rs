@@ -7,6 +7,7 @@
 
 use crate::app::Message;
 use crate::t;
+use crate::ui::style::form::field_style_with_radius;
 use crate::ui::style::style_manager::{hdivider, muted_text_style, tb_button, vsep};
 use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input, Space};
 use iced::{Background, Border, Element, Theme};
@@ -15,26 +16,6 @@ use std::borrow::Cow;
 /// Inline-rename text-input id, so the rename-start handler can focus it.
 pub fn rename_input_id() -> iced::widget::Id {
     iced::widget::Id::new("scale-rename-input")
-}
-
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    let border = match status {
-        text_input::Status::Focused { .. } => palette.primary.base.color,
-        _ => palette.background.neutral.color,
-    };
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
-    }
 }
 
 /// `scales` is (name, "paper:drawing" ratio label). The editor buffers hold the
@@ -154,7 +135,7 @@ pub fn view_window<'a, 'b>(
             text(label).size(11).style(muted_text_style).width(96),
             text_input(ph.as_ref(), value)
                 .on_input(on)
-                .style(field_style)
+                .style(|theme, status| field_style_with_radius(theme, status, 4.0))
                 .size(12)
                 .padding([5, 8])
                 .width(sizing.width),

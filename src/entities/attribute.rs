@@ -360,7 +360,13 @@ fn build_attr_layout(
             origin,
             color: None,
             fill_tris,
-            plane: None,
+            // An attribute out of the XY plane (a block aimed in 3D) lies in
+            // its own object coordinate plane.
+            plane: crate::scene::convert::acad_to_render::ocs_text_plane(
+                input.normal,
+                origin,
+                input.insertion_point.z,
+            ),
             // Carry a GlyphRun so the attribute renders as SDF glyph quads
             // (same as TEXT); the strokes above are the historical fallback and
             // are suppressed by the per-group SDF path.

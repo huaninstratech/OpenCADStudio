@@ -91,9 +91,9 @@ Aplikace je podepsána ad hoc, ale v současnosti není notářsky ověřena spo
 
 ## Jazyky
 
-Open CAD Studio může používat jazyk systému nebo jeden z těchto 22 jazyků rozhraní:
+Open CAD Studio může používat jazyk systému nebo jeden z těchto 23 jazyků rozhraní:
 
-> Arabština · Brazilská portugalština · Bulharština · Čeština · Nizozemština · Angličtina · Finština · Francouzština · Němčina · Řečtina · Hindština · Maďarština · Italština · Japonština · Korejština · Laoština · Polština · Ruština · Zjednodušená čínština · Španělština · Tradiční čínština · Turečtina
+> Arabština · Brazilská portugalština · Bulharština · Čeština · Nizozemština · Angličtina · Finština · Francouzština · Němčina · Řečtina · Hindština · Maďarština · Italština · Japonština · Korejština · Laoština · Polština · Ruština · Zjednodušená čínština · Španělština · Tradiční čínština · Turečtina · Vietnamština
 
 Jazyk změníte v nastavení aplikace. Pokud je vybrána možnost **Systém**, webová verze používá také preferované národní prostředí prohlížeče.
 

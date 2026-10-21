@@ -7,7 +7,7 @@
 //! Shape X → along the linetype direction; Shape Y → perpendicular in XZ.
 
 use crate::entities::text_support::resolve_dxf_special_chars;
-use crate::io::linetypes::{ComplexLt, LtSegment};
+use crate::io::linetypes::{ComplexLt, LtRotation, LtSegment};
 use crate::scene::model::wire_model::WireModel;
 use crate::scene::text::lff;
 
@@ -236,14 +236,25 @@ pub fn apply_along(
                     y,
                     scale: sh_scale,
                     rot_deg,
+                    rot_mode,
                 } => {
                     flush(&mut cur_stroke, &mut strokes);
 
                     let insert = lerp(ps, pe, pos / seg_len);
                     let insert = offset_pt(insert, fwd, perp, *x, *y);
-
+                    // Absolute shapes turn from the world X axis; upright ones
+                    // flip half a turn where they would read upside down.
+                    let (frame_fwd, frame_perp, rot) = match rot_mode {
+                        LtRotation::Absolute => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], *rot_deg),
+                        LtRotation::Upright
+                            if reads_upside_down(fwd[1].atan2(fwd[0]) + rot_deg.to_radians()) =>
+                        {
+                            (fwd, perp, *rot_deg + 180.0)
+                        }
+                        _ => (fwd, perp, *rot_deg),
+                    };
                     let shape_strokes = emit_shape(
-                        sh_name, shx_file, *number, insert, fwd, perp, *sh_scale, *rot_deg,
+                        sh_name, shx_file, *number, insert, frame_fwd, frame_perp, *sh_scale, rot,
                     );
                     strokes.extend(shape_strokes);
 
@@ -260,12 +271,22 @@ pub fn apply_along(
                     y,
                     scale: tx_scale,
                     rot_deg,
+                    rot_mode,
                 } => {
                     flush(&mut cur_stroke, &mut strokes);
 
                     let insert = lerp(ps, pe, pos / seg_len);
-                    let insert = offset_pt(insert, fwd, perp, *x, *y);
-                    let fwd_angle = fwd[1].atan2(fwd[0]) + rot_deg.to_radians();
+                    let mut insert = offset_pt(insert, fwd, perp, *x, *y);
+                    let mut fwd_angle = match rot_mode {
+                        LtRotation::Absolute => rot_deg.to_radians(),
+                        _ => fwd[1].atan2(fwd[0]) + rot_deg.to_radians(),
+                    };
+                    // Upright text that would read upside down turns half a
+                    // turn about the middle of its box, so it keeps its place.
+                    let flipped = *rot_mode == LtRotation::Upright && reads_upside_down(fwd_angle);
+                    if flipped {
+                        fwd_angle += std::f32::consts::PI;
+                    }
                     let resolved = resolve_dxf_special_chars(text);
                     // SDF: glyph quads at the insert point (rotation baked in by
                     // layout_glyph_quads), collected for the text wire.
@@ -278,6 +299,25 @@ pub fn apply_along(
                             // (every other text path passes 1.0).
                             1.0, style, false, &resolved,
                         );
+                        if flipped {
+                            // The half turn mirrors the glyphs' box through the
+                            // insert point; move it back by the box's centre
+                            // offset so it covers the unflipped box.
+                            let corners = quads.iter().flat_map(|q| q.corners);
+                            let (lo, hi) = corners.fold(
+                                ([f32::MAX; 2], [f32::MIN; 2]),
+                                |(lo, hi), [cx, cy]| {
+                                    (
+                                        [lo[0].min(cx), lo[1].min(cy)],
+                                        [hi[0].max(cx), hi[1].max(cy)],
+                                    )
+                                },
+                            );
+                            if lo[0] <= hi[0] {
+                                insert[0] -= lo[0] + hi[0];
+                                insert[1] -= lo[1] + hi[1];
+                            }
+                        }
                         crate::scene::pipeline::text_gpu::push_glyph_vertices(
                             &mut text_verts,
                             &quads,
@@ -430,6 +470,7 @@ enum LtSeg {
         y: f32,
         scale: f32,
         rot_deg: f32,
+        rot_mode: LtRotation,
     },
     Text {
         text: String,
@@ -438,6 +479,7 @@ enum LtSeg {
         y: f32,
         scale: f32,
         rot_deg: f32,
+        rot_mode: LtRotation,
     },
 }
 
@@ -455,6 +497,7 @@ fn scale_segments(segs: &[LtSegment], scale: f32) -> Vec<LtSeg> {
                 y,
                 scale: sh_scale,
                 rot_deg,
+                rot_mode,
             } => LtSeg::Shape {
                 name: name.clone(),
                 shx_file: shx_file.clone(),
@@ -463,6 +506,7 @@ fn scale_segments(segs: &[LtSegment], scale: f32) -> Vec<LtSeg> {
                 y: y * scale,
                 scale: *sh_scale * scale,
                 rot_deg: *rot_deg,
+                rot_mode: *rot_mode,
             },
             LtSegment::Text {
                 text,
@@ -471,6 +515,7 @@ fn scale_segments(segs: &[LtSegment], scale: f32) -> Vec<LtSeg> {
                 y,
                 scale: tx_scale,
                 rot_deg,
+                rot_mode,
             } => LtSeg::Text {
                 text: text.clone(),
                 style: style.clone(),
@@ -478,6 +523,7 @@ fn scale_segments(segs: &[LtSegment], scale: f32) -> Vec<LtSeg> {
                 y: y * scale,
                 scale: *tx_scale * scale,
                 rot_deg: *rot_deg,
+                rot_mode: *rot_mode,
             },
         })
         .collect()
@@ -579,4 +625,75 @@ fn emit_shape(
                 .collect()
         })
         .collect()
+}
+
+/// Whether text or a shape at `angle` (radians, from world X) reads upside
+/// down: it points into the left half-plane, or straight down.
+fn reads_upside_down(angle: f32) -> bool {
+    let (sin_a, cos_a) = angle.sin_cos();
+    cos_a < -1.0e-6 || (cos_a.abs() <= 1.0e-6 && sin_a < 0.0)
+}
+
+#[cfg(test)]
+mod upright_tests {
+    use super::apply_along;
+    use crate::io::linetypes::{ComplexLt, LtRotation, LtSegment};
+
+    /// Text vertices of one `GAS`-style repeat along `path`.
+    fn text_xs(path: [[f32; 3]; 2], rot_mode: LtRotation) -> Vec<[f32; 2]> {
+        let lt = ComplexLt {
+            segments: vec![
+                LtSegment::Dash(1.0),
+                LtSegment::Text {
+                    text: "GAS".into(),
+                    style: "txt".into(),
+                    x: -0.15,
+                    y: -0.05,
+                    scale: 0.1,
+                    rot_deg: 0.0,
+                    rot_mode,
+                },
+                LtSegment::Space(0.3),
+            ],
+        };
+        apply_along("GAS", &path, &lt, 1.0, [1.0; 4], false, 1.0, None)
+            .iter()
+            .flat_map(|wire| wire.text_verts.iter())
+            .map(|v| [v.pos[0] + v.pos_low[0], v.pos[1] + v.pos_low[1]])
+            .collect()
+    }
+
+    fn bounds(points: &[[f32; 2]]) -> [f32; 4] {
+        points
+            .iter()
+            .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
+                [
+                    b[0].min(p[0]),
+                    b[1].min(p[1]),
+                    b[2].max(p[0]),
+                    b[3].max(p[1]),
+                ]
+            })
+    }
+
+    #[test]
+    fn upright_text_on_a_leftward_line_reads_forward_in_the_same_box() {
+        let leftward = [[1.3, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let relative = text_xs(leftward, LtRotation::Relative);
+        let upright = text_xs(leftward, LtRotation::Upright);
+        assert!(!relative.is_empty() && relative.len() == upright.len());
+        let (a, b) = (bounds(&relative), bounds(&upright));
+        for (r, u) in a.iter().zip(b) {
+            assert!((r - u).abs() < 1.0e-3, "box moved: {a:?} vs {b:?}");
+        }
+        // Relative text runs right to left here; upright text left to right.
+        assert!(relative[0][0] > relative[relative.len() - 1][0]);
+        assert!(upright[0][0] < upright[upright.len() - 1][0]);
+        // A rightward line reads forward already and is left alone.
+        let rightward = [[0.0, 0.0, 0.0], [1.3, 0.0, 0.0]];
+        assert_eq!(
+            text_xs(rightward, LtRotation::Upright),
+            text_xs(rightward, LtRotation::Relative)
+        );
+    }
 }

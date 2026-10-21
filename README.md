@@ -143,9 +143,9 @@ The application is ad-hoc signed but is not currently notarized by Apple.
 
 ## Languages
 
-Open CAD Studio can follow the system language or use any of these 22 interface languages:
+Open CAD Studio can follow the system language or use any of these 23 interface languages:
 
-> Arabic · Brazilian Portuguese · Bulgarian · Czech · Dutch · English · Finnish · French · German · Greek · Hindi · Hungarian · Italian · Japanese · Korean · Lao · Polish · Russian · Simplified Chinese · Spanish · Traditional Chinese · Turkish
+> Arabic · Brazilian Portuguese · Bulgarian · Czech · Dutch · English · Finnish · French · German · Greek · Hindi · Hungarian · Italian · Japanese · Korean · Lao · Polish · Russian · Simplified Chinese · Spanish · Traditional Chinese · Turkish · Vietnamese
 
 Change the language from the application settings. The browser version also uses the browser's preferred locale when **System** is selected.
 

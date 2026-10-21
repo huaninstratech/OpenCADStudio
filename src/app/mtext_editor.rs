@@ -538,6 +538,30 @@ fn str_to_cells(
     cells
 }
 
+/// Replace each `%%d` / `%%p` / `%%c` that ends inside the freshly inserted
+/// `start..end` with its symbol (°, ±, ∅), as it is typed; returns the new end.
+/// The cells stay one per visible glyph, so the caret keeps matching the layout.
+fn fold_special_codes(cells: &mut Vec<Cell>, start: usize, mut end: usize) -> usize {
+    let mut i = start.saturating_sub(2);
+    while i + 3 <= end {
+        if let [Cell::Char('%', props), Cell::Char('%', _), Cell::Char(c, _)] = &cells[i..i + 3] {
+            let symbol = match c.to_ascii_lowercase() {
+                'd' => Some('°'),
+                'p' => Some('±'),
+                'c' => Some('∅'),
+                _ => None,
+            };
+            if let Some(symbol) = symbol {
+                let cell = Cell::Char(symbol, props.clone());
+                cells.splice(i..i + 3, [cell]);
+                end -= 2;
+            }
+        }
+        i += 1;
+    }
+    end
+}
+
 /// Properties newly-typed text at `caret` inherits — the cell to its left, or
 /// the default at the start of a paragraph / document.
 fn insert_props(cells: &[Cell], caret: usize) -> SpanProperties {
@@ -1401,7 +1425,7 @@ impl super::OpenCADStudio {
             let ins = str_to_cells(s, &props, &para_props);
             let added = ins.len();
             cells.splice(caret..caret, ins);
-            caret += added;
+            caret = fold_special_codes(&mut cells, caret, caret + added);
             ed.content =
                 text_editor::Content::with_text(&cells_to_doc(&para0, &cells).to_mtext_string());
             ed.caret = caret;
@@ -1940,6 +1964,28 @@ mod cell_tests {
                 "not idempotent for {s:?}: {once:?} vs {twice:?}"
             );
         }
+    }
+
+    #[test]
+    fn typed_percent_codes_fold_into_symbols() {
+        let props = SpanProperties::default();
+        let mut cells = str_to_cells("x%%c", &props, &ParagraphProperties::default());
+        let end = fold_special_codes(&mut cells, 3, 4);
+        assert_eq!(end, 2);
+        let text = |cells: &[Cell]| -> String {
+            cells
+                .iter()
+                .filter_map(|c| match c {
+                    Cell::Char(ch, _) => Some(*ch),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(text(&cells), "x∅");
+        let mut all = str_to_cells("%%D5 %%p1 %%x", &props, &ParagraphProperties::default());
+        let len = all.len();
+        fold_special_codes(&mut all, 0, len);
+        assert_eq!(text(&all), "°5 ±1 %%x");
     }
 
     #[test]

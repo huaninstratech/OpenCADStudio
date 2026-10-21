@@ -58,7 +58,7 @@ struct Font {
 
 /// A font's ascent, in metafile units, as the system lays the font out at
 /// its logical height: the baseline sits this far below a text's reference
-/// point. Without the system's font engine it is nine tenths of the height.
+/// point. Elsewhere it is read from the font file.
 #[cfg(target_os = "windows")]
 fn ascent(font: &Font) -> f64 {
     use windows_sys::Win32::Graphics::Gdi::{
@@ -98,9 +98,94 @@ fn ascent(font: &Font) -> f64 {
     }
 }
 
+/// A font's ascent from its file, as the system's font engine sets it: the
+/// font's own per-size maximum (its `VDMX` table, 1:1 aspect ratio) where
+/// it has one, otherwise the Windows ascent scaled to the size. A negative
+/// height is the em size; a positive one the cell height (ascent plus
+/// descent), the largest size that fits it.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn file_ascent(face: &ttf_parser::Face, height: f64) -> Option<f64> {
+    let upem = f64::from(face.units_per_em());
+    let os2 = face.tables().os2?;
+    let (win_ascent, win_descent) = (
+        f64::from(os2.windows_ascender()),
+        -f64::from(os2.windows_descender()),
+    );
+    let sizes = face
+        .raw_face()
+        .table(ttf_parser::Tag::from_bytes(b"VDMX"))
+        .map(vdmx_square)
+        .unwrap_or_default();
+    if height < 0.0 {
+        let ppem = height.abs().round();
+        return Some(match sizes.iter().find(|(p, ..)| f64::from(*p) == ppem) {
+            Some(&(_, max, _)) => f64::from(max),
+            None => (win_ascent * ppem / upem).round(),
+        });
+    }
+    let fitting = sizes
+        .iter()
+        .filter(|(_, max, min)| f64::from(*max) - f64::from(*min) <= height)
+        .max_by_key(|(p, ..)| *p);
+    Some(match fitting {
+        Some(&(_, max, _)) if !sizes.is_empty() => f64::from(max),
+        _ => (win_ascent * height / (win_ascent + win_descent)).round(),
+    })
+}
+
+/// The `(ppem, yMax, yMin)` records of a `VDMX` table's group for a 1:1 (or
+/// any) aspect ratio.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn vdmx_square(data: &[u8]) -> Vec<(u16, i16, i16)> {
+    let u16_at = |o: usize| data.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let (Some(_), Some(ratios)) = (u16_at(2), u16_at(4)) else {
+        return Vec::new();
+    };
+    let ratios = usize::from(ratios);
+    let pick = (0..ratios).find(|&r| {
+        let at = 6 + 4 * r;
+        matches!(
+            data.get(at..at + 4),
+            Some([_, 0, 0, 0]) | Some([_, 1, 1, 1])
+        )
+    });
+    let Some(group) = pick.and_then(|r| u16_at(6 + 4 * ratios + 2 * r)) else {
+        return Vec::new();
+    };
+    let group = usize::from(group);
+    let count = u16_at(group).map_or(0, usize::from);
+    (0..count)
+        .filter_map(|i| {
+            let at = group + 4 + 6 * i;
+            Some((u16_at(at)?, u16_at(at + 2)? as i16, u16_at(at + 4)? as i16))
+        })
+        .collect()
+}
+
 #[cfg(not(target_os = "windows"))]
 fn ascent(font: &Font) -> f64 {
-    0.9 * font.height.abs()
+    ascent_from_file(font)
+}
+
+/// [`file_ascent`] of the font's installed face.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn ascent_from_file(font: &Font) -> f64 {
+    let weight = fontdb::Weight(font.weight.clamp(1, 1000) as u16);
+    // A face that is not installed falls back to the usual sans faces.
+    [
+        font.face.as_str(),
+        "Arial",
+        "Liberation Sans",
+        "DejaVu Sans",
+    ]
+    .into_iter()
+    .find_map(|family| {
+        crate::scene::text::sysfont::with_face_data_weighted(family, weight, |data, index| {
+            file_ascent(&ttf_parser::Face::parse(data, index).ok()?, font.height)
+        })
+        .flatten()
+    })
+    .unwrap_or(0.9 * font.height.abs())
 }
 
 #[derive(Clone)]
@@ -200,50 +285,77 @@ const ARC_STEPS: i64 = 99;
 
 /// The angle of a radial point round an ellipse, in degrees in `(0, 360]`
 /// counter-clockwise in drawing orientation — or `None` for a point inside
-/// the ellipse, which marks no angle.
-fn radial_angle(bounds: [f64; 4], x: f64, y: f64) -> Option<f64> {
+/// the arc's outline (`grid`), which marks no angle.
+fn radial_angle(bounds: [f64; 4], grid: &[[f64; 2]], x: f64, y: f64) -> Option<f64> {
+    if inside_outline(grid, x, y) {
+        return None;
+    }
     let [left, top, right, bottom] = bounds;
     let (cx, cy) = (0.5 * (left + right), 0.5 * (top + bottom));
     let (rx, ry) = (0.5 * (right - left).abs(), 0.5 * (bottom - top).abs());
     let (u, v) = ((x - cx) / rx, -(y - cy) / ry);
-    if u.hypot(v) < 1.0 {
-        return None;
-    }
     let degrees = v.atan2(u).to_degrees().rem_euclid(360.0);
     Some(if degrees == 0.0 { 360.0 } else { degrees })
 }
 
+/// Whether a point lies strictly inside the closed polygon `outline`; a
+/// point on its boundary is outside.
+fn inside_outline(outline: &[[f64; 2]], x: f64, y: f64) -> bool {
+    let n = outline.len();
+    let mut inside = false;
+    for i in 0..n {
+        let ([xi, yi], [xj, yj]) = (outline[i], outline[(i + n - 1) % n]);
+        let cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+        if cross == 0.0
+            && (xi.min(xj)..=xi.max(xj)).contains(&x)
+            && (yi.min(yj)..=yi.max(yj)).contains(&y)
+        {
+            return false;
+        }
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 /// An arc's points: round the ellipse's whole-unit centre and radii at
-/// whole multiples of 1/99 turn, rounded
-/// down to whole units, from the start angle up to the end angle — past
+/// whole multiples of 1/99 turn, cut
+/// to whole units (toward zero), from the start angle up to the end angle — past
 /// 360 degrees back from zero when the end comes first. A start inside the
-/// ellipse starts at zero; an end inside it runs on to a whole turn; with
-/// both inside there is no arc.
+/// outline those whole-unit points make round the whole ellipse starts at
+/// zero; an end inside it runs on to a whole turn; with both inside there
+/// is no arc. A point on the outline is outside it.
 fn arc_points(bounds: [f64; 4], start: [f64; 2], end: [f64; 2]) -> Vec<[f64; 2]> {
     let [left, top, right, bottom] = bounds.map(|v| v as i64);
     let (cx, cy) = ((left + right).div_euclid(2), (top + bottom).div_euclid(2));
     let (rx, ry) = ((right - left).abs() / 2, (bottom - top).abs() / 2);
+    // The unit vectors are stepped out from zero by turning the last one
+    // through 1/99 turn in plain doubles, rounding and all, so the error
+    // grows from step to step as the points come out.
+    const STEP_COS: f64 = 0.99798667647188444; // cos(2π/99)
+    const STEP_SIN: f64 = 0.063423919656564506; // sin(2π/99)
+    let mut turns = vec![(1.0f64, 0.0f64); ARC_STEPS as usize + 1];
+    for k in 1..turns.len() {
+        let (c, s) = turns[k - 1];
+        turns[k] = (c * STEP_COS - s * STEP_SIN, s * STEP_COS + c * STEP_SIN);
+    }
+    let point = |k: i64| {
+        let (cos, sin) = turns[k as usize];
+        [
+            (cx as f64 + rx as f64 * cos).trunc(),
+            (cy as f64 - ry as f64 * sin).trunc(),
+        ]
+    };
+    let grid: Vec<[f64; 2]> = (0..ARC_STEPS).map(point).collect();
     let (from, to) = (
-        radial_angle(bounds, start[0], start[1]),
-        radial_angle(bounds, end[0], end[1]),
+        radial_angle(bounds, &grid, start[0], start[1]),
+        radial_angle(bounds, &grid, end[0], end[1]),
     );
     let (start_angle, end_angle) = match (from, to) {
         (None, None) => return Vec::new(),
         (None, to) => (0.0, to),
         (Some(from), to) => (from, to.filter(|to| *to != from)),
-    };
-    // The angles are stepped out from zero one step at a time in degrees,
-    // rounding and all, as the points come out.
-    let mut degrees = vec![0.0f64; ARC_STEPS as usize + 1];
-    for k in 1..degrees.len() {
-        degrees[k] = degrees[k - 1] + 360.0 / ARC_STEPS as f64;
-    }
-    let point = |k: i64| {
-        let a = degrees[k as usize] * (std::f64::consts::PI / 180.0);
-        [
-            (cx as f64 + rx as f64 * a.cos()).floor(),
-            (cy as f64 + ry as f64 * -a.sin()).floor(),
-        ]
     };
     // `k` steps lie below an angle when k·360 < angle·99, kept exact.
     let under = |k: &i64, angle: f64| ((k * 360) as f64) < angle * ARC_STEPS as f64;
@@ -533,7 +645,8 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 }
                 raw.truncate(count);
                 let value: String = raw.iter().map(|b| char::from(*b)).collect();
-                if value.trim().is_empty() {
+                // A run of spaces is still a text object; only no text is none.
+                if value.is_empty() {
                     continue;
                 }
                 // The reference point is the cell's top; the baseline sits

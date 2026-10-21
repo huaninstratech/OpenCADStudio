@@ -194,6 +194,7 @@ impl OpenCADStudio {
                 self.cancel_active_grip_edit();
                 self.grip_pending = None;
                 self.visibility_popup = None;
+                self.table_popup = None;
                 self.grip_popup = None;
                 self.grip_hover = None;
             }
@@ -369,10 +370,15 @@ impl OpenCADStudio {
                     self.command_line.input.push_str(&s);
                 }
             } else {
-                // Command-line entry is shown uppercase — except in
-                // free-form text prompts, where the typed case is the
-                // content (matches the CommandInput route).
-                if self.is_free_text_active() {
+                // Preserve case while entering a command or literal/free-text
+                // value. Active single-token prompt keywords keep their
+                // established uppercase normalization.
+                let preserve_case = self.tabs[i].active_cmd.is_none()
+                    || self.is_free_text_active()
+                    || self.command_line.literal_spaces
+                    || self.command_line.input.starts_with('>')
+                    || s.starts_with('>');
+                if preserve_case {
                     self.command_line.input.push_str(&s);
                 } else {
                     self.command_line.input.push_str(&s.to_uppercase());
@@ -1279,6 +1285,8 @@ impl OpenCADStudio {
         // its menu (#337). Falls through — Esc keeps its usual effect.
         self.snap_override_popup = None;
         self.snapper.clear_override();
+        // Clear the deferred snap dwell — the command is being cancelled.
+        self.snap_dwell = None;
         // Open MText editor swallows Escape (cancel without committing).
         if self.mtext_editor.is_some() {
             self.mtext_cancel();
@@ -1349,7 +1357,11 @@ impl OpenCADStudio {
             self.grip_hover = None;
             return Task::none();
         }
+        if self.table_popup.take().is_some() {
+            return Task::none();
+        }
         if self.visibility_popup.take().is_some() {
+            self.table_popup = None;
             return Task::none();
         }
         if self.tabs[self.active_tab].active_grip.is_some() {
@@ -2688,18 +2700,11 @@ impl OpenCADStudio {
             let document = &self.tabs[i].scene.document;
             let (toggle, current) = match document.get_entity(handle) {
                 Some(codec::EntityType::MText(text)) => ("is_annotative", text.is_annotative),
+                // The same per-object state the row shows and the toggle
+                // flips; a dimension's style only seeds it. (#1917)
                 Some(entity) => (
                     "annotative_ctx",
-                    crate::scene::annotative::is_annotative(document, entity)
-                        || match entity {
-                            codec::EntityType::Dimension(dimension) => {
-                                crate::scene::annotative::dim_style_is_annotative(
-                                    document,
-                                    &dimension.base().style_name,
-                                )
-                            }
-                            _ => false,
-                        },
+                    crate::scene::annotative::is_annotative(document, entity),
                 ),
                 None => return Task::none(),
             };
@@ -3466,6 +3471,46 @@ impl OpenCADStudio {
                         _ => {}
                     }
                 }
+            } else if field == "dyn_visibility" {
+                // A visibility state picked in Properties, applied like a
+                // pick from the reference's visibility grip.
+                self.tabs[i].properties.edit_choice_open = false;
+                for &handle in &handles {
+                    let state = self.tabs[i]
+                        .scene
+                        .document
+                        .dynamic_visibility_for_insert(handle)
+                        .and_then(|(_, param)| param.states.iter().position(|s| s.name == value));
+                    if let Some(state) = state {
+                        self.apply_visibility_state(handle, state);
+                    }
+                }
+            } else if field == "dyn_lookup" {
+                self.tabs[i].properties.edit_choice_open = false;
+                let mut changed = false;
+                for &handle in &handles {
+                    if self.tabs[i].scene.is_layer_locked(handle) {
+                        continue;
+                    }
+                    let result = crate::scene::block_lookup::evaluate_reference_choice(
+                        &self.tabs[i].scene.document,
+                        handle,
+                        &value,
+                    );
+                    match result {
+                        Ok(Some(staged)) => {
+                            self.apply_action_document(i, staged);
+                            self.tabs[i].scene.bump_geometry();
+                            self.tabs[i].dirty = true;
+                            changed = true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+                    }
+                }
+                if changed {
+                    self.finish_pending_history(i);
+                }
             } else if field == "block" {
                 // Name dropdown on a block reference: re-point the
                 // selected inserts to the picked definition. A stale
@@ -3552,6 +3597,22 @@ impl OpenCADStudio {
                 let text_style = (field == "style")
                     .then(|| self.tabs[i].scene.document.text_styles.get(&value).cloned())
                     .flatten();
+                // A dimension taking a style takes its annotative state, as a
+                // new dimension would. (#1917)
+                let dim_style_annotative = (field == "style_name")
+                    .then(|| {
+                        self.tabs[i]
+                            .scene
+                            .document
+                            .dim_styles
+                            .iter()
+                            .find(|style| style.name.eq_ignore_ascii_case(&value))
+                            .map(|style| style.annotative)
+                    })
+                    .flatten();
+                let dim_scale = dim_style_annotative
+                    .filter(|annotative| *annotative)
+                    .and_then(|_| self.tabs[i].scene.creation_annotation_scale_handle());
                 for &handle in &handles {
                     let mline_style =
                         self.tabs[i]
@@ -3598,6 +3659,30 @@ impl OpenCADStudio {
                             {
                                 crate::modules::draw::draw::mline::sync_mline_element_parameters(
                                     mline, style,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(annotative) = dim_style_annotative {
+                        let document = &mut self.tabs[i].scene.document;
+                        let current = match document.get_entity(handle) {
+                            Some(codec::EntityType::Dimension(dimension))
+                                if !matches!(**dimension, codec::entities::Dimension::Arc(_)) =>
+                            {
+                                crate::scene::annotative::object_is_annotative(
+                                    document,
+                                    &dimension.base().common,
+                                )
+                            }
+                            _ => continue,
+                        };
+                        if current != annotative {
+                            crate::scene::annotative::set_entity_annotative(
+                                document, handle, annotative,
+                            );
+                            if let Some(scale) = dim_scale {
+                                crate::scene::annotative::create_annotation_context(
+                                    document, handle, scale,
                                 );
                             }
                         }
@@ -3966,6 +4051,18 @@ impl OpenCADStudio {
     }
 
     pub(super) fn on_prop_geom_commit(&mut self, field: &'static str) -> Task<Message> {
+        if field == "authoring_grip_count" {
+            return self.commit_block_grip_count();
+        }
+        if field.starts_with("authoring_action_") {
+            return self.commit_authoring_action_option(field);
+        }
+        if field == "authoring_name" {
+            return self.commit_authoring_name();
+        }
+        if field.starts_with("authoring_set_") {
+            return self.commit_authoring_value_set(field);
+        }
         if field.starts_with("bedit_") {
             return self.commit_block_property(field);
         }
@@ -5339,7 +5436,7 @@ mod tablestyle_buffer_tests {
         let mut app = OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
         app.ts_cell_textstyle[0] = "STALE_SENTINEL".to_string();
-        app.style_new(StyleKind::Table);
+        let _ = app.style_new(StyleKind::Table);
         assert_ne!(
             app.ts_cell_textstyle[0], "STALE_SENTINEL",
             "buffers must reload from the fresh style"

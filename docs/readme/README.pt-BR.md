@@ -91,9 +91,9 @@ O aplicativo possui assinatura ad hoc, mas atualmente não é notarizado pela Ap
 
 ## Idiomas
 
-Open CAD Studio pode seguir o idioma do sistema ou usar um destes 22 idiomas de interface:
+Open CAD Studio pode seguir o idioma do sistema ou usar um destes 23 idiomas de interface:
 
-> Árabe · Português do Brasil · Búlgaro · Tcheco · Holandês · Inglês · Finlandês · Francês · Alemão · Grego · Hindi · Húngaro · Italiano · Japonês · Coreano · Laosiano · Polonês · Russo · Chinês simplificado · Espanhol · Chinês tradicional · Turco
+> Árabe · Português do Brasil · Búlgaro · Tcheco · Holandês · Inglês · Finlandês · Francês · Alemão · Grego · Hindi · Húngaro · Italiano · Japonês · Coreano · Laosiano · Polonês · Russo · Chinês simplificado · Espanhol · Chinês tradicional · Turco · Vietnamita
 
 Altere o idioma nas configurações do aplicativo. A versão web também usa a localidade preferida do navegador quando **Sistema** está selecionado.
 

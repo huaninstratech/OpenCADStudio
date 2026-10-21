@@ -462,6 +462,182 @@ fn section_symbol_wires(
     wires
 }
 
+/// The proxy entity's own resolved style — what ByBlock primitives draw in.
+#[derive(Clone, Copy)]
+struct ProxyInherit {
+    color: [f32; 4],
+    aci: u8,
+    pattern_length: f32,
+    pattern: [f32; 8],
+    line_weight_px: f32,
+}
+
+/// Wires for a decoded proxy-graphics preview. Each primitive's traits
+/// resolve against its sub-entity layer (ByLayer) or the proxy entity itself
+/// (ByBlock); primitives sharing a style share one wire.
+fn proxy_preview_wires(
+    document: &codec::CadDocument,
+    e: &EntityType,
+    dec: &convert::proxy_graphics::Decoded,
+    own: ProxyInherit,
+    active_viewport: Option<Handle>,
+    bg_color: [f32; 4],
+    sel: bool,
+) -> Vec<WireModel> {
+    use crate::scene::convert::proxy_graphics::{ProxyColor, ProxyStyle, LT_BYBLOCK, LT_BYLAYER};
+    use std::collections::BTreeMap;
+    if dec.is_empty() {
+        return Vec::new();
+    }
+    let name = e.common().handle.value().to_string();
+    let nan = [f64::NAN; 3];
+    let layer_name = |index: Option<u32>| -> &str {
+        index
+            .and_then(|i| document.layers.iter().nth(i as usize))
+            .map_or(e.common().layer.as_str(), |layer| layer.name.as_str())
+    };
+    let show = |c: [f32; 4]| {
+        fade_if_locked(
+            document,
+            e,
+            view::render::adapt_to_bg(c, bg_color),
+            bg_color,
+        )
+    };
+    // (colour, aci, pattern length, pattern, lineweight px) of a style.
+    let resolve = |style: &ProxyStyle| -> ([f32; 4], u8, f32, [f32; 8], f32) {
+        let layer_name = layer_name(style.layer);
+        let layer =
+            view::render::layer_render_style_viewport(document, layer_name, active_viewport);
+        let (color, aci) = match style.color {
+            ProxyColor::ByBlock => (own.color, own.aci),
+            ProxyColor::ByLayer => {
+                let aci = match document.layers.get(layer_name).map(|l| &l.color) {
+                    Some(codec::types::Color::Index(i)) => *i,
+                    _ => 0,
+                };
+                (show(layer.color), aci)
+            }
+            ProxyColor::Aci(a) => (
+                show(convert::tess_util::aci_to_rgba(
+                    &codec::types::Color::Index(a),
+                )),
+                a,
+            ),
+            ProxyColor::Rgb(r, g, b) => {
+                let [r, g, b] = convert::tess_util::authored_rgb([
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                ]);
+                (show([r, g, b, 1.0]), 0)
+            }
+        };
+        let (pattern_length, pattern) = match style.linetype {
+            LT_BYBLOCK => (own.pattern_length, own.pattern),
+            LT_BYLAYER => (layer.pat_len, layer.pat),
+            index => document
+                .line_types
+                .iter()
+                .filter(|lt| {
+                    !lt.name.eq_ignore_ascii_case("ByLayer")
+                        && !lt.name.eq_ignore_ascii_case("ByBlock")
+                })
+                .nth(index as usize)
+                .map_or((own.pattern_length, own.pattern), |lt| {
+                    view::render::resolve_pattern(
+                        &document.line_types,
+                        &lt.name,
+                        document.header.linetype_scale as f32,
+                    )
+                }),
+        };
+        let lw_px = match style.lineweight {
+            w if w >= 0 => view::render::lineweight_to_px(&codec::types::LineWeight::Value(w)),
+            -1 if style.layer.is_some() => layer.lw_px,
+            _ => own.line_weight_px,
+        };
+        (color, aci, pattern_length, pattern, lw_px)
+    };
+    let wire = |style: &ProxyStyle, lines: Vec<[f64; 3]>, tris: Vec<[f64; 3]>| {
+        let (color, aci, pattern_length, pattern, lw_px) = resolve(style);
+        let (pts, pts_low) = convert::tessellate::points_to_ds(lines);
+        let mut w = WireModel::solid(name.clone(), pts, color, sel);
+        w.points_low = pts_low;
+        let (tris, tris_low) = convert::tessellate::points_to_ds(tris);
+        w.fill_tris = tris;
+        w.fill_tris_low = tris_low;
+        w.line_weight_px = lw_px;
+        w.pattern_length = pattern_length;
+        w.pattern = pattern;
+        w.aci = aci;
+        w
+    };
+
+    let mut lines: BTreeMap<ProxyStyle, Vec<[f64; 3]>> = BTreeMap::new();
+    let mut push_run = |style: ProxyStyle, run: &[[f64; 3]]| {
+        let buf = lines.entry(style).or_default();
+        if !buf.is_empty() {
+            buf.push(nan);
+        }
+        buf.extend_from_slice(run);
+    };
+    for poly in &dec.polylines {
+        push_run(poly.style, &poly.points);
+    }
+    // Text labels: the glyph strokes, grouped with the lines of their style.
+    for t in &dec.texts {
+        let font = t.font.trim();
+        let font = font.rsplit_once('.').map_or(font, |(stem, _)| stem);
+        let font = if font.is_empty() { "standard" } else { font };
+        let width = if t.width_factor > 0.0 {
+            t.width_factor
+        } else {
+            1.0
+        };
+        let (strokes, _) = crate::scene::text::lff::tessellate_text_ex(
+            [0.0, 0.0],
+            t.height as f32,
+            t.rotation as f32,
+            width as f32,
+            t.oblique as f32,
+            font,
+            &t.text,
+        );
+        for stroke in strokes.iter().filter(|s| s.len() >= 2) {
+            let run: Vec<[f64; 3]> = stroke
+                .iter()
+                .map(|&[x, y]| {
+                    [
+                        t.position[0] + x as f64,
+                        t.position[1] + y as f64,
+                        t.position[2],
+                    ]
+                })
+                .collect();
+            push_run(t.style, &run);
+        }
+    }
+    let mut fills: BTreeMap<ProxyStyle, Vec<[f64; 3]>> = BTreeMap::new();
+    for fill in &dec.fills {
+        fills
+            .entry(fill.style)
+            .or_default()
+            .extend_from_slice(&fill.tris);
+    }
+    let mut wires: Vec<WireModel> = lines
+        .into_iter()
+        .filter(|(_, pts)| pts.len() >= 2)
+        .map(|(style, pts)| wire(&style, pts, Vec::new()))
+        .collect();
+    wires.extend(
+        fills
+            .into_iter()
+            .map(|(style, tris)| wire(&style, Vec::new(), tris)),
+    );
+    wires
+}
+
 // ── Parallel tessellation free function ──────────────────────────────────────
 //
 // Takes only the `Send + Sync` data needed for tessellation so that
@@ -799,106 +975,17 @@ fn tessellate_entity_inner(
     };
     if let Some(blob) = proxy_blob {
         let dec = convert::proxy_graphics::decode(blob.as_ref());
-        if !dec.polylines.is_empty() || !dec.texts.is_empty() {
-            use crate::scene::convert::proxy_graphics::ProxyColor;
-            use std::collections::BTreeMap;
-            let nan = [f64::NAN; 3];
-            // A specific ACI / RGB overrides the entity colour; ByLayer /
-            // ByBlock inherit it.
-            let resolve = |pc: ProxyColor| -> ([f32; 4], u8) {
-                match pc {
-                    ProxyColor::Aci(a) => (
-                        view::render::adapt_to_bg(
-                            convert::tess_util::aci_to_rgba(&codec::types::Color::Index(a)),
-                            bg_color,
-                        ),
-                        a,
-                    ),
-                    ProxyColor::Rgb(r, g, b) => (
-                        {
-                            let [r, g, b] = convert::tess_util::authored_rgb([
-                                r as f32 / 255.0,
-                                g as f32 / 255.0,
-                                b as f32 / 255.0,
-                            ]);
-                            [r, g, b, 1.0]
-                        },
-                        0,
-                    ),
-                    ProxyColor::Inherit => (entity_color, aci),
-                }
-            };
-            let mut wires = Vec::new();
-            // Lines / shells: group by (colour, lineweight), one wire each.
-            let mut groups: BTreeMap<(ProxyColor, i16), Vec<[f64; 3]>> = BTreeMap::new();
-            for poly in &dec.polylines {
-                let buf = groups.entry((poly.color, poly.lineweight)).or_default();
-                if !buf.is_empty() {
-                    buf.push(nan);
-                }
-                buf.extend_from_slice(&poly.points);
-            }
-            for ((pcolor, plw), pts64) in groups {
-                let (col, w_aci) = resolve(pcolor);
-                let lw_px = if plw >= 0 {
-                    view::render::lineweight_to_px(&codec::types::LineWeight::Value(plw))
-                } else {
-                    line_weight_px
-                };
-                let (pts, pts_low) = convert::tessellate::points_to_ds(pts64);
-                let mut w = WireModel::solid(h.value().to_string(), pts, col, sel);
-                w.points_low = pts_low;
-                w.line_weight_px = lw_px;
-                w.aci = w_aci;
-                wires.push(w);
-            }
-            // Text labels: draw the glyph strokes (simplex.shx etc. are
-            // single-stroke fonts, so the outline is the character).
-            for t in &dec.texts {
-                let font = t
-                    .font
-                    .trim()
-                    .trim_end_matches(".shx")
-                    .trim_end_matches(".SHX");
-                let font = if font.is_empty() { "standard" } else { font };
-                let (strokes, _) = crate::scene::text::lff::tessellate_text_ex(
-                    [0.0, 0.0],
-                    t.height as f32,
-                    t.rotation as f32,
-                    1.0,
-                    0.0,
-                    font,
-                    &t.text,
-                );
-                let mut pts64: Vec<[f64; 3]> = Vec::new();
-                for stroke in &strokes {
-                    if stroke.len() < 2 {
-                        continue;
-                    }
-                    if !pts64.is_empty() {
-                        pts64.push(nan);
-                    }
-                    for &[x, y] in stroke {
-                        pts64.push([
-                            t.position[0] + x as f64,
-                            t.position[1] + y as f64,
-                            t.position[2],
-                        ]);
-                    }
-                }
-                if pts64.len() >= 2 {
-                    let (col, w_aci) = resolve(t.color);
-                    let (pts, pts_low) = convert::tessellate::points_to_ds(pts64);
-                    let mut w = WireModel::solid(h.value().to_string(), pts, col, sel);
-                    w.points_low = pts_low;
-                    w.line_weight_px = line_weight_px;
-                    w.aci = w_aci;
-                    wires.push(w);
-                }
-            }
-            if !wires.is_empty() {
-                return wires;
-            }
+        let inherited = ProxyInherit {
+            color: entity_color,
+            aci,
+            pattern_length,
+            pattern,
+            line_weight_px,
+        };
+        let wires =
+            proxy_preview_wires(document, e, &dec, inherited, active_viewport, bg_color, sel);
+        if !wires.is_empty() {
+            return wires;
         }
     }
 

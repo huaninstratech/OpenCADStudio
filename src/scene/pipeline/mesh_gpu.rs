@@ -888,6 +888,21 @@ pub fn create_material_resources(
     }
 }
 
+fn surface_params(
+    material: Option<&crate::scene::model::material_model::MeshMaterial>,
+    face_color: [f32; 4],
+) -> MeshSurfaceParams {
+    let (material_params, specular, ambient, advanced, flags) = material_vertex_params(material);
+    MeshSurfaceParams {
+        face_color,
+        material: material_params,
+        specular,
+        ambient,
+        advanced,
+        flags,
+    }
+}
+
 pub fn create_material_bind_group_from_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -896,15 +911,7 @@ pub fn create_material_bind_group_from_resources(
     material: Option<&crate::scene::model::material_model::MeshMaterial>,
     face_color: [f32; 4],
 ) -> wgpu::BindGroup {
-    let (material_params, specular, ambient, advanced, flags) = material_vertex_params(material);
-    let surface = MeshSurfaceParams {
-        face_color,
-        material: material_params,
-        specular,
-        ambient,
-        advanced,
-        flags,
-    };
+    let surface = surface_params(material, face_color);
     let surface_buffer = super::gpu_upload::upload_buffer(
         device,
         queue,
@@ -995,6 +1002,11 @@ pub fn create_material_bind_group(
     create_material_bind_group_from_resources(device, queue, layout, &resources, material, color)
 }
 
+/// Give every chunk its material bind group. Chunks are split by geometry
+/// (instance source, buffer caps), so many of them carry the same material and
+/// colour; those share one bind group. Each live bind group holds its views
+/// and uniforms in a device-wide descriptor heap that is only 2048 entries on
+/// D3D12, and one group per chunk exhausted it on large solid models (#1727).
 pub fn upload_chunk_material_bind_groups(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1003,35 +1015,50 @@ pub fn upload_chunk_material_bind_groups(
 ) {
     let mut fallback = None;
     let mut materials = rustc_hash::FxHashMap::default();
+    // Key: material handle (`None` = no material) + the exact surface uniform.
+    let mut bind_groups: rustc_hash::FxHashMap<(Option<u64>, [u32; 24]), wgpu::BindGroup> =
+        rustc_hash::FxHashMap::default();
     for chunk in chunks {
-        let resources = match chunk.material.as_ref() {
-            None => fallback.get_or_insert_with(|| create_material_resources(device, queue, None)),
-            Some(material) => {
-                let Some(handle) = material.handle else {
+        let material = chunk.material.as_ref();
+        let handle = match material {
+            None => None,
+            Some(material) => match material.handle {
+                Some(handle) => Some(handle.value()),
+                // No handle to identify the material's maps by: keep it private.
+                None => {
                     let resources = create_material_resources(device, queue, Some(material));
                     chunk.material_bind_group = Some(create_material_bind_group_from_resources(
                         device,
                         queue,
                         layout,
                         &resources,
-                        chunk.material.as_ref(),
+                        Some(material),
                         chunk.face_color,
                     ));
                     continue;
-                };
-                materials
-                    .entry(handle.value())
-                    .or_insert_with(|| create_material_resources(device, queue, Some(material)))
-            }
+                }
+            },
         };
-        chunk.material_bind_group = Some(create_material_bind_group_from_resources(
-            device,
-            queue,
-            layout,
-            resources,
-            chunk.material.as_ref(),
-            chunk.face_color,
-        ));
+        let surface = bytemuck::cast(surface_params(material, chunk.face_color));
+        let bind_group = bind_groups.entry((handle, surface)).or_insert_with(|| {
+            let resources = match material {
+                None => {
+                    fallback.get_or_insert_with(|| create_material_resources(device, queue, None))
+                }
+                Some(material) => materials
+                    .entry(handle)
+                    .or_insert_with(|| create_material_resources(device, queue, Some(material))),
+            };
+            create_material_bind_group_from_resources(
+                device,
+                queue,
+                layout,
+                resources,
+                material,
+                chunk.face_color,
+            )
+        });
+        chunk.material_bind_group = Some(bind_group.clone());
     }
 }
 

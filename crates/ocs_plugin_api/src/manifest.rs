@@ -31,7 +31,35 @@
 /// XDATA class-identity display labels, folded into the registered manifest.
 /// Display-only; the host consults the declaration only while the declaring
 /// plugin is loaded, and entities without one keep their native type names.
-pub const API_VERSION: u32 = 10;
+/// v11 appends the plugin grip surface: `HostApi::entity_grips` (built-in
+/// grip enumeration with viewport parity), `HostApi::grip_drag` (the same
+/// one-undo-step edit the interactive viewport performs), and
+/// `HostApi::set_plugin_grips` plus `BuiltinPlugin::on_custom_grip_event`
+/// (plugin-declared, plugin-owned custom grip points: session display state
+/// the host renders, hit-tests and drags but never interprets). v12 lands
+/// the consumer-validation hardening: the plugin-directed LIVE-GEOMETRY
+/// channel (CustomGripResponse::live_entities, capped), grip deliveries
+/// that never block the UI loop (bounded polls plus the settle watchdog
+/// that tears a silent plugin connection down), nested COMMAND frames
+/// refused inside grip deliveries (their execution would need the message
+/// loop the blocked delivery cannot pump — the UI-freeze wedge), cheap
+/// per-entity reads (HostApi::entities_batch) so refresh passes never
+/// re-clone invalidated document snapshots, and the deterministic-boot
+/// retry for plugin command dispatch. v13 closes the consumer's validation
+/// round: live geometry is VISUAL-ONLY against the parametric solver too
+/// (the restyled bump policy — bonded partners no longer move by host
+/// action mid-drag), constraint creation is a first-class HostApi write
+/// (`HostApi::constraint_create`, joining the caller's open scope like
+/// every other write; the driver's `begin_undo` joins plugin scopes
+/// instead of closing them — a re-bond composed of writes + constraints +
+/// replays is ONE plugin-labeled step), `CommandRequest::RunQuiet` replays
+/// commands with the command-line echo suppressed, the notification channel
+/// attaches deterministically (`PluginNotification::ChannelReady` ack;
+/// boot-window broadcasts defer then flush), boundary notifications carry
+/// DIRTY REGIONS (`DocumentChangedRegions`: touched entities + record
+/// pairs), and record walks batch (`read_xrecords` / `update_xrecords` /
+/// `list_xrecords_with_entries` — one frame per pass, not per record).
+pub const API_VERSION: u32 = 13;
 
 /// Oldest plugin API major the current host still loads. This keeps previously
 /// compiled cdylibs usable as long as their vtable layout is a prefix of the

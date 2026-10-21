@@ -135,6 +135,9 @@ fn listen(
     // the id — the same ergonomics as the headless server.
     let document_cache: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     for stream in listener.incoming().flatten() {
+        // Same request/response-line shape as the native control transport:
+        // disable Nagle so reply tails never wait on the peer's delayed ACK.
+        let _ = stream.set_nodelay(true);
         if clients.fetch_add(1, Ordering::SeqCst) >= 8 {
             clients.fetch_sub(1, Ordering::SeqCst);
             continue;

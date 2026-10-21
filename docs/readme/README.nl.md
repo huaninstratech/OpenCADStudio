@@ -91,9 +91,9 @@ De toepassing is ad hoc ondertekend, maar momenteel niet door Apple genotariseer
 
 ## Talen
 
-Open CAD Studio kan de systeemtaal volgen of een van deze 22 interfacetalen gebruiken:
+Open CAD Studio kan de systeemtaal volgen of een van deze 23 interfacetalen gebruiken:
 
-> Arabisch · Braziliaans-Portugees · Bulgaars · Tsjechisch · Nederlands · Engels · Fins · Frans · Duits · Grieks · Hindi · Hongaars · Italiaans · Japans · Koreaans · Laotiaans · Pools · Russisch · Vereenvoudigd Chinees · Spaans · Traditioneel Chinees · Turks
+> Arabisch · Braziliaans-Portugees · Bulgaars · Tsjechisch · Nederlands · Engels · Fins · Frans · Duits · Grieks · Hindi · Hongaars · Italiaans · Japans · Koreaans · Laotiaans · Pools · Russisch · Vereenvoudigd Chinees · Spaans · Traditioneel Chinees · Turks · Vietnamees
 
 Wijzig de taal in de toepassingsinstellingen. De browserversie gebruikt ook de voorkeurstaal van de browser wanneer **Systeem** is geselecteerd.
 

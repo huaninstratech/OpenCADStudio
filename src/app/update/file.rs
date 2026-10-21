@@ -822,6 +822,7 @@ impl OpenCADStudio {
             zoom_factor: self.zoom_factor,
             cursor_size: self.cursor_size,
             pick_box: self.pick_box,
+            aperture: self.snapper.osnap_radius_px,
             hatch_associative: self.hatch_associative,
             show_menu_bar: self.show_menu_bar,
             ribbon_closed: self.ribbon_closed,
@@ -938,6 +939,7 @@ impl OpenCADStudio {
             block_mru_list: self.block_mru_list,
             block_redefine_mode: self.block_redefine_mode,
             block_navigate: self.block_navigate.clone(),
+            block_editor: self.block_editor_preferences.clone(),
             refedit: self.refedit_options.clone(),
             xfadectl: crate::scene::cache::block_cache::refedit_fade_ctl() as u8,
             count_color: self.count_palette.color,
@@ -967,6 +969,14 @@ impl OpenCADStudio {
         self.zoom_factor_input = self.zoom_factor.to_string();
         self.cursor_size = s.cursor_size.clamp(1, 100);
         self.pick_box = s.pick_box.clamp(0, 50);
+        self.snapper.osnap_radius_px = if s.aperture.is_finite() {
+            s.aperture.clamp(
+                crate::snap::MIN_OSNAP_RADIUS_PX,
+                crate::snap::MAX_OSNAP_RADIUS_PX,
+            )
+        } else {
+            crate::snap::DEFAULT_OSNAP_RADIUS_PX
+        };
         self.hatch_associative = s.hatch_associative;
         self.show_menu_bar = s.show_menu_bar;
         self.ribbon_closed = s.ribbon_closed;
@@ -1125,6 +1135,7 @@ impl OpenCADStudio {
         self.block_mru_list = s.block_mru_list.min(100);
         self.block_redefine_mode = s.block_redefine_mode.min(2);
         self.block_navigate = s.block_navigate.clone();
+        self.block_editor_preferences = s.block_editor.clone();
         crate::scene::cache::block_cache::set_refedit_fade_ctl(i32::from(s.xfadectl.min(90)));
         self.refedit_options = s.refedit.clone();
         self.count_palette.color = s.count_color;
@@ -7206,6 +7217,11 @@ impl OpenCADStudio {
                 Task::done(Message::Command("PLOTWINDOW".into()))
             }
             M::SelectSetup(name) => {
+                // Leaving a row mid-rename commits it; otherwise the rename
+                // field would follow the selection onto every clicked row.
+                if self.plot_dialog.name_rename && self.plot_dialog.selected_setup != name {
+                    let _ = self.on_plot_dlg(M::NameCommit);
+                }
                 // Print All Options edits the page setups represented by the
                 // layout rows. With "Save changes to layout" enabled, preserve
                 // the setup we are leaving before another one is loaded.
@@ -7265,7 +7281,7 @@ impl OpenCADStudio {
                 self.refresh_page_setups();
                 self.plot_dialog.name_input = Some(name);
                 self.plot_dialog.name_rename = true;
-                Task::none()
+                iced::widget::operation::focus(crate::ui::window::plot::setup_rename_id())
             }
             M::CopySetup => {
                 if self.print_all_options {
@@ -7289,6 +7305,9 @@ impl OpenCADStudio {
                     self.refresh_page_setups();
                     self.plot_dialog.name_input = Some(name);
                     self.plot_dialog.name_rename = true;
+                    return iced::widget::operation::focus(
+                        crate::ui::window::plot::setup_rename_id(),
+                    );
                 }
                 Task::none()
             }
@@ -7306,7 +7325,7 @@ impl OpenCADStudio {
                 }
                 self.plot_dialog.name_input = Some(name);
                 self.plot_dialog.name_rename = true;
-                Task::none()
+                iced::widget::operation::focus(crate::ui::window::plot::setup_rename_id())
             }
             M::DeleteSetup => {
                 if self.print_all_options {
@@ -7317,6 +7336,8 @@ impl OpenCADStudio {
                     self.tabs[self.active_tab].scene.page_setup_delete(&sel);
                     self.tabs[self.active_tab].dirty = true;
                     self.plot_dialog.selected_setup.clear();
+                    self.plot_dialog.name_input = None;
+                    self.plot_dialog.name_rename = false;
                     self.refresh_page_setups();
                 }
                 Task::none()
@@ -8065,46 +8086,83 @@ impl OpenCADStudio {
         })
     }
 
+    pub(super) fn commit_plotstyle_panel_baseline(&mut self) {
+        if self.plotstyle_panel_baseline.is_some() {
+            self.plotstyle_panel_baseline = Some(self.active_plot_style.clone());
+        }
+    }
+
     pub(super) fn on_plot_style_panel_apply(&mut self) -> Task<Message> {
-        let aci = self.plotstyle_panel_aci as usize;
-        if let Some(table) = self.active_plot_style.as_mut() {
-            if let Some(entry) = table.aci_entries.get_mut(aci) {
-                // Parse color.
-                let color_str = self.ps_color_buf.trim();
-                if color_str.is_empty() {
-                    entry.color = None;
-                } else if color_str.starts_with('#') && color_str.len() == 7 {
-                    let r = u8::from_str_radix(&color_str[1..3], 16).unwrap_or(0);
-                    let g = u8::from_str_radix(&color_str[3..5], 16).unwrap_or(0);
-                    let b = u8::from_str_radix(&color_str[5..7], 16).unwrap_or(0);
-                    entry.color = Some([r, g, b]);
-                }
-                if let Ok(lw) = self.ps_lineweight_buf.trim().parse::<u8>() {
-                    entry.lineweight = lw;
-                }
-                if let Ok(sc) = self.ps_screening_buf.trim().parse::<u8>() {
-                    entry.screening = sc.min(100);
-                }
-            }
+        let color_text = self.ps_color_buf.trim();
+        let color = if color_text.is_empty() {
+            None
         } else {
-            // No table loaded: create an identity table and apply.
-            let mut table = crate::io::plot_style::PlotStyleTable::identity("Custom.ctb");
-            if let Some(entry) = table.aci_entries.get_mut(aci) {
-                let color_str = self.ps_color_buf.trim();
-                if color_str.starts_with('#') && color_str.len() == 7 {
-                    let r = u8::from_str_radix(&color_str[1..3], 16).unwrap_or(0);
-                    let g = u8::from_str_radix(&color_str[3..5], 16).unwrap_or(0);
-                    let b = u8::from_str_radix(&color_str[5..7], 16).unwrap_or(0);
-                    entry.color = Some([r, g, b]);
-                }
-                if let Ok(lw) = self.ps_lineweight_buf.trim().parse::<u8>() {
-                    entry.lineweight = lw;
-                }
-                if let Ok(sc) = self.ps_screening_buf.trim().parse::<u8>() {
-                    entry.screening = sc.min(100);
-                }
-            }
-            self.active_plot_style = Some(table);
+            let Some(hex) = color_text.strip_prefix('#').filter(|hex| hex.len() == 6) else {
+                self.command_line.push_error(
+                    crate::t!("Enter a plot color as #RRGGBB, or clear it to use object color.")
+                        .as_ref(),
+                );
+                return Task::none();
+            };
+            let Ok(rgb) = u32::from_str_radix(hex, 16) else {
+                self.command_line.push_error(
+                    crate::t!("Enter a plot color as #RRGGBB, or clear it to use object color.")
+                        .as_ref(),
+                );
+                return Task::none();
+            };
+            Some([
+                ((rgb >> 16) & 0xFF) as u8,
+                ((rgb >> 8) & 0xFF) as u8,
+                (rgb & 0xFF) as u8,
+            ])
+        };
+
+        let Ok(lineweight) = self.ps_lineweight_buf.trim().parse::<u8>() else {
+            self.command_line
+                .push_error(crate::t!("Choose a valid plot lineweight.").as_ref());
+            return Task::none();
+        };
+        if lineweight != 255 && lineweight as usize >= crate::io::plot_style::LW_TABLE.len() {
+            self.command_line
+                .push_error(crate::t!("Choose a valid plot lineweight.").as_ref());
+            return Task::none();
+        }
+
+        let Ok(screening) = self.ps_screening_buf.trim().parse::<u8>() else {
+            self.command_line
+                .push_error(crate::t!("Screening must be a whole number from 0 to 100.").as_ref());
+            return Task::none();
+        };
+        if screening > 100 {
+            self.command_line
+                .push_error(crate::t!("Screening must be a whole number from 0 to 100.").as_ref());
+            return Task::none();
+        }
+
+        let aci = self.plotstyle_panel_aci as usize;
+        if aci == 0 {
+            self.command_line
+                .push_error(crate::t!("Select a plot style color index from 1 to 255.").as_ref());
+            return Task::none();
+        }
+
+        let created = self.active_plot_style.is_none();
+        if created {
+            self.active_plot_style = Some(crate::io::plot_style::PlotStyleTable::identity(
+                "Custom.ctb",
+            ));
+        }
+        if let Some(entry) = self
+            .active_plot_style
+            .as_mut()
+            .and_then(|table| table.aci_entries.get_mut(aci))
+        {
+            entry.color = color;
+            entry.lineweight = lineweight;
+            entry.screening = screening;
+        }
+        if created {
             self.command_line
                 .push_output(crate::tf!("Created new CTB table, ACI {aci} updated.").as_ref());
         }
@@ -8149,6 +8207,57 @@ impl OpenCADStudio {
 mod plot_paper_tests {
     use crate::app::{Message, OpenCADStudio};
     use crate::ui::window::plot::PlotDlgMsg;
+
+    /// Solids draw on screen as GPU meshes and a thickened wide polyline's band
+    /// is a fill: both must reach model and layout plots (#1904, #1882).
+    #[test]
+    fn solids_and_thick_band_fills_reach_model_and_layout_plots() {
+        use codec::entities::{LwPolyline, LwVertex, Solid3D};
+        use codec::types::Vector2;
+        use codec::EntityType;
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let base = crate::scene::model::solid_model::box_solid([0.0, 0.0, 2.5], 10.0, 10.0, 5.0)
+            .expect("kernel box");
+        let sat = crate::scene::convert::acis_export::solid_to_sat(&base).expect("sat");
+        let mut solid = Solid3D::new();
+        solid.set_sat_document(&sat);
+        let solid = app.tabs[i].scene.add_entity(EntityType::Solid3D(solid));
+        let mut band = LwPolyline::new();
+        band.vertices = vec![
+            LwVertex::new(Vector2::new(-20.0, 0.0)),
+            LwVertex::new(Vector2::new(20.0, 0.0)),
+        ];
+        band.constant_width = 2.0;
+        band.thickness = 3.0;
+        let band = app.tabs[i].scene.add_entity(EntityType::LwPolyline(band));
+
+        let check = |app: &OpenCADStudio, space: &str| {
+            let page = app.layout_plot_page();
+            let named = |handle: codec::Handle| {
+                let name = handle.value().to_string();
+                page.content
+                    .wires
+                    .iter()
+                    .filter(move |wire| wire.name == name)
+            };
+            assert!(
+                named(solid).any(|wire| wire.points.iter().any(|p| p[0].is_finite())),
+                "{space}: the solid plots no edges"
+            );
+            assert!(
+                named(band).any(|wire| !wire.fill_tris.is_empty()),
+                "{space}: the thickened band plots no fill"
+            );
+        };
+        check(&app, "model");
+        let _ = app.update(Message::LayoutSwitch("Layout1".into()));
+        let _ = app.run_command_line("MSPACE");
+        let _ = app.run_command_line("ZOOM EXTENTS");
+        let _ = app.run_command_line("PSPACE");
+        check(&app, "layout");
+    }
 
     /// A drawing on `Layout1` whose page setup names its sheet the way a
     /// Windows printer driver does — a bare `A4` with landscape dimensions.
@@ -9677,6 +9786,115 @@ mod background_task_tests {
             .expect("worker panic reported as an error");
         assert!(error.contains("STL export"), "error = {error}");
         assert!(error.contains("worker exploded"), "error = {error}");
+    }
+}
+
+#[cfg(test)]
+mod plot_style_panel_tests {
+    use crate::app::{Message, OpenCADStudio};
+
+    fn app_with_test_table() -> OpenCADStudio {
+        let mut app = OpenCADStudio::new_for_test();
+        let mut table = crate::io::plot_style::PlotStyleTable::identity("Test.ctb");
+        table.aci_entries[1].screening = 65;
+        app.plot_dialog.style_name = table.name.clone();
+        app.active_plot_style = Some(table);
+        app
+    }
+
+    #[test]
+    fn invalid_screening_keeps_last_valid_value_and_reports_error() {
+        let mut app = app_with_test_table();
+
+        let old_error_revision = app.command_line.error_revision;
+        let _ = app.update(Message::PlotStylePanelScreenBuf("200".into()));
+
+        assert_eq!(
+            app.active_plot_style.as_ref().unwrap().aci_entries[1].screening,
+            65,
+            "invalid input must not overwrite the last valid screening"
+        );
+        assert!(
+            app.command_line.error_revision > old_error_revision,
+            "invalid input should report feedback on the command line"
+        );
+    }
+
+    #[test]
+    fn invalid_color_is_reported_without_changing_the_entry() {
+        let mut app = app_with_test_table();
+        let entry = &mut app.active_plot_style.as_mut().unwrap().aci_entries[1];
+        entry.color = Some([12, 34, 56]);
+        entry.lineweight = 4;
+        app.ps_lineweight_buf = "5".into();
+        app.ps_screening_buf = "70".into();
+        let old_error_revision = app.command_line.error_revision;
+
+        let _ = app.update(Message::PlotStylePanelColorBuf("#fff".into()));
+
+        let entry = &app.active_plot_style.as_ref().unwrap().aci_entries[1];
+        assert_eq!(entry.color, Some([12, 34, 56]));
+        assert_eq!(entry.lineweight, 4);
+        assert_eq!(entry.screening, 65);
+        assert!(app.command_line.error_revision > old_error_revision);
+    }
+
+    #[test]
+    fn invalid_lineweight_is_reported_without_changing_the_entry() {
+        let mut app = app_with_test_table();
+        let entry = &mut app.active_plot_style.as_mut().unwrap().aci_entries[1];
+        entry.color = Some([12, 34, 56]);
+        entry.lineweight = 4;
+        app.ps_color_buf = "#010203".into();
+        app.ps_lineweight_buf = "200".into();
+        app.ps_screening_buf = "70".into();
+        let old_error_revision = app.command_line.error_revision;
+
+        let _ = app.update(Message::PlotStylePanelLwBuf("200".into()));
+
+        let entry = &app.active_plot_style.as_ref().unwrap().aci_entries[1];
+        assert_eq!(entry.color, Some([12, 34, 56]));
+        assert_eq!(entry.lineweight, 4);
+        assert_eq!(entry.screening, 65);
+        assert!(app.command_line.error_revision > old_error_revision);
+    }
+
+    #[test]
+    fn closing_plot_style_panel_restores_unsaved_table_edits() {
+        let mut app = app_with_test_table();
+        let _ = app.update(Message::PlotStylePanelOpen);
+
+        let _ = app.update(Message::PlotStylePanelScreenBuf("72".into()));
+        assert_eq!(
+            app.active_plot_style.as_ref().unwrap().aci_entries[1].screening,
+            72
+        );
+
+        app.close_active_modal();
+
+        assert_eq!(
+            app.active_plot_style.as_ref().unwrap().aci_entries[1].screening,
+            65,
+            "closing without saving should restore the table from editor open"
+        );
+    }
+
+    #[test]
+    fn closing_after_save_keeps_saved_table_and_discards_later_edits() {
+        let mut app = app_with_test_table();
+        let _ = app.update(Message::PlotStylePanelOpen);
+
+        let _ = app.update(Message::PlotStylePanelScreenBuf("72".into()));
+        app.commit_plotstyle_panel_baseline();
+
+        let _ = app.update(Message::PlotStylePanelScreenBuf("80".into()));
+        app.close_active_modal();
+
+        assert_eq!(
+            app.active_plot_style.as_ref().unwrap().aci_entries[1].screening,
+            72,
+            "closing should keep the last successfully saved table state"
+        );
     }
 }
 

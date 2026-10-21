@@ -56,6 +56,11 @@ fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
     let _ = crate::mcp::sync_agent_tool_schemas();
     let clients = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
+        // Replies are one-shot request/response lines: Nagle would hold each
+        // reply's tail segment for the peer's delayed ACK (the bridge sends
+        // nothing back until the full reply arrives). Disable coalescing on
+        // both ends of the exchange.
+        let _ = stream.set_nodelay(true);
         if clients.fetch_add(1, Ordering::SeqCst) >= 8 {
             clients.fetch_sub(1, Ordering::SeqCst);
             continue;
@@ -92,7 +97,15 @@ fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
                             } else {
                                 json!({"ok":false,"code":"busy","error":"GUI queue full"})
                             };
-                            let _ = writeln!(writer, "{result}");
+                            // write_fmt streams a Value Display token by
+                            // token: one unbuffered TCP syscall per JSON
+                            // token (tens of thousands for a records reply,
+                            // ~20 us each on loopback = the dominant ocs_read
+                            // cost). Serialize once, write once; the bytes
+                            // are identical (Value's Display == to_string).
+                            let mut reply_line = result.to_string();
+                            reply_line.push('\n');
+                            let _ = writer.write_all(reply_line.as_bytes());
                         }
                     }
                 }

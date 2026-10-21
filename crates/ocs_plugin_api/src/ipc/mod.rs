@@ -240,6 +240,213 @@ mod tests {
             discriminant(&crate::ipc::protocol::PluginResponse::Record(None)),
             3
         );
+        // API v11 additions sit at the ENDS of their enums; the legacy
+        // discriminants pinned above are unchanged. Pin the new tails too so
+        // a future variant inserted mid-enum fails here.
+        assert_eq!(
+            discriminant(&HostRequest::CustomGripEvent {
+                tab_index: 0,
+                event: crate::host::CustomGripEvent {
+                    grip_id: 7,
+                    phase: crate::host::CustomGripPhase::Settle,
+                    point: [1.0, 2.0, 3.0],
+                    anchor: None,
+                }
+            }),
+            10
+        );
+        assert_eq!(
+            discriminant(&HostResponse::CustomGrip(crate::host::CustomGripResponse {
+                preview: Vec::new(),
+                live_entities: Default::default(),
+            })),
+            8
+        );
+        assert_eq!(
+            discriminant(&crate::ipc::protocol::PluginRequest::SetPluginGrips {
+                grips: Vec::new(),
+            }),
+            39
+        );
+        assert_eq!(
+            discriminant(&crate::ipc::protocol::PluginResponse::SetPluginGripsResult(
+                Ok(())
+            )),
+            28
+        );
+        // API v12 additions stay at the ends (cheaper per-entity reads).
+        assert_eq!(
+            discriminant(&crate::ipc::protocol::PluginRequest::GetEntitiesBatch {
+                handles: Vec::new(),
+            }),
+            40
+        );
+        assert_eq!(
+            discriminant(
+                &crate::ipc::protocol::PluginResponse::GetEntitiesBatchResult(Ok(Vec::new()))
+            ),
+            29
+        );
+    }
+
+    #[test]
+    fn v11_grip_frames_bincode_roundtrip() {
+        // The whole custom-grip surface over the wire: a declaration batch
+        // and a settle event with its preview-wire answer.
+        let grips = vec![crate::host::PluginGrip {
+            grip_id: 42,
+            anchor: Some(codec::Handle::from(0x8A)),
+            point: [12.5, -3.25, 0.0],
+            axis: Some([0.7071067811865476, 0.7071067811865476, 0.0]),
+            shape: crate::host::PluginGripShape::Triangle,
+        }];
+        let req = crate::ipc::protocol::PluginRequest::SetPluginGrips { grips };
+        let bytes = bincode::serialize(&req).unwrap();
+        let got: crate::ipc::protocol::PluginRequest = bincode::deserialize(&bytes).unwrap();
+        match got {
+            crate::ipc::protocol::PluginRequest::SetPluginGrips { grips } => {
+                assert_eq!(grips.len(), 1);
+                assert_eq!(grips[0].grip_id, 42);
+                assert_eq!(grips[0].anchor, Some(codec::Handle::from(0x8A)));
+                assert_eq!(grips[0].shape, crate::host::PluginGripShape::Triangle);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let resp = crate::ipc::protocol::PluginResponse::EntityGripsResult(Ok(vec![
+            crate::host::GripInfo {
+                grip_id: 2,
+                point: [1.0, 2.0, 3.0],
+                moves_entity: true,
+                shape: "Square".to_string(),
+                axis: None,
+            },
+        ]));
+        let bytes = bincode::serialize(&resp).unwrap();
+        let got: crate::ipc::protocol::PluginResponse = bincode::deserialize(&bytes).unwrap();
+        match got {
+            crate::ipc::protocol::PluginResponse::EntityGripsResult(Ok(infos)) => {
+                assert_eq!(infos.len(), 1);
+                assert_eq!(infos[0].shape, "Square");
+                assert!(infos[0].moves_entity);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let answer = HostResponse::CustomGrip(crate::host::CustomGripResponse {
+            preview: vec![crate::host::PreviewWire::circle(
+                [0.0; 3],
+                5.0,
+                Some([0.0, 1.0, 2.0, 3.5]),
+            )],
+            // API v12: the live-geometry channel rides the same response;
+            // an old (v11) answer without it decodes default-empty above.
+            live_entities: vec![(
+                codec::Handle::from(2),
+                codec::EntityType::Line(codec::entities::Line::from_points(
+                    codec::types::Vector3::new(0.0, 0.0, 0.0),
+                    codec::types::Vector3::new(3.0, 0.0, 0.0),
+                )),
+            )],
+        });
+        let bytes = bincode::serialize(&answer).unwrap();
+        let got: HostResponse = bincode::deserialize(&bytes).unwrap();
+        match got {
+            HostResponse::CustomGrip(resp) => {
+                assert_eq!(resp.preview.len(), 1);
+                assert_eq!(resp.live_entities.len(), 1);
+                assert_eq!(resp.live_entities[0].0, codec::Handle::from(2));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        use crate::host::HostNotification;
+        // API v13: the attach ack round-trips (a plugin->host notification).
+        let ack = crate::host::PluginNotification::ChannelReady;
+        let bytes = bincode::serialize(&ack).unwrap();
+        let got: crate::host::PluginNotification = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(got, crate::host::PluginNotification::ChannelReady);
+        // And the dirty-region payload (a host->plugin notification).
+        let regions = HostNotification::DocumentChangedRegions {
+            tab_id: 12,
+            version: 93,
+            entities: vec![codec::Handle::from(0x2A)],
+            records: vec![(codec::Handle::from(0x8A), "CVIFC".to_string())],
+        };
+        let bytes = bincode::serialize(&regions).unwrap();
+        let got: HostNotification = bincode::deserialize(&bytes).unwrap();
+        match got {
+            HostNotification::DocumentChangedRegions {
+                tab_id,
+                version,
+                entities,
+                records,
+            } => {
+                assert_eq!((tab_id, version), (12, 93));
+                assert_eq!(entities, vec![codec::Handle::from(0x2A)]);
+                assert_eq!(
+                    records,
+                    vec![(codec::Handle::from(0x8A), "CVIFC".to_string())]
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // And a v11-shaped answer (no live_entities) still decodes.
+        let old = HostResponse::CustomGrip(crate::host::CustomGripResponse {
+            preview: Vec::new(),
+            live_entities: Default::default(),
+        });
+        let bytes = bincode::serialize(&old).unwrap();
+        let got: HostResponse = bincode::deserialize(&bytes).unwrap();
+        match got {
+            HostResponse::CustomGrip(resp) => assert!(resp.live_entities.is_empty()),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The per-entity read frames round-trip too (API v12).
+        let req = crate::ipc::protocol::PluginRequest::GetEntitiesBatch {
+            handles: vec![codec::Handle::from(1), codec::Handle::from(2)],
+        };
+        let bytes = bincode::serialize(&req).unwrap();
+        let got: crate::ipc::protocol::PluginRequest = bincode::deserialize(&bytes).unwrap();
+        match got {
+            crate::ipc::protocol::PluginRequest::GetEntitiesBatch { handles } => {
+                assert_eq!(handles.len(), 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v11_grip_wire_shapes_default_tolerantly() {
+        // Older/leaner senders omit optional fields: a bare-minimum
+        // PluginGrip / GripInfo / CustomGripEvent / CustomGripResponse
+        // decode with every defaulted field at its default.
+        let minimal = crate::host::PluginGrip {
+            grip_id: 1,
+            anchor: None,
+            point: [0.0; 3],
+            axis: None,
+            shape: Default::default(),
+        };
+        // Round-trips through JSON; and a leaner sender that omits every
+        // defaulted field still decodes (the additive-tolerance discipline).
+        let json = serde_json::to_value(&minimal).unwrap();
+        let round: crate::host::PluginGrip = serde_json::from_value(json).unwrap();
+        assert_eq!(round.grip_id, 1);
+        assert_eq!(round.shape, crate::host::PluginGripShape::Square);
+        let json = serde_json::json!({"grip_id": 1, "point": [0.0, 0.0, 0.0]});
+        let missing: crate::host::PluginGrip = serde_json::from_value(json).unwrap();
+        assert_eq!(missing.shape, crate::host::PluginGripShape::Square);
+        assert!(missing.axis.is_none());
+        assert!(missing.anchor.is_none());
+        let missing: crate::host::GripInfo = serde_json::from_value(serde_json::json!({
+            "grip_id": 0,
+            "point": [0.0, 0.0, 0.0],
+            "shape": "Square"
+        }))
+        .unwrap();
+        assert!(!missing.moves_entity);
+        assert!(missing.axis.is_none());
+        let missing: crate::host::CustomGripResponse =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(missing.preview.is_empty());
     }
 
     #[test]

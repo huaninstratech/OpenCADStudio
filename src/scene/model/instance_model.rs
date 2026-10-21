@@ -109,11 +109,35 @@ pub fn expand_stubs(wires: &[WireModel]) -> std::borrow::Cow<'_, [WireModel]> {
 
 /// Append the translated copies a stub wire stands for.
 pub fn expand_stub_into(stub_wire: &WireModel, out: &mut Vec<WireModel>) {
+    expand_stub_near_into(stub_wire, None, out);
+}
+
+/// `expand_stub_into`, keeping only the copies whose XY box meets `near`
+/// (or has no finite box). The test runs on the prototype before anything
+/// is cloned, so a block copy under the cursor costs only its wires near
+/// the cursor, not the whole block (#1891).
+pub fn expand_stub_near_into(
+    stub_wire: &WireModel,
+    near: Option<[f64; 4]>,
+    out: &mut Vec<WireModel>,
+) {
     let Some(stub) = stub_wire.stub.as_ref() else {
         out.push(stub_wire.clone());
         return;
     };
-    for wire in stub.prototype.iter() {
+    let meets = |wire: &WireModel| {
+        let Some(query) = near else {
+            return true;
+        };
+        let [x0, y0, x1, y1] = wire.aabb.map(f64::from);
+        let (dx, dy) = (stub.delta[0], stub.delta[1]);
+        !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+            || (x1 + dx >= query[0]
+                && x0 + dx <= query[2]
+                && y1 + dy >= query[1]
+                && y0 + dy <= query[3])
+    };
+    for wire in stub.prototype.iter().filter(|wire| meets(wire)) {
         let mut copy = crate::scene::cache::block_cache::translated_prototype_wire(
             wire,
             &stub_wire.name,
@@ -123,7 +147,7 @@ pub fn expand_stub_into(stub_wire: &WireModel, out: &mut Vec<WireModel>) {
         copy.selected = stub_wire.selected;
         copy.display_visible &= stub_wire.display_visible;
         if copy.stub.is_some() {
-            expand_stub_into(&copy, out);
+            expand_stub_near_into(&copy, near, out);
         } else {
             out.push(copy);
         }

@@ -4,7 +4,7 @@ use crate::app::{ColorPickTarget, DsField, Message};
 use crate::scene::convert::tessellate::{arrow_from_block_name, ArrowKind};
 use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::hdivider;
+use crate::ui::style::form::{field_style, hdivider};
 use iced::widget::{
     button, canvas, checkbox, column, container, row, scrollable, text, text_input, Space,
 };
@@ -134,26 +134,6 @@ fn tab_btn_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
             },
             ..Default::default()
         }
-    }
-}
-
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    let border = match status {
-        text_input::Status::Focused { .. } => palette.primary.base.color,
-        _ => palette.background.neutral.color,
-    };
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
     }
 }
 

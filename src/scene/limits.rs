@@ -160,7 +160,10 @@ impl Scene {
         }
 
         let aspect = self.active_camera_aspect();
-        self.camera.borrow_mut().fit_to_bounds(min, max, aspect);
+        let pixels = self.active_camera_pixels();
+        self.camera
+            .borrow_mut()
+            .fit_to_bounds_bordered_f32(min, max, aspect, pixels);
         self.camera_generation += 1;
     }
 }

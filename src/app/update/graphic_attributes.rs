@@ -882,7 +882,6 @@ impl OpenCADStudio {
                     .into_iter()
                     .collect();
                 let command = crate::modules::draw::draw::hatch::HatchCommand::new(
-                    Vec::new(),
                     object_sources,
                     vec![*handle],
                     None,

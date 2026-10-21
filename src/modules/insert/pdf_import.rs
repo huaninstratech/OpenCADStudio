@@ -365,10 +365,10 @@ impl PdfImportCommand {
             return CmdResult::ReportError(UNREADABLE_FILE.to_string());
         }
         crate::scene::model::pdf_raster::register_source(&path, std::sync::Arc::new(bytes));
-        // An encrypted file is asked for again without a message.
-        if crate::scene::model::pdf_raster::is_encrypted(&path) {
-            return CmdResult::NeedPoint;
-        }
+        let notice = match crate::scene::model::pdf_password::prompt_gate(&path, text, false) {
+            Ok(notice) => notice,
+            Err(ask) => return ask,
+        };
         let Some(pages) =
             crate::scene::model::pdf_raster::page_count(&path).filter(|&pages| pages > 0)
         else {
@@ -377,7 +377,7 @@ impl PdfImportCommand {
         self.pages = pages;
         self.file.path = path;
         self.step = Step::Page;
-        CmdResult::NeedPoint
+        notice.map_or(CmdResult::NeedPoint, CmdResult::ReportMeasurement)
     }
 
     fn page(&mut self, text: &str) -> CmdResult {
@@ -710,7 +710,8 @@ fn color_of(rgb: [u8; 3]) -> Color {
         [0, 255, 255] => Color::Index(4),
         [0, 0, 255] => Color::Index(5),
         [255, 0, 255] => Color::Index(6),
-        [0, 0, 0] | [255, 255, 255] => Color::Index(7),
+        // Black is 7; white stays a true colour.
+        [0, 0, 0] => Color::Index(7),
         [r, g, b] => Color::Rgb { r, g, b },
     }
 }
@@ -721,8 +722,9 @@ fn lineweight_of(width_pt: f64) -> LineWeight {
         0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158,
         200, 211,
     ];
+    // A zero-width (thinnest) line is the 0.00 mm weight.
     if width_pt <= 0.0 {
-        return LineWeight::ByLayer;
+        return LineWeight::Value(0);
     }
     let hundredths = width_pt * 25.4 / 72.0 * 100.0;
     let best = STANDARD
@@ -855,6 +857,12 @@ impl Stroke {
 /// three-quarter points on the circle through its ends and midpoint), from
 /// its midpoint's height over the chord; positive counter-clockwise.
 fn arc_bulge(seg: &Segment) -> Option<f64> {
+    arc_bulge_within(seg, 2e-3)
+}
+
+/// [`arc_bulge`] with the curve allowed `tolerance` (a share of the
+/// radius) off the circle.
+fn arc_bulge_within(seg: &Segment, tolerance: f64) -> Option<f64> {
     let Segment::Cubic(p0, _, _, p3) = seg else {
         return None;
     };
@@ -870,7 +878,7 @@ fn arc_bulge(seg: &Segment) -> Option<f64> {
     let (a2, b2) = (ax * ax + ay * ay, bx * bx + by * by);
     let c = [(by * a2 - ay * b2) / d, (ax * b2 - bx * a2) / d];
     let r = c[0].hypot(c[1]);
-    let tol = r * 2e-3;
+    let tol = r * tolerance;
     let on = [0.25, 0.75].iter().all(|t| {
         let q = bezier(seg, *t);
         ((q[0] - p0[0] - c[0]).hypot(q[1] - p0[1] - c[1]) - r).abs() <= tol
@@ -1406,24 +1414,18 @@ pub fn convert(
     let in_area = |p: [f64; 2]| area_local.as_deref().is_none_or(|a| inside(a, p));
 
     let mut result = ImportResult::default();
+    // Layers in the order their first object comes; the colours are settled
+    // once every object is made (see `layer_colours_by_majority`).
     let mut layer_colors: Vec<(String, Color)> = Vec::new();
-    // A layer takes the colour of its first object; objects of that colour
-    // then follow the layer.
     let mut color_on = |layer: &str, color: Color| -> Color {
-        let layer_color = match layer_colors.iter().find(|(n, _)| n == layer) {
-            Some((_, c)) => *c,
-            None => {
-                layer_colors.push((layer.to_string(), color));
-                color
-            }
-        };
-        if color == layer_color {
-            Color::ByLayer
-        } else {
-            color
+        if !layer_colors.iter().any(|(n, _)| n == layer) {
+            layer_colors.push((layer.to_string(), color));
         }
+        color
     };
     let fill_transparency = codec::types::Transparency::from_alpha_value(0x0200_007F);
+    // A mirrored placement turns arcs the other way.
+    let turn = (underlay.x_scale * underlay.y_scale).signum();
     let mut strokes: Vec<Stroke> = Vec::new();
     // Circles and splines, by drawing position like the strokes.
     let mut curves: Vec<(usize, EntityType)> = Vec::new();
@@ -1436,6 +1438,38 @@ pub fn convert(
                     continue;
                 }
                 match (path.stroke, path.fill) {
+                    // Filled and stroked by one operator: the fill, at the
+                    // stroke's weight; curves that cannot bound it are lines
+                    // in the stroke's colour.
+                    (Some((stroke_rgb, width)), Some(rgb)) if settings.fills => {
+                        let layer = naming.layer(pdf_layer, Kind::Fill);
+                        let color = color_on(&layer, color_of(rgb));
+                        let weight = if settings.lineweights {
+                            lineweight_of(width)
+                        } else {
+                            LineWeight::ByLayer
+                        };
+                        let (fills, loose) =
+                            fill_entities(path, settings.hatches, turn, &world2, &world3, z);
+                        for mut entity in fills {
+                            let common = entity.common_mut();
+                            (
+                                common.layer,
+                                common.color,
+                                common.transparency,
+                                common.line_weight,
+                            ) = (layer.clone(), color, fill_transparency, weight);
+                            result.entities.push(entity);
+                        }
+                        let layer = naming.layer(pdf_layer, Kind::Geometry);
+                        let color = color_on(&layer, color_of(stroke_rgb));
+                        for mut entity in loose {
+                            let common = entity.common_mut();
+                            (common.layer, common.color, common.line_weight) =
+                                (layer.clone(), color, weight);
+                            curves.push((strokes.len() + curves.len(), entity));
+                        }
+                    }
                     (Some((rgb, width)), _) => {
                         let layer = naming.layer(pdf_layer, Kind::Geometry);
                         let color = color_on(&layer, color_of(rgb));
@@ -1500,12 +1534,22 @@ pub fn convert(
                     (None, Some(rgb)) if settings.fills => {
                         let layer = naming.layer(pdf_layer, Kind::Fill);
                         let color = color_on(&layer, color_of(rgb));
-                        for mut entity in fill_entities(path, settings.hatches, &world2, &world3, z)
-                        {
+                        let (fills, loose) =
+                            fill_entities(path, settings.hatches, turn, &world2, &world3, z);
+                        for mut entity in fills {
                             let common = entity.common_mut();
                             (common.layer, common.color, common.transparency) =
                                 (layer.clone(), color, fill_transparency);
                             result.entities.push(entity);
+                        }
+                        // Curves that cannot bound the fill are lines in its
+                        // colour.
+                        let layer = naming.layer(pdf_layer, Kind::Geometry);
+                        let color = color_on(&layer, color_of(rgb));
+                        for mut entity in loose {
+                            let common = entity.common_mut();
+                            (common.layer, common.color) = (layer.clone(), color);
+                            curves.push((strokes.len() + curves.len(), entity));
                         }
                     }
                     _ => {}
@@ -1542,7 +1586,8 @@ pub fn convert(
                 mtext.rotation = text.rotation + underlay.rotation;
                 mtext.style = style;
                 mtext.attachment_point = AttachmentPoint::MiddleLeft;
-                let layer = naming.layer(pdf_layer, Kind::Text);
+                // Text goes to the text layer whatever PDF layer holds it.
+                let layer = naming.layer(None, Kind::Text);
                 mtext.common.color = color_on(&layer, color_of(text.color));
                 mtext.common.layer = layer;
                 result.entities.push(EntityType::MText(Box::new(mtext)));
@@ -1585,8 +1630,6 @@ pub fn convert(
 
     // The joined strokes, then (when asked) dashes read as one dashed line.
     let strokes = join_strokes(strokes, settings.join);
-    // A mirrored placement turns arcs the other way.
-    let turn = (underlay.x_scale * underlay.y_scale).signum();
     // Joined strokes that trace circles, arcs and ellipses become those.
     let strokes: Vec<Stroke> = strokes
         .into_iter()
@@ -1664,12 +1707,41 @@ pub fn convert(
         .entities
         .extend(curves.into_iter().map(|(_, entity)| entity));
     result.layers = layer_colors;
+    layer_colours_by_majority(&mut result);
     for image in &result.images {
         if !result.layers.iter().any(|(n, _)| *n == image.layer) {
             result.layers.push((image.layer.clone(), Color::Index(7)));
         }
     }
     result
+}
+
+/// Each layer takes the colour most of its objects have (the first such
+/// colour on a tie); those objects then follow the layer.
+fn layer_colours_by_majority(result: &mut ImportResult) {
+    for (layer, layer_color) in &mut result.layers {
+        let mut counts: Vec<(Color, usize)> = Vec::new();
+        for entity in &result.entities {
+            let common = entity.common();
+            if common.layer != *layer {
+                continue;
+            }
+            match counts.iter_mut().find(|(c, _)| *c == common.color) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((common.color, 1)),
+            }
+        }
+        // `max_by_key` keeps the last maximum: search from the back.
+        if let Some((color, _)) = counts.iter().rev().max_by_key(|(_, n)| *n) {
+            *layer_color = *color;
+        }
+        for entity in &mut result.entities {
+            let common = entity.common_mut();
+            if common.layer == *layer && common.color == *layer_color {
+                common.color = Color::ByLayer;
+            }
+        }
+    }
 }
 
 /// One cubic B-spline through a subpath's Bézier control points (lines as
@@ -1711,75 +1783,142 @@ fn spline_of(sp: &SubPath, world3: &dyn Fn([f64; 2]) -> Vector3) -> Spline {
     spline
 }
 
-/// A filled area: a triangle or four-cornered straight loop is a SOLID; any
-/// other loop, and every loop but a triangle when fills become hatches, one
+/// A filled area, and the curves that cannot bound it: a lone triangle or
+/// four-cornered straight loop is a SOLID; other loops (with circular arcs
+/// as bulges), and every loop but a triangle when fills become hatches, one
 /// solid HATCH.
 fn fill_entities(
     path: &PdfPath,
     hatches: bool,
+    turn: f64,
     world2: &dyn Fn([f64; 2]) -> Vector2,
     world3: &dyn Fn([f64; 2]) -> Vector3,
     z: f64,
-) -> Vec<EntityType> {
-    let straight = |sp: &SubPath| sp.segments.iter().all(|s| matches!(s, Segment::Line(..)));
-    let corners = |sp: &SubPath| {
-        let mut pts: Vec<[f64; 2]> = sp.segments.iter().map(|s| s.start()).collect();
-        pts.dedup_by(|a, b| same_point(*a, *b));
-        if pts.len() > 1 && same_point(pts[0], *pts.last().unwrap()) {
-            pts.pop();
+) -> (Vec<EntityType>, Vec<EntityType>) {
+    // Each subpath splits where a curve is not a circular arc (within the
+    // error of the usual four-curve circle): such a curve is its own spline,
+    // a straight one a two-point polyline (the reference cannot bound a fill
+    // with them), and each run of lines and arcs between them is one loop
+    // of the fill.
+    let arc = |seg: &Segment| arc_bulge_within(seg, 5e-4);
+    // A run that goes all round closes on its start; one cut by a curve
+    // ends at its last point. A loop that stays on one point (to the file's
+    // single precision) bounds nothing.
+    let finish = |mut run: Vec<([f64; 2], f64)>, end: Option<[f64; 2]>| {
+        if let Some(e) = end {
+            if !run.first().is_some_and(|(p, _)| same_point(*p, e)) {
+                run.push((e, 0.0));
+            }
         }
-        pts
+        run.dedup_by(|a, b| same_point(a.0, b.0) && a.1 == 0.0 && b.1 == 0.0);
+        if let [(first, _), .., (last, bulge)] = run.as_slice() {
+            if same_point(*first, *last) && *bulge == 0.0 {
+                run.pop();
+            }
+        }
+        let o = run.first().map_or([0.0; 2], |(p, _)| *p);
+        run.iter()
+            .any(|(p, _)| (p[0] - o[0]).hypot(p[1] - o[1]) > 1e-5)
+            .then_some(run)
     };
-    if path.subpaths.len() == 1 && straight(&path.subpaths[0]) {
-        let pts = corners(&path.subpaths[0]);
-        match pts.len() {
-            3 => {
-                return vec![EntityType::Solid(Solid::triangle(
-                    world3(pts[0]),
-                    world3(pts[1]),
-                    world3(pts[2]),
-                ))]
+    let mut loops: Vec<Vec<([f64; 2], f64)>> = Vec::new();
+    let mut curves: Vec<EntityType> = Vec::new();
+    for sp in &path.subpaths {
+        let mut segments = sp.segments.clone();
+        // A fill closes every subpath; the walk starts after its first
+        // curve that cannot bound the fill, so the run through the
+        // subpath's start stays one loop.
+        if let (Some(first), Some(last)) = (segments.first(), segments.last()) {
+            let (first, last) = (first.start(), last.end());
+            if !same_point(first, last) {
+                segments.push(Segment::Line(last, first));
             }
-            4 if !hatches => {
-                // SOLID corners run 1-2-4-3 (the second edge crosses).
-                return vec![EntityType::Solid(Solid::new(
-                    world3(pts[0]),
-                    world3(pts[1]),
-                    world3(pts[3]),
-                    world3(pts[2]),
-                ))];
+        }
+        let cut = |seg: &Segment| matches!(seg, Segment::Cubic(..)) && arc(seg).is_none();
+        if let Some(k) = segments.iter().position(cut) {
+            segments.rotate_left(k + 1);
+        }
+        let mut run: Vec<([f64; 2], f64)> = Vec::new();
+        let mut end: Option<[f64; 2]> = None;
+        for seg in &segments {
+            match seg {
+                Segment::Cubic(a, b, c, d) if cut(seg) => {
+                    loops.extend(finish(std::mem::take(&mut run), end.take()));
+                    let off = |p: &[f64; 2]| {
+                        let (dx, dy) = (d[0] - a[0], d[1] - a[1]);
+                        let cross = (p[0] - a[0]) * dy - (p[1] - a[1]) * dx;
+                        cross.abs() / dx.hypot(dy).max(1e-12)
+                    };
+                    if off(b) <= 1e-9 && off(c) <= 1e-9 {
+                        let mut line = LwPolyline::from_points(vec![world2(*a), world2(*d)]);
+                        line.elevation = z;
+                        curves.push(EntityType::LwPolyline(line));
+                    } else {
+                        let one = SubPath {
+                            segments: vec![seg.clone()],
+                            closed: false,
+                        };
+                        curves.push(EntityType::Spline(spline_of(&one, world3)));
+                    }
+                }
+                _ => {
+                    run.push((seg.start(), arc(seg).unwrap_or(0.0)));
+                    end = Some(seg.end());
+                }
             }
-            _ => {}
+        }
+        loops.extend(finish(run, end));
+    }
+    let straight = |l: &Vec<([f64; 2], f64)>| l.iter().all(|(_, b)| *b == 0.0);
+    if let [only] = loops.as_slice() {
+        if straight(only) {
+            let pts: Vec<[f64; 2]> = only.iter().map(|(p, _)| *p).collect();
+            match pts.len() {
+                3 => {
+                    return (
+                        vec![EntityType::Solid(Solid::triangle(
+                            world3(pts[0]),
+                            world3(pts[1]),
+                            world3(pts[2]),
+                        ))],
+                        curves,
+                    )
+                }
+                4 if !hatches => {
+                    // SOLID corners run 1-2-4-3 (the second edge crosses).
+                    return (
+                        vec![EntityType::Solid(Solid::new(
+                            world3(pts[0]),
+                            world3(pts[1]),
+                            world3(pts[3]),
+                            world3(pts[2]),
+                        ))],
+                        curves,
+                    );
+                }
+                _ => {}
+            }
         }
     }
     let mut hatch = Hatch::solid();
-    for sp in &path.subpaths {
-        let mut ring: Vec<Vector2> = Vec::new();
-        for seg in &sp.segments {
-            let steps = if matches!(seg, Segment::Cubic(..)) {
-                8
-            } else {
-                1
-            };
-            for k in 0..steps {
-                ring.push(world2(bezier(seg, k as f64 / steps as f64)));
-            }
-        }
-        if ring.len() < 3 {
+    for l in &loops {
+        if l.len() < 2 {
             continue;
+        }
+        let mut edge = PolylineEdge::new(Vec::new(), true);
+        for (p, bulge) in l {
+            edge.add_vertex(world2(*p), bulge * turn);
         }
         let mut boundary = BoundaryPath::external();
         boundary.flags.set_polyline(true);
-        boundary
-            .edges
-            .push(BoundaryEdge::Polyline(PolylineEdge::new(ring, true)));
+        boundary.edges.push(BoundaryEdge::Polyline(edge));
         hatch.add_path(boundary);
     }
     if hatch.paths.is_empty() {
-        return Vec::new();
+        return (Vec::new(), curves);
     }
     hatch.elevation = z;
-    vec![EntityType::Hatch(Box::new(hatch))]
+    (vec![EntityType::Hatch(Box::new(hatch))], curves)
 }
 
 inventory::submit!(crate::command::CommandRegistration {

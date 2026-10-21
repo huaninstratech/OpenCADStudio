@@ -225,3 +225,51 @@ fn degenerate_linear_preview_defers_to_plain_rubber_band() {
     assert_eq!(text(&app, &styled[0]), "80");
     assert!(committed(&app).is_empty(), "hover must not commit");
 }
+
+/// The vertical extent of a dimension's rendered text.
+fn rendered_text_height(app: &OpenCADStudio, handle: Handle) -> f32 {
+    let name = handle.value().to_string();
+    let wires = app.tabs[app.active_tab].scene.entity_wires();
+    let (low, high) = wires
+        .iter()
+        .filter(|wire| wire.name == name)
+        .flat_map(|wire| &wire.text_verts)
+        .fold((f32::MAX, f32::MIN), |(low, high), vertex| {
+            (low.min(vertex.pos[1]), high.max(vertex.pos[1]))
+        });
+    high - low
+}
+
+#[test]
+fn annotative_dimension_text_follows_the_scale_once() {
+    // #1939: a dimension holding a representation for the displayed scale
+    // drew its text at the square of that scale.
+    let (mut app, i) = app();
+    let _ = app.dispatch_command("CANNOSCALE 1:1");
+    app.dimstyle_selected = app.tabs[i]
+        .scene
+        .document
+        .header
+        .current_dimstyle_name
+        .clone();
+    app.load_dimstyle_bufs(i);
+    app.apply_ds_toggle(crate::app::DsField::Annotative);
+    app.apply_dimstyle_bufs(i);
+    let dimension = place_linear(
+        &mut app,
+        DVec3::ZERO,
+        DVec3::new(100.0, 0.0, 0.0),
+        DVec3::new(50.0, 20.0, 0.0),
+    );
+    let at_one = rendered_text_height(&app, dimension);
+    app.annotation_auto_scale = 4;
+    let _ = app.dispatch_command("CANNOSCALE 1:2");
+    let scales: Vec<_> =
+        crate::scene::annotative::object_scale_memberships(&app.tabs[i].scene.document, dimension)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    assert_eq!(scales, ["1:1", "1:2"]);
+    let ratio = rendered_text_height(&app, dimension) / at_one;
+    assert!((ratio - 2.0).abs() < 1.0e-3, "text grew {ratio}x at 1:2");
+}

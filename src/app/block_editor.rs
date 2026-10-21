@@ -150,17 +150,30 @@ impl OpenCADStudio {
                 candidate_handles.insert(record.block_end_handle);
             }
         }
+        // Action-set edits can rebuild anonymous references outside the editor
+        // definition. Include their entities in the single drawing save delta.
+        for document in [before_doc, &tab.scene.document] {
+            for entity in document.entities() {
+                if let EntityType::Insert(insert) = entity {
+                    if document.dynamic_definition_for_insert(insert.common.handle)
+                        == Some(session.br_handle)
+                    {
+                        candidate_handles.insert(insert.common.handle);
+                        if let Some(record) = document.block_records.get(&insert.block_name) {
+                            candidate_handles.extend(record.entity_handles.iter().copied());
+                            candidate_handles.insert(record.block_entity_handle);
+                            candidate_handles.insert(record.block_end_handle);
+                        }
+                    }
+                }
+            }
+        }
         let mut sub_handles = Vec::new();
         for &h in &candidate_handles {
-            let entity_opt = before_doc
-                .get_entity(h)
-                .or_else(|| tab.scene.document.get_entity(h));
-            if let Some(EntityType::Insert(ins)) = entity_opt {
-                for attr in &ins.attributes {
-                    sub_handles.push(attr.common.handle);
-                }
-                if let Some(seqend) = ins.seqend_handle {
-                    sub_handles.push(seqend);
+            for document in [before_doc, &tab.scene.document] {
+                if let Some(EntityType::Insert(insert)) = document.get_entity(h) {
+                    sub_handles.extend(insert.attributes.iter().map(|a| a.common.handle));
+                    sub_handles.extend(insert.seqend_handle);
                 }
             }
         }
@@ -309,6 +322,11 @@ impl OpenCADStudio {
     }
 
     pub(super) fn open_bedit_dialog(&mut self, i: usize) {
+        if self.block_editor_preferences.locked {
+            self.command_line
+                .push_error(crate::t!("The Block Editor is locked by BLOCKEDITLOCK.").as_ref());
+            return;
+        }
         if self.tabs[i].refedit_session.is_some() {
             self.command_line.push_error(
                 crate::t!("BEDIT: finish the active REFEDIT (REFCLOSE) first.").as_ref(),
@@ -550,6 +568,7 @@ impl OpenCADStudio {
         self.grip_hover = None;
         self.grip_popup = None;
         self.visibility_popup = None;
+        self.table_popup = None;
         history.checkpoint = self.block_edit_checkpoint(i);
         self.tabs[i].block_edit_history = Some(history);
         self.tabs[i].scene.bump_geometry();
@@ -560,6 +579,49 @@ impl OpenCADStudio {
         self.command_line
             .push_output(crate::tf!("Block {} saved.", name).as_ref());
         true
+    }
+
+    /// Save-time representation edits belong to the preceding editor command,
+    /// so local Undo cannot leave untracked members or reuse their handles.
+    fn coalesce_saved_representations(&mut self, i: usize, before: &CadDocument) {
+        let tab = &mut self.tabs[i];
+        let doc = &tab.scene.document;
+        if before == doc {
+            return;
+        }
+        let Some(HistorySnapshot::Delta(delta)) = tab.history.undo_stack.last_mut() else {
+            return;
+        };
+        let handles = before
+            .entities()
+            .chain(doc.entities())
+            .map(|e| e.common().handle)
+            .collect::<FxHashSet<_>>();
+        for handle in handles {
+            let a = before.get_entity_arc(handle);
+            let b = doc.get_entity_arc(handle);
+            if a == b {
+                continue;
+            }
+            if let Some((_, _, after)) = delta.entities.iter_mut().find(|(h, _, _)| *h == handle) {
+                *after = b;
+            } else {
+                delta.entities.push((handle, a, b));
+            }
+        }
+        if !delta
+            .structure
+            .as_ref()
+            .is_some_and(StructureSnapshot::is_full)
+        {
+            let mut previous = before.clone();
+            let broad = StructureSnapshot::Full(previous.snapshot_structure());
+            delta.structure = Some(match delta.structure.take() {
+                Some(specialized) => StructureSnapshot::Combined(vec![broad, specialized]),
+                None => broad,
+            });
+        }
+        delta.dirty_after = true;
     }
 
     pub(super) fn save_block_edit(&mut self, i: usize) -> bool {
@@ -601,11 +663,33 @@ impl OpenCADStudio {
         // A dynamic block leaves the editor showing its first visibility
         // state, with erased objects dropped from its states.
         let definition = session.br_handle;
-        crate::scene::block_visibility::finish_editing(
-            &mut self.tabs[i].scene.document,
-            definition,
-        );
-        self.tabs[i].scene.visibility_states.remove(&definition);
+        if self.block_edit_delta(i, true).is_some() {
+            self.reconcile_block_edit_membership(i);
+            self.finish_pending_history(i);
+            let before_sync = self.tabs[i].scene.document.clone();
+            let mut staged = before_sync.clone();
+            crate::scene::block_visibility::finish_editing(&mut staged, definition);
+            crate::scene::block_actions::prune_erased_targets(&mut staged, definition);
+            let before = &self.tabs[i]
+                .block_edit_history
+                .as_ref()
+                .unwrap()
+                .checkpoint
+                .document;
+            match crate::scene::block_actions::instance::refresh_after_edit(
+                &staged, before, definition,
+            ) {
+                Ok(document) => {
+                    self.apply_action_document(i, document);
+                    self.coalesce_saved_representations(i, &before_sync);
+                }
+                Err(error) => {
+                    self.command_line.push_error(crate::t!(error).as_ref());
+                    return false;
+                }
+            }
+            self.tabs[i].scene.visibility_states.remove(&definition);
+        }
         if let Some(delta) = self.block_edit_delta(i, true) {
             let mut history = self.tabs[i].block_edit_history.take().unwrap();
             std::mem::swap(&mut self.tabs[i].history, &mut history.main);

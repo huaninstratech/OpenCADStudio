@@ -281,15 +281,16 @@ pub static PROPERTY: OpDef = OpDef {
 
 pub static GRIP_DRAG: OpDef = OpDef {
     name: "grip_drag",
-    doc: "Drag one grip of an entity to a world point the way a grip pick-and-place in the viewport does. Read grips for the ids; object snaps, ortho and polar are off for the move.",
+    doc: "Drag one grip to a world point the way a grip pick-and-place in the viewport does. Built-ins: supply handle (read grips for the ids); object snaps, ortho and polar are off for the move. Plugin-declared custom grips (API v11): supply plugin (the owner id from the grips read's plugin_grips) instead of a handle — the drag routes to the owning plugin (begin, move, settle), whose settle writes are its own single undo step.",
     batchable: true,
     params: &[
-        req("handle", Ty::Handle, "Entity whose grip moves."),
-        req("grip_id", Ty::Int, "Grip id from the grips read."),
+        opt("handle", Ty::Handle, "Entity whose grip moves (built-in grips)."),
+        req("grip_id", Ty::Int, "Grip id from the grips read (entity grip id, or the plugin grip's id for custom grips)."),
         req("point", Ty::Point, "World point [x, y, z] the grip moves to."),
+        opt("plugin", Ty::Str, "Owner plugin id when dragging a plugin-declared custom grip (from the grips read's plugin_grips); omit for built-in entity grips."),
     ],
     rules: &[],
-    example: r#"{"op":"grip_drag","handle":"2A","grip_id":0,"point":[10,0,0]}"#,
+    example: r#"{"op":"grip_drag","plugin":"opencad.civil_ifc","grip_id":7,"point":[10,0,0]}"#,
 };
 
 pub static CLICK: OpDef = OpDef {
@@ -312,7 +313,7 @@ pub static POINTER: OpDef = OpDef {
         req(
             "events",
             Ty::ArrayOf(&Ty::Raw(r#"{"type":"object","properties":{"move":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"move_world":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"press":{"type":"string","enum":["left","right","middle"]},"release":{"type":"string","enum":["left","right","middle"]},"wheel":{"type":"number"}}}"#)),
-            "Events in order; each holds one of move, move_world, press, release or wheel (lines, positive zooms in).",
+            "Events in order; each holds one of move, move_world, press, release, wheel (lines, positive zooms in) or leave (true: the pointer leaves the canvas).",
         ),
         opt("modifiers", Ty::Str, "Keys held throughout: \"ctrl\", \"shift\" or \"ctrl+shift\"."),
     ],

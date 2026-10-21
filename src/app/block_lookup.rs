@@ -54,7 +54,7 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, &format!("{} parameter", kind.name()));
-        match kind {
+        let parameter = match kind {
             Kind::Basepoint => {
                 block_basepoint::create(&mut self.tabs[i].scene.document, definition, location)
             }
@@ -75,7 +75,7 @@ impl OpenCADStudio {
             })
             .as_ref(),
         );
-        Task::none()
+        self.finish_parameter_set_placement(i, parameter)
     }
     pub(in crate::app) fn lookup_table_error(&self) -> Option<&'static str> {
         let tab = &self.tabs[self.active_tab];

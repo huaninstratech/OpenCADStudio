@@ -88,6 +88,29 @@ impl OpenCADStudio {
         (!offered).then_some(kind)
     }
 
+    /// Keys while the snap override menu is open: a snap's letter (see
+    /// [`crate::snap::override_menu_key`]) picks it; any other command-line
+    /// key is swallowed so it cannot land in the prompt behind the menu.
+    pub(in crate::app) fn intercept_snap_override_key(
+        &mut self,
+        msg: &crate::app::Message,
+    ) -> Option<iced::Task<crate::app::Message>> {
+        use crate::app::Message;
+        let typed = match msg {
+            Message::CommandAppendChar(s) => s.chars().next(),
+            // The focused field delivers its whole buffer; take the new char.
+            Message::CommandInput(buf) => buf
+                .strip_prefix(self.command_line.input.as_str())
+                .and_then(|rest| rest.chars().next()),
+            _ => None,
+        };
+        if let Some(t) = typed.and_then(crate::snap::override_menu_snap) {
+            self.apply_snap_override(crate::snap::SnapOverrideKind::Mode(t));
+            return Some(iced::Task::none());
+        }
+        super::is_modal_blocked_key_msg(msg).then(iced::Task::none)
+    }
+
     /// Apply a transparent one-shot snap override (from typed input or the context menu).
     pub(crate) fn apply_snap_override(&mut self, kind: crate::snap::SnapOverrideKind) {
         match kind {

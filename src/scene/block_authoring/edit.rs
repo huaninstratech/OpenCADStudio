@@ -93,18 +93,63 @@ pub fn items(doc: &CadDocument, definition: Handle) -> Vec<Item> {
             p.parameter.definition_point,
         ));
     }
-    if let Some((handle, p)) = crate::scene::block_basepoint::parameter(doc, definition) {
-        result.push(single(
+    let basepoint = crate::scene::block_basepoint::parameter(doc, definition)
+        .map(|(handle, p)| {
+            (
+                handle,
+                p.parameter.definition_point,
+                p.parameter.parameter.element.name.clone(),
+            )
+        })
+        .or_else(|| {
+            let name = doc
+                .block_records
+                .iter()
+                .find(|record| record.handle == definition)?
+                .name
+                .as_str();
+            Some((
+                definition,
+                crate::scene::render_graph::block_base_point(doc, name),
+                "Basepoint".to_string(),
+            ))
+        });
+    if let Some((handle, point, name)) = basepoint {
+        let label = point + Vector3::new(0.25, 0.25, 0.0);
+        let mut graphic = Graphic::default();
+        graphic.lines.push([point, label]);
+        graphic.labels.push((label, name.clone()));
+        result.push(Item {
             handle,
-            "Basepoint".into(),
-            p.parameter.definition_point,
-        ));
+            name,
+            graphic,
+            grips: vec![(Part::Point, point)],
+        });
     }
     if let Some(p) = crate::scene::block_visibility::parameter(doc, definition) {
         result.push(single(p.handle, p.name.clone(), p.def_point));
     }
     for (handle, p, _, _) in crate::scene::block_actions::actions(doc, definition) {
-        result.push(single(handle, p.element.name.clone(), p.display_location));
+        let mut item = single(handle, p.element.name.clone(), p.display_location);
+        if let Some(base) =
+            crate::scene::block_actions::options::base(doc, handle).filter(|base| !base.dependent)
+        {
+            item.grips.push((Part::Base, base.base_point));
+            item.graphic
+                .lines
+                .push([p.display_location, base.base_point]);
+        }
+        let frame = crate::scene::block_actions::frame_outline(doc, handle);
+        if !frame.is_empty() {
+            item.graphic.lines.extend(
+                frame
+                    .iter()
+                    .zip(frame.iter().cycle().skip(1))
+                    .take(frame.len())
+                    .map(|(a, b)| [*a, *b]),
+            );
+        }
+        result.push(item);
     }
     result
 }
@@ -167,13 +212,16 @@ pub fn move_part(
     if (at - old).length() < 1e-10 {
         return Ok(false);
     }
-    let graph = graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
     let mut staged = doc.clone();
-    if crate::scene::block_basepoint::parameter(doc, definition).is_some_and(|(h, _)| h == handle) {
+    if handle == definition
+        || crate::scene::block_basepoint::parameter(doc, definition)
+            .is_some_and(|(h, _)| h == handle)
+    {
         crate::scene::block_basepoint::create(&mut staged, definition, at)?;
         *doc = staged;
         return Ok(true);
     }
+    let graph = graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
     let mut moved_grips = vec![];
     match staged
         .objects
@@ -277,7 +325,20 @@ pub fn move_part(
                     }
                 }
                 DynamicBlockData::MoveAction(p) => p.action.display_location = at,
-                DynamicBlockData::ScaleAction(p) => p.action.action.display_location = at,
+                DynamicBlockData::ArrayAction(p) => p.action.display_location = at,
+                DynamicBlockData::StretchAction(p) => p.action.display_location = at,
+                DynamicBlockData::FlipAction(p) => p.action.display_location = at,
+                DynamicBlockData::ScaleAction(p) | DynamicBlockData::RotateAction(p) => {
+                    if part == Part::Base {
+                        crate::scene::block_actions::options::pivot(
+                            &p.action,
+                            glam::DVec3::new(at.x, at.y, at.z),
+                        )?;
+                        p.action.base_point = at;
+                    } else {
+                        p.action.action.display_location = at;
+                    }
+                }
                 DynamicBlockData::AlignmentParameter(_) => {}
                 _ => return Err("This authoring object cannot be edited yet."),
             }
@@ -392,6 +453,166 @@ pub fn move_part(
     *doc = staged;
     Ok(true)
 }
+
+/// Remove an authoring parameter or action together with the graph
+/// expressions that it owns. Action bindings are reciprocal graph edges, so
+/// they are detached from both ends; actions left without any parameter can no
+/// longer drive anything and are removed with it.
+pub fn remove_parameter(
+    doc: &mut CadDocument,
+    definition: Handle,
+    handle: Handle,
+) -> Result<(), &'static str> {
+    if !items(doc, definition)
+        .iter()
+        .any(|item| item.handle == handle)
+    {
+        return Err("The selected authoring parameter is no longer available.");
+    }
+    if handle == definition && crate::scene::block_basepoint::parameter(doc, definition).is_none() {
+        return Err("The block basepoint cannot be deleted.");
+    }
+    let actions = crate::scene::block_actions::actions(doc, definition)
+        .into_iter()
+        .map(|(action, ..)| action)
+        .collect::<Vec<_>>();
+    let is_action = actions.contains(&handle);
+    // Objects hidden by a visibility state would stay hidden with no state left.
+    let unhide = match doc.objects.get(&handle) {
+        Some(ObjectType::BlockVisibilityParameter(p)) => p.all_blocks.clone(),
+        _ => vec![],
+    };
+    let graph_handle = graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
+    let ObjectType::DynamicBlock(graph_object) = doc.objects.get(&graph_handle).unwrap() else {
+        unreachable!()
+    };
+    let DynamicBlockData::EvaluationGraph(original) = &graph_object.data else {
+        unreachable!()
+    };
+    let mut graph = original.clone();
+    let parameter_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.expression == handle)
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    if parameter_nodes.len() != 1 {
+        return Err("The selected parameter has an invalid graph node.");
+    }
+    let parameter_node = parameter_nodes[0];
+    let mut owned_nodes = vec![parameter_node];
+    // Native authoring groups have one grip edge (grip -> parameter) and up
+    // to two component edges (parameter -> grip location components). Classify
+    // endpoint objects as well as edge direction so unrelated graph edges
+    // cannot cause another parameter to be erased.
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| !is_action && edge.next_id == 0)
+    {
+        if edge.destination_node == parameter_node
+            && graph.nodes.iter().find(|node| node.id == edge.source_node).is_some_and(|node| {
+                matches!(doc.objects.get(&node.expression), Some(ObjectType::DynamicBlock(object)) if matches!(object.data, DynamicBlockData::LinearGrip(_) | DynamicBlockData::PolarGrip(_) | DynamicBlockData::XYGrip(_) | DynamicBlockData::RotationGrip(_) | DynamicBlockData::AlignmentGrip(_) | DynamicBlockData::FlipGrip(_) | DynamicBlockData::LookupGrip(_) | DynamicBlockData::VisibilityGrip(_)))
+            })
+        {
+            owned_nodes.push(edge.source_node);
+        } else if edge.source_node == parameter_node
+            && graph.nodes.iter().find(|node| node.id == edge.destination_node).is_some_and(|node| {
+                matches!(doc.objects.get(&node.expression), Some(ObjectType::DynamicBlock(object)) if matches!(object.data, DynamicBlockData::GripLocationComponent(_)))
+            })
+        {
+            owned_nodes.push(edge.destination_node);
+        }
+    }
+    owned_nodes.sort_unstable();
+    owned_nodes.dedup();
+    let mut edge_ids = graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            owned_nodes.contains(&edge.source_node) || owned_nodes.contains(&edge.destination_node)
+        })
+        .map(|edge| edge.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    // Action relationships use reciprocal next_id=4 edges. Remove their
+    // inverse too; the action itself goes only once nothing else drives it.
+    let selected_edges = edge_ids.iter().copied().collect::<Vec<_>>();
+    for selected in selected_edges {
+        let Some(edge) = graph.edges.iter().find(|edge| edge.id == selected) else {
+            continue;
+        };
+        if edge.next_id == 4 {
+            let inverse = graph
+                .edges
+                .iter()
+                .find(|candidate| candidate.id == edge.outgoing_edges[4]);
+            let Some(inverse) = inverse.filter(|inverse| {
+                inverse.next_id == 4
+                    && inverse.outgoing_edges[4] == edge.id
+                    && inverse.source_node == edge.destination_node
+                    && inverse.destination_node == edge.source_node
+            }) else {
+                return Err("The parameter has an invalid action binding; it was not deleted.");
+            };
+            edge_ids.insert(inverse.id);
+        }
+    }
+    let bound = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.next_id == 4 && edge.source_node == parameter_node)
+        .map(|edge| edge.destination_node)
+        .collect::<Vec<_>>();
+    for edge in edge_ids {
+        crate::scene::block_authoring::graph::remove(&mut graph, edge);
+    }
+    if !is_action {
+        owned_nodes.extend(bound.into_iter().filter(|node| {
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == *node && actions.contains(&n.expression))
+                && !graph
+                    .edges
+                    .iter()
+                    .any(|edge| edge.source_node == *node || edge.destination_node == *node)
+        }));
+    }
+    let removed_handles = owned_nodes
+        .iter()
+        .filter_map(|node_id| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *node_id)
+                .map(|node| node.expression)
+        })
+        .collect::<Vec<_>>();
+    graph.nodes.retain(|node| !owned_nodes.contains(&node.id));
+    if let Some(max) = graph.nodes.iter().map(|node| node.next_id).max() {
+        graph.first_node_id = max;
+        graph.first_node_id_copy = max;
+    } else {
+        graph.first_node_id = 0;
+        graph.first_node_id_copy = 0;
+    }
+    if let Some(ObjectType::DynamicBlock(object)) = doc.objects.get_mut(&graph_handle) {
+        object.data = DynamicBlockData::EvaluationGraph(graph);
+    }
+    for owned in removed_handles.into_iter().chain(std::iter::once(handle)) {
+        if owned != graph_handle {
+            doc.objects.remove(&owned);
+        }
+    }
+    doc.block_visibility_params.remove(&handle);
+    for member in unhide {
+        if let Some(entity) = doc.get_entity_mut(member) {
+            entity.common_mut().invisible = false;
+        }
+    }
+    Ok(())
+}
+
 fn label_offset(p: &BlockTwoPointParameter, at: Vector3) -> f64 {
     let d = p.definition_end_point - p.definition_base_point;
     let n = Vector3::new(-d.y, d.x, 0.) * (1.0 / d.x.hypot(d.y));

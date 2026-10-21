@@ -669,7 +669,7 @@ fn run_probe_for(arg: &str) -> Option<ProbeCaps> {
 pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution {
     let prefs = load_prefs();
     let env_backend = std::env::var("WGPU_BACKEND").ok();
-    let excluded = if previous_run_crashed() {
+    let mut excluded = if previous_run_crashed() {
         crashed_backends()
     } else {
         Vec::new()
@@ -771,6 +771,33 @@ pub fn resolve_gpu(cli_backend: Option<&str>, safe_mode: bool) -> GpuResolution 
     } else {
         None
     };
+    // A run killed before the proof delay leaves a sentinel naming a backend
+    // that may never have failed. When nothing else can draw, the last resort
+    // is a GL that has just failed its own probe, so probe the suspect too
+    // (out of process, like every probe) unless the previous run's crash
+    // report says the graphics device itself failed.
+    if sw.is_none()
+        && results.iter().all(|(_, c)| c.is_none())
+        && !excluded.is_empty()
+        && !sentinel_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|text| crash_report_blames_the_device(&text))
+    {
+        for backend in std::mem::take(&mut excluded) {
+            let caps = run_probe_for(&backend);
+            eprintln!(
+                "[gpu] nothing else passed; retry {backend} from the previous run: {}",
+                caps.as_ref()
+                    .map(|c| c.adapter.as_str())
+                    .unwrap_or("FAILED")
+            );
+            let passed = caps.is_some();
+            results.push((backend, caps));
+            if passed {
+                break;
+            }
+        }
+    }
     let d = decide_backend(
         None,
         None,

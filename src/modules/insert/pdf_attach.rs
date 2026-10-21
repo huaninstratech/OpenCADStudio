@@ -276,8 +276,15 @@ impl PdfAttachCommand {
                 UnderlayType::Dgn => ".dgn",
             });
         }
+        let mut notice = None;
+        if self.kind == UnderlayType::Pdf {
+            match crate::scene::model::pdf_password::prompt_gate(&path, text, true) {
+                Ok(n) => notice = n,
+                Err(ask) => return ask,
+            }
+        }
         match self.open(&path) {
-            true => CmdResult::NeedPoint,
+            true => notice.map_or(CmdResult::NeedPoint, CmdResult::ReportMeasurement),
             false => CmdResult::ReportError(format!(
                 "{} not found.",
                 crate::entities::underlay::display_path(&path)
