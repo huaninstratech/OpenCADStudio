@@ -22,7 +22,8 @@ HTTP port, a stdio pipe, a TCP socket or an AI-tool (MCP) session.
 
 MCP session set-up and a hands-on REST walkthrough live in
 [`docs/automation/README.md`](README.md); this file links to it rather than
-repeating either.
+repeating either. A Vietnamese translation of this specification is
+maintained at [`API-SPEC.vi.md`](API-SPEC.vi.md).
 
 ---
 
