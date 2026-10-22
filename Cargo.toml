@@ -1,7 +1,7 @@
 [package]
 name = "OpenCADStudio"
 
-version = "2026.51.1"
+version = "2026.52.0"
 
 edition = "2021"
 build = "build.rs"
