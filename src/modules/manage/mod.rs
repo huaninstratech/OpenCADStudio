@@ -6,6 +6,7 @@ pub mod compare;
 mod cui_export;
 mod cui_import;
 mod find_nonpurgeable;
+mod legacy;
 mod options;
 mod overkill;
 mod purge;
@@ -73,6 +74,7 @@ impl CadModule for ManageModule {
                     tools: vec![
                         RibbonItem::LargeTool(find_nonpurgeable::tool()),
                         RibbonItem::Tool(purge::tool()),
+                        RibbonItem::Tool(legacy::tool()),
                         RibbonItem::Tool(overkill::tool()),
                         RibbonItem::Tool(audit::tool()),
                     ],

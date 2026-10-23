@@ -1037,6 +1037,30 @@ pub fn load_file(path: &Path) -> Result<CadDocument, String> {
     load_file_with_progress(path, None).map(|outcome| outcome.document)
 }
 
+/// Strict read first; when the file only parses under the failsafe reader
+/// (corrupt objects, truncated streams), retry in recovery mode and hand
+/// back whatever drawing data survived. Headless conversion needs this —
+/// PURGELEGACY exists exactly for such files, so `--export` must be able
+/// to open them even though the strict read balks.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_file_recovering(path: &Path) -> Result<CadDocument, String> {
+    load_file(path).or_else(|strict_error| {
+        let outcome = read_file_attempt(path, None, true)
+            .map_err(|failure| failure.message)
+            .and_then(|outcome| {
+                if outcome.stats.has_usable_drawing_data() {
+                    finalize_loaded_outcome(path, outcome)
+                } else {
+                    Err("recovery read returned no source drawing records".to_string())
+                }
+            })
+            .map_err(|recovery_error| {
+                format!("{strict_error}; recovery read also failed: {recovery_error}")
+            })?;
+        Ok(outcome.document)
+    })
+}
+
 /// Opening a drawing by path is a desktop affair. In the browser a file
 /// arrives through the page rather than from a filesystem the app can reach,
 /// so there is nothing behind a path to open.

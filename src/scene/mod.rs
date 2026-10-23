@@ -25,6 +25,7 @@ pub mod compare;
 pub mod convert;
 pub mod creation_style;
 pub(crate) mod frame;
+pub mod legacy;
 pub mod model;
 pub mod pick;
 pub mod pipeline;

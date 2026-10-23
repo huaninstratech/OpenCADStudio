@@ -24,6 +24,7 @@ const MENUS: &[(&str, Entries)] = &[
             ("Publish", "PUBLISH"),
             ("Audit", "AUDIT"),
             ("Purge", "PURGE"),
+            ("Purge Legacy", "PURGELEGACY"),
             ("Exit", "QUIT"),
         ],
     ),

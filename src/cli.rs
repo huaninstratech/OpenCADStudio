@@ -108,6 +108,11 @@ pub struct Cli {
     #[arg(long, value_name = "VERSION", requires = "export")]
     pub target_version: Option<String>,
 
+    /// With --export: rebuild proxy/AEC entities as native geometry and
+    /// strip vendor dictionaries before writing (the PURGELEGACY pass).
+    #[arg(long, requires = "export")]
+    pub purge_legacy: bool,
+
     /// Headless PDF plot: print the Zoom Extents of model space to
     /// <stem>.pdf (monochrome) beside each FILE and exit. This is what the
     /// Windows right-click "Convert to PDF" verb runs — selecting several

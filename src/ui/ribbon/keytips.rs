@@ -478,6 +478,7 @@ const CODES: &[(&str, &str, &str)] = &[
     ("ALIASEDIT_DROPDOWN", "ALIASEDIT", "EA"),
     ("manage", "FINDNONPURGEABLE", "FN"),
     ("manage", "PURGE", "PU"),
+    ("manage", "PURGELEGACY", "PL"),
     ("manage", "OVERKILL", "OK"),
     ("manage", "AUDIT", "AU"),
     // Block editor.

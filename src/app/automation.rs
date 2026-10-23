@@ -52,14 +52,24 @@ pub fn export_headless(
     input: &std::path::Path,
     output: &std::path::Path,
     target_version: Option<&str>,
+    purge_legacy: bool,
 ) -> i32 {
-    let doc = match crate::io::load_file(input) {
+    let mut doc = match crate::io::load_file_recovering(input) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("export: cannot read {}: {e}", input.display());
             return 1;
         }
     };
+    if purge_legacy {
+        let report = crate::scene::legacy::apply(&mut doc);
+        println!(
+            "purge-legacy: rebuilt {} legacy object(s), removed {} object(s), {} vendor APPID(s).",
+            report.proxies_converted + report.unknowns_converted,
+            report.objects_gced(),
+            report.app_ids_removed.len()
+        );
+    }
     let version = match target_version {
         Some(value) => match crate::io::parse_target_version(value) {
             Ok(version) => version,

@@ -21,6 +21,7 @@ mod fileops;
 mod inquiry;
 mod layerprops;
 mod layers;
+mod legacy;
 mod model_import;
 mod pc_colormap;
 mod pc_extract;
@@ -317,6 +318,7 @@ impl OpenCADStudio {
                     | "MVIEW"
                     | "WBLOCK"
                     | "PURGE"
+                    | "PURGELEGACY"
                     | "RENAME"
                     | "REFEDIT"
                     | "REFEDIT_BEGIN"
@@ -549,6 +551,9 @@ impl OpenCADStudio {
             return Some(t);
         }
         if let Some(t) = self.dispatch_styleprops(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_legacy(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_display(cmd, i) {
@@ -1130,6 +1135,7 @@ inventory::submit!(crate::command::CommandRegistration {
         "PROPS",
         "PSPACE",
         "PURGE",
+        "PURGELEGACY",
         "QP",
         "QUICKPRINT",
         "QS",

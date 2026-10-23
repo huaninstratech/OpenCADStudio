@@ -153,7 +153,12 @@ fn main() -> iced::Result {
         }
         if let Some(io) = &args.export {
             // clap enforces exactly two values for --export.
-            let code = app::export_headless(&io[0], &io[1], args.target_version.as_deref());
+            let code = app::export_headless(
+                &io[0],
+                &io[1],
+                args.target_version.as_deref(),
+                args.purge_legacy,
+            );
             std::process::exit(code);
         }
 
