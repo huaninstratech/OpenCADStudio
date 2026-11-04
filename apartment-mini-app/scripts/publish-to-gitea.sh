@@ -30,7 +30,7 @@ else
   echo "→ Tách thư mục '${prefix}' thành nhánh ${export_branch}…"
   # Tạo lại nhánh xuất mỗi lần chạy để luôn khớp với HEAD hiện tại.
   git -C "$git_root" branch -D "$export_branch" >/dev/null 2>&1 || true
-  git -C "$git_root" subtree split --prefix="$prefix" -b "$export_branch" >/dev/null
+  git -C "$git_root" subtree split --quiet --prefix="$prefix" -b "$export_branch" >/dev/null
   export_ref="$export_branch"
 fi
 echo "→ Sẵn sàng đẩy: $(git -C "$git_root" log --oneline -1 "$export_ref")"
