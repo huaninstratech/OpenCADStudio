@@ -1092,7 +1092,16 @@ pub struct Chrome {
 /// and close. Pressing the row starts re-docking the panel. A floating panel
 /// gets nothing here: its frame draws a vertical title bar beside it.
 pub fn title_bar<'a>(id: PanelId, title: String, chrome: Chrome) -> Element<'a, Message> {
-    title_bar_with(id, title, chrome, None)
+    title_bar_custom(id, title, chrome, None, false)
+}
+
+/// [`title_bar`] whose close button stays visible without hover, so the
+/// pallet can always be dismissed at a glance. The pin still only shows
+/// while the bar is hovered. The IFC Model Tree uses this: its close used
+/// to hide behind the hover reveal and the pallet looked impossible to
+/// dismiss.
+pub fn title_bar_closable<'a>(id: PanelId, title: String, chrome: Chrome) -> Element<'a, Message> {
+    title_bar_custom(id, title, chrome, None, true)
 }
 
 /// [`title_bar`] with a pallet's own control (a menu button) before the pin
@@ -1103,6 +1112,18 @@ pub fn title_bar_with<'a>(
     title: String,
     chrome: Chrome,
     extra: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    title_bar_custom(id, title, chrome, extra, false)
+}
+
+/// The shared title row: title, hovered-only control and pin, then the
+/// close — always there when `always_close`, otherwise hovered-only too.
+fn title_bar_custom<'a>(
+    id: PanelId,
+    title: String,
+    chrome: Chrome,
+    extra: Option<Element<'a, Message>>,
+    always_close: bool,
 ) -> Element<'a, Message> {
     if chrome.floating {
         return match extra {
@@ -1123,13 +1144,14 @@ pub fn title_bar_with<'a>(
         if let Some(extra) = extra {
             bar = bar.push(extra);
         }
-        bar = bar
-            .push(pin_button(
-                id,
-                chrome.auto_collapse,
-                tooltip::Position::Bottom,
-            ))
-            .push(close_button(id, tooltip::Position::Bottom));
+        bar = bar.push(pin_button(
+            id,
+            chrome.auto_collapse,
+            tooltip::Position::Bottom,
+        ));
+    }
+    if always_close || chrome.title_hovered {
+        bar = bar.push(close_button(id, tooltip::Position::Bottom));
     }
     mouse_area(
         container(bar)

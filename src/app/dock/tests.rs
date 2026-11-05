@@ -32,6 +32,19 @@ fn blockpalette_pin_toggles_autocollapse_and_close_hides() {
     assert!(!app.show_block_palette, "close dismisses the sidebar");
 }
 
+#[test]
+fn modeltree_close_dismisses_the_pallet() {
+    let mut app = dock_app();
+    let id = crate::ui::dock::PanelId::ModelTree;
+    let _ = app.dock_set_open(id, true);
+    assert!(app.dock_panel_visible(id), "opened pallet is visible");
+    let _ = app.on_dock(crate::ui::dock::DockMsg::Close(id));
+    assert!(
+        !app.dock_panel_visible(id),
+        "close dismisses the IFC Model Tree"
+    );
+}
+
 /// A hermetic app with a 1600×900 workspace and the default dock layout
 /// (Properties left, block palette right), both shown.
 /// Run `f` on a thread with the stack the application's own threads get:
@@ -752,6 +765,64 @@ fn docked_title_bar_double_click_floats_the_pallet_in_the_real_view() {
         assert!(
             app.dock.float_rect(PanelId::BlockPalette).is_some(),
             "a double-click on a docked title bar floats the pallet"
+        );
+    });
+}
+
+#[test]
+fn modeltree_close_button_presses_without_hover_in_the_real_chrome() {
+    // The IFC Model Tree's close is always visible, not hovered-only: a
+    // click on the title bar's right end (no pointer over it beforehand)
+    // must reach the close button, not the drag grab.
+    with_stack(|| {
+        use crate::ui::dock::{self, Chrome, DockMsg, PanelId};
+        use iced::widget::container;
+        use iced_test::core::{mouse, shell, window};
+        use iced_test::runtime::user_interface::{Cache, UserInterface};
+        let view = || -> iced::Element<'static, Message> {
+            container(dock::title_bar_closable(
+                PanelId::ModelTree,
+                "IFC Model Tree".to_string(),
+                Chrome::default(),
+            ))
+            .width(260)
+            .height(26)
+            .into()
+        };
+        let mut renderer = headless_renderer();
+        let mut cache = Cache::default();
+        let mut messages = Vec::new();
+        // The close button fills the bar's right end: 6 px padding, a 22 px
+        // button, all inside a 260 px bar. Move onto it, then press there —
+        // with Chrome::default() nothing is hovered, so this is the cold
+        // click a user makes when dismissing the pallet.
+        let at = iced::Point::new(243.0, 13.0);
+        let events = [
+            iced::Event::Mouse(mouse::Event::CursorMoved { position: at }),
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ];
+        for event in events {
+            let mut published = Vec::new();
+            {
+                let mut ui = UserInterface::build(view(), VIEW_SIZE, cache, &mut renderer);
+                let _ = ui.update(
+                    &window::Headless,
+                    &shell::Waker::noop(),
+                    &[event],
+                    mouse::Cursor::Available(at),
+                    &mut renderer,
+                    &mut published,
+                );
+                cache = ui.into_cache();
+            }
+            messages.extend(published);
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::Dock(DockMsg::Close(PanelId::ModelTree)))),
+            "the cold click lands on the always-visible close button: {messages:?}"
         );
     });
 }

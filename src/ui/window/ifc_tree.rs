@@ -12,7 +12,8 @@ use crate::ui::dock::{self, Chrome, PanelId};
 const INDENT: f32 = 14.0;
 
 pub fn view<'a>(tree: &'a [IfcTreeNode], width: f32, chrome: Chrome) -> Element<'a, Message> {
-    let title_bar = dock::title_bar(PanelId::ModelTree, "IFC Model Tree".to_string(), chrome);
+    let title_bar =
+        dock::title_bar_closable(PanelId::ModelTree, "IFC Model Tree".to_string(), chrome);
     let mut content = column![].spacing(0).width(Fill);
     if tree.is_empty() {
         content = content.push(
