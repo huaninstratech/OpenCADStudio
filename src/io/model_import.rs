@@ -157,6 +157,13 @@ fn step_blocks(model: crate::io::step_import::StepModel, scale: f64, stem: &str)
                     let faces: Vec<Option<Color>> =
                         body.faces.iter().map(|c| c.map(step_colour)).collect();
                     painted_body_entity(&body.body, body.colour.map(step_colour), &faces, false)
+                    let faces: Vec<Option<Color>> = body.faces.iter().map(|c| c.map(step_colour)).collect();
+                    let colour = body.colour.map(step_colour);
+                    let mut entity = painted_body_entity(&body.body, colour, &faces, false)?;
+                    if product.scale != 1.0 {
+                        entity.apply_transform(&Transform::from_scale(product.scale));
+                    }
+                    Some(entity)
                 })
                 .collect();
             entities.extend(

@@ -1,14 +1,16 @@
 use codec::entities::{Block, BlockEnd, EntityCommon};
 use codec::objects::ObjectType;
 use codec::tables::BlockRecord;
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
+
+mod constraints;
 
 /// The copy is built in the last saved document, so the source definition and
 /// its references remain at their checkpoint even when the editor is dirty.
 pub(super) struct DefinitionCopy {
-    pub document: CadDocument,
+    pub document: Document,
     pub handles: FxHashMap<Handle, Handle>,
     pub record: Handle,
 }
@@ -37,6 +39,9 @@ fn remap_common(common: &mut EntityCommon, handles: &FxHashMap<Handle, Handle>) 
 }
 
 fn cloneable_object(object: &ObjectType) -> bool {
+    if let ObjectType::Associative(object) = object {
+        return constraints::cloneable(object);
+    }
     if let ObjectType::DynamicBlock(object) = object {
         return !matches!(object.data, codec::objects::DynamicBlockData::Unknown);
     }
@@ -61,8 +66,8 @@ fn cloneable_object(object: &ObjectType) -> bool {
 }
 
 pub(super) fn copy_definition(
-    source: &CadDocument,
-    mut target: CadDocument,
+    source: &Document,
+    mut target: Document,
     source_name: &str,
     name: &str,
 ) -> Result<DefinitionCopy, String> {
@@ -388,6 +393,9 @@ pub(super) fn copy_definition(
     for (old, mut object) in objects {
         let new = handles[&old];
         match &mut object {
+            ObjectType::Associative(object) => {
+                constraints::remap(object, new, &handles)?;
+            }
             ObjectType::DynamicBlock(object) => {
                 object.handle = new;
                 object.visit_handles_mut(&mut |handle| {
@@ -519,15 +527,7 @@ pub(super) fn copy_definition(
         target.objects.insert(new, object);
     }
     for (_, name) in &records {
-        let has_attributes = target
-            .entities_in_block(name)
-            .any(|entity| matches!(entity, EntityType::AttributeDefinition(_)));
-        target
-            .block_records
-            .get_mut(name)
-            .unwrap()
-            .flags
-            .has_attributes = has_attributes;
+        crate::scene::Scene::sync_attribute_flag(&mut target, name);
         for entity in target.entities_in_block(name) {
             if let EntityType::Insert(insert) = entity {
                 if crate::scene::block_service::would_create_cycle(
@@ -579,6 +579,7 @@ pub(super) fn copy_definition(
         let definition = handles[&record.handle];
         crate::scene::block_authoring::refresh_copied_identity(&mut target, definition, name);
     }
+    crate::scene::Scene::register_copied_constraint_networks(&mut target, &handles)?;
     Ok(DefinitionCopy {
         record: handles[&root.handle],
         document: target,

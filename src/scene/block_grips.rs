@@ -1,9 +1,10 @@
 //! Native grip metadata shared by the editor and insertion commands.
 pub(crate) mod config;
+pub(crate) mod runtime;
 use codec::{
     objects::{BlockGrip, DynamicBlockData, ObjectType},
     types::Vector3,
-    CadDocument, Handle,
+    Document, Handle,
 };
 
 pub(crate) struct GripInfo {
@@ -44,7 +45,7 @@ fn grip_mut(data: &mut DynamicBlockData) -> Option<&mut BlockGrip> {
     }
 }
 
-pub(crate) fn grips(doc: &CadDocument, definition: Handle) -> Result<Vec<GripInfo>, &'static str> {
+pub(crate) fn grips(doc: &Document, definition: Handle) -> Result<Vec<GripInfo>, &'static str> {
     let Some(graph) = super::block_authoring::graph(doc, definition)? else {
         return Ok(vec![]);
     };
@@ -106,7 +107,7 @@ pub(crate) fn grips(doc: &CadDocument, definition: Handle) -> Result<Vec<GripInf
 }
 
 pub(crate) fn set_cycle_order(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     rows: &[(Handle, bool)],
 ) -> Result<bool, &'static str> {
@@ -151,7 +152,7 @@ pub(crate) fn set_cycle_order(
     Ok(true)
 }
 
-pub(crate) fn insertion_points(doc: &CadDocument, definition: Handle) -> Vec<Vector3> {
+pub(crate) fn insertion_points(doc: &Document, definition: Handle) -> Vec<Vector3> {
     grips(doc, definition)
         .unwrap_or_default()
         .into_iter()
@@ -167,6 +168,32 @@ mod tests {
     use crate::scene::{block_distance_parameter as distance, Scene};
     use codec::{DwgReader, DwgWriter, DxfReader, DxfWriter};
     use std::io::Cursor;
+
+    #[test]
+    fn draw_order_table_does_not_drop_the_dynamic_graph() {
+        let mut scene = Scene::new();
+        scene.define_block_raw("SORTED", Vector3::ZERO, vec![]);
+        scene.define_block_raw("COPY", Vector3::ZERO, vec![]);
+        let doc = &mut scene.document;
+        let definition = doc.block_records.get("SORTED").unwrap().handle;
+        let (start, end) = (Vector3::ZERO, Vector3::new(10.0, 0.0, 0.0));
+        let label = Vector3::new(5.0, 2.0, 0.0);
+        distance::create(doc, definition, distance::Kind::Linear, start, end, label).unwrap();
+        let xdict = doc.extension_dictionary_handle(definition).unwrap();
+        let mut table = codec::objects::SortEntitiesTable::for_block(definition);
+        table.handle = doc.allocate_handle();
+        table.owner_handle = xdict;
+        let sort = table.handle;
+        doc.objects.insert(sort, ObjectType::SortEntitiesTable(table));
+        if let Some(ObjectType::Dictionary(d)) = doc.objects.get_mut(&xdict) {
+            d.add_entry("ACAD_SORTENTS", sort);
+        }
+        assert!(doc.export_block_graph(definition).is_none());
+        let graph = crate::scene::block_authoring::export_graph(doc, definition).unwrap();
+        let copy = doc.block_records.get("COPY").unwrap().handle;
+        doc.import_block_graph(&graph, copy, &Default::default());
+        assert_eq!(grips(doc, copy).unwrap().len(), 1);
+    }
 
     #[test]
     fn block_grip_cycling_preserves_native_order_through_dwg_and_dxf() {

@@ -135,6 +135,14 @@ pub fn remembered_notice(path: &str) -> String {
     crate::tr!("pdf-password", "remembered", path = path)
 }
 
+/// The notice importing a page of `path` prints: the file is opened again
+/// with the password supplied for it whenever it cannot be read without one.
+pub fn reopened_notice(path: &str) -> Option<String> {
+    let bytes = super::pdf_raster::source_bytes(path)?;
+    let security = Security::read(&bytes)?;
+    (!security.is_owner(&bytes, "")).then(|| remembered_notice(path))
+}
+
 /// The lines a file prompt prints when the password window is cancelled;
 /// the prompt is then asked again.
 pub fn refused_notice(path: &str) -> String {

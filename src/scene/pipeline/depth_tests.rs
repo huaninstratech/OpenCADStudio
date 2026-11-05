@@ -416,7 +416,7 @@ fn draw_order_preserves_clip_boundaries_sorting_and_mesh_occlusion() {
         pipeline.upload_mesh_batch(
             &device,
             &queue,
-            &[MeshLodSet::from_single(MeshModel {
+            &std::sync::Arc::new(vec![MeshLodSet::from_single(MeshModel {
                 name: "100".into(),
                 verts: vec![
                     [-0.6, -0.8, 0.5],
@@ -431,7 +431,8 @@ fn draw_order_preserves_clip_boundaries_sorting_and_mesh_occlusion() {
                 triangle_colors: Vec::new(),
                 color: [0., 1., 0., 1.],
                 selected: false,
-            })],
+            })]),
+            &mut Default::default(),
         );
         let mesh_only = pixels(
             &device,

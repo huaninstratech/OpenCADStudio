@@ -33,6 +33,44 @@ const PORTABLE_FORMATS: [image::ImageFormat; 3] = [
     image::ImageFormat::Bmp,
 ];
 
+/// The system Insert Object window, opened on Create from File (links and
+/// icons off). The chosen file, or `Err("Cancelled")`; choosing Create New
+/// reports that a new object needs its own application.
+#[cfg(target_os = "windows")]
+pub fn insert_object_dialog() -> Result<std::path::PathBuf, String> {
+    use windows_sys::Win32::System::Ole::{
+        OleInitialize, OleUIInsertObjectW, IOF_DISABLEDISPLAYASICON,
+        IOF_DISABLELINK, IOF_SELECTCREATEFROMFILE, OLEUIINSERTOBJECTW, OLEUI_OK,
+    };
+    // The window takes at most MAX_PATH characters.
+    let mut file = vec![0u16; 260];
+    // SAFETY: the window runs in this thread's own OLE apartment, which ends
+    // with the thread; the structure and the file buffer outlive the call.
+    unsafe {
+        OleInitialize(std::ptr::null());
+        let mut info: OLEUIINSERTOBJECTW = std::mem::zeroed();
+        info.cbStruct = std::mem::size_of::<OLEUIINSERTOBJECTW>() as u32;
+        info.dwFlags = IOF_SELECTCREATEFROMFILE | IOF_DISABLELINK | IOF_DISABLEDISPLAYASICON;
+        info.lpszFile = file.as_mut_ptr();
+        info.cchFile = file.len() as u32;
+        // The window writes the chosen mode back into the structure.
+        let result = OleUIInsertObjectW(std::ptr::addr_of_mut!(info));
+        let from_file = info.dwFlags & IOF_SELECTCREATEFROMFILE != 0;
+        // OLEUI_CANCEL is 2; anything else is the window's error code.
+        if result == 2 {
+            return Err("Cancelled".into());
+        }
+        if result != OLEUI_OK {
+            return Err(format!("Insert Object window error {result}"));
+        }
+        if !from_file {
+            return Err(crate::tr!("ole-props", "create-new"));
+        }
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Ok(std::path::PathBuf::from(String::from_utf16_lossy(&file[..len])))
+}
+
 /// A raster image prepared for embedding: encoded bytes plus the metadata the
 /// placement prompts need.
 #[derive(Clone, Debug, PartialEq)]
@@ -161,7 +199,7 @@ pub fn build_embedded_ole(
 /// Non-interactive embed used by the control API: add the entity to `doc` and
 /// return its handle. The undo snapshot is the caller's responsibility.
 pub fn add_embedded_image(
-    doc: &mut codec::CadDocument,
+    doc: &mut codec::Document,
     image: &EmbeddedImage,
     origin: Vector3,
     width: f64,
@@ -233,7 +271,7 @@ mod tests {
             pixel_height: 3,
             name: "t.png".into(),
         };
-        let mut doc = codec::CadDocument::new();
+        let mut doc = codec::Document::new();
         let handle =
             add_embedded_image(&mut doc, &image, Vector3::new(10.0, 10.0, 0.0), 20.0).unwrap();
 
@@ -242,7 +280,7 @@ mod tests {
         let path = dir.join("embedded_roundtrip.dwg");
         codec::DwgWriter::write_to_file(&path, &doc).unwrap();
 
-        let mut reader = codec::io::dwg::DwgReader::from_file(&path).unwrap();
+        let mut reader = codec::DwgReader::from_file(&path).unwrap();
         let reopened = reader.read().unwrap();
         std::fs::remove_file(&path).ok();
 

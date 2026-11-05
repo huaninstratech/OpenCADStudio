@@ -1,7 +1,10 @@
+use crate::scene::model::hatch_model::HatchModel;
 use crate::scene::Scene;
-use codec::entities::hatch::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge, SplineEdge};
+use codec::entities::hatch::{
+    BoundaryEdge, BoundaryPath, BoundaryPathFlags, Hatch, LineEdge, PolylineEdge, SplineEdge,
+};
 use codec::types::{Vector2, Vector3};
-use kernel::geom2d::{refine_spline_boundary, triangulate_rings, Curve, NurbsCurve};
+use kernel::geom2d::{refine_spline_boundary, Curve, NurbsCurve};
 use kernel::tessellation::DEFAULT_ANGLE;
 
 #[test]
@@ -162,7 +165,8 @@ fn narrow_fill_preserves_corners_holes_and_shared_origin() {
             .into_iter()
             .map(|p| project(p).map(f64::from))
             .collect();
-        assert!(triangulate_rings(&[original]).1.is_empty());
+        // The plain sampling crosses itself: as one polygon it has no inside.
+        assert!(kernel::geom2d::triangulate(&original, &[]).1.is_empty());
         for i in 0..=6 {
             assert!(model
                 .boundary
@@ -214,7 +218,9 @@ fn valid_samples_are_unchanged_and_invalid_samples_stay_rejected() {
             })
             .collect();
         assert_eq!(model.boundary.as_ref(), &expected);
-        assert_eq!(model.fill_mesh().1.is_empty(), clearance < 0.01);
+        // A sample that crosses itself is kept as it is and fills by the
+        // even-odd rule, its lobes (kernel #106), like a crossing loop.
+        assert!(!model.fill_mesh().1.is_empty(), "clearance {clearance}");
     }
     let curve = Curve::Nurbs(narrow(0.01, [0.0; 2]));
     assert!(refine_spline_boundary(
@@ -270,4 +276,251 @@ fn recovery_respects_the_total_hatch_vertex_cap() {
         .map(|p| project(p).map(|v| v as f32))
         .collect();
     assert_eq!(&model.boundary[..expected.len()], expected.as_slice());
+}
+
+fn filled_area(model: &HatchModel) -> f64 {
+    let (vertices, indices) = model.fill_mesh();
+    indices
+        .chunks_exact(3)
+        .map(|triangle| {
+            let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
+                .map(|i| vertices[i as usize].map(f64::from));
+            ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * 0.5
+        })
+        .sum()
+}
+
+/// Square from line edges whose last edge stops `gap` short of the start.
+fn square_with_gap(gap: f64) -> BoundaryPath {
+    let points = [
+        [0.0, 0.0],
+        [10.0, 0.0],
+        [10.0, 10.0],
+        [0.0, 10.0],
+        [0.0, gap],
+    ];
+    let mut path = BoundaryPath::new();
+    for pair in points.windows(2) {
+        path.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(pair[0][0], pair[0][1]),
+            end: Vector2::new(pair[1][0], pair[1][1]),
+        }));
+    }
+    path
+}
+
+// Same cases as a test sheet checked in DWG TrueView: AutoCAD skips each loop
+// flagged not closed (bit 5), closed or not, and still fills the hatch's other
+// loops; a loop with a real gap but no flag fills.
+#[test]
+fn loops_flagged_not_closed_are_skipped_like_autocad() {
+    let flagged = |mut path: BoundaryPath| {
+        path.flags = BoundaryPathFlags::from_bits(1 | 32);
+        path
+    };
+    let square = |a: [f64; 2], b: [f64; 2]| rectangle(a, b, [0.0; 2]);
+    let area = |paths: Vec<BoundaryPath>| {
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths = paths;
+        Scene::hatch_model_from_dxf(&hatch, [1.0; 4]).map(|model| filled_area(&model))
+    };
+    let close_to =
+        |area: Option<f64>, expected: f64| area.is_some_and(|area| (area - expected).abs() < 1e-3);
+
+    assert!(area(vec![flagged(square([0.0, 0.0], [10.0, 10.0]))]).is_none());
+    assert!(area(vec![flagged(square_with_gap(0.02))]).is_none());
+    assert!(close_to(area(vec![square_with_gap(0.02)]), 100.0));
+    // Flagged island: no hole.
+    assert!(close_to(
+        area(vec![
+            square([0.0, 0.0], [10.0, 10.0]),
+            flagged(square([3.0, 3.0], [7.0, 7.0])),
+        ]),
+        100.0
+    ));
+    // Flagged outer loop: only the island fills.
+    assert!(close_to(
+        area(vec![
+            flagged(square([0.0, 0.0], [10.0, 10.0])),
+            square([3.0, 3.0], [7.0, 7.0]),
+        ]),
+        16.0
+    ));
+    // Side by side: only the unflagged loop fills.
+    assert!(close_to(
+        area(vec![
+            square([0.0, 0.0], [4.5, 10.0]),
+            flagged(square([5.5, 0.0], [10.0, 10.0])),
+        ]),
+        45.0
+    ));
+}
+
+// AutoCAD leaves these loops out of the drawing extents too: DWG TrueView's
+// ZOOM Extents frames a drawing without them.
+#[test]
+fn loops_flagged_not_closed_stay_out_of_the_extents() {
+    let mut scene = Scene::new();
+    let mut line = codec::entities::Line::new();
+    line.end = Vector3::new(10.0, 10.0, 0.0);
+    scene.add_entity(codec::EntityType::Line(line));
+    let mut path = rectangle([100.0, 100.0], [110.0, 110.0], [0.0; 2]);
+    path.flags = BoundaryPathFlags::from_bits(1 | 32);
+    let mut hatch = Hatch::new();
+    hatch.is_solid = true;
+    hatch.paths.push(path);
+    scene.add_entity(codec::EntityType::Hatch(Box::new(hatch)));
+
+    let (_, max) = scene.model_space_extents().unwrap();
+    assert!(max.x < 10.5 && max.y < 10.5, "{max:?}");
+}
+
+// The island style picks loops by their path flags: Outer keeps loops flagged
+// external (bit 0) or outermost (bit 4), Ignore only those flagged external,
+// Normal all of them. The kept loops fill even-odd. Squares of 40, 24 and 10
+// (two loops: 40 and 20), each centred in the one before.
+#[test]
+fn island_style_keeps_loops_by_their_flags() {
+    use codec::entities::HatchStyleType::{Ignore, Normal, Outer};
+    let square = |half: f64, flags: u32| {
+        let mut path = rectangle(
+            [20.0 - half, 20.0 - half],
+            [20.0 + half, 20.0 + half],
+            [0.0; 2],
+        );
+        path.flags = BoundaryPathFlags::from_bits(flags);
+        path
+    };
+    let two = |f0, f1| vec![square(20.0, f0), square(10.0, f1)];
+    let three = |f0, f1, f2| vec![square(20.0, f0), square(12.0, f1), square(5.0, f2)];
+    let area = |style, paths: Vec<BoundaryPath>| {
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.style = style;
+        hatch.paths = paths;
+        Scene::hatch_model_from_dxf(&hatch, [1.0; 4]).map_or(0.0, |model| filled_area(&model))
+    };
+    let cases = [
+        // A letter's counter stored as an external loop is a hole.
+        ("ignore 1 1", area(Ignore, two(1, 1)), 1200.0),
+        ("ignore 1 0", area(Ignore, two(1, 0)), 1600.0),
+        ("ignore 1 1 1", area(Ignore, three(1, 1, 1)), 1124.0),
+        ("ignore 1 1 0", area(Ignore, three(1, 1, 0)), 1024.0),
+        ("ignore 1 16 0", area(Ignore, three(1, 16, 0)), 1600.0),
+        ("ignore 0 1", area(Ignore, two(0, 1)), 400.0),
+        ("outer 1 0 0", area(Outer, three(1, 0, 0)), 1600.0),
+        ("outer 1 1 1", area(Outer, three(1, 1, 1)), 1124.0),
+        ("outer 1 16 0", area(Outer, three(1, 16, 0)), 1024.0),
+        ("outer 17 16 0", area(Outer, three(17, 16, 0)), 1024.0),
+        ("outer 1 0 1", area(Outer, three(1, 0, 1)), 1500.0),
+        ("normal 1 0 0", area(Normal, three(1, 0, 0)), 1124.0),
+        ("normal 0 0", area(Normal, two(0, 0)), 1200.0),
+    ];
+    for (name, area, expected) in cases {
+        assert!(
+            (area - expected).abs() < 1e-3,
+            "{name}: {area}, expected {expected}"
+        );
+    }
+}
+
+// With no loop flagged the way the style needs, nesting depth picks the loops
+// as before: Ignore the outermost, Outer the outermost and the next.
+#[test]
+fn island_style_without_flags_falls_back_to_nesting_depth() {
+    use codec::entities::HatchStyleType::{Ignore, Outer};
+    let square = |half: f64| {
+        rectangle(
+            [20.0 - half, 20.0 - half],
+            [20.0 + half, 20.0 + half],
+            [0.0; 2],
+        )
+    };
+    let area = |style, paths: Vec<BoundaryPath>| {
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.style = style;
+        hatch.paths = paths;
+        Scene::hatch_model_from_dxf(&hatch, [1.0; 4]).map_or(0.0, |model| filled_area(&model))
+    };
+    let ignore = area(Ignore, vec![square(20.0), square(10.0)]);
+    let outer = area(Outer, vec![square(20.0), square(12.0), square(5.0)]);
+    assert!((ignore - 1600.0).abs() < 1e-3, "{ignore}");
+    assert!((outer - 1024.0).abs() < 1e-3, "{outer}");
+}
+
+#[test]
+fn a_pattern_hatch_keeps_loops_flagged_not_closed() {
+    let flagged = |mut path: BoundaryPath, bits: u32| {
+        path.flags = BoundaryPathFlags::from_bits(bits);
+        path
+    };
+    let square = |a: [f64; 2], b: [f64; 2]| rectangle(a, b, [0.0; 2]);
+    let area = |solid: bool, style, paths: Vec<BoundaryPath>| {
+        let mut hatch = Hatch::new();
+        hatch.is_solid = solid;
+        hatch.pattern.name = if solid { "SOLID" } else { "ANSI31" }.into();
+        hatch.style = style;
+        hatch.paths = paths;
+        Scene::hatch_model_from_dxf(&hatch, [1.0; 4]).map_or(0.0, |model| filled_area(&model))
+    };
+    use codec::entities::HatchStyleType::{Normal, Outer};
+    let outer = || square([0.0, 0.0], [10.0, 10.0]);
+    let island = || square([3.0, 3.0], [7.0, 7.0]);
+    let cases = [
+        (
+            "pattern, outer 33",
+            area(false, Normal, vec![flagged(outer(), 33)]),
+            100.0,
+        ),
+        (
+            "pattern, outer 33 round an island 16",
+            area(
+                false,
+                Outer,
+                vec![flagged(island(), 16), flagged(outer(), 33)],
+            ),
+            84.0,
+        ),
+        (
+            "pattern, outer 33, island 0",
+            area(
+                false,
+                Normal,
+                vec![flagged(outer(), 33), flagged(island(), 0)],
+            ),
+            84.0,
+        ),
+        (
+            "pattern, island 32",
+            area(
+                false,
+                Normal,
+                vec![flagged(outer(), 1), flagged(island(), 32)],
+            ),
+            84.0,
+        ),
+        // A solid fill still leaves them out.
+        (
+            "solid, outer 33",
+            area(true, Normal, vec![flagged(outer(), 33)]),
+            0.0,
+        ),
+        (
+            "solid, outer 33 round an island 16",
+            area(
+                true,
+                Outer,
+                vec![flagged(island(), 16), flagged(outer(), 33)],
+            ),
+            16.0,
+        ),
+    ];
+    for (name, area, expected) in cases {
+        assert!(
+            (area - expected).abs() < 1e-3,
+            "{name}: {area}, expected {expected}"
+        );
+    }
 }

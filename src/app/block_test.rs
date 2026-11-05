@@ -7,7 +7,7 @@ pub(super) struct BlockTestSession {
     pub source_id: u64,
     pub definition: codec::Handle,
     pub insert: codec::Handle,
-    pub baseline: std::sync::Arc<codec::CadDocument>,
+    pub baseline: std::sync::Arc<codec::Document>,
 }
 
 impl OpenCADStudio {
@@ -78,12 +78,12 @@ impl OpenCADStudio {
         let transform = crate::scene::render_graph::insert_transform_with_base(&insert, base);
         for entity in document.entities_in_block(&name) {
             if let EntityType::AttributeDefinition(definition) = entity {
-                if !definition.flags.constant {
-                    let mut attribute = AttributeEntity::from_definition(definition, None);
-                    attribute.attdef_handle = definition.common.handle;
-                    attribute.apply_transform(&transform);
-                    insert.attributes.push(attribute);
-                }
+                // Constant included: the mode decides whether an attribute is
+                // asked for, not whether the reference carries it.
+                let mut attribute = AttributeEntity::from_definition(definition, None);
+                attribute.attdef_handle = definition.common.handle;
+                attribute.apply_transform(&transform);
+                insert.attributes.push(attribute);
             }
         }
         for attribute in &mut insert.attributes {

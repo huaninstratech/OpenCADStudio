@@ -184,7 +184,7 @@ fn emit_image(
     let mut width = image.width;
     let mut height = image.height;
     let mut pixels: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(image.pixels.as_slice());
-    if let Some(target) = options.quality.target_dpi() {
+    if let Some(target) = options.raster_dpi.or(options.quality.target_dpi()) {
         let dist =
             |a: [f32; 2], b: [f32; 2]| ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
         let width_edge = dist(corners[0], corners[1]);
@@ -510,6 +510,7 @@ fn append_pdf_page(
     let (rotation_deg, scale, clip) = (page.rotation_deg, page.scale, page.clip);
     let plot_style = page.plot_style.as_ref().or(fallback_plot_style);
     let options = page.options;
+    let line_step = vector_step(options);
     let mut ops: Vec<Op> = Vec::new();
 
     // White page background.
@@ -699,8 +700,27 @@ fn append_pdf_page(
         // Consecutive items on one drawing layer share a marked-content run,
         // so a viewer's layer panel can hide that layer.
         let mut open_layer: Option<&str> = None;
+        // Plot transparency: an object whose colour carries alpha gets its own
+        // graphics state with that alpha (constant fill and stroke alpha), so
+        // what lies beneath stays visible, as on screen and in SVG export.
+        // Opened before the object and closed before the next one, inside the
+        // object's marked-content layer run.
+        let mut alpha_states: std::collections::HashMap<u8, ExtendedGraphicsStateId> =
+            std::collections::HashMap::new();
+        let mut alpha_open = false;
 
         for (_, _, _, item) in draw_items {
+            if alpha_open {
+                ops.push(Op::RestoreGraphicsState);
+                alpha_open = false;
+                last_color = None;
+                last_lw = None;
+                // Q restores whatever was set before the q, not the page
+                // default: force the next object to state its own.
+                last_cap = None;
+                last_join = None;
+                last_dash = None;
+            }
             let layer = match &item {
                 DrawItem::WireFill(wire) | DrawItem::Wire(wire) | DrawItem::Text(wire) => {
                     layer_of(&wire.name)
@@ -724,6 +744,29 @@ fn append_pdf_page(
                     ops.push(Op::BeginLayer { layer_id });
                 }
                 open_layer = layer;
+            }
+            let alpha = match &item {
+                DrawItem::WireFill(w) | DrawItem::Wire(w) | DrawItem::Text(w) => Some(w.color[3]),
+                // Wipeouts mask with paper white and stay opaque.
+                DrawItem::Hatch(h) if h.name != "WIPEOUT_FILL" => Some(h.color[3]),
+                _ => None,
+            };
+            if let Some(alpha) = object_alpha(alpha, options) {
+                let gs = alpha_states
+                    .entry(alpha)
+                    .or_insert_with(|| {
+                        let a = alpha as f32 / 255.0;
+                        // printpdf 0.9.1 swaps the serialized CA/ca keys; set both.
+                        doc.add_graphics_state(
+                            ExtendedGraphicsState::default()
+                                .with_current_fill_alpha(a)
+                                .with_current_stroke_alpha(a),
+                        )
+                    })
+                    .clone();
+                ops.push(Op::SaveGraphicsState);
+                ops.push(Op::LoadGraphicsState { gs });
+                alpha_open = true;
             }
             let wire = match item {
                 DrawItem::WireFill(wire) => {
@@ -948,6 +991,21 @@ fn append_pdf_page(
             };
             let stationed = !dash_arr.is_empty() && !stations.is_empty();
             if stationed {
+                // Match the screen's short-run policy. A sub-period aligned
+                // run is solid, even when clipping left its stations in a gap.
+                // Start-phased and longer continuous runs keep their phase.
+                let aligned_stations;
+                let stations = if wire.pattern[0] > 0.0 && wire.pattern[1] < 0.0 {
+                    let (mut distances, _, total) =
+                        crate::scene::pipeline::wire_gpu::wire_distances(wire);
+                    if total > 0.0 && total <= wire.pattern_length {
+                        distances.fill(0.0);
+                    }
+                    aligned_stations = distances;
+                    aligned_stations.as_slice()
+                } else {
+                    stations
+                };
                 if last_dash.as_ref().is_none_or(|dash| !dash.is_empty()) {
                     ops.push(Op::SetLineDashPattern {
                         dash: LineDashPattern::default(),
@@ -974,7 +1032,7 @@ fn append_pdf_page(
                             ),
                             bezier: false,
                         };
-                        flush_line(&mut ops, &[point(from), point(to)], None);
+                        flush_line(&mut ops, &[point(from), point(to)], None, line_step);
                     }
                 }
                 continue;
@@ -1036,7 +1094,7 @@ fn append_pdf_page(
                             ops.push(Op::SetOutlineThickness { pt: Pt(thin) });
                             last_lw = Some(thin);
                         }
-                        flush_line(&mut ops, &[mm(a), mm(b)], None);
+                        flush_line(&mut ops, &[mm(a), mm(b)], None, line_step);
                         continue;
                     }
                     let n = [-dy / len, dx / len];
@@ -1070,7 +1128,7 @@ fn append_pdf_page(
                     if band {
                         pen_up = true;
                     } else {
-                        flush_line(&mut ops, &segment, dot_radius);
+                        flush_line(&mut ops, &segment, dot_radius, line_step);
                         segment.clear();
                     }
                 } else {
@@ -1084,13 +1142,16 @@ fn append_pdf_page(
                         if joined {
                             continue;
                         }
-                        flush_line(&mut ops, &segment, dot_radius);
+                        flush_line(&mut ops, &segment, dot_radius, line_step);
                         segment.clear();
                     }
                     segment.push(LinePoint { p, bezier: false });
                 }
             }
-            flush_line(&mut ops, &segment, dot_radius);
+            flush_line(&mut ops, &segment, dot_radius, line_step);
+        }
+        if alpha_open {
+            ops.push(Op::RestoreGraphicsState);
         }
         if open_layer.is_some() {
             ops.push(Op::EndLayer);
@@ -1303,7 +1364,34 @@ fn visible_station_ranges(
     ranges
 }
 
-fn flush_line(ops: &mut Vec<Op>, pts: &[LinePoint], dot_radius: Option<Pt>) {
+/// One vector DPI step in points, for `PlotOptions::vector_dpi`.
+fn vector_step(options: PdfPlotOptions) -> Option<f32> {
+    options.vector_dpi.filter(|&dpi| dpi > 0).map(|dpi| 72.0 / dpi as f32)
+}
+
+fn flush_line(ops: &mut Vec<Op>, pts: &[LinePoint], dot_radius: Option<Pt>, step: Option<f32>) {
+    // Snapped to the vector resolution, points that land together merge.
+    let snapped: Vec<LinePoint>;
+    let pts = match step {
+        Some(step) => {
+            let snap = |v: f32| (v / step).round() * step;
+            let mut out: Vec<LinePoint> = Vec::with_capacity(pts.len());
+            for point in pts {
+                let mut point = point.clone();
+                point.p.x.0 = snap(point.p.x.0);
+                point.p.y.0 = snap(point.p.y.0);
+                // Bezier control points keep their slot so curves stay whole.
+                if out.last().is_none_or(|last| {
+                    point.bezier || last.bezier || last.p.x.0 != point.p.x.0 || last.p.y.0 != point.p.y.0
+                }) {
+                    out.push(point);
+                }
+            }
+            snapped = out;
+            snapped.as_slice()
+        }
+        None => pts,
+    };
     if pts.len() < 2 {
         return;
     }
@@ -1348,13 +1436,23 @@ fn emit_round_dot(ops: &mut Vec<Op>, center: Point, radius: Pt) {
     });
 }
 
-fn plotted_color(rgb: [f32; 3], alpha: f32, screening: f32, options: PdfPlotOptions) -> [f32; 3] {
-    let amount = screening.clamp(0.0, 1.0)
-        * if options.transparency {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+/// Quantised alpha (1..=254) for an object plotted with transparency, or
+/// `None` when it plots opaque: transparency off, alpha at or near 1, or
+/// fully transparent (such objects are skipped by the emitters).
+fn object_alpha(alpha: Option<f32>, options: PdfPlotOptions) -> Option<u8> {
+    let a = alpha?;
+    if !options.transparency || !a.is_finite() || a < 0.01 {
+        return None;
+    }
+    let q = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (q < 255).then_some(q.max(1))
+}
+
+/// Paper colour of an object: plot-style screening blends towards white.
+/// Object alpha is not folded in here; with transparency on it is plotted as
+/// a graphics-state alpha around the object (see the draw loop).
+fn plotted_color(rgb: [f32; 3], _alpha: f32, screening: f32, _options: PdfPlotOptions) -> [f32; 3] {
+    let amount = screening.clamp(0.0, 1.0);
     [
         1.0 - (1.0 - rgb[0]) * amount,
         1.0 - (1.0 - rgb[1]) * amount,
@@ -1727,7 +1825,7 @@ fn emit_hatch(
                 },
             ];
             let dot_radius = Pt(SCREEN_DOT_MM * MM_TO_PT / (2.0 * scale.max(1e-6)));
-            flush_line(ops, &points, Some(dot_radius));
+            flush_line(ops, &points, Some(dot_radius), vector_step(options));
         }
         return;
     }
@@ -1819,7 +1917,7 @@ pub(crate) fn adapt_to_paper([r, g, b]: [f32; 3]) -> [f32; 3] {
 ///   A Type3 font synthesized from the SDF atlas would cover those exactly and
 ///   is the natural follow-up; it needs no new layout data.
 /// - `Tf` takes an *em* size but `run.height` is a *cap* height: the em size
-///   is `height / cap_ratio` (per-font OS/2 sCapHeight, 0.72 for Helvetica) so
+///   is `height / cap_ratio` (the face's capital A height, 0.72 for Helvetica) so
 ///   the invisible run aligns with the drawn cap height.
 /// - Width-matching (`Tz`, baked into the `Tm` x-basis — equivalent, and the
 ///   only horizontal scaling printpdf exposes): `k = laid_advance /
@@ -2130,12 +2228,13 @@ fn subset_family(
     // below must be in subset space. Anything unmappable stays out.
     let sub = ttf_parser::Face::parse(&subset_bytes, 0).ok()?;
     let upem = sub.units_per_em().max(1);
-    let cap_ratio = sub
-        .capital_height()
-        .filter(|c| *c > 0)
-        .map(|c| c as f32 / upem as f32)
-        .filter(|r| (0.2..=1.0).contains(r))
-        .unwrap_or(0.7);
+    // The drawn text's capital measure, read from the full face: the subset
+    // may not hold its A.
+    let cap_ratio = Some(
+        crate::scene::text::ttf_glyph::capital_units(&orig) / orig.units_per_em().max(1) as f32,
+    )
+    .filter(|r| (0.2..=1.0).contains(r))
+    .unwrap_or(0.7);
     let mut gid_chars: std::collections::BTreeMap<char, u16> = std::collections::BTreeMap::new();
     let mut width_of: std::collections::BTreeMap<u16, u16> = std::collections::BTreeMap::new();
     for c in chars {
@@ -2154,10 +2253,17 @@ fn subset_family(
     let (ascent, descent) = (sub.ascender(), sub.descender());
     let cp_map: std::collections::BTreeMap<u32, u16> =
         gid_chars.iter().map(|(c, g)| (*c as u32, *g)).collect();
+    // A styled family (its bold / italic face) reads as a plain font name.
+    let (base, styled_bold, italic) = crate::scene::text::sysfont::split_style(family);
+    let name = format!(
+        "{base}{}{}",
+        if styled_bold { " Bold" } else { "" },
+        if italic { " Italic" } else { "" }
+    );
     let parsed = printpdf::ParsedFont::with_glyph_data(
         subset_bytes,
         0,
-        Some(family.to_string()),
+        Some(name),
         cp_map,
         width_of.clone(),
         upem,
@@ -2746,6 +2852,87 @@ mod tests {
     }
 
     #[test]
+    fn short_aligned_dashes_plot_the_complete_run() {
+        let mut missing = Vec::new();
+        for stationed in [false, true] {
+            let mut wire = WireModel::solid(
+                "synthetic".into(),
+                vec![[10.0, 20.0, 0.0], [12.0, 20.0, 0.0]],
+                WireModel::WHITE,
+                false,
+            );
+            wire.pattern_length = 4.0;
+            wire.pattern = [0.25, -3.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            if stationed {
+                // A clipped, independently patterned run can start in a gap.
+                wire.plinegen = false;
+                wire.pattern_stations = vec![1.0, 3.0, 8.0];
+            }
+            let page = test_page(vec![PlotWire {
+                wire,
+                draw_depth: 0.0,
+            }]);
+            let text = pdf_stream_text(&render_pdf_bytes(&[page], None).unwrap());
+            let tokens: Vec<_> = text.split_whitespace().collect();
+            let ends: Vec<f32> = tokens
+                .windows(3)
+                .filter_map(|items| (items[2] == "l").then(|| items[0].parse().unwrap()))
+                .collect();
+            if ends.len() != 1 || (ends[0] - 12.0 * MM_TO_PT).abs() >= 0.001 {
+                missing.push((stationed, ends));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "short runs must reach their endpoints: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn short_start_phased_dashes_keep_their_gap() {
+        let mut wire = WireModel::solid(
+            "synthetic".into(),
+            vec![[10.0, 20.0, 0.0], [12.0, 20.0, 0.0]],
+            WireModel::WHITE,
+            false,
+        );
+        wire.pattern_length = 4.0;
+        wire.pattern = [0.25, -3.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        wire.dash_from_start = true;
+        let page = test_page(vec![PlotWire {
+            wire,
+            draw_depth: 0.0,
+        }]);
+        let text = pdf_stream_text(&render_pdf_bytes(&[page], None).unwrap());
+        let tokens: Vec<_> = text.split_whitespace().collect();
+        let ends: Vec<f32> = tokens
+            .windows(3)
+            .filter_map(|items| (items[2] == "l").then(|| items[0].parse().unwrap()))
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert!((ends[0] - 10.25 * MM_TO_PT).abs() < 0.001);
+    }
+
+    #[test]
+    fn short_clip_of_a_long_continuous_dash_keeps_its_gap() {
+        let mut wire = WireModel::solid(
+            "synthetic".into(),
+            vec![[10.0, 20.0, 0.0], [12.0, 20.0, 0.0]],
+            WireModel::WHITE,
+            false,
+        );
+        wire.pattern_length = 4.0;
+        wire.pattern = [0.25, -3.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        wire.pattern_stations = vec![1.0, 3.0, 8.0];
+        let page = test_page(vec![PlotWire {
+            wire,
+            draw_depth: 0.0,
+        }]);
+        let text = pdf_stream_text(&render_pdf_bytes(&[page], None).unwrap());
+        assert!(!text.split_whitespace().any(|token| token == "S"));
+    }
+
+    #[test]
     fn atomic_write_replaces_an_existing_pdf() {
         let path = std::env::temp_dir().join(format!(
             "ocs-pdf-replace-{}-{}.pdf",
@@ -2781,6 +2968,50 @@ mod tests {
         // A valid PDF is produced (starts with the PDF header) and is non-trivial.
         assert!(bytes.starts_with(b"%PDF"), "not a PDF");
         assert!(bytes.len() > 200, "suspiciously small: {}", bytes.len());
+    }
+
+    #[test]
+    fn plot_transparency_keeps_colour_and_plots_alpha() {
+        // A half-transparent red line: with plot transparency on it keeps its
+        // red and plots through a graphics-state alpha, so what lies beneath
+        // stays visible; with it off it plots opaque without any alpha state.
+        let make_page = |transparency: bool| {
+            let wire = PlotWire {
+                wire: WireModel::solid(
+                    "test".into(),
+                    vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                    [1.0, 0.0, 0.0, 0.5],
+                    false,
+                ),
+                draw_depth: 0.0,
+            };
+            let mut page = test_page(vec![wire]);
+            page.options.transparency = transparency;
+            page
+        };
+        let on = pdf_stream_text(&render_pdf_bytes(&[make_page(true)], None).unwrap());
+        assert!(on.contains("/ca 0.5") || on.contains("/CA 0.5"), "alpha state missing");
+        assert!(on.contains("1 0 0 RG"), "colour must not be blended towards white");
+        let off = pdf_stream_text(&render_pdf_bytes(&[make_page(false)], None).unwrap());
+        assert!(!off.contains("/ca ") && !off.contains("/CA "), "no alpha without transparency");
+        assert!(off.contains("1 0 0 RG"), "opaque red without transparency");
+    }
+
+    #[test]
+    fn fully_opaque_objects_get_no_alpha_state() {
+        let wire = PlotWire {
+            wire: WireModel::solid(
+                "test".into(),
+                vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                [0.0, 0.0, 1.0, 1.0],
+                false,
+            ),
+            draw_depth: 0.0,
+        };
+        let mut page = test_page(vec![wire]);
+        page.options.transparency = true;
+        let text = pdf_stream_text(&render_pdf_bytes(&[page], None).unwrap());
+        assert!(!text.contains("/ca ") && !text.contains("/CA "));
     }
 
     #[test]
@@ -2991,6 +3222,12 @@ mod tests {
         assert!(
             stream.contains("Tr"),
             "searchable layer must be invisible (Tr rendering mode)"
+        );
+        // `Tr` outlives `ET`: unless the run restores the graphics state,
+        // every embedded TrueType glyph drawn after it is invisible (#2007).
+        assert!(
+            stream.contains("q\nBT") && stream.contains("ET\nQ"),
+            "searchable run must be wrapped in q/Q"
         );
     }
 

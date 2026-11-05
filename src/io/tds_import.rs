@@ -3,7 +3,7 @@
 //! mesh a polyface mesh on a layer chosen by object, material, object colour
 //! or a single layer, with its material; each camera a named view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use codec::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
 use codec::types::Vector3;
@@ -74,18 +74,28 @@ pub struct TdsScene {
 impl TdsScene {
     /// The materials a mesh uses, in the order the file defines them.
     pub fn mesh_materials(&self, mesh: &TdsMesh) -> Vec<String> {
+        // One pass over the groups instead of a full scan per scene material.
+        let present: HashSet<&str> = mesh
+            .groups
+            .iter()
+            .filter(|(_, faces)| !faces.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect();
         let mut used: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for m in &self.materials {
             if mesh
                 .groups
                 .iter()
                 .any(|(name, faces)| !faces.is_empty() && *name == m.name)
             {
+            if present.contains(m.name.as_str()) {
                 used.push(m.name.clone());
+                seen.insert(m.name.as_str());
             }
         }
         for (name, faces) in &mesh.groups {
-            if !faces.is_empty() && !used.contains(name) {
+            if !faces.is_empty() && seen.insert(name.as_str()) {
                 used.push(name.clone());
             }
         }
@@ -424,6 +434,9 @@ pub struct TdsImport {
     pub materials: Vec<String>,
     pub views: Vec<TdsCameraView>,
     pub messages: Vec<String>,
+    /// The texture maps not found, as (map file, material), in the order
+    /// their materials were converted.
+    pub missing_maps: Vec<(String, String)>,
 }
 
 /// Polyface meshes of `faces` of `mesh`: its vertices in file order, or
@@ -484,6 +497,7 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
         materials: Vec::new(),
         views: Vec::new(),
         messages: Vec::new(),
+        missing_maps: Vec::new(),
     };
     let chosen = |name: &str| options.selected.iter().any(|s| s == name);
     // The objects are taken in the order the window lists them, by name.
@@ -494,6 +508,8 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
             continue;
         }
         if options.stop_at.as_ref() == Some(name) {
+            // The mesh the cancelled material question stopped at.
+            out.messages.push(format!("Processing object {name}"));
             out.messages.push(format!("Import stopped at {name}"));
             return out;
         }
@@ -521,6 +537,30 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                                 (Some(m.clone()), faces)
                             })
                             .collect(),
+                    match options.multi.get(name).cloned().unwrap_or(MultiMaterial::Split) {
+                        MultiMaterial::Split => {
+                            // Index the groups once; the old code scanned the
+                            // whole list again for every material.
+                            let mut by_material: HashMap<&str, Vec<usize>> = HashMap::new();
+                            for (group_name, faces) in &mesh.groups {
+                                if !faces.is_empty() {
+                                    by_material
+                                        .entry(group_name.as_str())
+                                        .or_default()
+                                        .extend_from_slice(faces);
+                                }
+                            }
+                            materials
+                                .iter()
+                                .map(|m| {
+                                    let faces = by_material
+                                        .get(m.as_str())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    (Some(m.clone()), faces)
+                                })
+                                .collect()
+                        }
                         MultiMaterial::First => vec![(materials.first().cloned(), all)],
                         MultiMaterial::Material(m) => vec![(m, all)],
                     }
@@ -533,6 +573,23 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                     if let Some(m) = &material {
                         if !out.materials.contains(m) {
                             out.messages.push(format!("Converting material {m}"));
+                            // A texture map is looked for in the search path
+                            // (the current folder), not beside the file.
+                            let map = scene
+                                .materials
+                                .iter()
+                                .find(|x| x.name == *m)
+                                .and_then(|x| x.map.as_ref());
+                            if let Some((file, _)) = map {
+                                let found = std::env::current_dir()
+                                    .is_ok_and(|dir| dir.join(file).is_file());
+                                if !found {
+                                    out.messages.push(format!(
+                                        "Cannot find texture map file \"{file}\"."
+                                    ));
+                                    out.missing_maps.push((file.clone(), m.clone()));
+                                }
+                            }
                             out.materials.push(m.clone());
                             first_use = Some(m.clone());
                         }

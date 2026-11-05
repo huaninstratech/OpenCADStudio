@@ -9,8 +9,8 @@ use std::io::Read;
 
 use super::model::{
     arc_cubics, bspline_points, dgn_color_table, paths_bounds, scaled_elements, By, DgnCollector,
-    DgnColor, DgnElement, DgnGeom, DgnImport, DgnReference, Path, PathBuilder, Segment, Sheet,
-    SubPath, Text, DGN_DEFAULT_COLORS,
+    DgnColor, DgnDimLook, DgnDimStyle, DgnElement, DgnGeom, DgnImport, DgnReference, Path,
+    PathBuilder, Segment, Sheet, SubPath, Text, DGN_DEFAULT_COLORS,
 };
 
 // ── Compound file ───────────────────────────────────────────────────────────
@@ -323,18 +323,75 @@ fn text_style_table(nm: &[&[u8]]) -> Vec<(u32, String, String)> {
     out
 }
 
-/// The dimension style table (table 5): each entry's element id and name.
-/// One style can have more than one entry.
-fn dim_style_table(nm: &[&[u8]]) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
+/// The dimension style table (table 5), lengths in master units (`s` per
+/// UOR). One style can have more than one entry. An entry holds its
+/// element id (16), text style id (56), accuracy (72), flags (85: 0x10
+/// text in the line, 0x20 horizontal text; 184: 0x01 a line between the
+/// extension lines, 0x10 trailing zeros shown), text height (112),
+/// extension line offset and extension (152, 160), text gap (360) and
+/// terminator width (408) as text heights, stack offset (288), centre
+/// mark (296), angle decimal places (307, plus one), its master and sub
+/// units (numerator and denominator per metre at 520 and 544) and name
+/// (after 104); the linkage `de 56` holds its scale 54 bytes in.
+fn dim_style_table(nm: &[&[u8]], s: f64) -> Vec<DgnDimStyle> {
+    // Text style id (32) → its font number and kind (40); the text style
+    // table can follow the dimension style table.
+    let mut fonts = HashMap::new();
     let mut table = 0;
     for e in nm {
         match kind(e) {
             96 => table = u32_at(e, 12).unwrap_or(0),
-            95 if table == 5 => {
-                if let (Some(id), Some(name)) = (u32_at(e, 16), marked_string(e, 104)) {
-                    out.push((id, name));
+            95 if table == 3 => {
+                if let (Some(id), Some(f)) = (u32_at(e, 32), e.get(40..42)) {
+                    fonts.entry(id).or_insert((f[0], f[1]));
                 }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for e in nm {
+        match kind(e) {
+            96 => table = u32_at(e, 12).unwrap_or(0),
+            95 if table == 5 => {
+                let (Some(id), Some(name)) = (u32_at(e, 16), marked_string(e, 104)) else {
+                    continue;
+                };
+                let real = |at: usize| f64_at(e, at).filter(|v| v.is_finite()).unwrap_or(0.0);
+                let bit = |at: usize, mask: u8| e.get(at).is_some_and(|b| b & mask != 0);
+                let text_height = real(112) * s;
+                // Metres per unit: denominator over numerator.
+                let metres = |at: usize| {
+                    let n = real(at);
+                    (n > 0.0).then(|| real(at + 8) / n)
+                };
+                let near = |m: Option<f64>, v: f64| m.is_some_and(|m| (m - v).abs() < 1e-9);
+                let scale = (600..e.len().saturating_sub(4))
+                    .find(|&k| e[k + 1] == 0x10 && e[k + 2] == 0xde && e[k + 3] == 0x56)
+                    .and_then(|k| f64_at(e, k + 54))
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0);
+                out.push(DgnDimStyle {
+                    id,
+                    name,
+                    text_style: u32_at(e, 56).unwrap_or(0),
+                    font: u32_at(e, 56).and_then(|t| fonts.get(&t).copied()).unwrap_or((0, 0)),
+                    text_height,
+                    arrow: real(408) * text_height,
+                    ext_offset: real(152) * text_height,
+                    ext_extension: real(160) * text_height,
+                    gap: real(360) * text_height,
+                    stack_offset: real(288) * s,
+                    center: real(296) * s,
+                    accuracy: e.get(72).copied().unwrap_or(0x84),
+                    angle_places: e.get(307).map_or(0, |b| b.saturating_sub(1)),
+                    trailing_zeros: bit(184, 0x10),
+                    inline_text: bit(85, 0x10),
+                    horizontal_text: bit(85, 0x20),
+                    line_inside: bit(184, 0x01),
+                    scale,
+                    two_units: near(metres(520), 0.3048) && near(metres(544), 0.0254),
+                });
             }
             _ => {}
         }
@@ -811,6 +868,8 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             geom,
             filled: matches!(kind(e), 6 | 14)
                 && e.windows(4).any(|w| w == [0x07, 0x10, 0x41, 0x00]),
+            filled: matches!(kind(e), 6 | 14) && e.windows(4).any(|w| w == [0x07, 0x10, 0x41, 0x00]),
+            construction: false,
         };
         let stroke = Some((color, -1.0));
         let d3 = is_3d(e);
@@ -1129,12 +1188,30 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                     {
                         let x = dir3(x);
                         let y = dir3(y);
+                        // Its own settings: text height (152), font number
+                        // and kind (168), text off the line (180, 0x40),
+                        // extension line offset and extension (192, 200),
+                        // text gap and margin (208, 216), terminator width
+                        // (232).
+                        let real = |at: usize| f64_at(e, at).unwrap_or(0.0);
+                        let byte = |at: usize| e.get(at).copied().unwrap_or(0);
+                        let look = DgnDimLook {
+                            font: (byte(168), byte(169)),
+                            text_height: real(152),
+                            ext_offset: real(192),
+                            ext_extension: real(200),
+                            gap: real(208),
+                            margin: real(216),
+                            arrow: real(232),
+                            text_outside: byte(180) & 0x40 != 0,
+                        };
                         collect.push(element(DgnGeom::Dimension {
                             kind: dim,
                             points,
                             offset: f64_at(e, 328).unwrap_or(0.0),
                             axes: [[x[0], x[1]], [y[0], y[1]]],
                             style,
+                            look,
                         }));
                     }
                     // Otherwise the dimension comes in as its drawing.
@@ -1164,6 +1241,8 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             105 if u32_at(e, 108) == Some(1) => {
                 let n = u32_at(e, 104).unwrap_or(0) as usize;
                 let parts = &run[index + 1..(index + 1 + n).min(run.len())];
+                // A large matrix does not fit one element: its values run on
+                // through every data element up to the next header.
                 let data = |family: u32, data_kind: u8, size: usize| {
                     let d = parts.windows(2).find(|w| {
                         kind(w[0]) == 101
@@ -1177,6 +1256,15 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                             .take(count)
                             .collect::<Vec<_>>(),
                     )
+                    let header = parts
+                        .iter()
+                        .position(|&p| kind(p) == 101 && u32_at(p, 116) == Some(family))?;
+                    let mut values = Vec::new();
+                    for &d in parts[header + 1..].iter().take_while(|&&p| kind(p) == data_kind) {
+                        let count = u32_at(d, 104)? as usize;
+                        values.extend(d.get(120..)?.chunks_exact(size).take(count));
+                    }
+                    (!values.is_empty()).then_some(values)
                 };
                 let (Some(numbers), Some(coords)) = (data(1, 102, 4), data(2, 103, 8)) else {
                     continue;
@@ -1411,14 +1499,37 @@ fn inflate_budget(cfb: &Cfb) -> usize {
     cfb.b.len().saturating_mul(64).max(256 << 20)
 }
 
+/// The model directories of the file: those holding graphic streams.
+fn model_dirs<E>(streams: &[(String, E)]) -> Vec<String> {
+    let mut dirs: Vec<String> = streams
+        .iter()
+        .filter_map(|(p, _)| {
+            let (dir, n) = p.rsplit_once("/Dgn^G/$")?;
+            n.parse::<u32>().is_ok().then(|| dir.to_string())
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// The numbered streams `{dir}/{kind}/$1`, `$2`, … of a model, in number
+/// order: an element stream holds about a thousand elements, and a model
+/// edited and compressed may have only its later ones filled (#2421).
+fn numbered<'a, E>(streams: &'a [(String, E)], dir: &str, kind: &str) -> Vec<&'a E> {
+    let prefix = format!("{dir}/{kind}/$");
+    let mut found: Vec<(u32, &E)> = streams
+        .iter()
+        .filter_map(|(p, e)| Some((p.strip_prefix(&prefix)?.parse().ok()?, e)))
+        .collect();
+    found.sort_by_key(|(n, _)| *n);
+    found.into_iter().map(|(_, e)| e).collect()
+}
+
 /// Models of the file: (name, graphic stream, header stream).
 fn models(cfb: &Cfb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let streams = cfb.streams();
-    let mut dirs: Vec<String> = streams
-        .iter()
-        .filter_map(|(p, _)| p.strip_suffix("/Dgn^G/$1").map(|d| d.to_string()))
-        .collect();
-    dirs.sort();
+    let dirs = model_dirs(&streams);
     // Each stream may inflate to `STREAM_LIMIT` (512 MB) and every model
     // dir inflates its own — entries can all point at the same payload, so
     // N dirs × 512 MB was reachable from one small stream. The budget
@@ -1439,7 +1550,13 @@ fn models(cfb: &Cfb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
                 .map(|(_, e)| inflate(&cfb.stream(e)))
                 .unwrap_or_default()
         };
-        let graphics = get("Dgn^G/$1");
+        let mut graphics = Vec::new();
+        for entry in numbered(&streams, &dir, "Dgn^G") {
+            if total.saturating_add(graphics.len()) >= total_limit {
+                break;
+            }
+            graphics.extend(inflate(&cfb.stream(entry)));
+        }
         let header = get("Dgn~Mh");
         total = total
             .saturating_add(graphics.len())
@@ -1665,23 +1782,21 @@ pub fn design_model_names(bytes: &[u8]) -> Option<Vec<String>> {
 /// are taken by the models already read).
 fn control_stream(cfb: &Cfb, k: usize, used: usize) -> Vec<u8> {
     let streams = cfb.streams();
-    let mut dirs: Vec<&str> = streams
-        .iter()
-        .filter_map(|(p, _)| p.strip_suffix("/Dgn^G/$1"))
-        .collect();
-    dirs.sort();
+    let dirs = model_dirs(&streams);
     let Some(dir) = dirs.get(k) else {
         return Vec::new();
     };
-    let left = inflate_budget(cfb).saturating_sub(used) as u64;
-    if left == 0 {
-        return Vec::new();
+    let mut left = inflate_budget(cfb).saturating_sub(used) as u64;
+    let mut out = Vec::new();
+    for entry in numbered(&streams, dir, "Dgn^C") {
+        if left == 0 {
+            break;
+        }
+        let part = inflate_at_most(&cfb.stream(entry), left.min(STREAM_LIMIT));
+        left = left.saturating_sub(part.len() as u64);
+        out.extend(part);
     }
-    streams
-        .iter()
-        .find(|(p, _)| *p == format!("{dir}/Dgn^C/$1"))
-        .map(|(_, e)| inflate_at_most(&cfb.stream(e), left.min(STREAM_LIMIT)))
-        .unwrap_or_default()
+    out
 }
 
 /// Every string of an element stored after the "ff fe 01 00" marker, with
@@ -1828,8 +1943,16 @@ pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
         v7: false,
         references,
         text_styles: text_style_table(&nm),
-        dim_styles: dim_style_table(&nm),
+        dim_styles: dim_style_table(&nm, s),
+        fonts: font_table(&nm)
+            .into_iter()
+            .map(|(n, k, name)| {
+                let file = font_file(Some((k, &name)));
+                (n, k, name, file)
+            })
+            .collect(),
         three_d: false,
+        construction_layers: false,
     })
 }
 

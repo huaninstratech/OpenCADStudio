@@ -52,7 +52,12 @@ pub fn read_text_field(entity: &EntityType) -> Option<(String, TextEntityField)>
         EntityType::AttributeEntity(a) => {
             Some((a.get_value().to_string(), TextEntityField::AttEnt))
         }
-        EntityType::Dimension(d) => Some((d.base().text.clone(), TextEntityField::Dim)),
+        EntityType::Dimension(d) => Some((
+            crate::entities::dimension::dimension_text_override(d.base())
+                .unwrap_or_default()
+                .to_string(),
+            TextEntityField::Dim,
+        )),
         EntityType::Tolerance(t) => Some((t.text.clone(), TextEntityField::Tolerance)),
         EntityType::MultiLeader(ml) => {
             Some((ml.context.text_string.clone(), TextEntityField::MLeader))
@@ -68,7 +73,14 @@ pub fn write_text_field(entity: &mut EntityType, field: TextEntityField, value: 
         (EntityType::MText(m), TextEntityField::MText) => m.value = value,
         (EntityType::AttributeDefinition(a), TextEntityField::AttDef) => a.default_value = value,
         (EntityType::AttributeEntity(a), TextEntityField::AttEnt) => a.set_value(value),
-        (EntityType::Dimension(d), TextEntityField::Dim) => d.base_mut().text = value,
+        (EntityType::Dimension(d), TextEntityField::Dim) => {
+            // Both override slots, as the Properties row writes them: a stale
+            // `user_text` would otherwise keep winning over the new text.
+            crate::entities::dimension::set_dimension_text_override(
+                d.base_mut(),
+                (!value.trim().is_empty()).then_some(value),
+            );
+        }
         (EntityType::Tolerance(t), TextEntityField::Tolerance) => t.text = value,
         (EntityType::MultiLeader(ml), TextEntityField::MLeader) => {
             ml.context.text_string = value;
@@ -101,7 +113,7 @@ pub struct TextInlineState {
     /// Canvas-space anchor where the field is drawn (the insertion-point click).
     pub screen_anchor: iced::Point,
 }
-pub(super) fn can_edit_text(mut handle: Handle, document: &codec::CadDocument) -> bool {
+pub(super) fn can_edit_text(mut handle: Handle, document: &codec::Document) -> bool {
     for _ in 0..8 {
         match document.get_entity(handle) {
             Some(codec::EntityType::Leader(l)) => {
@@ -155,11 +167,29 @@ impl super::OpenCADStudio {
             self.open_tolerance_dialog(Some(target));
             return iced::Task::none();
         }
+        // A table edits its first cell on the command line.
+        if let Some(EntityType::Table(table)) = self.tabs[i].scene.document.get_entity(target) {
+            let command = crate::modules::annotate::table_cmd::TableCellEditCommand::new(
+                target, table, 0, 0,
+            );
+            self.command_line
+                .push_info(&crate::command::CadCommand::prompt(&command));
+            self.tabs[i].active_cmd = Some(Box::new(command));
+            return iced::Task::none();
+        }
         if matches!(
             self.tabs[i].scene.document.get_entity(target),
             Some(EntityType::AttributeDefinition(_))
         ) {
             self.open_attdef_edit(target);
+            return iced::Task::none();
+        }
+        // A text that is one field, as FIELD makes it, edits that field.
+        if matches!(
+            self.tabs[i].scene.document.get_entity(target),
+            Some(EntityType::MText(_) | EntityType::Text(_))
+        ) && self.open_field_edit(target)
+        {
             return iced::Task::none();
         }
         // Snapshot what we need before borrowing `self` mutably to open.
@@ -244,6 +274,11 @@ impl super::OpenCADStudio {
             if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(h) {
                 write_text_field(entity, ed.field, ed.value.clone());
             }
+            if ed.field == TextEntityField::Dim {
+                // The dimension draws from its baked block; drop it so the
+                // new text is drawn (and re-baked on save).
+                self.tabs[i].scene.invalidate_dim_block_recorded(h);
+            }
             self.tabs[i]
                 .scene
                 .bump_entities(&[(h, crate::scene::ChangeKind::Modified)]);
@@ -315,7 +350,7 @@ impl super::OpenCADStudio {
             {
                 self.tabs[i].scene.document.header.text_height = paper_height;
             }
-            let handle = self.commit_entity_handle(plane.place_entity(EntityType::Text(t)));
+            let handle = self.commit_new_text(plane.place_entity(EntityType::Text(t)));
             if annotative {
                 let scale = self.tabs[i].scene.creation_annotation_scale_handle();
                 if let (Some(handle), Some(scale)) = (handle, scale) {

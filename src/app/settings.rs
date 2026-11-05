@@ -108,6 +108,17 @@ impl AutoConstrainSettings {
     }
 }
 
+/// Check Spelling preferences kept with the profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpellPrefs {
+    /// BCP-47 tag of the main dictionary; empty: the system language.
+    pub language: String,
+    pub options: crate::ui::window::spell_dialog::SpellOptions,
+    /// Words added to the user's dictionary.
+    pub custom: Vec<String>,
+}
+
 /// TXT2MTXT (Combine Text) settings, the profile values
 /// TXT2MTXTCOMBINEMTEXT, TXT2MTXTTEXTORDER, TXT2MTXTWORDWRAP and
 /// TXT2MTXTLINESPACING.
@@ -123,6 +134,30 @@ pub struct Txt2MtxtSettings {
     pub word_wrap: bool,
     /// Force uniform line spacing (always on while word-wrap is).
     pub uniform_spacing: bool,
+}
+
+/// The Inspection Dimension window's last values, offered the next time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DimInspectSettings {
+    /// 0 round, 1 angular, 2 no frame.
+    pub shape: u8,
+    pub label_on: bool,
+    pub label: String,
+    pub rate_on: bool,
+    pub rate: String,
+}
+
+impl Default for DimInspectSettings {
+    fn default() -> Self {
+        Self {
+            shape: 0,
+            label_on: false,
+            label: String::new(),
+            rate_on: true,
+            rate: "100%".to_string(),
+        }
+    }
 }
 
 impl Default for Txt2MtxtSettings {
@@ -203,6 +238,65 @@ pub const ZOOM_FACTOR_MIN: i32 = 3;
 pub const ZOOM_FACTOR_SYSVAR_MAX: i32 = 100;
 pub const ZOOM_FACTOR_MAX: i32 = 200;
 
+/// QUADWIDTH bounds: below 2 columns the expanded quad cannot show the
+/// most-recently-used set and its tabs meaningfully, above 12 the row of
+/// icons is unreadable — the range the variable itself takes.
+pub const QUAD_WIDTH_MIN: u8 = 2;
+pub const QUAD_WIDTH_MAX: u8 = 12;
+
+/// Hold a QUADWIDTH inside the range the quad lays out, wherever it arrives
+/// from — the Options field, `SETVAR QUADWIDTH`, or a configuration file
+/// written by hand or by an older build.
+pub fn clamp_quad_width(v: u8) -> u8 {
+    v.clamp(QUAD_WIDTH_MIN, QUAD_WIDTH_MAX)
+}
+
+/// QUADHOVERDELAY-style dwell bounds: above 2000 ms the hover quad becomes
+/// unreachable in practice; 0 opens it immediately. Shared with the Options
+/// slider so its range and labels cannot drift from this clamp.
+pub const QUAD_HOVER_DELAY_MAX: u64 = 2000;
+
+pub fn clamp_quad_hover_delay_ms(v: u64) -> u64 {
+    v.min(QUAD_HOVER_DELAY_MAX)
+}
+
+/// In-code default when the `quad_width` key is absent (serde's bare
+/// `default` would fall back to `u8::default()` = 0, off the domain).
+fn default_quad_width() -> u8 {
+    clamp_quad_width(6)
+}
+
+/// In-code default when the `quad_hover_delay_ms` key is absent.
+fn default_quad_hover_delay_ms() -> u64 {
+    300
+}
+
+/// Tolerant load for a hand-edited `quad_width` (`serde(deserialize_with)`):
+/// any JSON number parses as `i64` and clamps into QUADWIDTH's domain
+/// instead of failing the whole settings parse — which would reset every
+/// other preference with it. A value that is not a number at all still
+/// errors, exactly like the neighbouring strict fields.
+fn deserialize_quad_width<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = i64::deserialize(deserializer)?;
+    let saturated = raw.clamp(0, i64::from(u8::MAX)) as u8;
+    Ok(clamp_quad_width(saturated))
+}
+
+/// Tolerant load for a hand-edited `quad_hover_delay_ms`: any JSON number
+/// parses as `i64` (a negative one latches to 0 = immediate) and clamps into
+/// the dwell domain instead of failing the whole settings parse. A value
+/// that is not a number at all still errors, like the neighbouring fields.
+fn deserialize_quad_hover_delay_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = i64::deserialize(deserializer)?;
+    Ok(clamp_quad_hover_delay_ms(raw.max(0) as u64))
+}
+
 /// Hold a ZOOMFACTOR inside the range the application can store, wherever it
 /// arrives from — the slider, the Options field, or a configuration file
 /// written by hand or by an older build.
@@ -232,21 +326,154 @@ pub fn zoom_notch_percent(factor: i32) -> f32 {
     (1.0 - ratio) * 100.0
 }
 
-/// Which mouse gestures pan and orbit the model view.
+/// Which mouse gestures pan and orbit the model view. Besides the own CAD
+/// default, the styles follow the programs they are named after, as FreeCAD
+/// offers them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigationStyle {
     /// Middle button pans; Shift + middle button orbits.
     #[default]
     Cad,
-    /// Middle button orbits; Shift + middle button pans.
+    /// Middle button orbits; Shift + middle button, or left + right, pans.
     Blender,
-    /// Middle button pans; middle and left buttons together orbit.
+    /// Middle button pans; middle with the right (or left) button orbits
+    /// about the screen centre; a right click during a middle drag zooms.
     Catia,
+    /// Middle button pans; middle with the left or right button orbits.
+    FreeCad,
+    /// Left button orbits, right button pans, both together tilt.
+    Gesture,
+    /// Alt + left orbits, Alt + middle pans, Alt + right zooms.
+    MayaGesture,
+    /// Middle pans; middle + right or Ctrl + right orbits; Ctrl + left zooms.
+    OpenCascade,
+    /// Left button orbits, middle pans, middle + left zooms.
+    OpenInventor,
+    /// Left button orbits, right pans, middle (or Shift + right) zooms.
+    OpenScad,
+    /// Middle pans; Shift + middle or middle + right orbits; left + right pans.
+    Revit,
+    /// Middle orbits; Shift + middle or middle + right pans; middle + left zooms.
+    SiemensNx,
+    /// Middle orbits; Ctrl + middle pans; Shift + middle zooms.
+    SolidWorks,
+    /// Right button orbits, middle pans.
+    TinkerCad,
+    /// No button needed: Shift pans, Alt orbits, Ctrl + Shift zooms.
+    Touchpad,
+}
+
+/// What a navigation drag does to the view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavAction {
+    Pan,
+    Orbit,
+    Zoom,
+    /// Turn about the view axis.
+    Roll,
+}
+
+/// The mouse buttons held down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NavButtons {
+    pub left: bool,
+    pub middle: bool,
+    pub right: bool,
 }
 
 impl NavigationStyle {
-    pub const ALL: [NavigationStyle; 3] = [Self::Cad, Self::Blender, Self::Catia];
+    pub const ALL: [NavigationStyle; 14] = [
+        Self::Cad,
+        Self::Blender,
+        Self::Catia,
+        Self::FreeCad,
+        Self::Gesture,
+        Self::MayaGesture,
+        Self::OpenCascade,
+        Self::OpenInventor,
+        Self::OpenScad,
+        Self::Revit,
+        Self::SiemensNx,
+        Self::SolidWorks,
+        Self::TinkerCad,
+        Self::Touchpad,
+    ];
+
+    /// What dragging with `held` and the modifiers does, `None` when the
+    /// buttons do not navigate (a left drag selects, a right click opens the
+    /// menu). `dragging` is true while a navigation drag is under way, for
+    /// the styles where a button keeps one going that would not start it.
+    pub fn action(
+        self,
+        held: NavButtons,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        dragging: bool,
+    ) -> Option<NavAction> {
+        use NavAction::*;
+        let NavButtons {
+            left,
+            middle,
+            right,
+        } = held;
+        match (self, left, middle, right) {
+            (Self::Cad, false, true, false) => Some(if shift { Orbit } else { Pan }),
+            (Self::Blender, false, true, false) => Some(if shift { Pan } else { Orbit }),
+            (Self::Blender, true, false, true) => Some(Pan),
+            (Self::Catia, false, true, false) => Some(Pan),
+            (Self::Catia, _, true, _) => Some(Orbit),
+            (Self::FreeCad, false, true, false) => Some(Pan),
+            (Self::FreeCad, _, true, _) => Some(Orbit),
+            // The middle button may be let go once the right one is down.
+            (Self::FreeCad, false, false, true) if dragging => Some(Orbit),
+            (Self::Gesture, true, false, false) => Some(Orbit),
+            (Self::Gesture, false, false, true) => Some(Pan),
+            (Self::Gesture, true, false, true) => Some(Roll),
+            (Self::MayaGesture, true, false, false) if alt => Some(Orbit),
+            (Self::MayaGesture, false, true, false) if alt => Some(Pan),
+            (Self::MayaGesture, false, false, true) if alt => Some(Zoom),
+            (Self::MayaGesture, true, false, true) if alt => Some(Roll),
+            (Self::OpenCascade, true, false, false) if ctrl => Some(Zoom),
+            (Self::OpenCascade, false, false, true) if ctrl => Some(Orbit),
+            (Self::OpenCascade, false, true, true) => Some(Orbit),
+            (Self::OpenCascade, false, true, false) => Some(Pan),
+            (Self::OpenInventor, true, false, false) if !shift && !ctrl => Some(Orbit),
+            (Self::OpenInventor, false, true, false) => Some(Pan),
+            (Self::OpenInventor, true, true, false) => Some(Zoom),
+            (Self::OpenScad, true, false, false) => Some(Orbit),
+            (Self::OpenScad, false, false, true) => Some(if shift { Zoom } else { Pan }),
+            (Self::OpenScad, false, true, false) => Some(Zoom),
+            (Self::OpenScad, false, true, true) => Some(Orbit),
+            (Self::Revit, false, true, false) => Some(if shift { Orbit } else { Pan }),
+            (Self::Revit, false, true, true) => Some(Orbit),
+            (Self::Revit, true, false, true) => Some(Pan),
+            (Self::SiemensNx, false, true, false) => Some(if shift { Pan } else { Orbit }),
+            (Self::SiemensNx, false, true, true) => Some(Pan),
+            (Self::SiemensNx, true, true, false) => Some(Zoom),
+            (Self::SolidWorks, false, true, false) => Some(if ctrl {
+                Pan
+            } else if shift {
+                Zoom
+            } else {
+                Orbit
+            }),
+            (Self::TinkerCad, false, false, true) => Some(Orbit),
+            (Self::TinkerCad, false, true, false) => Some(Pan),
+            (Self::Touchpad, false, false, false) if ctrl && shift => Some(Zoom),
+            (Self::Touchpad, false, false, false) if shift => Some(Pan),
+            (Self::Touchpad, false, false, false) if alt => Some(Orbit),
+            (Self::Touchpad, true, false, false) if shift => Some(Orbit),
+            _ => None,
+        }
+    }
+
+    /// A middle click (no drag) brings the point under the pointer to the
+    /// centre of the view.
+    pub fn middle_click_recenters(self) -> bool {
+        !matches!(self, Self::Cad | Self::OpenCascade | Self::Touchpad)
+    }
 }
 
 impl std::fmt::Display for NavigationStyle {
@@ -255,6 +482,17 @@ impl std::fmt::Display for NavigationStyle {
             Self::Cad => crate::t!("CAD: Shift + middle button orbits"),
             Self::Blender => crate::t!("Blender: middle button orbits, Shift pans"),
             Self::Catia => crate::t!("CATIA: middle + left button orbits"),
+            Self::FreeCad => crate::t!("FreeCAD CAD: middle + left button orbits"),
+            Self::Gesture => crate::t!("Gesture: left button orbits, right button pans"),
+            Self::MayaGesture => crate::t!("Maya-Gesture: Alt + mouse buttons"),
+            Self::OpenCascade => crate::t!("OpenCascade: Ctrl + right button orbits"),
+            Self::OpenInventor => crate::t!("OpenInventor: left button orbits"),
+            Self::OpenScad => crate::t!("OpenSCAD: left button orbits, right button pans"),
+            Self::Revit => crate::t!("Revit: Shift + middle button orbits"),
+            Self::SiemensNx => crate::t!("Siemens NX: middle button orbits, Shift pans"),
+            Self::SolidWorks => crate::t!("SolidWorks: middle button orbits, Ctrl pans"),
+            Self::TinkerCad => crate::t!("TinkerCAD: right button orbits"),
+            Self::Touchpad => crate::t!("Touchpad: Shift pans, Alt orbits"),
         })
     }
 }
@@ -450,6 +688,7 @@ pub struct BlockEditorPreferences {
     pub dynamic_grip_color: u8,
     pub grip_tips: bool,
     pub action_bars: bool,
+    pub constraint_colors: [String; 4],
 }
 
 impl Default for BlockEditorPreferences {
@@ -468,6 +707,7 @@ impl Default for BlockEditorPreferences {
             dynamic_grip_color: 140,
             grip_tips: true,
             action_bars: true,
+            constraint_colors: ["8".into(), "2".into(), "3".into(), "1".into()],
         }
     }
 }
@@ -566,7 +806,7 @@ impl BlockEditorPreferences {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
     pub block_editor: BlockEditorPreferences,
@@ -594,10 +834,19 @@ pub struct UserSettings {
     pub aperture: f32,
     /// HPASSOC: new hatches follow their boundary objects.
     pub hatch_associative: bool,
+    /// HPGAPTOL: largest boundary gap HATCH/BOUNDARY picks treat as closed.
+    pub hatch_gap_tolerance: f64,
+    /// HATCH starts with the boundary method used last (0 pick internal
+    /// point, 1 select objects, 2 draw).
+    pub hatch_start_method: u8,
     /// MENUBAR: the classic pull-down menus show above the ribbon.
     pub show_menu_bar: bool,
     /// RIBBONCLOSE hid the ribbon; RIBBON brings it back.
     pub ribbon_closed: bool,
+    /// COMMANDLINEHIDE (Ctrl+9) hid the command line; COMMANDLINE shows it.
+    pub command_line_hidden: bool,
+    /// The Layer Manager's column order; a hidden column is led by `-`.
+    pub layer_columns: Vec<String>,
     /// When true, double-clicking a block reference starts REFEDIT instead of BEDIT.
     pub double_click_block_refedit: bool,
     /// When true, double-clicking a block with attributes opens ATTEDIT.
@@ -607,6 +856,37 @@ pub struct UserSettings {
     /// Hold duration that turns a time-sensitive right-click into the menu,
     /// in milliseconds (SHORTCUTMENUDURATION, 100..=1000).
     pub right_click_hold_ms: i32,
+    /// Whether the Quad cursor menu exists at all (F12, the status-bar QUAD
+    /// field, `SETVAR QUAD`). Off by default: with a target present the quad
+    /// takes over the right-click, so existing users keep their habit until
+    /// they opt in.
+    pub quad: bool,
+    /// QUADDISPLAY bit: hovering an entity offers its default command quad.
+    pub quad_on_hover: bool,
+    /// QUADDISPLAY bit: a selection set offers its common commands on the
+    /// quad.
+    pub quad_on_select: bool,
+    /// QUADDISPLAY bit: a right-click without a target opens the No Selection
+    /// quad (recently used commands + creation groups) instead of the legacy
+    /// shortcut menu.
+    pub quad_on_right_click: bool,
+    /// QUADDISPLAY bit: the selection takes precedence — hovering keeps
+    /// offering the quad only when nothing is selected.
+    pub quad_suppress_hover_when_selection: bool,
+    /// QUADWIDTH: columns the expanded quad lays out (2..=12, default 6).
+    /// The reader is the tolerant one above: a hand-written out-of-range
+    /// number loads clamped instead of failing the whole config parse.
+    #[serde(default = "default_quad_width", deserialize_with = "deserialize_quad_width")]
+    pub quad_width: u8,
+    /// QUADCOMMANDLAUNCH: a right-click over an entity without entering the
+    /// quad launches the entity's default command directly.
+    pub quad_command_launch: bool,
+    /// How long the cursor must rest on an entity before the hover quad
+    /// appears, in milliseconds (0..=2000; 0 = immediately). The reader is
+    /// the tolerant one above: a negative or oversized hand-written number
+    /// loads clamped instead of failing the whole config parse.
+    #[serde(default = "default_quad_hover_delay_ms", deserialize_with = "deserialize_quad_hover_delay_ms")]
+    pub quad_hover_delay_ms: u64,
     /// GRIPOBJLIMIT: past this many selected objects, no grips are drawn at
     /// all. 0 means no limit. The drawing header carries no slot for it.
     pub grip_object_limit: i32,
@@ -615,6 +895,8 @@ pub struct UserSettings {
     pub image_frame: i16,
     /// The Attribute Definition dialog's "Specify on-screen" choice.
     pub attdef_on_screen: bool,
+    /// Insert Table / -TABLE column and row settings and insertion behaviour.
+    pub table_insert: crate::modules::annotate::table_cmd::TableDefaults,
     /// Block Definition dialog: base point "Specify On-screen".
     pub block_base_on_screen: bool,
     /// Block Definition dialog: objects "Specify On-screen".
@@ -631,15 +913,39 @@ pub struct UserSettings {
     pub wblock_object_mode: u8,
     /// FIELDDISPLAY: fields show on a gray background.
     pub field_display: bool,
+    /// HYPERLINKOPTIONS: the hyperlink cursor, tooltip and shortcut menu.
+    pub hyperlink_options: bool,
     /// XDWGFADECTL: how much referenced drawings fade (-90..=90; negative is off).
     pub xref_fade: i32,
     /// FILEDIA: file dialogs of commands that have a command-line form.
     pub file_dia: bool,
+    /// OLEHIDE: which OLE objects show (0 all, 1 paper space, 2 model space, 3 none).
+    pub ole_hide: i16,
+    /// OLEQUALITY: the plot quality of new OLE objects (3 automatic).
+    pub ole_quality: i16,
+    /// GROUPDISPLAYMODE: a picked group shows member grips (0), a centre
+    /// grip (1) or a centre grip and a box (2).
+    pub group_display_mode: i16,
+    /// OFFSETGAPTYPE: how a polyline offset outward closes its corners
+    /// (0 extend, 1 fillet, 2 chamfer).
+    pub offset_gap_type: u8,
     /// TRIMEXTENDMODE: TRIM and EXTEND start in Quick mode (else Standard).
     pub trim_extend_quick: bool,
+    /// MATCHMODE: the properties MATCHPROP transfers, one bit each.
+    pub match_mode: u32,
+    /// MEASUREGEOM starts in quick measure (its Mode option).
+    pub measuregeom_quick: bool,
+    /// REVCLOUDCREATEMODE: the type REVCLOUD starts with (0 Freehand, 1 Rectangular, 2 Polygonal).
+    pub revcloud_create_mode: u8,
+    /// REVCLOUDARCVARIANCE: cloud chords of random length.
+    pub revcloud_arc_variance: bool,
+    /// REVCLOUDGRIPS: clouds show the grips of their path.
+    pub revcloud_grips: bool,
     /// Fonts and plot styles kept in a chosen folder (`None`: the default).
     pub fonts_folder: Option<String>,
     pub plot_styles_folder: Option<String>,
+    /// The user's support files folder (patterns, linetypes, fonts).
+    pub support_folder: Option<String>,
     /// The file type ATTACH's picker was last left on (1-based).
     pub attach_filter: u32,
     /// SURFACEASSOCIATIVITY: new surfaces stay associative to their sources.
@@ -670,6 +976,13 @@ pub struct UserSettings {
     pub ucs_icon_at_origin: bool,
     /// Selection cycling: a click where objects overlap opens a picker.
     pub selection_cycling: bool,
+    /// OSNAPZ: object snaps take the current elevation instead of the
+    /// snapped object's Z.
+    pub osnap_z: bool,
+    /// SELECTSIMILARMODE: the properties besides the type that Select
+    /// Similar matches (1 colour, 2 layer, 4 linetype, 8 linetype scale,
+    /// 16 lineweight, 32 plot style, 64 object style, 128 name).
+    pub select_similar_mode: u16,
     /// CURSORTYPE: crosshair or the platform pointer over the drawing.
     pub cursor_type: CursorType,
     /// Explicit crosshair RGB. `None` keeps automatic background contrast.
@@ -768,6 +1081,12 @@ pub struct UserSettings {
     /// TXT2MTXT settings (Text to MText Settings dialog).
     #[serde(default)]
     pub txt2mtxt: Txt2MtxtSettings,
+    /// Check Spelling: main dictionary, options and the user's words.
+    #[serde(default)]
+    pub spell: SpellPrefs,
+    /// Inspection Dimension window values.
+    #[serde(default)]
+    pub dim_inspect: DimInspectSettings,
     /// Keep existing geometry size while solving after a constraint edit.
     #[serde(default = "default_constraint_solve_mode")]
     pub constraint_solve_mode: bool,
@@ -799,6 +1118,11 @@ pub struct UserSettings {
     pub pick_drag_rect: bool,
     /// Show the floating Quick Properties panel when objects are selected.
     pub quick_properties: bool,
+    /// QPLOCATION 1: the Quick Properties panel floats where it was last
+    /// dragged instead of following the cursor.
+    pub quick_properties_float: bool,
+    /// Where the floating Quick Properties panel sits (top-left).
+    pub quick_properties_pos: [f32; 2],
     /// Interface language preference. `System` negotiates against the
     /// platform locale on every launch.
     pub language: crate::i18n::Language,
@@ -818,6 +1142,10 @@ pub struct UserSettings {
     pub commandline_fade_ms: i32,
     /// COMMANDLINEOPACITY: command-line panel opacity in percent (20–100).
     pub command_line_opacity: u8,
+    /// Command line font family; empty uses the interface font.
+    pub command_line_font: String,
+    /// Command line text size in pixels (8–24).
+    pub command_line_font_size: u16,
     /// SNAPUNIT X/Y spacing used by grid snap. 10 matches the Drafting
     /// Settings dialog defaults; older configs without these keys fall
     /// back via `default_snap_spacing`.
@@ -895,6 +1223,9 @@ pub struct UserSettings {
     /// SSMAUTOOPEN, SSLOCATE, SSMPOLLTIME, SSMSHEETSTATUS.
     #[serde(default)]
     pub sheet_set: crate::ui::window::sheet_set::SheetSetSettings,
+    /// QuickCalc: the global variables, the open sections and the angle mode.
+    #[serde(default)]
+    pub quick_calc: crate::ui::window::quick_calc::QuickCalcSettings,
 }
 
 /// A block the Blocks palette lists from outside the current drawing (a
@@ -1097,27 +1428,46 @@ impl Default for UserSettings {
             zoom_wheel_reversed: false,
             navigation_style: NavigationStyle::Cad,
             dynamic_ucs: true,
-            touchpad_pan: false,
+            // A Mac's built-in trackpad is the common case there.
+            touchpad_pan: cfg!(target_os = "macos"),
             ui_scale_percent: 100,
             zoom_factor: 60,
             cursor_size: 5,
             pick_box: 3,
             aperture: crate::snap::DEFAULT_OSNAP_RADIUS_PX,
             hatch_associative: true,
+            hatch_gap_tolerance: 0.0,
+            hatch_start_method: 0,
             show_menu_bar: false,
             ribbon_closed: false,
+            command_line_hidden: false,
+            layer_columns: Vec::new(),
             options_tab: crate::ui::window::options::OptionsTab::General,
             show_viewcube: true,
             show_ucs_icon: true,
             ucs_icon_at_origin: true,
             selection_cycling: false,
+            osnap_z: false,
+            select_similar_mode: crate::scene::SELECT_SIMILAR_DEFAULT,
             double_click_block_refedit: false,
             double_click_block_attedit: true,
             right_click_mode: RightClickMode::ShortcutMenu,
             right_click_hold_ms: 250,
+            // The quad is opt-in in v1 (see the run of `quad_*` fields); when
+            // it is on, every trigger except command-launch ships enabled,
+            // and the layout matches the commercial default of 6 columns.
+            quad: false,
+            quad_on_hover: true,
+            quad_on_select: true,
+            quad_on_right_click: true,
+            quad_suppress_hover_when_selection: true,
+            quad_width: 6,
+            quad_command_launch: false,
+            quad_hover_delay_ms: 300,
             grip_object_limit: DEFAULT_GRIP_OBJECT_LIMIT,
             image_frame: 1,
             attdef_on_screen: true,
+            table_insert: Default::default(),
             block_base_on_screen: false,
             block_objects_on_screen: false,
             block_object_mode: 1,
@@ -1125,11 +1475,22 @@ impl Default for UserSettings {
             block_open_in_editor: false,
             wblock_object_mode: 0,
             field_display: true,
+            hyperlink_options: true,
             xref_fade: 50,
             file_dia: true,
+            ole_hide: 0,
+            ole_quality: 3,
+            group_display_mode: 2,
+            offset_gap_type: 0,
             trim_extend_quick: true,
+            match_mode: crate::entities::match_props::MatchOpts::DEFAULT_MODE,
+            measuregeom_quick: true,
+            revcloud_create_mode: 1,
+            revcloud_arc_variance: true,
+            revcloud_grips: true,
             fonts_folder: None,
             plot_styles_folder: None,
+            support_folder: None,
             attach_filter: 7,
             surface_associativity: true,
             ucs_ortho: true,
@@ -1156,11 +1517,12 @@ impl Default for UserSettings {
             plugin_repos: Vec::new(),
             literal_spaces: false,
             command_history_height: crate::ui::command_line::HISTORY_HEIGHT_DEFAULT,
-            // Snapper::default(): END|MID|CEN|NODE|QUAD|INT|NEA (575), master
-            // on. Object snap is a drafting aid users expect to be live from
-            // the first click; the suppress bit (16384) is left for the user
-            // to set via the status-bar pill or OSNAP.
-            osmode: 575,
+            // Snapper::default(): END|MID|CEN|NODE|QUAD|INT (63), master on.
+            // Object snap is a drafting aid users expect to be live from the
+            // first click; the suppress bit (16384) is left for the user to
+            // set via the status-bar pill or OSNAP. Nearest is off: on, it is
+            // nearer than any point the object under the cursor offers (#1914).
+            osmode: 63,
             texteditmode: false,
             quick_dimension_snap_priority: 0,
             dimension_continue_mode: 1,
@@ -1171,6 +1533,8 @@ impl Default for UserSettings {
             show_constraint_values: true,
             auto_constrain: AutoConstrainSettings::default(),
             txt2mtxt: Txt2MtxtSettings::default(),
+            spell: SpellPrefs::default(),
+            dim_inspect: DimInspectSettings::default(),
             constraint_solve_mode: true,
             constraint_infer: false,
             constraint_bar_display: 3,
@@ -1181,10 +1545,14 @@ impl Default for UserSettings {
             pick_add: true,
             pick_drag_rect: false,
             quick_properties: false,
+            quick_properties_float: false,
+            quick_properties_pos: [40.0, 40.0],
             language: crate::i18n::Language::default(),
             cliprompt_lines: 3,
             commandline_fade_ms: 3000,
             command_line_opacity: 80,
+            command_line_font: String::new(),
+            command_line_font_size: 11,
             snap_spacing_x: 10.0,
             snap_spacing_y: 10.0,
             grid_spacing_x: 10.0,
@@ -1210,6 +1578,7 @@ impl Default for UserSettings {
             count_service: true,
             count_invalid_area: 0,
             sheet_set: Default::default(),
+            quick_calc: Default::default(),
         }
     }
 }
@@ -1358,6 +1727,99 @@ mod tests {
         let text = serde_json::to_string(&off).unwrap();
         let back: crate::app::config::AppConfig = serde_json::from_str(&text).unwrap();
         assert!(!back.settings.script_commands);
+    }
+
+    /// The quad is opt-in in v1, so a fresh profile has it off while its
+    /// display flags ship ready for when it is turned on. A settings.json
+    /// written before the quad existed carries none of the keys at all, and
+    /// must load with exactly the in-code defaults.
+    #[test]
+    fn quad_defaults_opt_in_and_old_configs_load_unchanged() {
+        let defaults = UserSettings::default();
+        assert!(!defaults.quad, "the quad is opt-in in v1");
+        assert!(defaults.quad_on_hover);
+        assert!(defaults.quad_on_select);
+        assert!(defaults.quad_on_right_click);
+        assert!(defaults.quad_suppress_hover_when_selection);
+        assert_eq!(defaults.quad_width, 6);
+        assert!(!defaults.quad_command_launch);
+        assert_eq!(defaults.quad_hover_delay_ms, 300);
+
+        // A minimal old config: the quad keys are missing, not merely false.
+        let old: crate::app::config::AppConfig =
+            serde_json::from_str(r#"{"settings": {"pick_add": false}}"#).unwrap();
+        let s = &old.settings;
+        assert!(!s.quad, "an old config must not turn the quad on");
+        assert!(s.quad_on_hover && s.quad_on_select && s.quad_on_right_click);
+        assert!(s.quad_suppress_hover_when_selection);
+        assert_eq!(s.quad_width, 6);
+        assert!(!s.quad_command_launch);
+        assert_eq!(s.quad_hover_delay_ms, 300);
+    }
+
+    /// What a user configured on the quad comes back from a save/load. An
+    /// in-domain value is kept as written (the range is applied by whoever
+    /// consumes it, apply_settings / `SETVAR QUADWIDTH`); the tolerant
+    /// readers below exist for the out-of-domain, hand-written ones.
+    #[test]
+    fn quad_settings_round_trip_and_clamp_their_width() {
+        let mut set = UserSettings::default();
+        set.quad = true;
+        set.quad_on_hover = false;
+        set.quad_on_select = false;
+        set.quad_on_right_click = false;
+        set.quad_suppress_hover_when_selection = false;
+        set.quad_width = 9;
+        set.quad_command_launch = true;
+        set.quad_hover_delay_ms = 450;
+        let text = serde_json::to_string(&set).unwrap();
+        let back: UserSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, set);
+
+        for (raw, clamped) in [(0, 2), (1, 2), (6, 6), (13, 12), (255, 12)] {
+            assert_eq!(clamp_quad_width(raw), clamped);
+        }
+    }
+
+    /// A hand-written config with out-of-domain numbers must load clamped
+    /// instead of failing the whole parse — a strict `u8`/`u64` reader once
+    /// reset every other preference with it. Keys absent entirely still
+    /// load the defaults, and a non-numeric value still errors the way the
+    /// neighbouring strict fields do.
+    #[test]
+    fn quad_numeric_settings_tolerate_out_of_domain_numbers() {
+        let loose: UserSettings = serde_json::from_str(
+            r#"{"pick_add": true, "quad_width": 300, "quad_hover_delay_ms": -50}"#,
+        )
+        .expect("a tolerant numeric parse must not fail the settings");
+        assert_eq!(loose.quad_width, 12, "an oversized width loads clamped");
+        assert_eq!(
+            loose.quad_hover_delay_ms, 0,
+            "a negative dwell loads clamped"
+        );
+        assert!(loose.pick_add, "the rest of the file survived the parse");
+
+        // Not a number at all: still an error, like the strict fields.
+        assert!(
+            serde_json::from_str::<UserSettings>(r#"{"quad_width": "wide"}"#).is_err(),
+            "a non-numeric quad_width must still fail the parse"
+        );
+
+        // Absent keys keep the in-code defaults (struct-level serde
+        // default untouched).
+        let minimal: UserSettings =
+            serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
+        assert_eq!(minimal.quad_width, 6);
+        assert_eq!(minimal.quad_hover_delay_ms, 300);
+    }
+
+    /// The hover quad opens on a dwell, so one above a couple of seconds is
+    /// unreachable in practice; 0 opens it immediately.
+    #[test]
+    fn quad_hover_delay_clamps_to_a_reachable_dwell() {
+        assert_eq!(clamp_quad_hover_delay_ms(0), 0);
+        assert_eq!(clamp_quad_hover_delay_ms(300), 300);
+        assert_eq!(clamp_quad_hover_delay_ms(9999), 2000);
     }
 
     #[test]

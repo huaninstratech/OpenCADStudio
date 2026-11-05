@@ -1,7 +1,7 @@
 use iced::{widget::canvas, Color, Point, Size};
 
 #[derive(Default)]
-pub(crate) struct AuthoringFeedback {
+pub struct AuthoringFeedback {
     pub dependencies: Vec<[Point; 2]>,
     pub markers: Vec<Point>,
     pub clip: iced::Rectangle,
@@ -9,7 +9,7 @@ pub(crate) struct AuthoringFeedback {
 
 /// Display-only settings; no geometry or drawing history depends on these values.
 #[derive(Clone, Debug)]
-pub(crate) struct AuthoringVisualOptions {
+pub struct AuthoringVisualOptions {
     pub action: Color,
     pub parameter: Color,
     pub grip: Color,
@@ -22,7 +22,7 @@ pub(crate) struct AuthoringVisualOptions {
 impl AuthoringVisualOptions {
     pub(crate) fn new(
         prefs: &crate::app::settings::BlockEditorPreferences,
-        doc: &codec::CadDocument,
+        doc: &codec::Document,
         bg: [f32; 4],
     ) -> Self {
         let foreground = if bg[0] * 0.2126 + bg[1] * 0.7152 + bg[2] * 0.0722 < 0.5 {

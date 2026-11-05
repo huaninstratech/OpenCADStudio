@@ -141,7 +141,7 @@ fn enum_row<'a>(
         .unwrap_or_else(|| crate::i18n::translate(&selected));
     row![
         text(label).size(11).style(muted_style).width(165),
-        iced::widget::pick_list(
+        crate::ui::dropdown_list::pick_list(
             Some(EnumChoice {
                 code: selected,
                 label: selected_label
@@ -186,7 +186,7 @@ fn handle_row<'a>(
         .collect();
     row![
         text(label).size(11).style(muted_style).width(165),
-        iced::widget::pick_list(Some(selected), options, |value| value.to_string())
+        crate::ui::dropdown_list::pick_list(Some(selected), options, |value| value.to_string())
             .on_select(move |value| Message::MLeaderStyleSetHandle {
                 field,
                 value: value.code
@@ -214,12 +214,11 @@ const ATTACHMENTS: [(&str, &str); 11] = [
     ("MiddleOfText", "Middle of text"),
     ("MiddleOfBottomLine", "Middle of bottom line"),
     ("BottomOfBottomLine", "Bottom of bottom line"),
-    ("BottomLine", "Bottom line"),
-    (
-        "BottomOfTopLineUnderlineBottomLine",
-        "Underline bottom line",
-    ),
-    ("BottomOfTopLineUnderlineTopLine", "Underline top line"),
+    // The codec names values 5–8 one place off from AutoCAD; the labels
+    // follow AutoCAD (see `ATTACH_LABELS` in entities/multileader.rs).
+    ("BottomLine", "Underline bottom line"),
+    ("BottomOfTopLineUnderlineBottomLine", "Underline top line"),
+    ("BottomOfTopLineUnderlineTopLine", "Bottom of top line"),
     ("BottomOfTopLineUnderlineAll", "Underline all text"),
     ("CenterOfText", "Center of text"),
     ("CenterOfTextOverline", "Center of text with overline"),
@@ -565,12 +564,14 @@ impl canvas::Program<Message> for LeaderPreviewCanvas {
                     .min(8.0);
             let attachment_offset = if self.attachment_direction == "Horizontal" {
                 match self.left_attachment_code.as_str() {
-                    "TopOfTopLine" | "BottomOfTopLineUnderlineTopLine" => box_height * 0.5,
+                    // Values 6–8 attach at the top line (see `ATTACHMENTS`).
+                    "TopOfTopLine"
+                    | "BottomOfTopLineUnderlineBottomLine"
+                    | "BottomOfTopLineUnderlineTopLine"
+                    | "BottomOfTopLineUnderlineAll" => box_height * 0.5,
                     "MiddleOfTopLine" => box_height * 0.25,
                     "MiddleOfBottomLine" => -box_height * 0.25,
-                    "BottomOfBottomLine" | "BottomLine" | "BottomOfTopLineUnderlineBottomLine" => {
-                        -box_height * 0.5
-                    }
+                    "BottomOfBottomLine" | "BottomLine" => -box_height * 0.5,
                     _ => 0.0,
                 }
             } else {
@@ -699,7 +700,7 @@ pub fn view_window<'a>(
                     .size(11)
                     .style(muted_style)
                     .width(165),
-                iced::widget::pick_list(
+                crate::ui::dropdown_list::pick_list(
                     Some(crate::ui::properties::LwItem(style.line_weight)),
                     crate::ui::properties::lw_options(),
                     |value| value.to_string(),
@@ -1030,10 +1031,15 @@ pub fn view_window<'a>(
         on_new: Message::MLeaderStyleDialogNew,
         on_copy: Message::MLeaderStyleDialogCopy,
         on_delete: Message::MLeaderStyleDialogDelete,
+        on_import: None,
         on_select: Message::MLeaderStyleDialogSelect,
         on_set_current: Message::MLeaderStyleDialogSetCurrent,
         on_apply: Message::MLeaderStyleApply,
         read_only: false,
+        in_use_filter: None,
+        apply_blocked: None,
+        rows: None,
+        compact: false,
         editor,
     })
 }

@@ -30,10 +30,9 @@ pub fn general_section(entity: &EntityType) -> PropSection {
         },
     );
 
-    let hyperlink = crate::scene::pe_url_description_of(entity)
-        .or_else(|| crate::scene::pe_url_of(entity))
-        .unwrap_or_default()
-        .to_owned();
+    let hyperlink = crate::scene::hyperlink::Link::of(entity)
+        .map(|link| link.label())
+        .unwrap_or_default();
 
     let section = PropSection {
         title: t!("General").into_owned(),
@@ -56,7 +55,9 @@ pub fn general_section(entity: &EntityType) -> PropSection {
             Property {
                 label: t!("Linetype scale").into_owned(),
                 field: "linetype_scale",
-                value: PropValue::EditText(format!("{:.4}", common.linetype_scale)),
+                value: PropValue::EditText(crate::entities::common::format_decimal(
+                    common.linetype_scale,
+                )),
             },
             Property {
                 label: t!("Plot style").into_owned(),
@@ -80,7 +81,7 @@ pub fn general_section(entity: &EntityType) -> PropSection {
                 field: "transparency",
                 value: PropValue::EditChoice {
                     value: transp_display,
-                    options: vec!["ByLayer".to_string(), "ByBlock".to_string()],
+                    options: crate::scene::creation_style::transparency_options(),
                 },
             },
             Property {
@@ -108,6 +109,9 @@ pub fn visualization_section(entity: &EntityType) -> Option<PropSection> {
             // The reference lists no 3D group for an underlay; a point
             // cloud's is its own (stylization and colour scheme).
             | EntityType::Underlay(_)
+            // Nor for an OLE object or a multileader.
+            | EntityType::Ole2Frame(_)
+            | EntityType::MultiLeader(_)
             | EntityType::Unknown(_)
             // Non-plotting drawing-view border: never rendered, no properties.
             | EntityType::ViewBorder(_)

@@ -336,7 +336,14 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
         // Projected points cannot use direct paper-space source inference.
-        let association_allowed = self.dimension_association_allowed(i);
+        // A source picked inside a block reference needs its INSERT path,
+        // which only the acquired snaps carry.
+        let association_allowed = self.dimension_association_allowed(i)
+            && !self.accepted_snaps().iter().any(|snap| {
+                snap.source
+                    .as_ref()
+                    .is_some_and(|source| !source.block_path.is_empty())
+            });
         let inherited_dimension = if preserve_base_style {
             match &entity {
                 codec::EntityType::Dimension(dimension) => Some((
@@ -348,9 +355,10 @@ impl OpenCADStudio {
         } else {
             None
         };
+        let mut committed = None;
         let pending =
             if association_mode == 0 {
-                let layer = self.tabs[i].active_layer.clone();
+                let layer = self.new_dimension_layer(i);
                 if layer != "0" || entity.as_entity().layer().is_empty() {
                     entity.as_entity_mut().set_layer(layer);
                 }
@@ -397,11 +405,19 @@ impl OpenCADStudio {
                 }
                 pending
             } else {
+                let mut entity = entity;
+                if !preserve_base_style {
+                    crate::scene::creation_style::apply_drawing_dimdli(
+                        &self.tabs[i].scene.document,
+                        &mut entity,
+                    );
+                }
                 let delta_safe = self.delta_add_safe(i, &entity);
                 let pending = self.begin_undo(i, label, 1, delta_safe);
                 if let Some(handle) =
                     self.commit_entity_handle_with_dimension_policy(entity, preserve_base_style)
                 {
+                    committed = Some(handle);
                     if association_mode == 2 && association_allowed {
                         let mut changes = vec![(handle, crate::scene::ChangeKind::Modified)];
                         match association {
@@ -451,6 +467,28 @@ impl OpenCADStudio {
         if let Some(pd) = pending {
             self.commit_undo_delta(i, pd);
         }
+        // A dimension DIM placed over another asks what to do with them.
+        let in_dim = self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .is_some_and(|command| command.name() == "DIM");
+        if let (true, Some(handle)) = (continue_command && in_dim, committed) {
+            let overlapped = super::dim_edit::overlapping_dimensions(&self.tabs[i].scene, handle);
+            if !overlapped.is_empty() {
+                let asked = self.tabs[i]
+                    .active_cmd
+                    .as_mut()
+                    .is_some_and(|command| command.ask_dim_overlap(handle, overlapped));
+                if asked {
+                    if let Some(command) = self.tabs[i].active_cmd.as_ref() {
+                        let (prompt, options) = (command.prompt(), command.options());
+                        self.command_line.push_info(&prompt);
+                        self.command_line.set_step_options(options);
+                    }
+                    return None;
+                }
+            }
+        }
         if continue_command {
             if let Some(prompt) = self.tabs[i].active_cmd.as_ref().map(|cmd| cmd.prompt()) {
                 self.command_line.push_info(&prompt);
@@ -472,7 +510,7 @@ impl OpenCADStudio {
         let pending = if association_mode == 0 {
             let mut pieces = Vec::new();
             for (mut entity, _) in dimensions {
-                let layer = self.tabs[i].active_layer.clone();
+                let layer = self.new_dimension_layer(i);
                 if layer != "0" || entity.as_entity().layer().is_empty() {
                     entity.as_entity_mut().set_layer(layer);
                 }
@@ -678,25 +716,7 @@ impl OpenCADStudio {
         // Link the leader to its annotation so the pair edits as a unit
         // (double-click on the leader resolves to the text entity).
         if let (Some(lh), Some(ah)) = (leader_handle, edit_handle) {
-            let linked = if let Some(codec::EntityType::Leader(l)) =
-                self.tabs[i].scene.document.get_entity_mut(lh)
-            {
-                l.annotation_handle = ah;
-                true
-            } else {
-                false
-            };
-
-            if linked {
-                // The LEADER may already have received its annotation context while
-                // annotation_handle was still NULL. Refresh it now that the MTEXT link
-                // is known so the context represents the finished leader.
-                self.tabs[i].scene.sync_displayed_annotation_context(lh);
-
-                self.tabs[i]
-                    .scene
-                    .bump_entities(&[(lh, crate::scene::ChangeKind::Modified)]);
-            }
+            self.tabs[i].scene.link_leader_annotation(lh, ah);
         }
         self.tabs[i].dirty = true;
         self.tabs[i].scene.clear_preview_wire();
@@ -788,8 +808,11 @@ impl OpenCADStudio {
                 .block_records
                 .get(&name)
                 .is_some();
+        let fresh = !self.block_palette_stale();
         match self.tabs[i].scene.create_block_with_options(*options) {
             Ok(insert_handle) => {
+                // Only this block's definition changed.
+                self.note_block_changes(fresh, [&name]);
                 self.tabs[i].dirty = true;
                 self.tabs[i].scene.deselect_all();
                 if !insert_handle.is_null() {
@@ -938,6 +961,25 @@ impl OpenCADStudio {
         }
     }
 
+    /// Commit a drawn HATCH boundary; the command stays at its prompt.
+    pub(super) fn handle_commit_hatch_continue(
+        &mut self,
+        hatch: crate::scene::HatchModel,
+        entity_style: Option<(codec::types::Color, codec::types::Transparency)>,
+        message: String,
+    ) {
+        let i = self.active_tab;
+        let label = self.history_label_from_active_cmd(i, "HATCH");
+        let pending = self.begin_undo(i, label, 1, true);
+        let layer = self.tabs[i].active_layer.clone();
+        self.tabs[i].scene.add_hatch(hatch, Some(&layer), entity_style);
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+        self.handle_report_measurement(message);
+    }
+
     pub(super) fn handle_commit_hatches(
         &mut self,
         hatches: Vec<crate::scene::HatchModel>,
@@ -996,6 +1038,18 @@ impl OpenCADStudio {
         let label = self.history_label_from_active_cmd(i, "EDIT");
         self.push_undo_snapshot(i, label);
         let is_dimension = matches!(entity, codec::EntityType::Dimension(_));
+        // The updated object's xdata applications must be registered, as
+        // for a new object.
+        let apps: Vec<String> = entity
+            .common()
+            .extended_data
+            .records()
+            .iter()
+            .map(|record| record.application_name.clone())
+            .collect();
+        for app in &apps {
+            self.tabs[i].scene.ensure_app_id(app);
+        }
         if let Some(current) = self.tabs[i].scene.document.get_entity_mut(handle) {
             *current = entity;
             if is_dimension {
@@ -1032,12 +1086,37 @@ impl OpenCADStudio {
             .reassociate_center_mark(target, source, point)
         {
             self.tabs[i].dirty = true;
-            self.command_line
-                .push_output(crate::t!("CENTERREASSOCIATE: center mark associated.").as_ref());
         } else {
             self.command_line.push_error(
                 crate::t!("CENTERREASSOCIATE: the selected source is not circular.").as_ref(),
             );
+        }
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        self.tabs[i].scene.clear_preview_wire();
+        self.refresh_properties();
+        None
+    }
+
+    pub(super) fn handle_reassociate_center_line(
+        &mut self,
+        target: Handle,
+        first: (Handle, glam::DVec3),
+        second: (Handle, glam::DVec3),
+    ) -> Option<Task<Message>> {
+        let i = self.active_tab;
+        if self.reject_locked_edit(i, target) {
+            return Some(Task::none());
+        }
+        self.push_undo_snapshot(i, "CENTERREASSOCIATE");
+        if self.tabs[i]
+            .scene
+            .reassociate_centerline(target, first, second)
+        {
+            self.tabs[i].dirty = true;
+        } else {
+            self.command_line
+                .push_error(&crate::tr!("center-cmd", "line-same"));
         }
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
@@ -1153,6 +1232,22 @@ impl OpenCADStudio {
             if let Some(cmd) = self.tabs[i].active_cmd.as_mut() {
                 cmd.attreq_set_block_base(block_base);
             }
+            // A control client answers the attribute prompts itself; a form
+            // would sit over the command it feeds.
+            let asks = self.tabs[i].scene.document.header.attribute_dialog
+                && !self.control_owns_command(i)
+                && attdefs
+                    .iter()
+                    .any(|ad| !ad.flags.constant && !ad.flags.preset);
+            let askable: Vec<codec::entities::AttributeDefinition> = if asks {
+                attdefs
+                    .iter()
+                    .filter(|ad| !ad.flags.constant && !ad.flags.preset)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let completed = self.tabs[i]
                 .active_cmd
                 .as_mut()
@@ -1171,6 +1266,10 @@ impl OpenCADStudio {
                 } else {
                     CmdResult::CommitAndExit(entity)
                 }));
+            }
+            if asks {
+                self.open_insert_attr_dialog(&block_name, &askable);
+                return None;
             }
             let prompt = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt());
             if let Some(p) = prompt {

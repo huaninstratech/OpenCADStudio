@@ -104,6 +104,10 @@ pub struct DimStyleValues<'a> {
     pub dimltex2_name: String,
     // Dropdown option lists shared by the arrowhead / linetype fields.
     pub block_opts: Vec<String>,
+    /// The drawing's blocks a User Arrow can name.
+    pub user_arrow_blocks: Vec<String>,
+    /// The arrowhead field whose User Arrow block list is open.
+    pub user_arrow_field: Option<&'static str>,
     pub lt_opts: Vec<String>,
     pub text_style_opts: Vec<String>,
     pub text_style_fixed_height: Option<f64>,
@@ -150,6 +154,8 @@ struct DimensionPreview {
     dim2: bool,
     tick: bool,
     arrow_size: f32,
+    dimexe: f32,
+    dimexo: f32,
     arrow1: ArrowKind,
     arrow2: ArrowKind,
     text_above: bool,
@@ -176,6 +182,18 @@ fn preview_arrow_kinds(
     } else {
         (kind(dimblk), kind(dimblk))
     }
+}
+
+/// Keep the legacy default composition while using the arrow preview's five
+/// pixels per drawing unit for edits. Clamp to the canvas and dimension line
+/// so very large offsets cannot invert an extension line (max/min, not clamp,
+/// so a short canvas cannot panic).
+fn preview_extension_geometry(height: f32, dimexe: f32, dimexo: f32) -> (f32, f32) {
+    let y = height * 0.58;
+    let object_y = height - 18.0;
+    let start_y = (object_y - dimexo.max(0.0) * 5.0).max(y).min(object_y);
+    let end_y = (22.0 - (dimexe.max(0.0) - 0.18) * 5.0).max(1.0).min(y);
+    (start_y, end_y)
 }
 
 impl canvas::Program<Message> for DimensionPreview {
@@ -209,15 +227,17 @@ impl canvas::Program<Message> for DimensionPreview {
                 .with_color(ink.scale_alpha(0.38))
                 .with_width(1.0),
         );
+        let (ext_start, ext_end) =
+            preview_extension_geometry(bounds.height, self.dimexe, self.dimexo);
         if self.ext1 {
             frame.stroke(
-                &line(Point::new(x1, object_y), Point::new(x1, 22.0)),
+                &line(Point::new(x1, ext_start), Point::new(x1, ext_end)),
                 stroke.clone(),
             );
         }
         if self.ext2 {
             frame.stroke(
-                &line(Point::new(x2, object_y), Point::new(x2, 22.0)),
+                &line(Point::new(x2, ext_start), Point::new(x2, ext_end)),
                 stroke.clone(),
             );
         }
@@ -307,10 +327,12 @@ impl canvas::Program<Message> for DimensionPreview {
                         );
                     }
                 }
-                ArrowKind::Tick { size } => {
+                ArrowKind::Tick { size, width } => {
+                    // The architectural tick reads heavier than the oblique.
+                    let w = if *width > 0.0 { 3.0 } else { 1.6 };
                     frame.stroke(
                         &tick_path(tip_x, *size),
-                        canvas::Stroke::default().with_color(guide).with_width(1.6),
+                        canvas::Stroke::default().with_color(guide).with_width(w),
                     );
                 }
                 ArrowKind::Box_ { size, filled } => {
@@ -346,7 +368,7 @@ impl canvas::Program<Message> for DimensionPreview {
                         );
                     }
                 }
-                ArrowKind::Origin { size } => {
+                ArrowKind::Origin { size, .. } => {
                     let dot =
                         canvas::Path::circle(Point::new(tip_x + sign * size * 0.5, y), size * 0.4);
                     frame.stroke(
@@ -499,7 +521,7 @@ pub fn view_window<'a>(
         let choice: Element<'a, Message> = if vals.read_only {
             crate::ui::read_only::field(cur.to_string().as_str(), 11.0, Length::Fixed(150.0))
         } else {
-            iced::widget::pick_list(Some(cur), options, |value| value.to_string())
+            crate::ui::dropdown_list::pick_list(Some(cur), options, |value| value.to_string())
                 .on_select(move |chosen: DimEnumChoice| Message::DsEdit(fld.clone(), chosen.code))
                 .text_size(11)
                 .width(150)
@@ -608,7 +630,7 @@ pub fn view_window<'a>(
         ];
         let feet_current = feet_modes[(raw & 3) as usize].clone();
         let feet: Element<'a, Message> = if show_feet_inches {
-            let list = iced::widget::pick_list(Some(feet_current.clone()), feet_modes, |choice| {
+            let list = crate::ui::dropdown_list::pick_list(Some(feet_current.clone()), feet_modes, |choice| {
                 choice.to_string()
             })
             .text_size(11)
@@ -701,6 +723,8 @@ pub fn view_window<'a>(
 
     // Block / linetype Handle dropdown: pick a block-record (arrowheads) or a
     // linetype by name from the available records.
+    let user_arrow_blocks = &vals.user_arrow_blocks;
+    let user_arrow_field = vals.user_arrow_field;
     let hrow = move |label: Cow<'static, str>,
                      options: Vec<String>,
                      selected: String,
@@ -708,8 +732,10 @@ pub fn view_window<'a>(
           -> Element<'a, Message> {
         let list: Element<'a, Message> = if vals.read_only {
             crate::ui::read_only::field(&selected, 11.0, Length::Fixed(150.0))
+        } else if user_arrow_field == Some(field) {
+            user_arrow_list(user_arrow_blocks.clone(), field)
         } else {
-            iced::widget::pick_list(Some(selected), options, |value| value.to_string())
+            crate::ui::dropdown_list::pick_list(Some(selected), options, |value| value.to_string())
                 .on_select(move |value| Message::DsSetHandle { field, value })
                 .text_size(11)
                 .width(150)
@@ -728,10 +754,15 @@ pub fn view_window<'a>(
                              enabled: bool|
           -> Element<'a, Message> {
         let list =
-            iced::widget::pick_list(Some(selected.clone()), options, |value| value.to_string())
+            crate::ui::dropdown_list::pick_list(Some(selected.clone()), options, |value| value.to_string())
                 .text_size(11)
                 .width(150);
-        let list: Element<'a, Message> = if enabled && !vals.read_only {
+        let list: Element<'a, Message> = if enabled
+            && !vals.read_only
+            && user_arrow_field == Some(field)
+        {
+            user_arrow_list(user_arrow_blocks.clone(), field)
+        } else if enabled && !vals.read_only {
             list.on_select(move |value| Message::DsSetHandle { field, value })
                 .into()
         } else {
@@ -746,7 +777,7 @@ pub fn view_window<'a>(
     let text_style_field: Element<'a, Message> = if vals.read_only {
         crate::ui::read_only::field(&vals.dimtxsty, 11.0, Length::Fixed(150.0))
     } else {
-        iced::widget::pick_list(
+        crate::ui::dropdown_list::pick_list(
             Some(vals.dimtxsty.to_string()),
             vals.text_style_opts.clone(),
             |value| value.to_string(),
@@ -798,7 +829,7 @@ pub fn view_window<'a>(
             Length::Fixed(150.0),
         )
     } else {
-        iced::widget::pick_list(Some(center_current), center_choices, |choice| {
+        crate::ui::dropdown_list::pick_list(Some(center_current), center_choices, |choice| {
             choice.to_string()
         })
         .on_select(|choice| Message::DsCenterMarkMode(choice.code))
@@ -846,7 +877,7 @@ pub fn view_window<'a>(
             Length::Fixed(150.0),
         )
     } else {
-        iced::widget::pick_list(Some(tolerance_current), tolerance_choices, |choice| {
+        crate::ui::dropdown_list::pick_list(Some(tolerance_current), tolerance_choices, |choice| {
             choice.to_string()
         })
         .on_select(|choice| Message::DsToleranceMode(choice.code))
@@ -1336,6 +1367,8 @@ pub fn view_window<'a>(
         dim2: !vals.dimsd2,
         tick: vals.dimtsz.trim().parse::<f32>().unwrap_or(0.0) > 0.0,
         arrow_size,
+        dimexe: vals.dimexe.trim().parse::<f32>().unwrap_or(0.18),
+        dimexo: vals.dimexo.trim().parse::<f32>().unwrap_or(0.0625),
         arrow1,
         arrow2,
         text_above: vals.dimtad.trim() != "0",
@@ -1378,7 +1411,7 @@ pub fn view_window<'a>(
         };
         row![
             text(t!("Compare with")).size(10).style(muted_style),
-            iced::widget::pick_list(
+            crate::ui::dropdown_list::pick_list(
                 Some(vals.compare_name.clone()),
                 vals.compare_opts.clone(),
                 |value| value.to_string(),
@@ -1432,10 +1465,15 @@ pub fn view_window<'a>(
         on_new: Message::DimStyleDialogNew,
         on_copy: Message::DimStyleDialogCopy,
         on_delete: Message::DimStyleDialogDelete,
+        on_import: Some(Message::StyleImportPick(crate::app::StyleKind::Dim)),
         on_select: Message::DimStyleDialogSelect,
         on_set_current: Message::DimStyleDialogSetCurrent,
         on_apply: Message::DimStyleDialogApply,
         read_only: vals.read_only,
+        in_use_filter: None,
+        apply_blocked: None,
+        rows: None,
+        compact: false,
         editor: right_panel.into(),
     })
 }
@@ -1459,5 +1497,60 @@ mod preview_arrow_tests {
         let (first, second) = preview_arrow_kinds(true, "OPEN", "DOT", "NONE", 10.0);
         assert!(matches!(first, ArrowKind::Dot { .. }));
         assert!(matches!(second, ArrowKind::None));
+    }
+}
+
+/// The drawing's blocks, offered once User Arrow… is picked for `field`.
+fn user_arrow_list<'a>(blocks: Vec<String>, field: &'static str) -> Element<'a, Message> {
+    crate::ui::dropdown_list::pick_list(None::<String>, blocks, |value| value.to_string())
+        .placeholder(t!("Select Block").into_owned())
+        .on_select(move |value| Message::DsSetHandle { field, value })
+        .text_size(11)
+        .width(150)
+        .into()
+}
+
+#[cfg(test)]
+mod preview_extension_tests {
+    use super::preview_extension_geometry;
+
+    #[test]
+    fn dimexe_changes_preview_extension_end() {
+        let default = preview_extension_geometry(112.0, 0.18, 0.0625);
+        let changed = preview_extension_geometry(112.0, 1.18, 0.0625);
+        assert_eq!(changed.0, default.0);
+        assert!((default.1 - changed.1 - 5.0).abs() < 0.001,
+            "DIMEXE must move the extension end by 5 px: {default:?} -> {changed:?}");
+    }
+
+    #[test]
+    fn dimexo_changes_preview_extension_start() {
+        let default = preview_extension_geometry(112.0, 0.18, 0.0625);
+        let changed = preview_extension_geometry(112.0, 0.18, 1.0625);
+        assert_eq!(changed.1, default.1);
+        assert!((default.0 - changed.0 - 5.0).abs() < 0.001,
+            "DIMEXO must move the extension start by 5 px: {default:?} -> {changed:?}");
+    }
+
+    #[test]
+    fn default_extensions_preserve_preview_within_one_pixel() {
+        // DIMASZ 0.18 retains its existing 5.9 px arrow; extension edits use
+        // the same 5 px/unit. The default origin gap is subpixel.
+        let (start, end) = preview_extension_geometry(112.0, 0.18, 0.0625);
+        assert!((start - 94.0).abs() <= 1.0);
+        assert!((end - 22.0).abs() <= 1.0);
+        assert!((94.0 - start - 0.3125).abs() < 0.001,
+            "default DIMEXO must contribute its scaled gap, got start {start}");
+    }
+
+    #[test]
+    fn extension_geometry_clamps_extreme_values() {
+        let y = 112.0 * 0.58;
+        for value in [f32::MAX, f32::INFINITY] {
+            assert_eq!(preview_extension_geometry(112.0, value, value), (y, 1.0));
+        }
+        assert_eq!(preview_extension_geometry(112.0, -1.0, -1.0), (94.0, 22.9));
+        let (start, end) = preview_extension_geometry(112.0, f32::NAN, f32::NAN);
+        assert!(start.is_finite() && end.is_finite());
     }
 }

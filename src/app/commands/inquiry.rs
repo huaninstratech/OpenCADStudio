@@ -31,6 +31,11 @@ impl OpenCADStudio {
                 .push_info(crate::t!("Select objects").as_ref());
             return;
         }
+        if self.any_entity_is_fixed(i, &handles) {
+            self.command_line
+                .push_error(crate::app::properties::HELD_BY_FIXED);
+            return;
+        }
 
         let bounds: Vec<_> = self.tabs[i]
             .scene
@@ -91,6 +96,9 @@ impl OpenCADStudio {
                 self.command_line
                     .push_output(crate::tf!("SELECTALL: {} object(s) selected.", count).as_ref());
                 self.refresh_properties();
+                // Same as SELECTSIMILAR: leave the command field so Ctrl+C
+                // reaches COPYCLIP.
+                return Some(self.unfocus_widgets());
             }
 
             "DESELECT" | "DESELALL" => {
@@ -100,11 +108,43 @@ impl OpenCADStudio {
                 self.refresh_properties();
             }
 
+            "SELECTPREVIOUS" => {
+                match self.tabs[i].scene.select_previous() {
+                    Some(count) => self.command_line.push_output(
+                        crate::tf!("SELECTPREVIOUS: {} object(s) selected.", count).as_ref(),
+                    ),
+                    None => self.command_line.push_error(
+                        crate::t!("SELECTPREVIOUS: no previous selection.").as_ref(),
+                    ),
+                }
+                self.refresh_properties();
+            }
+
+            "SELECTSIMILAR SETTINGS" | "SELECTSIMILAR SE" => {
+                self.select_similar_settings = Some(self.select_similar_mode);
+                self.active_modal = Some(crate::app::ModalKind::SelectSimilarSettings);
+                self.reset_modal_geometry();
+            }
+            "SELECTSIMILAR" | "SELSIM" if self.tabs[i].scene.selected.is_empty() => {
+                use crate::modules::draw::select::SelectObjectsCommand;
+                let command = SelectObjectsCommand::with_settings(
+                    "SELECTSIMILAR",
+                    "SELECTSIMILAR",
+                    "Select objects or [SEttings]:",
+                    || crate::command::CmdResult::Dispatch("SELECTSIMILAR SETTINGS".to_string()),
+                );
+                self.command_line.push_info(&command.prompt());
+                self.command_line.set_step_options(command.options());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
             "SELECTSIMILAR" | "SELSIM" => {
-                let added = self.tabs[i].scene.select_similar();
+                let added = self.tabs[i].scene.select_similar(self.select_similar_mode);
                 self.command_line
                     .push_output(crate::tf!("Select Similar: {} added.", added).as_ref());
                 self.refresh_properties();
+                // The completed selection belongs to the canvas; an empty
+                // focused command field would swallow the next Ctrl+C.
+                return Some(self.unfocus_widgets());
             }
 
             // ADDSELECTED — draw a new object of the same type as the selected
@@ -119,11 +159,24 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::QSelectOpen));
             }
 
-            // CAL / QUICKCALC <expression> — evaluate an arithmetic expression
-            //   (+ - * /, parentheses, unary minus, decimals).
-            "CAL" | "QUICKCALC" | "QC" => {
-                use crate::command::ValuePromptCommand;
-                let c = ValuePromptCommand::new("CAL", "CAL  expression  (e.g. (2+3)*4):");
+            // CAL <expression> — evaluate an expression on the
+            //   shared calculator engine (`app::calc`): arithmetic, points,
+            //   functions, unit suffixes, variables and `ans`. Free text, so
+            //   spaces inside the expression don't end the input.
+            // QUICKCALC / QC show or hide the QuickCalc pallet.
+            "QUICKCALC" | "QC" => return Some(self.toggle_quick_calc()),
+            // COMMANDHISTORY shows or hides the Command History pallet.
+            "COMMANDHISTORY" => {
+                let id = crate::ui::dock::PanelId::CommandHistory;
+                let open = !self.dock_panel_wanted(id);
+                if open {
+                    self.pallet_as_window(id);
+                }
+                return Some(self.dock_set_open(id, open));
+            }
+            "CAL" => {
+                use crate::command::FreeTextValuePromptCommand;
+                let c = FreeTextValuePromptCommand::new("CAL", "CAL  expression  (e.g. (2+3)*4):");
                 self.command_line.push_info(&c.prompt());
                 self.tabs[self.active_tab].active_cmd = Some(Box::new(c));
             }
@@ -141,8 +194,14 @@ impl OpenCADStudio {
                         crate::t!("Usage: CAL <expression>   e.g. CAL (2+3)*4").as_ref(),
                     );
                 } else {
-                    match arith_eval(expr) {
-                        Ok(v) => self.command_line.push_output(crate::tf!("= {v}").as_ref()),
+                    self.cal_context.base_unit = crate::app::quick_calc::base_unit(&self.tabs[i]);
+                    self.cal_context.sysvars =
+                        Some(crate::app::quick_calc::sysvars(&self.tabs[i]));
+                    match crate::app::calc::evaluate(expr, &mut self.cal_context) {
+                        Ok(v) => {
+                            let v = v.display();
+                            self.command_line.push_output(crate::tf!("= {v}").as_ref())
+                        }
                         Err(e) => self
                             .command_line
                             .push_error(crate::tf!("CAL: {e}").as_ref()),
@@ -150,13 +209,37 @@ impl OpenCADStudio {
                 }
             }
 
+            // ── SELECT — a selection set for the next command ─────────────
+            // Objects already selected are taken as they are; otherwise the
+            // prompt gathers them. Either way they stay selected and become
+            // the Previous set.
+            "SELECT" | "PSELECT" => {
+                let found = self.tabs[i].scene.selected.len();
+                if found == 0 {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::routed("SELECT", "_SELECT_DONE");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    return Some(Task::none());
+                }
+                self.command_line
+                    .push_output(crate::tf!("{found} found").as_ref());
+                self.tabs[i].prev_selection = self.tabs[i].scene.selected.iter().copied().collect();
+            }
+            "_SELECT_DONE" => {
+                self.tabs[i].prev_selection = self.tabs[i].scene.selected.iter().copied().collect();
+            }
+
             // ── LIST — entity info ────────────────────────────────────────
             "LIST" => {
                 let selected: Vec<_> = self.tabs[i].scene.selected_entities();
                 if selected.is_empty() {
-                    self.command_line.push_error(
-                        crate::t!("LIST: no entities selected. Select entities first.").as_ref(),
-                    );
+                    // Without a selection, ask for the objects first.
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("LIST");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    return Some(Task::none());
                 } else {
                     for (handle, _) in &selected {
                         if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle) {
@@ -588,6 +671,24 @@ impl OpenCADStudio {
             }
 
             "BSAVE" => {
+                // The saved block reaches the recovery copy now rather than at
+                // the next SAVETIME tick, so a crash before leaving the editor
+                // keeps it.
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.save_block_edit(i) {
+                    let target = self.autosave_target(i);
+                    let version = self.tabs[i].scene.document.version;
+                    return Some(self.queue_native_save(
+                        i,
+                        target,
+                        version,
+                        crate::app::SavePurpose::Autosave,
+                        crate::app::SaveContinuation::None,
+                        false,
+                        false,
+                    ));
+                }
+                #[cfg(target_arch = "wasm32")]
                 self.save_block_edit(i);
             }
             "BTESTBLOCK" => return Some(self.open_block_test(i)),
@@ -792,6 +893,14 @@ impl OpenCADStudio {
 
             // ── FLATTEN — move selected (or all) entities to Z=0 ─────────────
             "FLATTEN" => {
+                // Without a selection, ask for the objects first.
+                if self.tabs[i].scene.selected_entities().is_empty() {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("FLATTEN");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    return Some(Task::none());
+                }
                 let scene = &self.tabs[i].scene;
                 let handles = crate::modules::draw::modify::flatten::collect_flatten_handles(scene);
                 if handles.is_empty() {
@@ -900,6 +1009,23 @@ impl OpenCADStudio {
 
             "DATAEXTRACTION" | "EATTEXT" | "ATTEXT" => {
                 self.open_data_extraction();
+            }
+
+            // -DATAEXTRACTION: run a saved extraction from the command line.
+            "-DATAEXTRACTION" => {
+                let command = crate::modules::annotate::data_extract::TemplateCommand {
+                    drawing_dir: self.tabs[i]
+                        .current_path
+                        .as_deref()
+                        .and_then(std::path::Path::parent)
+                        .map(std::path::Path::to_path_buf),
+                };
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+            }
+            cmd if cmd.starts_with("-DATAEXTRACTION _RUN ") => {
+                let path = cmd.trim_start_matches("-DATAEXTRACTION _RUN ").trim().to_string();
+                self.run_extraction_template(&path);
             }
 
             // ── Find / Replace ────────────────────────────────────────────────
@@ -1024,7 +1150,7 @@ impl OpenCADStudio {
         i: usize,
         block_name: String,
         br_handle: codec::Handle,
-        unpersisted_pre_document: Option<codec::CadDocument>,
+        unpersisted_pre_document: Option<codec::Document>,
     ) {
         if self.block_editor_preferences.locked {
             self.command_line
@@ -1061,6 +1187,7 @@ impl OpenCADStudio {
             self.tabs[i].scene.set_current_layout("Model".to_string());
         }
         self.tabs[i].scene.block_edit_block = Some(br_handle);
+        self.reset_block_constraint_display(i);
         self.tabs[i].block_edits.push(BlockEditSession {
             block_name: block_name.clone(),
             br_handle,
@@ -1136,6 +1263,7 @@ impl OpenCADStudio {
             };
             self.tabs[i].scene.set_current_layout("Model".to_string());
             self.tabs[i].scene.block_edit_block = Some(br_handle);
+            self.reset_block_constraint_display(i);
             self.tabs[i].active_block_edit = Some(parent_index);
             *self.tabs[i].scene.camera.borrow_mut() = editor_camera;
         } else {
@@ -1458,13 +1586,19 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
             a.end_angle.to_degrees()
         )
         .into_owned(),
-        codec::EntityType::LwPolyline(p) => crate::tf!(
-            "{} vertices  closed={}  elevation={:.4}",
-            p.vertices.len(),
-            p.is_closed,
-            p.elevation
-        )
-        .into_owned(),
+        codec::EntityType::LwPolyline(p) => {
+            let mut details = crate::tf!(
+                "{} vertices  closed={}  elevation={:.4}",
+                p.vertices.len(),
+                p.is_closed,
+                p.elevation
+            )
+            .into_owned();
+            for v in &p.vertices {
+                details.push_str(&format!("\n    ({:.4},{:.4})", v.location.x, v.location.y));
+            }
+            details
+        }
         codec::EntityType::Text(t) => crate::tf!(
             "\"{}\"  h={:.4}  at ({:.4},{:.4})",
             t.value,
@@ -1512,21 +1646,6 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
     }
 }
 
-// ── CAL — arithmetic expression evaluator ──────────────────────────────────
-// A small recursive-descent parser for `+ - * /`, parentheses, unary signs and
-// decimal numbers. Self-contained (no external dependency).
-fn arith_eval(expr: &str) -> Result<f64, String> {
-    let mut p = ArithParser {
-        chars: expr.chars().filter(|c| !c.is_whitespace()).collect(),
-        pos: 0,
-    };
-    let v = p.expr()?;
-    if p.pos != p.chars.len() {
-        return Err(crate::tf!("unexpected '{}'", p.chars[p.pos]).into_owned());
-    }
-    Ok(v)
-}
-
 impl OpenCADStudio {
     /// Open the attribute editor. If a single block with attributes is already
     /// selected it opens directly on that block; otherwise it starts the
@@ -1555,94 +1674,6 @@ impl OpenCADStudio {
             self.command_line.push_info(&cmd_obj.prompt());
             self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
         }
-    }
-}
-
-struct ArithParser {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl ArithParser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    // expr = term (('+' | '-') term)*
-    fn expr(&mut self) -> Result<f64, String> {
-        let mut v = self.term()?;
-        while let Some(op) = self.peek() {
-            if op == '+' || op == '-' {
-                self.pos += 1;
-                let rhs = self.term()?;
-                v = if op == '+' { v + rhs } else { v - rhs };
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-
-    // term = factor (('*' | '/') factor)*
-    fn term(&mut self) -> Result<f64, String> {
-        let mut v = self.factor()?;
-        while let Some(op) = self.peek() {
-            if op == '*' || op == '/' {
-                self.pos += 1;
-                let rhs = self.factor()?;
-                if op == '/' {
-                    if rhs == 0.0 {
-                        return Err("division by zero".into());
-                    }
-                    v /= rhs;
-                } else {
-                    v *= rhs;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-
-    // factor = ('+' | '-') factor | '(' expr ')' | number
-    fn factor(&mut self) -> Result<f64, String> {
-        match self.peek() {
-            Some('+') => {
-                self.pos += 1;
-                self.factor()
-            }
-            Some('-') => {
-                self.pos += 1;
-                Ok(-self.factor()?)
-            }
-            Some('(') => {
-                self.pos += 1;
-                let v = self.expr()?;
-                if self.peek() != Some(')') {
-                    return Err("missing ')'".into());
-                }
-                self.pos += 1;
-                Ok(v)
-            }
-            Some(c) if c.is_ascii_digit() || c == '.' => self.number(),
-            Some(c) => Err(crate::tf!("unexpected '{c}'").into_owned()),
-            None => Err("unexpected end of expression".into()),
-        }
-    }
-
-    fn number(&mut self) -> Result<f64, String> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == '.' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
-            .map_err(|_| crate::tf!("bad number '{s}'").into_owned())
     }
 }
 
@@ -1847,5 +1878,89 @@ mod find_replace_command_tests {
             }
             _ => panic!("Expected CmdResult::Measurement"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cal_tests {
+    use super::*;
+
+    #[test]
+    fn cal_evaluates_on_the_shared_engine() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.insertion_units = 4;
+        // The prompt takes free text, spaces included; variables, ans and
+        // the drawing unit carry through every CAL.
+        let _ = app.dispatch_command("CAL");
+        let _ = app.feed_active_cmd("$wall = (2 + 1.6) * 1m");
+        for (cmd, expected) in [
+            ("CAL $wall + 90", "= 3690"),
+            ("CAL *2", "= 7380"),
+            ("CAL dist([0,0],[3,4])", "= 5"),
+            ("CAL 1/0", "CAL:"),
+        ] {
+            let _ = app.dispatch_command(cmd);
+            let last = &app.command_line.history.last().unwrap().text;
+            assert!(last.contains(expected), "{cmd}: {last}");
+        }
+        app.tabs[i].scene.document.header.insertion_units = 6;
+        let _ = app.dispatch_command("CAL 1500mm");
+        let last = &app.command_line.history.last().unwrap().text;
+        assert!(last.ends_with("= 1.5"), "{last}");
+    }
+}
+
+#[cfg(test)]
+mod select_similar_clipboard_tests {
+    use super::*;
+    use iced::futures::StreamExt;
+
+    #[test]
+    fn select_similar_releases_command_focus_for_copy_shortcut() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let handles = app.tabs[i].scene.add_entities(
+            (0..2)
+                .map(|y| {
+                    codec::EntityType::Line(codec::entities::Line::from_points(
+                        codec::types::Vector3::new(0.0, y as f64, 0.0),
+                        codec::types::Vector3::new(10.0, y as f64, 0.0),
+                    ))
+                })
+                .collect(),
+        );
+        app.tabs[i].scene.select_entities(&handles[..1]);
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let mut input = iced::widget::text_input::State::<Paragraph>::new();
+        input.focus();
+        let task = app.dispatch_command("SELECTSIMILAR");
+        if let Some(mut stream) = iced_runtime::task::into_stream(task) {
+            while let Some(action) = iced::futures::executor::block_on(stream.next()) {
+                if let iced_runtime::Action::Widget(mut operation) = action {
+                    operation.focusable(
+                        Some(&iced::widget::Id::new(
+                            crate::ui::command_line::CMD_INPUT_ID,
+                        )),
+                        iced::Rectangle::default(),
+                        &mut input,
+                    );
+                }
+            }
+        }
+        assert_eq!(app.tabs[i].scene.selected.len(), 2);
+        assert!(
+            !input.is_focused(),
+            "empty command input must not capture Ctrl+C"
+        );
+        let shortcut = if cfg!(target_os = "macos") {
+            "CMD+C"
+        } else {
+            "CTRL+C"
+        };
+        let _ = app.run_shortcut(shortcut);
+        assert_eq!(app.clipboard.len(), 2, "both similar entities must copy");
     }
 }

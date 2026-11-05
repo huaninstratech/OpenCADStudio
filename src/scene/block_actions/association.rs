@@ -1,7 +1,7 @@
 //! Reconnect orphaned native actions without replacing their identities.
 use super::*;
 
-pub(crate) fn orphaned(doc: &CadDocument, definition: Handle) -> Vec<Handle> {
+pub(crate) fn orphaned(doc: &Document, definition: Handle) -> Vec<Handle> {
     actions(doc, definition)
         .into_iter()
         .filter(|(_, _, kind, id)| {
@@ -14,7 +14,7 @@ pub(crate) fn orphaned(doc: &CadDocument, definition: Handle) -> Vec<Handle> {
 }
 
 pub(crate) fn associate(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     action: Handle,
     parameter: Handle,
@@ -32,7 +32,7 @@ pub(crate) fn associate(
         .into_iter()
         .find(|p| p.handle == parameter && compatible(p, kind))
         .ok_or("Select a compatible parameter for this action.")?;
-    if key_point.is_some() && !matches!(kind, Kind::Move | Kind::Stretch) {
+    if key_point.is_some() && !matches!(kind, Kind::Move | Kind::Stretch | Kind::PolarStretch) {
         return Err("This action does not use a parameter key point.");
     }
     if !p.xy && matches!(key_point, Some(XyKeyPoint::X | XyKeyPoint::Y)) {
@@ -74,6 +74,11 @@ pub(crate) fn associate(
                 .filter(|handle| !native.handles.contains(handle))
                 .collect::<Vec<_>>();
             native.bindings = stretch::bind_existing(doc, &stretching, &native.points, p.end.z)?;
+            let key_point = key_point.or_else(|| stretch::polar_key_point(native).ok());
+            native.connections = polar_connections(&p, key_point);
+            let stretching = native.action.dependencies.iter().copied().filter(|handle| !native.handles.contains(handle)).collect::<Vec<_>>();
+            native.bindings =
+                stretch::bind_existing(doc, &stretching, &native.points, p.end.z)?;
         }
         DynamicBlockData::ArrayAction(native) => {
             native.connections = ["Base", "End", "UpdatedBase", "UpdatedEnd"].map(connection)
@@ -109,7 +114,7 @@ mod tests {
     use codec::{DwgReader, DwgWriter, DxfReader, DxfWriter};
     use std::io::Cursor;
 
-    fn parameter(doc: &mut CadDocument, definition: Handle, kind: Kind) -> Handle {
+    fn parameter(doc: &mut Document, definition: Handle, kind: Kind) -> Handle {
         if matches!(kind, Kind::Rotate | Kind::Flip) {
             orientation::create(
                 doc,

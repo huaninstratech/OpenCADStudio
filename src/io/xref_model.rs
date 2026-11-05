@@ -284,12 +284,13 @@ pub fn wildcard_match(name: &str, pattern: &str) -> bool {
     let mut star: Option<usize> = None;
     let mut match_idx = 0usize;
     while si < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[si]) {
-            si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // `*` first: a name may hold a literal `*` (anonymous blocks).
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             match_idx = si;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[si]) {
+            si += 1;
             pi += 1;
         } else if let Some(s) = star {
             pi = s + 1;
@@ -768,7 +769,7 @@ mod tests {
     fn roundtrip_probe(ext: &str) {
         use codec::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
         use codec::tables::BlockRecord;
-        use codec::CadDocument;
+        use codec::Document;
 
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_probe_{}_{}",
@@ -780,7 +781,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("probe dir");
 
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
 
         // Cell 1: xref block record — is_xref flag + absolute path.
         let xref_abs = dir.join("PROBE_REF.dwg").to_string_lossy().into_owned();

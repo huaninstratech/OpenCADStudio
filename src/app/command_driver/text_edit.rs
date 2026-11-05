@@ -15,6 +15,7 @@ impl OpenCADStudio {
         };
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
+        self.tabs[i].scene.clear_preview_wire();
         self.open_mtext_editor(pos, handle, &initial, height, template.map(|m| *m));
     }
 
@@ -223,8 +224,10 @@ impl OpenCADStudio {
                 }
                 codec::EntityType::Dimension(d) => {
                     // Empty string resets to auto-measured value; otherwise set override.
-                    let base = d.base_mut();
-                    base.text = new_text;
+                    crate::entities::dimension::set_dimension_text_override(
+                        d.base_mut(),
+                        (!new_text.trim().is_empty()).then_some(new_text),
+                    );
                     updated = true;
                     is_dim = true;
                 }

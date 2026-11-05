@@ -442,10 +442,15 @@ pub fn view_window<'a>(
         on_new: Message::MlStyleDialogNew,
         on_copy: Message::MlStyleDialogCopy,
         on_delete: Message::MlStyleDialogDelete,
+        on_import: None,
         on_select: Message::MlStyleDialogSelect,
         on_set_current: Message::MlStyleDialogSetCurrent,
         on_apply: Message::MlStyleApply,
         read_only: false,
+        in_use_filter: None,
+        apply_blocked: None,
+        rows: None,
+        compact: false,
         editor,
     })
 }

@@ -82,6 +82,8 @@ pub struct LinearDimensionCommand {
     awaiting_angle: bool,
     /// True while a rotation value for the Rotated option is being entered.
     awaiting_rotation: bool,
+    /// The first of two picked points giving the Rotated angle.
+    rotation_from: Option<DVec3>,
     axis_mode: AxisMode,
     selecting_object: bool,
     picked_entity: Option<EntityType>,
@@ -99,6 +101,7 @@ impl LinearDimensionCommand {
             text_angle: None,
             awaiting_angle: false,
             awaiting_rotation: false,
+            rotation_from: None,
             axis_mode: AxisMode::Automatic,
             selecting_object: false,
             picked_entity: None,
@@ -166,6 +169,9 @@ impl CadCommand for LinearDimensionCommand {
             return t!("DIMLINEAR  Specify text angle (degrees):").into_owned();
         }
         if self.awaiting_rotation {
+            if self.rotation_from.is_some() {
+                return t!("Specify second point:").into_owned();
+            }
             return t!("DIMLINEAR  Specify dimension line angle (degrees):").into_owned();
         }
         if self.selecting_object {
@@ -186,6 +192,22 @@ impl CadCommand for LinearDimensionCommand {
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        // The Rotated angle can be shown by two points.
+        if self.awaiting_rotation {
+            match self.rotation_from.take() {
+                None => self.rotation_from = Some(pt),
+                Some(from) => {
+                    let (a, b) = (self.plane.to_local(from), self.plane.to_local(pt));
+                    if a.distance_squared(b) > 1e-24 {
+                        self.axis_mode = AxisMode::Rotated((b.y - a.y).atan2(b.x - a.x));
+                        self.awaiting_rotation = false;
+                    } else {
+                        self.rotation_from = Some(from);
+                    }
+                }
+            }
+            return CmdResult::NeedPoint;
+        }
         match self.step {
             Step::FirstPoint => {
                 self.step = Step::SecondPoint(pt);
@@ -222,6 +244,7 @@ impl CadCommand for LinearDimensionCommand {
         }
         if self.awaiting_rotation {
             self.awaiting_rotation = false;
+            self.rotation_from = None;
             return CmdResult::NeedPoint;
         }
         if matches!(self.step, Step::FirstPoint) {
@@ -315,6 +338,7 @@ impl CadCommand for LinearDimensionCommand {
                 self.axis_mode = AxisMode::Rotated(angle);
             }
             self.awaiting_rotation = false;
+            self.rotation_from = None;
             return Some(CmdResult::NeedPoint);
         }
         if !matches!(self.step, Step::DimensionLine { .. }) {
@@ -384,6 +408,9 @@ impl CadCommand for LinearDimensionCommand {
     }
 
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
+        if let Some(from) = self.rotation_from {
+            return Some(preview_wire(vec![from, pt]));
+        }
         match self.step {
             Step::FirstPoint => None,
             Step::SecondPoint(first) => Some(preview_wire(vec![first, pt])),
@@ -552,46 +579,14 @@ fn ocs_point(point: [f64; 2], elevation: f64, normal: Vector3) -> DVec3 {
 }
 
 fn preview_wire(points: Vec<DVec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimlinear_preview".to_string(),
-        points: points
-            .into_iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
-            .collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
-        ..Default::default()
-    }
+    // Preview geometry is f64; `solid_f64` keeps the residual so the rubber
+    // band stays on the snapped points at UTM-scale coordinates.
+    WireModel::solid_f64(
+        "dimlinear_preview".to_string(),
+        points.into_iter().map(|p| p.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
 /// Project the two extension origins onto the dimension line, which passes

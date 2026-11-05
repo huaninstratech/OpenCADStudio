@@ -17,7 +17,7 @@ use iced::{
     Theme, Vector,
 };
 
-use super::{draw_panel, item_id, Ribbon};
+use super::{draw_panel, extras, Ribbon};
 use crate::app::Message;
 use crate::modules::{RibbonItem, ToolDef};
 use crate::ui::wrap_bar::{fresh_bounds, PosReport};
@@ -64,7 +64,7 @@ pub struct Tip {
     /// The id the widget reports its bounds under.
     pub anchor: String,
     /// The table key: tool id, dropdown id, group title or command.
-    pub target: &'static str,
+    pub target: std::borrow::Cow<'static, str>,
     pub code: Option<String>,
     action: Action,
 }
@@ -84,6 +84,12 @@ pub(super) struct State {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Alt is down and nothing else was pressed since.
 static ALT_ALONE: AtomicBool = AtomicBool::new(false);
+/// Timestamp (ms) when a lone Alt was pressed down.
+static ALT_PRESSED_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Timestamp (ms) of the last window focus gain or loss.
+static LAST_FOCUS_CHANGE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Timestamp (ms) of the last command, pick, or automation operation completion.
+static LAST_COMMAND_FINISH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Anchors that carried a code in the last drawn frame.
@@ -99,6 +105,16 @@ const RIBBON_AREA: &str = "KEYTIP_RIBBON_AREA";
 pub(super) const XREF_LAUNCHER: &str = "XREF_LAUNCHER";
 /// The xref fading switch in the Reference slide-out.
 pub(super) const XREF_FADE: &str = "XREF_FADE";
+/// The Text panel's corner arrow (Text Style).
+pub(super) const TEXT_LAUNCHER: &str = "TEXT_LAUNCHER";
+/// The Text panel's text height box.
+pub(super) const TEXT_HEIGHT: &str = "TEXT_HEIGHT";
+/// The Dimensions panel's corner arrow (Dimension Style).
+pub(super) const DIMENSION_LAUNCHER: &str = "DIMENSION_LAUNCHER";
+/// The Leaders panel's corner arrow (Multileader Style).
+pub(super) const LEADER_LAUNCHER: &str = "LEADER_LAUNCHER";
+/// Annotate > Tables: the corner arrow to the table styles.
+pub(super) const TABLE_LAUNCHER: &str = "TABLE_LAUNCHER";
 const COLLAPSED_PREFIX: &str = "panel:";
 
 pub fn active() -> bool {
@@ -178,10 +194,14 @@ pub fn key_pressed(
 ) -> Option<Option<Message>> {
     let alt = matches!(key, Key::Named(Named::Alt));
     if !repeat {
-        ALT_ALONE.store(
-            alt && !modifiers.control() && !modifiers.shift() && !modifiers.logo(),
-            Ordering::Relaxed,
-        );
+        let is_lone_alt = alt && !modifiers.control() && !modifiers.shift() && !modifiers.logo();
+        ALT_ALONE.store(is_lone_alt, Ordering::Relaxed);
+        if is_lone_alt {
+            let now_ms = now_ms();
+            ALT_PRESSED_AT_MS.store(now_ms, Ordering::Relaxed);
+        } else {
+            ALT_PRESSED_AT_MS.store(0, Ordering::Relaxed);
+        }
     }
     if !active() {
         return None;
@@ -202,13 +222,55 @@ pub fn key_pressed(
 
 /// Keyboard listener hook for a key release: a lone Alt toggles the tips.
 pub fn key_released(key: &Key) -> Option<Message> {
-    (matches!(key, Key::Named(Named::Alt)) && ALT_ALONE.swap(false, Ordering::Relaxed))
-        .then_some(Message::KeyTip(KeyTipInput::AltTap))
+    if matches!(key, Key::Named(Named::Alt)) && ALT_ALONE.swap(false, Ordering::Relaxed) {
+        let pressed_at = ALT_PRESSED_AT_MS.swap(0, Ordering::Relaxed);
+        let now_ms = now_ms();
+        let last_focus = LAST_FOCUS_CHANGE_MS.load(Ordering::Relaxed);
+        let last_cmd = LAST_COMMAND_FINISH_MS.load(Ordering::Relaxed);
+        // Suppress Alt if focus changed or a command/debugging step finished within the last 1.2s.
+        // Synthetic events, Alt-Tab window switching, and completion tails must never trigger keytips.
+        if now_ms.saturating_sub(last_focus) < 1200 || now_ms.saturating_sub(last_cmd) < 1200 {
+            return None;
+        }
+        // Key tips only open on an intentional, quick tap of lone Alt (<= 500ms).
+        if pressed_at > 0 && now_ms.saturating_sub(pressed_at) <= 500 {
+            return Some(Message::KeyTip(KeyTipInput::AltTap));
+        }
+    }
+    None
+}
+
+/// Milliseconds since the first call. `iced::time::Instant` also runs in the
+/// browser, where `std::time::SystemTime::now` panics.
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<iced::time::Instant> = std::sync::OnceLock::new();
+    // Starts at 1 so that 0 keeps meaning "not set" for the timestamps.
+    START.get_or_init(iced::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Clear any pending lone-Alt state.
+pub fn clear_alt_alone() {
+    ALT_ALONE.store(false, Ordering::Relaxed);
+    ALT_PRESSED_AT_MS.store(0, Ordering::Relaxed);
+}
+
+/// Note that window focus changed (gained or lost), suppressing any Alt release artifacts.
+pub fn note_focus_changed() {
+    clear_alt_alone();
+    let now_ms = now_ms();
+    LAST_FOCUS_CHANGE_MS.store(now_ms, Ordering::Relaxed);
+}
+
+/// Note that a command, pick session, or automation operation finished.
+pub fn note_command_finished() {
+    clear_alt_alone();
+    let now_ms = now_ms();
+    LAST_COMMAND_FINISH_MS.store(now_ms, Ordering::Relaxed);
 }
 
 /// A pointer press ends a lone Alt.
 pub fn pointer_pressed() {
-    ALT_ALONE.store(false, Ordering::Relaxed);
+    clear_alt_alone();
 }
 
 /// Codes of the ribbon tabs, by module id.
@@ -238,6 +300,51 @@ const QUICK_ACCESS: &[(&str, &str)] = &[
     (super::widgets::UNDO_HISTORY_ID, "7"),
     (super::widgets::REDO_HISTORY_ID, "8"),
 ];
+
+/// The code of each Quick Access item, in order: a built-in button on the
+/// toolbar keeps its reference code (`QUICK_ACCESS`); every other item but
+/// a separator takes the next code no other item has, from 1–9, then 01–09,
+/// then 0A–0Z. They follow the order whenever it changes. An item past the
+/// last code gets none.
+pub(super) fn qat_codes(items: &[super::layout::QatItem]) -> Vec<Option<String>> {
+    use super::layout::{QatBuiltin, QatItem};
+    let reserved = |item: &QatItem| -> Option<&'static str> {
+        let id = match item {
+            QatItem::Command(cmd) => cmd.trim(),
+            QatItem::Builtin(QatBuiltin::Undo) => super::widgets::UNDO_HISTORY_ID,
+            QatItem::Builtin(QatBuiltin::Redo) => super::widgets::REDO_HISTORY_ID,
+            _ => return None,
+        };
+        QUICK_ACCESS
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(id))
+            .map(|(_, code)| *code)
+    };
+    let mut taken: Vec<String> = Vec::new();
+    // The first item holding a reserved code keeps it; a repeat does not.
+    let kept: Vec<Option<&'static str>> = items
+        .iter()
+        .map(|item| {
+            let code = reserved(item).filter(|code| !taken.iter().any(|t| t == code))?;
+            taken.push(code.to_string());
+            Some(code)
+        })
+        .collect();
+    let mut free = ('1'..='9')
+        .map(|c| c.to_string())
+        .chain(('1'..='9').map(|c| format!("0{c}")))
+        .chain(('A'..='Z').map(|c| format!("0{c}")))
+        .filter(|code| !taken.contains(code));
+    items
+        .iter()
+        .zip(kept)
+        .map(|(item, kept)| match (item, kept) {
+            (QatItem::Separator, _) => None,
+            (_, Some(code)) => Some(code.to_string()),
+            _ => free.next(),
+        })
+        .collect()
+}
 
 /// Reference codes as (scope, target, code). In a tab's scope (its module id)
 /// the target is a tool id, a dropdown id or a group title; a group title's
@@ -307,6 +414,7 @@ const CODES: &[(&str, &str, &str)] = &[
     ("draw", "LAYLCK", "LK"),
     ("draw", "LAYMCUR", "LC"),
     ("draw", "LAYISO", "LS"),
+    ("draw", "LAYWALK", "LX"),
     ("draw", "LAYON", "LN"),
     ("draw", "LAYTHW", "LW"),
     ("draw", "LAYULK", "UL"),
@@ -412,34 +520,70 @@ const CODES: &[(&str, &str, &str)] = &[
     ("insert", "PDFSHXTEXT", "PS"),
     ("insert", "PDFSHXTEXT_SETTINGS", "PT"),
     ("insert", "TXT2MTXT", "TM"),
+    ("insert", "FIELD", "FI"),
+    ("insert", "UPDATEFIELD", "UF"),
+    ("insert", "INSERTOBJ", "OL"),
+    ("insert", "HYPERLINK", "HY"),
+    ("insert", "DATALINK", "DL"),
+    ("insert", "DATALINKUPDATE", "UD"),
+    ("insert", "DATALINKUPDATE_WRITE", "WD"),
+    ("insert", "DATAEXTRACTION", "DX"),
     // Annotate.
     ("annotate", "Text", "TE"),
     ("annotate", "ANNOTATE_TEXT", "MT"),
     ("annotate", "TEXT_STYLE_COMBO", "TY"),
+    ("annotate", TEXT_LAUNCHER, "TS"),
+    ("annotate", "SPELL", "CS"),
+    ("annotate", "TEXTALIGN", "TA"),
+    ("annotate", "JUSTIFYTEXT", "JT"),
+    ("annotate", TEXT_HEIGHT, "TH"),
+    ("text_extension", "SCALETEXT", "ST"),
     ("annotate", "Dimensions", "DM"),
-    ("annotate", "ANNOTATE_DIM", "DN"),
+    ("annotate", "DIM", "DI"),
     ("annotate", "DIM_STYLE_COMBO", "DY"),
-    ("annotate", "QDIM", "QD"),
-    ("annotate", "DIMCONTINUE", "CO"),
-    ("annotate", "TOLERANCE", "TO"),
-    ("annotate", "DIMEDIT", "DE"),
     ("annotate", "DIMBREAK", "BR"),
     ("annotate", "DIMSPACE", "SP"),
     ("annotate", "DIMJOGLINE", "DJ"),
+    ("annotate", super::widgets::DIM_LAYER_COMBO, "DA"),
+    ("annotate", "DIMINSPECT", "DP"),
+    ("annotate", "DIMSTYLE_APPLY", "DU"),
+    ("annotate", "DIMREASSOCIATE", "DR"),
+    ("annotate", "ANNOTATE_DIM", "DN"),
+    ("annotate", "QDIM", "QD"),
+    ("annotate", "ANNOTATE_DIM_CONTINUE", "CO"),
+    ("annotate", DIMENSION_LAUNCHER, "DS"),
+    ("dimensions_extension", "TOLERANCE", "TO"),
+    ("dimensions_extension", "DIMEDIT;O", "DE"),
+    ("dimensions_extension", "DIMTEDIT_ANGLE", "DTA"),
+    ("dimensions_extension", "DIMTEDIT_LEFT", "DTL"),
+    ("dimensions_extension", "DIMTEDIT_CENTER", "DTC"),
+    ("dimensions_extension", "DIMTEDIT_RIGHT", "DTR"),
+    ("dimensions_extension", "DIMOVERRIDE", "DO"),
     ("annotate", "Centerlines", "CE"),
     ("annotate", "CENTERMARK", "CM"),
     ("annotate", "CENTERLINE", "CL"),
-    ("annotate", "ANNOTATE_LEADER", "ML"),
+    ("centerlines_extension", super::widgets::CENTER_LAYER_COMBO, "CA"),
+    ("annotate", "MLEADER", "ML"),
     ("annotate", "MLEADER_STYLE_COMBO", "MY"),
-    ("annotate", "MLEADERADD", "MAD"),
-    ("annotate", "MLEADERREMOVE", "MV"),
+    ("annotate", super::widgets::MLEADER_LAYER_COMBO, "MU"),
+    ("annotate", LEADER_LAUNCHER, "MS"),
+    ("annotate", "AIMLEADEREDITADD", "MAD"),
+    ("annotate", "AIMLEADEREDITREMOVE", "MV"),
     ("annotate", "MLEADERALIGN", "MAL"),
     ("annotate", "MLEADERCOLLECT", "MC"),
     ("annotate", "TABLE", "TB"),
     ("annotate", "TABLE_STYLE_COMBO", "TL"),
     ("annotate", "DATALINK", "DL"),
+    ("annotate", "DATALINKUPDATE", "UD"),
+    ("annotate", "DATALINKUPDATE_WRITE", "WD"),
+    ("annotate", TABLE_LAUNCHER, "TT"),
     ("annotate", "WIPEOUT", "WI"),
     ("annotate", "REVCLOUD", "AC"),
+    // Every Revision Cloud type is RC in the reference; typing it runs
+    // the first.
+    ("REVCLOUD", "REVCLOUD_RECTANGULAR", "RC"),
+    ("REVCLOUD", "REVCLOUD_POLYGONAL", "RC"),
+    ("REVCLOUD", "REVCLOUD_FREEHAND", "RC"),
     // The reference shows AC here too; typing it runs Revision Cloud.
     ("annotate", "ANNOTATION_CURRENT_SCALE", "AC"),
     ("annotate", "SCALELISTEDIT", "SL"),
@@ -530,7 +674,7 @@ fn code(scope: &str, target: &str) -> Option<&'static str> {
 fn tool_tip(scope: &str, tool: &ToolDef) -> Tip {
     Tip {
         anchor: tool.id.to_string(),
-        target: tool.id,
+        target: tool.id.into(),
         code: code(scope, tool.id).map(str::to_string),
         action: Action::Run(Message::RibbonToolClick {
             tool_id: tool.id.to_string(),
@@ -542,7 +686,7 @@ fn tool_tip(scope: &str, tool: &ToolDef) -> Tip {
 fn dropdown_tip(scope: &str, id: &'static str) -> Tip {
     Tip {
         anchor: id.to_string(),
-        target: id,
+        target: id.into(),
         code: code(scope, id).map(str::to_string),
         action: Action::Open(Message::ToggleRibbonDropdown(id.to_string())),
     }
@@ -621,7 +765,7 @@ impl Ribbon {
         let rank = |tip: &Tip| {
             CODES
                 .iter()
-                .position(|(s, t, _)| *s == scope && *t == tip.target)
+                .position(|(s, t, _)| *s == scope && *t == tip.target.as_ref())
                 .unwrap_or(usize::MAX)
         };
         let exact = |typed: &str| {
@@ -653,7 +797,7 @@ impl Ribbon {
         match tip.action.clone() {
             Action::Tab(index) => {
                 state.top = false;
-                self.select(index);
+                self.keytip_tab(index);
                 KeyTipStep::Stay
             }
             Action::Open(message) => KeyTipStep::Open(message),
@@ -676,29 +820,82 @@ impl Ribbon {
     }
 
     fn tab_tips(&self) -> Vec<Tip> {
-        let tabs = self.modules.iter().enumerate().filter(|(_, module)| {
+        let tabs = self.modules.iter().enumerate().filter(|(index, module)| {
             module.id() != "layout"
                 && (module.id() != "block_editor" || self.block_editing.is_some())
+                && !self.tab_hidden(*index)
         });
         let mut tips: Vec<Tip> = tabs
             .map(|(index, module)| Tip {
                 anchor: format!("tab:{}", module.id()),
-                target: module.id(),
+                target: module.id().into(),
                 code: tab_code(module.id()).map(str::to_string),
                 action: Action::Tab(index),
             })
             .collect();
-        tips.extend(QUICK_ACCESS.iter().map(|&(id, code)| Tip {
-            anchor: quick_access_anchor(id),
-            target: id,
-            code: Some(code.to_string()),
-            action: Action::Run(match id {
-                super::widgets::UNDO_HISTORY_ID => Message::Undo,
-                super::widgets::REDO_HISTORY_ID => Message::Redo,
-                command => Message::Command(command.to_string()),
-            }),
-        }));
+        tips.extend(self.qat_tips());
         tips
+    }
+
+    /// The Quick Access items: the built-in buttons keep the reference's
+    /// codes, every other item takes the next free one (`qat_codes`).
+    pub(super) fn qat_tips(&self) -> Vec<Tip> {
+        use super::layout::{QatBuiltin, QatItem};
+        use super::qat::{QAT_SWITCH_ID, QAT_UI_ID};
+        let open = |id: &str| Action::Open(Message::ToggleRibbonDropdown(id.to_string()));
+        let codes = qat_codes(&self.layout.qat);
+        self.layout
+            .qat
+            .iter()
+            .zip(codes)
+            .filter_map(|(item, code)| {
+                let (target, action): (std::borrow::Cow<'static, str>, Action) = match item {
+                    QatItem::Command(cmd) => match self.qat_look(cmd) {
+                        // A split item runs its face, as a click on it does.
+                        super::qat::QatLook::Split {
+                            id, items, default, ..
+                        } => (
+                            id.into(),
+                            Action::Run(Message::MenuCommand(
+                                self.qat_face_command(id, &items, default).to_string(),
+                            )),
+                        ),
+                        // A command OCS does not have yet gets no key tip.
+                        super::qat::QatLook::Plain { runs: false, .. } => return None,
+                        super::qat::QatLook::Plain { .. } => (
+                            cmd.clone().into(),
+                            Action::Run(Message::MenuCommand(cmd.clone())),
+                        ),
+                    },
+                    QatItem::Builtin(QatBuiltin::Undo) => (
+                        super::widgets::UNDO_HISTORY_ID.into(),
+                        Action::Run(Message::Undo),
+                    ),
+                    QatItem::Builtin(QatBuiltin::Redo) => (
+                        super::widgets::REDO_HISTORY_ID.into(),
+                        Action::Run(Message::Redo),
+                    ),
+                    QatItem::Builtin(QatBuiltin::SwitchWindows) => {
+                        (QAT_SWITCH_ID.into(), open(QAT_SWITCH_ID))
+                    }
+                    QatItem::Builtin(QatBuiltin::UserInterface) => {
+                        (QAT_UI_ID.into(), open(QAT_UI_ID))
+                    }
+                    // A list opens its dropdown.
+                    QatItem::Builtin(control) => {
+                        let (id, _) = super::qat::list_ids(*control)?;
+                        (id.into(), open(id))
+                    }
+                    QatItem::Separator => return None,
+                };
+                Some(Tip {
+                    anchor: quick_access_anchor(&target),
+                    target,
+                    code,
+                    action,
+                })
+            })
+            .collect()
     }
 
     /// Every button, dropdown, slide-out and collapsed panel of tab `index`.
@@ -736,6 +933,9 @@ impl Ribbon {
                     }
                     RibbonItem::StyleComboGroup { combo_id, rows, .. } => {
                         tips.push(dropdown_tip(scope, combo_id));
+                        if *combo_id == "MLEADER_STYLE_COMBO" {
+                            tips.push(dropdown_tip(scope, super::widgets::MLEADER_LAYER_COMBO));
+                        }
                         tips.extend(rows.iter().flatten().map(|tool| tool_tip(scope, tool)));
                     }
                 }
@@ -744,22 +944,41 @@ impl Ribbon {
             // panel's slide-out. Both carry it; only the drawn one shows, and
             // the form the panel had in the last frame comes first, so the
             // code runs that one.
-            let ids: Vec<&'static str> = group.tools.iter().filter_map(item_id).collect();
             let collapsed = collapsed_anchor(group.title);
             let was_collapsed = crate::ui::wrap_bar::recent_bounds(&collapsed).is_some();
             let flyout = Tip {
                 anchor: collapsed,
-                target: group.title,
+                target: group.title.into(),
                 code: code(scope, group.title).map(str::to_string),
                 action: Action::Open(Message::ToggleRibbonPanel(group.title.to_string())),
             };
-            let Some(id) = draw_panel::slide_out_id(group.title, &ids) else {
+            let key = extras::panel_key(scope, group.title);
+            // The panel's dialog launcher, with or without a slide-out.
+            if let Some(panel) = extras::for_panel(&key) {
+                if let Some(dialog) = panel.dialog {
+                    tips.push(Tip {
+                        anchor: panel.launcher.to_string(),
+                        target: panel.launcher.into(),
+                        code: code(scope, panel.launcher).map(str::to_string),
+                        action: Action::Run(draw_panel::launcher_message(dialog)),
+                    });
+                }
+            }
+            if key == extras::panel_key("annotate", "Text") {
+                tips.push(Tip {
+                    anchor: TEXT_HEIGHT.to_string(),
+                    target: TEXT_HEIGHT.into(),
+                    code: code(scope, TEXT_HEIGHT).map(str::to_string),
+                    action: Action::Run(Message::RibbonTextHeightFocus),
+                });
+            }
+            let Some(id) = draw_panel::slide_out_id(&key) else {
                 tips.push(flyout);
                 continue;
             };
             let slide_out = Tip {
                 anchor: id.to_string(),
-                target: group.title,
+                target: group.title.into(),
                 code: code(scope, group.title).map(str::to_string),
                 action: Action::Open(Message::ToggleRibbonDropdown(id.to_string())),
             };
@@ -768,14 +987,6 @@ impl Ribbon {
                 tips.extend([flyout, slide_out]);
             } else {
                 tips.extend([slide_out, flyout]);
-            }
-            if id == draw_panel::REFERENCE_PANEL_ID {
-                tips.push(Tip {
-                    anchor: XREF_LAUNCHER.to_string(),
-                    target: XREF_LAUNCHER,
-                    code: code(scope, XREF_LAUNCHER).map(str::to_string),
-                    action: Action::Run(Message::ToggleXrefManager),
-                });
             }
         }
         tips
@@ -813,7 +1024,7 @@ impl Ribbon {
             .enumerate()
             .map(|(position, (dropdown_id, cmd, submenu))| Tip {
                 anchor: item_anchor(dropdown_id, cmd),
-                target: cmd,
+                target: cmd.into(),
                 code: Some(
                     code(open, cmd).map_or_else(|| (position + 1).to_string(), str::to_string),
                 ),
@@ -824,10 +1035,13 @@ impl Ribbon {
                 },
             })
             .collect();
-        if open == draw_panel::REFERENCE_PANEL_ID {
+        if open == extras::CENTERLINES_ID {
+            tips.push(dropdown_tip(open, super::widgets::CENTER_LAYER_COMBO));
+        }
+        if open == extras::REFERENCE_ID {
             tips.push(Tip {
                 anchor: item_anchor(open, XREF_FADE),
-                target: XREF_FADE,
+                target: XREF_FADE.into(),
                 code: code(open, XREF_FADE).map(str::to_string),
                 action: Action::Run(Message::XrefFadeToggle),
             });
@@ -896,7 +1110,7 @@ impl Ribbon {
                 // A collapsed panel's title is centred in a wider box: its
                 // text width places the code beside the words.
                 let title_w = if tip.anchor.starts_with(COLLAPSED_PREFIX) {
-                    text_width(&crate::t!(tip.target), 9.0, iced::Font::default())
+                    text_width(&crate::t!(tip.target.as_ref()), 9.0, iced::Font::default())
                 } else {
                     0.0
                 };
@@ -1228,10 +1442,11 @@ fn draw_bar(renderer: &mut Renderer, theme: &Theme, parts: &[String; 3]) {
     };
     let (fill, edge, ink) = colors(theme);
     let font = bold(renderer);
-    let bar = Rectangle::new(
-        Point::new(ribbon.x, ribbon.y + ribbon.height),
-        Size::new(ribbon.width, BAR_H),
-    );
+    // Under a minimized ribbon's open popup, which hangs below the ribbon.
+    let top = fresh_bounds(super::minimize::POPUP_ID).map_or(ribbon.y + ribbon.height, |popup| {
+        (popup.y + popup.height).max(ribbon.y + ribbon.height)
+    });
+    let bar = Rectangle::new(Point::new(ribbon.x, top), Size::new(ribbon.width, BAR_H));
     renderer.fill_quad(
         renderer::Quad {
             bounds: bar,
@@ -1311,7 +1526,7 @@ fn pill_candidates(
             Point::new(b.x + 14.0, b.center_y()),
         ];
     }
-    if anchor == XREF_LAUNCHER {
+    if anchor.ends_with("_LAUNCHER") {
         return vec![
             b.center(),
             Point::new(b.x + b.width + 2.0 + width / 2.0, b.center_y()),
@@ -1354,10 +1569,10 @@ fn pill_candidates(
         let icon = Point::new(b.center_x(), (b.y + label.y) / 2.0);
         let mut spots = Vec::new();
         if dropdown {
-            // The arrow strip lies under the label.
+            // The arrow lies under the label.
             spots.push(Point::new(
                 b.center_x(),
-                b.y + b.height - super::widgets::LARGE_ARR / 2.0,
+                b.y + b.height - crate::ui::style::ribbon_metrics::LARGE_ARROW_BOTTOM,
             ));
         }
         spots.extend([
@@ -1383,4 +1598,110 @@ fn pill_candidates(
         Point::new(icon.x, b.y + b.height + PILL_H / 2.0 - 2.0),
     ]);
     spots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::layout::{default_qat, QatBuiltin, QatItem, RibbonLayout};
+    use super::{qat_codes, Ribbon};
+
+    fn some(list: &[&str]) -> Vec<Option<String>> {
+        list.iter().map(|code| Some(code.to_string())).collect()
+    }
+
+    #[test]
+    fn quick_access_codes_keep_the_reference_ones_and_number_the_rest() {
+        assert_eq!(
+            qat_codes(&default_qat()),
+            some(&["1", "2", "3", "4", "6", "7", "8"])
+        );
+
+        // Others take 5, 9, then 01... in order; a separator takes none.
+        let mut items = default_qat();
+        items.insert(3, QatItem::Separator);
+        items.push(QatItem::Command("HATCH".into()));
+        items.push(QatItem::Builtin(QatBuiltin::LayerCombo));
+        items.push(QatItem::Command("ZOOM E".into()));
+        let got = qat_codes(&items);
+        assert_eq!(got[3], None);
+        assert_eq!(got[8..], some(&["5", "9", "01"]));
+
+        // Without Save its 3 is free for the next item.
+        let items = vec![
+            QatItem::Command("QNEW".into()),
+            QatItem::Command("HATCH".into()),
+            QatItem::Command("LINE".into()),
+            QatItem::Command("CIRCLE".into()),
+        ];
+        assert_eq!(qat_codes(&items), some(&["1", "2", "3", "4"]));
+    }
+
+    #[test]
+    fn past_nine_the_codes_go_01_to_09_then_0a_to_0z_without_repeating() {
+        let many: Vec<QatItem> = (0..60)
+            .map(|i| QatItem::Command(format!("CMD{i}")))
+            .collect();
+        let got: Vec<String> = qat_codes(&many).into_iter().flatten().collect();
+        assert_eq!(got.len(), 9 + 9 + 26);
+        assert_eq!(got[9], "01");
+        assert_eq!(got[18], "0A");
+        assert_eq!(got.last().map(String::as_str), Some("0Z"));
+        let mut unique = got.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), got.len());
+    }
+
+    #[test]
+    fn a_repeated_item_in_a_saved_toolbar_is_dropped_so_anchors_stay_unique() {
+        let layout = RibbonLayout {
+            qat: vec![
+                QatItem::Command("HATCH".into()),
+                QatItem::Separator,
+                QatItem::Command("hatch".into()),
+                QatItem::Command("LINE".into()),
+                QatItem::Builtin(QatBuiltin::LayerCombo),
+                QatItem::Builtin(QatBuiltin::LayerCombo),
+            ],
+            ..RibbonLayout::default()
+        };
+        let mut ribbon = Ribbon::default();
+        ribbon.set_layout(layout);
+        assert_eq!(
+            ribbon.layout().qat,
+            [
+                QatItem::Command("HATCH".into()),
+                QatItem::Separator,
+                QatItem::Command("LINE".into()),
+                QatItem::Builtin(QatBuiltin::LayerCombo),
+            ]
+        );
+        let tips = ribbon.qat_tips();
+        assert_eq!(tips.len(), 3);
+        let mut anchors: Vec<&str> = tips.iter().map(|tip| tip.anchor.as_str()).collect();
+        anchors.sort_unstable();
+        anchors.dedup();
+        assert_eq!(anchors.len(), tips.len());
+    }
+
+    #[test]
+    fn a_toolbar_list_gets_a_key_tip_that_opens_its_list() {
+        let mut ribbon = Ribbon::default();
+        ribbon.set_layout(RibbonLayout {
+            qat: vec![
+                QatItem::Builtin(QatBuiltin::Color),
+                QatItem::Builtin(QatBuiltin::CenterLayer),
+            ],
+            ..RibbonLayout::default()
+        });
+        let tips = ribbon.qat_tips();
+        assert_eq!(tips.len(), 2);
+        for (tip, id) in tips.iter().zip(["QAT_COLOR", "QAT_CENTER_LAYER"]) {
+            assert_eq!(tip.target, id);
+            assert!(matches!(
+                &tip.action,
+                super::Action::Open(crate::app::Message::ToggleRibbonDropdown(open)) if open == id
+            ));
+        }
+    }
 }

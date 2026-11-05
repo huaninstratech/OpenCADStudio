@@ -88,6 +88,9 @@ pub struct SelectionInput {
     pub middle_down: bool,
     pub middle_last_pos: Option<Point>,
     pub middle_last_press_time: Option<Instant>,
+    /// Where a middle drag that is panning started; Shift pressed during
+    /// that pan locks it to one axis instead of orbiting (#2155).
+    pub middle_pan_from: Option<Point>,
     /// Which way a ZOOM Dynamic drag is currently zooming: `true` while it is
     /// zooming out. Only the magnifier cursor reads it. The sign is latched
     /// rather than taken from the live `dy` so that the sub-pixel jitter of a
@@ -115,20 +118,30 @@ pub struct SelectionMenu {
     /// Transient UI state of the open context menu (expanded submenu,
     /// keyboard highlight). Reset every time the menu opens.
     pub ui: ContextMenuUi,
+    /// Open quad cursor menu (docs/quad-menu.md §3.1). `None` = closed, so
+    /// `Option` mirrors `open_at`'s discipline: the transient popup state
+    /// belongs to the selection boundary, and [`SelectionMenu::open`] /
+    /// [`SelectionMenu::close`] reset it exactly like the context-menu state.
+    pub quad: Option<crate::ui::popup::quad_menu::QuadUi>,
 }
 
 impl SelectionMenu {
     /// Open the context menu at `at`, discarding the previous menu's
-    /// expanded-submenu / highlight state.
+    /// expanded-submenu / highlight state. The two cursor-anchored menus are
+    /// mutually exclusive: opening the context menu closes the quad.
     pub fn open(&mut self, at: Point) {
         self.open_at = Some(at);
         self.ui = ContextMenuUi::default();
+        self.quad = None;
     }
 
-    /// Close the context menu (no-op when it is not open).
+    /// Close the context menu (no-op when it is not open). A disruptive
+    /// transition that dismisses the menu also dismisses an open quad: both
+    /// are transient cursor popups of the same owner.
     pub fn close(&mut self) {
         self.open_at = None;
         self.ui = ContextMenuUi::default();
+        self.quad = None;
     }
 }
 

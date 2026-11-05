@@ -16,12 +16,28 @@ fn tessellation(body: &Body) -> brep::mesh::BodyMesh {
     )
 }
 
+/// `tolerance` with a body's isolines: a surface's own U/V counts and
+/// planar switch, or (`planar_isolines` `None`) a solid's, spaced as the
+/// drawing's isoline setting spaces them.
+pub(crate) fn with_isolines(
+    tolerance: brep::mesh::TessellationTolerance,
+    isolines: [usize; 2],
+    planar_isolines: Option<bool>,
+) -> brep::mesh::TessellationTolerance {
+    match planar_isolines {
+        None => tolerance.with_solid_isolines(isolines[0]),
+        Some(planar) => tolerance
+            .with_uv_isolines(isolines[0], isolines[1])
+            .with_planar_isolines(planar),
+    }
+}
+
 fn display_tessellation(
     body: &Body,
     facet_resolution: f64,
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
-    planar_isolines: bool,
+    planar_isolines: Option<bool>,
 ) -> brep::mesh::BodyMesh {
     let resolution = if facet_resolution.is_finite() && facet_resolution > 0.0 {
         facet_resolution.clamp(0.01, 10.0)
@@ -32,9 +48,11 @@ fn display_tessellation(
         || kernel::tessellation::angle_for_resolution(resolution),
         |_| kernel::tessellation::display_angle_for_resolution(resolution),
     );
-    let mut tolerance = brep::mesh::TessellationTolerance::new(max_angle, TOL)
-        .with_uv_isolines(isolines[0], isolines[1])
-        .with_planar_isolines(planar_isolines);
+    let mut tolerance = with_isolines(
+        brep::mesh::TessellationTolerance::new(max_angle, TOL),
+        isolines,
+        planar_isolines,
+    );
     if let Some(deflection) = chordal_deflection {
         tolerance = tolerance.with_chordal_deflection(deflection);
     }
@@ -621,7 +639,7 @@ pub fn display_from_solid(
     facet_resolution: f64,
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
-    planar_isolines: bool,
+    planar_isolines: Option<bool>,
 ) -> Option<(MeshLodSet, Vec<codec::entities::Wire>, [f64; 3])> {
     use codec::types::Vector3;
     let tessellation = display_tessellation(
@@ -710,7 +728,7 @@ mod tests {
     use super::*;
 
     fn tri_count(body: &Body) -> usize {
-        display_from_solid(body, [0.7, 0.7, 0.7, 1.0], 1.0, None, [0; 2], false)
+        display_from_solid(body, [0.7, 0.7, 0.7, 1.0], 1.0, None, [0; 2], None)
             .map(|(m, _, _)| m.lods[0].indices.len() / 3)
             .unwrap_or(0)
     }
@@ -746,7 +764,7 @@ mod tests {
     fn planar_display_uses_independent_isoline_counts() {
         let body = box_solid([0.0; 3], 10.0, 10.0, 10.0).unwrap();
         let display = |counts, planar| {
-            display_from_solid(&body, [0.7, 0.7, 0.7, 1.0], 1.0, None, counts, planar)
+            display_from_solid(&body, [0.7, 0.7, 0.7, 1.0], 1.0, None, counts, Some(planar))
                 .unwrap()
                 .0
                 .edge_verts

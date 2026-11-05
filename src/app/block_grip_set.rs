@@ -25,6 +25,80 @@ impl OpenCADStudio {
         }
         Task::none()
     }
+    pub(super) fn commit_native_grip_location(&mut self, field: &'static str) -> Task<Message> {
+        let i = self.active_tab;
+        let tab = &self.tabs[i];
+        let Some(session) = tab.active_block_edit_session() else {
+            return Task::none();
+        };
+        let definition = session.br_handle;
+        let Some(parameter) = tab.selected_authoring else {
+            return Task::none();
+        };
+        let Some((role, y)) = native_grip_fields()
+            .iter()
+            .enumerate()
+            .find_map(|(role, (x, y))| {
+                if *x == field {
+                    Some((role, false))
+                } else if *y == field {
+                    Some((role, true))
+                } else {
+                    None
+                }
+            })
+        else {
+            return Task::none();
+        };
+        let key = crate::ui::properties::FieldKey::Geom(field);
+        let Some(input) = tab.properties.edit_buf.get(&key) else {
+            return Task::none();
+        };
+        let Ok(value) = crate::app::expr_eval::eval_to_string(input).parse::<f64>() else {
+            self.command_line
+                .push_error(crate::t!("Specify a finite grip coordinate.").as_ref());
+            return Task::none();
+        };
+        let Ok(locations) = crate::scene::block_grips::config::locations(
+            &tab.scene.document,
+            definition,
+            parameter,
+        ) else {
+            return Task::none();
+        };
+        let Some(grip) = locations.into_iter().find(|grip| grip.role == role) else {
+            return Task::none();
+        };
+        let mut point = grip.point;
+        if y {
+            point.y = value;
+        } else {
+            point.x = value;
+        }
+        let mut staged = tab.scene.document.clone();
+        match crate::scene::block_grips::config::set_location(
+            &mut staged,
+            definition,
+            parameter,
+            role,
+            point,
+        ) {
+            Ok(changed) => {
+                if changed {
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Move native block grip"));
+                    self.apply_action_document(i, staged);
+                    self.tabs[i].dirty = true;
+                    self.tabs[i].scene.bump_geometry();
+                    self.finish_pending_history(i);
+                }
+                self.tabs[i].properties.edit_buf.remove(&key);
+                self.refresh_properties();
+            }
+            Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+        }
+        Task::none()
+    }
+
     pub(super) fn commit_block_grip_count(&mut self) -> Task<Message> {
         let i = self.active_tab;
         let tab = &self.tabs[i];
@@ -85,7 +159,7 @@ impl OpenCADStudio {
         match crate::scene::block_grips::config::set(&mut staged, definition, parameter, count) {
             Ok(changed) => {
                 if changed {
-                    self.push_undo_snapshot(i, "Configure block parameter grips");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Configure block parameter grips"));
                     self.apply_action_document(i, staged);
                     self.tabs[i].dirty = true;
                     self.tabs[i].scene.bump_geometry();
@@ -110,4 +184,19 @@ impl OpenCADStudio {
         }
         Task::none()
     }
+}
+
+pub(super) fn native_grip_fields() -> [(&'static str, &'static str); 4] {
+    [
+        (
+            "authoring_display_grip_base_x",
+            "authoring_display_grip_base_y",
+        ),
+        (
+            "authoring_display_grip_end_x",
+            "authoring_display_grip_end_y",
+        ),
+        ("authoring_display_grip_x_x", "authoring_display_grip_x_y"),
+        ("authoring_display_grip_y_x", "authoring_display_grip_y_y"),
+    ]
 }

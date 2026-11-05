@@ -1,7 +1,7 @@
 use codec::entities::{Dimension, DimensionDiameter};
 use codec::types::{Handle, Vector3};
 use codec::EntityType;
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview, InputKind,
@@ -62,29 +62,36 @@ impl DiameterDimensionCommand {
         source: crate::scene::dimension_assoc::RadialSourceGeometry,
         world: DVec3,
     ) -> EntityType {
-        let plane = WorkingPlane::new(
-            DVec3::from_array(source.plane.origin),
-            DVec3::from_array(source.plane.x_axis),
-            DVec3::from_array(source.plane.y_axis),
-        );
-        let chord = plane.to_local(dvec(source.chord_at(world.to_array())));
-        let far_chord = plane.to_local(dvec(source.opposite_chord_at(world.to_array())));
-        let point = plane.to_local(world);
-        let mut dim = DimensionDiameter::new(v3(chord), v3(far_chord));
-        dim.base.text_middle_point = v3(point);
-        dim.base.insertion_point = v3(point);
-        dim.base.text_user_positioned = true;
-        dim.leader_length = chord.distance(point);
-        dim.base.actual_measurement = dim.measurement();
-        crate::entities::dimension::set_dimension_text_override(
-            &mut dim.base,
-            self.text_override.clone(),
-        );
-        if let Some(angle) = self.text_angle {
-            dim.base.text_rotation = angle;
-        }
-        plane.place_entity(EntityType::Dimension(Box::new(Dimension::Diameter(dim))))
+        diameter_dimension_entity(source, world, self.text_override.clone(), self.text_angle)
     }
+}
+
+/// A diameter dimension of `source` with its text at `world`.
+pub(crate) fn diameter_dimension_entity(
+    source: crate::scene::dimension_assoc::RadialSourceGeometry,
+    world: DVec3,
+    text_override: Option<String>,
+    text_angle: Option<f64>,
+) -> EntityType {
+    let plane = WorkingPlane::new(
+        DVec3::from_array(source.plane.origin),
+        DVec3::from_array(source.plane.x_axis),
+        DVec3::from_array(source.plane.y_axis),
+    );
+    let chord = plane.to_local(dvec(source.chord_at(world.to_array())));
+    let far_chord = plane.to_local(dvec(source.opposite_chord_at(world.to_array())));
+    let point = plane.to_local(world);
+    let mut dim = DimensionDiameter::new(v3(chord), v3(far_chord));
+    dim.base.text_middle_point = v3(point);
+    dim.base.insertion_point = v3(point);
+    dim.base.text_user_positioned = true;
+    dim.leader_length = chord.distance(point);
+    dim.base.actual_measurement = dim.measurement();
+    crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
+    if let Some(angle) = text_angle {
+        dim.base.text_rotation = angle;
+    }
+    plane.place_entity(EntityType::Dimension(Box::new(Dimension::Diameter(dim))))
 }
 
 /// A diameter dimension for a dimensional constraint: the dimension line
@@ -122,7 +129,8 @@ impl CadCommand for DiameterDimensionCommand {
         }
         match self.step {
             Step::SelectObject => {
-                t!("DIMDIAMETER  Select arc, circle, or polyline arc:").into_owned()
+                t!("DIMDIAMETER  Select arc or circle:")
+                    .into_owned()
             }
             Step::DimLine(_) => {
                 t!("DIMDIAMETER  Specify dimension line location  [Mtext/Text/Angle]:").into_owned()
@@ -294,9 +302,9 @@ impl CadCommand for DiameterDimensionCommand {
         match self.step {
             Step::SelectObject => None,
             Step::DimLine(source) => {
-                let chord = dvec(source.chord_at(pt.to_array())).as_vec3();
-                let far_chord = dvec(source.opposite_chord_at(pt.to_array())).as_vec3();
-                Some(preview_line(far_chord, chord, pt.as_vec3()))
+                let chord = dvec(source.chord_at(pt.to_array()));
+                let far_chord = dvec(source.opposite_chord_at(pt.to_array()));
+                Some(preview_line(far_chord, chord, pt))
             }
         }
     }
@@ -319,51 +327,22 @@ fn dvec(point: Vector3) -> DVec3 {
     DVec3::new(point.x, point.y, point.z)
 }
 
-fn preview_line(far_chord: Vec3, chord: Vec3, text: Vec3) -> WireModel {
-    let separator = [f32::NAN; 3];
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimdia_preview".into(),
-        points: vec![
+fn preview_line(far_chord: DVec3, chord: DVec3, text: DVec3) -> WireModel {
+    // Preview geometry is f64; `solid_f64` keeps the residual so the preview
+    // stays on the snapped points at UTM-scale coordinates.
+    let separator = [f64::NAN; 3];
+    WireModel::solid_f64(
+        "dimdia_preview".into(),
+        vec![
             far_chord.to_array(),
             chord.to_array(),
             separator,
             chord.to_array(),
             text.to_array(),
         ],
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
-        ..Default::default()
-    }
+        WireModel::CYAN,
+        false,
+    )
 }
 
 inventory::submit!(crate::command::CommandRegistration {

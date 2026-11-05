@@ -166,7 +166,7 @@ impl AngularDimensionCommand {
             dim.base.insertion_point = dim.base.text_middle_point;
             dim.base.text_user_positioned = true;
         }
-        dim.base.actual_measurement = dim.measurement_degrees();
+        dim.base.actual_measurement = dim.measurement_radians();
         crate::entities::dimension::set_dimension_text_override(
             &mut dim.base,
             self.text_override.clone(),
@@ -220,7 +220,7 @@ impl AngularDimensionCommand {
             dim.base.insertion_point = dim.base.text_middle_point;
             dim.base.text_user_positioned = true;
         }
-        dim.base.actual_measurement = dim.measurement_degrees();
+        dim.base.actual_measurement = dim.measurement_radians();
         crate::entities::dimension::set_dimension_text_override(
             &mut dim.base,
             self.text_override.clone(),
@@ -1242,7 +1242,7 @@ pub(crate) fn angular_two_line_entity(
     // No stored text point: the style places the text (DIMTAD) beside the
     // arc at render time, as the reference draws a dynamic dimension.
     dim.base.insertion_point = dim.dimension_arc;
-    dim.base.actual_measurement = dim.measurement_degrees();
+    dim.base.actual_measurement = dim.measurement_radians();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text);
     Some(EntityType::Dimension(Box::new(Dimension::Angular2Ln(dim))))
 }
@@ -1261,7 +1261,7 @@ pub(crate) fn angular_three_point_entity(
     dim.base.definition_point = dim.definition_point;
     dim.base.text_middle_point = Vector3::new(0.0, 0.0, 0.0);
     dim.base.insertion_point = dim.definition_point;
-    dim.base.actual_measurement = dim.measurement_degrees();
+    dim.base.actual_measurement = dim.measurement_radians();
     crate::entities::dimension::set_dimension_text_override(&mut dim.base, text);
     Some(EntityType::Dimension(Box::new(Dimension::Angular3Pt(dim))))
 }
@@ -1275,46 +1275,12 @@ fn nan() -> DVec3 {
 }
 
 fn preview_wire(points: Vec<DVec3>) -> WireModel {
-    WireModel {
-        bg_adapt: None,
-        point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
-        world_width: 0.0,
-        depth_override: None,
-        display_visible: true,
-        snap_only: false,
-        plot_visible: true,
-        fill_is_3d: false,
-        fill_is_2d_solid: false,
-        render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
-        dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
-        name: "dimangular_preview".to_string(),
-        points: points
-            .into_iter()
-            .map(|point| [point.x as f32, point.y as f32, point.z as f32])
-            .collect(),
-        points_low: Vec::new(),
-        color: WireModel::CYAN,
-        selected: false,
-        pattern_length: 0.0,
-        pattern: [0.0; 8],
-        line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        aci: 0,
-        key_vertices: vec![],
-        aabb: WireModel::UNBOUNDED_AABB,
-        plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
-        ..Default::default()
-    }
+    WireModel::solid_f64(
+        "dimangular_preview".to_string(),
+        points.into_iter().map(|point| point.to_array()).collect(),
+        WireModel::CYAN,
+        false,
+    )
 }
 
 inventory::submit!(crate::command::CommandRegistration {

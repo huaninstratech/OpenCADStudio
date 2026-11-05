@@ -86,6 +86,51 @@ impl ModifyEntityIndex {
             .and_then(|index| entities.get(*index))
     }
 
+    /// Take `handle` out of `entities` and the index. The last entity moves
+    /// into its slot, so nothing else is re-indexed.
+    pub(super) fn remove(&mut self, entities: &mut Vec<EntityType>, handle: Handle) {
+        let Some(index) = self.by_handle.remove(&handle) else {
+            return;
+        };
+        entities.swap_remove(index);
+        if let Some(moved) = entities.get(index) {
+            self.by_handle.insert(moved.common().handle, index);
+        }
+        if let Some(tree) = self.tree.as_mut() {
+            tree.remove(handle);
+        }
+        self.unbounded.retain(|other| *other != handle);
+    }
+
+    /// Append `entity` to `entities` and index it in place.
+    pub(super) fn push(&mut self, entities: &mut Vec<EntityType>, entity: EntityType) {
+        let handle = entity.common().handle;
+        self.by_handle.insert(handle, entities.len());
+        match entity_world_aabb_f64(&entity) {
+            // Outside the tree's bounds it lands in the tree's overflow list,
+            // which every query still returns.
+            Some(aabb) => self
+                .tree
+                .get_or_insert_with(|| QuadTree::new(aabb))
+                .insert(handle, aabb),
+            None => self.unbounded.push(handle),
+        }
+        entities.push(entity);
+    }
+
+    /// Query a selection rectangle against the already-built command index.
+    /// Entities without a finite AABB remain candidates for correctness
+    /// (rays, XLINEs and other unbounded/unsupported shapes).
+    pub(super) fn handles_in_aabb(&self, aabb: [f64; 4]) -> FxHashSet<Handle> {
+        let mut handles: FxHashSet<Handle> = self
+            .tree
+            .as_ref()
+            .map(|tree| tree.query_rect(aabb).into_iter().collect())
+            .unwrap_or_default();
+        handles.extend(self.unbounded.iter().copied());
+        handles
+    }
+
     pub(super) fn nearby_handles(
         &self,
         entities: &[EntityType],

@@ -40,6 +40,7 @@ struct AttrTextInputs<'a> {
     mtext_flag: MTextFlag,
     is_multiline: bool,
     line_count: i16,
+    rectangle_width: f64,
 }
 
 fn halign_str(a: AHA) -> &'static str {
@@ -107,7 +108,7 @@ fn mtext_flag_str(f: MTextFlag) -> &'static str {
 /// glyph boxes, the point they are relative to and the layout rotation.
 pub(crate) type AttrCells = (Vec<crate::entities::text_support::GlyphBox>, [f64; 2], f32);
 
-fn build_attr_render(input: AttrTextInputs<'_>, document: &codec::CadDocument) -> RenderEntity {
+fn build_attr_render(input: AttrTextInputs<'_>, document: &codec::Document) -> RenderEntity {
     build_attr_layout(input, document, None)
 }
 
@@ -115,7 +116,7 @@ fn build_attr_render(input: AttrTextInputs<'_>, document: &codec::CadDocument) -
 /// character cells in `cells` (left `None` for a single-line one).
 fn build_attr_layout(
     mut input: AttrTextInputs<'_>,
-    document: &codec::CadDocument,
+    document: &codec::Document,
     mut cells: Option<&mut Option<AttrCells>>,
 ) -> RenderEntity {
     let normal = (input.normal.x, input.normal.y, input.normal.z);
@@ -250,12 +251,13 @@ fn build_attr_layout(
             is_vertical: false,
         };
         let layout = layout_mtext(&MTextRenderOpts {
+            layer_color: None,
             // Not an MTEXT: text in a fixed box, never columnar.
             columns: Default::default(),
             value: &display_value,
             insertion: [anchor_pt.x, anchor_pt.y, anchor_pt.z],
             height: input.height as f32,
-            rect_w: 0.0,
+            rect_w: input.rectangle_width as f32,
             rotation,
             style: &style_for_mtext,
             attach_h_anchor,
@@ -265,6 +267,7 @@ fn build_attr_layout(
             rectangle_height: 0.0,
             vertical_text: false,
             want_glyph_boxes: cells.is_some(),
+            break_long_words: false,
         });
         if let Some(out) = cells.as_deref_mut() {
             *out = Some((
@@ -327,11 +330,19 @@ fn build_attr_layout(
                 AHA::Center | AHA::Middle => b.advance * 0.5,
                 AHA::Right | AHA::Aligned | AHA::Fit => b.advance,
             };
+            // As TEXT: the font's height and descender decide, Middle
+            // (72 = 4) centres on the strokes.
             let ay = match input.vertical_alignment {
+                _ if matches!(input.horizontal_alignment, AHA::Middle) => {
+                    (b.ink_min[1] + b.ink_max[1]) * 0.5
+                }
                 AVA::Baseline => 0.0,
-                AVA::Bottom => b.ink_min[1],
-                AVA::Middle => (b.ink_min[1] + b.ink_max[1]) * 0.5,
-                AVA::Top => b.ink_max[1],
+                AVA::Bottom => {
+                    -(input.height as f32)
+                        * crate::entities::text_support::descent_ratio(&resolved.font_name)
+                }
+                AVA::Middle => input.height as f32 * 0.5,
+                AVA::Top => input.height as f32,
             };
             (ax, ay)
         } else {
@@ -379,6 +390,7 @@ fn build_attr_layout(
                 oblique: oblique_angle,
                 tracking: 1.0,
                 bold: false,
+                aci: None,
             }),
         });
     }
@@ -397,7 +409,7 @@ fn build_attr_layout(
 // ── AttributeDefinition ───────────────────────────────────────────────────────
 
 impl RenderConvertible for AttributeDefinition {
-    fn to_render(&self, document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
         // A definition shows its tag; the value appears only on the block
         // references (block content renders a constant one's value itself).
         Some(build_attr_render(
@@ -418,6 +430,7 @@ impl RenderConvertible for AttributeDefinition {
                 mtext_flag: MTextFlag::SingleLine,
                 is_multiline: false,
                 line_count: 1,
+                rectangle_width: 0.0,
             },
             document,
         ))
@@ -563,10 +576,18 @@ fn justify_offset(a: &AttributeDefinition) -> Option<(f64, f64)> {
         AHA::Right | AHA::Aligned | AHA::Fit => b.advance as f64,
     };
     let ay = match a.vertical_alignment {
+        _ if matches!(a.horizontal_alignment, AHA::Middle) => {
+            (b.ink_min[1] + b.ink_max[1]) as f64 * 0.5
+        }
         AVA::Baseline => 0.0,
-        AVA::Bottom => b.ink_min[1] as f64,
-        AVA::Middle => (b.ink_min[1] + b.ink_max[1]) as f64 * 0.5,
-        AVA::Top => b.ink_max[1] as f64,
+        AVA::Bottom => {
+            -a.height
+                * crate::entities::text_support::descent_ratio(
+                    &crate::entities::common::style_font(&a.text_style),
+                ) as f64
+        }
+        AVA::Middle => a.height * 0.5,
+        AVA::Top => a.height,
     };
     Some((ax, ay))
 }
@@ -947,7 +968,7 @@ impl Transformable for AttributeDefinition {
 /// single-line attribute.
 pub(crate) fn attribute_cells(
     a: &AttributeEntity,
-    document: &codec::CadDocument,
+    document: &codec::Document,
 ) -> Option<AttrCells> {
     let mut out = None;
     build_attr_layout(attr_inputs(a), document, Some(&mut out));
@@ -971,11 +992,12 @@ fn attr_inputs(a: &AttributeEntity) -> AttrTextInputs<'_> {
         mtext_flag: a.mtext_flag,
         is_multiline: a.is_multiline,
         line_count: a.line_count,
+        rectangle_width: a.embedded_mtext.as_ref().map_or(0.0, |m| m.rectangle_width),
     }
 }
 
 impl RenderConvertible for AttributeEntity {
-    fn to_render(&self, document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
         Some(build_attr_render(
             AttrTextInputs {
                 value: &self.value,
@@ -993,6 +1015,10 @@ impl RenderConvertible for AttributeEntity {
                 mtext_flag: self.mtext_flag,
                 is_multiline: self.is_multiline,
                 line_count: self.line_count,
+                rectangle_width: self
+                    .embedded_mtext
+                    .as_ref()
+                    .map_or(0.0, |m| m.rectangle_width),
             },
             document,
         ))
@@ -1280,5 +1306,44 @@ impl crate::entities::traits::TextContent for codec::entities::AttributeEntity {
         if cur.to_lowercase().contains(&search_lc) {
             self.set_value(cur.replace(search, rep));
         }
+    }
+}
+
+#[cfg(test)]
+mod wrapping_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_attribute_uses_embedded_boundary_width() {
+        let document = codec::Document::new();
+        let mut attribute = AttributeEntity::new("TITLE".into(), "Alpha Beta Gamma Delta".into());
+        attribute.mtext_flag = MTextFlag::MultiLine;
+        attribute.is_multiline = true;
+        let mut mtext = codec::entities::MText::new();
+        mtext.rectangle_width = 15.0;
+        attribute.embedded_mtext = Some(Box::new(mtext));
+        let rendered = attribute.to_render(&document).expect("attribute render");
+        let RenderObject::Text(strokes) = rendered.object else {
+            panic!("attribute must render as text");
+        };
+        let baseline = strokes.first().expect("text runs").origin[1];
+        assert!(strokes
+            .iter()
+            .any(|stroke| (stroke.origin[1] - baseline).abs() > 1.0));
+        let layout = attribute_cells(&attribute, &document).expect("multiline cells");
+        let min_y = layout
+            .0
+            .iter()
+            .map(|cell| cell.ymin)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = layout
+            .0
+            .iter()
+            .map(|cell| cell.ymin)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_y - min_y > attribute.height as f32,
+            "defined width must produce multiple baselines: {min_y}..{max_y}"
+        );
     }
 }

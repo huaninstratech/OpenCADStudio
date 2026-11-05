@@ -18,6 +18,7 @@ const NAMES: &[&str] = &[
     "GRIPDYNCOLOR",
     "GRIPTIPS",
     "BACTIONBARMODE",
+    "BCONSTATUSMODE",
 ];
 
 inventory::submit!(crate::command::CommandRegistration { names: NAMES });
@@ -33,12 +34,15 @@ impl OpenCADStudio {
     pub(in crate::app) fn block_editor_session_variable(&self, name: &str, i: usize) -> Option<u8> {
         let tab = self.tabs.get(i)?;
         Some(match name {
+            // The palettes are a pane, so the answer is the pane the screen
+            // renders: this one reads the active tab, not `i`.
             "APSTATE" => {
-                u8::from(self.show_authoring_palettes && tab.active_block_edit_session().is_some())
+                u8::from(self.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes))
             }
             "BLOCKEDITOR" => u8::from(tab.active_block_edit_session().is_some()),
             "BLOCKTESTWINDOW" => u8::from(tab.block_test.is_some()),
             "BLOCKEDITLOCK" => u8::from(self.block_editor_preferences.locked),
+            "BCONSTATUSMODE" => u8::from(tab.scene.block_constraint_status_mode),
             _ => return None,
         })
     }
@@ -74,6 +78,7 @@ impl OpenCADStudio {
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        if name == "BCONSTATUSMODE" { return Some(self.dispatch_constraint_status_mode(i, value)); }
         if let Some(current) = self.block_editor_preferences.display_variable(&name) {
             if let Some(value) = value {
                 match self
@@ -99,7 +104,7 @@ impl OpenCADStudio {
                 }
             } else {
                 self.command_line
-                    .push_output(&format!("Enter new value for {name} <{current}>:"));
+                    .push_output(&crate::ui::command_line::value_prompt(&name, &current));
                 self.pending_setvar = Some(name);
             }
             return Some(Task::none());
@@ -129,7 +134,7 @@ impl OpenCADStudio {
             }
         } else {
             self.command_line
-                .push_output(&format!("Enter new value for {name} <{current}>:"));
+                .push_output(&crate::ui::command_line::value_prompt(&name, &current));
             self.pending_setvar = Some(name);
         }
         Some(Task::none())
@@ -223,6 +228,128 @@ mod tests {
             app.block_editor_session_variable("APSTATE", source),
             Some(0)
         );
+    }
+
+    /// The action-bar mode is one of the block editor's own variables: the bare
+    /// form answers with the value it holds, and that value decides whether a bar
+    /// is displayed at all.
+    #[test]
+    fn the_action_bar_mode_variable_reads_back_and_gates_the_bars() {
+        let (mut app, _, reference) = fixture();
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+        let _ = app.run_command_line("BPARAMETER LOOKUP 3,3");
+        let bounds =
+            iced::Rectangle::new(iced::Point::new(0.0, 0.0), iced::Size::new(800.0, 600.0));
+        let last = |app: &OpenCADStudio| app.command_line.history.last().unwrap().text.clone();
+        assert!(
+            !app.action_bar_layout(bounds).is_empty(),
+            "a parameter that carries a bar shows it while the mode is on"
+        );
+
+        let _ = app.dispatch_command("SETVAR BACTIONBARMODE");
+        assert!(
+            last(&app).starts_with("Enter new value for BACTIONBARMODE <"),
+            "the bare form shows the value it holds: {}",
+            last(&app)
+        );
+        assert!(
+            last(&app).contains("<1>"),
+            "and the value the variable holds at that point is one"
+        );
+
+        let _ = app.dispatch_command("SETVAR BACTIONBARMODE 0");
+        assert!(
+            last(&app).contains("BACTIONBARMODE = 0"),
+            "the write answers with the new value"
+        );
+        assert!(
+            app.action_bar_layout(bounds).is_empty(),
+            "with the mode off no bar is laid out"
+        );
+        assert_eq!(
+            app.action_bar_error(),
+            Some("Set BACTIONBARMODE to 1 to display action bars."),
+            "and the bar command says why"
+        );
+
+        let _ = app.dispatch_command("SETVAR BACTIONBARMODE");
+        assert!(
+            last(&app).contains("<0>"),
+            "the read now reports the value the write set"
+        );
+
+        let _ = app.dispatch_command("BACTIONBAR");
+        assert!(
+            app.command_line
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.contains("Set BACTIONBARMODE to 1")),
+            "the bar command refused off the command line prints that reason too"
+        );
+        assert!(
+            app.tabs[app.active_tab].active_cmd.is_none(),
+            "and the refused bar command leaves nothing running"
+        );
+
+        let _ = app.dispatch_command("SETVAR BACTIONBARMODE 1");
+        assert_eq!(
+            app.action_bar_error(),
+            None,
+            "with the mode back on the refusal is gone"
+        );
+        assert!(
+            !app.action_bar_layout(bounds).is_empty(),
+            "and the bar is laid out again"
+        );
+        let _ = app.dispatch_command("BEDIT_DISCARD");
+    }
+
+    #[test]
+    fn the_authoring_palette_variable_reports_the_pane_the_screen_shows() {
+        use crate::ui::dock::PanelId;
+        let mut bare = OpenCADStudio::new_for_test();
+        bare.show_authoring_palettes = true;
+        assert!(
+            bare.tabs[bare.active_tab].is_start,
+            "the app opens on the start screen, which carries no panels"
+        );
+        assert_eq!(
+            bare.block_editor_session_variable("APSTATE", bare.active_tab),
+            Some(0),
+            "so a palette the toggle wants is still not on the screen"
+        );
+        let (mut app, _, reference) = fixture();
+        let i = app.active_tab;
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        assert!(app.dock_panel_visible(PanelId::AuthoringPalettes));
+        assert_eq!(
+            app.block_editor_session_variable("APSTATE", i),
+            Some(1),
+            "the palettes are open, so the variable says so"
+        );
+        let _ = app.update(Message::ToggleCleanScreen);
+        assert!(app.clean_screen, "the viewport is cleared of panels");
+        assert!(
+            app.show_authoring_palettes,
+            "while the flag the toggle command sets stays set"
+        );
+        assert!(
+            !app.dock_panel_visible(PanelId::AuthoringPalettes),
+            "and none of the palettes is rendered"
+        );
+        assert_eq!(
+            app.block_editor_session_variable("APSTATE", i),
+            Some(0),
+            "so the variable cannot report palettes the screen is not showing"
+        );
+        let _ = app.update(Message::ToggleCleanScreen);
+        assert_eq!(
+            app.block_editor_session_variable("APSTATE", i),
+            Some(1),
+            "and it comes back with the pane"
+        );
+        let _ = app.dispatch_command("BEDIT_DISCARD");
     }
 
     #[test]

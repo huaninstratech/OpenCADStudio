@@ -253,13 +253,13 @@ pub fn grips_to_screen(
     camera: &crate::scene::view::camera::Camera,
     bounds: Rectangle,
 ) -> Vec<(usize, Point, bool, GripShape, Option<[f32; 2]>)> {
+    // One view matrix for every grip (a selection can hold thousands).
+    let project = camera.projector(bounds);
     grips
         .iter()
         .map(|g| {
-            // Project from the f64 grip position via the relative-to-eye path so
-            // the grip stays glued to the wire at UTM-scale coordinates (an
-            // `as_vec3` cast first would quantize it ~0.5 m off at high zoom).
-            let project = |world: DVec3| camera.project(world, bounds);
+            // Keep f64 eye-relative projection and its behind-eye guard.
+            // An early as_vec3() conversion breaks UTM-scale precision.
             let (screen, dir) = match placed_marker(g, project(g.world), project) {
                 Some((p, dir)) => (Point::new(bounds.x + p.x, bounds.y + p.y), dir),
                 None => (Point::new(f32::NAN, f32::NAN), None),
@@ -301,6 +301,28 @@ pub fn grips_to_screen_paper(
         .collect()
 }
 
+/// Start of the ID range used by custom block parameter markers.
+pub const CUSTOM_GRIP_ID_START: usize = usize::MAX / 2;
+
+pub(crate) fn is_custom_block_marker(grip: &GripDef) -> bool {
+    grip.id >= CUSTOM_GRIP_ID_START && matches!(grip.shape, GripShape::Triangle | GripShape::Arrow)
+}
+
+fn nearer_grip(
+    distance: f32,
+    best_distance: f32,
+    grip: &GripDef,
+    best: &Option<(usize, usize, bool, DVec3)>,
+    grips: &[GripDef],
+) -> bool {
+    distance < best_distance
+        || (distance == best_distance
+            && is_custom_block_marker(grip)
+            && best
+                .as_ref()
+                .is_some_and(|(index, _, _, _)| !is_custom_block_marker(&grips[*index])))
+}
+
 /// Paper-space hit-test variant (mirrors `find_hit_grip` but uses 2-D projection).
 pub fn find_hit_grip_paper(
     cursor: Point,
@@ -325,7 +347,7 @@ pub fn find_hit_grip_paper(
         let dx = screen.x - cursor.x;
         let dy = screen.y - cursor.y;
         let d = (dx * dx + dy * dy).sqrt();
-        if d < best_dist {
+        if nearer_grip(d, best_dist, g, &best, grips) {
             best_dist = d;
             best = Some((index, g.id, g.is_midpoint, g.world));
         }
@@ -343,14 +365,15 @@ pub fn find_hit_grip(
 ) -> Option<(usize, usize, bool, DVec3)> {
     let mut best_dist = GRIP_THRESHOLD_PX;
     let mut best: Option<(usize, usize, bool, DVec3)> = None;
+    // One view matrix for every grip, not one per pointer move and grip.
+    let project = camera.projector(bounds);
 
     for (index, g) in grips.iter().enumerate() {
-        let project = |world: DVec3| camera.project(world, bounds);
         let Some((screen, dir)) = placed_marker(g, project(g.world), project) else {
             continue;
         };
         let d = marker_distance(g.shape, screen, dir, cursor);
-        if d < best_dist {
+        if nearer_grip(d, best_dist, g, &best, grips) {
             best_dist = d;
             best = Some((index, g.id, g.is_midpoint, g.world));
         }
@@ -422,7 +445,7 @@ pub fn find_hit_grip_rte(
             continue;
         };
         let d = marker_distance(g.shape, screen, dir, cursor);
-        if d < best_dist {
+        if nearer_grip(d, best_dist, g, &best, grips) {
             best_dist = d;
             best = Some((index, g.id, g.is_midpoint, g.world));
         }
@@ -433,6 +456,98 @@ pub fn find_hit_grip_rte(
 #[cfg(test)]
 mod tests {
     use super::GripEditMode;
+
+    #[test]
+    fn custom_grips_win_coincident_hits_without_overriding_nearer_entity_grips() {
+        use super::*;
+        let scene = crate::scene::Scene::new();
+        let bounds = Rectangle::with_size(iced::Size::new(1000., 800.));
+        let mut camera = scene.camera.borrow_mut();
+        camera.fit_to_bounds_f64(DVec3::new(-5., -4., 0.), DVec3::new(5., 4., 0.), 1.25);
+        let standard = GripDef {
+            id: 0,
+            world: DVec3::ZERO,
+            is_midpoint: false,
+            shape: GripShape::Square,
+            dir: None,
+            axis: None,
+        };
+        let custom = GripDef {
+            id: CUSTOM_GRIP_ID_START,
+            world: DVec3::ZERO,
+            is_midpoint: false,
+            shape: GripShape::Triangle,
+            dir: Some(DVec3::Y),
+            axis: None,
+        };
+        let screen = camera.project(DVec3::ZERO, bounds).unwrap();
+        let cursor = Point::new(screen.x, screen.y);
+        for grips in [
+            vec![standard.clone(), custom.clone()],
+            vec![custom.clone(), standard.clone()],
+        ] {
+            assert_eq!(
+                find_hit_grip(cursor, &grips, &camera, bounds).unwrap().1,
+                CUSTOM_GRIP_ID_START
+            );
+            assert_eq!(
+                find_hit_grip_rte(
+                    cursor,
+                    &grips,
+                    camera.view_proj_rte(bounds),
+                    camera.eye(),
+                    bounds
+                )
+                .unwrap()
+                .1,
+                CUSTOM_GRIP_ID_START
+            );
+            assert_eq!(
+                find_hit_grip_paper(Point::new(500., 400.), &grips, 0., 0., 5., 4., bounds)
+                    .unwrap()
+                    .1,
+                CUSTOM_GRIP_ID_START
+            );
+        }
+        let mut nearby = custom;
+        nearby.world.x = 0.01;
+        assert_eq!(
+            find_hit_grip(cursor, &[standard, nearby], &camera, bounds)
+                .unwrap()
+                .1,
+            0
+        );
+    }
+
+    #[test]
+    fn large_coordinate_grip_hit_matches_display_projection() {
+        use super::*;
+        let scene = crate::scene::Scene::new();
+        let bounds = Rectangle::with_size(iced::Size::new(1200.0, 800.0));
+        let mut camera = scene.camera.borrow_mut();
+        let base = DVec3::new(1_000_000.0, 5_000_000.0, 0.0);
+        camera.fit_to_bounds_f64(
+            base - DVec3::new(15.0, 10.0, 0.0),
+            base + DVec3::new(15.0, 10.0, 0.0),
+            1.25,
+        );
+        let grip = GripDef {
+            id: 42,
+            world: base + DVec3::new(0.125, 0.25, 0.0),
+            is_midpoint: false,
+            shape: GripShape::Square,
+            dir: None,
+            axis: None,
+        };
+        let cursor = camera.project(grip.world, bounds).expect("visible grip");
+        let cursor = Point::new(cursor.x, cursor.y);
+        let hit = find_hit_grip(cursor, std::slice::from_ref(&grip), &camera, bounds)
+            .expect("precise grip hit");
+        assert_eq!(hit.1, 42);
+        let on_screen = grips_to_screen(&[grip], &camera, bounds);
+        assert!((on_screen[0].1.x - cursor.x).abs() < 0.001);
+        assert!((on_screen[0].1.y - cursor.y).abs() < 0.001);
+    }
 
     #[test]
     fn scalar_dynamic_input_modes_include_move_parallel() {

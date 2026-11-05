@@ -167,6 +167,35 @@ fn ascent(font: &Font) -> f64 {
     ascent_from_file(font)
 }
 
+/// The installed face's Windows descent and the advance of `value`, both
+/// over its cap height (a text's height): what a text of the font
+/// reaches below its baseline and how long it runs, per unit of height.
+fn run_metrics(font: &Font, value: &str) -> Option<(f64, f64)> {
+    let weight = fontdb::Weight(font.weight.clamp(1, 1000) as u16);
+    [font.face.as_str(), "Arial"].into_iter().find_map(|family| {
+        crate::scene::text::sysfont::with_face_data_weighted(family, weight, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let upem = f64::from(face.units_per_em());
+            let cap = face
+                .capital_height()
+                .filter(|&c| c > 0)
+                .map_or(0.7 * upem, f64::from);
+            let descent = face
+                .tables()
+                .os2
+                .map_or(-f64::from(face.descender()), |os2| -f64::from(os2.windows_descender()));
+            let advance: f64 = value
+                .chars()
+                .filter_map(|ch| face.glyph_index(ch))
+                .filter_map(|glyph| face.glyph_hor_advance(glyph))
+                .map(f64::from)
+                .sum();
+            Some((descent / cap, advance / cap))
+        })
+        .flatten()
+    })
+}
+
 /// [`file_ascent`] of the font's installed face.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 fn ascent_from_file(font: &Font) -> f64 {
@@ -477,6 +506,7 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
         face: String::new(),
     };
     let mut text_rgb = [0, 0, 0];
+    let mut text_align = 0u16;
     let mut table: Vec<Option<Object>> = Vec::new();
     let mut current = [0.0, 0.0];
     for (function, p) in &records {
@@ -551,6 +581,8 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                     *slot = None;
                 }
             }
+            // SETTEXTALIGN
+            0x012E => text_align = p.first().copied().unwrap_or(0),
             // SETTEXTCOLOR
             0x0209 => {
                 text_rgb = colorref(
@@ -649,12 +681,30 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 if value.is_empty() {
                     continue;
                 }
-                // The reference point is the cell's top; the baseline sits
-                // the font's ascent below it, and the text is four fifths
-                // of that ascent tall.
+                // The text is four fifths of the font's ascent tall. The
+                // alignment places it as a text of the full ascent's height
+                // would sit: a top reference point has the baseline that
+                // height below it, a bottom one the face's Windows descent
+                // at that height above it, a baseline one on it; a right
+                // reference point ends the run's advance at it, a centre one
+                // halves it.
                 let rotation = font.escapement.to_radians();
-                let drop = ascent(&font);
-                let base = player.at(x + drop * rotation.sin(), y + drop * rotation.cos());
+                let height = ascent(&font);
+                let (descent, width) = run_metrics(&font, &value).unwrap_or((0.0, 0.0));
+                let drop = match text_align & 0x18 {
+                    0x08 => -descent * height,
+                    0x18 => 0.0,
+                    _ => height,
+                };
+                let along = match text_align & 0x06 {
+                    0x02 => -width * height,
+                    0x06 => -0.5 * width * height,
+                    _ => 0.0,
+                };
+                let base = player.at(
+                    x + drop * rotation.sin() + along * rotation.cos(),
+                    y + drop * rotation.cos() - along * rotation.sin(),
+                );
                 let face = Face {
                     name: font.face.clone(),
                     bold: font.weight >= 600,
@@ -670,7 +720,7 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Option<Picture> {
                 let mut text = Text::new();
                 text.value = value;
                 text.insertion_point = base;
-                text.height = 0.8 * drop * scale;
+                text.height = 0.8 * height * scale;
                 text.rotation = rotation;
                 text.common.color = color(text_rgb);
                 player.text_fonts.push((player.entities.len(), index));

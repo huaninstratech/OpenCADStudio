@@ -5,13 +5,14 @@ pub(crate) mod attedit;
 pub(crate) mod attman;
 pub mod base_point;
 pub(crate) mod block_cmdline;
-mod content_browser;
+pub(crate) mod content_browser;
 pub(crate) mod create_block;
-mod design_center;
+pub(crate) mod design_center;
 pub(crate) mod dgn_import;
 pub(crate) mod edit_block;
 mod ifc_data;
 mod ifc_import;
+pub(crate) mod hyperlink_cmd;
 pub(crate) mod image_transparency;
 pub(crate) mod insert_block;
 mod landxml;
@@ -123,14 +124,15 @@ impl CadModule for InsertModule {
                     title: "Reference",
                     tools: vec![
                         RibbonItem::LargeTool(xattach::tool()),
-                        // PDF, DWF, DGN or a point cloud; the face runs the
-                        // last one chosen.
+                        // PDF, a raster image, DWF, DGN or a point cloud;
+                        // the face runs the last one chosen.
                         RibbonItem::LargeDropdown {
                             id: "UNDERLAY_ATTACH",
                             label: "Attach Underlay",
                             icon: pdf_attach::ICON,
                             items: vec![
                                 ("PDFATTACH", "Attach PDF", pdf_attach::ICON),
+                                ("IMAGEATTACH", "Attach Image", pdf_attach::ICON),
                                 ("DWFATTACH", "Attach DWF", pdf_attach::ICON),
                                 ("DGNATTACH", "Attach DGN", pdf_attach::ICON),
                                 ("POINTCLOUDATTACH", "Attach Point Cloud", pc_attach::ICON),
@@ -214,6 +216,60 @@ impl CadModule for InsertModule {
                             event: ModuleEvent::Command("TXT2MTXT".to_string()),
                         }),
                         RibbonItem::Tool(ifc_data::tool()),
+                    ],
+                },
+                // ── Data ─────────────────────────────────────────────────────────
+                RibbonGroup {
+                    title: "Data",
+                    tools: vec![
+                        RibbonItem::LargeTool(ToolDef {
+                            id: "FIELD",
+                            label: "Field",
+                            icon: IconKind::Svg(include_bytes!("../../../assets/icons/text.svg")),
+                            event: ModuleEvent::Command("FIELD".to_string()),
+                        }),
+                        RibbonItem::LabeledTool(ToolDef {
+                            id: "UPDATEFIELD",
+                            label: "Update Fields",
+                            icon: IconKind::Svg(include_bytes!(
+                                "../../../assets/icons/ui/refresh.svg"
+                            )),
+                            event: ModuleEvent::Command("UPDATEFIELD".to_string()),
+                        }),
+                        RibbonItem::LabeledTool(ToolDef {
+                            id: "INSERTOBJ",
+                            label: "OLE Object",
+                            icon: IconKind::Svg(include_bytes!("../../../assets/icons/paste.svg")),
+                            event: ModuleEvent::Command("INSERTOBJ".to_string()),
+                        }),
+                        RibbonItem::LabeledTool(ToolDef {
+                            id: "HYPERLINK",
+                            label: "Hyperlink",
+                            icon: IconKind::Svg(include_bytes!(
+                                "../../../assets/icons/ui/arrow_long_right.svg"
+                            )),
+                            event: ModuleEvent::Command("HYPERLINK".to_string()),
+                        }),
+                    ],
+                },
+                // ── Linking & Extraction ─────────────────────────────────────────
+                RibbonGroup {
+                    title: "Linking & Extraction",
+                    tools: vec![
+                        RibbonItem::LargeTool(ToolDef {
+                            label: "Data\nLink",
+                            ..crate::modules::annotate::data_link::tool()
+                        }),
+                        RibbonItem::LabeledTool(
+                            crate::modules::annotate::data_link::download_tool(),
+                        ),
+                        RibbonItem::LabeledTool(
+                            crate::modules::annotate::data_link::upload_tool(),
+                        ),
+                        RibbonItem::LabeledTool(ToolDef {
+                            label: "Extract Data",
+                            ..crate::modules::annotate::data_extract::tool()
+                        }),
                     ],
                 },
                 // ── Content ───────────────────────────────────────────────────────

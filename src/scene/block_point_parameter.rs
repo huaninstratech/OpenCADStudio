@@ -6,12 +6,12 @@ use codec::objects::{
     DynamicBlockData, ObjectType,
 };
 use codec::types::{Transform, Vector3};
-use codec::{CadDocument, Handle};
+use codec::{Document, Handle};
 
-fn graph_handle(document: &CadDocument, definition: Handle) -> Option<Handle> {
+fn graph_handle(document: &Document, definition: Handle) -> Option<Handle> {
     match document
         .objects
-        .get(&document.extension_dictionary_handle(definition)?)?
+        .get(&super::block_authoring::definition_dictionary(document, definition)?)?
     {
         ObjectType::Dictionary(dictionary) => dictionary.get("ACAD_ENHANCEDBLOCK"),
         _ => None,
@@ -19,7 +19,7 @@ fn graph_handle(document: &CadDocument, definition: Handle) -> Option<Handle> {
 }
 
 pub(crate) fn parameters(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
 ) -> Vec<(Handle, &BlockPointParameter)> {
     let Some(graph) = graph_handle(document, definition) else {
@@ -44,12 +44,26 @@ pub(crate) fn parameters(
         .collect()
 }
 
-pub(crate) fn placement_error(document: &CadDocument, definition: Handle) -> Option<&'static str> {
+pub(crate) fn placement_error(document: &Document, definition: Handle) -> Option<&'static str> {
     authoring::graph(document, definition).err()
 }
 
+/// The next free position label, e.g. the `Position1` a placement prompt
+/// offers when no such label is taken.
+pub(crate) fn next_position_name(document: &Document, definition: Handle) -> String {
+    let existing = parameters(document, definition);
+    (1..)
+        .map(|number| format!("Position{number}"))
+        .find(|name| {
+            existing
+                .iter()
+                .all(|(_, parameter)| !parameter.position_name.eq_ignore_ascii_case(name))
+        })
+        .unwrap()
+}
+
 pub(crate) fn create(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     location: Vector3,
     label: Vector3,
@@ -71,15 +85,7 @@ pub(crate) fn create(
             ("BLOCKGRIPLOCATIONCOMPONENT", "AcDbBlockGripExpr", 20),
         ],
     );
-    let existing = parameters(document, definition);
-    let name = (1..)
-        .map(|number| format!("Position{number}"))
-        .find(|name| {
-            existing
-                .iter()
-                .all(|(_, parameter)| !parameter.position_name.eq_ignore_ascii_case(name))
-        })
-        .unwrap();
+    let name = next_position_name(document, definition);
     let [parameter, grip, x, y] = [(); 4].map(|_| document.allocate_handle());
     let element = |offset, name: &str| BlockElement {
         eval: expression(slots.eval + offset, NO_VALUE, BlockEvalValue::None),
@@ -157,7 +163,7 @@ pub(crate) fn create(
 }
 
 pub(crate) fn reframe(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     transform: &Transform,
 ) -> usize {
@@ -342,7 +348,7 @@ mod tests {
     }
 
     fn graph_data(
-        document: &CadDocument,
+        document: &Document,
         definition: Handle,
     ) -> &codec::objects::BlockEvaluationGraph {
         let ObjectType::DynamicBlock(object) =

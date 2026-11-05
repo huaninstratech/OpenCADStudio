@@ -7,7 +7,7 @@ thread_local! {
     static ROTATE_ANGLE:    Cell<f64> = Cell::new(0.0);   // degrees
     static SCALE_FACTOR:    Cell<f64> = Cell::new(1.0);
     static OFFSET_DIST:     Cell<f64> = Cell::new(1.0);
-    static FILLET_RADIUS:   Cell<f64> = Cell::new(1.0);
+    static FILLET_RADIUS:   Cell<f64> = Cell::new(0.0);
     static CHAMFER_DIST1:   Cell<f64> = Cell::new(10.0);
     static CHAMFER_DIST2:   Cell<f64> = Cell::new(10.0);
     static ARRAY_ROWS:      Cell<f64> = Cell::new(2.0);
@@ -17,6 +17,8 @@ thread_local! {
     static ARRAY_P_COUNT:   Cell<f64> = Cell::new(6.0);
     static ARRAY_P_ANGLE:   Cell<f64> = Cell::new(360.0); // degrees
     static ARRAY_PATH_COUNT: Cell<f64> = Cell::new(6.0);
+    static ARRAY_PATH_SPACING: Cell<f64> = Cell::new(0.0);
+    static ARRAY_PATH_MEASURE: Cell<f64> = Cell::new(1.0);
     static ARRAY_ASSOC:     Cell<f64> = Cell::new(1.0); // 1 = associative
     static POLYGON_SIDES:   Cell<f64> = Cell::new(6.0);
     static RECT_ELEVATION:  Cell<f64> = Cell::new(0.0);
@@ -34,6 +36,7 @@ thread_local! {
     static HELIX_TURNS: Cell<f64> = Cell::new(3.0);
     static HELIX_COUNTER_CLOCKWISE: Cell<bool> = Cell::new(true);
     static FILLET_TRIM:     Cell<bool> = Cell::new(true);   // TRIMMODE
+    static PELLIPSE:        Cell<bool> = Cell::new(false);  // ELLIPSE draws a polyline
 }
 
 macro_rules! accessors {
@@ -69,6 +72,8 @@ accessors!(get_array_col_sp, set_array_col_sp, ARRAY_COL_SP);
 accessors!(get_array_p_count, set_array_p_count, ARRAY_P_COUNT);
 accessors!(get_array_p_angle, set_array_p_angle, ARRAY_P_ANGLE);
 accessors!(get_array_path_count, set_array_path_count, ARRAY_PATH_COUNT);
+accessors!(get_array_path_spacing, set_array_path_spacing, ARRAY_PATH_SPACING);
+accessors!(get_array_path_measure, set_array_path_measure, ARRAY_PATH_MEASURE);
 accessors!(get_polygon_sides, set_polygon_sides, POLYGON_SIDES);
 accessors!(get_rect_elevation, set_rect_elevation, RECT_ELEVATION);
 accessors!(get_rect_thickness, set_rect_thickness, RECT_THICKNESS);
@@ -91,6 +96,13 @@ pub fn get_helix_counter_clockwise() -> bool {
 
 pub fn set_helix_counter_clockwise(value: bool) {
     HELIX_COUNTER_CLOCKWISE.with(|current| current.set(value));
+}
+pub fn get_pellipse() -> bool {
+    PELLIPSE.with(|value| value.get())
+}
+
+pub fn set_pellipse(value: bool) {
+    PELLIPSE.with(|current| current.set(value));
 }
 pub fn get_fillet_trim() -> bool {
     FILLET_TRIM.with(|value| value.get())

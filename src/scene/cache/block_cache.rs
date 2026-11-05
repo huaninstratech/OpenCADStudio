@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
 use codec::types::{Color as AcadColor, LineWeight, Transform, Vector3};
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use kernel::space::{Plane as KernelPlane, Vec3 as KernelVec3};
 
 use crate::scene::convert::tessellate;
@@ -73,6 +73,9 @@ pub struct LocalWire {
     /// equals the sub-entity's resolved colour. For colour-split MTEXT
     /// (`\C`/`\c` inline overrides) each wire carries its own override colour.
     pub color: [f32; 4],
+    /// True when the source entity's own layer is locked. This is applied
+    /// after ByBlock and layer-0 inheritance are resolved at expansion time.
+    pub layer_locked: bool,
     pub contrast_bg: Option<[f32; 4]>,
     pub preserve_color: bool,
     pub canvas_color: bool,
@@ -85,7 +88,14 @@ pub struct LocalWire {
     /// Block-local; the expand-time transform scales it by the insert so the
     /// shader band grows with a scaled insert. `0.0` = a normal wire.
     pub world_width: f32,
+    /// Per-point band width of a tapered polyline (see
+    /// `WireModel.taper_widths`), block-local and aligned with `points`.
+    /// Scaled with `world_width` at expand time. Empty = a constant band.
+    pub taper_widths: Vec<f32>,
     pub plinegen: bool,
+    /// Hidden reference geometry must retain its snap-only role in INSERTs.
+    pub snap_only: bool,
+    pub region_boundary_click: bool,
     pub plot_visible: bool,
     pub plot_l0: bool,
     pub hide_unselected: bool,
@@ -128,6 +138,8 @@ pub struct NestedRef {
     pub instance_offsets: Vec<[f64; 3]>,
     pub plot_visible: bool,
     pub plot_l0: bool,
+    /// True when this nested INSERT is itself on a locked layer.
+    pub layer_locked: bool,
     /// XCLIP boundary for this nested insert, in the parent defn's local frame
     /// (`None` = unclipped). Baked at build time because the clip's spatial
     /// filter lives in `doc.objects`, which isn't reachable at expand time; on
@@ -201,6 +213,9 @@ struct CachedExpansion {
 }
 
 impl BlockCache {
+    pub(crate) fn disable_prototypes(&mut self) {
+        self.prototype_blocks.clear();
+    }
     pub fn clip_source_id(
         &self,
         source_id: u64,
@@ -251,7 +266,7 @@ impl BlockCache {
     /// Build definitions referenced by block-backed entities. Space records stay
     /// roots so their direct entities preserve individual selection handles.
     pub fn build(
-        doc: &CadDocument,
+        doc: &Document,
         anno_scale: f32,
         annotation_scale_handle: Option<Handle>,
         all_visible: bool,
@@ -261,7 +276,33 @@ impl BlockCache {
         // block child's in-block rank, shared by cached wires and graph leaves.
         depth_map: &HashMap<u64, [f32; 2]>,
     ) -> Self {
+        Self::build_with_solid_snaps(
+            doc,
+            anno_scale,
+            annotation_scale_handle,
+            all_visible,
+            bg_color,
+            viewport,
+            depth_map,
+            &HashMap::default(),
+        )
+    }
+
+    /// [`Self::build`], with the block-local B-rep snaps of block solids
+    /// (their vertices and edge middles, from the scene's block meshes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_solid_snaps(
+        doc: &Document,
+        anno_scale: f32,
+        annotation_scale_handle: Option<Handle>,
+        all_visible: bool,
+        bg_color: [f32; 4],
+        viewport: Option<Handle>,
+        depth_map: &HashMap<u64, [f32; 2]>,
+        solid_snaps: &HashMap<Handle, Vec<(glam::DVec3, SnapHint)>>,
+    ) -> Self {
         use crate::par::prelude::*;
+        let _owners = crate::scene::block_authoring::DictionaryOwners::publish(doc);
         let mut cache = Self::new();
         let referenced = collect_referenced_blocks(doc, anno_scale);
         let mut reference_counts: HashMap<String, usize> = HashMap::default();
@@ -296,6 +337,7 @@ impl BlockCache {
                         bg_color,
                         viewport,
                         depth_map,
+                        solid_snaps,
                     )),
                 )
             })
@@ -307,7 +349,7 @@ impl BlockCache {
     /// Build a small cache rooted at one block. Used only when a synthetic or
     /// newly-added Insert is not present in the resident cache yet.
     pub fn build_for_block(
-        doc: &CadDocument,
+        doc: &Document,
         block_name: &str,
         anno_scale: f32,
         annotation_scale_handle: Option<Handle>,
@@ -317,6 +359,7 @@ impl BlockCache {
         depth_map: &HashMap<u64, [f32; 2]>,
     ) -> Self {
         use crate::par::prelude::*;
+        let _owners = crate::scene::block_authoring::DictionaryOwners::publish(doc);
         let mut cache = Self::new();
         let referenced = referenced_block_tree(doc, block_name, anno_scale);
         cache.defns = referenced
@@ -333,6 +376,7 @@ impl BlockCache {
                         bg_color,
                         viewport,
                         depth_map,
+                        &HashMap::default(),
                     )),
                 )
             })
@@ -358,10 +402,10 @@ impl BlockCache {
             .collect();
         for (name, metrics, inline_point_cost) in resolved {
             if let Some(defn_arc) = self.defns.get_mut(name) {
-                let mut defn = (**defn_arc).clone();
+                // Unshared while the cache is being built: no deep copy.
+                let defn = Arc::make_mut(defn_arc);
                 defn.metrics = metrics;
                 defn.inline_point_cost = inline_point_cost;
-                *defn_arc = Arc::new(defn);
             }
         }
     }
@@ -448,7 +492,7 @@ impl BlockCache {
     }
 }
 
-fn block_object_names(doc: &CadDocument, entity: &EntityType, anno_scale: f32) -> Vec<String> {
+fn block_object_names(doc: &Document, entity: &EntityType, anno_scale: f32) -> Vec<String> {
     crate::scene::render_graph::entity_render_block_uses(doc, entity, anno_scale)
         .into_iter()
         .filter(|block_use| !block_use.block.is_null())
@@ -457,7 +501,7 @@ fn block_object_names(doc: &CadDocument, entity: &EntityType, anno_scale: f32) -
 }
 
 /// Collect block definitions needed by rendered representations.
-fn collect_referenced_blocks(doc: &CadDocument, anno_scale: f32) -> Vec<String> {
+fn collect_referenced_blocks(doc: &Document, anno_scale: f32) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::default();
     let mut queue: Vec<String> = Vec::new();
 
@@ -486,7 +530,7 @@ fn collect_referenced_blocks(doc: &CadDocument, anno_scale: f32) -> Vec<String> 
     seen.into_iter().collect()
 }
 
-fn referenced_block_tree(doc: &CadDocument, root: &str, anno_scale: f32) -> Vec<String> {
+fn referenced_block_tree(doc: &Document, root: &str, anno_scale: f32) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::default();
     let mut queue = vec![root.to_string()];
     seen.insert(root.to_string());
@@ -523,7 +567,7 @@ fn nested_attachment_transform(nref: &NestedRef, offset: [f64; 3]) -> Transform 
 }
 
 fn build_defn(
-    doc: &CadDocument,
+    doc: &Document,
     block_name: &str,
     anno_scale: f32,
     annotation_scale_handle: Option<Handle>,
@@ -531,6 +575,7 @@ fn build_defn(
     bg_color: [f32; 4],
     viewport: Option<Handle>,
     depth_map: &HashMap<u64, [f32; 2]>,
+    solid_snaps: &HashMap<Handle, Vec<(glam::DVec3, SnapHint)>>,
 ) -> BlockDefn {
     let br = match crate::scene::render_graph::block_record_by_name(doc, block_name) {
         Some(br) => br,
@@ -556,7 +601,7 @@ fn build_defn(
         // anonymous block and mark all but the active state's entities
         // invisible — honouring the flag is what shows a single profile
         // instead of every variant stacked on top of each other.
-        if entity.common().invisible {
+        if entity.common().invisible || crate::scene::block_construction::is_construction(entity.common()) {
             continue;
         }
         // A sub-entity on a layer that is off or frozen must not render, same
@@ -564,7 +609,15 @@ fn build_defn(
         // leaves its members to the insert's layer. The defn cache is rebuilt on
         // every layer off/freeze toggle (bump_geometry bumps block_epoch), so
         // baking the visibility here stays in sync.
-        if crate::scene::render_graph::block_member_layer_hidden(doc, &entity.common().layer) {
+        // The defn cache is space-shared: a session LAYWALK never enters
+        // here (`None`), so one walked space cannot bake its hides into the
+        // block definitions every other space draws. Graph walks apply the
+        // walk per instance instead.
+        if crate::scene::render_graph::block_member_layer_hidden(
+            doc,
+            &entity.common().layer,
+            None,
+        ) {
             continue;
         }
         // Annotative scale representation: bake only the current scale's copy
@@ -634,7 +687,8 @@ fn build_defn(
                 // the LocalWire; `emit_wire` scales it by the insert transform
                 // so the shader band matches the scaled geometry (same band the
                 // top-level path draws — depth-tested + linetype-dashed).
-                for lw in tessellate_sub_local(
+                let solid = solid_snaps.get(&entity.common().handle);
+                for mut lw in tessellate_sub_local(
                     doc,
                     entity,
                     anno_scale,
@@ -643,6 +697,14 @@ fn build_defn(
                     viewport,
                     depth_map,
                 ) {
+                    // A solid's shell wire carries its corner snaps, as at
+                    // the top level; its box grows to hold them.
+                    if let Some(points) = solid.filter(|_| lw.points.is_empty()) {
+                        lw.snap_pts.extend(points.iter().copied());
+                        lw.aabb_local = aabb_from_points_iter(
+                            lw.snap_pts.iter().map(|(p, _)| p.as_vec3().to_array()),
+                        );
+                    }
                     subs.push(LocalSub::Wire(lw));
                 }
             }
@@ -675,7 +737,7 @@ fn inline_wire_point_cost(wire: &LocalWire) -> Option<usize> {
 fn build_nested_ref(
     nested_ins: &codec::entities::Insert,
     scale_policy: crate::scene::BlockScalePolicy,
-    doc: &CadDocument,
+    doc: &Document,
     anno_scale: f32,
     bg_color: [f32; 4],
     viewport: Option<Handle>,
@@ -718,6 +780,10 @@ fn build_nested_ref(
         instance_offsets: crate::scene::render_graph::array_offsets(nested_ins),
         plot_visible,
         plot_l0,
+        layer_locked: crate::scene::view::render::layer_locked(
+            doc,
+            &EntityType::Insert(nested_ins.clone()),
+        ),
         clip_poly,
         local_rank: depth_map
             .get(&nested_ins.common.handle.value())
@@ -727,7 +793,7 @@ fn build_nested_ref(
 }
 
 fn tessellate_sub_local(
-    doc: &CadDocument,
+    doc: &Document,
     sub: &EntityType,
     anno_scale: f32,
     annotation_scale_handle: Option<Handle>,
@@ -754,6 +820,7 @@ fn tessellate_sub_local(
     let _ = bg_color;
 
     let has_book_color = crate::scene::view::render::has_resolved_book_color(doc, sub);
+    let layer_locked = crate::scene::view::render::layer_locked(doc, sub);
     let color_is_byblock = !has_book_color && sub.common().color == AcadColor::ByBlock;
     let lt_is_byblock = sub.common().linetype.eq_ignore_ascii_case("byblock");
     let lw_is_byblock = matches!(sub.common().line_weight, LineWeight::ByBlock);
@@ -893,6 +960,7 @@ fn tessellate_sub_local(
             pick_tris: wire.pick_tris,
             pick_tris_low: wire.pick_tris_low,
             color: wire.color,
+            layer_locked,
             contrast_bg,
             preserve_color,
             canvas_color,
@@ -902,8 +970,13 @@ fn tessellate_sub_local(
             line_weight_px: lw_px,
             pattern_stations: wire.pattern_stations,
             world_width: wire.world_width,
+            taper_widths: wire.taper_widths,
             plinegen: wire.plinegen,
-            plot_visible: frame_mode.is_none_or(|mode| mode == 1) && (on_l0 || layer_plottable),
+            snap_only: wire.snap_only,
+            region_boundary_click: wire.region_boundary_click,
+            plot_visible: !wire.snap_only
+                && frame_mode.is_none_or(|mode| mode == 1)
+                && (on_l0 || layer_plottable),
             plot_l0: on_l0,
             hide_unselected: frame_mode == Some(0),
             is_fill_only,
@@ -1012,7 +1085,7 @@ pub fn aabb_disjoint_xy(a: [f32; 4], b: [f32; 4]) -> bool {
 /// Returns `None` if no defn is cached for `ins.block_name`. Returns
 /// `Some(empty)` if the defn exists but is empty.
 pub fn expand_insert(
-    doc: &CadDocument,
+    doc: &Document,
     cache: &BlockCache,
     ins: &codec::entities::Insert,
     ins_handle: Handle,
@@ -1066,7 +1139,8 @@ pub fn expand_insert(
         LocalSub::Nested(_) => false,
     });
     let prototype_key =
-        if !ins.is_array() && !has_masks && cache.prototype_blocks.contains(&ins.block_name) {
+        if !crate::scene::block_construction::is_construction(&ins.common)
+            && !ins.is_array() && !has_masks && cache.prototype_blocks.contains(&ins.block_name) {
             Some(expansion_prototype_key(
                 ins,
                 &xform,
@@ -1082,6 +1156,10 @@ pub fn expand_insert(
                 bg_color,
                 anno_scale,
                 suppress_root_points,
+                crate::scene::view::render::layer_locked(
+                    doc,
+                    &EntityType::Insert(ins.clone()),
+                ),
             ))
         } else {
             None
@@ -1186,6 +1264,10 @@ pub fn expand_insert(
         world_per_pixel: None,
         is_xref,
         bg_color,
+        insert_layer_locked: crate::scene::view::render::layer_locked(
+            doc,
+            &EntityType::Insert(ins.clone()),
+        ),
     };
     if offsets.len() > 1 {
         let first_xform = cell_xform(&offsets[0]);
@@ -1295,6 +1377,7 @@ fn expansion_prototype_key(
     bg_color: [f32; 4],
     anno_scale: f32,
     suppress_root_points: bool,
+    insert_layer_locked: bool,
 ) -> ExpansionPrototypeKey {
     let matrix = &transform.matrix.m;
     let linear = [
@@ -1318,6 +1401,7 @@ fn expansion_prototype_key(
     insert_style.extend(ins_layer.pat.map(f32::to_bits));
     insert_style.push(ins_layer.lw_px.to_bits());
     insert_style.push(ins_layer_plottable as u32);
+    insert_style.push(insert_layer_locked as u32);
     insert_style.push(pslt_factor.to_bits());
     insert_style.extend(bg_color.map(f32::to_bits));
     insert_style.push(anno_scale.to_bits());
@@ -1470,6 +1554,8 @@ struct ExpandCtx<'a> {
     // which geometry comes from an external reference.
     is_xref: bool,
     bg_color: [f32; 4],
+    /// True when the current INSERT is on a locked layer.
+    insert_layer_locked: bool,
 }
 
 fn nested_prototype_key(
@@ -1502,6 +1588,7 @@ fn nested_prototype_key(
     style.push(ctx.l0.lw_px.to_bits());
     style.push(ctx.l0_plottable as u32);
     style.push(ctx.plot_visible as u32);
+    style.push(ctx.insert_layer_locked as u32);
     style.push(ctx.pslt_factor.to_bits());
     style.extend(ctx.bg_color.map(f32::to_bits));
     NestedPrototypeKey {
@@ -1602,6 +1689,8 @@ struct StyleKey {
     /// switchable after block geometry is merged by style.
     fill_is_2d_solid: bool,
     fill_is_3d: bool,
+    snap_only: bool,
+    region_boundary_click: bool,
     plot_visible: bool,
     hide_unselected: bool,
     /// Bit-cast composed block-local depth for band wires (`0` = no override).
@@ -1633,6 +1722,10 @@ struct BatchEntry {
     pattern_station_pieces: Vec<PatternStationPiece>,
     source_length: f32,
     world_width: f32,
+    /// Per-point band widths, aligned with `points`, once any member of the
+    /// batch tapers; members appended before that are back-filled with the
+    /// batch's constant `world_width`. Empty = every member is a constant band.
+    taper_widths: Vec<f32>,
     point_marker: Option<PointMarker>,
     aci: u8,
     plinegen: bool,
@@ -1652,6 +1745,8 @@ struct BatchEntry {
     fill_tris_low: Vec<[f32; 3]>,
     fill_is_3d: bool,
     fill_is_2d_solid: bool,
+    snap_only: bool,
+    region_boundary_click: bool,
     plot_visible: bool,
     hide_unselected: bool,
     /// Accumulated thickness-wall pick geometry, paired high/low like
@@ -1831,12 +1926,13 @@ impl Batches {
                 WireModel {
                     bg_adapt,
                     point_marker: b.point_marker,
-                    taper_widths: Vec::new(),
+                    taper_widths: b.taper_widths,
                     pattern_stations: b.pattern_stations,
                     world_width: b.world_width,
                     depth_override: b.local_depth,
-                    display_visible: !b.hide_unselected || selected,
-                    snap_only: false,
+                    display_visible: !b.snap_only && (!b.hide_unselected || selected),
+                    snap_only: b.snap_only,
+                    region_boundary_click: b.region_boundary_click,
                     reference_only: false,
                     plot_visible: b.plot_visible,
                     fill_is_3d: b.fill_is_3d,
@@ -1935,6 +2031,8 @@ fn style_key(
         is_fill_only,
         fill_is_2d_solid,
         fill_is_3d,
+        snap_only: false,
+        region_boundary_click: false,
         plot_visible,
         hide_unselected,
         depth_bits: local_depth.map_or(0, f32::to_bits),
@@ -2025,6 +2123,7 @@ fn expand_defn(
                     world_per_pixel: ctx.world_per_pixel,
                     is_xref: ctx.is_xref,
                     bg_color: ctx.bg_color,
+                    insert_layer_locked: ctx.insert_layer_locked || nref.layer_locked,
                 };
                 for offset in &nref.instance_offsets {
                     let attachment_transform =
@@ -2272,10 +2371,18 @@ fn resolve_wire_color(lw: &LocalWire, ctx: &ExpandCtx) -> [f32; 4] {
         };
     }
     if ctx.is_xref && !ctx.selected {
-        xref_fade(color, ctx.bg_color)
-    } else {
-        color
+        color = xref_fade(color, ctx.bg_color);
     }
+    // ByBlock and layer-0 colours may already inherit the faded INSERT style.
+    // Do not fade those a second time; an explicitly coloured child still
+    // needs the current INSERT-layer fade applied here.
+    let inherited_color = lw.color_is_byblock || lw.color_l0;
+    if !ctx.selected
+        && (lw.layer_locked || (ctx.insert_layer_locked && !inherited_color))
+    {
+        color = fade_toward_bg(color, ctx.bg_color);
+    }
+    color
 }
 
 /// Effective linetype scale along this wire after an INSERT transform.
@@ -2508,6 +2615,7 @@ fn emit_wire(
         && lw.fill_tris.is_empty()
         && lw.text_verts.is_empty()
         && lw.pick_tris.is_empty()
+        && lw.snap_pts.is_empty()
     {
         return;
     }
@@ -2535,6 +2643,33 @@ fn emit_wire(
         ctx.l0.lw_px
     } else {
         lw.line_weight_px
+    };
+
+    // A wide polyline's band width is baked in block-local units; scale it by
+    // the insert transform so the shader band matches the scaled geometry.
+    // Average the X and Y axis image lengths — exact for a uniform insert, a
+    // sensible mean for a non-uniform one (the band carries one width).
+    // A taper's per-point widths scale the same way.
+    let band_scale = || {
+        let o = accum_xform.apply(Vector3::new(0.0, 0.0, 0.0));
+        let ax = accum_xform.apply(Vector3::new(1.0, 0.0, 0.0));
+        let ay = accum_xform.apply(Vector3::new(0.0, 1.0, 0.0));
+        let sx = ((ax.x - o.x).powi(2) + (ax.y - o.y).powi(2) + (ax.z - o.z).powi(2)).sqrt();
+        let sy = ((ay.x - o.x).powi(2) + (ay.y - o.y).powi(2) + (ay.z - o.z).powi(2)).sqrt();
+        ((sx + sy) * 0.5) as f32
+    };
+    let final_world_width = if lw.world_width > 0.0 {
+        lw.world_width * band_scale()
+    } else if lw.world_width < 0.0 {
+        lw.world_width
+    } else {
+        0.0
+    };
+    let final_taper_widths: Vec<f32> = if lw.taper_widths.is_empty() {
+        Vec::new()
+    } else {
+        let scale = band_scale();
+        lw.taper_widths.iter().map(|width| width * scale).collect()
     };
 
     // Analytical GPU circle / arc / ellipse fast path:
@@ -2633,15 +2768,18 @@ fn emit_wire(
                     None
                 };
 
+                // A wide or tapered polyline arc keeps its band: the
+                // analytical arc pipeline draws both (`circle_gpu`).
                 let wire = WireModel {
                     bg_adapt,
                     point_marker: lw.point_marker,
-                    taper_widths: Vec::new(),
+                    taper_widths: final_taper_widths,
                     pattern_stations: Vec::new(),
-                    world_width: 0.0,
+                    world_width: final_world_width,
                     depth_override: local_depth,
-                    display_visible: !lw.hide_unselected || ctx.selected,
-                    snap_only: false,
+                    display_visible: !lw.snap_only && (!lw.hide_unselected || ctx.selected),
+                    snap_only: lw.snap_only,
+                    region_boundary_click: lw.region_boundary_click,
                     plot_visible: lw.plot_visible,
                     fill_is_3d: false,
                     fill_is_2d_solid: false,
@@ -2709,22 +2847,6 @@ fn emit_wire(
         |data| data.source_length,
     );
 
-    // A wide polyline's band width is baked in block-local units; scale it by
-    // the insert transform so the shader band matches the scaled geometry.
-    // Average the X and Y axis image lengths — exact for a uniform insert, a
-    // sensible mean for a non-uniform one (the band carries one width).
-    let final_world_width = if lw.world_width > 0.0 {
-        let o = accum_xform.apply(Vector3::new(0.0, 0.0, 0.0));
-        let ax = accum_xform.apply(Vector3::new(1.0, 0.0, 0.0));
-        let ay = accum_xform.apply(Vector3::new(0.0, 1.0, 0.0));
-        let sx = ((ax.x - o.x).powi(2) + (ax.y - o.y).powi(2) + (ax.z - o.z).powi(2)).sqrt();
-        let sy = ((ay.x - o.x).powi(2) + (ay.y - o.y).powi(2) + (ay.z - o.z).powi(2)).sqrt();
-        lw.world_width * ((sx + sy) * 0.5) as f32
-    } else if lw.world_width < 0.0 {
-        lw.world_width
-    } else {
-        0.0
-    };
     let marker_transform = lw
         .point_marker
         .map(|marker| transformed_point_marker(marker, accum_xform));
@@ -2761,7 +2883,7 @@ fn emit_wire(
         && (has_stations
             || transformed_stations.is_some()
             || lw.points.iter().any(|point| point[0].is_nan()));
-    let key = style_key(
+    let mut key = style_key(
         final_color,
         lw.contrast_bg,
         lw.preserve_color,
@@ -2781,8 +2903,13 @@ fn emit_wire(
         lw.hide_unselected,
         local_depth,
     );
+    // Never fold reference-only boundaries into a visible geometry batch.
+    key.snap_only = lw.snap_only;
+    key.region_boundary_click = lw.region_boundary_click;
 
-    if transformed_stations.is_some() {
+    // Keep snap-only edges separate: concatenating key_vertices across
+    // disconnected boundaries would invent midpoint references between them.
+    if lw.snap_only || transformed_stations.is_some() {
         if let Some(closed) = out.by_style.remove(&key) {
             out.closed.push(closed);
         }
@@ -2819,6 +2946,8 @@ fn emit_wire(
         )
     });
     entry.local_depth = local_depth;
+    entry.snap_only = lw.snap_only;
+    entry.region_boundary_click = lw.region_boundary_click;
     if let Some(data) = &transformed_stations {
         entry.pattern_station_pieces.clone_from(&data.pieces);
     }
@@ -2828,10 +2957,20 @@ fn emit_wire(
     let needs_sep =
         !entry.points.is_empty() && !entry.points.last().map(|p| p[0].is_nan()).unwrap_or(false);
 
+    // Once a member tapers, the batch carries a width per point: back-fill
+    // the members already in it with their constant band.
+    let tapered = !final_taper_widths.is_empty() || !entry.taper_widths.is_empty();
+    if tapered && !lw.points.is_empty() {
+        let fill = entry.world_width;
+        entry.taper_widths.resize(entry.points.len(), fill);
+    }
     if !lw.points.is_empty() {
         if needs_sep {
             entry.points.push([f32::NAN; 3]);
             entry.points_low.push([0.0; 3]);
+            if tapered {
+                entry.taper_widths.push(0.0);
+            }
             if has_stations {
                 entry.pattern_stations.push(0.0);
             }
@@ -2850,6 +2989,15 @@ fn emit_wire(
             let station_segment = transformed_stations
                 .as_ref()
                 .map(|data| data.point_segments[idx]);
+            if tapered {
+                let constant = if p[0].is_nan() {
+                    0.0
+                } else {
+                    final_world_width
+                };
+                let width = final_taper_widths.get(idx).copied().unwrap_or(constant);
+                entry.taper_widths.push(width);
+            }
             if p[0].is_nan() {
                 entry.points.push([f32::NAN; 3]);
                 entry.points_low.push([0.0; 3]);
@@ -2917,6 +3065,13 @@ fn emit_wire(
         entry
             .snap_pts
             .push((glam::DVec3::new(v.x, v.y, v.z), *hint));
+        // A solid's shell wire has only snaps: they bound it.
+        if lw.points.is_empty() {
+            entry.min_x = entry.min_x.min(v.x as f32);
+            entry.min_y = entry.min_y.min(v.y as f32);
+            entry.max_x = entry.max_x.max(v.x as f32);
+            entry.max_y = entry.max_y.max(v.y as f32);
+        }
     }
     for tg in &lw.tangent_geoms {
         if let Some(tangent) = transform_tangent(tg, accum_xform) {
@@ -3018,6 +3173,7 @@ fn emit_wire(
                 uv: tv.uv,
                 color: [rgb[0], rgb[1], rgb[2], final_color[3]],
                 draw_depth: tv.draw_depth,
+                pen: tv.pen,
             });
     }
     // Searchable runs follow the same insert transform: origin via the full
@@ -3235,6 +3391,7 @@ mod bg_resolution_tests {
             uv: [0.0; 2],
             color,
             draw_depth: 0.0,
+            pen: 0.0,
         }];
         e
     }
@@ -3322,7 +3479,7 @@ mod compact_nested_tests {
     use codec::entities::{Insert, Line};
     use codec::tables::BlockRecord;
 
-    fn add_block(document: &mut CadDocument, name: &str) -> Handle {
+    fn add_block(document: &mut Document, name: &str) -> Handle {
         let mut block = BlockRecord::new(name);
         block.handle = document.allocate_handle();
         let handle = block.handle;
@@ -3330,14 +3487,14 @@ mod compact_nested_tests {
         handle
     }
 
-    fn add_owned(document: &mut CadDocument, owner: Handle, mut entity: EntityType) {
+    fn add_owned(document: &mut Document, owner: Handle, mut entity: EntityType) {
         entity.common_mut().owner_handle = owner;
         document.add_entity(entity).unwrap();
     }
 
     #[test]
     fn repeated_small_nested_lines_fold_into_parent_batches() {
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let leaf = add_block(&mut document, "LEAF");
         for y in 0..6 {
             add_owned(
@@ -3421,6 +3578,106 @@ mod compact_nested_tests {
         assert!(wires[0].render_instance.is_none());
     }
 
+    /// A block arrow drawn as a tapered polyline segment (width 250 → 0, as
+    /// AutoCAD drawings commonly make them) kept its taper only once
+    /// exploded: inside an INSERT it drew as a constant 250-wide band, a
+    /// rectangle. A constant wide polyline batched alongside keeps its band.
+    #[test]
+    fn tapered_polyline_keeps_its_taper_inside_an_insert() {
+        use codec::entities::{LwPolyline, LwVertex};
+        use codec::types::Vector2;
+
+        let mut document = Document::new();
+        let arrow = add_block(&mut document, "FLE");
+        let mut tip = LwPolyline::new();
+        let mut start = LwVertex::new(Vector2::new(0.0, 0.0));
+        start.start_width = 250.0;
+        tip.vertices = vec![start, LwVertex::new(Vector2::new(400.0, 0.0))];
+        add_owned(&mut document, arrow, EntityType::LwPolyline(tip));
+        let mut shaft =
+            LwPolyline::from_points(vec![Vector2::new(0.0, 500.0), Vector2::new(400.0, 500.0)]);
+        shaft.constant_width = 250.0;
+        add_owned(&mut document, arrow, EntityType::LwPolyline(shaft));
+
+        // Mirrored and scaled 5×, like the drawing's nested arrows.
+        let insert = Insert::new("FLE", Vector3::ZERO).with_scale(-5.0, 5.0, 1.0);
+        let handle = document
+            .add_entity(EntityType::Insert(insert.clone()))
+            .unwrap();
+        let cache = BlockCache::build(
+            &document,
+            1.0,
+            None,
+            true,
+            [0.0, 0.0, 0.0, 1.0],
+            None,
+            &HashMap::default(),
+        );
+        let wires = expand_insert(
+            &document,
+            &cache,
+            &insert,
+            handle,
+            [1.0; 4],
+            0,
+            0.0,
+            [0.0; 8],
+            1.0,
+            InheritStyle {
+                color: [1.0; 4],
+                pat_len: 0.0,
+                pat: [0.0; 8],
+                lw_px: 1.0,
+            },
+            0,
+            true,
+            false,
+            1.0,
+            None,
+            None,
+            false,
+            [0.0, 0.0, 0.0, 1.0],
+            1.0,
+            crate::scene::BlockScalePolicy::FromInsert,
+            false,
+        )
+        .unwrap();
+
+        // Width at each finite point, keyed by its (mirrored, scaled) position.
+        let widths: Vec<([f32; 2], f32)> = wires
+            .iter()
+            .filter(|wire| wire.world_width > 0.0)
+            .flat_map(|wire| {
+                wire.points
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p[0].is_finite())
+                    .map(move |(index, p)| {
+                        let width = wire
+                            .taper_widths
+                            .get(index)
+                            .copied()
+                            .unwrap_or(wire.world_width);
+                        ([p[0], p[1]], width)
+                    })
+            })
+            .collect();
+        let width_at = |x: f32, y: f32| {
+            widths
+                .iter()
+                .find(|(p, _)| (p[0] - x).abs() < 1.0e-3 && (p[1] - y).abs() < 1.0e-3)
+                .map(|(_, width)| *width)
+        };
+        assert_eq!(width_at(0.0, 0.0), Some(1250.0), "arrow base: 250 × 5");
+        assert_eq!(width_at(-2000.0, 0.0), Some(0.0), "arrow tip tapers to 0");
+        assert_eq!(width_at(0.0, 2500.0), Some(1250.0), "constant band, start");
+        assert_eq!(
+            width_at(-2000.0, 2500.0),
+            Some(1250.0),
+            "constant band, end"
+        );
+    }
+
     #[test]
     fn test_transform_tangent_ellipse_arc_negative_scale_and_rotation() {
         let ellipse_geom = TangentGeom::PlanarEllipse {
@@ -3489,7 +3746,7 @@ mod metrics_depth_tests {
     use codec::entities::{Insert, Line};
     use codec::tables::BlockRecord;
 
-    fn add_block(document: &mut CadDocument, name: &str) -> Handle {
+    fn add_block(document: &mut Document, name: &str) -> Handle {
         let mut block = BlockRecord::new(name);
         block.handle = document.allocate_handle();
         let handle = block.handle;
@@ -3497,7 +3754,7 @@ mod metrics_depth_tests {
         handle
     }
 
-    fn add_owned(document: &mut CadDocument, owner: Handle, mut entity: EntityType) {
+    fn add_owned(document: &mut Document, owner: Handle, mut entity: EntityType) {
         entity.common_mut().owner_handle = owner;
         document.add_entity(entity).unwrap();
     }
@@ -3510,7 +3767,7 @@ mod metrics_depth_tests {
     #[test]
     fn a_deep_insert_chain_computes_metrics_without_overflowing_the_stack() {
         const DEPTH: usize = 20_000;
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let mut prev = add_block(&mut document, "B0");
         for i in 1..=DEPTH {
             let cur = add_block(&mut document, &format!("B{i}"));
@@ -3556,7 +3813,7 @@ mod metrics_depth_tests {
     #[test]
     fn metrics_below_the_depth_cap_are_still_fully_aggregated() {
         const DEPTH: usize = 10;
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let mut prev = add_block(&mut document, "B0");
         for i in 1..=DEPTH {
             let cur = add_block(&mut document, &format!("B{i}"));
@@ -3601,7 +3858,7 @@ mod metrics_depth_tests {
     fn locked_cyclic_block_document_renders_without_hanging_and_warns_once() {
         // Document built in code with pre-existing cycle:
         // A contains B, B contains A
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let blk_a = add_block(&mut document, "CYC_A");
         let blk_b = add_block(&mut document, "CYC_B");
 

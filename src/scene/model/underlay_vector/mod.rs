@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use codec::entities::UnderlayType;
 
 pub use model::{
-    scaled_elements, By, DgnColor, DgnElement, DgnGeom, DgnImport, DgnReference, Path, Segment,
-    Sheet, SubPath, P3,
+    scaled_elements, By, DgnColor, DgnDimLook, DgnDimStyle, DgnElement, DgnGeom, DgnImport,
+    DgnReference, Path, Segment, Sheet, SubPath, P3,
 };
 
 use super::pdf_raster::{source_bytes, PdfPage};
@@ -588,6 +588,9 @@ fn to_page_vectors(sheet: &Sheet) -> super::pdf_vector::PageVectors {
                 .collect(),
             stroke: p.stroke.map(|(c, w)| (c, w.max(0.0))),
             fill: p.fill,
+            pen: None,
+            closes: Vec::new(),
+            clip: None,
         })
         .collect();
     pv::PageVectors {

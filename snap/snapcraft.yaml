@@ -40,6 +40,13 @@ plugs:
     interface: content
     target: $SNAP/graphics
     default-provider: mesa-core22
+  # Xcursor themes. A Wayland client draws its own pointer from one and the
+  # core22 base ships none, so without this the pointer, once hidden over the
+  # drawing area, can never be shown again (#1850).
+  icon-themes:
+    interface: content
+    target: $SNAP/data-dir/icons
+    default-provider: gtk-common-themes
 
 layout:
   /usr/share/libdrm:
@@ -64,6 +71,7 @@ apps:
       - network         # license / Patreon check
       - opengl
       - graphics-core22
+      - icon-themes
       - wayland
       - x11
       - desktop
@@ -73,7 +81,7 @@ parts:
   open-cad-studio:
     plugin: nil
     override-build: |
-      mkdir -p "${CRAFT_PART_INSTALL}"
+      mkdir -p "${CRAFT_PART_INSTALL}" "${CRAFT_PART_INSTALL}/data-dir/icons"
       tar -xzf "${CRAFT_PROJECT_DIR}/linux-payload.tar.gz" -C "${CRAFT_PART_INSTALL}"
       install -Dm755 "${CRAFT_PROJECT_DIR}/snap/local/open-cad-studio-wrapper" \
         "${CRAFT_PART_INSTALL}/bin/open-cad-studio-wrapper"

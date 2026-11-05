@@ -24,7 +24,7 @@ use std::fmt;
 
 use crate::ui::properties::{lw_options, LwItem};
 use crate::ui::style::common::muted_style;
-use crate::ui::style::form::hdivider;
+use crate::ui::style::form::{field_style, hdivider};
 
 const LABEL_W: f32 = 120.0;
 
@@ -197,26 +197,9 @@ pub fn color_from_label(label: &str) -> Option<AcadColor> {
     })
 }
 
-fn field_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let palette = theme.palette();
-    let border = match status {
-        text_input::Status::Focused { .. } => palette.primary.base.color,
-        _ => palette.background.neutral.color,
-    };
-    text_input::Style {
-        background: Background::Color(palette.background.base.color),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        icon: palette.background.base.text,
-        placeholder: palette.background.base.text.scale_alpha(0.48),
-        value: palette.background.base.text,
-        selection: palette.primary.base.color.scale_alpha(0.5),
-    }
-}
-
+/// Read-only constant-attribute value: dimmer than `read_only::field`
+/// (weak background, 0.48 value alpha, subtler selection) because a constant
+/// attribute is not editable at all, rather than merely display-only.
 fn disabled_field_style(theme: &Theme, _status: text_input::Status) -> text_input::Style {
     let palette = theme.palette();
     text_input::Style {
@@ -275,7 +258,7 @@ fn pick_field<'a>(
     on_select: impl Fn(String) -> Message + 'a,
     width: Length,
 ) -> Element<'a, Message> {
-    let pl = iced::widget::pick_list(selected, options, |value| value.to_string())
+    let pl = crate::ui::dropdown_list::pick_list(selected, options, |value| value.to_string())
         .on_select(on_select)
         .text_size(13)
         .padding([3, 6])
@@ -318,7 +301,7 @@ fn localized_pick_field<'a>(
         .map(LocalizedChoice::new)
         .collect::<Vec<_>>();
     let selected = selected.map(LocalizedChoice::new);
-    let pl = iced::widget::pick_list(selected, options, |value| value.to_string())
+    let pl = crate::ui::dropdown_list::pick_list(selected, options, |value| value.to_string())
         .on_select(move |choice: LocalizedChoice| on_select(choice.raw))
         .text_size(13)
         .padding([3, 6])
@@ -617,7 +600,7 @@ fn properties_tab<'a>(
 
     let lw_opts = lw_options();
     let lw_sel = LwItem(r.line_weight);
-    let lw = iced::widget::pick_list(Some(lw_sel), lw_opts, |value| value.to_string())
+    let lw = crate::ui::dropdown_list::pick_list(Some(lw_sel), lw_opts, |value| value.to_string())
         .on_select(|it: LwItem| Message::AttrEditorLineweight(it.0))
         .text_size(13)
         .padding([3, 6])

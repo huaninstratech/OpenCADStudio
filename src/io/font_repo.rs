@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codec::CadDocument;
+use codec::Document;
 
 /// The community folder's GitHub contents API (lists name + download URL).
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +34,30 @@ pub fn fonts_folder() -> Option<PathBuf> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_fonts_folder(folder: Option<PathBuf>) {
     *FONTS_FOLDER.write().unwrap_or_else(|e| e.into_inner()) = folder;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static SUPPORT_FOLDER: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// A folder of the user's own support files — hatch patterns, linetypes,
+/// fonts and shape files — searched beside the built-in locations, so one
+/// folder (on a flash drive, say) carries them from machine to machine.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn support_folder() -> Option<PathBuf> {
+    SUPPORT_FOLDER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn support_folder() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_support_folder(folder: Option<PathBuf>) {
+    *SUPPORT_FOLDER.write().unwrap_or_else(|e| e.into_inner()) = folder;
 }
 
 /// Local store for fonts downloaded from the community repository. Text
@@ -88,7 +112,7 @@ pub struct RepoFont {
 /// Referenced-but-unresolvable `.shx` font files across the document's text
 /// styles. Names are deduplicated case-insensitively and reduced to the bare
 /// file name (`C:\Fonts\VNArial.shx` → `VNArial.shx`).
-pub fn missing_shx_fonts(doc: &CadDocument) -> Vec<String> {
+pub fn missing_shx_fonts(doc: &Document) -> Vec<String> {
     let mut missing: Vec<String> = Vec::new();
     let base = doc
         .source_path
@@ -99,15 +123,7 @@ pub fn missing_shx_fonts(doc: &CadDocument) -> Vec<String> {
         // The primary font and the big font (Asian double-byte glyphs) are
         // both plain .shx files the style depends on.
         for file in [style.font_file.trim(), style.big_font_file.trim()] {
-            if file.is_empty()
-                || !file.to_ascii_lowercase().ends_with(".shx")
-                || crate::io::linetypes::is_bundled_shape_file(file)
-            {
-                continue;
-            }
-            let resolved = crate::io::resolve_image_file(file, base).is_some()
-                || local_font_file(file).is_some();
-            if resolved {
+            if !shx_file_missing(file, base) {
                 continue;
             }
             let name = file.rsplit(['/', '\\']).next().unwrap_or(file).to_string();
@@ -123,7 +139,7 @@ pub fn missing_shx_fonts(doc: &CadDocument) -> Vec<String> {
 /// Text-style names whose `.shx` font file is one of `missing` (matched by
 /// bare file name, case-insensitively). Xref-dependent styles are left alone —
 /// they belong to the referenced drawing, not this one.
-pub fn styles_using_missing_fonts(doc: &CadDocument, missing: &[String]) -> Vec<String> {
+pub fn styles_using_missing_fonts(doc: &Document, missing: &[String]) -> Vec<String> {
     doc.text_styles
         .iter()
         .filter(|style| {
@@ -145,7 +161,7 @@ pub fn styles_using_missing_fonts(doc: &CadDocument, missing: &[String]) -> Vec<
 /// `TextStyle::new` face — resolves to the embedded stroke font everywhere,
 /// or to a downloaded `txt.shx` when one exists). Returns the (style name,
 /// replaced font file) pairs so the caller can report them.
-pub fn substitute_missing_fonts(doc: &mut CadDocument, names: &[String]) -> Vec<(String, String)> {
+pub fn substitute_missing_fonts(doc: &mut Document, names: &[String]) -> Vec<(String, String)> {
     let mut replaced = Vec::new();
     for name in names {
         if let Some(style) = doc.text_styles.get_mut(name) {
@@ -157,21 +173,53 @@ pub fn substitute_missing_fonts(doc: &mut CadDocument, names: &[String]) -> Vec<
     replaced
 }
 
+/// Whether `file` is an `.shx` font that draws with an unrelated stand-in:
+/// not bundled, not beside the drawing (`base`), not in the font folders. A
+/// font with a built-in stroke equivalent (romans, simplex, txt...) already
+/// draws as it should.
+pub fn shx_file_missing(file: &str, base: Option<&Path>) -> bool {
+    let file = file.trim();
+    !(file.is_empty()
+        || !file.to_ascii_lowercase().ends_with(".shx")
+        || crate::io::linetypes::is_bundled_shape_file(file)
+        || crate::scene::text::lff::is_builtin(file)
+        || crate::io::resolve_image_file(file, base).is_some()
+        || local_font_file(file).is_some())
+}
+
+/// The `.shx` files in the downloaded-fonts folder and the support folder,
+/// by file name, sorted and de-duplicated case-insensitively.
+pub fn folder_shx_fonts() -> Vec<String> {
+    let mut files: Vec<String> = fonts_dir()
+        .into_iter()
+        .chain(support_folder())
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.to_ascii_lowercase().ends_with(".shx"))
+        .collect();
+    files.sort_by_key(|name| name.to_ascii_lowercase());
+    files.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    files
+}
+
 /// A font file previously downloaded into the local fonts directory, matched
 /// case-insensitively by file name.
 pub fn local_font_file(name: &str) -> Option<PathBuf> {
     let file = name.rsplit(['/', '\\']).next()?;
-    let dir = fonts_dir()?;
-    let direct = dir.join(file);
-    if direct.is_file() {
-        return Some(direct);
-    }
     let lower = file.to_ascii_lowercase();
-    std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase() == lower)
-        .map(|entry| entry.path())
+    fonts_dir().into_iter().chain(support_folder()).find_map(|dir| {
+        let direct = dir.join(file);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase() == lower)
+            .map(|entry| entry.path())
+    })
 }
 
 /// List the community folder through the GitHub contents API.
@@ -355,7 +403,7 @@ mod tests {
         let dir = std::env::temp_dir().join("ocs_font_repo_tests");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("exists.shx"), b"stub").unwrap();
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         let mk = |name: &str, file: &str| {
             let mut style = codec::TextStyle::new(name);
             style.font_file = file.into();
@@ -365,6 +413,9 @@ mod tests {
         let _ = doc.text_styles.add(mk("B", "missing1.SHX"));
         let _ = doc.text_styles.add(mk("C", "exists.shx"));
         doc.source_path = Some(dir.join("drawing.dwg").to_string_lossy().into_owned());
+        // Fonts with a built-in stroke equivalent are not missing (#2156).
+        let _ = doc.text_styles.add(mk("D", "romans.shx"));
+        let _ = doc.text_styles.add(mk("E", "SIMPLEX.SHX"));
         let missing = missing_shx_fonts(&doc);
         assert_eq!(missing, vec!["MISSING1.shx".to_string()]);
         let _ = std::fs::remove_file(dir.join("exists.shx"));
@@ -378,7 +429,7 @@ mod tests {
         let dir = std::env::temp_dir().join("ocs_font_repo_tests");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vntime.shx"), b"stub").unwrap();
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         let mut style = codec::TextStyle::new("A");
         style.font_file = "CRO_ROM.shx".into();
         let _ = doc.text_styles.add(style);
@@ -413,7 +464,7 @@ mod tests {
                 ("B".to_string(), "cro_rom.shx".to_string()),
             ]
         );
-        let get = |doc: &CadDocument, name: &str| {
+        let get = |doc: &Document, name: &str| {
             doc.text_styles
                 .iter()
                 .find(|s| s.name == name)

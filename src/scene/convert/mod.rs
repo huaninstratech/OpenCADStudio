@@ -8,3 +8,8 @@ pub mod solid3d_tess;
 pub(crate) mod tess;
 pub mod tess_util;
 pub mod tessellate;
+
+#[cfg(test)]
+mod complex_lt_tests;
+#[cfg(test)]
+mod region_snap_tests;

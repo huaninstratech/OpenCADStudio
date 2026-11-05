@@ -4,11 +4,16 @@ use crate::scene::block_actions::{self as actions, Kind};
 use codec::{EntityType, Handle};
 use iced::Task;
 
+mod preview;
+
 // These grips start an ordinary point-input command, keeping snapping, typed
 // coordinates and Escape on the command driver's existing path.
-pub(super) const TEST_GRIP_START: usize = usize::MAX / 2;
+pub(super) const TEST_GRIP_START: usize = crate::scene::pick::grip::CUSTOM_GRIP_ID_START;
 pub(super) fn is_test_grip(id: usize) -> bool {
-    (TEST_GRIP_START..usize::MAX).contains(&id)
+    id >= TEST_GRIP_START && crate::scene::block_grips::runtime::decode(id).is_some()
+}
+pub(in crate::app) fn lookup_action_arg(args: &str) -> bool {
+    matches!(args.trim().to_ascii_uppercase().as_str(), "LOOKUP" | "L")
 }
 impl OpenCADStudio {
     pub(in crate::app) fn action_association_error(&self) -> Option<&'static str> {
@@ -103,7 +108,7 @@ impl OpenCADStudio {
             }
         }
         if changed != 0 {
-            self.push_undo_snapshot(i, "Reset block references");
+            self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Reset block references"));
             self.apply_action_document(i, staged);
             self.tabs[i].scene.bump_geometry();
             self.tabs[i].dirty = true;
@@ -125,11 +130,17 @@ impl OpenCADStudio {
         {
             return Some(e);
         }
-        let candidates = kind.map_or_else(
-            || actions::all_parameters(&tab.scene.document, s.br_handle),
-            |kind| actions::parameters(&tab.scene.document, s.br_handle, kind),
-        );
-        if candidates.is_empty() {
+        let has_candidate = match kind {
+            Some(kind) => !actions::parameters(&tab.scene.document, s.br_handle, kind).is_empty(),
+            // The type prompt also offers Lookup, whose parameter is not a
+            // geometry action target.
+            None => {
+                !actions::all_parameters(&tab.scene.document, s.br_handle).is_empty()
+                    || !crate::scene::block_lookup::parameters(&tab.scene.document, s.br_handle)
+                        .is_empty()
+            }
+        };
+        if !has_candidate {
             return Some("Place a compatible parameter before adding this action.");
         }
         None
@@ -166,7 +177,7 @@ impl OpenCADStudio {
         self.tabs[self.active_tab].active_cmd = Some(Box::new(command));
         Task::none()
     }
-    pub(super) fn apply_action_document(&mut self, i: usize, mut staged: codec::CadDocument) {
+    pub(super) fn apply_action_document(&mut self, i: usize, mut staged: codec::Document) {
         let doc = &mut self.tabs[i].scene.document;
         let changes = staged
             .entities()
@@ -191,7 +202,58 @@ impl OpenCADStudio {
             }
         }
     }
+    /// Lookup has no geometry action of its own: choose the parameter whose
+    /// property table the new action edits.
+    pub(in crate::app) fn start_block_lookup_action(
+        &mut self,
+        document: u64,
+        definition: Handle,
+    ) -> Task<Message> {
+        let i = self.active_tab;
+        if self.tabs[i].id != document
+            || self.tabs[i].active_block_edit_session().map(|s| s.br_handle) != Some(definition)
+        {
+            self.command_line.push_error(
+                crate::t!("The action's Block Editor session is no longer active.").as_ref(),
+            );
+            return Task::none();
+        }
+        if let Some(error) = self.lookup_table_error() {
+            self.command_line.push_error(crate::t!(error).as_ref());
+            return Task::none();
+        }
+        let candidates =
+            crate::scene::block_lookup::parameters(&self.tabs[i].scene.document, definition)
+                .into_iter()
+                .map(
+                    |(_, parameter)| crate::modules::block_editor::lookup_action::Candidate {
+                        name: parameter.lookup_name.clone(),
+                        point: actions::v(parameter.parameter.definition_point),
+                    },
+                )
+                .collect();
+        let command = crate::modules::block_editor::lookup_action::LookupActionCommand::new(
+            document, definition, candidates,
+        );
+        self.command_line.push_info(&command.prompt());
+        self.command_line.set_step_options(command.options());
+        self.tabs[i].active_cmd = Some(Box::new(command));
+        Task::none()
+    }
     pub(in crate::app) fn start_block_action(&mut self, args: &str) -> Task<Message> {
+        if lookup_action_arg(args) {
+            let i = self.active_tab;
+            let Some(definition) = self.tabs[i]
+                .active_block_edit_session()
+                .map(|session| session.br_handle)
+            else {
+                self.command_line.push_error(
+                    crate::t!("Open a block in the Block Editor before adding actions.").as_ref(),
+                );
+                return Task::none();
+            };
+            return self.start_block_lookup_action(self.tabs[i].id, definition);
+        }
         let kind = if args.is_empty() {
             None
         } else {
@@ -199,7 +261,7 @@ impl OpenCADStudio {
         };
         if !args.is_empty() && kind.is_none() {
             self.command_line.push_error(
-                crate::t!("Supported actions: Move, Scale, Stretch, Polar Stretch, Rotate, Flip, Array. Other action types are not wired yet.")
+                crate::t!("Supported actions: Move, Scale, Stretch, Polar Stretch, Rotate, Flip, Array, Lookup.")
                     .as_ref(),
             );
             return Task::none();
@@ -214,10 +276,7 @@ impl OpenCADStudio {
             tab.id,
             definition,
             kind,
-            kind.map_or_else(
-                || actions::all_parameters(&tab.scene.document, definition),
-                |kind| actions::parameters(&tab.scene.document, definition, kind),
-            ),
+            &tab.scene.document,
         );
         self.command_line.push_info(&command.prompt());
         self.command_line.set_step_options(command.options());
@@ -249,12 +308,11 @@ impl OpenCADStudio {
         }
         let tab = &self.tabs[self.active_tab];
         let definition = tab.active_block_edit_session().unwrap().br_handle;
-        let candidates = actions::parameters(&tab.scene.document, definition, kind);
         let Some(command) = crate::modules::block_editor::action::ActionCommand::for_parameter(
             tab.id,
             definition,
             kind,
-            candidates,
+            &tab.scene.document,
             parameter,
             xy_key_point,
         ) else {
@@ -343,7 +401,7 @@ impl OpenCADStudio {
                 match result {
                     Ok(changed) => {
                         if changed {
-                            self.push_undo_snapshot(i, "Associate block action");
+                            self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Associate block action"));
                             self.apply_action_document(i, staged);
                             self.tabs[i].scene.bump_geometry();
                             self.tabs[i].dirty = true;
@@ -364,6 +422,7 @@ impl OpenCADStudio {
                 definition,
                 action,
                 expected,
+                point_choices,
                 targets,
                 frame,
                 rotate_only,
@@ -372,6 +431,12 @@ impl OpenCADStudio {
                 if tab.id != document
                     || tab.active_block_edit_session().map(|s| s.br_handle) != Some(definition)
                     || tab.scene.document.objects.get(&action) != Some(expected.as_ref())
+                    || point_choices.as_ref().is_some_and(|(source, expected)| {
+                        let current = actions::all_parameters(&tab.scene.document, definition)
+                            .into_iter().filter(|p| p.is_move_target() && p.id != *source)
+                            .map(|p| (p.handle, p.id, p.name)).collect::<Vec<_>>();
+                        current != *expected
+                    })
                 {
                     self.command_line.push_error(
                         crate::t!(
@@ -405,10 +470,26 @@ impl OpenCADStudio {
                     }
                     Ok(changed)
                 });
+                let result = actions::retarget_frame_points(&mut staged, definition, action, &targets, frame.as_deref())
+                    .and_then(|changed| {
+                        let rotation_changed = match rotate_only.as_deref() {
+                            Some(targets) => actions::options::set_rotate_only(&mut staged, definition, action, targets)?,
+                            None => false,
+                        };
+                        let changed = changed || rotation_changed;
+                        if changed {
+                            staged = actions::instance::refresh_after_edit(
+                                &staged,
+                                &tab.scene.document,
+                                definition,
+                            )?;
+                        }
+                        Ok(changed)
+                    });
                 match result {
                     Ok(changed) => {
                         if changed {
-                            self.push_undo_snapshot(i, "Action selection set");
+                            self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Action selection set"));
                             self.apply_action_document(i, staged);
                             self.tabs[i].scene.bump_geometry();
                             self.tabs[i].dirty = true;
@@ -429,6 +510,7 @@ impl OpenCADStudio {
                 kind,
                 parameter,
                 xy_key_point,
+                point_choices,
                 targets,
                 location,
                 frame,
@@ -446,6 +528,16 @@ impl OpenCADStudio {
                         crate::t!("The action's Block Editor session is no longer active.")
                             .as_ref(),
                     );
+                    return Task::none();
+                }
+                if point_choices.as_ref().is_some_and(|(source, expected)| {
+                    let current = actions::all_parameters(&self.tabs[i].scene.document, definition)
+                        .into_iter().filter(|p| p.is_move_target() && p.id != *source)
+                        .map(|p| (p.handle, p.id, p.name)).collect::<Vec<_>>();
+                    current != *expected || !actions::all_parameters(&self.tabs[i].scene.document, definition)
+                        .iter().any(|p| p.handle == parameter && p.id == *source)
+                }) {
+                    self.command_line.push_error(crate::tr!("block-action-targets", "create-stale").as_str());
                     return Task::none();
                 }
                 let mut staged = self.tabs[i].scene.document.clone();
@@ -474,10 +566,13 @@ impl OpenCADStudio {
                     } else if !rotate_only.is_empty() {
                         return Err("Rotate-only objects require a Polar Stretch action.");
                     }
+                    if kind == Kind::Move && targets.iter().any(|h| staged.get_entity(*h).is_none()) {
+                        staged = actions::instance::refresh_after_edit(&staged, &self.tabs[i].scene.document, definition)?;
+                    }
                     Ok(handle)
                 }) {
                     Ok(_) => {
-                        self.push_undo_snapshot(i, &format!("{} action", kind.name()));
+                        self.push_undo_snapshot(i, super::document::HistoryLabel::formatted(format!("{} action", kind.name()), "action", super::document::HistoryLabel::Message(kind.name())));
                         self.tabs[i].scene.document = staged;
                         self.tabs[i].scene.bump_geometry();
                         self.tabs[i].dirty = true;
@@ -530,6 +625,7 @@ impl OpenCADStudio {
                 }
             }
             crate::command::CmdResult::EvaluateBlockParameter {
+                grip,
                 insert,
                 document,
                 definition,
@@ -539,13 +635,15 @@ impl OpenCADStudio {
                 if self.tabs[i].id != document {
                     return Task::none();
                 }
+                let source = self.tabs[i].block_test.as_ref().filter(|test| insert.is_none() && test.definition == definition).map(|test| test.baseline.as_ref()).unwrap_or(&self.tabs[i].scene.document);
+                if grip.is_some_and(|id| !crate::scene::block_grips::runtime::action_grip_available(source, definition, parameter, id)) { return Task::none(); }
                 if let Some(insert) = insert {
                     return self.evaluate_reference_parameter(insert, definition, parameter, value);
                 }
                 let Some(test) = self.tabs[i].block_test.as_ref() else {
                     return Task::none();
                 };
-                if test.definition != definition {
+                if test.definition != definition || !actions::has_action(&test.baseline, definition, parameter) {
                     return Task::none();
                 }
                 let Some(EntityType::Insert(insert)) =
@@ -553,6 +651,10 @@ impl OpenCADStudio {
                 else {
                     return Task::none();
                 };
+                if self.tabs[i].scene.is_layer_locked(test.insert) {
+                    self.command_line.push_error(crate::t!("The test reference is on a locked layer.").as_ref());
+                    return Task::none();
+                }
                 let doc = &self.tabs[i].scene.document;
                 if doc.entities().any(|e|matches!(e,EntityType::Insert(other) if other.common.handle!=test.insert && (other.block_name==insert.block_name||doc.dynamic_definition_for_insert(other.common.handle)==Some(definition)))) {
                     self.command_line.push_error(crate::t!("Test actions with one reference in Test Block. Remove the extra references or reopen Test Block.").as_ref());return Task::none();
@@ -568,58 +670,17 @@ impl OpenCADStudio {
                     );
                     return Task::none();
                 };
-                let local = match value {
-                    actions::Value::Point(at) => {
-                        actions::Value::Point(actions::v(inverse.apply(actions::native(at))))
-                    }
-                    state => state,
-                };
-                let representation = insert.block_name.clone();
-                let mut staged = self.tabs[i].scene.document.clone();
-                match actions::evaluate_value(
-                    &mut staged,
-                    &test.baseline,
-                    definition,
-                    parameter,
-                    local,
+                let local = value.map_points(|point| actions::v(inverse.apply(actions::native(point))));
+                match actions::instance::evaluate_test_value(
+                    &self.tabs[i].scene.document, &test.baseline, definition, test.insert, parameter, local,
                 ) {
-                    Ok(changed) => {
-                        if changed {
-                            if let Err(e) = actions::sync_representation(
-                                &mut staged,
-                                definition,
-                                &representation,
-                            ) {
-                                self.command_line.push_error(crate::t!(e).as_ref());
-                                return Task::none();
-                            }
-                            self.finish_pending_history(i);
-                            let before = &self.tabs[i].scene.document;
-                            let entities = before
-                                .entities()
-                                .filter_map(|e| {
-                                    let h = e.common().handle;
-                                    (staged.get_entity(h) != Some(e))
-                                        .then(|| (h, before.get_entity_arc(h).unwrap()))
-                                })
-                                .collect();
-                            let objects = before
-                                .objects
-                                .iter()
-                                .filter(|(h, o)| staged.objects.get(h) != Some(*o))
-                                .map(|(h, o)| (*h, o.clone()))
-                                .collect();
-                            let dirty_before = self.tabs[i].dirty;
-                            self.tabs[i].scene.document = staged;
+                    Ok(staged) => {
+                        if let Some(staged) = staged {
+                            self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Test block parameter"));
+                            self.apply_action_document(i, staged);
                             self.tabs[i].scene.bump_geometry();
                             self.tabs[i].dirty = true;
-                            self.push_entity_group_history(
-                                i,
-                                "Test block parameter",
-                                entities,
-                                objects,
-                                dirty_before,
-                            );
+                            self.finish_pending_history(i);
                         }
                         self.tabs[i].active_cmd = None;
                         self.tabs[i].scene.clear_preview_wire();
@@ -632,6 +693,28 @@ impl OpenCADStudio {
         }
         Task::none()
     }
+    pub(super) fn custom_block_grip_at_cursor(&self, i: usize, point: iced::Point, width: f32, height: f32) -> bool {
+        use crate::scene::pick::grip::{find_hit_grip, find_hit_grip_paper, find_hit_grip_rte, is_custom_block_marker};
+        let tab = &self.tabs[i];
+        if !tab.selected_grips.iter().any(is_custom_block_marker) { return false }
+        let frame = tab.scene.viewport_edit_frame((width, height));
+        let rect = frame.as_ref().map(|(_, rect)| *rect).unwrap_or_else(|| tab.scene.active_model_tile_bounds(width, height));
+        let bounds = iced::Rectangle::with_size(iced::Size::new(rect.width, rect.height));
+        let local = iced::Point::new(point.x - rect.x, point.y - rect.y);
+        let hit = if let Some((camera, _)) = frame {
+            find_hit_grip_rte(local, &tab.selected_grips, camera.view_proj_rte(bounds), camera.eye(), bounds)
+        } else if tab.scene.current_layout != "Model" {
+            let camera = tab.scene.camera.borrow();
+            let half_h = camera.ortho_size();
+            let half_w = half_h * rect.width / rect.height.max(1.);
+            find_hit_grip_paper(local, &tab.selected_grips, camera.target.x as f32, camera.target.y as f32, half_w, half_h, bounds)
+        } else {
+            find_hit_grip(local, &tab.selected_grips, &tab.scene.camera.borrow(), bounds)
+        };
+        hit.is_some_and(|(index, _, _, _)| is_custom_block_marker(&tab.selected_grips[index])
+            && tab.selected_grip_handles.get(index).is_some_and(|handle| matches!(tab.scene.document.get_entity(*handle), Some(EntityType::Insert(_)))))
+    }
+
     pub(super) fn refresh_test_action_grips(&mut self, wo: [f64; 3]) {
         let i = self.active_tab;
         let tab = &self.tabs[i];
@@ -648,32 +731,26 @@ impl OpenCADStudio {
         let transform = crate::scene::render_graph::insert_transform(&tab.scene.document, insert);
         let mut grips = vec![];
         let all = actions::actions(&test.baseline, test.definition);
-        for (index, p) in actions::all_parameters(&test.baseline, test.definition)
-            .into_iter()
-            .enumerate()
-        {
-            if p.grip == Handle::NULL || !all.iter().any(|(_, _, _, id)| *id == p.id) {
-                continue;
+        for p in actions::all_parameters(&test.baseline, test.definition) {
+            if !all.iter().any(|(_, _, _, id)| *id == p.id) { continue; }
+            let Ok(value) = actions::instance::test_value(&tab.scene.document, test.insert, &p) else { continue; };
+            let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, test.insert, &p, true) else { continue; };
+            for grip in actions::instance::action_grips(&tab.scene.document, &test.baseline, test.definition, test.insert, &p, value, true) {
+                grips.push(crate::scene::model::object::GripDef {
+                    id: grip.id,
+                    world: actions::v(transform.apply(actions::native(grip.point))) - glam::DVec3::from_array(wo),
+                    is_midpoint: false,
+                    shape: if p.flip {
+                        crate::scene::model::object::GripShape::Arrow
+                    } else {
+                        crate::scene::model::object::GripShape::Triangle
+                    },
+                    dir: grip.direction.and_then(|direction| actions::v(transform.apply_rotation(actions::native(direction))).try_normalize()),
+                    axis: None,
+                });
             }
-            let Ok(value) = actions::value(&tab.scene.document, &p) else {
-                continue;
-            };
-            let world =
-                actions::v(transform.apply(actions::native(actions::grip_position(&p, value))))
-                    - glam::DVec3::from_array(wo);
-            grips.push(crate::scene::model::object::GripDef {
-                id: TEST_GRIP_START + index,
-                world,
-                is_midpoint: false,
-                shape: crate::scene::model::object::GripShape::Triangle,
-                dir: actions::grip_direction(&p, value).and_then(|direction| {
-                    (actions::v(transform.apply(actions::native(direction)))
-                        - actions::v(transform.apply(codec::types::Vector3::ZERO)))
-                    .try_normalize()
-                }),
-                axis: None,
-            });
         }
+        grips.extend(self.alignment_grip_markers(test.insert, wo));
         let handle = test.insert;
         let tab = &mut self.tabs[i];
         for grip in grips {
@@ -685,6 +762,7 @@ impl OpenCADStudio {
         if !is_test_grip(id) {
             return false;
         }
+        if self.start_alignment_grip(handle, id) { return true; }
         let i = self.active_tab;
         let tab = &self.tabs[i];
         let Some(test) = tab.block_test.as_ref() else {
@@ -696,22 +774,34 @@ impl OpenCADStudio {
         if tab.scene.is_layer_locked(handle) {
             return true;
         }
+        let Some((node, role)) = crate::scene::block_grips::runtime::decode(id) else { return false };
         let Some(p) = actions::all_parameters(&test.baseline, test.definition)
-            .get(id - TEST_GRIP_START)
-            .cloned()
+            .into_iter().find(|p| p.id == node)
         else {
             return false;
         };
         if p.grip == Handle::NULL {
             return false;
         }
+        if !actions::has_action(&test.baseline, test.definition, p.handle) { return false; }
+        let Ok(value) = actions::instance::test_value(&tab.scene.document, test.insert, &p) else { return false };
+        let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, test.insert, &p, true) else { return false };
+        let Some(grip) = actions::instance::action_grips(&tab.scene.document, &test.baseline, test.definition, test.insert, &p, value, true).into_iter().find(|grip| grip.role == role) else { return false };
         if p.flip {
-            let state = actions::value(&tab.scene.document, &p);
+            let state = actions::instance::test_value(&tab.scene.document, test.insert, &p);
             let document = tab.id;
             let definition = test.definition;
             return self.toggle_action_grip(document, definition, p.handle, None, state);
         }
+        let Some(EntityType::Insert(reference)) = tab.scene.document.get_entity(test.insert) else { return false };
+        let to_world = crate::scene::render_graph::insert_transform(&tab.scene.document, reference);
+        let Some(to_local) = crate::scene::inverse_affine(&to_world) else { return false };
+        let Ok(frame) = actions::instance::test_frame(&tab.scene.document, test.insert, &p) else { return false };
         let command = crate::modules::block_editor::action::TestParameterCommand {
+            grip_input: Some(crate::scene::block_grips::runtime::Input { id, role, frame, offset: grip.offset,
+                point: p.point, linear_axis: p.linear.then(|| (frame.end - frame.base).normalize()),
+                limits: crate::scene::block_grips::runtime::Limits::read(&test.baseline, test.definition, &p), to_world, to_local }),
+            display_offset: glam::DVec3::ZERO,
             insert: None,
             document: tab.id,
             definition: test.definition,
@@ -745,32 +835,26 @@ impl OpenCADStudio {
             crate::scene::render_graph::insert_transform(&tab.scene.document, reference);
         let all = actions::actions(&tab.scene.document, def);
         let mut grips = vec![];
-        for (index, p) in actions::all_parameters(&tab.scene.document, def)
-            .into_iter()
-            .enumerate()
-        {
-            if p.grip == Handle::NULL || !all.iter().any(|(_, _, _, id)| *id == p.id) {
-                continue;
+        for p in actions::all_parameters(&tab.scene.document, def) {
+            if !all.iter().any(|(_, _, _, id)| *id == p.id) { continue; }
+            let Ok(value) = actions::instance::value(&tab.scene.document, handle, &p) else { continue; };
+            let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, handle, &p, false) else { continue; };
+            for grip in actions::instance::action_grips(&tab.scene.document, &tab.scene.document, def, handle, &p, value, false) {
+                grips.push(crate::scene::model::object::GripDef {
+                    id: grip.id,
+                    world: actions::v(transform.apply(actions::native(grip.point))) - glam::DVec3::from_array(wo),
+                    is_midpoint: false,
+                    shape: if p.flip {
+                        crate::scene::model::object::GripShape::Arrow
+                    } else {
+                        crate::scene::model::object::GripShape::Triangle
+                    },
+                    dir: grip.direction.and_then(|direction| actions::v(transform.apply_rotation(actions::native(direction))).try_normalize()),
+                    axis: None,
+                });
             }
-            let Ok(value) = actions::instance::value(&tab.scene.document, handle, &p) else {
-                continue;
-            };
-            let world =
-                actions::v(transform.apply(actions::native(actions::grip_position(&p, value))))
-                    - glam::DVec3::from_array(wo);
-            grips.push(crate::scene::model::object::GripDef {
-                id: TEST_GRIP_START + index,
-                world,
-                is_midpoint: false,
-                shape: crate::scene::model::object::GripShape::Triangle,
-                dir: actions::grip_direction(&p, value).and_then(|direction| {
-                    (actions::v(transform.apply(actions::native(direction)))
-                        - actions::v(transform.apply(codec::types::Vector3::ZERO)))
-                    .try_normalize()
-                }),
-                axis: None,
-            });
         }
+        grips.extend(self.alignment_grip_markers(handle, wo));
         for grip in grips {
             self.tabs[i].selected_grips.push(grip);
             self.tabs[i].selected_grip_handles.push(handle);
@@ -788,21 +872,33 @@ impl OpenCADStudio {
         if tab.scene.is_layer_locked(handle) {
             return true;
         }
+        let Some((node, role)) = crate::scene::block_grips::runtime::decode(id) else { return false };
         let Some(p) = actions::all_parameters(&tab.scene.document, def)
-            .get(id - TEST_GRIP_START)
-            .cloned()
+            .into_iter().find(|p| p.id == node)
         else {
             return false;
         };
         if p.grip == Handle::NULL {
             return false;
         }
+        if !actions::has_action(&tab.scene.document, def, p.handle) { return false; }
+        let Ok(value) = actions::instance::value(&tab.scene.document, handle, &p) else { return false };
+        let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, handle, &p, false) else { return false };
+        let Some(grip) = actions::instance::action_grips(&tab.scene.document, &tab.scene.document, def, handle, &p, value, false).into_iter().find(|grip| grip.role == role) else { return false };
         if p.flip {
             let state = actions::instance::value(&tab.scene.document, handle, &p);
             let document = tab.id;
             return self.toggle_action_grip(document, def, p.handle, Some(handle), state);
         }
+        let Some(EntityType::Insert(reference)) = tab.scene.document.get_entity(handle) else { return false };
+        let to_world = crate::scene::render_graph::insert_transform(&tab.scene.document, reference);
+        let Some(to_local) = crate::scene::inverse_affine(&to_world) else { return false };
+        let Ok(frame) = actions::instance::frame(&tab.scene.document, handle, &p) else { return false };
         let command = crate::modules::block_editor::action::TestParameterCommand {
+            grip_input: Some(crate::scene::block_grips::runtime::Input { id, role, frame, offset: grip.offset,
+                point: p.point, linear_axis: p.linear.then(|| (frame.end - frame.base).normalize()),
+                limits: crate::scene::block_grips::runtime::Limits::read(&tab.scene.document, def, &p), to_world, to_local }),
+            display_offset: glam::DVec3::ZERO,
             insert: Some(handle),
             document: tab.id,
             definition: def,
@@ -826,6 +922,7 @@ impl OpenCADStudio {
         if tab.active_block_edit_session().is_some()
             || tab.block_test.is_some()
             || actions::instance::definition(&tab.scene.document, handle) != Some(definition)
+            || !actions::has_action(&tab.scene.document, definition, parameter)
         {
             return Task::none();
         }
@@ -840,16 +937,11 @@ impl OpenCADStudio {
         ) else {
             return Task::none();
         };
-        let local = match value {
-            actions::Value::Point(at) => {
-                actions::Value::Point(actions::v(inverse.apply(actions::native(at))))
-            }
-            state => state,
-        };
+        let local = value.map_points(|point| actions::v(inverse.apply(actions::native(point))));
         match actions::instance::evaluate_value(&tab.scene.document, handle, parameter, local) {
             Ok(staged) => {
                 if let Some(staged) = staged {
-                    self.push_undo_snapshot(i, "Block reference parameter");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block reference parameter"));
                     self.apply_action_document(i, staged);
                     self.tabs[i].scene.bump_geometry();
                     self.tabs[i].dirty = true;
@@ -878,6 +970,7 @@ impl OpenCADStudio {
             Ok(actions::Value::Flip(state)) => {
                 let _ = self.handle_block_action_result(
                     crate::command::CmdResult::EvaluateBlockParameter {
+                        grip: None,
                         document,
                         definition,
                         parameter,

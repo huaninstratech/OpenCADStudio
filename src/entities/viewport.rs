@@ -355,18 +355,39 @@ pub(crate) fn is_clipped(vp: &Viewport) -> bool {
     !vp.clip_boundary_handle.is_null() && vp.status.non_rectangular_clipping
 }
 
+/// The corners [`stretch`] tests against the window, at the height it tests
+/// them: the points a STRETCH window can catch.
+pub fn stretch_corners(vp: &Viewport) -> [glam::DVec3; 4] {
+    let hw = vp.width * 0.5;
+    let hh = vp.height * 0.5;
+    let (left, right) = (vp.center.x - hw, vp.center.x + hw);
+    let (bottom, top) = (vp.center.y - hh, vp.center.y + hh);
+    [
+        glam::DVec3::new(left, bottom, 0.0),
+        glam::DVec3::new(right, bottom, 0.0),
+        glam::DVec3::new(left, top, 0.0),
+        glam::DVec3::new(right, top, 0.0),
+    ]
+}
+
 pub fn stretch(
     vp: &mut Viewport,
     win_min: glam::DVec3,
     win_max: glam::DVec3,
+    excluded: &dyn Fn(glam::DVec3) -> bool,
     delta: glam::DVec3,
 ) -> bool {
     let hw = vp.width * 0.5;
     let hh = vp.height * 0.5;
     let (left, right) = (vp.center.x - hw, vp.center.x + hw);
     let (bottom, top) = (vp.center.y - hh, vp.center.y + hh);
-    let inside =
-        |x: f64, y: f64| x >= win_min.x && x <= win_max.x && y >= win_min.y && y <= win_max.y;
+    let inside = |x: f64, y: f64| {
+        x >= win_min.x
+            && x <= win_max.x
+            && y >= win_min.y
+            && y <= win_max.y
+            && !excluded(glam::DVec3::new(x, y, 0.0))
+    };
 
     let bottom_left = inside(left, bottom);
     let bottom_right = inside(right, bottom);
@@ -400,16 +421,24 @@ pub fn stretch(
 }
 
 /// Rebuild center and size from two opposite corners while preserving viewport
-/// scale as its paper-space height changes.
+/// scale as its paper-space height changes. The model stays where it is on the
+/// sheet: as the viewport's centre moves, its view centre moves with it.
 fn resize_from_corners(vp: &mut Viewport, a: (f64, f64), b: (f64, f64)) -> bool {
     let new_width = (b.0 - a.0).abs();
     let new_height = (b.1 - a.1).abs();
     let mut changed = false;
+    // Model units per sheet unit; the view centre is in display coordinates,
+    // whose axes are the sheet's.
+    let model_per_sheet = match vp.height > 1e-9 {
+        true => vp.view_height / vp.height,
+        false => 0.0,
+    };
 
     if new_width > 0.01 {
         let new_center_x = (a.0 + b.0) * 0.5;
         changed |=
             (vp.center.x - new_center_x).abs() > 1e-12 || (vp.width - new_width).abs() > 1e-12;
+        vp.view_center.x += (new_center_x - vp.center.x) * model_per_sheet;
         vp.center.x = new_center_x;
         vp.width = new_width;
     }
@@ -418,6 +447,7 @@ fn resize_from_corners(vp: &mut Viewport, a: (f64, f64), b: (f64, f64)) -> bool 
         let new_center_y = (a.1 + b.1) * 0.5;
         changed |=
             (vp.center.y - new_center_y).abs() > 1e-12 || (old_height - new_height).abs() > 1e-12;
+        vp.view_center.y += (new_center_y - vp.center.y) * model_per_sheet;
         vp.center.y = new_center_y;
         if old_height > 1e-9 && vp.view_height.abs() > 1e-9 {
             vp.view_height *= new_height / old_height;

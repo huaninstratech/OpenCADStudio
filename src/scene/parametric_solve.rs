@@ -33,9 +33,11 @@ use kernel_constraints::util::ParamId;
 use super::named_parameters::ParameterTable;
 use super::parametric_constraints::{
     angle_sector, distance_direction_type, ConstraintId, ConstraintKind, ParametricConstraint,
-    ParametricConstraintSet, ParametricRef,
+    ParametricRef,
 };
 use super::{ChangeKind, Scene};
+
+pub(crate) mod status;
 
 /// One referenced entity's geometry, registered into an `kernel_constraints::System`'s
 /// parameter store.
@@ -186,7 +188,7 @@ fn as_circle_or_line(g: EntityGeom, reference: ParametricRef) -> CircleOrLine {
 /// they solve exactly one constraint in isolation, so they need that
 /// convention; a whole scope's constraint graph does not).
 fn register_entity(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     sys: &mut System,
     handle: Handle,
 ) -> Option<EntityGeom> {
@@ -497,7 +499,7 @@ fn register_entity_geom(
 /// supported entity type, or (for a point ref) uses a marker that entity
 /// type doesn't support.
 fn resolve_ref(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     sys: &mut System,
     cache: &mut HashMap<Handle, EntityGeom>,
     r: ParametricRef,
@@ -515,7 +517,7 @@ fn resolve_ref(
 /// midpoint markers are derived parameters so moving either parent geometry
 /// or another constrained object recomputes them in the same solve.
 fn resolve_constraint_point(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     sys: &mut System,
     cache: &mut HashMap<Handle, EntityGeom>,
     reference: ParametricRef,
@@ -795,7 +797,7 @@ fn entity_plane_z(entity: &EntityType) -> Option<f64> {
     z.is_finite().then_some(z)
 }
 
-fn refs_share_supported_plane(document: &codec::CadDocument, refs: &[ParametricRef]) -> bool {
+fn refs_share_supported_plane(document: &codec::Document, refs: &[ParametricRef]) -> bool {
     let mut plane_z = None;
     for reference in refs {
         let Some(entity) = document.get_entity(reference.entity) else {
@@ -813,7 +815,7 @@ fn refs_share_supported_plane(document: &codec::CadDocument, refs: &[ParametricR
 }
 
 fn concentric_reference_geometry(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     reference: ParametricRef,
 ) -> Option<(Vector3, kernel::space::Plane)> {
     let marker = reference.marker?;
@@ -826,7 +828,7 @@ fn concentric_reference_geometry(
     Some((center, plane))
 }
 
-fn concentric_refs_share_plane(document: &codec::CadDocument, refs: &[ParametricRef]) -> bool {
+fn concentric_refs_share_plane(document: &codec::Document, refs: &[ParametricRef]) -> bool {
     let [first, second] = refs else {
         return false;
     };
@@ -873,8 +875,8 @@ fn ref_is_driven(driven: &[ParametricRef], reference: ParametricRef) -> bool {
 }
 
 fn apply_spatial_concentric_constraints(
-    document: &codec::CadDocument,
-    set: &ParametricConstraintSet,
+    document: &codec::Document,
+    constraints: &[&ParametricConstraint],
     driven_refs: &[ParametricRef],
     initial_fixed_refs: &[ParametricRef],
     results: &mut Vec<(Handle, EntityType)>,
@@ -892,7 +894,7 @@ fn apply_spatial_concentric_constraints(
     let mut relations = Vec::new();
     let mut fixed = Vec::new();
     let mut points = Vec::new();
-    for constraint in set.constraints.iter().filter(|constraint| {
+    for constraint in constraints.iter().filter(|constraint| {
         constraint.enabled
             && constraint.kind == ConstraintKind::Concentric
             && !refs_share_supported_plane(document, &constraint.refs)
@@ -1004,7 +1006,7 @@ fn oriented_distance(target: f64, current_projection: f64) -> f64 {
 }
 
 fn retained_tangent_side(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     retained_before: &HashMap<Handle, std::sync::Arc<EntityType>>,
     constraint: &ParametricConstraint,
 ) -> Option<bool> {
@@ -1061,7 +1063,7 @@ fn collapsed_by_solve(entity: &EntityType) -> bool {
 /// Ellipse likewise pins center + radmin, `focus1` being tied to `center`
 /// by the ellipse-rules `Difference` constraints.
 fn fixed_pin_params(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     sys: &mut System,
     cache: &mut HashMap<Handle, EntityGeom>,
     r: ParametricRef,
@@ -1126,7 +1128,7 @@ fn fixed_pin_params(
 /// Builds the kernel equations for one constraint. Unsupported references or
 /// invalid dimensional targets produce no equations.
 fn build_constraint(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     sys: &mut System,
     cache: &mut HashMap<Handle, EntityGeom>,
     params: &ParameterTable,
@@ -2061,7 +2063,7 @@ fn smooth_entity_plane(
 }
 
 fn smooth_refs_share_plane(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     source_ref: ParametricRef,
     target_curve_ref: ParametricRef,
 ) -> bool {
@@ -2098,12 +2100,11 @@ fn smooth_refs_share_plane(
 }
 
 fn apply_smooth_constraints(
-    document: &codec::CadDocument,
-    set: &ParametricConstraintSet,
+    document: &codec::Document,
+    constraints: &[&ParametricConstraint],
     results: &mut Vec<(Handle, EntityType)>,
 ) {
-    for constraint in set
-        .constraints
+    for constraint in constraints
         .iter()
         .filter(|constraint| constraint.enabled && constraint.kind == ConstraintKind::Smooth)
     {
@@ -2152,10 +2153,20 @@ fn apply_smooth_constraints(
 }
 
 const MOVE_EPS: f64 = 1e-9;
+/// The fixpoint gate for `solve_scope`: a scope whose every constraint row
+/// already evaluates to zero at the current values is not iterated at all.
+/// Mirrors the kernel solvers' own convergence tolerance (`TOLF = 1e-10` in
+/// `kernel_constraints::solvers::dogleg`, the bound `solve_dl` exits on) so
+/// "already converged" means exactly what the solver itself would conclude.
+const FIXPOINT_TOLF: f64 = 1.0e-10;
+/// How far a constraint may be off after a solve and still count as held.
+const SATISFIED_TOL: f64 = 1.0e-7;
 type SolveResult = (
     Vec<(Handle, EntityType)>,
     usize,
     Vec<(ConstraintId, kernel_constraints::diagnosis::RedundancyKind)>,
+    // Whether the scope's own constraints hold after the solve.
+    bool,
 );
 
 fn retained_line_length(entity: &EntityType, segment: Option<usize>) -> Option<f64> {
@@ -2221,7 +2232,7 @@ fn retain_segment_length(sys: &mut System, a: GPoint, b: GPoint, current_length:
 
 /// Visit vertices and segments in stored drawing order, including the closing edge last.
 fn polyline_ref_order(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     reference: ParametricRef,
 ) -> Option<(u64, usize)> {
     if !matches!(
@@ -2243,10 +2254,10 @@ fn polyline_ref_order(
 }
 
 fn constraints_in_drawing_order<'a>(
-    document: &codec::CadDocument,
-    set: &'a ParametricConstraintSet,
+    document: &codec::Document,
+    constraints: &[&'a ParametricConstraint],
 ) -> Vec<&'a ParametricConstraint> {
-    let mut constraints: Vec<_> = set.constraints.iter().collect();
+    let mut constraints: Vec<_> = constraints.to_vec();
     // A relation is visited when its last referenced element is reached.
     // Keep reference roles and persisted constraint IDs unchanged.
     constraints.sort_by_cached_key(|constraint| {
@@ -2257,6 +2268,46 @@ fn constraints_in_drawing_order<'a>(
             .max()
     });
     constraints
+}
+
+/// Replays sweeping `pairs` in order until a sweep changes nothing, where a
+/// pair with exactly one side in `known` teaches it the other side. Returns
+/// the firings in sweep order as `(pair index, the second side was learned)`.
+/// A pair is revisited only when one of its sides is learned, at the place
+/// the next sweep would reach it, so a chain running against the sweep costs
+/// one visit per link instead of one sweep per link.
+fn propagate_in_sweep_order<K: Copy + Eq + std::hash::Hash>(
+    pairs: &[(K, K)],
+    known: &mut HashSet<K>,
+) -> Vec<(usize, bool)> {
+    use std::cmp::Reverse;
+    let mut incident: HashMap<K, Vec<usize>> = HashMap::new();
+    let mut due = std::collections::BinaryHeap::new();
+    for (index, &(a, b)) in pairs.iter().enumerate() {
+        incident.entry(a).or_default().push(index);
+        if b != a {
+            incident.entry(b).or_default().push(index);
+        }
+        if known.contains(&a) != known.contains(&b) {
+            due.push(Reverse((0usize, index)));
+        }
+    }
+    let mut fired = Vec::new();
+    while let Some(Reverse((sweep, index))) = due.pop() {
+        let (a, b) = pairs[index];
+        let (learned, second) = match (known.contains(&a), known.contains(&b)) {
+            (true, false) => (b, true),
+            (false, true) => (a, false),
+            _ => continue,
+        };
+        known.insert(learned);
+        fired.push((index, second));
+        for &next in &incident[&learned] {
+            let at = if next > index { sweep } else { sweep + 1 };
+            due.push(Reverse((at, next)));
+        }
+    }
+    fired
 }
 
 /// Propagate explicit axis constraints through parallel/perpendicular relations.
@@ -2286,52 +2337,72 @@ fn constrained_line_axes(constraints: &[&ParametricConstraint]) -> HashMap<Param
             }
         }
     }
-    loop {
-        let before = axes.len();
-        for c in constraints.iter().filter(|c| c.enabled) {
-            if !matches!(
-                c.kind,
-                ConstraintKind::Parallel | ConstraintKind::Perpendicular | ConstraintKind::Colinear
-            ) {
-                continue;
-            }
-            let [a, b] = c.refs.as_slice() else { continue };
-            let perpendicular = c.kind == ConstraintKind::Perpendicular;
-            if let Some(axis) = axes.get(a).copied() {
-                axes.entry(*b).or_insert(axis ^ perpendicular);
-            }
-            if let Some(axis) = axes.get(b).copied() {
-                axes.entry(*a).or_insert(axis ^ perpendicular);
-            }
-        }
-        if before == axes.len() {
-            return axes;
-        }
+    let relations: Vec<(ParametricRef, ParametricRef, bool)> = constraints
+        .iter()
+        .filter(|c| {
+            c.enabled
+                && matches!(
+                    c.kind,
+                    ConstraintKind::Parallel
+                        | ConstraintKind::Perpendicular
+                        | ConstraintKind::Colinear
+                )
+        })
+        .filter_map(|c| match c.refs.as_slice() {
+            [a, b] => Some((*a, *b, c.kind == ConstraintKind::Perpendicular)),
+            _ => None,
+        })
+        .collect();
+    let pairs: Vec<_> = relations.iter().map(|&(a, b, _)| (a, b)).collect();
+    let mut known: HashSet<ParametricRef> = axes.keys().copied().collect();
+    for (index, second) in propagate_in_sweep_order(&pairs, &mut known) {
+        let (a, b, perpendicular) = relations[index];
+        let (from, to) = if second { (a, b) } else { (b, a) };
+        let axis = axes[&from] ^ perpendicular;
+        axes.entry(to).or_insert(axis);
     }
+    axes
 }
 
 /// Solve the scope through the kernel and return changed geometry plus diagnostics.
 /// Failed solves still return DOF/conflicts, but never write back geometry.
 /// Returns `None` when no supported geometry or smooth constraint can be built.
+///
+/// `constraint_view` is the already-filtered view of the scope's constraints
+/// to solve (callers pass the full set on commit, or just the connected
+/// component during a grip-drag preview) — no cloning of the set is needed.
+/// `diagnostics` is `false` on the per-move preview path, which discards
+/// DOF/conflict results anyway; it then skips the `diagnose`/`classify_redundant`
+/// work (one extra dogleg solve per redundant constraint) and returns an
+/// empty diagnostic result.
+// The solver inputs are inherently flat; grouping them into a params struct
+// would churn every call site for no readability gain (clippy's threshold
+// was already exceeded before this signature grew).
+#[allow(clippy::too_many_arguments)]
 fn solve_scope(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     drawing_params: &ParameterTable,
-    set: &ParametricConstraintSet,
+    local_parameters: &ParameterTable,
+    constraint_view: &[&ParametricConstraint],
     driven_refs: &[ParametricRef],
     retain_size: bool,
     retain_lengths: bool,
     retained_before: &HashMap<Handle, std::sync::Arc<EntityType>>,
     initial_fixed_refs: &[ParametricRef],
     originals: &HashMap<Handle, std::sync::Arc<EntityType>>,
+    diagnostics: bool,
 ) -> Option<SolveResult> {
-    let params = if set.local_parameters.is_empty() {
+    let params = if local_parameters.is_empty() {
         drawing_params
     } else {
-        &set.local_parameters
+        local_parameters
     };
     let mut sys = System::new();
     let mut cache: HashMap<Handle, EntityGeom> = HashMap::new();
-    let constraints = constraints_in_drawing_order(document, set);
+    // Drawing order for the solve itself; `constraint_view` (insertion
+    // order) is what the post-solve smooth/concentric passes see, matching
+    // what they saw when they took the whole set directly.
+    let constraints = constraints_in_drawing_order(document, constraint_view);
     // A persistent Fixed outranks any edit: a point it holds is never a
     // driven grip / STRETCH anchor, and a moved entity it holds gets no
     // temporary whole-entity pin — the Fixed one, targeting the retained
@@ -2430,6 +2501,10 @@ fn solve_scope(
             tangent_point,
             originals,
         ) {
+            // The row→id map backs the fixpoint gate below and
+            // `diagnose`/`classify_redundant`; the gate decides whether to
+            // solve at all, so it needs every user row even when the
+            // diagnostics themselves are not collected.
             owner.push((constraint.clone(), c.id));
             sys.add_constraint(constraint);
         }
@@ -2614,35 +2689,29 @@ fn solve_scope(
                 .iter()
                 .any(|reference| reference.entity == handle)
     };
-    let mut equal_followers: Vec<ParametricRef> = Vec::new();
-    let mut moving: Vec<Handle> = cache
+    let equal_refs: Vec<(ParametricRef, ParametricRef)> = constraints
+        .iter()
+        .filter(|c| c.enabled && c.kind == ConstraintKind::Equal)
+        .filter_map(|c| match c.refs.as_slice() {
+            [a, b] => Some((*a, *b)),
+            _ => None,
+        })
+        .collect();
+    let equal_entities: Vec<(Handle, Handle)> =
+        equal_refs.iter().map(|(a, b)| (a.entity, b.entity)).collect();
+    let mut moving: HashSet<Handle> = cache
         .keys()
         .copied()
         .filter(|handle| edited(*handle))
         .collect();
-    loop {
-        let before = equal_followers.len();
-        for constraint in &constraints {
-            if !constraint.enabled || constraint.kind != ConstraintKind::Equal {
-                continue;
-            }
-            let [a, b] = constraint.refs.as_slice() else {
-                continue;
-            };
-            let follower = match (moving.contains(&a.entity), moving.contains(&b.entity)) {
-                (true, false) => *b,
-                (false, true) => *a,
-                _ => continue,
-            };
-            if !equal_followers.contains(&follower) {
-                equal_followers.push(follower);
-                moving.push(follower.entity);
-            }
-        }
-        if equal_followers.len() == before {
-            break;
-        }
-    }
+    let equal_followers: Vec<ParametricRef> =
+        propagate_in_sweep_order(&equal_entities, &mut moving)
+            .into_iter()
+            .map(|(index, second)| {
+                let (a, b) = equal_refs[index];
+                if second { b } else { a }
+            })
+            .collect();
     for follower in &equal_followers {
         let Some(geometry) = resolve_ref(document, &mut sys, &mut cache, *follower) else {
             continue;
@@ -2692,6 +2761,28 @@ fn solve_scope(
             }
         }
     }
+    // A driving dimension between an entity's own ends is its size, so a
+    // retained length would contradict a new value — and pinning both ends
+    // of a dragged line would contradict it outright.
+    let driving_self_size: HashSet<Handle> = constraints
+        .iter()
+        .filter(|c| {
+            c.enabled
+                && c.driving_param.is_some()
+                && matches!(
+                    c.kind,
+                    ConstraintKind::Distance
+                        | ConstraintKind::DistanceX
+                        | ConstraintKind::DistanceY
+                        | ConstraintKind::DistanceDirected
+                )
+                && c.refs.len() >= 2
+                && c.refs
+                    .iter()
+                    .all(|r| r.entity == c.refs[0].entity && r.marker.is_some())
+        })
+        .map(|c| c.refs[0].entity)
+        .collect();
     if !retain_lengths {
         let mut axis_lines: Vec<_> = line_axes
             .into_iter()
@@ -2795,7 +2886,11 @@ fn solve_scope(
                 } else {
                     line.p1
                 };
-                if !driven_points.contains(&opposite) {
+                // A driving size between the line's own ends owns that span;
+                // pinning the far end's along-edge coordinate would fight it.
+                if !driven_points.contains(&opposite)
+                    && !driving_self_size.contains(&reference.entity)
+                {
                     let parameter = if *vertical { opposite.y } else { opposite.x };
                     // Only the along-edge coordinate stays fixed. The normal
                     // coordinate follows the grabbed point through the kernel.
@@ -2875,10 +2970,22 @@ fn solve_scope(
                     .iter()
                     .any(|(line_ref, _, _)| line_ref.entity == reference.entity)
             {
-                anchors.push(ParametricRef::point(
-                    reference.entity,
-                    1 - reference.marker.unwrap(),
-                ));
+                let opposite =
+                    ParametricRef::point(reference.entity, 1 - reference.marker.unwrap());
+                let both_ends_grabbed = driven_refs.iter().any(|other| {
+                    other.entity == reference.entity
+                        && matches!(other.marker, Some(marker) if Some(marker) != reference.marker)
+                });
+                // A driving size relation owns the span between the line's
+                // ends, so a single grab gives way: the far end stays put and
+                // the grabbed end is pulled back onto the dimension. A grab
+                // that names both ends keeps them exact.
+                if driving_self_size.contains(&reference.entity) && !both_ends_grabbed {
+                    anchors.retain(|anchor| anchor != reference);
+                }
+                if !anchors.contains(&opposite) {
+                    anchors.push(opposite);
+                }
             }
         }
     }
@@ -2886,6 +2993,8 @@ fn solve_scope(
     // Grip edits retain radii while connected lines resize to meet their
     // endpoints. Other edits can retain line lengths as well.
     if retain_size {
+        let follower_entities: HashSet<Handle> =
+            equal_followers.iter().map(|follower| follower.entity).collect();
         for (handle, geom) in &cache {
             // A Fixed entity's size is whatever its pins say: whole → all
             // pinned anyway, partial → the reference lets it resize (MOVE
@@ -2897,22 +3006,8 @@ fn solve_scope(
                 || symmetric_constraints.iter().any(|constraint| {
                     constraint.refs.get(2).is_some_and(|axis| axis.entity == *handle)
                 })
-                || equal_followers.iter().any(|follower| follower.entity == *handle)
-                // A driving dimension between an entity's own ends is its size;
-                // a retained length would contradict a new value.
-                || constraints.iter().any(|c| {
-                    c.enabled
-                        && c.driving_param.is_some()
-                        && matches!(
-                            c.kind,
-                            ConstraintKind::Distance
-                                | ConstraintKind::DistanceX
-                                | ConstraintKind::DistanceY
-                                | ConstraintKind::DistanceDirected
-                        )
-                        && c.refs.len() >= 2
-                        && c.refs.iter().all(|r| r.entity == *handle && r.marker.is_some())
-                })
+                || follower_entities.contains(handle)
+                || driving_self_size.contains(handle)
             {
                 continue;
             }
@@ -3000,52 +3095,7 @@ fn solve_scope(
     // its endpoint. Not tracked in `owner`: these are solver-internal
     // bookkeeping, never redundant with anything a user-facing constraint
     // could name, so there's no `ConstraintId` for them to report against.
-    let add_arc_rules = |sys: &mut System, arc: GArc, sweep: Option<f64>| {
-        let curve = Rc::new(arc);
-        sys.add_constraint(Rc::new(CurveValue::new(
-            arc.start,
-            arc.start.x,
-            curve.clone(),
-            arc.start_angle,
-        )));
-        sys.add_constraint(Rc::new(CurveValue::new(
-            arc.start,
-            arc.start.y,
-            curve.clone(),
-            arc.start_angle,
-        )));
-        sys.add_constraint(Rc::new(CurveValue::new(
-            arc.end,
-            arc.end.x,
-            curve.clone(),
-            arc.end_angle,
-        )));
-        sys.add_constraint(Rc::new(CurveValue::new(
-            arc.end,
-            arc.end.y,
-            curve,
-            arc.end_angle,
-        )));
-        if let Some(sweep) = sweep {
-            let target = sys.add_param(sweep, true);
-            sys.add_constraint(Rc::new(Difference::new(
-                arc.start_angle,
-                arc.end_angle,
-                target,
-            )));
-        }
-    };
-    for geom in cache.values() {
-        match geom {
-            EntityGeom::Arc(arc) => add_arc_rules(&mut sys, *arc, None),
-            EntityGeom::Polyline { arcs, .. } => {
-                for segment in arcs.iter().flatten() {
-                    add_arc_rules(&mut sys, segment.arc, Some(segment.sweep));
-                }
-            }
-            _ => {}
-        }
-    }
+    status::add_intrinsic_arc_rules(&mut sys, &cache);
 
     // Ellipse rules (same motivation as arc rules, different mechanism):
     // `kernel_constraints::geo::Ellipse` stores `focus1` as an absolute point, not an
@@ -3063,7 +3113,7 @@ fn solve_scope(
         let EntityGeom::Ellipse(el) = geom else {
             continue;
         };
-        let symmetric = set.constraints.iter().any(|constraint| {
+        let symmetric = constraints.iter().any(|constraint| {
             constraint.enabled
                 && constraint.kind == ConstraintKind::Symmetric
                 && constraint.refs.get(..2).is_some_and(|references| {
@@ -3084,7 +3134,7 @@ fn solve_scope(
                 store.get(el.focus1.y),
             )
         };
-        let directional = set.constraints.iter().any(|constraint| {
+        let directional = constraints.iter().any(|constraint| {
             constraint.enabled
                 && matches!(
                     constraint.kind,
@@ -3126,7 +3176,7 @@ fn solve_scope(
                 store.get(line.p2.y),
             )
         };
-        let directional = set.constraints.iter().any(|constraint| {
+        let directional = constraints.iter().any(|constraint| {
             constraint.enabled
                 && matches!(
                     constraint.kind,
@@ -3158,7 +3208,7 @@ fn solve_scope(
     // free-variable list; an approximate equality equation would still allow
     // visible drift after repeated grip frames.
     for reference in &anchors {
-        if !set.constraints.iter().any(|constraint| {
+        if !constraints.iter().any(|constraint| {
             constraint
                 .refs
                 .iter()
@@ -3218,74 +3268,119 @@ fn solve_scope(
     }
 
     let partitions = sys.partition();
-    for sub in &partitions {
-        if solve_dl(sub, sys.store_mut()) == SolveStatus::Failed {
-            solve_lm(sub, sys.store_mut());
-        }
-    }
-    // `System::partition` only includes parameters referenced by a
-    // constraint, so an otherwise registered but unconstrained coordinate (e.g. a
-    // line's X after only a Horizontal constraint pins its Ys) is invisible
-    // to `diagnose` entirely, undercounting DOF. Every such untouched free
-    // param is unconstrained on its own, i.e. exactly 1 DOF each — added
-    // back here rather than fixed in `kernel_constraints::diagnosis`, which correctly
-    // has no opinion on params outside the `SubSystem` it was handed.
-    let total_free: usize = cache
-        .values()
-        .map(|g| match g {
-            EntityGeom::Point(_) => 2,
-            EntityGeom::TextLine(_)
-            | EntityGeom::Line(_)
-            | EntityGeom::Ray(_)
-            | EntityGeom::XLine(_) => 4,
-            EntityGeom::Polyline { points, arcs, .. } => {
-                points.len() * 2 + arcs.iter().flatten().count() * 5
-            }
-            EntityGeom::Circle(_) => 3,
-            // Raw param count (center×2, rad, start×2, end×2, both
-            // angles) — same "raw, not netted against its own
-            // constraints" convention as every other arm here. The four
-            // arc-rules `CurveValue` constraints (always present, added
-            // just above) already reduce this to 5 *effective* DOF through
-            // the normal `touched_free`/`diag.dof` accounting below, the
-            // same way any other constraint would.
-            EntityGeom::Arc(_) => 9,
-            EntityGeom::Ellipse(_) => 5,
-            EntityGeom::Spline { curve, .. } => curve.poles.len() * 2,
-        })
-        .sum();
-    let touched_free: usize = partitions.iter().map(|s| s.p_size()).sum();
-    let mut dof = total_free.saturating_sub(touched_free);
-    let mut conflicts: Vec<(ConstraintId, kernel_constraints::diagnosis::RedundancyKind)> =
-        Vec::new();
-    for sub in &partitions {
-        let diag = kernel_constraints::diagnosis::diagnose(sub, sys.store());
-        dof += diag.dof;
-        if diag.redundant.is_empty() {
-            continue;
-        }
-        let mut seen = HashSet::new();
-        let reportable: Vec<_> = diag
-            .redundant
+    // Fixpoint guarantee: a transaction whose resulting document state
+    // satisfies every constraint of the scope within the solver's own
+    // convergence tolerance is a fixpoint of any correct iterative solver.
+    // The solve such a write triggers must be a no-op — never a
+    // re-projection of the written state onto a different (e.g. the
+    // retained pre-edit) valid configuration, which is how a
+    // two-valued tangency could displace a consistent write by the
+    // distance between its two solutions. Only the scope's own rows
+    // (`owner` — the rows compiled from the scope's parametric
+    // constraints) decide this: the temporary pins, size/length
+    // retentions and Equal-follow datums below are the solver's
+    // instrumentation for genuinely violated interactive solves, and a
+    // state whose rows are all zero needs none of them. Smooth and
+    // out-of-plane Concentric refine outside this 2D system (they run in
+    // the result phase after it), so scopes carrying them keep their
+    // current flow exactly. The gate is route-independent (no caller-route
+    // conjuncts): a state whose user rows are all zero is a fixpoint of any
+    // iterative solver and holds for every write route — the plugin's
+    // transactions included — while the ONE live exception is an actively
+    // driven drag (`driven_refs` non-empty): the grip re-alignment the
+    // implied-axis machinery owes the cursor must still run even when the
+    // written state satisfies every user constraint, because the machinery
+    // - not the rows - carries the drag semantics there.
+    let scope_is_a_fixpoint = !has_smooth
+        && !has_spatial_concentric
+        && driven_refs.is_empty()
+        && owner
             .iter()
-            .copied()
-            .filter(|row| {
-                owner
-                    .iter()
-                    .find(|(rc, _)| Rc::ptr_eq(rc, &sub.constraints()[*row]))
-                    .is_some_and(|(_, id)| seen.insert(*id))
-            })
-            .collect();
-        for (row, kind) in
-            kernel_constraints::diagnosis::classify_redundant(sub, sys.store(), &reportable)
-        {
-            let row_constraint = &sub.constraints()[row];
-            if let Some(&(_, id)) = owner.iter().find(|(rc, _)| Rc::ptr_eq(rc, row_constraint)) {
-                conflicts.push((id, kind));
+            .all(|(constraint, _)| constraint.error(sys.store()).abs() <= FIXPOINT_TOLF);
+    if !scope_is_a_fixpoint {
+        for sub in &partitions {
+            if solve_dl(sub, sys.store_mut()) == SolveStatus::Failed {
+                solve_lm(sub, sys.store_mut());
             }
         }
     }
+    // DOF/conflict diagnostics feed only the commit path, which stores them
+    // on the set for the status badges; the grip-drag preview discards them,
+    // so `diagnostics == false` skips `diagnose` entirely — and with it
+    // `classify_redundant`, which runs one full extra dogleg solve per
+    // redundant constraint.
+    let (dof, conflicts) = if diagnostics {
+        // `System::partition` only includes parameters referenced by a
+        // constraint, so an otherwise registered but unconstrained coordinate (e.g. a
+        // line's X after only a Horizontal constraint pins its Ys) is invisible
+        // to `diagnose` entirely, undercounting DOF. Every such untouched free
+        // param is unconstrained on its own, i.e. exactly 1 DOF each — added
+        // back here rather than fixed in `kernel_constraints::diagnosis`, which correctly
+        // has no opinion on params outside the `SubSystem` it was handed.
+        let total_free: usize = cache
+            .values()
+            .map(|g| match g {
+                EntityGeom::Point(_) => 2,
+                EntityGeom::TextLine(_)
+                | EntityGeom::Line(_)
+                | EntityGeom::Ray(_)
+                | EntityGeom::XLine(_) => 4,
+                EntityGeom::Polyline { points, arcs, .. } => {
+                    points.len() * 2 + arcs.iter().flatten().count() * 5
+                }
+                EntityGeom::Circle(_) => 3,
+                // Raw param count (center×2, rad, start×2, end×2, both
+                // angles) — same "raw, not netted against its own
+                // constraints" convention as every other arm here. The four
+                // arc-rules `CurveValue` constraints (always present, added
+                // just above) already reduce this to 5 *effective* DOF through
+                // the normal `touched_free`/`diag.dof` accounting below, the
+                // same way any other constraint would.
+                EntityGeom::Arc(_) => 9,
+                EntityGeom::Ellipse(_) => 5,
+                EntityGeom::Spline { curve, .. } => curve.poles.len() * 2,
+            })
+            .sum();
+        let touched_free: usize = partitions.iter().map(|s| s.p_size()).sum();
+        let mut dof = total_free.saturating_sub(touched_free);
+        let mut conflicts: Vec<(ConstraintId, kernel_constraints::diagnosis::RedundancyKind)> =
+            Vec::new();
+        for sub in &partitions {
+            let diag = kernel_constraints::diagnosis::diagnose(sub, sys.store());
+            dof += diag.dof;
+            if diag.redundant.is_empty() {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let reportable: Vec<_> = diag
+                .redundant
+                .iter()
+                .copied()
+                .filter(|row| {
+                    owner
+                        .iter()
+                        .find(|(rc, _)| Rc::ptr_eq(rc, &sub.constraints()[*row]))
+                        .is_some_and(|(_, id)| seen.insert(*id))
+                })
+                .collect();
+            for (row, kind) in
+                kernel_constraints::diagnosis::classify_redundant(sub, sys.store(), &reportable)
+            {
+                let row_constraint = &sub.constraints()[row];
+                if let Some(&(_, id)) = owner.iter().find(|(rc, _)| Rc::ptr_eq(rc, row_constraint))
+                {
+                    conflicts.push((id, kind));
+                }
+            }
+        }
+        (dof, conflicts)
+    } else {
+        (0, Vec::new())
+    };
 
+    let satisfied = owner
+        .iter()
+        .all(|(constraint, _)| constraint.error(sys.store()).abs() <= SATISFIED_TOL);
     let store = sys.store();
     let mut results = Vec::new();
     for (&handle, geom) in &cache {
@@ -3663,15 +3758,15 @@ fn solve_scope(
             _ => {}
         }
     }
-    apply_smooth_constraints(document, set, &mut results);
+    apply_smooth_constraints(document, constraint_view, &mut results);
     apply_spatial_concentric_constraints(
         document,
-        set,
+        constraint_view,
         driven_refs,
         initial_fixed_refs,
         &mut results,
     );
-    Some((results, dof, conflicts))
+    Some((results, dof, conflicts, satisfied))
 }
 
 impl Scene {
@@ -3789,7 +3884,11 @@ impl Scene {
         &mut self,
         changes: &[(Handle, ChangeKind)],
     ) -> Vec<(Handle, ChangeKind)> {
-        self.refresh_parametric_constraints_with_policy(changes, &[], false)
+        let refreshed = self.refresh_parametric_constraints_with_policy(changes, &[], false);
+        // This entry point reports nothing, so it leaves no moved record for
+        // a later solve to inherit.
+        self.solve_moved.clear();
+        refreshed
     }
 
     #[allow(dead_code)]
@@ -3826,7 +3925,10 @@ impl Scene {
         )
     }
 
-    pub(crate) fn refresh_parametric_constraints_with_initial_policy(
+    /// `doc(hidden)` public only so `benches/parametric_constraint_refresh.rs`
+    /// can time the real per-command-commit production entry point.
+    #[doc(hidden)]
+    pub fn refresh_parametric_constraints_with_initial_policy(
         &mut self,
         changes: &[(Handle, ChangeKind)],
         driven_refs: &[ParametricRef],
@@ -3834,6 +3936,7 @@ impl Scene {
         retained_originals: &[(Handle, EntityType)],
         initial_fixed_refs: &[ParametricRef],
     ) -> Vec<(Handle, ChangeKind)> {
+        self.solve_moved.clear();
         // An erased entity takes its constraints with it instead of leaving
         // dangling references. Done first,
         // and unconditionally over every scope (not just ones a `touched`
@@ -3846,24 +3949,136 @@ impl Scene {
         // `document.objects` and neither of those directories ever saw this
         // mutation) — one undo press now restores both the entity and its
         // constraints together.
-        for (handle, kind) in changes {
-            if *kind != ChangeKind::Removed {
-                continue;
-            }
-            for i in 0..self.parametric_constraints.len() {
-                if self.parametric_constraints[i]
-                    .constraints
-                    .iter()
-                    .any(|constraint| constraint.refs.iter().any(|r| r.entity == *handle))
-                {
-                    let scope = self.parametric_constraints[i].scope;
-                    let before = self.parametric_constraints[i].clone();
-                    self.record_undo_parametric_constraints_before(scope, before);
-                    self.parametric_constraints[i].remove_all_touching(*handle);
-                    // Erasing an entity deletes its constraints with it — the
-                    // glyph set changed.
-                    self.bump_constraints_epoch();
+        //
+        // The removed-handle → scope-indices map inverts the old per-handle
+        // × per-scope `constraints.iter().any(...)` scans: one pass over
+        // every constraint's refs against a hashed removed-handle set,
+        // replacing O(removed × scopes × constraints) predicate evaluations
+        // with O(constraints + removed + hits). The per-(handle, scope)
+        // record/remove/bump sequence below is unchanged, so the undo
+        // before-image ordering and the epoch-bump count match the scan
+        // exactly. The before-image clone happens only when the recording is
+        // open and this scope has not been recorded yet:
+        // `record_undo_parametric_constraints_before` is first-touch-wins,
+        // so every later hit would have dropped the clone anyway.
+        let removed_handles: rustc_hash::FxHashSet<Handle> = changes
+            .iter()
+            .filter_map(|(handle, kind)| (*kind == ChangeKind::Removed).then_some(*handle))
+            .collect();
+        if !removed_handles.is_empty() {
+            let mut touching_removed: rustc_hash::FxHashMap<Handle, Vec<usize>> =
+                rustc_hash::FxHashMap::default();
+            for (index, set) in self.parametric_constraints.iter().enumerate() {
+                for constraint in set.constraints.iter() {
+                    for reference in constraint.refs.iter() {
+                        if removed_handles.contains(&reference.entity) {
+                            let scopes = touching_removed.entry(reference.entity).or_default();
+                            if scopes.last() != Some(&index) {
+                                scopes.push(index);
+                            }
+                        }
+                    }
                 }
+            }
+            let mut orphaned_dimensions: Vec<Handle> = Vec::new();
+            let mut orphaned_parameters: Vec<String> = Vec::new();
+            for (handle, kind) in changes {
+                if *kind != ChangeKind::Removed {
+                    continue;
+                }
+                let Some(scopes) = touching_removed.get(handle) else {
+                    continue;
+                };
+                for &index in scopes {
+                    let scope = self.parametric_constraints[index].scope;
+                    let missing_before = self.undo_recording.as_ref().is_some_and(|recording| {
+                        !recording
+                            .parametric_constraints_before
+                            .contains_key(&scope)
+                    });
+                    if missing_before {
+                        let before = self.parametric_constraints[index].clone();
+                        self.record_undo_parametric_constraints_before(scope, before);
+                    }
+                    // What this erase orphans: the dimension each constraint
+                    // drew (not a participant, so nothing else deletes it) and
+                    // the parameter it drives.
+                    {
+                        let set = &self.parametric_constraints[index];
+                        for constraint in &set.constraints {
+                            if !constraint
+                                .refs
+                                .iter()
+                                .any(|reference| reference.entity == *handle)
+                            {
+                                continue;
+                            }
+                            if let Some(dimension) = set.dimensions.get(&constraint.id).copied() {
+                                if !orphaned_dimensions.contains(&dimension) {
+                                    orphaned_dimensions.push(dimension);
+                                }
+                            }
+                            if let Some(crate::scene::named_parameters::DrivingValue::Named(name)) =
+                                &constraint.driving_param
+                            {
+                                if !orphaned_parameters.contains(name) {
+                                    orphaned_parameters.push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    let removed = self.parametric_constraints[index].remove_all_touching(*handle);
+                    // Erasing an entity deletes its constraints with it — the
+                    // glyph set changed. Bumped exactly when the removal took
+                    // something, which is precisely when the old raw-ref
+                    // predicate held for this (handle, scope) pair.
+                    if !removed.is_empty() {
+                        self.bump_constraints_epoch();
+                    }
+                }
+            }
+            // The constraint's own records go with it: its dimension is erased
+            // and its parameter is dropped only when no surviving constraint
+            // reads it. The erase re-enters this refresh, which finds no
+            // constraint naming a dimension; its `solve_moved` clear is
+            // harmless because this purge runs before the outer solve.
+            self.drop_unread_named_parameters(orphaned_parameters);
+            if !orphaned_dimensions.is_empty() {
+                self.erase_constraint_owned(&orphaned_dimensions);
+            }
+        }
+
+        // A dimension erased on its own leaves its set pointing at a handle
+        // that is gone; a later block save rejects a dimension it cannot find.
+        if !removed_handles.is_empty() {
+            let stale: Vec<usize> = self
+                .parametric_constraints
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| {
+                    set.dimensions
+                        .values()
+                        .any(|dimension| removed_handles.contains(dimension))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in stale {
+                let scope = self.parametric_constraints[index].scope;
+                // First-touch wins: an image recorded earlier in this
+                // transaction still holds the entry this drop removes.
+                let missing_before = self.undo_recording.as_ref().is_some_and(|recording| {
+                    !recording.parametric_constraints_before.contains_key(&scope)
+                });
+                if missing_before {
+                    let before = self.parametric_constraints[index].clone();
+                    self.record_undo_parametric_constraints_before(scope, before);
+                }
+                self.parametric_constraints[index]
+                    .dimensions
+                    .retain(|_, dimension| !removed_handles.contains(dimension));
+                // The glyph set counts constraints without a dimension, so a
+                // dropped entry changes which badges are drawn.
+                self.bump_constraints_epoch();
             }
         }
 
@@ -3890,27 +4105,59 @@ impl Scene {
             HashMap::new()
         };
         let mut result = Vec::new();
+        // Inverted touched check: a small change set (the common
+        // single-entity edit) still probes each scope's touch index once
+        // per change as before, but a bulk change set walks the scope's
+        // constraint list once against a hashed change set — O(total refs)
+        // per scope instead of O(changes × scope). The two probes are
+        // equivalent: `constraints_touching(h).next().is_some()` exists
+        // iff some enabled constraint in the scope references `h`.
+        let mut changed: Option<rustc_hash::FxHashSet<Handle>> = None;
         for i in 0..self.parametric_constraints.len() {
-            let touched = changes.iter().any(|(handle, _)| {
-                self.parametric_constraints[i]
-                    .constraints_touching(*handle)
-                    .next()
-                    .is_some()
-            });
+            let set = &self.parametric_constraints[i];
+            let touched = if changes.len() <= set.constraints.len() {
+                changes
+                    .iter()
+                    .any(|(handle, _)| set.constraints_touching(*handle).next().is_some())
+            } else {
+                let changed = changed
+                    .get_or_insert_with(|| changes.iter().map(|(handle, _)| *handle).collect());
+                set.constraints.iter().any(|constraint| {
+                    constraint.enabled
+                        && constraint
+                            .refs
+                            .iter()
+                            .any(|reference| changed.contains(&reference.entity))
+                })
+            };
             if !touched {
                 continue;
             }
-            let Some((solved, dof, conflicts)) = solve_scope(
-                &self.document,
-                &self.named_parameters,
-                &self.parametric_constraints[i],
-                driven_refs,
-                retain_size,
-                true,
-                &retained_before,
-                initial_fixed_refs,
-                &originals,
-            ) else {
+            let view: Vec<&ParametricConstraint> =
+                self.parametric_constraints[i].constraints.iter().collect();
+            let solve = |retain_lengths: bool| {
+                solve_scope(
+                    &self.document,
+                    &self.named_parameters,
+                    &self.parametric_constraints[i].local_parameters,
+                    &view,
+                    driven_refs,
+                    retain_size,
+                    retain_lengths,
+                    &retained_before,
+                    initial_fixed_refs,
+                    &originals,
+                    true,
+                )
+            };
+            // Kept lengths are a preference: when holding every edge length
+            // leaves the constraints unmet (a second perpendicular on a
+            // closed polyline), the edges give way rather than nothing
+            // moving at all.
+            let Some((solved, dof, conflicts, _)) = (match solve(true) {
+                Some(result) if !result.3 => solve(false).filter(|loose| loose.3).or(Some(result)),
+                other => other,
+            }) else {
                 continue;
             };
             if initial_fixed_refs.is_empty() {
@@ -3960,11 +4207,20 @@ impl Scene {
                     }
                     _ => new_entity,
                 };
-                if let Some(before) = self.document.get_entity_arc(handle) {
+                let before = self.document.get_entity_arc(handle);
+                // A handle the solve names but the document no longer holds is
+                // not geometry the solve moved.
+                let moved = before
+                    .as_deref()
+                    .is_some_and(|before| before != &new_entity);
+                if let Some(before) = before {
                     self.record_undo_before(handle, Some(before));
                 }
                 if let Some(slot) = self.document.get_entity_mut(handle) {
                     *slot = new_entity;
+                }
+                if moved {
+                    self.solve_moved.push(handle);
                 }
                 result.push((handle, ChangeKind::Modified));
             }
@@ -3975,7 +4231,11 @@ impl Scene {
     /// Re-solves touched scopes during a grip drag without mutating the
     /// document or recording undo. The caller owns preview write-back and the
     /// final gesture history entry.
-    pub(crate) fn solve_parametric_constraints_preview(
+    ///
+    /// `doc(hidden)` public only so `benches/parametric_preview_solve.rs`
+    /// can time the real per-move production entry point.
+    #[doc(hidden)]
+    pub fn solve_parametric_constraints_preview(
         &self,
         touched: &[Handle],
         driven_refs: &[ParametricRef],
@@ -3998,16 +4258,27 @@ impl Scene {
                 continue;
             }
             let connected = self.parametric_connected_handles(set.scope, touched, true);
-            let mut component = set.clone();
-            component.constraints.retain(|constraint| {
-                constraint
-                    .refs
-                    .iter()
-                    .any(|reference| connected.contains(&reference.entity))
-            });
-            let Some((solved, _dof, _conflicts)) = solve_scope(
+            // Borrowed view of just the connected component — `solve_scope`
+            // takes the constraint slice directly, so the previous deep
+            // clone of the whole `ParametricConstraintSet` per mouse move is
+            // gone.
+            let component: Vec<&ParametricConstraint> = set
+                .constraints
+                .iter()
+                .filter(|constraint| {
+                    constraint
+                        .refs
+                        .iter()
+                        .any(|reference| connected.contains(&reference.entity))
+                })
+                .collect();
+            // `diagnostics = false`: the preview discards DOF/conflicts (the
+            // commit path recomputes and stores them for the badges), so the
+            // per-move `diagnose`/`classify_redundant` work is skipped.
+            let Some((solved, _dof, _conflicts, _)) = solve_scope(
                 &self.document,
                 &self.named_parameters,
+                &set.local_parameters,
                 &component,
                 driven_refs,
                 retain_size,
@@ -4015,6 +4286,7 @@ impl Scene {
                 &retained_before,
                 &[],
                 &retained_before,
+                false,
             ) else {
                 continue;
             };
@@ -4028,11 +4300,22 @@ impl Scene {
 mod tests {
     use super::super::named_parameters::DrivingValue;
     use super::super::parametric_constraints::{
-        ConstraintKind, ParametricConstraintSet, ParametricRef, ParametricScope,
+        ConstraintKind, ParametricConstraint, ParametricConstraintSet, ParametricRef,
+        ParametricScope,
     };
     use super::Scene;
     use codec::entities::EntityType;
     use codec::types::Vector3;
+
+    /// `constraints_in_drawing_order` over a standalone set (test helper —
+    /// the production paths borrow the view from a scene-owned set).
+    fn constraints_in_drawing_order<'a>(
+        document: &codec::Document,
+        set: &'a ParametricConstraintSet,
+    ) -> Vec<&'a ParametricConstraint> {
+        let view: Vec<&ParametricConstraint> = set.constraints.iter().collect();
+        super::constraints_in_drawing_order(document, &view)
+    }
 
     fn spatial_circle(center: Vector3, radius: f64) -> codec::entities::Circle {
         let normal = Vector3::UNIT_Y;
@@ -4043,6 +4326,68 @@ mod tests {
         let mut circle = codec::entities::Circle::from_coords(x, y, z, radius);
         circle.normal = normal;
         circle
+    }
+
+    #[test]
+    fn sweep_order_propagation_matches_literal_sweeps() {
+        use std::collections::HashSet;
+        fn literal(pairs: &[(u32, u32)], known: &mut Vec<u32>) -> Vec<(usize, bool)> {
+            let mut fired = Vec::new();
+            loop {
+                let before = fired.len();
+                for (index, &(a, b)) in pairs.iter().enumerate() {
+                    match (known.contains(&a), known.contains(&b)) {
+                        (true, false) => {
+                            known.push(b);
+                            fired.push((index, true));
+                        }
+                        (false, true) => {
+                            known.push(a);
+                            fired.push((index, false));
+                        }
+                        _ => {}
+                    }
+                }
+                if fired.len() == before {
+                    return fired;
+                }
+            }
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u32
+        };
+        for case in 0..500 {
+            let nodes = 2 + case % 40;
+            let pairs: Vec<(u32, u32)> = (0..next(3 * nodes) + 1)
+                .map(|_| (next(nodes), next(nodes)))
+                .collect();
+            let seeds: Vec<u32> = (0..next(3) + 1).map(|_| next(nodes)).collect();
+            let mut expected_known = seeds.clone();
+            let expected = literal(&pairs, &mut expected_known);
+            let mut known: HashSet<u32> = seeds.into_iter().collect();
+            let fired = super::propagate_in_sweep_order(&pairs, &mut known);
+            assert_eq!(fired, expected, "case {case}: {pairs:?}");
+            assert_eq!(known, expected_known.into_iter().collect::<HashSet<_>>());
+        }
+        // A chain against the sweep direction, one link learned per sweep.
+        let chain: Vec<(u32, u32)> = (0..200).map(|i| (i, i + 1)).collect();
+        let mut known: HashSet<u32> = [200].into_iter().collect();
+        let fired = super::propagate_in_sweep_order(&chain, &mut known);
+        let expected: Vec<(usize, bool)> = (0..200).rev().map(|i| (i, false)).collect();
+        assert_eq!(fired, expected);
+
+        // A cycle seeded at two nodes: the lower index learns its neighbour in
+        // the same sweep, and the pair closing the cycle fires nothing.
+        let cycle = [(0, 1), (1, 2), (2, 3), (3, 0)];
+        let mut expected_known = vec![0, 3];
+        let expected = literal(&cycle, &mut expected_known);
+        let mut known: HashSet<u32> = [0, 3].into_iter().collect();
+        assert_eq!(super::propagate_in_sweep_order(&cycle, &mut known), expected);
+        assert_eq!(known, expected_known.into_iter().collect::<HashSet<_>>());
     }
 
     #[test]
@@ -4081,7 +4426,7 @@ mod tests {
                 for reference in refs.iter().rev() {
                     set.add(ConstraintKind::Fixed, vec![*reference], None);
                 }
-                let ordered = super::constraints_in_drawing_order(&scene.document, &set);
+                let ordered = constraints_in_drawing_order(&scene.document, &set);
                 assert_eq!(ordered.iter().map(|c| c.refs[0]).collect::<Vec<_>>(), refs);
                 assert_eq!(
                     super::polyline_ref_order(&scene.document, ParametricRef::segment(handle, 1)),
@@ -4120,7 +4465,7 @@ mod tests {
                 None,
             );
         }
-        let ordered = super::constraints_in_drawing_order(&scene.document, &set);
+        let ordered = constraints_in_drawing_order(&scene.document, &set);
         assert_eq!(
             ordered.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![2, 1, 0]
@@ -4153,7 +4498,7 @@ mod tests {
             vec![ParametricRef::whole(line)],
             None,
         );
-        let ordered = super::constraints_in_drawing_order(&scene.document, &set);
+        let ordered = constraints_in_drawing_order(&scene.document, &set);
         assert_eq!(
             ordered.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![0, 1, 2]
@@ -4964,6 +5309,7 @@ mod tests {
             ],
             &[first_ref],
             true,
+            &[],
         );
 
         let EntityType::Circle(first_circle) = scene.document.get_entity(first).unwrap() else {
@@ -5015,5 +5361,78 @@ mod tests {
             };
             assert!((circle.center_wcs() - driven_center).length() < 1.0e-9);
         }
+    }
+
+    /// A constraint addition's solve can move geometry the command never
+    /// named. The scene records exactly that geometry: never the command's own
+    /// entities, and never an annotation whose label merely refreshed.
+    #[test]
+    fn a_constraint_add_records_only_the_geometry_it_moves_outside_the_command() {
+        use crate::modules::annotate::linear_dim::linear_dimension_entity;
+
+        let long = codec::Handle::new(1);
+        let label = codec::Handle::new(2);
+        let constrained = codec::Handle::new(3);
+        let mut scene = Scene::new();
+        let mut line = codec::entities::Line::from_points(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(200.0, 0.0, 0.0),
+        );
+        line.common.handle = long;
+        scene.document.add_entity(EntityType::Line(line)).unwrap();
+        let mut other = codec::entities::Line::from_points(
+            Vector3::new(0.0, 50.0, 0.0),
+            Vector3::new(10.0, 60.0, 0.0),
+        );
+        other.common.handle = constrained;
+        scene.document.add_entity(EntityType::Line(other)).unwrap();
+        // A dynamic dimension on the long line. The solve refreshes its label,
+        // but a label is not geometry the solve moved.
+        let dimension = linear_dimension_entity(
+            glam::DVec3::new(0.0, 0.0, 0.0),
+            glam::DVec3::new(200.0, 0.0, 0.0),
+            glam::DVec3::new(100.0, -10.0, 0.0),
+            glam::DVec3::Y,
+            None,
+        );
+        let mut dimension = match dimension {
+            EntityType::Dimension(dimension) => dimension,
+            _ => panic!("the builder must return a dimension"),
+        };
+        dimension.base_mut().common.handle = label;
+        dimension.base_mut().common.layer =
+            super::super::parametric_constraints::DYNAMIC_DIMENSION_LAYER.to_string();
+        scene
+            .document
+            .add_entity(EntityType::Dimension(dimension))
+            .unwrap();
+        let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
+        let id = set.add(
+            ConstraintKind::DistanceX,
+            vec![ParametricRef::point(long, 0), ParametricRef::point(long, 1)],
+            Some(DrivingValue::Literal(100.0)),
+        );
+        set.dimensions.insert(id, label);
+        let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
+        set.add(
+            ConstraintKind::Horizontal,
+            vec![ParametricRef::whole(constrained)],
+            None,
+        );
+
+        scene.bump_entities_after_constraint_added(
+            &[(constrained, super::ChangeKind::Modified)],
+            &[],
+            false,
+            &[],
+        );
+
+        // The horizontal constraint moves the named, slanted line as well;
+        // only the line nobody named may be reported.
+        assert_eq!(
+            scene.constraint_network_moves,
+            vec![long],
+            "only the line nobody named is reported"
+        );
     }
 }

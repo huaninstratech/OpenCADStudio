@@ -9,11 +9,11 @@ use crate::ui::style::row_button::{cell_button_style, header_button_style};
 use crate::ui::ROW_H;
 use codec::tables::layer::Layer as DocLayer;
 use codec::tables::Table;
-use codec::types::aci_table::aci_to_rgb;
 use codec::types::{Color as AcadColor, LineWeight};
 use codec::Handle;
 use iced::widget::{
-    button, column, combo_box, container, mouse_area, row, scrollable, text, text_input, tooltip,
+    button, checkbox, column, combo_box, container, mouse_area, row, scrollable, text, text_input,
+    tooltip,
 };
 use iced::Padding;
 use iced::{Background, Border, Color, Element, Fill, Length, Theme};
@@ -25,6 +25,15 @@ use std::borrow::Cow;
 pub struct VpCol {
     pub handle: Handle,
     pub label: String,
+}
+
+/// A layout viewport as the Layer Manager shows it: its frozen layers and
+/// its layer colour overrides.
+pub struct ViewportLayers {
+    pub handle: Handle,
+    pub label: String,
+    pub frozen: Vec<Handle>,
+    pub colors: Vec<(Handle, AcadColor)>,
 }
 
 /// Sortable column in the Layer Manager table. Clicking a header sorts by
@@ -40,6 +49,121 @@ pub enum LayerSortCol {
     Linetype,
     Lineweight,
     Transparency,
+}
+
+impl LayerSortCol {
+    /// The name a column is saved under.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::On => "On",
+            Self::Freeze => "Freeze",
+            Self::Lock => "Lock",
+            Self::Plot => "Plot",
+            Self::Color => "Color",
+            Self::Linetype => "Linetype",
+            Self::Lineweight => "Lineweight",
+            Self::Transparency => "Transparency",
+        }
+    }
+
+    fn label(self) -> Cow<'static, str> {
+        match self {
+            Self::Name => t!("Name"),
+            Self::On => t!("On"),
+            Self::Freeze => t!("Freeze"),
+            Self::Lock => t!("Lock"),
+            Self::Plot => t!("Plot"),
+            Self::Color => t!("Color"),
+            Self::Linetype => t!("Linetype"),
+            Self::Lineweight => t!("Lineweight"),
+            Self::Transparency => t!("Transparency"),
+        }
+    }
+
+    fn width(self) -> f32 {
+        match self {
+            Self::Color => COL_COLOR,
+            Self::Linetype => COL_LT,
+            Self::Lineweight => COL_LW,
+            Self::Transparency => COL_TRANS,
+            _ => COL_ICON,
+        }
+    }
+}
+
+/// The columns after Name that can be moved and hidden, in their default
+/// order.
+const COLUMNS: [LayerSortCol; 8] = [
+    LayerSortCol::On,
+    LayerSortCol::Freeze,
+    LayerSortCol::Lock,
+    LayerSortCol::Plot,
+    LayerSortCol::Color,
+    LayerSortCol::Linetype,
+    LayerSortCol::Lineweight,
+    LayerSortCol::Transparency,
+];
+
+thread_local! {
+    /// The columns' order and which show; a user preference (UI thread).
+    static COLUMN_LAYOUT: std::cell::RefCell<Vec<(LayerSortCol, bool)>> =
+        std::cell::RefCell::new(COLUMNS.iter().map(|&col| (col, true)).collect());
+}
+
+pub fn column_layout() -> Vec<(LayerSortCol, bool)> {
+    COLUMN_LAYOUT.with(|layout| layout.borrow().clone())
+}
+
+/// The layout as saved: column names in order, a hidden one led by `-`.
+pub fn column_layout_names() -> Vec<String> {
+    column_layout()
+        .into_iter()
+        .map(|(col, shown)| format!("{}{}", if shown { "" } else { "-" }, col.key()))
+        .collect()
+}
+
+/// The saved layout back; unknown names are skipped and columns the save
+/// lacks come last, shown.
+pub fn set_column_layout_names(names: &[String]) {
+    let mut layout: Vec<(LayerSortCol, bool)> = names
+        .iter()
+        .filter_map(|name| {
+            let (shown, key) = match name.strip_prefix('-') {
+                Some(key) => (false, key),
+                None => (true, name.as_str()),
+            };
+            COLUMNS.iter().find(|col| col.key() == key).map(|&col| (col, shown))
+        })
+        .collect();
+    for col in COLUMNS {
+        if !layout.iter().any(|(c, _)| *c == col) {
+            layout.push((col, true));
+        }
+    }
+    layout.dedup_by_key(|(col, _)| *col);
+    COLUMN_LAYOUT.with(|current| *current.borrow_mut() = layout);
+}
+
+/// Show or hide `col`.
+pub fn toggle_column(col: LayerSortCol) {
+    COLUMN_LAYOUT.with(|layout| {
+        if let Some(entry) = layout.borrow_mut().iter_mut().find(|(c, _)| *c == col) {
+            entry.1 = !entry.1;
+        }
+    });
+}
+
+/// Move `col` one place left (`-1`) or right (`1`).
+pub fn move_column(col: LayerSortCol, step: i8) {
+    COLUMN_LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        let Some(at) = layout.iter().position(|(c, _)| *c == col) else {
+            return;
+        };
+        let to = (at as i64 + i64::from(step)).clamp(0, layout.len() as i64 - 1) as usize;
+        layout.swap(at, to);
+    });
 }
 
 // ── Row-height-derived constants ─────────────────────────────────────────
@@ -71,6 +195,8 @@ pub struct Layer {
     pub transparency: i32,
     /// Freeze state per-viewport, indexed parallel to LayerPanel::vp_cols.
     pub vp_frozen: Vec<bool>,
+    /// Colour override per-viewport, parallel to `vp_frozen`.
+    pub vp_colors: Vec<Option<AcadColor>>,
 }
 
 impl Layer {
@@ -88,6 +214,7 @@ impl Layer {
             lineweight: LineWeight::Default,
             transparency: 0,
             vp_frozen: vec![],
+            vp_colors: vec![],
         }
     }
 }
@@ -123,6 +250,13 @@ pub struct LayerPanel {
     pub sort_asc: bool,
     /// Live name filter from the search box; empty shows every layer (#343).
     pub filter: String,
+    /// The column chooser (a right-click on the header) is open; it stays
+    /// open while columns are ticked, until Close.
+    pub columns_menu: bool,
+    /// The drawing's layer groups by layer name.
+    pub groups: Vec<(String, Vec<String>)>,
+    /// The group shown, `None` for every layer.
+    pub group: Option<String>,
 }
 
 impl Default for LayerPanel {
@@ -152,17 +286,101 @@ impl Default for LayerPanel {
             sort_col: Some(LayerSortCol::Name),
             sort_asc: true,
             filter: String::new(),
+            columns_menu: false,
+            groups: Vec::new(),
+            group: None,
         }
     }
 }
 
 impl LayerPanel {
+    /// Take the drawing's groups; a shown group that is gone shows all.
+    pub fn set_groups(&mut self, groups: Vec<(String, Vec<String>)>) {
+        if let Some(shown) = &self.group {
+            if !groups.iter().any(|(name, _)| name == shown) {
+                self.group = None;
+            }
+        }
+        self.groups = groups;
+    }
+
+    /// The selected rows' layer names.
+    pub fn selected_names(&self) -> Vec<String> {
+        let mut rows = self.selected_multi.clone();
+        rows.extend(self.selected);
+        rows.sort_unstable();
+        rows.dedup();
+        rows.into_iter()
+            .filter_map(|row| self.layers.get(row).map(|layer| layer.name.clone()))
+            .collect()
+    }
+
+    /// The group bar under the toolbar: the group shown, a new group from
+    /// the selection, adding the selection to a group, taking it out of the
+    /// shown group and deleting that group.
+    fn group_bar(&self) -> Element<'_, Message> {
+        let all = crate::tr!("layer-groups", "all-layers");
+        let mut shown_options = vec![all.clone()];
+        shown_options.extend(self.groups.iter().map(|(name, _)| name.clone()));
+        let shown = self.group.clone().unwrap_or_else(|| all.clone());
+        let has_selection = !self.selected_names().is_empty();
+        let names: Vec<String> = self.groups.iter().map(|(name, _)| name.clone()).collect();
+        let show = crate::ui::dropdown_list::pick_list(Some(shown), shown_options, |v| v.to_string())
+            .on_select(move |picked| {
+                Message::LayerGroupShow((picked != all).then_some(picked))
+            })
+            .text_size(FONT_SZ)
+            .padding([3, 6])
+            .width(Length::Fixed(170.0));
+        let add_to: Element<'_, Message> = if has_selection && !names.is_empty() {
+            crate::ui::dropdown_list::pick_list(None::<String>, names, |v| v.to_string())
+                .on_select(Message::LayerGroupAdd)
+                .placeholder(crate::tr!("layer-groups", "add-to"))
+                .text_size(FONT_SZ)
+                .padding([3, 6])
+                .width(Length::Fixed(150.0))
+                .into()
+        } else {
+            iced::widget::Space::new().width(0).into()
+        };
+        let in_group = self.group.is_some();
+        container(
+            row![
+                show,
+                toolbar_btn_cond(
+                    crate::ui::icons::FOLDER_OPEN,
+                    crate::tr!("layer-groups", "new-group").into(),
+                    Message::LayerGroupNew,
+                    has_selection,
+                ),
+                add_to,
+                toolbar_btn_cond(
+                    crate::ui::icons::MINUS,
+                    crate::tr!("layer-groups", "remove").into(),
+                    Message::LayerGroupRemove,
+                    in_group && has_selection,
+                ),
+                toolbar_btn_cond(
+                    crate::ui::icons::TRASH,
+                    crate::tr!("layer-groups", "delete").into(),
+                    Message::LayerGroupDelete,
+                    in_group,
+                ),
+            ]
+            .spacing(4)
+            .align_y(iced::Center),
+        )
+        .width(Length::Fill)
+        .padding([2, 8])
+        .into()
+    }
+
     /// Sync layers + update per-viewport freeze columns.
     /// `vp_info`: list of (vp_handle, vp_label, frozen_layer_handles) from scene.
     pub fn sync_with_viewports(
         &mut self,
         doc_layers: &Table<DocLayer>,
-        vp_info: Vec<(Handle, String, Vec<Handle>)>,
+        vp_info: Vec<ViewportLayers>,
     ) {
         // The rebuild below re-indexes rows, so capture the selection by name
         // first and re-resolve it after (indices alone would go stale).
@@ -178,9 +396,9 @@ impl LayerPanel {
 
         self.vp_cols = vp_info
             .iter()
-            .map(|(h, label, _)| VpCol {
-                handle: *h,
-                label: label.clone(),
+            .map(|vp| VpCol {
+                handle: vp.handle,
+                label: vp.label.clone(),
             })
             .collect();
 
@@ -192,7 +410,16 @@ impl LayerPanel {
                 let layer_handle = l.handle;
                 let vp_frozen = vp_info
                     .iter()
-                    .map(|(_, _, frozen_handles)| frozen_handles.contains(&layer_handle))
+                    .map(|vp| vp.frozen.contains(&layer_handle))
+                    .collect();
+                let vp_colors = vp_info
+                    .iter()
+                    .map(|vp| {
+                        vp.colors
+                            .iter()
+                            .find(|(layer, _)| *layer == layer_handle)
+                            .map(|(_, color)| *color)
+                    })
                     .collect();
                 Layer {
                     name: l.name.clone(),
@@ -211,6 +438,7 @@ impl LayerPanel {
                     lineweight: l.line_weight,
                     transparency: (l.transparency.as_percent() * 100.0).round() as i32,
                     vp_frozen,
+                    vp_colors,
                 }
             })
             .collect();
@@ -304,9 +532,16 @@ impl LayerPanel {
     /// these; raw `selected_multi` ranges would sweep in hidden rows (#50).
     pub fn visible_indices(&self) -> Vec<usize> {
         let filter = self.filter.to_lowercase();
+        let members = self.group.as_ref().and_then(|shown| {
+            self.groups
+                .iter()
+                .find(|(name, _)| name == shown)
+                .map(|(_, layers)| layers)
+        });
         self.layers
             .iter()
             .enumerate()
+            .filter(|(_, layer)| members.is_none_or(|members| members.contains(&layer.name)))
             .filter(|(_, layer)| filter.is_empty() || layer.name.to_lowercase().contains(&filter))
             .map(|(i, _)| i)
             .collect()
@@ -315,11 +550,14 @@ impl LayerPanel {
     /// The Layer Manager as a dock pallet: its title bar, the toolbar across
     /// the pallet (search box on the right), then the table, at least as wide
     /// as the pallet and scrolling sideways when the pallet is narrower.
+    /// `active_vp`: the layout viewport being worked in, whose columns are
+    /// then the only ones shown.
     pub fn view_panel(
         &self,
         name_col_w: f32,
         width: f32,
         chrome: crate::ui::dock::Chrome,
+        active_vp: Option<Handle>,
     ) -> Element<'_, Message> {
         use crate::ui::dock::PanelId;
         let title_bar = crate::ui::dock::title_bar(
@@ -328,7 +566,7 @@ impl LayerPanel {
             chrome,
         );
         // Inside the pallet's 1 px border on either side.
-        let body = self.view_content(name_col_w, (width - 2.0).max(0.0));
+        let body = self.view_content(name_col_w, (width - 2.0).max(0.0), active_vp);
         container(column![title_bar, body])
             .width(Length::Fixed(width))
             .height(Length::Fill)
@@ -345,7 +583,14 @@ impl LayerPanel {
     }
 
     /// Toolbar and table for a pallet `inner_w` wide.
-    fn view_content(&self, name_col_w: f32, inner_w: f32) -> Element<'_, Message> {
+    fn view_content(
+        &self,
+        name_col_w: f32,
+        inner_w: f32,
+        active_vp: Option<Handle>,
+    ) -> Element<'_, Message> {
+        // A viewport the columns do not list yet shows them all.
+        let active_vp = active_vp.filter(|h| self.vp_cols.iter().any(|vp| vp.handle == *h));
         let has_sel = self.selected.is_some();
         let sel_is_zero = self
             .selected
@@ -416,66 +661,27 @@ impl LayerPanel {
             )
             .on_press(Message::LayerNameColGrab)
             .interaction(iced::mouse::Interaction::ResizingHorizontally),
-            sortable_header(t!("On"), LayerSortCol::On, Length::Fixed(COL_ICON), sc, sa),
-            sortable_header(
-                t!("Freeze"),
-                LayerSortCol::Freeze,
-                Length::Fixed(COL_ICON),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Lock"),
-                LayerSortCol::Lock,
-                Length::Fixed(COL_ICON),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Plot"),
-                LayerSortCol::Plot,
-                Length::Fixed(COL_ICON),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Color"),
-                LayerSortCol::Color,
-                Length::Fixed(COL_COLOR),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Linetype"),
-                LayerSortCol::Linetype,
-                Length::Fixed(COL_LT),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Lineweight"),
-                LayerSortCol::Lineweight,
-                Length::Fixed(COL_LW),
-                sc,
-                sa
-            ),
-            sortable_header(
-                t!("Transparency"),
-                LayerSortCol::Transparency,
-                Length::Fixed(COL_TRANS),
-                sc,
-                sa
-            ),
         ]
         .spacing(4)
         .align_y(iced::Center);
+        for (col, shown) in column_layout() {
+            if shown {
+                header_row = header_row.push(sortable_header(
+                    col.label(),
+                    col,
+                    Length::Fixed(col.width()),
+                    sc,
+                    sa,
+                ));
+            }
+        }
 
-        for vp in &self.vp_cols {
+        for vp in self.vp_cols.iter().filter(|vp| active_vp.is_none_or(|h| h == vp.handle)) {
             header_row = header_row.push(
                 text(vp.label.as_str())
                     .size(10)
                     .style(muted_style)
-                    .width(Length::Fixed(COL_ICON)),
+                    .width(Length::Fixed(COL_ICON * 2.0 + 4.0)),
             );
         }
 
@@ -494,6 +700,9 @@ impl LayerPanel {
             })
             .padding([4, 8])
             .width(Length::Fill);
+        // A right-click on the header chooses the columns.
+        let col_header = iced::widget::mouse_area(col_header)
+            .on_right_press(Message::LayerColumnsMenu(true));
 
         // ── Layer rows ────────────────────────────────────────────────────
         let mut rows_col = column![].spacing(0);
@@ -524,6 +733,7 @@ impl LayerPanel {
                 ltc,
                 lwc,
                 &self.vp_cols,
+                active_vp,
                 name_col_w,
             ));
         }
@@ -551,8 +761,56 @@ impl LayerPanel {
             ))
             .width(Length::Fill)
             .height(Length::Fill);
-        column![toolbar, grid].height(Length::Fill).into()
+        if self.columns_menu {
+            column![toolbar, self.group_bar(), column_chooser(), grid].height(Length::Fill).into()
+        } else {
+            column![toolbar, self.group_bar(), grid].height(Length::Fill).into()
+        }
     }
+}
+
+/// Every movable column with a tick to show it and arrows to move it; it
+/// stays open while several are changed.
+fn column_chooser<'a>() -> Element<'a, Message> {
+    let mut list = column![].spacing(2);
+    let layout = column_layout();
+    let last = layout.len().saturating_sub(1);
+    for (n, (col, shown)) in layout.into_iter().enumerate() {
+        let arrow = |up: bool| {
+            let icon = if up {
+                crate::ui::icons::themed_arrow_up(9.0)
+            } else {
+                crate::ui::icons::themed_arrow_down(9.0)
+            };
+            let enabled = if up { n > 0 } else { n < last };
+            button(icon)
+                .on_press_maybe(enabled.then_some(Message::LayerColumnMove(col, if up { -1 } else { 1 })))
+                .style(button::text)
+                .padding([2, 6])
+        };
+        list = list.push(
+            row![
+                checkbox(shown)
+                    .label(col.label())
+                    .text_size(FONT_SZ)
+                    .size(13)
+                    .on_toggle(move |_| Message::LayerColumnToggle(col))
+                    .width(Length::Fill),
+                arrow(true),
+                arrow(false),
+            ]
+            .align_y(iced::Center),
+        );
+    }
+    let close = button(text(t!("Close")).size(FONT_SZ))
+        .on_press(Message::LayerColumnsMenu(false))
+        .padding([2, 10])
+        .style(button::secondary);
+    container(column![list, close].spacing(6))
+        .style(container::bordered_box)
+        .padding(6)
+        .width(Length::Fixed(220.0))
+        .into()
 }
 
 // ── Sorting helpers ─────────────────────────────────────────────────────────
@@ -729,6 +987,7 @@ fn layer_row<'a>(
     lt_combo: Option<&'a combo_box::State<LinetypeItem>>,
     lw_combo_state: Option<&'a combo_box::State<LwItem>>,
     vp_cols: &'a [VpCol],
+    active_vp: Option<Handle>,
     name_col_w: f32,
 ) -> Element<'a, Message> {
     // #22: messages carry the layer name (resolved at dispatch time) so a
@@ -800,18 +1059,24 @@ fn layer_row<'a>(
     } else {
         // ~6 px per glyph at the 10 px row font — track the column width.
         let name_budget = ((name_col_w / 6.0) as usize).max(8);
-        let name_btn =
-            button(text(crate::ui::text_util::elide(&layer.name, name_budget)).size(FONT_SZ))
-                .on_press(Message::LayerRenameStart(lname.clone()))
-                .style(cell_button_style(is_selected, index))
-                .padding(Padding {
-                    top: COMBO_PAD_V,
-                    bottom: COMBO_PAD_V,
-                    left: 4.0,
-                    right: 4.0,
-                })
-                .height(Length::Fixed(ROW_H))
-                .width(Length::Fixed(name_col_w));
+        // One line, cut at the cell: the glyph estimate can run over a narrow
+        // column, and a wrapped name spilled into the rows below (#2251).
+        let name_btn = button(
+            text(crate::ui::text_util::elide(&layer.name, name_budget))
+                .size(FONT_SZ)
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .clip(true)
+        .on_press(Message::LayerRenameStart(lname.clone()))
+        .style(cell_button_style(is_selected, index))
+        .padding(Padding {
+            top: COMBO_PAD_V,
+            bottom: COMBO_PAD_V,
+            left: 4.0,
+            right: 4.0,
+        })
+        .height(Length::Fixed(ROW_H))
+        .width(Length::Fixed(name_col_w));
         // When the name is truncated, reveal the full text on hover so the
         // user can still read it without widening the column.
         if layer.name.chars().count() > name_budget {
@@ -934,38 +1199,84 @@ fn layer_row<'a>(
             .align_y(iced::Center),
         name_cell,
         iced::widget::Space::new().width(2),
-        container(svg_btn(vis_svg, Message::LayerToggleVisible(lname.clone())))
-            .width(Length::Fixed(COL_ICON))
-            .align_x(iced::Center),
-        container(svg_btn(frz_svg, Message::LayerToggleFreeze(lname.clone())))
-            .width(Length::Fixed(COL_ICON))
-            .align_x(iced::Center),
-        container(svg_btn(lck_svg, Message::LayerToggleLock(lname.clone())))
-            .width(Length::Fixed(COL_ICON))
-            .align_x(iced::Center),
-        container(plot_btn)
-            .width(Length::Fixed(COL_ICON))
-            .align_x(iced::Center),
-        color_cell,
-        lt_cell,
-        lw_cell,
-        trans_cell,
     ]
     .spacing(4)
     .width(Fill)
     .align_y(iced::Center);
+    // The movable columns, in the chosen order.
+    let mut cells: Vec<(LayerSortCol, Element<'a, Message>)> = vec![
+        (
+            LayerSortCol::On,
+            container(svg_btn(vis_svg, Message::LayerToggleVisible(lname.clone())))
+                .width(Length::Fixed(COL_ICON))
+                .align_x(iced::Center)
+                .into(),
+        ),
+        (
+            LayerSortCol::Freeze,
+            container(svg_btn(frz_svg, Message::LayerToggleFreeze(lname.clone())))
+                .width(Length::Fixed(COL_ICON))
+                .align_x(iced::Center)
+                .into(),
+        ),
+        (
+            LayerSortCol::Lock,
+            container(svg_btn(lck_svg, Message::LayerToggleLock(lname.clone())))
+                .width(Length::Fixed(COL_ICON))
+                .align_x(iced::Center)
+                .into(),
+        ),
+        (
+            LayerSortCol::Plot,
+            container(plot_btn)
+                .width(Length::Fixed(COL_ICON))
+                .align_x(iced::Center)
+                .into(),
+        ),
+        (LayerSortCol::Color, color_cell),
+        (LayerSortCol::Linetype, lt_cell),
+        (LayerSortCol::Lineweight, lw_cell),
+        (LayerSortCol::Transparency, trans_cell.into()),
+    ];
+    for (col, shown) in column_layout() {
+        if let Some(at) = cells.iter().position(|(c, _)| *c == col) {
+            let (_, cell) = cells.swap_remove(at);
+            if shown {
+                row_content = row_content.push(cell);
+            }
+        }
+    }
 
     // Per-viewport freeze columns
-    for (vp_idx, _vp_col) in vp_cols.iter().enumerate() {
+    for (vp_idx, vp_col) in vp_cols.iter().enumerate() {
+        if active_vp.is_some_and(|h| h != vp_col.handle) {
+            continue;
+        }
         let is_vp_frozen = layer.vp_frozen.get(vp_idx).copied().unwrap_or(false);
         let vp_frz_svg = crate::ui::icons::layer_vp_freeze(is_vp_frozen);
-        row_content = row_content.push(
-            container(svg_btn(
-                vp_frz_svg,
-                Message::LayerToggleVpFreeze(lname.clone(), vp_idx),
+        // The viewport's colour for this layer: its override, else the layer's.
+        let vp_color = layer.vp_colors.get(vp_idx).copied().flatten();
+        let shown = vp_color.unwrap_or(layer.color);
+        let vp_color_btn = button(crate::ui::color_select::swatch(iced_color_from_acad(&shown)))
+            .on_press(Message::OpenColorWindow(
+                crate::app::ColorPickTarget::LayerViewport(lname.clone(), vp_col.handle),
+                shown,
             ))
-            .width(Length::Fixed(COL_ICON))
-            .align_x(iced::Center),
+            .padding(2)
+            .style(button::text);
+        row_content = row_content.push(
+            row![
+                container(svg_btn(
+                    vp_frz_svg,
+                    Message::LayerToggleVpFreeze(lname.clone(), vp_idx),
+                ))
+                .width(Length::Fixed(COL_ICON))
+                .align_x(iced::Center),
+                container(vp_color_btn)
+                    .width(Length::Fixed(COL_ICON))
+                    .align_x(iced::Center),
+            ]
+            .spacing(4),
         );
     }
 
@@ -1003,12 +1314,8 @@ fn layer_row<'a>(
 
 pub fn iced_color_from_acad(c: &AcadColor) -> Color {
     match c {
-        AcadColor::Index(i) => {
-            let (r, g, b) = aci_to_rgb(*i).unwrap_or((200, 200, 200));
-            Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
-        }
-        AcadColor::Rgb { r, g, b } => {
-            Color::from_rgb(*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0)
+        AcadColor::Index(_) | AcadColor::Rgb { .. } => {
+            crate::ui::properties::acad_color_display(*c).0
         }
         _ => Color::WHITE,
     }
@@ -1023,3 +1330,24 @@ const COL_COLOR: f32 = 90.0;
 const COL_LT: f32 = 110.0;
 const COL_LW: f32 = 90.0;
 const COL_TRANS: f32 = 80.0;
+
+#[cfg(test)]
+mod column_layout_tests {
+    use super::*;
+
+    /// #2180: columns hide, move, and come back from their saved names.
+    #[test]
+    fn columns_hide_move_and_round_trip() {
+        set_column_layout_names(&[]);
+        toggle_column(LayerSortCol::Plot);
+        move_column(LayerSortCol::Color, -1);
+        move_column(LayerSortCol::On, -1);
+        let names = column_layout_names();
+        assert_eq!(names[..5], ["On", "Freeze", "Lock", "Color", "-Plot"]);
+        set_column_layout_names(&["-Lock".into(), "Transparency".into(), "bogus".into()]);
+        let layout = column_layout();
+        assert_eq!(layout[0], (LayerSortCol::Lock, false));
+        assert_eq!(layout[1], (LayerSortCol::Transparency, true));
+        assert_eq!(layout.len(), COLUMNS.len());
+    }
+}

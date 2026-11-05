@@ -1,7 +1,7 @@
 //! Definition-level annotation metadata shared by block creation and editing.
 
 use codec::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 
 fn flag(data: Option<&ExtendedData>, app: &str) -> Option<bool> {
     data?
@@ -16,21 +16,11 @@ fn flag(data: Option<&ExtendedData>, app: &str) -> Option<bool> {
 }
 
 fn link(data: Option<&ExtendedData>) -> Option<(String, String)> {
-    let mut strings = data?
-        .get_record("PE_URL")?
-        .values
-        .iter()
-        .filter_map(|value| match value {
-            XDataValue::String(text) => Some(text.trim().to_string()),
-            _ => None,
-        });
-    Some((
-        strings.next().unwrap_or_default(),
-        strings.next().unwrap_or_default(),
-    ))
+    let link = super::hyperlink::Link::from_values(&data?.get_record(super::hyperlink::APP)?.values)?;
+    Some((link.url.trim().to_string(), link.text.trim().to_string()))
 }
 
-pub(crate) fn hyperlink(document: &CadDocument, name: &str) -> (String, String) {
+pub(crate) fn hyperlink(document: &Document, name: &str) -> (String, String) {
     let Some(record) = document.block_records.get(name) else {
         return Default::default();
     };
@@ -45,7 +35,7 @@ pub(crate) fn hyperlink(document: &CadDocument, name: &str) -> (String, String) 
         .unwrap_or_default()
 }
 
-fn ensure_application(document: &mut CadDocument, app: &str) {
+fn ensure_application(document: &mut Document, app: &str) {
     if !document.app_ids.contains(app) {
         let mut entry = codec::tables::AppId::new(app);
         entry.handle = document.allocate_handle();
@@ -57,7 +47,7 @@ fn ensure_application(document: &mut CadDocument, app: &str) {
 }
 
 pub(crate) fn set_hyperlink(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     url: &str,
     description: &str,
@@ -66,22 +56,22 @@ pub(crate) fn set_hyperlink(
         document.remove_object_xdata_record(definition, "PE_URL");
     } else {
         ensure_application(document, "PE_URL");
+        // A named location the record already had stays.
+        let current = document
+            .object_xdata(definition)
+            .and_then(|data| data.get_record(super::hyperlink::APP))
+            .and_then(|record| super::hyperlink::Link::from_values(&record.values))
+            .unwrap_or_default();
+        // `file#location` names the location too.
+        let (url, location) = super::hyperlink::Link::split_address(url);
+        let link = super::hyperlink::Link {
+            url,
+            text: description.trim().into(),
+            location: if location.is_empty() { current.location.clone() } else { location },
+            ..current
+        };
         let mut record = ExtendedDataRecord::new("PE_URL");
-        record.values = vec![
-            XDataValue::String(url.trim().into()),
-            XDataValue::ControlString("{".into()),
-        ];
-        if !description.trim().is_empty() {
-            record
-                .values
-                .push(XDataValue::String(description.trim().into()));
-        }
-        record.values.extend([
-            XDataValue::ControlString("{".into()),
-            XDataValue::Integer32(0),
-            XDataValue::ControlString("}".into()),
-            XDataValue::ControlString("}".into()),
-        ]);
+        record.values = link.values();
         document.set_object_xdata_record(definition, record);
     }
     let marker = document
@@ -94,7 +84,7 @@ pub(crate) fn set_hyperlink(
     }
 }
 
-pub(crate) fn annotation_flags(document: &CadDocument, name: &str) -> (bool, bool) {
+pub(crate) fn annotation_flags(document: &Document, name: &str) -> (bool, bool) {
     let Some(record) = document.block_records.get(name) else {
         return (false, false);
     };
@@ -111,7 +101,7 @@ pub(crate) fn annotation_flags(document: &CadDocument, name: &str) -> (bool, boo
 }
 
 pub(crate) fn set_annotation_flags(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     annotative: bool,
     orientation: bool,

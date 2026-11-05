@@ -20,11 +20,81 @@ pub fn tool() -> ToolDef {
     }
 }
 
+/// What the next TEXT starts from: the rotation last typed and, for each
+/// drawing, the last line it wrote — which Enter at the start point continues
+/// below.
+pub(crate) struct Session {
+    rotation: f64,
+    /// One line per drawing, kept with the drawing that wrote it, so a
+    /// remembered position cannot be read as another drawing's and each
+    /// drawing keeps its own.
+    last: Vec<(u64, Text)>,
+}
+
+static SESSION: std::sync::Mutex<Session> = std::sync::Mutex::new(Session {
+    rotation: 0.0,
+    last: Vec::new(),
+});
+
+pub(crate) fn session() -> std::sync::MutexGuard<'static, Session> {
+    SESSION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Session {
+    /// The line this drawing wrote last, if it has written one.
+    pub(crate) fn last_in(&self, document: u64) -> Option<&Text> {
+        self.last
+            .iter()
+            .find(|(written_in, _)| *written_in == document)
+            .map(|(_, line)| line)
+    }
+
+    /// The line this drawing continues below, replacing its old one.
+    pub(crate) fn set_place(&mut self, document: u64, line: &Text) {
+        self.forget_place_of(document);
+        self.last.push((document, line.clone()));
+    }
+
+    /// Drop the line remembered for this drawing.
+    fn forget_place_of(&mut self, document: u64) {
+        self.last.retain(|(written_in, _)| *written_in != document);
+    }
+}
+
+/// A whole document replaced this drawing's content, so the line it would
+/// continue below belongs to the document before it.
+pub fn forget_place_of(document: u64) {
+    session().forget_place_of(document);
+}
+
+/// A value the way the prompts show a default (no trailing zeros).
+pub fn number_text(value: f64) -> String {
+    angle_text(value)
+}
+
+/// An angle in degrees the way the prompts show it (no trailing zeros).
+fn angle_text(degrees: f64) -> String {
+    let text = format!("{degrees:.6}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() || text == "-0" {
+        "0".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// A height the way TEXT shows it (four decimals).
+fn length4(value: f64) -> String {
+    format!("{value:.4}")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
     Start,
     Justification,
     Style,
+    /// Style's `?`: which styles to list.
+    StyleList,
     Height,
     Rotation,
     SecondPoint,
@@ -48,6 +118,11 @@ pub struct TextCommand {
     annotation_multiplier: f64,
     last_display_height: Option<f64>,
     last_entity: Option<Text>,
+    /// A justification was chosen: the point prompt names its point.
+    justified: bool,
+    /// Which drawing this command runs in: the line Enter continues below is
+    /// that drawing's, not the last one written anywhere.
+    document: u64,
 }
 
 impl TextCommand {
@@ -55,6 +130,7 @@ impl TextCommand {
         defaults: TextCreationDefaults,
         styles: Vec<TextStyle>,
         annotation_multiplier: f64,
+        document: u64,
     ) -> Self {
         let current_height = defaults.height;
         let mut command = Self {
@@ -67,7 +143,7 @@ impl TextCommand {
             style_name: defaults.style_name,
             styles,
             height: defaults.height,
-            rotation: 0.0,
+            rotation: session().rotation,
             width_factor: defaults.width_factor,
             oblique_angle: defaults.oblique_angle,
             fixed_height: false,
@@ -75,6 +151,8 @@ impl TextCommand {
             annotation_multiplier: annotation_multiplier.max(1.0e-9),
             last_display_height: None,
             last_entity: None,
+            justified: false,
+            document,
         };
         let style = command.style_name.clone();
         command.select_style(&style);
@@ -108,6 +186,44 @@ impl TextCommand {
         true
     }
 
+    /// TEXT's `?` at the style name: every style with its font and settings.
+    fn style_listing(&self, pattern: &str) -> String {
+        let mut out = vec![crate::tr!("text-cmd", "styles-title")];
+        let listed: Vec<&TextStyle> = self
+            .styles
+            .iter()
+            .filter(|style| {
+                pattern
+                    .split(',')
+                    .any(|part| crate::io::xref_model::wildcard_match(&style.name, part.trim()))
+            })
+            .collect();
+        let width = listed.iter().map(|s| s.name.chars().count() + 2).max().unwrap_or(0);
+        for style in listed {
+            let name = format!("\"{}\"", style.name);
+            let font = if style.true_type_font.trim().is_empty() {
+                let file = style.font_file.trim();
+                let stem = file
+                    .strip_suffix(".shx")
+                    .or_else(|| file.strip_suffix(".SHX"))
+                    .unwrap_or(file);
+                format!("Font files: {stem}")
+            } else {
+                format!("Font typeface: {}", style.true_type_font.trim())
+            };
+            out.push(format!("Style name: {name:<width$}  {font}"));
+            out.push(format!(
+                "   Height: {:.4}  Width factor: {:.4}  Obliquing angle: {}",
+                style.height,
+                style.width_factor,
+                angle_text(style.oblique_angle.to_degrees())
+            ));
+            out.push("   Generation: Normal".to_string());
+        }
+        out.push(format!("Current text style: \"{}\"", self.style_name));
+        out.join("\n")
+    }
+
     fn set_justification(&mut self, value: &str) -> bool {
         let normalized = value.trim().to_ascii_uppercase().replace([' ', '-'], "");
         let alignment = match normalized.as_str() {
@@ -131,6 +247,45 @@ impl TextCommand {
         self.horizontal = alignment.0;
         self.vertical = alignment.1;
         true
+    }
+
+    fn justify_label(&self) -> &'static str {
+        match (self.horizontal, self.vertical) {
+            (HA::Aligned, _) => "Align",
+            (HA::Fit, _) => "Fit",
+            (HA::Middle, _) => "Middle",
+            (HA::Left, VA::Baseline) => "Left",
+            (HA::Center, VA::Baseline) => "Center",
+            (HA::Right, VA::Baseline) => "Right",
+            (HA::Left, VA::Top) => "TL",
+            (HA::Center, VA::Top) => "TC",
+            (HA::Right, VA::Top) => "TR",
+            (HA::Left, VA::Middle) => "ML",
+            (HA::Center, VA::Middle) => "MC",
+            (HA::Right, VA::Middle) => "MR",
+            (HA::Left, VA::Bottom) => "BL",
+            (HA::Center, VA::Bottom) => "BC",
+            (HA::Right, VA::Bottom) => "BR",
+        }
+    }
+
+    /// The point a chosen justification asks for.
+    fn point_prompt(&self) -> String {
+        match (self.horizontal, self.vertical) {
+            (HA::Aligned | HA::Fit, _) => crate::tr!("text-cmd", "first-endpoint"),
+            (HA::Middle, _) | (HA::Center, VA::Middle) => crate::tr!("text-cmd", "middle-point"),
+            (HA::Left, VA::Baseline) => crate::tr!("text-cmd", "start-point"),
+            (HA::Center, VA::Baseline) => crate::tr!("text-cmd", "center-point"),
+            (HA::Right, VA::Baseline) => crate::tr!("text-cmd", "right-endpoint"),
+            (HA::Left, VA::Top) => crate::tr!("text-cmd", "top-left"),
+            (HA::Center, VA::Top) => crate::tr!("text-cmd", "top-center"),
+            (HA::Right, VA::Top) => crate::tr!("text-cmd", "top-right"),
+            (HA::Left, VA::Middle) => crate::tr!("text-cmd", "middle-left"),
+            (HA::Right, VA::Middle) => crate::tr!("text-cmd", "middle-right"),
+            (HA::Left, VA::Bottom) => crate::tr!("text-cmd", "bottom-left"),
+            (HA::Center, VA::Bottom) => crate::tr!("text-cmd", "bottom-center"),
+            (HA::Right, VA::Bottom) => crate::tr!("text-cmd", "bottom-right"),
+        }
     }
 
     fn is_two_point(&self) -> bool {
@@ -238,46 +393,52 @@ impl CadCommand for TextCommand {
     }
 
     fn prompt(&self) -> String {
-        match self.step {
-            Step::Start => format!(
-                "{}\n{}",
-                crate::tf!(
-                    "TEXT  Current style: {}, Height: {}, Annotative: {}",
-                    self.style_name,
-                    self.height,
-                    if self.annotative { t!("Yes") } else { t!("No") }
-                ),
-                t!("TEXT  Specify start point or [Justify/Style]:")
-            ),
-            Step::Justification => t!(
-                "TEXT  Enter justification [Left/Center/Right/Aligned/Middle/Fit/TL/TC/TR/ML/MC/MR/BL/BC/BR]:"
-            )
-            .into_owned(),
-            Step::Style => crate::tf!("TEXT  Enter style name <{}>:", self.style_name).into_owned(),
-            Step::Height if self.annotative => {
-                crate::tf!("TEXT  Specify paper text height <{}>:", self.height).into_owned()
+        let text = match self.step {
+            Step::Start if self.justified => self.point_prompt(),
+            Step::Start => {
+                let header = crate::tr!(
+                    "text-cmd",
+                    "header",
+                    style = self.style_name.clone(),
+                    height = length4(self.height),
+                    annotative = if self.annotative { t!("Yes") } else { t!("No") }.into_owned(),
+                    justify = self.justify_label()
+                );
+                format!("TEXT  {header}\nTEXT  {}", crate::tr!("text-cmd", "start"))
             }
-            Step::Height => crate::tf!("TEXT  Specify height <{}>:", self.height).into_owned(),
-            Step::Rotation => crate::tf!(
-                "TEXT  Specify rotation angle <{}>:",
-                self.rotation.to_degrees()
-            )
-            .into_owned(),
-            Step::SecondPoint => t!("TEXT  Specify second endpoint:").into_owned(),
+            Step::Justification => crate::tr!("text-cmd", "justify"),
+            Step::Style => crate::tr!("text-cmd", "style", default = self.style_name.clone()),
+            Step::StyleList => crate::tr!("text-cmd", "style-list"),
+            Step::Height if self.annotative => {
+                crate::tf!("Specify paper text height <{}>:", length4(self.height)).into_owned()
+            }
+            Step::Height => crate::tr!("text-cmd", "height", default = length4(self.height)),
+            Step::Rotation => crate::tr!(
+                "text-cmd",
+                "rotation",
+                default = angle_text(self.rotation.to_degrees())
+            ),
+            Step::SecondPoint => crate::tr!("text-cmd", "second-endpoint"),
+        };
+        if text.starts_with("TEXT  ") {
+            text
+        } else {
+            format!("TEXT  {text}")
         }
     }
 
     fn options(&self) -> Vec<CmdOption> {
         match self.step {
+            Step::Start if self.justified => Vec::new(),
             Step::Start => vec![
                 CmdOption::new(t!("Justify").as_ref(), "J"),
-                CmdOption::new(t!("Style").as_ref(), "ST"),
+                CmdOption::new(t!("Style").as_ref(), "S"),
             ],
             Step::Justification => [
                 ("Left", "L"),
                 ("Center", "C"),
                 ("Right", "R"),
-                ("Aligned", "A"),
+                ("Align", "A"),
                 ("Middle", "M"),
                 ("Fit", "F"),
                 ("TL", "TL"),
@@ -305,7 +466,7 @@ impl CadCommand for TextCommand {
     fn wants_text_input(&self) -> bool {
         matches!(
             self.step,
-            Step::Justification | Step::Style | Step::Height | Step::Rotation
+            Step::Justification | Step::Style | Step::StyleList | Step::Height | Step::Rotation
         )
     }
 
@@ -316,28 +477,49 @@ impl CadCommand for TextCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let token = text.trim();
         let upper = token.to_ascii_uppercase();
+        let upper = upper.trim_start_matches(['_', '.']).to_string();
         match self.step {
+            Step::Start if self.justified => return None,
             Step::Start => match upper.as_str() {
                 "J" | "JUSTIFY" | "JUSTIFICATION" => self.step = Step::Justification,
                 "S" | "ST" | "STYLE" => self.step = Step::Style,
                 _ => return None,
             },
             Step::Justification => {
-                if !self.set_justification(token) {
-                    return None;
+                if !self.set_justification(&upper) {
+                    return Some(CmdResult::ReportError(crate::tr!("text-cmd", "invalid-keyword")));
                 }
+                self.justified = true;
                 self.step = Step::Start;
             }
             Step::Style => {
+                if upper == "?" {
+                    self.step = Step::StyleList;
+                    return Some(CmdResult::NeedPoint);
+                }
                 if !self.select_style(token) {
-                    return None;
+                    return Some(CmdResult::ReportError(crate::tr!(
+                        "text-cmd",
+                        "no-style",
+                        name = token.to_string()
+                    )));
                 }
                 self.step = Step::Start;
             }
+            // The listing ends the Style option.
+            Step::StyleList => {
+                let pattern = if token.is_empty() { "*" } else { token };
+                self.step = Step::Start;
+                return Some(CmdResult::ReportMeasurement(self.style_listing(pattern)));
+            }
             Step::Height => {
-                let value = token.replace(',', ".").parse::<f64>().ok()?;
+                let Ok(value) = token.replace(',', ".").parse::<f64>() else {
+                    return Some(CmdResult::ReportError(
+                        crate::t!("Requires numeric distance or second point.").into_owned(),
+                    ));
+                };
                 if !value.is_finite() || value <= 1.0e-9 {
-                    return None;
+                    return Some(CmdResult::ReportError(crate::tr!("text-cmd", "positive")));
                 }
                 self.height = value;
                 if self.is_two_point() {
@@ -351,6 +533,7 @@ impl CadCommand for TextCommand {
                     return None;
                 }
                 self.rotation = value.to_radians();
+                session().rotation = self.rotation;
                 return Some(self.open_editor());
             }
             Step::SecondPoint => return None,
@@ -393,6 +576,7 @@ impl CadCommand for TextCommand {
                     return CmdResult::NeedPoint;
                 };
                 self.rotation = angle;
+                session().rotation = angle;
                 self.open_editor()
             }
             Step::SecondPoint => {
@@ -411,13 +595,25 @@ impl CadCommand for TextCommand {
                 self.second_point = Some(point);
                 self.after_second_point()
             }
-            Step::Justification | Step::Style => CmdResult::NeedPoint,
+            Step::Justification | Step::Style | Step::StyleList => CmdResult::NeedPoint,
         }
     }
 
     fn on_enter(&mut self) -> CmdResult {
         match self.step {
-            Step::Start => CmdResult::Cancel,
+            // Enter continues one line below the last line this drawing wrote.
+            Step::Start if !self.justified => match session().last_in(self.document).cloned() {
+                Some(last) => {
+                    self.last_entity = Some(last);
+                    self.open_next_line()
+                }
+                None => CmdResult::Cancel,
+            },
+            Step::Start => CmdResult::NeedPoint,
+            Step::StyleList => {
+                self.step = Step::Start;
+                CmdResult::ReportMeasurement(self.style_listing("*"))
+            }
             Step::Justification | Step::Style => {
                 self.step = Step::Start;
                 CmdResult::NeedPoint
@@ -437,6 +633,10 @@ impl CadCommand for TextCommand {
 
     fn on_editor_closed(&mut self, committed: bool) -> CmdResult {
         if committed {
+            match self.last_entity.clone() {
+                Some(line) => session().set_place(self.document, &line),
+                None => session().forget_place_of(self.document),
+            }
             self.open_next_line()
         } else {
             CmdResult::Cancel
@@ -459,3 +659,81 @@ impl CadCommand for TextCommand {
 }
 
 inventory::submit!(crate::command::CommandRegistration { names: &["TEXT"] });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(value: &str) -> Text {
+        Text {
+            value: value.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn empty() -> Session {
+        Session {
+            rotation: 0.0,
+            last: Vec::new(),
+        }
+    }
+
+    /// Enter at the start point continues below the line this drawing wrote,
+    /// and never below a line another drawing wrote.
+    #[test]
+    fn a_line_is_continued_only_within_the_drawing_that_wrote_it() {
+        let first = u64::MAX - 9;
+        let second = u64::MAX - 8;
+        let mut s = empty();
+        assert!(
+            s.last_in(first).is_none(),
+            "a fresh drawing has nothing to continue below"
+        );
+        s.set_place(first, &line("MINE"));
+        assert_eq!(
+            s.last_in(first).map(|t| t.value.as_str()),
+            Some("MINE"),
+            "the drawing that wrote one continues below it"
+        );
+        assert!(
+            s.last_in(second).is_none(),
+            "a second drawing does not inherit it"
+        );
+        assert!(s.last_in(0).is_none(), "nor does an id no drawing ever had");
+        s.set_place(second, &line("OTHER"));
+        s.set_place(first, &line("NEW"));
+        assert_eq!(s.last.len(), 2, "one line per drawing, not one per writing");
+        assert_eq!(
+            s.last_in(first).map(|t| t.value.as_str()),
+            Some("NEW"),
+            "the newest line is the one its drawing continues below"
+        );
+        assert_eq!(
+            s.last_in(second).map(|t| t.value.as_str()),
+            Some("OTHER"),
+            "another drawing's line is left alone"
+        );
+    }
+
+    /// A drawing that gets a whole new document must not keep continuing
+    /// below a line from the document it replaced.
+    #[test]
+    fn replacing_the_document_clears_the_line_remembered_for_it() {
+        let first = u64::MAX - 9;
+        let second = u64::MAX - 8;
+        let mut s = empty();
+        s.set_place(first, &line("MINE"));
+        s.set_place(second, &line("OTHER"));
+        s.forget_place_of(second);
+        assert_eq!(
+            s.last_in(first).map(|t| t.value.as_str()),
+            Some("MINE"),
+            "another drawing's new document keeps this one's line"
+        );
+        s.forget_place_of(first);
+        assert!(
+            s.last_in(first).is_none(),
+            "this drawing's new document drops the line it no longer owns"
+        );
+    }
+}

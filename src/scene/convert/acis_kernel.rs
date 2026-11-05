@@ -25,7 +25,7 @@ pub fn tessellate_sat(
     facet_res: f64,
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
-    planar_isolines: bool,
+    planar_isolines: Option<bool>,
 ) -> Option<MeshLodSet> {
     let (bodies, loss) = lift(document);
     if bodies.is_empty() {
@@ -116,10 +116,11 @@ pub fn tessellate_sat(
         DEFAULT_FIT_TOLERANCE
     };
     for (body, placement_scale) in &bodies {
-        let mut tolerance =
-            brep::mesh::TessellationTolerance::new(max_angle, source_fit * placement_scale)
-                .with_uv_isolines(isolines[0], isolines[1])
-                .with_planar_isolines(planar_isolines);
+        let mut tolerance = crate::scene::model::solid_model::with_isolines(
+            brep::mesh::TessellationTolerance::new(max_angle, source_fit * placement_scale),
+            isolines,
+            planar_isolines,
+        );
         if let Some(deflection) = chordal_deflection {
             tolerance = tolerance.with_chordal_deflection(deflection);
         }

@@ -330,6 +330,7 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
             style: By::Own((symbology & 7) as u32),
             geom,
             filled: fill_index(e).is_some(),
+            construction: uint16(e, 32).unwrap_or(0) & 0xf == 2,
         };
         // One pixel wide, as V8 models draw: the element weight is a
         // lineweight, not shown while lineweights are off.
@@ -434,7 +435,11 @@ fn read_run(run: &[&[u8]], colors: &[[u8; 3]], d3: bool, depth: usize) -> Raw {
                     (0..n).filter_map(|k| vertex(k, 38 + k * step, n)).collect();
                 let pts: Vec<[f64; 2]> = pts3.iter().map(|p| plan(*p)).collect();
                 if pts.len() >= 2 {
-                    collect.push(element(DgnGeom::Points(pts3)));
+                    collect.push(element(if kind == 11 {
+                        DgnGeom::Curve(pts3)
+                    } else {
+                        DgnGeom::Points(pts3)
+                    }));
                     push(
                         &mut raw,
                         &mut complex,
@@ -1045,6 +1050,7 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
         .collect();
     Some(DgnImport {
         dim_styles: Vec::new(),
+        fonts: Vec::new(),
         three_d: is_3d(bytes),
         elements: scaled_elements(&raw.elements, s, [-u.origin[0] * s, -u.origin[1] * s, 0.0]),
         cells,
@@ -1052,6 +1058,8 @@ pub fn import(bytes: &[u8]) -> Option<DgnImport> {
         sub_per_master: u.sub_per_master,
         unit_names: (unit_name(bytes, 1120), unit_name(bytes, 1122)),
         v7: true,
+        // The first view's flags (46): constructions shown at 0x1000.
+        construction_layers: uint16(bytes, 46).is_some_and(|flags| flags & 0x1000 == 0),
         ..Default::default()
     })
 }

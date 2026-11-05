@@ -551,6 +551,29 @@ mod linux_impl {
         Ok(())
     }
 
+    /// The .desktop entry the AppImage and the snap ship. The entry written
+    /// below is built from it, so the two cannot drift apart: it keeps the
+    /// translated Comment/Keywords that scripts/export-locales.py maintains,
+    /// and a StartupWMClass equal to APP_ID, which is the X11 WM_CLASS iced
+    /// gives the window (see `boot` in app/mod.rs).
+    const PACKAGED_DESKTOP_ENTRY: &str = include_str!("../../packaging/OpenCADStudio.desktop");
+
+    /// The packaged .desktop entry with `Exec=` pointed at `exec`. The
+    /// packaged `Exec=OpenCADStudio` relies on PATH, which a portable binary
+    /// or an AppImage is not on.
+    fn desktop_entry(exec: &str) -> String {
+        let mut entry = String::with_capacity(PACKAGED_DESKTOP_ENTRY.len() + exec.len());
+        for line in PACKAGED_DESKTOP_ENTRY.lines() {
+            if line.starts_with("Exec=") {
+                entry.push_str(&format!("Exec={exec} %F"));
+            } else {
+                entry.push_str(line);
+            }
+            entry.push('\n');
+        }
+        entry
+    }
+
     /// Write a user-level .desktop file pointing at the running binary, then
     /// refresh the MIME cache so file managers list us under "Open with".
     /// Skipped when a system package already registered the app, so we don't
@@ -585,19 +608,7 @@ mod linux_impl {
         let apps = data_home()?.join("applications");
         let desktop_path = apps.join(format!("{APP_ID}.desktop"));
 
-        let contents = format!(
-            "[Desktop Entry]\n\
-             Name=Open CAD Studio\n\
-             Comment=A CAD application for 2D/3D drawing and design\n\
-             Exec={exec} %F\n\
-             Icon={APP_ID}\n\
-             Terminal=false\n\
-             Type=Application\n\
-             Categories=Graphics;Engineering;\n\
-             MimeType=image/vnd.dwg;image/vnd.dxf;\n\
-             Keywords=CAD;DWG;DXF;drawing;design;\n\
-             StartupWMClass=OpenCADStudio\n"
-        );
+        let contents = desktop_entry(&exec);
 
         // The icon is checked first and on its own. It and the .desktop entry
         // change for different reasons — the entry only when this text does,
@@ -738,6 +749,7 @@ mod linux_impl {
         let mut changed = false;
         for (name, bytes) in [
             ("image-vnd.dwg.svg", DWG_ICON),
+            ("application-x-dwg.svg", DWG_ICON),
             ("image-vnd.dxf.svg", DXF_ICON),
         ] {
             let path = dir.join(name);
@@ -756,7 +768,38 @@ mod linux_impl {
                 .args(["--force", "--quiet", &hicolor.to_string_lossy()])
                 .status();
         }
+        install_mime_icon_names();
         Ok(())
+    }
+
+    fn install_mime_icon_names() {
+        let Ok(home) = data_home() else { return };
+        let pkgs = home.join("mime/packages");
+        let xml_path = pkgs.join(format!("{APP_ID}-icons.xml"));
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/vnd.dwg">
+    <icon name="image-vnd.dwg"/>
+    <generic-icon name="image-vnd.dwg"/>
+  </mime-type>
+  <mime-type type="application/x-dwg">
+    <icon name="application-x-dwg"/>
+    <generic-icon name="application-x-dwg"/>
+  </mime-type>
+  <mime-type type="image/vnd.dxf">
+    <icon name="image-vnd.dxf"/>
+    <generic-icon name="image-vnd.dxf"/>
+  </mime-type>
+</mime-info>
+"#;
+        if std::fs::read_to_string(&xml_path).ok().as_deref() == Some(xml) {
+            return;
+        }
+        if std::fs::create_dir_all(&pkgs).is_ok() && std::fs::write(&xml_path, xml).is_ok() {
+            let _ = std::process::Command::new("update-mime-database")
+                .arg(home.join("mime"))
+                .status();
+        }
     }
 
     fn data_home() -> Result<PathBuf, String> {
@@ -776,6 +819,37 @@ mod linux_impl {
             Ok("Open CAD Studio is now the default for .dwg and .dxf files.".to_string())
         } else {
             Err(format!("xdg-mime exited with {status}"))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{desktop_entry, PACKAGED_DESKTOP_ENTRY};
+        use crate::io::file_association::APP_ID;
+
+        #[test]
+        fn written_desktop_entry_is_the_packaged_one_with_an_absolute_exec() {
+            let entry = desktop_entry("/home/user/Apps/OpenCADStudio.AppImage");
+            let lines: Vec<&str> = entry.lines().collect();
+
+            let exec: Vec<&&str> = lines.iter().filter(|l| l.starts_with("Exec=")).collect();
+            assert_eq!(exec, [&"Exec=/home/user/Apps/OpenCADStudio.AppImage %F"]);
+
+            // On X11 the taskbar ties the window to this entry through
+            // StartupWMClass, which must equal the WM_CLASS iced sets: APP_ID.
+            assert!(lines.contains(&format!("Icon={APP_ID}").as_str()));
+            assert!(lines.contains(&format!("StartupWMClass={APP_ID}").as_str()));
+            assert!(lines.contains(&"MimeType=image/vnd.dwg;image/vnd.dxf;"));
+
+            // Everything else, translations included, is the packaged file.
+            let packaged: Vec<&str> = PACKAGED_DESKTOP_ENTRY.lines().collect();
+            assert_eq!(lines.len(), packaged.len());
+            for (written, shipped) in lines.iter().zip(&packaged) {
+                if !shipped.starts_with("Exec=") {
+                    assert_eq!(written, shipped);
+                }
+            }
+            assert!(lines.iter().any(|l| l.starts_with("Comment[")));
         }
     }
 }

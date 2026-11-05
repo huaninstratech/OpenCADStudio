@@ -1,14 +1,13 @@
 //! Ribbon description types — the plain-data vocabulary a [`CadModule`] uses to
 //! declare its tab. No UI-framework dependency: the host renders these.
 
-#[cfg(feature = "host")]
 pub mod owned;
 
 // ── Events ────────────────────────────────────────────────────────────────
 
 /// Events a module tool can emit to the host application.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "host", derive(serde::Serialize, serde::Deserialize))]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ModuleEvent {
     /// Fire a named CAD command (e.g. "LINE", "CIRCLE").
     Command(String),
@@ -126,9 +125,12 @@ pub enum RibbonItem {
     },
 }
 
+/// A [`RibbonItem::LargeDropdown`] label that shows the icon and name of the
+/// item last chosen, which the face then runs.
+pub const FOLLOW_CHOSEN: &str = "\u{1}";
+
 /// Identifies which style list a `StyleComboGroup` refers to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "host", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StyleKey {
     TextStyle,
     DimStyle,

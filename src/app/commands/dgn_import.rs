@@ -72,6 +72,7 @@ enum Route {
     Dgn,
     Model(ModelFormat),
     Wmf,
+    Svg,
     Tds,
 }
 
@@ -99,6 +100,7 @@ fn route(path: &str, format: Option<usize>) -> Result<Route, String> {
         Some("STEP") => return Ok(Route::Model(ModelFormat::Step)),
         Some("IGES") => return Ok(Route::Model(ModelFormat::Iges)),
         Some("Metafile") => return Ok(Route::Wmf),
+        Some("SVG") => return Ok(Route::Svg),
         Some("3D Studio") => return Ok(Route::Tds),
         _ => {}
     }
@@ -275,6 +277,11 @@ impl OpenCADStudio {
                 let i = self.active_tab;
                 self.import_wmf(i, path, false)
             }
+            Ok(Route::Svg) => {
+                self.remember_import(path);
+                let i = self.active_tab;
+                self.import_svg(i, path, false)
+            }
             // The options window opens whatever FILEDIA is.
             Ok(Route::Tds) => {
                 self.remember_import(path);
@@ -406,6 +413,11 @@ impl OpenCADStudio {
                         self.remember_import(&path);
                         self.close_active_modal();
                         return self.import_wmf(i, &path, false);
+                    }
+                    Ok(Route::Svg) => {
+                        self.remember_import(&path);
+                        self.close_active_modal();
+                        return self.import_svg(i, &path, false);
                     }
                     Ok(Route::Tds) => {
                         self.remember_import(&path);
@@ -845,6 +857,9 @@ fn place_converted(
             let mut layer = codec::tables::Layer::new(target.as_str());
             layer.handle = scene.document.allocate_handle();
             layer.color = *color;
+            if converted.layers_off.contains(name) {
+                layer.flags.off = true;
+            }
             let _ = scene.document.layers.add(layer);
         }
         layers.insert(name.clone(), target);
@@ -871,11 +886,11 @@ fn place_converted(
         }
         styles.insert(name.clone(), target);
     }
-    // Dimension styles take the drawing's style of the same name (else
-    // the current one) as their settings; the style records' own values
-    // are not read.
+    // Dimension styles take the values the file gives them, their text in
+    // the text style they name and closed arrows (a leader none); without
+    // values, the drawing's style of the same name (else the current one).
     let mut dim_styles: HashMap<String, String> = HashMap::new();
-    for name in &converted.dim_styles {
+    for (name, values) in &converted.dim_styles {
         let doc = &scene.document;
         let taken = |n: &str| {
             doc.dim_styles
@@ -890,18 +905,30 @@ fn place_converted(
             .any(|s| s.name.eq_ignore_ascii_case(&target))
         {
             let doc = &scene.document;
-            let base = doc
-                .dim_styles
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(name))
-                .or_else(|| {
-                    doc.dim_styles.iter().find(|s| {
-                        s.name
-                            .eq_ignore_ascii_case(&doc.header.current_dimstyle_name)
+            let base = values.clone().or_else(|| {
+                doc.dim_styles
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(name))
+                    .or_else(|| {
+                        doc.dim_styles
+                            .iter()
+                            .find(|s| s.name.eq_ignore_ascii_case(&doc.header.current_dimstyle_name))
                     })
-                })
-                .cloned();
+                    .cloned()
+            });
             let mut style = base.unwrap_or_else(|| codec::tables::DimStyle::new(target.as_str()));
+            if values.is_some() {
+                let text = styles.get(&style.dimtxsty).cloned().unwrap_or_else(|| style.dimtxsty.clone());
+                if let Some(t) = scene.document.text_styles.iter().find(|t| t.name.eq_ignore_ascii_case(&text)) {
+                    style.dimtxsty = t.name.clone();
+                    style.dimtxsty_handle = t.handle;
+                }
+                let arrow = crate::entities::arrowheads::resolve(&mut scene.document, "_Closed");
+                style.dimblk1 = arrow.unwrap_or(codec::Handle::NULL);
+                style.dimblk2 = style.dimblk1;
+                style.dimldrblk = crate::entities::arrowheads::resolve(&mut scene.document, "_None")
+                    .unwrap_or(codec::Handle::NULL);
+            }
             style.name = target.clone();
             style.handle = scene.document.allocate_handle();
             let _ = scene.document.dim_styles.add(style);
@@ -963,18 +990,35 @@ fn place_converted(
         if scene.document.block_records.get(target).is_some() {
             continue;
         }
-        let entities = entities.into_iter().map(&fix).collect();
-        if let Ok(handles) =
-            scene.define_block_from_owned_entities(entities, target, glam::DVec3::ZERO)
-        {
+        let entities = entities
+            .into_iter()
+            .map(|e| placed_dimension_text(&scene.document, fix(e)))
+            .collect();
+        if let Ok(handles) = scene.define_block_from_owned_entities(entities, target, glam::DVec3::ZERO) {
             scene.bind_outline_hatches(&handles);
         }
     }
-    let handles: Vec<_> = converted
-        .entities
-        .into_iter()
-        .map(|entity| scene.add_entity(fix(entity)))
-        .collect();
+    let mut handles = Vec::new();
+    for entity in converted.entities {
+        let entity = placed_dimension_text(&scene.document, fix(entity));
+        handles.push(scene.add_entity(entity));
+    }
     scene.bind_outline_hatches(&handles);
     layers
+}
+
+/// A dimension whose text the user has not placed gets the place its style
+/// lays the text out at in this drawing.
+fn placed_dimension_text(
+    document: &codec::Document,
+    mut entity: codec::EntityType,
+) -> codec::EntityType {
+    if let codec::EntityType::Dimension(d) = &mut entity {
+        if !d.base().text_user_positioned {
+            if let Some(p) = crate::entities::dimension::automatic_text_position(document, d) {
+                d.base_mut().text_middle_point = p;
+            }
+        }
+    }
+    entity
 }

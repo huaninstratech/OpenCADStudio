@@ -69,6 +69,7 @@ const ENVELOPE_OPS: &[&str] = &[
     "entities_create",
     "entities_delete",
     "entities_transform",
+    "node_graph",
     "block_define",
     "block_delete",
     "file_identity",
@@ -259,9 +260,17 @@ fn listen(mut app: OpenCADStudio, port: u16, bound_port: Arc<AtomicU16>) {
     // threads above, not in the app.
     let mut document_id: Option<u64> = None;
     let mut counter: u64 = 0;
-    for job in incoming {
-        let (status, body) = route(&mut app, &job.request, &mut document_id, &mut counter);
-        let _ = job.reply.send((status, body));
+    // Between requests, plugins' worker threads are still served, as the
+    // window's timer does in the GUI.
+    loop {
+        match incoming.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(job) => {
+                let (status, body) = route(&mut app, &job.request, &mut document_id, &mut counter);
+                let _ = job.reply.send((status, body));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => app.pump_plugin_requests(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
 }
 
@@ -599,6 +608,9 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             if let Some(v) = request.param("layer") {
                 request_json["layer"] = json!(v);
             }
+            if let Some(v) = request.param("xdata_app") {
+                request_json["xdata_app"] = json!(v);
+            }
             if let Some(v) = request.param("detail") {
                 request_json["detail"] = json!(v);
             }
@@ -751,10 +763,15 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             // Mutate (not Run): the undo/redo ops require a document_id and the Run
             // path never stamps one — Run would always answer "document_required" no
             // matter what the caller sends. Mutate stamps the cached id and
-            // refresh-retries, exactly like every other mutation route.
+            // refresh-retries, exactly like every other mutation route; a
+            // caller-supplied document_id in the body is honoured on top of it.
+            let mut fields = json!({});
+            if let Some(id) = body["document_id"].as_u64() {
+                fields["document_id"] = json!(id);
+            }
             Plan::Mutate {
                 op: op.into(),
-                fields: json!({}),
+                fields,
                 created: 200,
             }
         }
@@ -765,6 +782,9 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             let mut fields = json!({});
             if let Some(path) = body["path"].as_str() {
                 fields["path"] = json!(path);
+            }
+            if let Some(id) = body["document_id"].as_u64() {
+                fields["document_id"] = json!(id);
             }
             Plan::Mutate {
                 op: "save".into(),

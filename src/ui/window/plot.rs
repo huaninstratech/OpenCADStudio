@@ -178,6 +178,8 @@ pub enum PlotFlag {
     HidePaperspace,
     /// Write the dialog into the layout when a plot is sent.
     SaveToLayout,
+    /// Open the written file in the system viewer.
+    OpenWhenDone,
 }
 
 /// The page setups of another drawing, offered for import (`PSETUPIN`).
@@ -258,6 +260,12 @@ pub enum PlotDlgMsg {
     /// The drawing side of the custom scale.
     CustomScaleDrawing(String),
     Quality(String),
+    /// File plot output folder choice ("0" ask, "1" drawing, "2" PDF subfolder).
+    OutputFolder(String),
+    /// File plot naming choice ("0" drawing, "1" layout, "2" both).
+    OutputName(String),
+    RasterDpi(String),
+    VectorDpi(String),
     Shade(String),
     Copies(String),
     OffsetX(String),
@@ -488,6 +496,22 @@ pub struct PlotDialogState {
     pub printer: Option<String>,
     /// Output goes to a file instead of a printer.
     pub to_file: bool,
+    /// A file plot opens in the system viewer once written.
+    #[serde(default)]
+    pub open_when_done: bool,
+    /// Where a file plot goes: 0 ask, 1 the drawing's folder, 2 its `PDF`
+    /// subfolder. The last two skip the save dialog.
+    #[serde(default)]
+    pub output_folder: u8,
+    /// File name of a file plot: 0 drawing, 1 layout, 2 drawing-layout.
+    #[serde(default)]
+    pub output_name: u8,
+    /// Raster image resolution in DPI; blank follows the quality setting.
+    #[serde(default)]
+    pub raster_dpi: String,
+    /// Vector resolution in DPI; blank keeps full precision.
+    #[serde(default)]
+    pub vector_dpi: String,
     /// File output is SVG instead of PDF (only meaningful when `to_file`).
     /// Session state, like the printer choice: never written into the
     /// drawing's page setup, which only knows printers and PDF drivers.
@@ -603,6 +627,11 @@ impl Default for PlotDialogState {
             printer: None,
             // Web defaults to PDF output: it has no system printers.
             to_file: cfg!(target_arch = "wasm32"),
+            open_when_done: false,
+            output_folder: 0,
+            output_name: 0,
+            raster_dpi: String::new(),
+            vector_dpi: String::new(),
             file_svg: false,
             paper: paper_catalog::default_paper().canonical.to_string(),
             paper_width_mm: 297.0,
@@ -1222,7 +1251,10 @@ pub fn view_window(
             .padding([6, 8])
             .into()
     } else {
-        scrollable(column(rows).spacing(1)).height(height).into()
+        scrollable(column(rows).spacing(1))
+            .width(Length::Fill)
+            .height(height)
+            .into()
     };
     // The name gets the sidebar's full width; beside the buttons it was
     // squeezed to nothing. (#1817)
@@ -1416,7 +1448,7 @@ pub fn view_window(
             .size(11)
             .style(muted_style)
             .width(form::LABEL_WIDTH),
-        iced::widget::pick_list(printer_sel, printer_opts, |value| value.to_string())
+        crate::ui::dropdown_list::pick_list(printer_sel, printer_opts, |value| value.to_string())
             .on_select(|choice| Message::PlotDlg(PlotDlgMsg::Printer(choice.raw)))
             .text_size(12)
             .padding([3, 6])
@@ -1426,7 +1458,56 @@ pub fn view_window(
     .align_y(iced::Center)
     .width(Length::Fill);
     let printer_controls: Element<'_, Message> = if to_file {
-        Space::new().height(0).into()
+        let pick = |value: u8, label: String| PlotChoice {
+            raw: value.to_string(),
+            localized: false,
+            display: Some(label),
+        };
+        let folders = vec![
+            pick(0, crate::tr!("plot", "folder-ask")),
+            pick(1, crate::tr!("plot", "folder-drawing")),
+            pick(2, crate::tr!("plot", "folder-pdf")),
+        ];
+        let names = vec![
+            pick(0, crate::tr!("plot", "name-drawing")),
+            pick(1, crate::tr!("plot", "name-layout")),
+            pick(2, crate::tr!("plot", "name-drawing-layout")),
+        ];
+        let folder_choice = folders.get(s.output_folder as usize).cloned();
+        let name_choice = names.get(s.output_name as usize).cloned();
+        let dpi = row![
+            field_row(crate::tr!("plot", "raster-dpi").into(), &s.raster_dpi, PlotDlgMsg::RasterDpi, 60),
+            field_row(crate::tr!("plot", "vector-dpi").into(), &s.vector_dpi, PlotDlgMsg::VectorDpi, 60),
+        ]
+        .spacing(8);
+        let name_row = drop_row(
+            crate::tr!("plot", "output-name").into(),
+            names,
+            name_choice,
+            PlotDlgMsg::OutputName,
+            Length::Fill,
+        );
+        if cfg!(target_arch = "wasm32") {
+            column![name_row, dpi].spacing(7).into()
+        } else {
+            column![
+                checkbox(s.open_when_done)
+                    .label(crate::tr!("plot", "open-when-done"))
+                    .text_size(12)
+                    .on_toggle(|_| Message::PlotDlg(PlotDlgMsg::Flag(PlotFlag::OpenWhenDone))),
+                drop_row(
+                    crate::tr!("plot", "output-folder").into(),
+                    folders,
+                    folder_choice,
+                    PlotDlgMsg::OutputFolder,
+                    Length::Fill,
+                ),
+                name_row,
+                dpi,
+            ]
+            .spacing(7)
+            .into()
+        }
     } else {
         row![
             field_row(t!("Copies"), &s.copies, PlotDlgMsg::Copies, 60),
@@ -1523,7 +1604,7 @@ pub fn view_window(
             .size(11)
             .style(muted_style)
             .width(92),
-        iced::widget::pick_list(
+        crate::ui::dropdown_list::pick_list(
             Some(PlotChoice::localized(s.area.clone())),
             area_options,
             |value| value.to_string(),
@@ -1854,4 +1935,57 @@ pub fn view_window(
         .width(width)
         .height(height)
         .into()
+}
+
+#[cfg(test)]
+mod sidebar_layout_tests {
+    use super::*;
+    use iced::advanced::widget::{self, Operation};
+
+    #[test]
+    fn page_setup_scrollbar_viewport_fills_sidebar_width() {
+        struct ScrollBounds(Vec<iced::Rectangle>);
+        impl Operation for ScrollBounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn widget::operation::Scrollable,
+            ) {
+                self.0.push(bounds);
+            }
+        }
+        let _lock = crate::headless_ui_lock();
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                None,
+            ),
+        )
+        .expect("headless renderer");
+        let mut state = PlotDialogState::default();
+        state.page_setups = (0..25).map(|i| format!("Setup {i:02}")).collect();
+        let mut ui = iced_test::runtime::user_interface::UserInterface::build(
+            view_window(&state, false, crate::ui::modal::ModalSizing::FILL),
+            iced::Size::new(1100.0, 360.0),
+            iced_test::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut bounds = ScrollBounds(Vec::new());
+        ui.operate(&renderer, &mut widget::operation::black_box(&mut bounds));
+        let sidebar = bounds
+            .0
+            .iter()
+            .find(|bounds| bounds.x < 160.0)
+            .expect("page setup list scrollable");
+        assert!(
+            (sidebar.width - 136.0).abs() < 1.0,
+            "scrollbar must sit at the sidebar edge: {sidebar:?}"
+        );
+    }
 }

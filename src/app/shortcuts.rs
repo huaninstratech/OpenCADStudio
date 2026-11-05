@@ -48,11 +48,22 @@ pub(super) fn default_bindings() -> BTreeMap<String, String> {
         ("F10".to_string(), "POLAR"),
         ("F11".to_string(), "OTRACK"),
         ("F12".to_string(), "DYNINPUT"),
+        // F12 itself is Dynamic Input (as in the commercial solutions this
+        // application mirrors), so the quad's master toggle rides the
+        // nearest free seat beside it: Shift+F12.
+        ("SHIFT+F12".to_string(), "QUADTOGGLE"),
+        // The next and the previous open drawing.
+        ("CTRL+TAB".to_string(), "NEXTDRAWING"),
+        ("CTRL+SHIFT+TAB".to_string(), "PREVDRAWING"),
         (format!("{ACCEL}+0"), "CLEANSCREEN"),
+        (format!("{ACCEL}+9"), "COMMANDLINETOGGLE"),
         (format!("{ACCEL}+1"), "PROPERTIES"),
+        (format!("{ACCEL}+K"), "HYPERLINK"),
         (format!("{ACCEL}+N"), "QNEW"),
         (format!("{ACCEL}+O"), "OPEN"),
         (format!("{ACCEL}+P"), "PLOT"),
+        (format!("{ACCEL}+W"), "TOGGLESELECTIONCYCLING"),
+        (format!("{ACCEL}+R"), "NEXTVIEWPORT"),
         (format!("{ACCEL}+Q"), "QUIT"),
         (format!("{ACCEL}+S"), "SAVE"),
         (format!("{ACCEL}+SHIFT+S"), "SAVEAS"),
@@ -80,9 +91,16 @@ pub(super) fn default_bindings() -> BTreeMap<String, String> {
         ("RIGHT".to_string(), "CARETRIGHT"),
     ]
     .into_iter()
+    .chain(PLATFORM_BINDINGS.iter().map(|(key, action)| (key.to_string(), *action)))
     .map(|(key, action)| (key, action.to_string()))
     .collect()
 }
+
+/// Bindings a platform expects of every application.
+#[cfg(target_os = "macos")]
+pub(super) const PLATFORM_BINDINGS: &[(&str, &str)] = &[("CMD+,", "OPTIONS")];
+#[cfg(not(target_os = "macos"))]
+pub(super) const PLATFORM_BINDINGS: &[(&str, &str)] = &[];
 
 /// Canonical form used by the editor, command interface, config and key event
 /// resolver. Modifier order is stable so equivalent user input shares one row.
@@ -189,8 +207,14 @@ pub(super) const INPUT_ACTIONS: &[&str] = &[
     "TOGGLEDUCS",
     "OTRACK",
     "DYNINPUT",
+    "TOGGLESELECTIONCYCLING",
+    "NEXTVIEWPORT",
     "SELECTALL",
     "PASTECLIP",
+    // The quad cursor menu's master toggle (docs/quad-menu.md §3.6).
+    "QUADTOGGLE",
+    "NEXTDRAWING",
+    "PREVDRAWING",
 ];
 
 impl OpenCADStudio {
@@ -291,8 +315,44 @@ impl OpenCADStudio {
         self.persist_settings_if_changed();
     }
 
+    /// Ctrl+R: make the next viewport of the layout current, from paper
+    /// space the first one, keeping a running command going.
+    fn next_viewport(&mut self) -> Task<Message> {
+        let scene = &self.tabs[self.active_tab].scene;
+        if scene.current_layout == "Model" {
+            return Task::none();
+        }
+        let viewports: Vec<codec::Handle> =
+            scene.viewport_list().into_iter().map(|vp| vp.handle).collect();
+        let next = match scene.active_viewport.and_then(|h| viewports.iter().position(|v| *v == h)) {
+            Some(index) => viewports.get((index + 1) % viewports.len()),
+            None => viewports.first(),
+        };
+        let Some(&next) = next else {
+            return Task::none();
+        };
+        self.viewport_switch_keeps_command = true;
+        Task::done(Message::EnterViewport(next))
+    }
+
     pub(super) fn run_shortcut(&mut self, key: &str) -> Task<Message> {
-        let action = self.shortcut_bindings.get(key).or_else(|| {
+        // Configurations saved before these keys were bound still switch
+        // drawings with them, rather than falling back to plain Tab.
+        let builtin = match key {
+            "CTRL+TAB" => Some("NEXTDRAWING".to_string()),
+            "CTRL+SHIFT+TAB" => Some("PREVDRAWING".to_string()),
+            _ => None,
+        };
+        let builtin = builtin.filter(|_| !self.shortcut_bindings.contains_key(key));
+        // Alt+letter opens that menu of the menu bar, unless it is bound.
+        if let Some(letter) = key.strip_prefix("ALT+").filter(|rest| rest.chars().count() == 1) {
+            if !self.shortcut_bindings.contains_key(key) {
+                if let Some(task) = letter.chars().next().and_then(|ch| self.open_menu_bar_menu(ch)) {
+                    return task;
+                }
+            }
+        }
+        let action = builtin.as_ref().or_else(|| self.shortcut_bindings.get(key)).or_else(|| {
             let base = key.rsplit('+').next()?;
             is_named_key(base)
                 .then(|| self.shortcut_bindings.get(base))
@@ -348,8 +408,29 @@ impl OpenCADStudio {
             "TOGGLEDUCS" => Message::ToggleDynamicUcs,
             "OTRACK" => Message::ToggleOTrack,
             "DYNINPUT" => Message::ToggleDynInput,
+            "TOGGLESELECTIONCYCLING" => Message::ToggleSelectionCycling,
+            // Quad cursor menu master toggle (Shift+F12, Options window,
+            // status-bar field): the pure on/off flip, quad panel updates
+            // included, lives in the quad router (docs/quad-menu.md §3.6).
+            "QUADTOGGLE" => Message::Quad(crate::ui::popup::quad_menu::QuadMsg::Toggle),
+            "NEXTVIEWPORT" => return self.next_viewport(),
+            // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous open drawing.
+            "NEXTDRAWING" | "PREVDRAWING" => {
+                let count = self.tabs.len();
+                if count < 2 {
+                    return Task::none();
+                }
+                let step = if action == "NEXTDRAWING" { 1 } else { count - 1 };
+                Message::TabSwitch((self.active_tab + step) % count)
+            }
             "SELECTALL" => Message::SelectAllShortcut,
             "PASTECLIP" => Message::PasteShortcut,
+
+            // The multiline text editor keeps its own history.
+            "UNDO" if self.mtext_editor.is_some() => Message::MTextUndo,
+            "REDO" if self.mtext_editor.is_some() => Message::MTextRedo,
+            // In the text editor Ctrl+F inserts a field instead of finding.
+            "FIND" if self.mtext_editor.is_some() => Message::MTextInsertField,
 
             "UNDO" => {
                 let i = self.active_tab;
@@ -375,5 +456,57 @@ impl OpenCADStudio {
         };
 
         self.update(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::OpenCADStudio;
+
+    /// Bare F12 toggles dynamic input and SHIFT+F12 toggles the quad, also
+    /// through the config-upgrade path: a settings file saved before the
+    /// quad carries no SHIFT+F12 row, and the bare-base-key fallback of
+    /// `run_shortcut` must not shadow it into F12 (DYNINPUT) — `apply_config`
+    /// backfills the row (docs/quad-menu.md §3.6).
+    #[test]
+    fn f12_is_dyn_input_and_shift_f12_is_quad_toggle() {
+        let mut app = OpenCADStudio::new_for_test();
+
+        // Stale table: exact shape of a config saved before the quad existed.
+        let mut cfg = crate::app::config::AppConfig::default();
+        cfg.shortcuts.bindings = [(normalize_key("F12"), "DYNINPUT".to_string())]
+            .into_iter()
+            .collect();
+        app.apply_config(cfg);
+
+        let dyn_before = app.dyn_input;
+        let _ = app.run_shortcut("F12");
+        assert_eq!(
+            app.dyn_input,
+            !dyn_before,
+            "bare F12 toggles dynamic input"
+        );
+        assert!(!app.quad, "bare F12 must not touch the quad");
+
+        let _ = app.run_shortcut("SHIFT+F12");
+        assert!(app.quad, "SHIFT+F12 toggles the quad via QUADTOGGLE");
+    }
+
+    #[test]
+    fn ctrl_tab_switches_drawings_also_without_a_binding() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"new"}"#);
+        let count = app.tabs.len();
+        let start = app.active_tab;
+        let _ = app.update(Message::ShortcutPressed("CTRL+TAB".into()));
+        assert_eq!(app.active_tab, (start + 1) % count);
+        let _ = app.update(Message::ShortcutPressed("CTRL+SHIFT+TAB".into()));
+        assert_eq!(app.active_tab, start);
+        // A configuration saved before the binding existed.
+        app.shortcut_bindings.remove("CTRL+TAB");
+        let _ = app.update(Message::ShortcutPressed("CTRL+TAB".into()));
+        assert_eq!(app.active_tab, (start + 1) % count);
     }
 }

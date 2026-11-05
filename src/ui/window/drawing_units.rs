@@ -97,7 +97,7 @@ fn drop_row<'a>(
     selected: Option<Choice>,
     ctor: fn(i16) -> Field,
 ) -> Element<'a, Message> {
-    let picker = iced::widget::pick_list(selected, options, |choice| choice.to_string())
+    let picker = crate::ui::dropdown_list::pick_list(selected, options, |choice| choice.to_string())
         .on_select(move |choice| Message::DrawingUnitsField(ctor(choice.code)))
         .text_size(12)
         .padding([3, 6])
@@ -314,6 +314,7 @@ fn with_context(state: &State, body: impl FnOnce() -> String) -> String {
             .unwrap_or(0.0)
             .to_radians(),
         angdir_cw: state.clockwise,
+        dimzin: 0,
     });
     let out = body();
     set_unit_context(previous);

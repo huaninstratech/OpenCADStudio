@@ -19,9 +19,9 @@ enum AreaMode {
 }
 
 #[derive(Clone, Copy)]
-struct AreaMeasurement {
-    area: f64,
-    perimeter: Option<f64>,
+pub(crate) struct AreaMeasurement {
+    pub(crate) area: f64,
+    pub(crate) perimeter: Option<f64>,
 }
 
 pub struct AreaCommand {
@@ -63,7 +63,7 @@ impl AreaCommand {
     /// Measured in space rather than in projection — a picked sequence need
     /// not lie in a coordinate plane, and flattening it to XY first would
     /// report its shadow.
-    fn point_measurement(points: &[DVec3], close_perimeter: bool) -> AreaMeasurement {
+    pub(crate) fn point_measurement(points: &[DVec3], close_perimeter: bool) -> AreaMeasurement {
         if points.len() < 2 {
             return AreaMeasurement {
                 area: 0.0,
@@ -96,7 +96,7 @@ impl AreaCommand {
         })
     }
 
-    fn entity_measurement(entity: &EntityType) -> Option<AreaMeasurement> {
+    pub(crate) fn entity_measurement(entity: &EntityType) -> Option<AreaMeasurement> {
         // Anything the converter recognises is measured from its own curve.
         if let Some(measurement) = Self::curve_measurement(entity) {
             return Some(measurement);
@@ -246,11 +246,7 @@ impl CadCommand for AreaCommand {
 
     fn prompt(&self) -> String {
         if self.objects_gathering {
-            return crate::tr!(
-                "area",
-                "prompt-objects",
-                count = self.selected_entities.len()
-            );
+            return crate::tr!("area", "prompt-objects");
         }
         if !self.points.is_empty() {
             return crate::tr!("area", "prompt-next", count = self.points.len());
@@ -418,7 +414,7 @@ impl CadCommand for AreaCommand {
         if self.objects_gathering || self.points.is_empty() {
             return None;
         }
-        let to_render = |p: DVec3| [p.x as f32, p.y as f32, p.z as f32];
+        let to_render = |p: DVec3| p.to_array();
         let mut points = self
             .points
             .iter()
@@ -426,43 +422,14 @@ impl CadCommand for AreaCommand {
             .collect::<Vec<_>>();
         points.push(to_render(point));
         points.push(to_render(self.points[0]));
-        Some(WireModel {
-            bg_adapt: None,
-            point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
-            world_width: 0.0,
-            depth_override: None,
-            display_visible: true,
-            snap_only: false,
-            plot_visible: true,
-            fill_is_3d: false,
-            fill_is_2d_solid: false,
-            render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
-            name: "area_preview".into(),
+        // Preview geometry is f64; `solid_f64` keeps the residual so the
+        // boundary stays on the picked points at UTM-scale coordinates.
+        Some(WireModel::solid_f64(
+            "area_preview".into(),
             points,
-            points_low: Vec::new(),
-            color: WireModel::CYAN,
-            selected: false,
-            pattern_length: 0.0,
-            pattern: [0.0; 8],
-            line_weight_px: 1.0,
-            snap_pts: Vec::new(),
-            tangent_geoms: Vec::new(),
-            aci: 0,
-            key_vertices: Vec::new(),
-            aabb: WireModel::UNBOUNDED_AABB,
-            plinegen: true,
-            fill_tris: Vec::new(),
-            fill_tris_low: Vec::new(),
-
-            ..Default::default()
-        })
+            WireModel::CYAN,
+            false,
+        ))
     }
 
     fn area_preview_regions(&self) -> Option<Vec<AreaPreviewRegion>> {

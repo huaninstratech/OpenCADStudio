@@ -11,6 +11,8 @@ use OpenCADStudio::sys;
 use OpenCADStudio::{cli, io, mcp, rest};
 
 fn main() -> iced::Result {
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenCADStudio::sys::startup_times::mark("main entry");
     // Web (wasm) uses the single-window entry; native uses the multi-window
     // daemon. Trunk calls `main` from its generated JS bootstrap. The web build
     // takes no CLI args, so it skips parsing entirely.
@@ -40,6 +42,8 @@ fn main() -> iced::Result {
         // line on success and exit 0/1. This must run before any logging/GUI
         // setup; the parent interprets any non-zero exit (including a driver
         // abort) as "this backend is unusable".
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("cli parsed");
         if let Some(which) = &args.gpu_probe {
             OpenCADStudio::gpu_backend::run_probe_child(which);
         }
@@ -110,6 +114,11 @@ fn main() -> iced::Result {
             let _ = env_logger::try_init();
         }
 
+        // Unattended script runs need no window, so no GPU either.
+        if let Some(script) = args.batch.as_ref().or(args.each.as_ref()) {
+            let files = if args.each.is_some() { &args.files[..] } else { &[] };
+            std::process::exit(app::run_batch(script, files, args.read_only));
+        }
         // Right-click convert: `--export-pdf <file>...` plots every layout of
         // each drawing to <stem>.pdf beside it and exits. Headless like the
         // handoffs above, so it also skips the GPU probe below — plotting
@@ -133,6 +142,8 @@ fn main() -> iced::Result {
         // survives a real offscreen render; a crash sentinel skips backends
         // that died with the previous run.
         let gpu = OpenCADStudio::gpu_backend::resolve_gpu(args.backend.as_deref(), args.safe_mode);
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("gpu resolved");
 
         // Headless modes exit without ever creating a window.
         if let Some(port) = args.http {
@@ -158,6 +169,7 @@ fn main() -> iced::Result {
                 &io[1],
                 args.target_version.as_deref(),
                 args.purge_legacy,
+                args.allow_lossy,
             );
             std::process::exit(code);
         }
@@ -251,6 +263,8 @@ fn main() -> iced::Result {
         // backend. A stale file at the next launch means this run aborted, so
         // the resolver skips those backends instead of crashing again.
         // Inactive on macOS/wasm, where the resolver leaves the env alone.
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenCADStudio::sys::startup_times::mark("entering app::run");
         if OpenCADStudio::gpu_backend::gpu_guard_active() {
             OpenCADStudio::gpu_backend::arm_sentinel(
                 gpu.backend_value.as_deref().unwrap_or("auto"),

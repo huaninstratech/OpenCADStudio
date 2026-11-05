@@ -418,12 +418,19 @@ impl Scene {
     /// there is unreliable.
     fn paper_canvas_hatches(&self, tint_selected: bool) -> Arc<Vec<HatchModel>> {
         let layout_block = self.current_layout_block_handle();
+        // LAYWALK: when the sheet's own space is walked, layers outside the
+        // visible set hide here as if frozen — captured once, like the walk
+        // never changes within a build.
+        let layer_walk = self.render_space_layer_walk(layout_block, None);
         let layer_hidden = |layer: &str| {
             self.document
                 .layers
                 .get(layer)
-                .map(|l| l.flags.off || l.flags.frozen)
-                .unwrap_or(false)
+                .is_some_and(|l| {
+                    l.flags.off
+                        || l.flags.frozen
+                        || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
+                })
         };
         let mut models: Vec<HatchModel> = Vec::new();
         let annotation_scale_handle = self.paper_annotation_scale_handle();
@@ -543,12 +550,18 @@ impl Scene {
         all_visible: bool,
         include_solids: bool,
     ) -> Vec<HatchModel> {
+        // The walked space hides its outside-set layers in sheet fills too;
+        // foreign blocks / plot passes resolve to `None` and stay complete.
+        let layer_walk = self.render_space_layer_walk(block, None);
         let layer_hidden = |layer: &str| {
             self.document
                 .layers
                 .get(layer)
-                .map(|l| l.flags.off || l.flags.frozen)
-                .unwrap_or(false)
+                .is_some_and(|l| {
+                    l.flags.off
+                        || l.flags.frozen
+                        || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
+                })
         };
         let layer_plottable = |layer: &str| {
             self.document
@@ -603,7 +616,11 @@ impl Scene {
                 }
                 _ => model.clone(),
             };
-            let style = self.render_style(entity);
+            // Resolve against the sheet, like the block-child fills below, not
+            // the screen: in Model the screen is dark, so colour 7 / ByBlock
+            // fills stayed white and vanished on the white page.
+            let mut style = view::render::render_style_for(&self.document, entity);
+            style.0 = view::render::adapt_to_bg(style.0, self.paper_bg_color);
             if matches!(
                 hatch.pattern,
                 model::hatch_model::HatchPattern::Gradient { .. }
@@ -616,6 +633,13 @@ impl Scene {
             hatch.line_weight_px = style.3;
             hatch.draw_depth = depth_map.get(&handle.value()).map_or(0.0, |depth| depth[0]);
             if let EntityType::Hatch(dxf) = entity {
+                // The background fill plots under the pattern, as on screen.
+                let fill_style = (style.0, style.4);
+                if let Some(mut backdrop) = self.hatch_backdrop(dxf, &hatch, fill_style, None) {
+                    backdrop.color = view::render::adapt_to_bg(backdrop.color, self.paper_bg_color);
+                    backdrop.name = hatch.name.clone();
+                    models.push(backdrop);
+                }
                 if let model::hatch_model::HatchPattern::Pattern(_) = &hatch.pattern {
                     if dxf.pattern.lines.is_empty() {
                         hatch.angle_offset = dxf.pattern_angle as f32;
@@ -654,6 +678,7 @@ impl Scene {
             self.paper_bg_color,
             highlight_selection,
             true,
+            None,
         )
     }
 
@@ -672,6 +697,7 @@ impl Scene {
             self.paper_bg_color,
             true,
             false,
+            None,
         ))
     }
 

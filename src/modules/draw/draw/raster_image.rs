@@ -7,6 +7,8 @@
 // Workflow (both commands):
 //   1. File dialog opens (async, handled in update.rs).
 //   2. User picks insertion point (first click).
+//      A georeferenced file (GeoTIFF tags or a world file) offers its own
+//      place instead: Enter or G commits it at once.
 //   3. User drags to pick width; height is computed from the image's aspect ratio.
 //   4. Entity is committed.
 
@@ -37,11 +39,15 @@ pub struct ImageCommand {
     pixel_height: u32,
     origin: Option<DVec3>,
     plane: WorkingPlane,
+    /// The file's own placement (GeoTIFF tags or a world file), offered as
+    /// the default insertion.
+    georef: Option<crate::io::georef::Georef>,
 }
 
 impl ImageCommand {
     pub fn new(file_path: String, pixel_width: u32, pixel_height: u32) -> Self {
         Self {
+            georef: crate::io::georef::find(&file_path),
             source: ImageSource::File(file_path),
             name: "IMAGE",
             pixel_width,
@@ -60,6 +66,7 @@ impl ImageCommand {
             pixel_height,
             origin: None,
             plane: WorkingPlane::default(),
+            georef: None,
         }
     }
 
@@ -76,6 +83,27 @@ impl ImageCommand {
         } else {
             self.pixel_width as f64 / self.pixel_height as f64
         }
+    }
+
+    /// The image at its georeferenced place. Those are world coordinates, so
+    /// the current UCS does not apply.
+    fn georeferenced_entity(&self) -> Option<EntityType> {
+        let (ImageSource::File(path), Some(georef)) = (&self.source, self.georef) else {
+            return None;
+        };
+        let (corner, u, v) = georef.placement(self.pixel_height);
+        let mut img = RasterImage::new(
+            path,
+            Vector3::new(corner.x, corner.y, corner.z),
+            self.pixel_width as f64,
+            self.pixel_height as f64,
+        );
+        img.u_vector = Vector3::new(u.x, u.y, u.z);
+        img.v_vector = Vector3::new(v.x, v.y, v.z);
+        img.flags = codec::entities::ImageDisplayFlags::SHOW_IMAGE
+            | codec::entities::ImageDisplayFlags::SHOW_NOT_ALIGNED
+            | codec::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY;
+        Some(EntityType::RasterImage(img))
     }
 
     fn make_entity(&self, origin: DVec3, width_pt: DVec3) -> EntityType {
@@ -121,7 +149,13 @@ impl CadCommand for ImageCommand {
     }
 
     fn prompt(&self) -> String {
-        if self.origin.is_none() {
+        if self.origin.is_none() && self.georef.is_some() {
+            t!(
+                "IMAGE  Specify insertion point or [Georeferenced] <Georeferenced> (%{name}):  ",
+                name = self.source_name()
+            )
+            .into_owned()
+        } else if self.origin.is_none() {
             t!(
                 "IMAGE  Specify insertion point (%{name}):  ",
                 name = self.source_name()
@@ -130,6 +164,23 @@ impl CadCommand for ImageCommand {
         } else {
             t!("IMAGE  Specify width (drag right):").into_owned()
         }
+    }
+
+    fn options(&self) -> Vec<crate::command::CmdOption> {
+        if self.origin.is_none() && self.georef.is_some() {
+            vec![crate::command::CmdOption::new("Georeferenced", "G")]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        let keyword = text.trim().to_ascii_uppercase();
+        let georeferenced = !keyword.is_empty() && "GEOREFERENCED".starts_with(&keyword);
+        if self.origin.is_some() || !georeferenced {
+            return None;
+        }
+        self.georeferenced_entity().map(CmdResult::CommitAndExit)
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
@@ -150,7 +201,8 @@ impl CadCommand for ImageCommand {
             let entity = self.make_entity(origin, width_pt);
             CmdResult::CommitAndExit(entity)
         } else {
-            CmdResult::Cancel
+            self.georeferenced_entity()
+                .map_or(CmdResult::Cancel, CmdResult::CommitAndExit)
         }
     }
 

@@ -1,10 +1,12 @@
 //! Command-line interface.
 //!
-//! Parsing lives here; `main` interprets the result. Four run modes split out
+//! Parsing lives here; `main` interprets the result. These run modes split out
 //! of the parsed args:
 //!   - `--mcp`              local stdio MCP server for AI clients
 //!   - `--serve`            headless JSON automation server (see `app::serve`)
 //!   - `--export IN OUT`    one-shot headless format conversion, then exit
+//!   - `--batch SCRIPT`     run a script headless, then exit
+//!   - `--each SCRIPT FILES` run a script headless on each drawing, then exit
 //!   - otherwise            launch the GUI editor, configured via [`GuiConfig`]
 //!
 //! GUI-only options (open-file, `--new`, `--read-only`, `--script`) are stashed
@@ -121,10 +123,28 @@ pub struct Cli {
     #[arg(help = crate::t!("Plot each drawing's model space to a monochrome PDF beside it, then exit.").into_owned(), long_help = None)]
     pub export_pdf: Vec<PathBuf>,
 
+    /// Let --export write an older DWG or DXF target that cannot store some
+    /// MTEXT data (columns, box height, background mask, line spacing). Without it
+    /// such an export is refused with exit code 3 and nothing is written.
+    #[arg(long, requires = "export")]
+    pub allow_lossy: bool,
+
     /// Run a command script at startup: one command line per line of FILE.
     #[arg(long, value_name = "FILE")]
     #[arg(help = crate::t!("Run a command script at startup, one command per line.").into_owned(), long_help = None)]
     pub script: Option<PathBuf>,
+
+    /// Run a command script with no window and exit when it ends (exit
+    /// code 1 when a row failed). Starts with no drawing open.
+    #[arg(long, value_name = "SCRIPT", conflicts_with_all = ["each", "files"])]
+    #[arg(help = crate::t!("Run a script with no window, then exit (1 if a row failed).").into_owned(), long_help = None)]
+    pub batch: Option<PathBuf>,
+
+    /// Run a command script with no window once per listed drawing: open,
+    /// run, close without saving what the script did not save.
+    #[arg(long, value_name = "SCRIPT", requires = "files")]
+    #[arg(help = crate::t!("Run a script on each listed drawing with no window, then exit.").into_owned(), long_help = None)]
+    pub each: Option<PathBuf>,
 
     /// Log level (error|warn|info|debug|trace). Also honours RUST_LOG.
     #[arg(long, value_name = "LEVEL")]

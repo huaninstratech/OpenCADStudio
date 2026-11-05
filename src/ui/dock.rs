@@ -44,9 +44,8 @@ pub enum DockMsg {
     SplitGrab(DockSide, usize, usize, usize),
     /// Give every pallet of a group the same height again (side, group).
     SplitReset(DockSide, usize),
-    /// Begin resizing floating `panel` from its corner grip; `true` for the
-    /// bottom-left grip (a panel whose title bar is on the right).
-    FloatResizeGrab(PanelId, bool),
+    /// Begin resizing floating `panel` from one of its sides or corners.
+    FloatResizeGrab(PanelId, FloatEdge),
     /// The pointer entered a docked title bar (shows its pin and close).
     TitleHover(PanelId),
     /// The pointer left that title bar.
@@ -57,6 +56,9 @@ pub enum DockMsg {
     /// Pallet menu pick: hide `panel` when it shows, else open it docked on
     /// the edge (as a new group unless it already has a group there).
     EdgeMenuToggle(DockSide, PanelId),
+    /// Show each pallet's name beside its icon in the strips (`true`), or
+    /// icons only.
+    StripLabels(bool),
     /// Begin dragging a whole group by its edge band in the icon strip.
     GroupGrab(DockSide, usize),
     /// The pointer entered a group's edge band (side, group).
@@ -73,6 +75,9 @@ pub enum DockMsg {
     FloatMenu(Option<PanelId>),
     /// Floating menu's Allow docking check: flip it for the panel.
     FloatDockingToggle(PanelId),
+    /// Desktop: move the pallet into a window of its own.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Detach(PanelId),
     /// The pointer moved over a floating title bar, at this point in it
     /// (where its right-click menu opens).
     FloatBarPointer(iced::Point),
@@ -108,6 +113,8 @@ pub enum PanelId {
     BlockPalette,
     /// Block Editor authoring tools.
     AuthoringPalettes,
+    /// The Block Editor's Parameters Manager.
+    ParametersManager,
     ExternalReferences,
     /// Outline of the drawing's origin planes, open sketch and solid bodies.
     Browser,
@@ -123,15 +130,24 @@ pub enum PanelId {
     SheetSetManager,
     /// The Layer Manager (LAYERS).
     Layers,
+    /// The LAYWALK pallet.
+    Laywalk,
+    /// The calculator (QUICKCALC).
+    QuickCalc,
+    /// The whole command history, kept open beside the drawing.
+    CommandHistory,
+    /// Dynamic plugin dockable side panel / palette (identified by unique numeric ID).
+    Plugin(u32),
 }
 
 impl PanelId {
     /// Every panel, in the order the pallet menu lists them.
-    pub const ALL: [PanelId; 12] = [
+    pub const ALL: [PanelId; 16] = [
         PanelId::Properties,
         PanelId::GraphicAttributes,
         PanelId::BlockPalette,
         PanelId::AuthoringPalettes,
+        PanelId::ParametersManager,
         PanelId::ExternalReferences,
         PanelId::Browser,
         PanelId::ModelTree,
@@ -140,6 +156,9 @@ impl PanelId {
         PanelId::Count,
         PanelId::SheetSetManager,
         PanelId::Layers,
+        PanelId::Laywalk,
+        PanelId::QuickCalc,
+        PanelId::CommandHistory,
     ];
 
     /// Localized-friendly display name used by the collapsed/edge chrome.
@@ -149,6 +168,7 @@ impl PanelId {
             PanelId::GraphicAttributes => "Graphic Attributes",
             PanelId::BlockPalette => "Block Palette",
             PanelId::AuthoringPalettes => "Authoring Palettes",
+            PanelId::ParametersManager => "Parameters Manager",
             PanelId::ExternalReferences => "External References",
             PanelId::Browser => "Browser",
             PanelId::ModelTree => "IFC Model Tree",
@@ -157,6 +177,10 @@ impl PanelId {
             PanelId::Count => "Count",
             PanelId::SheetSetManager => "Sheet Set Manager",
             PanelId::Layers => "Layer Manager",
+            PanelId::Laywalk => "Layer Walk",
+            PanelId::QuickCalc => "QuickCalc",
+            PanelId::CommandHistory => "Command History",
+            PanelId::Plugin(_) => "Plugin",
         }
     }
 
@@ -169,6 +193,7 @@ impl PanelId {
             }
             PanelId::BlockPalette => include_bytes!("../../assets/icons/blocks/insert.svg"),
             PanelId::AuthoringPalettes => include_bytes!("../../assets/icons/tool_palettes.svg"),
+            PanelId::ParametersManager => include_bytes!("../../assets/icons/table.svg"),
             PanelId::ExternalReferences => crate::ui::icons::FOLDER_OPEN,
             PanelId::Browser => include_bytes!("../../assets/icons/content_browser.svg"),
             PanelId::NodeGraph => crate::ui::icons::NODE_GRAPH,
@@ -177,16 +202,21 @@ impl PanelId {
             PanelId::SheetSetManager => include_bytes!("../../assets/icons/sheetset.svg"),
             PanelId::ModelTree => include_bytes!("../../assets/icons/ifc.svg"),
             PanelId::Layers => include_bytes!("../../assets/icons/layers/panel.svg"),
+            PanelId::Laywalk => include_bytes!("../../assets/icons/layers/laywalk.svg"),
+            PanelId::QuickCalc => crate::ui::window::quick_calc::ICON,
+            PanelId::CommandHistory => include_bytes!("../../assets/icons/ui/list.svg"),
+            PanelId::Plugin(_) => crate::ui::icons::MORE,
         }
     }
 
     /// Default dock width for a freshly-created panel instance.
-    fn default_width(self) -> f32 {
+    pub(crate) fn default_width(self) -> f32 {
         match self {
             PanelId::Properties => 250.0,
             PanelId::GraphicAttributes => 250.0,
             PanelId::BlockPalette => 260.0,
             PanelId::AuthoringPalettes => 260.0,
+            PanelId::ParametersManager => 420.0,
             PanelId::ExternalReferences => 460.0,
             PanelId::Browser => 230.0,
             PanelId::ModelTree => 260.0,
@@ -195,6 +225,10 @@ impl PanelId {
             PanelId::Count => 280.0,
             PanelId::SheetSetManager => 280.0,
             PanelId::Layers => 560.0,
+            PanelId::Laywalk => 420.0,
+            PanelId::QuickCalc => 320.0,
+            PanelId::CommandHistory => 420.0,
+            PanelId::Plugin(_) => 280.0,
         }
     }
 
@@ -356,6 +390,10 @@ pub struct FloatPanel {
     pub h: f32,
     /// Dragging the panel may dock it on an edge; off, it only ever floats.
     pub docking: bool,
+    /// The side its vertical title bar is on. It starts on the side the
+    /// pallet was docked on and only changes when a drag brings the panel
+    /// against an edge (see `dock_float_target`).
+    pub bar: DockSide,
 }
 
 /// On-disk form of a floating panel. A short-lived build floated groups,
@@ -372,6 +410,9 @@ struct FloatRepr {
     h: f32,
     #[serde(default = "docking_default")]
     docking: bool,
+    /// Missing in a config from before the bar kept its side.
+    #[serde(default)]
+    bar: Option<DockSide>,
 }
 
 fn docking_default() -> bool {
@@ -387,13 +428,15 @@ impl TryFrom<FloatRepr> for FloatPanel {
                 .ok_or("floating panel without id")?;
         Ok(Self {
             docking: r.docking,
+            bar: r.bar.unwrap_or(DockSide::Left),
             ..Self::new(id, r.x, r.y, r.w, r.h)
         })
     }
 }
 
 impl FloatPanel {
-    /// Panel `id` floating at `x`, `y`, sized `w` × `h`, free to dock.
+    /// Panel `id` floating at `x`, `y`, sized `w` × `h`, free to dock, with
+    /// its title bar on the left.
     pub fn new(id: PanelId, x: f32, y: f32, w: f32, h: f32) -> Self {
         Self {
             id,
@@ -402,6 +445,7 @@ impl FloatPanel {
             w,
             h,
             docking: true,
+            bar: DockSide::Left,
         }
     }
 
@@ -413,6 +457,48 @@ impl FloatPanel {
         self.y = finite_or(self.y, 0.0).max(0.0);
         self.w = finite_or(self.w, self.id.default_width()).clamp(DOCK_MIN_W, self.id.max_width());
         self.h = finite_or(self.h, FLOAT_MIN_H).max(FLOAT_MIN_H);
+    }
+}
+
+/// The side or corner of a floating panel being dragged to resize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatEdge {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl FloatEdge {
+    pub const N: Self = Self::new(false, false, true, false);
+    pub const S: Self = Self::new(false, false, false, true);
+    pub const W: Self = Self::new(true, false, false, false);
+    pub const E: Self = Self::new(false, true, false, false);
+    pub const NW: Self = Self::new(true, false, true, false);
+    pub const NE: Self = Self::new(false, true, true, false);
+    pub const SW: Self = Self::new(true, false, false, true);
+    pub const SE: Self = Self::new(false, true, false, true);
+
+    const fn new(left: bool, right: bool, top: bool, bottom: bool) -> Self {
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+
+    /// The resize cursor for this side or corner.
+    pub fn interaction(self) -> iced::mouse::Interaction {
+        use iced::mouse::Interaction;
+        let sideways = self.left || self.right;
+        let upright = self.top || self.bottom;
+        match (sideways, upright) {
+            (true, true) if self.left == self.top => Interaction::ResizingDiagonallyDown,
+            (true, true) => Interaction::ResizingDiagonallyUp,
+            (true, false) => Interaction::ResizingHorizontally,
+            _ => Interaction::ResizingVertically,
+        }
     }
 }
 
@@ -446,6 +532,15 @@ pub struct DockState {
     /// Per-panel settings, keyed by `PanelId`: the width a pallet floats at
     /// (and starts a new group with) and its floating auto-hide.
     pub panels: BTreeMap<PanelId, DockPanel>,
+    /// Desktop: pallets shown in a window of their own, and where that window
+    /// was. Out of the layout above while they are here.
+    pub detached: BTreeMap<PanelId, crate::app::tool_windows::WindowPlacement>,
+    /// Desktop: where each dialog's window of its own last was, by dialog
+    /// name.
+    pub tool_windows: BTreeMap<String, crate::app::tool_windows::WindowPlacement>,
+    /// The icon strips label each pallet, sharing the edge's height between
+    /// them, instead of showing icons only.
+    pub strip_labels: bool,
 }
 
 impl Default for DockState {
@@ -459,6 +554,9 @@ impl Default for DockState {
             auto_hide: (false, false),
             floating: Vec::new(),
             panels: BTreeMap::new(),
+            detached: BTreeMap::new(),
+            tool_windows: BTreeMap::new(),
+            strip_labels: false,
         }
     }
 }
@@ -692,6 +790,18 @@ impl DockState {
         self.set_group_width(side, group, width);
     }
 
+    /// Take pallet `id` out of the layout into a window of its own at
+    /// `placement`. It stays out until it comes back (`detached` cleared).
+    pub fn separate(&mut self, id: PanelId, placement: crate::app::tool_windows::WindowPlacement) {
+        self.detach(id);
+        self.detached.insert(id, placement);
+    }
+
+    /// Whether pallet `id` is in a window of its own.
+    pub fn is_separate(&self, id: PanelId) -> bool {
+        self.detached.contains_key(&id)
+    }
+
     /// Take `id` out of the layout. Returns the group it left, its position
     /// and weight there, and whether the group disappeared (it held nothing
     /// else).
@@ -720,6 +830,9 @@ impl DockState {
     /// (0 = first, `len` = last), counted before the move, and show it.
     /// Returns whether the layout changed.
     pub fn dock(&mut self, id: PanelId, side: DockSide, index: usize) -> bool {
+        if self.is_separate(id) {
+            return false;
+        }
         let before = self.clone();
         let mut index = index;
         if let Some((old_side, old_gi, _, _, removed)) = self.detach(id) {
@@ -739,7 +852,7 @@ impl DockState {
     /// pallet already in the group moves within it; the group keeps its
     /// width. Returns whether the layout changed.
     pub fn join_group(&mut self, id: PanelId, side: DockSide, group: usize, index: usize) -> bool {
-        if group >= self.groups(side).len() {
+        if self.is_separate(id) || group >= self.groups(side).len() {
             return false;
         }
         // A pallet alone in its group has nowhere to move within it (and
@@ -796,6 +909,9 @@ impl DockState {
 
     /// Float `id` at `rect`, on top of the other floating panels.
     pub fn float(&mut self, rect: FloatPanel) -> bool {
+        if self.is_separate(rect.id) {
+            return false;
+        }
         let before = self.clone();
         self.detach(rect.id);
         self.floating.push(rect);
@@ -821,16 +937,34 @@ impl DockState {
         }
     }
 
-    /// Resize a floating panel, keeping it at least a usable size. With
-    /// `keep_right` the right edge stays put (resizing from the left corner).
-    pub fn resize_float(&mut self, id: PanelId, w: f32, h: f32, keep_right: bool) {
-        if let Some(f) = self.floating.iter_mut().find(|f| f.id == id) {
-            let new_w = w.clamp(DOCK_MIN_W, id.max_width());
-            if keep_right {
-                f.x += f.w - new_w;
-            }
-            f.w = new_w;
-            f.h = h.max(FLOAT_MIN_H);
+    /// Resize floating panel `id` by dragging `edge` (`dx`, `dy`) from where
+    /// it was at `start` (x, y, w, h), keeping it at least a usable size; a
+    /// dragged left or top side moves the panel, never past the workspace's
+    /// left or top, and the opposite side stays put.
+    pub fn resize_float(
+        &mut self,
+        id: PanelId,
+        edge: FloatEdge,
+        start: (f32, f32, f32, f32),
+        dx: f32,
+        dy: f32,
+    ) {
+        let (x0, y0, w0, h0) = start;
+        let Some(f) = self.floating.iter_mut().find(|f| f.id == id) else {
+            return;
+        };
+        let max_w = id.max_width();
+        if edge.left {
+            f.w = (w0 - dx).min(x0 + w0).clamp(DOCK_MIN_W, max_w);
+            f.x = (x0 + w0 - f.w).max(0.0);
+        } else if edge.right {
+            f.w = (w0 + dx).clamp(DOCK_MIN_W, max_w);
+        }
+        if edge.top {
+            f.h = (h0 - dy).min(y0 + h0).max(FLOAT_MIN_H);
+            f.y = (y0 + h0 - f.h).max(0.0);
+        } else if edge.bottom {
+            f.h = (h0 + dy).max(FLOAT_MIN_H);
         }
     }
 
@@ -882,6 +1016,9 @@ pub enum DockDrag {
         origin: Option<iced::Point>,
         target: Option<DropTarget>,
         grab: iced::Vector,
+        /// The side a floating landing puts the title bar on (set once the
+        /// drag starts).
+        bar: DockSide,
     },
     /// Sizing the width of docked `panel`'s group.
     Width(PanelId),
@@ -892,11 +1029,18 @@ pub enum DockDrag {
         upper: usize,
         lower: usize,
     },
-    /// Sizing floating `panel` from its bottom-left (`from_left`) or
-    /// bottom-right corner.
-    FloatSize { panel: PanelId, from_left: bool },
+    /// Sizing floating `panel` by `edge`, from its place `start` (x, y, w,
+    /// h) when the pointer was first seen at `origin`.
+    FloatSize {
+        panel: PanelId,
+        edge: FloatEdge,
+        start: (f32, f32, f32, f32),
+        origin: Option<iced::Point>,
+    },
     /// Sizing the Layer Manager's Name column.
     LayerColumn,
+    /// Moving the floating Quick Properties panel.
+    QuickProperties,
 }
 
 impl DockDrag {
@@ -908,6 +1052,7 @@ impl DockDrag {
             origin: None,
             target: None,
             grab: iced::Vector::new(0.0, 0.0),
+            bar: DockSide::Left,
         }
     }
 
@@ -938,8 +1083,9 @@ pub enum DropTarget {
         group: usize,
         index: usize,
     },
-    /// Floating with its top-left corner at (`x`, `y`).
-    Float { x: f32, y: f32 },
+    /// Floating with its top-left corner at (`x`, `y`) and its title bar on
+    /// `bar`.
+    Float { x: f32, y: f32, bar: DockSide },
 }
 
 /// Split `avail` pixels of height between stacked pallets of `weights`,
@@ -968,7 +1114,7 @@ pub fn portion(weight: f32) -> u16 {
 /// `width` clamped to what fits on screen: at least [`DOCK_MIN_W`], at most
 /// `max` and 45 % of a `win_w` wide window.
 fn on_screen_width(width: f32, max: f32, win_w: f32) -> f32 {
-    width.clamp(DOCK_MIN_W, max.min(win_w * 0.45).max(DOCK_MIN_W))
+    width.clamp(DOCK_MIN_W, max.min(win_w * 0.75).max(DOCK_MIN_W))
 }
 
 /// Smallest docked width a panel may be dragged or sized to.
@@ -979,10 +1125,16 @@ pub const DOCK_MAX_W: f32 = 600.0;
 pub const DOCK_EDGE_ZONE: f32 = 48.0;
 /// Width of the grabbable divider between a docked group and the viewport.
 pub const DOCK_DIVIDER_W: f32 = 5.0;
+/// Width of a floating panel's vertical title bar.
+pub const DOCK_FLOAT_BAR_W: f32 = 28.0;
 /// Width of an edge's vertical icon strip.
 pub const DOCK_STRIP_W: f32 = 40.0;
 /// Height of one pallet icon in the strip.
 pub const STRIP_CELL_H: f32 = 32.0;
+/// Shortest pallet cell of a labelled strip.
+pub const STRIP_LABEL_MIN_H: f32 = 96.0;
+/// Height of the + button below a strip's groups.
+pub const STRIP_PLUS_H: f32 = 28.0;
 /// Space above and below a group's icons, inside the group.
 pub const STRIP_PAD: f32 = 6.0;
 /// Hairline divider between groups.
@@ -1007,12 +1159,14 @@ pub struct StripGroup {
     pub icons_top: f32,
     /// Number of icons (open pallets).
     pub icons: usize,
+    /// Height of one pallet's cell.
+    pub cell_h: f32,
 }
 
 impl StripGroup {
     /// Bottom of the group's last icon.
     pub fn icons_bottom(&self) -> f32 {
-        self.icons_top + self.icons as f32 * STRIP_CELL_H
+        self.icons_top + self.icons as f32 * self.cell_h
     }
 
     /// Bottom of the group's row (where its divider starts).
@@ -1021,9 +1175,10 @@ impl StripGroup {
     }
 }
 
-/// Lay out the icon strip for `groups` = (group index, open pallet count),
-/// returning each group's place and the top of the + button below them.
-pub fn strip_layout(groups: &[(usize, usize)]) -> (Vec<StripGroup>, f32) {
+/// Lay out the icon strip for `groups` = (group index, open pallet count)
+/// with `cell_h` tall pallet cells, returning each group's place and the top
+/// of the + button below them.
+pub fn strip_layout(groups: &[(usize, usize)], cell_h: f32) -> (Vec<StripGroup>, f32) {
     let mut y = 0.0;
     let placed = groups
         .iter()
@@ -1033,6 +1188,7 @@ pub fn strip_layout(groups: &[(usize, usize)]) -> (Vec<StripGroup>, f32) {
                 top: y,
                 icons_top: y + STRIP_PAD,
                 icons,
+                cell_h,
             };
             y = g.bottom() + STRIP_DIVIDER_H;
             g
@@ -1059,7 +1215,7 @@ pub fn strip_hit(y: f32, layout: &[StripGroup]) -> StripHit {
             return StripHit::NewGroup(Some(g.group));
         }
         if y < g.icons_bottom() - STRIP_NEW_GROUP_SLOP {
-            let index = (((y - g.icons_top) / STRIP_CELL_H).round().max(0.0) as usize).min(g.icons);
+            let index = (((y - g.icons_top) / g.cell_h).round().max(0.0) as usize).min(g.icons);
             return StripHit::Join {
                 group: g.group,
                 index,
@@ -1092,16 +1248,7 @@ pub struct Chrome {
 /// and close. Pressing the row starts re-docking the panel. A floating panel
 /// gets nothing here: its frame draws a vertical title bar beside it.
 pub fn title_bar<'a>(id: PanelId, title: String, chrome: Chrome) -> Element<'a, Message> {
-    title_bar_custom(id, title, chrome, None, false)
-}
-
-/// [`title_bar`] whose close button stays visible without hover, so the
-/// pallet can always be dismissed at a glance. The pin still only shows
-/// while the bar is hovered. The IFC Model Tree uses this: its close used
-/// to hide behind the hover reveal and the pallet looked impossible to
-/// dismiss.
-pub fn title_bar_closable<'a>(id: PanelId, title: String, chrome: Chrome) -> Element<'a, Message> {
-    title_bar_custom(id, title, chrome, None, true)
+    title_bar_custom(id, title, chrome, None)
 }
 
 /// [`title_bar`] with a pallet's own control (a menu button) before the pin
@@ -1113,17 +1260,16 @@ pub fn title_bar_with<'a>(
     chrome: Chrome,
     extra: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    title_bar_custom(id, title, chrome, extra, false)
+    title_bar_custom(id, title, chrome, extra)
 }
 
 /// The shared title row: title, hovered-only control and pin, then the
-/// close — always there when `always_close`, otherwise hovered-only too.
+/// close, which is always visible so a pallet can be dismissed at a glance.
 fn title_bar_custom<'a>(
     id: PanelId,
     title: String,
     chrome: Chrome,
     extra: Option<Element<'a, Message>>,
-    always_close: bool,
 ) -> Element<'a, Message> {
     if chrome.floating {
         return match extra {
@@ -1133,9 +1279,9 @@ fn title_bar_custom<'a>(
             None => Space::new().width(0).height(0).into(),
         };
     }
-    // The pallet's control, pin and close only show while the pointer is
-    // over the bar; the fixed height keeps the bar from jumping when they
-    // appear.
+    // The pallet's control and pin only show while the pointer is over the
+    // bar; close always shows. The fixed height keeps the bar from jumping
+    // when they appear.
     let mut bar = row![text(title).size(12), Space::new().width(Length::Fill)]
         .spacing(3)
         .height(Length::Fixed(TITLE_BUTTON_H))
@@ -1144,15 +1290,17 @@ fn title_bar_custom<'a>(
         if let Some(extra) = extra {
             bar = bar.push(extra);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            bar = bar.push(detach_button(id, tooltip::Position::Bottom));
+        }
         bar = bar.push(pin_button(
             id,
             chrome.auto_collapse,
             tooltip::Position::Bottom,
         ));
     }
-    if always_close || chrome.title_hovered {
-        bar = bar.push(close_button(id, tooltip::Position::Bottom));
-    }
+    bar = bar.push(close_button(id, tooltip::Position::Bottom));
     mouse_area(
         container(bar)
             .style(|theme: &Theme| container::Style {
@@ -1198,6 +1346,23 @@ pub fn pin_button<'a>(
 }
 
 /// The close button of a panel's title bar.
+/// Desktop: move the pallet into a window of its own.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn detach_button<'a>(id: PanelId, tip: tooltip::Position) -> Element<'a, Message> {
+    let detach = button(crate::ui::icons::themed_secondary(
+        crate::ui::icons::DETACH,
+        12.0,
+    ))
+    .on_press(Message::Dock(DockMsg::Detach(id)))
+    .style(button::subtle)
+    .padding([3, 5]);
+    let detach =
+        container(detach).id(iced::widget::Id::new(crate::ui::modal::DETACH_BUTTON_ID));
+    tooltip(detach, text(crate::t!("Open in its own window")).size(10), tip)
+        .gap(4)
+        .into()
+}
+
 pub fn close_button<'a>(id: PanelId, tip: tooltip::Position) -> Element<'a, Message> {
     let close = button(crate::ui::icons::themed_secondary(
         crate::ui::icons::CLOSE,
@@ -1274,6 +1439,8 @@ pub fn frame<'a>(
 /// Rotated label shared by floating dock title bars and palette categories.
 pub(crate) struct VerticalLabel {
     pub text: String,
+    /// Centre the text along the bar instead of starting at its bottom.
+    pub centered: bool,
 }
 
 impl iced::widget::canvas::Program<crate::app::Message> for VerticalLabel {
@@ -1293,12 +1460,17 @@ impl iced::widget::canvas::Program<crate::app::Message> for VerticalLabel {
             frame.rotate(iced::Radians(-std::f32::consts::FRAC_PI_2));
             // After the rotation the text runs along local +x (upward), so
             // the bar's bottom end sits at -height/2.
+            let (start, align_x) = if self.centered {
+                (0.0, iced::advanced::text::Alignment::Center)
+            } else {
+                (-bounds.height / 2.0, iced::advanced::text::Alignment::Left)
+            };
             frame.fill_text(iced::widget::canvas::Text {
                 content: self.text.clone(),
-                position: iced::Point::new(-bounds.height / 2.0, 0.0),
+                position: iced::Point::new(start, 0.0),
                 color: theme.palette().background.base.text.scale_alpha(0.72),
                 size: iced::Pixels(13.0),
-                align_x: iced::advanced::text::Alignment::Left,
+                align_x,
                 align_y: iced::alignment::Vertical::Center,
                 shaping: iced::advanced::text::Shaping::Advanced,
                 ..Default::default()
@@ -1392,10 +1564,10 @@ mod tests {
     fn width_respects_maximum_window_fraction() {
         let mut state = DockState::default();
         state.set_group_width(DockSide::Right, 0, 500.0);
-        // Window too narrow -> capped by the 0.45 fraction, not DOCK_MAX_W.
+        // Window too narrow -> capped by the 0.75 fraction, not DOCK_MAX_W.
         assert_eq!(
-            state.group_width_px(DockSide::Right, 0, 800.0),
-            DOCK_MAX_W.min(360.0)
+            state.group_width_px(DockSide::Right, 0, 600.0),
+            DOCK_MAX_W.min(450.0)
         );
     }
 
@@ -1595,7 +1767,7 @@ mod tests {
     #[test]
     fn strip_hit_maps_dividers_icons_and_the_end() {
         // Two groups: three icons, then one.
-        let (layout, plus_top) = strip_layout(&[(0, 3), (2, 1)]);
+        let (layout, plus_top) = strip_layout(&[(0, 3), (2, 1)], STRIP_CELL_H);
         let g0 = layout[0];
         let g1 = layout[1];
         assert_eq!(g0.icons_top, STRIP_PAD);
@@ -1650,14 +1822,68 @@ mod tests {
     #[test]
     fn float_resize_respects_minimums() {
         let mut state = DockState::default();
-        state.float(FloatPanel::new(PanelId::Count, 0.0, 0.0, 300.0, 300.0));
-        state.resize_float(PanelId::Count, 10.0, 10.0, false);
+        state.float(FloatPanel::new(PanelId::Count, 100.0, 100.0, 300.0, 300.0));
+        let start = (100.0, 100.0, 300.0, 300.0);
+        state.resize_float(PanelId::Count, FloatEdge::SE, start, -290.0, -290.0);
         let f = state.float_rect(PanelId::Count).unwrap();
-        assert_eq!((f.w, f.h), (DOCK_MIN_W, FLOAT_MIN_H));
-        // From the left corner the right edge stays where it was.
-        state.resize_float(PanelId::Count, 350.0, 300.0, true);
+        assert_eq!(
+            (f.x, f.y, f.w, f.h),
+            (100.0, 100.0, DOCK_MIN_W, FLOAT_MIN_H)
+        );
+        // From the left or top side the opposite side stays where it was.
+        state.resize_float(PanelId::Count, FloatEdge::NW, start, -50.0, 40.0);
         let f = state.float_rect(PanelId::Count).unwrap();
-        assert_eq!((f.x, f.w), (DOCK_MIN_W - 350.0, 350.0));
+        assert_eq!((f.x, f.y, f.w, f.h), (50.0, 140.0, 350.0, 260.0));
+        // Shrinking from the left stops at the minimum without moving the
+        // right side.
+        state.resize_float(PanelId::Count, FloatEdge::W, start, 250.0, 0.0);
+        let f = state.float_rect(PanelId::Count).unwrap();
+        assert_eq!((f.x, f.w), (400.0 - DOCK_MIN_W, DOCK_MIN_W));
+        // Growing from the top stops at the workspace's top.
+        state.resize_float(PanelId::Count, FloatEdge::N, start, 0.0, -500.0);
+        let f = state.float_rect(PanelId::Count).unwrap();
+        assert_eq!((f.y, f.h), (0.0, 400.0));
+    }
+
+    #[test]
+    fn float_resize_edge_cursors() {
+        use iced::mouse::Interaction;
+        assert_eq!(FloatEdge::N.interaction(), Interaction::ResizingVertically);
+        assert_eq!(
+            FloatEdge::E.interaction(),
+            Interaction::ResizingHorizontally
+        );
+        assert_eq!(
+            FloatEdge::NW.interaction(),
+            Interaction::ResizingDiagonallyDown
+        );
+        assert_eq!(
+            FloatEdge::SE.interaction(),
+            Interaction::ResizingDiagonallyDown
+        );
+        assert_eq!(
+            FloatEdge::NE.interaction(),
+            Interaction::ResizingDiagonallyUp
+        );
+        assert_eq!(
+            FloatEdge::SW.interaction(),
+            Interaction::ResizingDiagonallyUp
+        );
+    }
+
+    #[test]
+    fn floating_title_bar_side_round_trips_and_defaults_left() {
+        let mut state = DockState::default();
+        state.float(FloatPanel {
+            bar: DockSide::Right,
+            ..FloatPanel::new(PanelId::Count, 1.0, 2.0, 300.0, 400.0)
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        let back: DockState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.floating[0].bar, DockSide::Right);
+        let old = r#"{"floating":[{"id":"count","x":1.0,"y":2.0,"w":300.0,"h":400.0}]}"#;
+        let state: DockState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.floating[0].bar, DockSide::Left);
     }
 
     #[test]

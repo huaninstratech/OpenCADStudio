@@ -18,4 +18,21 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     [ -S "$wayland_socket" ] || unset WAYLAND_DISPLAY
 fi
 
+# Wayland pointer images come from an Xcursor theme on the client side and the
+# core22 base has none; use the themes from the icon-themes content snap. A
+# theme that only exists on the host (or the unset "default") is not visible
+# in here, so fall back to one that is.
+icons="$SNAP/data-dir/icons"
+if [ -d "$icons" ]; then
+    export XCURSOR_PATH="$icons"
+    if [ ! -d "$icons/${XCURSOR_THEME:-default}/cursors" ]; then
+        for theme in Yaru Adwaita DMZ-White; do
+            if [ -d "$icons/$theme/cursors" ]; then
+                export XCURSOR_THEME="$theme"
+                break
+            fi
+        done
+    fi
+fi
+
 exec "$@"

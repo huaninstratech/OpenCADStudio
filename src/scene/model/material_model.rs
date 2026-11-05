@@ -1,12 +1,12 @@
 use codec::objects::{Material, MaterialColor, MaterialMap, ObjectType};
 use codec::xdata::XDataValue;
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use std::path::Path;
 use std::sync::Arc;
 
 /// Render-ready subset of an AcDbMaterial.
 ///
-/// The complete decoded object stays authoritative in `CadDocument`; this
+/// The complete decoded object stays authoritative in `Document`; this
 /// compact copy travels with a tessellated mesh so the GPU path does not need
 /// to look back into the document. Map metadata is retained even when the
 /// referenced image cannot be resolved, allowing a later texture upload to
@@ -205,8 +205,10 @@ impl MeshMaterial {
             diffuse: color,
             diffuse_by_object: true,
             ambient: [color[0], color[1], color[2]],
-            specular: [0.08; 3],
-            gloss: 0.5,
+            // A dull, broad highlight: an object's colour is not a polished
+            // material.
+            specular: [0.03; 3],
+            gloss: 0.25,
             reflectivity: 0.0,
             self_illumination: 0.0,
             translucence: 0.0,
@@ -257,7 +259,9 @@ impl MeshMaterial {
         // the missing asset's intended appearance.
         let diffuse = material_color(&material.diffuse_color, entity_color);
         let ambient = material_color(&material.ambient_color, entity_color);
-        let specular = material_color(&material.specular_color, [1.0; 4]);
+        // Without its own specular colour a material gets a soft sheen, not a
+        // white hotspot.
+        let specular = material_color(&material.specular_color, [0.2, 0.2, 0.2, 1.0]);
         let opacity = material.opacity_percent.clamp(0.0, 1.0) as f32;
         Self {
             handle: Some(handle),
@@ -323,7 +327,7 @@ impl MeshMaterial {
     pub fn apply_to_with_face_overrides(
         &self,
         set: &mut super::mesh_model::MeshLodSet,
-        document: &CadDocument,
+        document: &Document,
         base_dir: Option<&Path>,
     ) {
         self.apply_to(set);
@@ -393,7 +397,7 @@ fn procedural_map_image(map: &MaterialMap) -> Option<Arc<MaterialImage>> {
 /// Outside a block a ByBlock material has no owner source and falls back to
 /// the entity colour, matching the existing ByBlock colour behaviour.
 pub fn resolve_material_with_base(
-    document: &CadDocument,
+    document: &Document,
     entity: &EntityType,
     entity_color: [f32; 4],
     by_block: Option<&MeshMaterial>,
@@ -473,7 +477,7 @@ fn entity_material_mapper(entity: &EntityType) -> Option<MeshMaterialMapper> {
 }
 
 pub fn resolve_layer_material_with_base(
-    document: &CadDocument,
+    document: &Document,
     layer_name: &str,
     layer_color: [f32; 4],
     base_dir: Option<&Path>,
@@ -498,7 +502,7 @@ pub fn resolve_layer_material_with_base(
 }
 
 pub fn resolve_material_handle_with_base(
-    document: &CadDocument,
+    document: &Document,
     handle: Handle,
     fallback: &MeshMaterial,
     base_dir: Option<&Path>,

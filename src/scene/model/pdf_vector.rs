@@ -42,6 +42,15 @@ pub struct SubPath {
     pub closed: bool,
 }
 
+/// How a subpath of a PDF path ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SubClose {
+    /// Closed by the close operator (`h`, `s`, `b`, `re`).
+    pub op: bool,
+    /// Its last segment is the line that operator added back to the start.
+    pub line: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PdfPath {
     pub subpaths: Vec<SubPath>,
@@ -49,6 +58,14 @@ pub struct PdfPath {
     pub stroke: Option<([u8; 3], f64)>,
     /// Fill colour (RGB), for filled paths.
     pub fill: Option<[u8; 3]>,
+    /// The stroke colour and width (points) current when the path was
+    /// painted, stroked or not; `None` when the page could not be followed.
+    pub pen: Option<([u8; 3], f64)>,
+    /// Per subpath, how it ends (empty when not known).
+    pub closes: Vec<SubClose>,
+    /// The clipping polygon (page inches, convex) the path reaches out of;
+    /// `None` when the path lies inside the clip or the clip is no polygon.
+    pub clip: Option<Vec<[f64; 2]>>,
 }
 
 /// A run of glyphs on one baseline in one font and size.
@@ -66,6 +83,8 @@ pub struct PdfText {
     /// Baseline direction, radians.
     pub rotation: f64,
     pub color: [u8; 3],
+    /// The font size (one em), inches.
+    pub em: f64,
 }
 
 /// A raster image drawn on a page: its pixels and where they land.
@@ -388,12 +407,12 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
     };
     interpret_page(page, &mut context, &mut device);
     device.finish_text();
+    assign_pens(page, initial, &mut device);
     merge_fill_and_stroke(page, &mut device);
 
     // Base font names in the order the content stream selects them; glyph
     // fonts are matched to them in their order of first use.
     let mut names: Vec<String> = Vec::new();
-    let mut embedded: Vec<bool> = Vec::new();
     let mut ops = page.typed_operations();
     while let Some(op) = ops.next() {
         if let TypedInstruction::TextFont(font) = op {
@@ -409,7 +428,6 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
                 .unwrap_or(name);
             if !names.contains(&name) {
                 names.push(name);
-                embedded.push(dict.as_ref().is_some_and(font_is_embedded));
             }
         }
     }
@@ -435,6 +453,10 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
             Some(top) if own => *top,
             _ => 0.72 * text.em,
         };
+        // Capital height as a size share; PDF import measures its own (see
+        // `pdf_import`).
+        text.text.cap_height = 0.72 * text.em;
+        text.text.em = text.em;
     }
     Some(PageVectors {
         paths: device.paths,
@@ -586,14 +608,34 @@ fn walk_operators<'a>(
     page: &hayro::hayro_syntax::page::Page<'a>,
     visit: &mut dyn FnMut(&TypedInstruction<'_, '_>, &hayro::hayro_syntax::page::Resources<'a>),
 ) {
+    walk_steps(page, &mut |step, resources| {
+        if let Step::Op(op) = step {
+            visit(op, resources);
+        }
+    });
+}
+
+/// One step of [`walk_steps`].
+enum Step<'s, 'b, 'a> {
+    Op(&'s TypedInstruction<'b, 'a>),
+    /// A form begins, with its matrix.
+    FormStart(Affine),
+    FormEnd,
+}
+
+/// [`walk_operators`], also told where each form begins and ends.
+fn walk_steps<'a>(
+    page: &hayro::hayro_syntax::page::Page<'a>,
+    visit: &mut dyn FnMut(Step<'_, '_, '_>, &hayro::hayro_syntax::page::Resources<'a>),
+) {
     use hayro::hayro_syntax::content::TypedIter;
-    use hayro::hayro_syntax::object::Dict;
+    use hayro::hayro_syntax::object::{Array, Dict};
     use hayro::hayro_syntax::page::Resources;
     fn walk<'a>(
         data: &[u8],
         resources: &Resources<'a>,
         depth: usize,
-        visit: &mut dyn FnMut(&TypedInstruction<'_, '_>, &Resources<'a>),
+        visit: &mut dyn FnMut(Step<'_, '_, '_>, &Resources<'a>),
     ) {
         let mut ops = TypedIter::new(data);
         while let Some(op) = ops.next() {
@@ -601,6 +643,8 @@ fn walk_operators<'a>(
             let TypedInstruction::XObject(x) = &op else {
                 continue;
             };
+            visit(Step::Op(&op), resources);
+            let TypedInstruction::XObject(x) = &op else { continue };
             // Nested forms are followed a few levels deep.
             if depth >= 8 {
                 continue;
@@ -620,7 +664,18 @@ fn walk_operators<'a>(
                 None => resources.clone(),
             };
             if let Ok(data) = stream.decoded() {
+                let m: Vec<f64> = stream
+                    .dict()
+                    .get::<Array<'_>>(b"Matrix")
+                    .map(|a| a.iter::<f64>().collect())
+                    .unwrap_or_default();
+                let matrix = match m.as_slice() {
+                    [a, b, c, d, e, f] => Affine::new([*a, *b, *c, *d, *e, *f]),
+                    _ => Affine::IDENTITY,
+                };
+                visit(Step::FormStart(matrix), &own);
                 walk(&data, &own, depth + 1, visit);
+                visit(Step::FormEnd, &own);
             }
         }
     }
@@ -629,21 +684,316 @@ fn walk_operators<'a>(
     }
 }
 
-/// Whether a font dictionary carries its font program (for a composite
-/// font, its descendant's).
-fn font_is_embedded(dict: &hayro::hayro_syntax::object::Dict<'_>) -> bool {
-    use hayro::hayro_syntax::object::{Array, Dict};
-    let descriptor = dict.get::<Dict<'_>>(b"FontDescriptor").or_else(|| {
-        dict.get::<Array<'_>>(b"DescendantFonts")?
-            .iter::<Dict<'_>>()
-            .next()?
-            .get::<Dict<'_>>(b"FontDescriptor")
+/// The stroke colour and width current when each path the interpreter drew
+/// was painted, followed through the page's operators (the interpreter hands
+/// a fill only its fill colour). Left unset when the drawn paths do not match
+/// the painting operators one for one.
+fn assign_pens(
+    page: &hayro::hayro_syntax::page::Page<'_>,
+    initial: Affine,
+    device: &mut Collector,
+) {
+    use hayro::hayro_syntax::object::{Dict, Number, Object, Stream};
+    #[derive(Clone)]
+    struct State {
+        ctm: Affine,
+        width: f64,
+        rgb: [u8; 3],
+        /// Components of the stroke colour space (0 for a pattern).
+        components: usize,
+    }
+    fn to_rgb(v: &[f64]) -> [u8; 3] {
+        let c = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        match v {
+            [g] => [c(*g); 3],
+            [r, g, b] => [c(*r), c(*g), c(*b)],
+            [cy, m, y, k] => [
+                c((1.0 - cy) * (1.0 - k)),
+                c((1.0 - m) * (1.0 - k)),
+                c((1.0 - y) * (1.0 - k)),
+            ],
+            _ => [0, 0, 0],
+        }
+    }
+    fn components(name: &Name<'_>, resources: &hayro::hayro_syntax::page::Resources<'_>) -> usize {
+        match name.as_ref() {
+            b"DeviceGray" | b"G" | b"CalGray" => 1,
+            b"DeviceRGB" | b"RGB" => 3,
+            b"DeviceCMYK" | b"CMYK" => 4,
+            b"Pattern" => 0,
+            _ => match resources.get_color_space(name) {
+                Some(Object::Array(array)) => {
+                    match array.iter::<Name<'_>>().next().as_ref().map(|f| f.as_ref()) {
+                        Some(b"ICCBased") => array
+                            .iter::<Stream<'_>>()
+                            .next()
+                            .and_then(|s| s.dict().get::<usize>(b"N"))
+                            .unwrap_or(3),
+                        Some(b"CalRGB") | Some(b"Lab") => 3,
+                        Some(b"Pattern") => 0,
+                        _ => 1,
+                    }
+                }
+                Some(Object::Name(n)) if n.as_ref() == b"Pattern" => 0,
+                _ => 3,
+            },
+        }
+    }
+    let f = |v: &Number| v.as_f64();
+    let pen = |s: &State| (s.rgb, s.width * s.ctm.determinant().abs().sqrt());
+    let mut stack = vec![State {
+        ctm: Affine::IDENTITY,
+        width: 1.0,
+        rgb: [0, 0, 0],
+        components: 1,
+    }];
+    // A form runs in a saved state its own `Q` cannot pop.
+    let mut floors: Vec<usize> = Vec::new();
+    // Per drawn path: the pen, and for a fill the path in user space with
+    // its transformation matrix.
+    type Fill = Option<(BezPath, Affine)>;
+    let mut calls: Vec<(([u8; 3], f64), Fill)> = Vec::new();
+    let mut path = BezPath::new();
+    let mut current = Point::ZERO;
+    walk_steps(page, &mut |step, resources| {
+        let op = match step {
+            Step::Op(op) => op,
+            Step::FormStart(matrix) => {
+                let mut state = stack[stack.len() - 1].clone();
+                state.ctm = state.ctm * matrix;
+                floors.push(stack.len());
+                stack.push(state);
+                return;
+            }
+            Step::FormEnd => {
+                if let Some(floor) = floors.pop() {
+                    stack.truncate(floor.max(1));
+                }
+                return;
+            }
+        };
+        let floor = floors.last().map_or(1, |f| f + 1);
+        let top = stack.len() - 1;
+        match op {
+            TypedInstruction::SaveState(_) => stack.push(stack[top].clone()),
+            TypedInstruction::RestoreState(_) => {
+                if stack.len() > floor {
+                    stack.pop();
+                }
+            }
+            TypedInstruction::Transform(t) => {
+                let m = Affine::new([f(&t.0), f(&t.1), f(&t.2), f(&t.3), f(&t.4), f(&t.5)]);
+                stack[top].ctm = stack[top].ctm * m;
+            }
+            TypedInstruction::LineWidth(w) => stack[top].width = f(&w.0),
+            TypedInstruction::SetGraphicsState(gs) => {
+                let width = resources
+                    .get_ext_g_state(&gs.0)
+                    .and_then(|d: Dict<'_>| d.get::<f64>(b"LW"));
+                if let Some(width) = width {
+                    stack[top].width = width;
+                }
+            }
+            TypedInstruction::StrokeColorDeviceGray(g) => {
+                (stack[top].rgb, stack[top].components) = (to_rgb(&[f(&g.0)]), 1)
+            }
+            TypedInstruction::StrokeColorDeviceRgb(c) => {
+                (stack[top].rgb, stack[top].components) =
+                    (to_rgb(&[f(&c.0), f(&c.1), f(&c.2)]), 3)
+            }
+            TypedInstruction::StrokeColorCmyk(c) => {
+                (stack[top].rgb, stack[top].components) =
+                    (to_rgb(&[f(&c.0), f(&c.1), f(&c.2), f(&c.3)]), 4)
+            }
+            TypedInstruction::ColorSpaceStroke(cs) => {
+                stack[top].components = components(cs.0, resources);
+                stack[top].rgb = [0, 0, 0];
+            }
+            TypedInstruction::StrokeColor(c) => {
+                if stack[top].components != 0 {
+                    let v: Vec<f64> = c.0.iter().map(f).collect();
+                    stack[top].rgb = to_rgb(&v);
+                }
+            }
+            TypedInstruction::StrokeColorNamed(c) => {
+                let v: Vec<f64> = c.0.iter().map(f).collect();
+                stack[top].rgb = if stack[top].components == 0 {
+                    [0, 0, 0]
+                } else {
+                    to_rgb(&v)
+                };
+            }
+            TypedInstruction::MoveTo(m) => {
+                let p = Point::new(f(&m.0), f(&m.1));
+                path.move_to(p);
+                current = p;
+            }
+            TypedInstruction::LineTo(m) => {
+                let p = Point::new(f(&m.0), f(&m.1));
+                path.line_to(p);
+                current = p;
+            }
+            TypedInstruction::CubicTo(c) => {
+                let p = Point::new(f(&c.4), f(&c.5));
+                path.curve_to(Point::new(f(&c.0), f(&c.1)), Point::new(f(&c.2), f(&c.3)), p);
+                current = p;
+            }
+            TypedInstruction::CubicStartTo(c) => {
+                let p = Point::new(f(&c.2), f(&c.3));
+                path.curve_to(current, Point::new(f(&c.0), f(&c.1)), p);
+                current = p;
+            }
+            TypedInstruction::CubicEndTo(c) => {
+                let p = Point::new(f(&c.2), f(&c.3));
+                path.curve_to(Point::new(f(&c.0), f(&c.1)), p, p);
+                current = p;
+            }
+            TypedInstruction::ClosePath(_) => path.close_path(),
+            TypedInstruction::RectPath(r) => {
+                let (x, y, w, h) = (f(&r.0), f(&r.1), f(&r.2), f(&r.3));
+                path.move_to((x, y));
+                path.line_to((x + w, y));
+                path.line_to((x + w, y + h));
+                path.line_to((x, y + h));
+                path.close_path();
+                current = Point::new(x, y);
+            }
+            TypedInstruction::EndPath(_) => path = BezPath::new(),
+            TypedInstruction::StrokePath(_) | TypedInstruction::CloseAndStrokePath(_) => {
+                calls.push((pen(&stack[top]), None));
+                path = BezPath::new();
+            }
+            TypedInstruction::FillPathNonZero(_)
+            | TypedInstruction::FillPathNonZeroCompatibility(_)
+            | TypedInstruction::FillPathEvenOdd(_) => {
+                let fill = (std::mem::take(&mut path), stack[top].ctm);
+                calls.push((pen(&stack[top]), Some(fill)));
+            }
+            TypedInstruction::FillAndStrokeNonZero(_)
+            | TypedInstruction::FillAndStrokeEvenOdd(_)
+            | TypedInstruction::CloseFillAndStrokeNonZero(_)
+            | TypedInstruction::CloseFillAndStrokeEvenOdd(_) => {
+                if matches!(
+                    op,
+                    TypedInstruction::CloseFillAndStrokeNonZero(_)
+                        | TypedInstruction::CloseFillAndStrokeEvenOdd(_)
+                ) {
+                    path.close_path();
+                }
+                let fill = (std::mem::take(&mut path), stack[top].ctm);
+                calls.push((pen(&stack[top]), Some(fill)));
+                calls.push((pen(&stack[top]), None));
+            }
+            _ => {}
+        }
     });
-    descriptor.is_some_and(|d| {
-        [&b"FontFile"[..], b"FontFile2", b"FontFile3"]
-            .iter()
-            .any(|key| d.contains_key(*key))
-    })
+    if calls.len() != device.path_calls.len() {
+        return;
+    }
+    for (call, (pen, fill)) in device.path_calls.iter().zip(calls) {
+        let Some(i) = *call else { continue };
+        let drawn = &mut device.paths[i];
+        drawn.pen = Some(pen);
+        // The interpreter draws a fill without width or height as a thin
+        // line across its box; the import reads the path that was filled.
+        let Some((user, ctm)) = fill else { continue };
+        if let (Some((rgb, _)), None) = (drawn.stroke, drawn.fill) {
+            let (subpaths, closes) = subpaths(&user, initial * ctm);
+            if !subpaths.is_empty() {
+                (drawn.subpaths, drawn.closes, drawn.stroke, drawn.fill) =
+                    (subpaths, closes, None, Some(rgb));
+            }
+        }
+    }
+}
+
+/// The points of a path that is one straight loop bounding a convex area,
+/// counter-clockwise; `None` for any other path.
+fn convex_loop(path: &BezPath) -> Option<Vec<[f64; 2]>> {
+    let mut points: Vec<[f64; 2]> = Vec::new();
+    for (k, el) in path.elements().iter().enumerate() {
+        match *el {
+            PathEl::MoveTo(p) if k == 0 => points.push(pt(p)),
+            PathEl::LineTo(p) => points.push(pt(p)),
+            PathEl::ClosePath => {}
+            _ => return None,
+        }
+    }
+    points.dedup_by(|a, b| same(*a, *b));
+    if points.len() > 1 && same(points[0], points[points.len() - 1]) {
+        points.pop();
+    }
+    if points.len() < 3 {
+        return None;
+    }
+    let n = points.len();
+    let turns: Vec<f64> = (0..n)
+        .map(|i| cross(points[i], points[(i + 1) % n], points[(i + 2) % n]))
+        .collect();
+    let area: f64 = turns.iter().sum();
+    if turns.iter().any(|t| t * area < -1e-12) {
+        return None;
+    }
+    if area < 0.0 {
+        points.reverse();
+    }
+    Some(points)
+}
+
+fn same(a: [f64; 2], b: [f64; 2]) -> bool {
+    (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-12
+}
+
+/// Twice the signed area of the triangle a, b, c (positive counter-clockwise).
+fn cross(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// Whether `p` lies in the counter-clockwise convex polygon (or on it).
+pub fn inside_convex(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    (0..poly.len()).all(|i| cross(poly[i], poly[(i + 1) % poly.len()], p) >= -1e-9)
+}
+
+/// A polygon cut to a counter-clockwise convex one (Sutherland–Hodgman).
+pub fn clip_to_convex(subject: &[[f64; 2]], clip: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut out: Vec<[f64; 2]> = subject.to_vec();
+    for i in 0..clip.len() {
+        let (a, b) = (clip[i], clip[(i + 1) % clip.len()]);
+        let input = std::mem::take(&mut out);
+        let side = |p: [f64; 2]| cross(a, b, p);
+        for k in 0..input.len() {
+            let (p, q) = (input[k], input[(k + 1) % input.len()]);
+            let (sp, sq) = (side(p), side(q));
+            if sp >= 0.0 {
+                out.push(p);
+            }
+            if (sp >= 0.0) != (sq >= 0.0) {
+                let t = sp / (sp - sq);
+                out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+            }
+        }
+    }
+    out
+}
+
+/// The part of the segment a–b inside a counter-clockwise convex polygon
+/// (Cyrus–Beck), or `None`.
+pub fn clip_segment(a: [f64; 2], b: [f64; 2], clip: &[[f64; 2]]) -> Option<([f64; 2], [f64; 2])> {
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for i in 0..clip.len() {
+        let (p, q) = (clip[i], clip[(i + 1) % clip.len()]);
+        let (sa, sb) = (cross(p, q, a), cross(p, q, b));
+        if sa < 0.0 && sb < 0.0 {
+            return None;
+        }
+        if sa < 0.0 {
+            t0 = t0.max(sa / (sa - sb));
+        } else if sb < 0.0 {
+            t1 = t1.min(sa / (sa - sb));
+        }
+    }
+    let at = |t: f64| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    (t0 < t1).then(|| (at(t0), at(t1)))
 }
 
 struct PendingText {
@@ -652,8 +1002,6 @@ struct PendingText {
     /// Baseline end, inches, for joining the next glyph.
     end: [f64; 2],
     em: f64,
-    /// Tops of the capital letters seen so far, inches.
-    caps: Vec<f64>,
     /// Optional-content sections begun before the run.
     oc: usize,
 }
@@ -676,6 +1024,9 @@ struct Collector {
     /// The visible area, in inches: the page, then each clip path's box
     /// within the one before it (the last is the current one).
     visible: Vec<Rect>,
+    /// Each clip as a convex polygon in inches (`None` when it is not one),
+    /// within the one before it.
+    clips: Vec<Option<Vec<[f64; 2]>>>,
 }
 
 impl Collector {
@@ -720,23 +1071,35 @@ fn import_precision(transform: Affine) -> impl Fn(Point) -> Point {
     move |p: Point| transform * Point::new(six(p.x), six(p.y))
 }
 
-fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
+fn subpaths(path: &BezPath, transform: Affine) -> (Vec<SubPath>, Vec<SubClose>) {
     let transform = import_precision(transform);
     let mut out: Vec<SubPath> = Vec::new();
+    let mut closes: Vec<SubClose> = Vec::new();
     let mut start = Point::ZERO;
     let mut last = Point::ZERO;
+    // The interpreter moves the end of a line onto its own start 0.0001 to
+    // the right (so round caps show); such a line is drawn on one point.
+    let (mut user_last, mut user_start) = (Point::ZERO, Point::ZERO);
     for el in path.elements() {
         match *el {
             PathEl::MoveTo(p) => {
+                (user_last, user_start) = (p, p);
                 let p = transform(p);
                 out.push(SubPath {
                     segments: Vec::new(),
                     closed: false,
                 });
+                closes.push(SubClose::default());
                 start = p;
                 last = p;
             }
             PathEl::LineTo(p) => {
+                let p = if (p.x - user_last.x - 1e-4).abs() < 1e-9 && p.y == user_last.y {
+                    user_last
+                } else {
+                    p
+                };
+                user_last = p;
                 let p = transform(p);
                 if let Some(sp) = out.last_mut() {
                     sp.segments.push(Segment::Line(pt(last), pt(p)));
@@ -744,6 +1107,7 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
                 last = p;
             }
             PathEl::QuadTo(c, p) => {
+                user_last = p;
                 let (c, p) = (transform(c), transform(p));
                 let c1 = last + (c - last) * (2.0 / 3.0);
                 let c2 = p + (c - p) * (2.0 / 3.0);
@@ -754,6 +1118,7 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
                 last = p;
             }
             PathEl::CurveTo(c1, c2, p) => {
+                user_last = p;
                 let (c1, c2, p) = (transform(c1), transform(c2), transform(p));
                 if let Some(sp) = out.last_mut() {
                     sp.segments
@@ -762,9 +1127,12 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
                 last = p;
             }
             PathEl::ClosePath => {
-                if let Some(sp) = out.last_mut() {
+                user_last = user_start;
+                if let (Some(sp), Some(close)) = (out.last_mut(), closes.last_mut()) {
+                    close.op = true;
                     if (last - start).hypot() > 1e-9 {
                         sp.segments.push(Segment::Line(pt(last), pt(start)));
+                        close.line = true;
                     }
                     sp.closed = true;
                 }
@@ -772,6 +1140,8 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
             }
         }
     }
+    let mut keep = out.iter().map(|sp| !sp.segments.is_empty());
+    closes.retain(|_| keep.next().unwrap_or(false));
     out.retain(|sp| !sp.segments.is_empty());
     // A path drawn back to its start without a close operator is closed.
     for sp in &mut out {
@@ -783,7 +1153,7 @@ fn subpaths(path: &BezPath, transform: Affine) -> Vec<SubPath> {
             sp.closed = true;
         }
     }
-    out
+    (out, closes)
 }
 
 impl<'a> Device<'a> for Collector {
@@ -799,10 +1169,21 @@ impl<'a> Device<'a> for Collector {
         // Graphics drawn between glyphs do not end a text run: the next
         // glyph still joins it when it follows on along the baseline.
         self.path_calls.push(None);
-        let subpaths = subpaths(path, transform);
+        let (subpaths, closes) = subpaths(path, transform);
         if subpaths.is_empty() {
             return;
         }
+        let points = || {
+            subpaths.iter().flat_map(|sp| &sp.segments).flat_map(|seg| match seg {
+                Segment::Line(a, b) => vec![*a, *b],
+                Segment::Cubic(a, b, c, d) => vec![*a, *b, *c, *d],
+            })
+        };
+        // A path reaching out of a polygon clip is clipped to it on import.
+        let clip = match self.clips.last() {
+            Some(Some(poly)) if points().any(|p| !inside_convex(poly, p)) => Some(poly.clone()),
+            _ => None,
+        };
         // A path wholly outside the visible area is left out; one that
         // reaches into it is kept whole.
         if let Some(area) = self.visible.last() {
@@ -841,12 +1222,23 @@ impl<'a> Device<'a> for Collector {
             subpaths,
             stroke,
             fill,
+            pen: None,
+            closes,
+            clip,
         });
     }
     fn push_clip_path(&mut self, clip: &ClipPath) {
         let bounds = clip.path.bounding_box();
         let area = self.visible.last().map_or(bounds, |a| a.intersect(bounds));
         self.visible.push(area);
+        // A clip of one straight convex loop is kept as a polygon (within
+        // the one before it); any other clip is known by its box alone.
+        let polygon = convex_loop(&clip.path).and_then(|poly| match self.clips.last() {
+            Some(Some(outer)) => Some(clip_to_convex(&poly, outer)),
+            Some(None) => None,
+            None => Some(poly),
+        });
+        self.clips.push(polygon);
     }
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
     fn draw_glyph(
@@ -887,12 +1279,6 @@ impl<'a> Device<'a> for Collector {
         if !self.font_order.contains(&key) {
             self.font_order.push(key);
         }
-        let bounds = outline.outline().bounding_box();
-        // Capitals and digits give the capital height.
-        let glyph_top = text
-            .chars()
-            .any(|c| c.is_uppercase() || c.is_ascii_digit())
-            .then(|| bounds.y1 / 1000.0 * em);
         let origin = pt(origin);
         // A glyph continues the run on its baseline (within half an em
         // across it) when the gap along it is under an em, whatever its font
@@ -920,11 +1306,11 @@ impl<'a> Device<'a> for Collector {
                     width: 0.0,
                     rotation,
                     color: rgb(paint),
+                    em,
                 },
                 font_key: key,
                 end: origin,
                 em,
-                caps: Vec::new(),
                 oc: self.oc_sections,
             });
         }
@@ -933,9 +1319,6 @@ impl<'a> Device<'a> for Collector {
                 run.text.text.push(' ');
             }
             run.text.text.push_str(&text);
-            if let Some(top) = glyph_top {
-                run.caps.push(top);
-            }
             run.end = [origin[0] + adv_vec.x, origin[1] + adv_vec.y];
             run.text.width = ((run.end[0] - run.text.origin[0]).powi(2)
                 + (run.end[1] - run.text.origin[1]).powi(2))
@@ -1003,6 +1386,7 @@ impl<'a> Device<'a> for Collector {
         if self.visible.len() > 1 {
             self.visible.pop();
         }
+        self.clips.pop();
     }
     fn pop_transparency_group(&mut self) {}
 }
@@ -1110,7 +1494,7 @@ const MAX_SNAP_POINTS: usize = 20_000;
 /// space, when PDFOSNAP is on and the page is shown.
 pub fn underlay_snap_points(
     u: &codec::entities::Underlay,
-    document: &codec::CadDocument,
+    document: &codec::Document,
 ) -> Vec<(glam::DVec3, crate::scene::model::wire_model::SnapHint)> {
     use crate::scene::model::wire_model::SnapHint;
     if !underlay_osnap(u.underlay_type)
@@ -1193,7 +1577,7 @@ pub struct SnapPiece {
 /// PDFOSNAP is off or the page is not shown.
 pub fn underlay_snap_geometry(
     u: &codec::entities::Underlay,
-    document: &codec::CadDocument,
+    document: &codec::Document,
 ) -> Vec<SnapPiece> {
     if !underlay_osnap(u.underlay_type)
         || !u.flags.contains(codec::entities::UnderlayDisplayFlags::ON)

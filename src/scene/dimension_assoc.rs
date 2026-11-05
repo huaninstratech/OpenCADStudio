@@ -116,7 +116,255 @@ fn dpoint(point: Vector3) -> DPoint {
     [point.x, point.y, point.z]
 }
 
+struct RegionBoundaryPiece {
+    curve: KernelCurve,
+    radial: Option<RadialSourceGeometry>,
+}
+
+fn certified_rational_quadratic_circle(
+    nurbs: &kernel::geom2d::NurbsCurve,
+) -> Option<([f64; 2], f64, f64, f64)> {
+    if nurbs.degree() != 2 {
+        return None;
+    }
+    let knots = nurbs.knots();
+    if knots.len() != 6 {
+        return None;
+    }
+    let t0 = knots[0];
+    let t1 = knots[5];
+    let knot_tol = 1e-12 * (1.0 + t0.abs().max(t1.abs()));
+    if (knots[1] - t0).abs() > knot_tol
+        || (knots[2] - t0).abs() > knot_tol
+        || (knots[3] - t1).abs() > knot_tol
+        || (knots[4] - t1).abs() > knot_tol
+        || t1 <= t0 + knot_tol
+    {
+        return None;
+    }
+    let cps = nurbs.control_points();
+    let weights = nurbs.weights();
+    if cps.len() != 3 || weights.len() != 3 {
+        return None;
+    }
+    let w0 = weights[0];
+    let w1_raw = weights[1];
+    let w2 = weights[2];
+    if !w0.is_finite()
+        || !w1_raw.is_finite()
+        || !w2.is_finite()
+        || w0 <= 0.0
+        || w1_raw <= 0.0
+        || w2 <= 0.0
+    {
+        return None;
+    }
+    let w_scale = (w0 * w2).sqrt();
+    let weight_tol = 1e-7 * (w0 + w2);
+    if (w0 - w2).abs() > weight_tol {
+        return None;
+    }
+    let w = w1_raw / w_scale;
+    if w <= 1e-9 || w >= 1.0 - 1e-12 {
+        return None;
+    }
+
+    let p0 = cps[0];
+    let p1 = cps[1];
+    let p2 = cps[2];
+    let v1 = [p1[0] - p0[0], p1[1] - p0[1]];
+    let v2 = [p2[0] - p0[0], p2[1] - p0[1]];
+    let t1 = [v2[0] - v1[0], v2[1] - v1[1]];
+
+    let l0_sq = v1[0] * v1[0] + v1[1] * v1[1];
+    let l1_sq = t1[0] * t1[0] + t1[1] * t1[1];
+    let l0 = l0_sq.sqrt();
+    let l1 = l1_sq.sqrt();
+    let geom_scale = l0.max(l1);
+    if geom_scale <= 1e-12 {
+        return None;
+    }
+
+    // Isosceles control triangle (equal tangent lengths)
+    let geom_tol = 1e-7 * geom_scale;
+    if (l0 - l1).abs() > geom_tol {
+        return None;
+    }
+
+    // Non-degenerate chord
+    let chord_sq = v2[0] * v2[0] + v2[1] * v2[1];
+    let chord = chord_sq.sqrt();
+    if chord <= 1e-12 {
+        return None;
+    }
+
+    // Midpoint symmetry: (P1 - M) . (P2 - P0) == 0
+    let m_rel = [v2[0] * 0.5, v2[1] * 0.5];
+    let p1_minus_m = [v1[0] - m_rel[0], v1[1] - m_rel[1]];
+    let dot = p1_minus_m[0] * v2[0] + p1_minus_m[1] * v2[1];
+    if dot.abs() > 1e-6 * geom_scale * chord {
+        return None;
+    }
+
+    // Conic circle identity: w = chord / (2 * l0)
+    let expected_w = chord / (2.0 * l0);
+    if (w - expected_w).abs() > 1e-6 {
+        return None;
+    }
+
+    // Center in local coordinates relative to P0
+    let w_sq = w * w;
+    let denom = 1.0 - w_sq;
+    if denom <= 1e-12 {
+        return None;
+    }
+    let c_rel = [
+        (m_rel[0] - w_sq * v1[0]) / denom,
+        (m_rel[1] - w_sq * v1[1]) / denom,
+    ];
+    let center = [p0[0] + c_rel[0], p0[1] + c_rel[1]];
+    let radius = c_rel[0].hypot(c_rel[1]);
+    if radius <= 1e-12 {
+        return None;
+    }
+
+    // Verify distance from center to P2 equals radius within relative tolerance
+    let p2_rel = [v2[0] - c_rel[0], v2[1] - c_rel[1]];
+    let r2 = p2_rel[0].hypot(p2_rel[1]);
+    if (r2 - radius).abs() > 1e-6 * radius {
+        return None;
+    }
+
+    // Angles
+    let th0 = (-c_rel[1]).atan2(-c_rel[0]);
+    let th2 = (p2_rel[1]).atan2(p2_rel[0]);
+    let shoulder_denom = 2.0 * (1.0 + w);
+    let shoulder_rel = [
+        (2.0 * w * v1[0] + v2[0]) / shoulder_denom - c_rel[0],
+        (2.0 * w * v1[1] + v2[1]) / shoulder_denom - c_rel[1],
+    ];
+    let th_mid = shoulder_rel[1].atan2(shoulder_rel[0]);
+    let span_0_mid = (th_mid - th0).rem_euclid(TAU);
+    let span_0_2 = (th2 - th0).rem_euclid(TAU);
+    let (start_angle, end_angle) = if span_0_mid <= span_0_2 {
+        (th0, th2)
+    } else {
+        (th2, th0)
+    };
+
+    Some((center, radius, start_angle, end_angle))
+}
+
+fn curve_as_circular(curve: &KernelCurve) -> Option<([f64; 2], f64, f64, f64, bool)> {
+    match curve {
+        KernelCurve::Circle(circle) => Some((circle.centre, circle.radius, 0.0, 0.0, true)),
+        KernelCurve::Arc(arc) => Some((
+            arc.centre,
+            arc.radius,
+            arc.start_angle,
+            arc.end_angle,
+            false,
+        )),
+        KernelCurve::Nurbs(nurbs) => {
+            let (center, radius, start, end) = certified_rational_quadratic_circle(nurbs)?;
+            Some((center, radius, start, end, false))
+        }
+        _ => None,
+    }
+}
+
+fn loop_is_full_circle(pieces: &[KernelCurve]) -> bool {
+    if pieces.is_empty() {
+        return false;
+    }
+    if pieces.len() == 1 {
+        if let KernelCurve::Circle(_) = &pieces[0] {
+            return true;
+        }
+    }
+    let mut total_sweep = 0.0;
+    let mut expected_center: Option<[f64; 2]> = None;
+    let mut expected_radius = 0.0;
+    for piece in pieces {
+        let Some((center, radius, start, end, full)) = curve_as_circular(piece) else {
+            return false;
+        };
+        if full {
+            return true;
+        }
+        if let Some(c0) = expected_center {
+            if (c0[0] - center[0]).hypot(c0[1] - center[1]) > 1e-4
+                || (expected_radius - radius).abs() > 1e-4
+            {
+                return false;
+            }
+        } else {
+            expected_center = Some(center);
+            expected_radius = radius;
+        }
+        total_sweep += positive_sweep(start, end);
+    }
+    (total_sweep - TAU).abs() <= 1e-3
+}
+
+fn region_boundary_pieces(entity: &EntityType) -> Option<(Plane, Vec<RegionBoundaryPiece>)> {
+    let (plane, loops, _) = crate::scene::model::presspull_model::profile_geometry(entity)?;
+    let unit = Plane::orthonormal(plane.origin, plane.x_axis, plane.normal()?)?;
+    let transform = kernel::geom2d::Transform {
+        origin: unit.project(plane.origin)?.into(),
+        x_axis: unit.project_vector(plane.x_axis)?.into(),
+        y_axis: unit.project_vector(plane.y_axis)?.into(),
+    };
+    let mut pieces = Vec::new();
+    for loop_curves in loops {
+        let transformed_loop: Vec<KernelCurve> = loop_curves
+            .into_iter()
+            .map(|curve| curve.transformed(&transform))
+            .collect::<Option<Vec<_>>>()?;
+        let is_circle_loop = loop_is_full_circle(&transformed_loop);
+        for curve in transformed_loop {
+            let marker = pieces.len() as i32;
+            let radial = curve_as_circular(&curve).map(|(center, radius, start, end, full)| {
+                let limited = !full && !is_circle_loop;
+                let (start_angle, end_angle) = if limited { (start, end) } else { (0.0, 0.0) };
+                RadialSourceGeometry {
+                    plane: unit,
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    limited,
+                    marker,
+                }
+            });
+            pieces.push(RegionBoundaryPiece { curve, radial });
+        }
+    }
+    Some((unit, pieces))
+}
+
+fn curve_distance_squared_to(plane: &Plane, curve: &KernelCurve, point: DPoint) -> f64 {
+    let Some(projected) = plane.project(point) else {
+        return f64::INFINITY;
+    };
+    let planar = closest_point(curve, projected).distance;
+    let world = plane.point_at(projected);
+    let dx = world[0] - point[0];
+    let dy = world[1] - point[1];
+    let dz = world[2] - point[2];
+    planar * planar + dx * dx + dy * dy + dz * dz
+}
+
 fn radial_candidates(entity: &EntityType) -> Vec<RadialSourceGeometry> {
+    if matches!(entity, EntityType::Region(_)) {
+        let Some((_, pieces)) = region_boundary_pieces(entity) else {
+            return Vec::new();
+        };
+        return pieces
+            .into_iter()
+            .filter_map(|piece| piece.radial)
+            .collect();
+    }
     let Some(planar) = crate::entities::curve::entity_curve(entity) else {
         return Vec::new();
     };
@@ -166,6 +414,15 @@ pub(crate) fn radial_source_at(
     entity: &EntityType,
     point: Vector3,
 ) -> Option<RadialSourceGeometry> {
+    if matches!(entity, EntityType::Region(_)) {
+        let (plane, pieces) = region_boundary_pieces(entity)?;
+        let pt = dpoint(point);
+        let nearest = pieces.iter().min_by(|first, second| {
+            curve_distance_squared_to(&plane, &first.curve, pt)
+                .total_cmp(&curve_distance_squared_to(&plane, &second.curve, pt))
+        })?;
+        return nearest.radial;
+    }
     radial_candidates(entity)
         .into_iter()
         .min_by(|first, second| {
@@ -176,6 +433,11 @@ pub(crate) fn radial_source_at(
 }
 
 fn radial_source_for_marker(entity: &EntityType, marker: i32) -> Option<RadialSourceGeometry> {
+    if matches!(entity, EntityType::Region(_)) {
+        let (_, pieces) = region_boundary_pieces(entity)?;
+        let index = usize::try_from(marker).ok()?;
+        return pieces.get(index).and_then(|piece| piece.radial);
+    }
     radial_candidates(entity)
         .into_iter()
         .find(|candidate| candidate.marker == marker)
@@ -570,10 +832,10 @@ pub fn resolve_reference_chain(
         }
     }
     let legacy = reference.main_subent_type != 2
-        && matches!(
+        && (matches!(
             reference.osnap_type,
             chain::osnap::NONE | chain::osnap::END | chain::osnap::START_POINT
-        );
+        ) || matches!(entity, EntityType::Region(_)));
     let local = if reference.osnap_type == chain::osnap::PERP && !walked.block_path.is_empty() {
         from_space
             .and_then(|from| {
@@ -636,8 +898,15 @@ fn resolve_local_by_marker(
         return Some(radial.point_at_angle(angle));
     }
     if reference.main_gs_marker == POLYLINE_ARC_CENTER_MARKER {
-        let segment = reference.osnap_distance.round().max(0.0) as usize;
-        return polyline_arc_center(entity, segment);
+        let segment = reference.osnap_distance.round().max(0.0) as i32;
+        if matches!(entity, EntityType::Region(_)) {
+            return radial_source_for_marker(entity, segment).map(|r| r.center_world());
+        }
+        return polyline_arc_center(entity, segment as usize);
+    }
+    if matches!(entity, EntityType::Region(_)) && reference.main_gs_marker >= 0 {
+        let radial = radial_source_for_marker(entity, reference.main_gs_marker)?;
+        return Some(radial.point_at_angle(reference.osnap_distance));
     }
     if reference.main_gs_marker == -3 {
         return match entity {
@@ -807,7 +1076,7 @@ fn remap_plane_offset(
 /// its first handle, so "some handle in `xrefs` exists" was true even for a
 /// reference whose actual source had been erased. Walking the chain asks the
 /// question that was meant — is the geometry still there.
-pub(crate) fn dimension_is_associative(document: &codec::CadDocument, dimension: Handle) -> bool {
+pub(crate) fn dimension_is_associative(document: &codec::Document, dimension: Handle) -> bool {
     document.objects.values().any(|object| {
         let ObjectType::Associative(object) = object else {
             return false;
@@ -826,7 +1095,7 @@ pub(crate) fn dimension_is_associative(document: &codec::CadDocument, dimension:
 }
 
 pub(crate) fn constraint_from_associative_dimension(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     handle: Handle,
 ) -> Option<(
     super::parametric_constraints::ConstraintKind,
@@ -913,7 +1182,7 @@ pub(crate) fn constraint_from_associative_dimension(
 }
 
 pub(crate) fn radial_extension_points(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     dimension: Handle,
     gap: f64,
     extension: f64,
@@ -1164,6 +1433,7 @@ impl Scene {
         let association_handle = self.document.allocate_handle();
         let mut object = AssociativeObject::new("DIMASSOC", "AcDbDimAssoc");
         object.handle = association_handle;
+        self.has_dimension_associations.set(Some(true));
         object.reactors.push(dimension);
         object.data = AssociativeData::DimensionAssociation(AssocDimensionAssociation {
             associativity,
@@ -1556,6 +1826,52 @@ impl Scene {
         })
     }
 
+    /// Remove the DIMASSOC object of `dimension`: the object itself, the
+    /// reactor it left on every entity and its entry in the owning dictionary.
+    /// Returns whether the dimension was associative.
+    pub(crate) fn detach_dimension_association(&mut self, dimension: Handle) -> bool {
+        let found = self.document.objects.iter().find_map(|(handle, object)| {
+            let ObjectType::Associative(object) = object else {
+                return None;
+            };
+            matches!(
+                &object.data,
+                AssociativeData::DimensionAssociation(data) if data.dimension == dimension
+            )
+            .then_some((*handle, object.owner))
+        });
+        let Some((association, owner)) = found else {
+            return false;
+        };
+        let before = self.document.objects.get(&association).cloned();
+        self.record_undo_object_before(association, before);
+        if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get(&owner) {
+            let before = ObjectType::Dictionary(dictionary.clone());
+            self.record_undo_object_before(owner, Some(before));
+        }
+        if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get_mut(&owner) {
+            dictionary.entries.retain(|(_, handle)| *handle != association);
+        }
+        self.document.objects.remove(&association);
+        let holders: Vec<Handle> = self
+            .document
+            .entities()
+            .filter(|entity| entity.common().reactors.contains(&association))
+            .map(|entity| entity.common().handle)
+            .collect();
+        for handle in holders {
+            if self.is_recording_undo() {
+                let before = self.document.get_entity_arc(handle);
+                self.record_undo_before(handle, before);
+            }
+            if let Some(entity) = self.document.get_entity_mut(handle) {
+                entity.common_mut().reactors.retain(|reactor| *reactor != association);
+            }
+        }
+        self.invalidate_dependency_index();
+        true
+    }
+
     /// Preserve an association only when the dimension and every source-chain
     /// handle were copied. Remap the complete chain to the new entities.
     pub(crate) fn copy_dimension_associations(
@@ -1646,6 +1962,159 @@ impl Scene {
         }
     }
 
+    /// DIMREASSOCIATE: move the definition point(s) `target` names onto
+    /// their object and associate the dimension with what now lies under
+    /// its points. False when no object lies there.
+    pub(crate) fn reassociate_dimension(
+        &mut self,
+        dimension: Handle,
+        target: &crate::command::ReassociateTarget,
+    ) -> bool {
+        use crate::command::ReassociateTarget as T;
+        let Some(owner) = self
+            .document
+            .get_entity(dimension)
+            .map(|entity| entity.common().owner_handle)
+        else {
+            return false;
+        };
+        let object = |handle: Handle| {
+            self.document
+                .get_entity(handle)
+                .filter(|entity| entity.common().owner_handle == owner && handle != dimension)
+                .cloned()
+        };
+        let ends = |entity: &EntityType| match entity {
+            EntityType::Line(line) => Some((line.start, line.end)),
+            EntityType::Arc(arc) => Some((arc.start_point_wcs(), arc.end_point_wcs())),
+            _ => None,
+        };
+        let point = |value: glam::DVec3| Vector3::new(value.x, value.y, value.z);
+        // Each change: (index into the inference points, new location).
+        let mut moves: Vec<(usize, Vector3)> = Vec::new();
+        let mut radial: Option<(Vector3, f64)> = None;
+        match target {
+            T::Point { index, point: at } => {
+                let at = point(*at);
+                let tolerance = (at.x.abs() + at.y.abs() + at.z.abs()).max(1.0) * 1e-9;
+                let found = self.document.entities().any(|entity| {
+                    entity.common().owner_handle == owner
+                        && entity.common().handle != dimension
+                        && !matches!(entity, EntityType::Dimension(_))
+                        && source_distance_squared(entity, at)
+                            .is_some_and(|distance| distance <= tolerance * tolerance)
+                });
+                if !found {
+                    return false;
+                }
+                moves.push((*index, at));
+            }
+            T::Ends(handle) => {
+                let Some((start, end)) = object(*handle).as_ref().and_then(ends) else {
+                    return false;
+                };
+                moves.extend([(0, start), (1, end)]);
+            }
+            T::Arc(handle) => {
+                let Some(EntityType::Arc(arc)) = object(*handle) else {
+                    return false;
+                };
+                moves.extend([
+                    (0, arc.center),
+                    (1, arc.start_point_wcs()),
+                    (2, arc.end_point_wcs()),
+                ]);
+            }
+            T::Line { index, object: handle } => {
+                let Some(EntityType::Line(line)) = object(*handle) else {
+                    return false;
+                };
+                let first = index * 2;
+                moves.extend([(first, line.start), (first + 1, line.end)]);
+            }
+            T::Radial(handle) => match object(*handle) {
+                Some(EntityType::Circle(circle)) => radial = Some((circle.center, circle.radius)),
+                Some(EntityType::Arc(arc)) => radial = Some((arc.center, arc.radius)),
+                _ => return false,
+            },
+        }
+        let Some(EntityType::Dimension(entity)) = self.document.get_entity_mut(dimension) else {
+            return false;
+        };
+        let along = |from: Vector3, to: Vector3| {
+            let (dx, dy, dz) = (to.x - from.x, to.y - from.y, to.z - from.z);
+            let length = (dx * dx + dy * dy + dz * dz).sqrt();
+            if length > 1e-12 {
+                (dx / length, dy / length, dz / length)
+            } else {
+                (1.0, 0.0, 0.0)
+            }
+        };
+        let offset = |center: Vector3, direction: (f64, f64, f64), distance: f64| {
+            Vector3::new(
+                center.x + direction.0 * distance,
+                center.y + direction.1 * distance,
+                center.z + direction.2 * distance,
+            )
+        };
+        match &mut **entity {
+            Dimension::Radius(radius) => {
+                let Some((center, size)) = radial else {
+                    return false;
+                };
+                let direction = along(radius.angle_vertex, radius.definition_point);
+                radius.angle_vertex = center;
+                radius.definition_point = offset(center, direction, size);
+            }
+            Dimension::Diameter(diameter) => {
+                let Some((center, size)) = radial else {
+                    return false;
+                };
+                let direction = along(diameter.definition_point, diameter.angle_vertex);
+                diameter.angle_vertex = offset(center, direction, size);
+                diameter.definition_point = offset(center, direction, -size);
+            }
+            other => {
+                for (index, at) in moves {
+                    let slot = match (&mut *other, index) {
+                        (Dimension::Linear(d), 0) => &mut d.first_point,
+                        (Dimension::Linear(d), 1) => &mut d.second_point,
+                        (Dimension::Aligned(d), 0) => &mut d.first_point,
+                        (Dimension::Aligned(d), 1) => &mut d.second_point,
+                        (Dimension::Angular3Pt(d), 0) => &mut d.angle_vertex,
+                        (Dimension::Angular3Pt(d), 1) => &mut d.first_point,
+                        (Dimension::Angular3Pt(d), 2) => &mut d.second_point,
+                        (Dimension::Angular2Ln(d), 0) => &mut d.first_point,
+                        (Dimension::Angular2Ln(d), 1) => &mut d.second_point,
+                        (Dimension::Angular2Ln(d), 2) => &mut d.angle_vertex,
+                        (Dimension::Angular2Ln(d), 3) => &mut d.definition_point,
+                        (Dimension::Ordinate(d), 0) => &mut d.feature_location,
+                        _ => return false,
+                    };
+                    *slot = at;
+                }
+            }
+        }
+        self.invalidate_dim_block_recorded(dimension);
+        let sources: Vec<Option<Handle>> = self
+            .infer_dimension_sources(dimension)
+            .into_iter()
+            .map(|source| {
+                source.filter(|source| {
+                    self.document
+                        .get_entity(*source)
+                        .is_some_and(|entity| entity.common().owner_handle == owner)
+                })
+            })
+            .collect();
+        self.detach_dimension_association(dimension);
+        if sources.iter().any(Option::is_some) {
+            self.attach_dimension_association(dimension, sources);
+        }
+        self.bump_entities(&[(dimension, ChangeKind::Modified)]);
+        true
+    }
+
     pub(crate) fn infer_dimension_sources(&self, dimension: Handle) -> Vec<Option<Handle>> {
         let Some(EntityType::Dimension(entity)) = self.document.get_entity(dimension) else {
             return Vec::new();
@@ -1704,14 +2173,38 @@ impl Scene {
             .collect()
     }
 
-    pub(crate) fn refresh_associative_dimensions(
+    /// Whether the drawing holds any DIMASSOC dimension association.
+    ///
+    /// Settled with one pass over `document.objects` and cached: creating an
+    /// association sets it to `true`, and a coarse structural change
+    /// (`Scene::bump_geometry`) re-opens the question. Most drawings have
+    /// none, so their per-edit refreshes stop scanning the object graph.
+    fn dimension_associations_possible(&self) -> bool {
+        if let Some(known) = self.has_dimension_associations.get() {
+            return known;
+        }
+        let any = self.document.objects.values().any(|object| {
+            matches!(
+                object,
+                ObjectType::Associative(associative)
+                    if matches!(associative.data, AssociativeData::DimensionAssociation(_))
+            )
+        });
+        self.has_dimension_associations.set(Some(any));
+        any
+    }
+
+    /// `doc(hidden)` public only so `benches/dimension_association_refresh.rs`
+    /// can time the real per-edit production entry point.
+    #[doc(hidden)]
+    pub fn refresh_associative_dimensions(
         &mut self,
         changes: &[(Handle, ChangeKind)],
     ) -> Vec<(Handle, ChangeKind)> {
-        let changed: rustc_hash::FxHashSet<_> = changes.iter().map(|(handle, _)| *handle).collect();
-        if changed.is_empty() {
+        if changes.is_empty() || !self.dimension_associations_possible() {
             return Vec::new();
         }
+        let changed: rustc_hash::FxHashSet<_> = changes.iter().map(|(handle, _)| *handle).collect();
         let associations: Vec<_> = self
             .document
             .objects
@@ -2104,7 +2597,7 @@ impl Scene {
             }
             let measurement = match &**dimension {
                 Dimension::Linear(linear) => linear_measurement(linear),
-                _ => dimension.measurement(),
+                _ => dimension.stored_measurement(),
             };
             // Store the raw sheet measurement; the formatter applies DIMLFAC once.
             debug_assert!(
@@ -2288,6 +2781,37 @@ mod tests {
             .iter()
             .any(|(handle, before)| *handle == association && before.is_some()));
     }
+
+    #[test]
+    fn dimension_association_gate_tracks_creation_and_reset() {
+        let mut scene = Scene::new();
+        assert!(
+            !scene.dimension_associations_possible(),
+            "a fresh drawing holds no DIMASSOC association"
+        );
+
+        let circle = scene.add_entity(EntityType::Circle(Circle::from_center_radius(
+            Vector3::ZERO,
+            5.0,
+        )));
+        let dimension = scene.add_entity(EntityType::Dimension(Box::new(Dimension::Diameter(
+            DimensionDiameter::new(Vector3::new(5.0, 0.0, 0.0), Vector3::new(-5.0, 0.0, 0.0)),
+        ))));
+        scene.attach_dimension_association(dimension, vec![Some(circle)]);
+        assert!(
+            scene.dimension_associations_possible(),
+            "creating an association must open the refresh path in this session"
+        );
+
+        // A coarse structural bump re-opens the question; the association is
+        // still there, so the answer stays true.
+        scene.bump_geometry();
+        assert!(scene.dimension_associations_possible());
+
+        // Detaching the association settles the answer back to false.
+        assert!(scene.detach_dimension_association(dimension));
+        assert!(!scene.dimension_associations_possible());
+    }
 }
 
 /// Average displacement of the dimension's resolved definition points.
@@ -2337,6 +2861,18 @@ fn feature_reference(
             }
             if matches!(entity, EntityType::Circle(_) | EntityType::Arc(_)) {
                 return source_reference(entity, point);
+            }
+            if matches!(entity, EntityType::Region(_)) && kind == S::Center {
+                if let Some((_, pieces)) = region_boundary_pieces(entity) {
+                    for (index, piece) in pieces.iter().enumerate() {
+                        if let Some(radial) = piece.radial {
+                            let center = radial.center_world();
+                            if point_distance_squared(center, point) < 1e-12 {
+                                return Some((POLYLINE_ARC_CENTER_MARKER, index as f64));
+                            }
+                        }
+                    }
+                }
             }
             let planar = crate::entities::curve::entity_curve(entity)?;
             if let KernelCurve::Polyline(polyline) = &planar.curve {
@@ -2391,7 +2927,7 @@ fn feature_reference(
 }
 
 fn persisted_measurement_scale(
-    doc: &codec::CadDocument,
+    doc: &codec::Document,
     entity: &EntityType,
 ) -> Option<MeasurementScale> {
     use crate::entities::dim_override;
@@ -2439,7 +2975,7 @@ fn persisted_measurement_scale(
 /// made by earlier releases kept their source's association this way, which
 /// the reference application reports as a damaged drawing. Returns how many
 /// reactors were dropped.
-pub(crate) fn drop_stray_dimension_reactors(document: &mut codec::CadDocument) -> usize {
+pub(crate) fn drop_stray_dimension_reactors(document: &mut codec::Document) -> usize {
     let associations: rustc_hash::FxHashMap<Handle, (Handle, Vec<Handle>)> = document
         .objects
         .iter()

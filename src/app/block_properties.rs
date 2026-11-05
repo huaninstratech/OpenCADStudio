@@ -32,6 +32,12 @@ impl OpenCADStudio {
         self.hyperlink_editor_description = description;
         self.hyperlink_editor_mixed = false;
         self.hyperlink_editor_dirty = false;
+        self.hyperlink_options = crate::ui::window::hyperlink_dialog::HyperlinkOptions {
+            edit: !self.hyperlink_editor_url.is_empty(),
+            dwf: true,
+            address_only: true,
+            ..Default::default()
+        };
         self.active_modal = Some(super::ModalKind::Hyperlink);
         true
     }
@@ -57,7 +63,7 @@ impl OpenCADStudio {
                 },
             );
             if current != next {
-                self.push_undo_snapshot(i, "Block hyperlink");
+                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block hyperlink"));
                 crate::scene::block_metadata::set_hyperlink(
                     &mut self.tabs[i].scene.document,
                     definition,
@@ -186,7 +192,8 @@ impl OpenCADStudio {
         if current == value {
             return Task::none();
         }
-        self.push_undo_snapshot(i, "Block properties");
+        let fresh = !self.block_palette_stale();
+        self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block properties"));
         let doc = &mut self.tabs[i].scene.document;
         match field {
             "bedit_annotative" | "bedit_match_orientation" => {
@@ -231,6 +238,8 @@ impl OpenCADStudio {
         self.tabs[i].scene.bump_geometry();
         self.finish_pending_history(i);
         self.refresh_properties();
+        // Only this block's definition changed.
+        self.note_block_changes(fresh, [&name]);
         self.refresh_block_palette();
         Task::none()
     }

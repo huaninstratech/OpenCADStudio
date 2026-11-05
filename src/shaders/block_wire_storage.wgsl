@@ -29,9 +29,23 @@ struct Uniforms {
     eye_high: vec3<f32>,
     highlight_widen: f32,
     eye_low: vec3<f32>,
-    _pad_el: f32,
+    edge_rgb: f32,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+// Edge colour of the filled-with-edges modes: 0x01RRGGBB in the bits of
+// `edge_rgb` picks that colour, anything else black.
+fn edge_color() -> vec3<f32> {
+    let bits = bitcast<u32>(u.edge_rgb);
+    if (bits >> 24u) != 1u {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(
+        f32((bits >> 16u) & 255u),
+        f32((bits >> 8u) & 255u),
+        f32(bits & 255u),
+    ) / 255.0;
+}
 
 struct WireConst {
     color: vec4<f32>,
@@ -177,7 +191,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, in: VertexIn) -> VertexOut 
         let world_hw_a = select(wire_const.world_half_width, seg_taper_ratio.x * wire_const.world_half_width, is_tapered);
         let world_hw_b = select(wire_const.world_half_width, seg_taper_ratio.y * wire_const.world_half_width, is_tapered);
         let cur_world_hw = mix(world_hw_a, world_hw_b, which_end);
-        let eff_hw = max(cur_world_hw, 0.5 * u.world_per_pixel);
+        let eff_hw = cur_world_hw + 0.5 * u.world_per_pixel;
 
         let world_delta = rel_b - rel_a;
         let world_len = length(world_delta);
@@ -300,17 +314,13 @@ fn in_dash(
         if distance <= align_end || distance >= align_total - align_end {
             return true;
         }
-        var first_dash = 0.0;
-        for (var i = 0u; i < count; i++) {
-            if elements[i] > 0.0 {
-                first_dash = elements[i];
-                break;
-            }
-        }
+        // The aligned pattern leads with its dash or dot (see wire.wgsl).
+        let first_dash = max(elements[0], 0.0);
         value = ((distance - align_end + first_dash) % pattern_length
             + pattern_length) % pattern_length;
     } else {
-        value = ((distance % pattern_length) + pattern_length) % pattern_length;
+        // The cap before the start reads as the start (see wire.wgsl).
+        value = ((max(distance, 0.0) % pattern_length) + pattern_length) % pattern_length;
     }
     var position = 0.0;
     let dot_half = u.world_per_pixel * 0.75;
@@ -375,5 +385,5 @@ fn fs_black(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5);
-    return vec4<f32>(0.0, 0.0, 0.0, alpha);
+    return vec4<f32>(edge_color(), alpha);
 }

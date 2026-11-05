@@ -1,6 +1,6 @@
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind, PointPickContext};
 use crate::scene::block_actions::{self as actions, Kind, Parameter, XyKeyPoint};
-use codec::{CadDocument, Handle};
+use codec::{Document, Handle};
 use glam::DVec3;
 
 inventory::submit!(crate::command::CommandRegistration {
@@ -29,7 +29,7 @@ impl AssociateCommand {
     pub(crate) fn new(
         document: u64,
         definition: Handle,
-        doc: &CadDocument,
+        doc: &Document,
         selected: Option<Handle>,
     ) -> Self {
         let orphaned = actions::association::orphaned(doc, definition);
@@ -71,7 +71,7 @@ impl AssociateCommand {
     fn choose_parameter(&mut self, index: usize, clicked_key: Option<XyKeyPoint>) -> CmdResult {
         self.parameter = Some(index);
         let kind = self.candidates[self.action.unwrap()].kind;
-        if matches!(kind, Kind::Move | Kind::Stretch) && !self.parameters[index].point {
+        if matches!(kind, Kind::Move | Kind::Stretch | Kind::PolarStretch) && !self.parameters[index].point {
             clicked_key.map_or(CmdResult::NeedPoint, |key| self.finish(Some(key)))
         } else {
             self.finish(None)

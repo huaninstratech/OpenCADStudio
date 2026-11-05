@@ -11,14 +11,46 @@ Every native OpenCADStudio build contains the same MCP server as the editor. `Op
 OpenCADStudio --mcp
 ```
 
-The client must start that command over standard input/output. If it asks for the executable and arguments separately, select the installed `OpenCADStudio` executable and enter `--mcp` as its only argument. The exact registration screen or configuration location belongs to the client. Once connected, the four tools below should appear in the client's MCP tool list.
+The client must start that command over standard input/output. If it asks for the executable and arguments separately, select the installed `OpenCADStudio` executable and enter `--mcp` as its only argument. The exact registration screen or configuration location belongs to the client. Once connected, the 20 tools below should appear in the client's MCP tool list.
 
-The server provides four tools:
+The server provides four general-purpose tools:
 
 - `ocs_sessions` finds running editor sessions and opens OpenCADStudio when none exists.
 - `ocs_read` discovers capabilities and reads document state, complete database records, command manifests, entities, properties, kernel measurements and spatial relationships, history, events, and operation status.
 - `ocs_execute` performs one operation, an atomic record update, or a sequential batch against the real editor.
 - `ocs_capture` returns a bounded PNG of the drawing viewport or complete window.
+
+It also provides 16 intent tools for common work:
+
+| Inspect | Change | Render |
+|---|---|---|
+| `ocs_inspect`, `ocs_query`, `ocs_find_text` | `ocs_run`, `ocs_new`, `ocs_open`, `ocs_save` | `ocs_render` |
+| `ocs_audit`, `ocs_commands`, `ocs_measure` | `ocs_save_verified`, `ocs_select`, `ocs_cancel` | |
+| | `ocs_undo`, `ocs_redo` | |
+
+Intent tools accept their operation arguments directly. When exactly one editor
+session is available, `ocs_session_id` is optional; pass it when several are
+open. Execute intents also make `request_id` optional and generate one when it
+is missing. Pass your own ID and reuse it with the identical request when a
+mutation must be retried safely. Automatic IDs preserve the existing
+idempotency mechanism, but they cannot make a retry safe without knowing the
+key.
+
+`ocs_render` is the low-friction drawing view. It delegates to the capture
+implementation and frames to extents by default. Use `ocs_capture` for tiles,
+window capture, and resource delivery. `ocs_read` and `ocs_execute`
+remain the full-control surface for advanced operations and explicit envelopes.
+
+A complete drawing and verification flow needs no session or request IDs:
+
+```json
+{"name":"ocs_new","arguments":{}}
+{"name":"ocs_run","arguments":{"command":"LINE 0,0 10,0"}}
+{"name":"ocs_run","arguments":{"command":"CIRCLE 5,5 2"}}
+{"name":"ocs_inspect","arguments":{}}
+{"name":"ocs_query","arguments":{"type":"Circle"}}
+{"name":"ocs_render","arguments":{}}
+```
 
 ### Stale sessions clean themselves up
 
@@ -46,7 +78,7 @@ Native builds also accept a second, headless entry point (`OpenCADStudio --serve
 JSON request per line) for scripts and CI; the two native channels, their startup dialogs
 and their limits are described in [native.md](native.md).
 
-The normal flow is to call `ocs_sessions`, pass its returned `session_id` as `ocs_session_id` to the other tools, read the chosen session with `ocs_read`, then pass the returned document state into `ocs_execute`. For example, an undo request has this shape:
+For the full-control flow, call `ocs_sessions`, pass its returned `session_id` as `ocs_session_id` to the other facade tools, read the chosen session with `ocs_read`, then pass the returned document state into `ocs_execute`. For example, an undo request has this shape:
 
 ```json
 {
@@ -243,13 +275,11 @@ unconsumed, and the command closed rather than left armed for a second line. Geo
 
 `ocs_capture` defaults to the drawing viewport and a longest edge of 1600 pixels. Set `scope` to `window` for the full interface or change `max_dimension` between 256 and 4096.
 
-With `diff: true`, an unchanged comparison returns metadata only, including
-`diff.changed: false`, the hash and resource URI; it does not resend image or
-resource content blocks, regardless of `delivery`. The initial baseline (also
-after `reset_diff_baseline: true`) still uses the requested image delivery.
-Changed captures retain the requested diff mode, including cropped patches.
-Use `diff: false` or read the returned resource URI to retrieve the full image
-when an unchanged comparison omitted it.
+Every capture delivers its image under the requested `delivery`. The retired
+`diff`, `diff_mode` and `reset_diff_baseline` parameters are refused by name: the
+comparison's baseline moved with the camera and the on-screen command line
+counted as changed pixels, so it was removed rather than repaired. Capture twice
+and compare the two images if you need a visual delta.
 
 Clients using MCP 2026-07-28 can advertise `io.modelcontextprotocol/tasks`. OCS then returns a standard task handle when an operation is still running and accepts `tasks/get`, `tasks/update`, and `tasks/cancel`. Other clients continue to receive the existing operation status and can read it with `ocs_read`.
 
@@ -922,6 +952,8 @@ maps onto these three steps rather than a native op.
 
 `query` entities of type `TEXT`/`MTEXT` return the raw stored string in `value` plus a formatting-free rendering in `text` (MTEXT inline codes such as `\A1;` or `\P` are resolved; `%%d`-style TEXT codes become their glyphs). With `detail:"full"`, degenerate-width text bounds are widened with a documented estimate (height × 0.8 × character count) so `bounds`-based region filters stay usable.
 
+Every entity above `summary` detail also carries `constraints` — the constraints referencing it, as `{kind, participants, enabled, conflict, form}` entries, where `conflict` names a constraint the solver flagged (`Redundant` or `Conflicting`) and is `null` otherwise, and `form` is `Dynamic`/`Annotational` for a dimensional constraint's dimension (`null` for a geometric constraint) (see the API spec for the exact shape).
+
 ### Text operations — search, audit and replace
 
 Three dedicated text operations go beyond `query` for bulk text work:
@@ -1243,7 +1275,7 @@ undo step; missing `layer`s are created and reported in `layers_created`.
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
 | `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
-| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg`, `attributes` (`{"TAG":"value"}`; tags are case-insensitive, the ones left out keep their default; unknown or constant tags are refused) |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
 
@@ -1386,6 +1418,7 @@ active-document guard — they may address any open document.
 | `osmode` | object-snap bitmask (integer) | ✓ |
 | `pdmode` / `pdsize` | point display mode / size | ✓ |
 | `extmin` / `extmax` | model-space extents `[x,y,z]` | read-only |
+| `constraintstatus` | active space's constraint state: `{scope, constraint_count, enabled_count, dof}` | read-only |
 
 ### `layout_create` / `page_setup_set` — layouts and page setups
 
@@ -1433,7 +1466,12 @@ template's tables/styles instead of the source drawing's.
 Copies the entities from the active document into the open document
 addressed by `document_id`. Every handle must exist in the source
 (`entity_absent` otherwise); the target must be open (`document_closed`).
-Referenced (missing) layer definitions travel along. `result.created` lists
+The dependencies the interactive copy carries travel along: layer, linetype
+and style records the copy needs, and the block definition the source holds
+for a copied reference — transitively, with its object graph. A reference
+whose definition the source itself does not hold stays a dangling reference,
+as it does when the drawing is loaded, and the audit reports it.
+`result.created` lists
 the new handles in the target, `result.count` their number. Combined with
 an empty `POST /documents` (REST) this is the multi-document assembly
 workflow.

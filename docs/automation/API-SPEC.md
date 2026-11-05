@@ -194,6 +194,22 @@ mutation operations, §6). `ocs_read` additionally serves the generated
 per-type creation schema (`entity_schema`) and on-demand guides. Session
 discovery and capability advertisement follow the same protocol-1 semantics.
 Set-up instructions: see the MCP section of [`README.md`](README.md).
+Exposes 20 tools with JSON-Schema described arguments. Four are general-purpose
+facades: `ocs_sessions`, `ocs_read`, `ocs_execute` (all 36 mutation operations,
+§6), and `ocs_capture`. Sixteen are intent tools over the same operation paths:
+`ocs_inspect`, `ocs_query`, `ocs_find_text`, `ocs_audit`, `ocs_commands`,
+`ocs_measure`, `ocs_render`, `ocs_run`, `ocs_new`, `ocs_open`, `ocs_save`,
+`ocs_save_verified`, `ocs_select`, `ocs_cancel`, `ocs_undo`, and `ocs_redo`.
+
+Intent tools expose operation arguments directly. `ocs_session_id` is optional
+when exactly one session is available and required to disambiguate several.
+Execute intents make `request_id` optional but pass through a caller-supplied
+value; reuse that value with the identical request for a safe retry. Generated
+IDs do not make autonomous retries safe. `ocs_run` maps `command` to the
+operation's `cmd`. `ocs_render` reuses capture behavior with `view: "extents"`
+as its default. Session discovery, idempotency, validation, task behavior, and
+capability advertisement remain identical to the facade path. Set-up
+instructions: see the MCP section of [`README.md`](README.md).
 
 ---
 
@@ -210,6 +226,7 @@ client needs to act:
 | `hand_seed` | The drawing's handle seed, hex — a monotonically advancing per-file object counter |
 | `documents[]` | Every open document: `id`, `title`, `path`, `dirty`, `revision` |
 | `selection[]` | Handles currently selected, in pick order |
+| `block_editor` | The definition open in the block editor, `{name, handle}`, or `null` — while set, created geometry joins that definition |
 | `command` | An interactive command's state, when one is running: `accepts[]`, `options[]`, `input_example` |
 | `operation` | The `request_id` of the operation currently pending, when one is |
 | `capabilities` | Feature list (also available as the dedicated `capabilities` read) |
@@ -245,7 +262,7 @@ and stable; branch on it, not on message text.
 | `document_required`, `document_not_active`, `document_closed` | Envelope addressing problem | yes (refresh state) |
 | `document_dirty` | Closing would lose unsaved changes | no — resend with `"discard":true` to confirm |
 | `entity_absent` | A listed handle does not exist (the message names them) | refresh and re-read |
-| `command_busy` | An interactive command is active | finish or `cancel` first |
+| `command_busy` | An interactive command is active; the reply names it (`command`, `document_id`) and the client holding it (`owner_client_id`, null when the user holds it) | finish or `cancel` first |
 | `gui_required` | Operation needs the editor window (`view_focus`, and the picks of §6.12 over headless transports) | headless sessions only |
 | `busy` | Async work still running | poll `operation` |
 | `interactive_pending` | Another person-pick (§6.12) is already waiting for the user | wait for it, or retract it with `cancel` |
@@ -262,6 +279,7 @@ and stable; branch on it, not on message text.
 | `document_not_found` | `document_id` names no open document | refresh `state` |
 | `layout_exists`, `layout_missing`, `layer_failed`, `block_failed`, `block_missing`, `block_protected`, `block_referenced`, `block_in_edit`, `block_invalid_name`, `block_exists`, `selection_set_missing`, `template_missing`, `template_failed`, `save_failed` | Domain refusals, self-explanatory | no |
 | `reopen_failed`, `version_mismatch`, `semantic_mismatch`, `invalid_dxf_handle_graph` | `save_verified` roundtrip checks (§6.1); the file is preserved for diagnosis | fix the source data |
+| `layout_exists`, `layout_missing`, `layer_failed`, `block_failed`, `block_missing`, `block_protected`, `block_cycle`, `selection_set_missing`, `template_missing`, `template_failed`, `save_failed` | Domain refusals, self-explanatory | no |
 
 Unknown routes answer `code:"unknown_route"` (HTTP 404). A timed-out parked
 request answers `code:"response_timeout"`.
@@ -433,9 +451,14 @@ An MCP `ocs_read` `entity_schema` call (no `type` → the type list, or
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
 | `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
-| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg`, `attributes` (`{"TAG":"value"}`; tags are case-insensitive, the ones left out keep their default; unknown or constant tags are refused) |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
+
+While `state.block_editor` names a definition, the whole batch is authored
+inside it, on the editor's own undo stack, exactly like `run`; an `Insert`
+that would nest the open definition inside itself is refused
+(`block_cycle`) before anything commits.
 
 Result: `{"handles":[…],"created":N,"layers_created":[…]}` → HTTP 201.
 
@@ -550,6 +573,36 @@ mutated.
  "scope":"model_space","dry_run":true}
 → {"ok":true,"status":"completed","result":{"dry_run":true,"replaced":12,"entities_changed":5,"changes":[…]},…}
 ```
+| Op | Fields | Notes |
+|---|---|---|
+| `entities_delete` | `handles` | Every handle must exist; nothing is erased otherwise (`entity_absent` names them) |
+| `entities_transform` | `handles`, `action`, per-action params | `move`/`copy`: `vector:[dx,dy(,dz)]` (copy returns new handles in `result.created`); `rotate`: `center`, `angle_deg`; `scale`: `center`, `factor` (≠ 0); `mirror`: `axis:[[x1,y1],[x2,y2]]`, optional `copy:true`; `array`: `rows`, `columns`, `row_spacing`, `column_spacing` |
+| `entities_copy_to` | `handles`, `document_id` (target) | Cross-document clone; the dependencies the interactive copy carries travel along (layers, linetypes, styles, and the block definitions the source holds for the copied references); result `created[]` + `count` |
+
+### 6.3a Node graph — `node_graph`
+
+`{"op":"node_graph","action":…}` drives the active drawing's node graph; every
+action answers with the graph state (`nodes` with their `sections`, ports,
+values, `params`, `outputs` and owned `handles`; `links`; `visible`).
+
+| Action | Fields | Notes |
+|---|---|---|
+| `library` | — | Node types: `objects` (drawing object nodes; `creates:false` for `Object`, which takes any linked object) and `operations` (`type`, `category`, `inputs`, `outputs`) |
+| `state` | — | Default action |
+| `show` / `hide` | — | Panel visibility |
+| `add` | `type`, optional `kind` (`object`/`operation`, needed when a name is both, e.g. `Point`), optional `position:[x,y]` | `result.node` is the new id |
+| `remove` | `node` | Erases the entities an object node made |
+| `connect` | `from:{node,field}`, `to:{node,field}` | `graph_cycle` when it would close a loop; `unknown_port` when a side has no such port |
+| `disconnect` | `to:{node,field}` | |
+| `set` | `node`, `field`, `value` | An input's own value. On object nodes it is written to the entity on every evaluation |
+| `toggle` | `node`, `field` | Folds a section (title or its `section:` port) or a coordinate group |
+| `clear` / `run` | — | Clear starts an empty graph; run re-evaluates |
+| `save` / `load` | `path` | `.ocg` file |
+
+Object node ports: each Properties row by its field, each coordinate group
+(`start_x|start_y|start_z`, a point `{x,y,z}`) and each section header
+(`section:<first field>`, an object of field values). Linking two groups or two
+section ports copies every value across.
 
 ### 6.4 Query and spatial filters — `query`
 
@@ -853,6 +906,38 @@ of its roundtrip): undeclared layers, dangling references, lossy records.
 MCP `ocs_read` additionally exposes `entity_schema` (§6.2), `validate`
 (preflight a request against the schema) and `guide` (on-demand guides:
 `workflow`, `architecture`, `capture`, `batch-bindings`).
+Every returned entity, at every detail level including `summary`, carries
+`owner` (the owning block record's handle, uppercase hex; `0` when unowned) and
+`space` (that record's name:
+`*Model_Space` for drawing geometry, a layout's record on a sheet, a
+definition such as `*U1` for its children), so definition geometry can be
+filtered out of a drawing result. The capture's `visible_entities` /
+`annotations` records carry the same two fields.
+
+Every entity returned above `summary` detail also carries `constraints`: one
+entry per constraint the solver holds on it — `kind` (the constraint's
+canonical kind name, shared by the constraint commands and reports),
+`participants` (every distinct entity handle the constraint relates, in
+reference order), `enabled` (`false` for a constraint kept but not solved),
+`conflict` (`null`, or `Redundant` when the solver found the constraint
+already implied by the rest, `Conflicting` when removing it would let the rest
+solve without satisfying it) and `form` (`Dynamic` or `Annotational` for a
+dimensional constraint's dimension; `null` when the record is not a
+dimensional constraint's dimension — a geometric constraint, or a dimension
+that does not resolve). An
+empty array states that the entity carries no
+constraint. A `fields`
+projection that does not name `constraints` drops it, like any other property.
+The same array is on each `records` `entities` row, each `get_selection`
+entity, each `user_select` hand-over and each capture candidate, so the
+association the solver enforces is enumerable from every read surface. The
+`user_select` hand-over follows its `detail` too: `summary` leaves the array
+out.
+
+Companion reads: `entities` (alias), `layers`, `header`, `records`
+(paged, filterable database records), `record_schema` (generated type
+registry with write rules), `properties`, `measure` (length/area/bounds),
+`xdata_get`, `get_selection` (§6.12).
 
 ### 6.5 Blocks
 
@@ -1010,6 +1095,7 @@ Result of a write: `{updated, app}`. REST: **route**
 | `textsize`, `filletrad`, `pdmode`, `pdsize` | defaults for new content | ✓ |
 | `mirrtext` (`0`/`1`), `insunits`, `osmode` | behaviour flags | ✓ |
 | `extmin`, `extmax` | model-space extents `[x,y,z]` | read-only |
+| `constraintstatus` | constraint state of the active space: `{scope, constraint_count, enabled_count, dof}` — `scope` is the name of the block record in force (`*Model_Space` outside an editor), the two counts are constraint totals (all vs still solved), and `dof` is the solver's remaining degrees of freedom, `null` until it has solved that space | read-only |
 
 `{"op":"sysvar","set":{"ltscale":2.5}}` applies the whole object atomically
 (`unknown_sysvar` / `invalid_sysvar_value` refuse it all);

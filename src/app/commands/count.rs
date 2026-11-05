@@ -36,7 +36,7 @@ fn parse_xy(s: &str) -> Option<[f64; 2]> {
 }
 
 /// A field referring to `boundary` keeps the count area's polyline.
-fn boundary_in_use(doc: &codec::CadDocument, boundary: Handle) -> bool {
+fn boundary_in_use(doc: &codec::Document, boundary: Handle) -> bool {
     let needle = format!("\"boundaryObjectHandle\":\"{}\"", hex(boundary));
     doc.fields.values().any(|f| f.code.contains(&needle))
 }
@@ -92,6 +92,7 @@ impl OpenCADStudio {
                 Some(Task::none())
             }
             "COUNTLIST" => {
+                self.pallet_as_window(crate::ui::dock::PanelId::Count);
                 self.set_count_palette(true);
                 Some(Task::none())
             }
@@ -314,7 +315,7 @@ impl OpenCADStudio {
                 // The boundary is gone (erased, undone): ask, or do what was
                 // chosen for good.
                 None => {
-                    if self.active_modal == Some(crate::app::ModalKind::CountInvalidArea) {
+                    if self.dialog_open(crate::app::ModalKind::CountInvalidArea) {
                         return;
                     }
                     match self.count_palette.invalid_choice {
@@ -386,7 +387,7 @@ impl OpenCADStudio {
     }
 
     fn close_invalid_area(&mut self, choice: u8) {
-        if self.active_modal == Some(crate::app::ModalKind::CountInvalidArea) {
+        if self.focus_dialog(crate::app::ModalKind::CountInvalidArea) {
             self.close_active_modal();
         }
         if self.count_palette.invalid_always {

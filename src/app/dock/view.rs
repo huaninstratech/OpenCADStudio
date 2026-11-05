@@ -4,7 +4,7 @@
 use crate::app::document::DocumentTab;
 use crate::app::{Message, OpenCADStudio};
 use crate::t;
-use crate::ui::dock::DOCK_DIVIDER_W;
+use crate::ui::dock::{DOCK_DIVIDER_W, DOCK_FLOAT_BAR_W};
 use iced::widget::{button, canvas, column, container, mouse_area, row, stack, text, Space};
 use iced::{Background, Border, Color, Element, Fill, Length, Theme};
 
@@ -17,17 +17,49 @@ impl OpenCADStudio {
         workspace: Element<'a, Message>,
         tab: &'a DocumentTab,
     ) -> Element<'a, Message> {
+        use crate::app::config::DockSide;
         // Floating panels sit over the workspace, back to front.
         let mut layers: Vec<Element<'_, Message>> = vec![workspace];
-        for f in &self.dock.floating {
-            // Once a drag is under way only its preview shows the panel.
-            let dragged = self
-                .dock_drag
-                .and_then(|d| d.movement())
-                .is_some_and(|(panel, _, target)| panel == f.id && target.is_some());
-            if self.dock_panel_visible(f.id) && !dragged {
-                layers.push(self.floating_panel(*f, tab));
+        // Auto-hiding edges draw over the drawing, below floating panels.
+        for side in [DockSide::Left, DockSide::Right] {
+            if !self.dock.edge_auto_hide(side) {
+                continue;
             }
+            if let Some(edge) = self.dock_edge(side, tab) {
+                // Opaque to the pointer, as a floating panel is: clicks on a
+                // revealed group's empty areas don't reach the drawing.
+                let edge = mouse_area(edge).interaction(iced::mouse::Interaction::Idle);
+                layers.push(
+                    container(edge)
+                        .width(Fill)
+                        .height(Fill)
+                        .align_x(match side {
+                            DockSide::Left => iced::alignment::Horizontal::Left,
+                            DockSide::Right => iced::alignment::Horizontal::Right,
+                        })
+                        .into(),
+                );
+            }
+        }
+        let movement = self.dock_drag.and_then(|d| d.movement());
+        for f in &self.dock.floating {
+            if !self.dock_panel_visible(f.id) {
+                continue;
+            }
+            // A floating pallet being dragged moves itself: it draws where it
+            // would land, its title bar on the side it would land on. Over a
+            // dock zone it hides and the preview in the column shows instead.
+            // Its layout only changes on release.
+            let f = match movement {
+                Some((panel, _, Some(target))) if panel == f.id => match target {
+                    crate::ui::dock::DropTarget::Float { x, y, bar } => {
+                        crate::ui::dock::FloatPanel { x, y, bar, ..*f }
+                    }
+                    _ => continue,
+                },
+                _ => *f,
+            };
+            layers.push(self.floating_panel(f, tab));
         }
         // An open pallet menu hangs beside its edge's + button, over a
         // catcher that closes it on any click elsewhere.
@@ -37,8 +69,11 @@ impl OpenCADStudio {
                 let checked: Vec<_> = crate::ui::dock::PanelId::ALL
                     .iter()
                     .filter(|p| {
-                        **p != crate::ui::dock::PanelId::AuthoringPalettes
-                            || tab.active_block_edit_session().is_some()
+                        !matches!(
+                            **p,
+                            crate::ui::dock::PanelId::AuthoringPalettes
+                                | crate::ui::dock::PanelId::ParametersManager
+                        ) || tab.active_block_edit_session().is_some()
                     })
                     .map(|p| {
                         let here = self.dock.location(*p).map(|(s, _)| s) == Some(side);
@@ -60,7 +95,7 @@ impl OpenCADStudio {
                         .into(),
                 );
                 layers.push(place_at(
-                    dock_edge_menu(side, &checked),
+                    dock_edge_menu(side, &checked, self.dock.strip_labels),
                     x.max(0.0),
                     plus_top,
                 ));
@@ -77,9 +112,17 @@ impl OpenCADStudio {
             );
             layers.push(menu);
         }
-        // While a panel is dragged, preview where it lands.
-        if let Some((id, _, Some(target))) = self.dock_drag.and_then(|d| d.movement()) {
+        // While a panel is dragged, preview where it lands, then cover
+        // everything with a layer that takes the pointer: the moving window
+        // must not react to it (hover highlights, its title bar's buttons,
+        // their cursors) and the cursor stays a closed hand.
+        if let Some((id, _, Some(target))) = movement {
             layers.push(self.dock_drop_preview(id, target));
+            layers.push(
+                mouse_area(Space::new().width(Fill).height(Fill))
+                    .interaction(iced::mouse::Interaction::Grabbing)
+                    .into(),
+            );
         }
         // Always a stack (and, below, always a mouse area), even with nothing
         // on top: iced keeps a widget's state only while the tree keeps its
@@ -98,14 +141,11 @@ impl OpenCADStudio {
                 .on_move(move |p| Message::Dock(crate::ui::dock::DockMsg::DragMove(p)))
                 .on_release(Message::Dock(crate::ui::dock::DockMsg::DragRelease))
                 .interaction(match self.dock_drag {
-                    Some(DockDrag::FloatSize {
-                        from_left: true, ..
-                    }) => iced::mouse::Interaction::ResizingDiagonallyUp,
-                    Some(DockDrag::FloatSize {
-                        from_left: false, ..
-                    }) => iced::mouse::Interaction::ResizingDiagonallyDown,
+                    Some(DockDrag::FloatSize { edge, .. }) => edge.interaction(),
                     Some(DockDrag::Split { .. }) => iced::mouse::Interaction::ResizingVertically,
-                    Some(DockDrag::Move { .. }) => iced::mouse::Interaction::Grabbing,
+                    Some(DockDrag::Move { .. } | DockDrag::QuickProperties) => {
+                        iced::mouse::Interaction::Grabbing
+                    }
                     // Widths, the Layer Manager column and the xref drags.
                     _ => iced::mouse::Interaction::ResizingHorizontally,
                 });
@@ -121,7 +161,29 @@ impl OpenCADStudio {
     /// neighbours. A group whose pallets all auto-hide shows only while one
     /// of its icons (or the group itself) is hovered; leaving the edge hides
     /// it again. `None` when nothing on the edge is open.
+    ///
+    /// An auto-hiding edge only holds room for its icon strip here: the edge
+    /// itself draws over the workspace (see `dock_overlay`), so revealing a
+    /// group covers the drawing instead of squeezing it.
     pub(in crate::app) fn build_edge_stack<'a>(
+        &'a self,
+        side: crate::app::config::DockSide,
+        tab: &'a DocumentTab,
+    ) -> Option<Element<'a, Message>> {
+        if self.dock.edge_auto_hide(side) {
+            self.dock_shown_group(side)?;
+            return Some(
+                Space::new()
+                    .width(crate::ui::dock::DOCK_STRIP_W)
+                    .height(Fill)
+                    .into(),
+            );
+        }
+        self.dock_edge(side, tab)
+    }
+
+    /// An edge as drawn: its icon strip and, when expanded, its shown group.
+    fn dock_edge<'a>(
         &'a self,
         side: crate::app::config::DockSide,
         tab: &'a DocumentTab,
@@ -184,8 +246,11 @@ impl OpenCADStudio {
         use crate::app::config::DockSide;
         use crate::ui::dock::{
             DockMsg, DropTarget, DOCK_STRIP_W, STRIP_CELL_H, STRIP_DIVIDER_H, STRIP_GRIP_W,
-            STRIP_PAD, STRIP_PLUS_GAP,
+            STRIP_PAD, STRIP_PLUS_GAP, STRIP_PLUS_H,
         };
+        let (layout, _) = self.dock_strip_layout(side);
+        let cell_h = layout.first().map_or(STRIP_CELL_H, |g| g.cell_h);
+        let labels = self.dock.strip_labels;
         // Only a group actually on screen is marked as shown: on an
         // auto-hiding edge nothing is, until a group is revealed.
         let shown = self
@@ -206,7 +271,7 @@ impl OpenCADStudio {
             let group_dragged =
                 dragging && movement.is_some_and(|(_, group, _)| group == Some((side, gi)));
             let panels = self.dock_group_visible(side, gi);
-            let row_h = 2.0 * STRIP_PAD + panels.len() as f32 * STRIP_CELL_H;
+            let row_h = 2.0 * STRIP_PAD + panels.len() as f32 * cell_h;
 
             let mut icons: Vec<Element<'_, Message>> = vec![Space::new().height(STRIP_PAD).into()];
             for id in panels {
@@ -222,9 +287,24 @@ impl OpenCADStudio {
                     crate::ui::icons::themed_secondary(id.icon(), 20.0)
                 };
                 let hovered = !dragging && self.dock_icon_hover == Some(id);
+                // Labelled, the pallet's name reads upward under its icon.
+                let glyph: Element<'_, Message> = if labels {
+                    column![
+                        container(glyph).center_x(Fill).height(Length::Fixed(STRIP_CELL_H - 4.0)),
+                        iced::widget::canvas(crate::ui::dock::VerticalLabel {
+                            text: t!(id.title()).into_owned(),
+                            centered: true,
+                        })
+                        .width(Fill)
+                        .height(Fill),
+                    ]
+                    .into()
+                } else {
+                    glyph.into()
+                };
                 let cell = container(glyph)
                     .center_x(Length::Fixed(STRIP_CELL_H))
-                    .center_y(Length::Fixed(STRIP_CELL_H - 2.0))
+                    .center_y(Length::Fixed(cell_h - 2.0))
                     .style(move |theme: &Theme| container::Style {
                         background: hovered
                             .then(|| Background::Color(theme.palette().background.weak.color)),
@@ -237,9 +317,10 @@ impl OpenCADStudio {
                 let cell = mouse_area(
                     container(cell)
                         .center_x(Length::Fixed(DOCK_STRIP_W))
-                        .center_y(Length::Fixed(STRIP_CELL_H)),
+                        .center_y(Length::Fixed(cell_h)),
                 )
                 .on_press(Message::Dock(DockMsg::IconPress(id)))
+                .on_right_press(Message::Dock(DockMsg::EdgeMenu(Some(side))))
                 .on_enter(Message::Dock(DockMsg::Hover(id)))
                 .on_exit(Message::Dock(DockMsg::HoverEnd(id)))
                 .interaction(iced::mouse::Interaction::Pointer);
@@ -351,8 +432,8 @@ impl OpenCADStudio {
             },
             ..Default::default()
         })
-        .width(Length::Fixed(28.0))
-        .height(Length::Fixed(28.0))
+        .width(Length::Fixed(STRIP_PLUS_H))
+        .height(Length::Fixed(STRIP_PLUS_H))
         .padding(7);
         items.push(container(plus).center_x(Length::Fixed(DOCK_STRIP_W)).into());
         container(column(items))
@@ -426,6 +507,25 @@ impl OpenCADStudio {
                     self.parameter_placement_error("LINEAR"),
                 )
             }
+            crate::ui::dock::PanelId::ParametersManager => {
+                let (definition, rows) = match tab.active_block_edit_session() {
+                    Some(session) => (
+                        session.br_handle,
+                        crate::scene::block_parameters_manager::rows(
+                            &tab.scene.document,
+                            session.br_handle,
+                        ),
+                    ),
+                    None => (codec::Handle::NULL, Vec::new()),
+                };
+                crate::ui::window::parameters_manager::view(
+                    &rows,
+                    &tab.parameters_panel,
+                    definition,
+                    width,
+                    chrome,
+                )
+            }
             crate::ui::dock::PanelId::BlockPalette => {
                 crate::ui::window::block_palette::view(&self.block_palette, width, chrome)
             }
@@ -465,7 +565,27 @@ impl OpenCADStudio {
                 crate::ui::window::sheet_set::view(&self.sheet_set, width, chrome)
             }
             crate::ui::dock::PanelId::Layers => {
-                tab.layers.view_panel(self.layer_name_col_w, width, chrome)
+                let active_vp = tab
+                    .scene
+                    .active_viewport
+                    .filter(|_| tab.scene.current_layout != "Model");
+                tab.layers.view_panel(self.layer_name_col_w, width, chrome, active_vp)
+            }
+            crate::ui::dock::PanelId::Laywalk => self.layer_walk_view(tab, width, chrome),
+            crate::ui::dock::PanelId::QuickCalc => self.quick_calc_view(tab, width, chrome),
+            crate::ui::dock::PanelId::CommandHistory => {
+                self.command_line.history_panel(&self.history_content, width, chrome)
+            }
+            crate::ui::dock::PanelId::Plugin(num) => {
+                if let Some(panel_id) = self.plugin_panel_by_num.get(&num) {
+                    if let Some(state) = self.plugin_panels.get(panel_id) {
+                        state.view(num, width, chrome)
+                    } else {
+                        Space::new().into()
+                    }
+                } else {
+                    Space::new().into()
+                }
             }
         }
     }
@@ -489,10 +609,9 @@ impl OpenCADStudio {
         }
     }
 
-    /// A floating panel at its saved place: a vertical title bar on the side
-    /// facing the nearer workspace edge, the panel beside it, and a corner
-    /// grip to resize it. With its pin on, the panel hides down to the title
-    /// bar until hovered.
+    /// A floating panel at its saved place: a vertical title bar on its side
+    /// and the panel beside it, resized by dragging any side or corner. With
+    /// its pin on, the panel hides down to the title bar until hovered.
     fn floating_panel<'a>(
         &'a self,
         f: crate::ui::dock::FloatPanel,
@@ -510,41 +629,9 @@ impl OpenCADStudio {
         let content: Element<'_, Message> = if hidden {
             bar
         } else {
-            // The resize grip sits in the bottom corner away from the bar.
-            let grip_left = !bar_left;
-            let grip_icon = crate::ui::icons::themed_secondary(
-                if grip_left {
-                    crate::ui::icons::RESIZE_LEFT
-                } else {
-                    crate::ui::icons::RESIZE
-                },
-                12.0,
-            );
-            let grip = mouse_area(
-                container(grip_icon)
-                    .center_x(Length::Fixed(14.0))
-                    .center_y(Length::Fixed(14.0)),
-            )
-            .on_press(Message::Dock(DockMsg::FloatResizeGrab(f.id, grip_left)))
-            .interaction(if grip_left {
-                iced::mouse::Interaction::ResizingDiagonallyUp
-            } else {
-                iced::mouse::Interaction::ResizingDiagonallyDown
-            });
-            let body = stack![
-                self.panel_body(f.id, f.w, true, tab),
-                container(grip)
-                    .width(Fill)
-                    .height(Fill)
-                    .align_x(if grip_left {
-                        iced::alignment::Horizontal::Left
-                    } else {
-                        iced::alignment::Horizontal::Right
-                    })
-                    .align_y(iced::alignment::Vertical::Bottom),
-            ]
-            .width(Length::Fixed(f.w))
-            .height(Fill);
+            let body = container(self.panel_body(f.id, f.w, true, tab))
+                .width(Length::Fixed(f.w))
+                .height(Fill);
             if bar_left {
                 row![bar, body].into()
             } else {
@@ -569,6 +656,9 @@ impl OpenCADStudio {
                 },
                 ..Default::default()
             });
+        // Every side and corner resizes the panel; hidden down to its title
+        // bar, only the top and bottom do.
+        let framed = stack![framed, float_resize_handles(f.id, hidden)];
         // The idle cursor marks the panel as opaque to the pointer, so clicks
         // on its empty areas don't fall through to the drawing below.
         let panel = mouse_area(framed)
@@ -586,14 +676,8 @@ impl OpenCADStudio {
     /// Where floating panel `f` draws.
     fn dock_float_frame(&self, f: crate::ui::dock::FloatPanel) -> FloatFrame {
         let (ww, wh) = self.dock_workspace_size();
-        // The bar faces the nearer workspace edge; while resizing, it stays
-        // opposite the grip being dragged so it cannot flip mid-drag.
-        let bar_left = match self.dock_drag {
-            Some(crate::ui::dock::DockDrag::FloatSize { panel, from_left }) if panel == f.id => {
-                !from_left
-            }
-            _ => f.x + (f.w + DOCK_FLOAT_BAR_W) * 0.5 < ww * 0.5,
-        };
+        // The bar keeps its side; only a drag against an edge moves it.
+        let bar_left = f.bar == crate::app::config::DockSide::Left;
         let hidden = self.dock.auto_collapse(f.id) && self.dock_peek != Some(f.id);
         // A hidden panel keeps its title bar where it sits when shown.
         let x = if hidden && !bar_left { f.x + f.w } else { f.x };
@@ -673,13 +757,25 @@ impl OpenCADStudio {
         ]
         .spacing(1)
         .padding(4);
+        // Desktop: the pallet can leave the main window, onto another monitor.
+        #[cfg(not(target_arch = "wasm32"))]
+        let menu = menu.push(item(
+            row![
+                text(t!("Open in its own window")).size(12).width(Fill),
+                crate::ui::icons::themed(crate::ui::icons::DETACH, 12.0),
+            ]
+            .align_y(iced::Center)
+            .into(),
+            DockMsg::Detach(id),
+        ));
         Some(place_at(menu_frame(menu.into()), menu_x, menu_y))
     }
 
     /// The live drop preview for dragged panel `id`: a tint over the target
     /// edge plus a panel-sized ghost where it lands — stacked into a group
     /// (sized as that group will be), as a new group of its own (full
-    /// height), or as a floating window.
+    /// height), or as a floating window (a pallet that already floats draws
+    /// itself there instead, see `dock_overlay`).
     fn dock_drop_preview(
         &self,
         id: crate::ui::dock::PanelId,
@@ -715,9 +811,11 @@ impl OpenCADStudio {
             .and_then(|(_, g, _)| g);
         let marks_side = match target {
             DropTarget::Edge { side, .. } | DropTarget::Join { side, .. } => Some(side),
-            DropTarget::Float { x, y } => {
-                let (w, h) = self.dock_float_size(id);
-                layers.push(place_at(dock_ghost(id, w + DOCK_FLOAT_BAR_W, h), x, y));
+            DropTarget::Float { x, y, .. } => {
+                if self.dock.float_rect(id).is_none() {
+                    let (w, h) = self.dock_float_size(id);
+                    layers.push(place_at(dock_ghost(id, w + DOCK_FLOAT_BAR_W, h), x, y));
+                }
                 None
             }
         };
@@ -789,7 +887,7 @@ impl OpenCADStudio {
         target: crate::ui::dock::DropTarget,
     ) -> Vec<Element<'_, Message>> {
         use crate::app::config::DockSide;
-        use crate::ui::dock::{DropTarget, DOCK_STRIP_W, STRIP_CELL_H};
+        use crate::ui::dock::{DropTarget, DOCK_STRIP_W};
         let (ww, _) = self.dock_workspace_size();
         let strip_x = match side {
             DockSide::Left => 0.0,
@@ -809,7 +907,7 @@ impl OpenCADStudio {
                     .iter()
                     .filter(|p| self.dock_panel_visible(**p) || Some(**p) == dragged)
                     .count();
-                let y = g.icons_top + above as f32 * STRIP_CELL_H;
+                let y = g.icons_top + above as f32 * g.cell_h;
                 marks.push(place_at(dock_insert_line(), strip_x + 7.0, y - 3.5));
             }
             DropTarget::Edge { index, .. } => {
@@ -922,9 +1020,6 @@ fn dock_icon_ghost(icons: &[crate::ui::dock::PanelId]) -> Element<'static, Messa
         .into()
 }
 
-/// Width of a floating panel's vertical title bar.
-const DOCK_FLOAT_BAR_W: f32 = 28.0;
-
 /// Where a floating panel draws: its top-left corner, whether its title bar
 /// is on the left, and whether it is hidden down to that bar (auto-hide, not
 /// hovered).
@@ -974,6 +1069,7 @@ fn floating_title_bar(
     };
     let title = canvas(crate::ui::dock::VerticalLabel {
         text: t!(id.title()).into_owned(),
+        centered: false,
     })
     .width(Fill)
     .height(Fill);
@@ -1014,6 +1110,66 @@ fn floating_title_bar(
     .into()
 }
 
+/// Thickness of the band along a floating panel's sides that resizes it.
+const FLOAT_EDGE_W: f32 = 5.0;
+/// Side length of the square in a floating panel's corners that resizes it
+/// both ways.
+const FLOAT_CORNER_W: f32 = 12.0;
+
+/// The invisible resize bands over floating panel `id`'s frame: one along
+/// each side and a square in each corner (with `hidden`, the panel shows
+/// only its title bar, just the top and bottom). Between them the layer is
+/// empty, so the panel below gets the pointer.
+fn float_resize_handles(id: crate::ui::dock::PanelId, hidden: bool) -> Element<'static, Message> {
+    use crate::ui::dock::{DockMsg, FloatEdge};
+    let handle = |edge: FloatEdge, w: Length, h: Length| -> Element<'static, Message> {
+        mouse_area(Space::new().width(w).height(h))
+            .on_press(Message::Dock(DockMsg::FloatResizeGrab(id, edge)))
+            .interaction(edge.interaction())
+            .into()
+    };
+    let band = |edge: FloatEdge, top: bool| -> Element<'static, Message> {
+        container(handle(edge, Fill, Length::Fixed(FLOAT_EDGE_W)))
+            .width(Fill)
+            .height(Length::Fixed(FLOAT_CORNER_W))
+            .align_y(if top {
+                iced::alignment::Vertical::Top
+            } else {
+                iced::alignment::Vertical::Bottom
+            })
+            .into()
+    };
+    if hidden {
+        return column![
+            band(FloatEdge::N, true),
+            Space::new().width(Fill).height(Fill),
+            band(FloatEdge::S, false),
+        ]
+        .into();
+    }
+    let corner = Length::Fixed(FLOAT_CORNER_W);
+    let side = Length::Fixed(FLOAT_EDGE_W);
+    column![
+        row![
+            handle(FloatEdge::NW, corner, corner),
+            band(FloatEdge::N, true),
+            handle(FloatEdge::NE, corner, corner),
+        ],
+        row![
+            handle(FloatEdge::W, side, Fill),
+            Space::new().width(Fill).height(Fill),
+            handle(FloatEdge::E, side, Fill),
+        ]
+        .height(Fill),
+        row![
+            handle(FloatEdge::SW, corner, corner),
+            band(FloatEdge::S, false),
+            handle(FloatEdge::SE, corner, corner),
+        ],
+    ]
+    .into()
+}
+
 /// Grabbable separator between a docked pallet and the viewport: drag to
 /// size its group, double-click to reset the width.
 fn dock_divider(id: crate::ui::dock::PanelId) -> Element<'static, Message> {
@@ -1036,7 +1192,7 @@ fn dock_divider(id: crate::ui::dock::PanelId) -> Element<'static, Message> {
 /// Width of the icon strip's pallet menu.
 const DOCK_MENU_W: f32 = 230.0;
 /// Rough height of a floating title bar's menu, to keep it on screen.
-const FLOAT_MENU_H: f32 = 110.0;
+const FLOAT_MENU_H: f32 = 140.0;
 
 /// The pallet menu of an edge's + button, styled like the right-click menu:
 /// one row per pallet with its icon, its name and a check mark when it is
@@ -1044,6 +1200,7 @@ const FLOAT_MENU_H: f32 = 110.0;
 fn dock_edge_menu(
     side: crate::app::config::DockSide,
     checked: &[(crate::ui::dock::PanelId, bool)],
+    labels: bool,
 ) -> Element<'static, Message> {
     use crate::ui::dock::DockMsg;
     let rows: Vec<Element<'static, Message>> = checked
@@ -1071,6 +1228,35 @@ fn dock_edge_menu(
             .into()
         })
         .collect();
+    let mut rows = rows;
+    rows.push(
+        container(Space::new())
+            .width(Fill)
+            .height(1)
+            .style(|theme: &Theme| container::Style {
+                background: Some(Background::Color(theme.palette().background.neutral.color)),
+                ..Default::default()
+            })
+            .into(),
+    );
+    for (label, on) in [
+        (crate::tr!("dock", "icons-only"), false),
+        (crate::tr!("dock", "icons-and-names"), true),
+    ] {
+        let check: Element<'static, Message> = if on == labels {
+            crate::ui::icons::themed(crate::ui::icons::CHECK, 12.0)
+        } else {
+            Space::new().width(12).height(12).into()
+        };
+        rows.push(
+            button(row![text(label).size(12).width(Fill), check].spacing(8).align_y(iced::Center))
+                .on_press(Message::Dock(DockMsg::StripLabels(on)))
+                .style(menu_row_style)
+                .padding([5, 8])
+                .width(Fill)
+                .into(),
+        );
+    }
     menu_frame(column(rows).spacing(1).padding(4).into())
 }
 
