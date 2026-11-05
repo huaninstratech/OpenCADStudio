@@ -54,6 +54,7 @@ jobs:
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: ./.github/actions/codec-url-rewrite
       - name: Validate package versions
         id: version
         shell: bash
@@ -145,6 +146,7 @@ jobs:
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: ./.github/actions/codec-url-rewrite
       - name: Validate package versions
         id: version
         shell: bash
@@ -220,6 +222,7 @@ jobs:
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: ./.github/actions/codec-url-rewrite
       - name: Validate package versions
         id: version
         shell: bash
@@ -402,6 +405,7 @@ jobs:
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: ./.github/actions/codec-url-rewrite
       - name: Validate package versions
         id: version
         shell: bash
@@ -606,6 +610,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
+      - uses: ./.github/actions/codec-url-rewrite
       - name: Verify native release assets and notes
         env:
           GH_TOKEN: ${{ github.token }}

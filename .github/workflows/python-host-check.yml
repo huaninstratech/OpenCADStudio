@@ -46,6 +46,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/codec-url-rewrite
         with:
           fetch-depth: 0
 

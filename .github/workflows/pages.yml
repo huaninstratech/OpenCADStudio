@@ -64,6 +64,7 @@ jobs:
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/codec-url-rewrite
         with:
           ref: ${{ steps.source.outputs.commit }}
           # Full history so build.rs can measure the distance from the

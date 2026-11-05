@@ -1,0 +1,13 @@
+name: 'Rewrite the codec repo URL'
+description: >-
+  The codec crate (acadrust) moved from HakanSeven12/opencadcodec to
+  hakanaktt/acadrust; the old URL no longer resolves, and the manifests
+  plus Cargo.lock still pin it (the kernel declares it transitively too).
+  Rewrites it at the git transport layer so the same revs resolve from the
+  renamed repo. cargo must fetch git deps through the git CLI for this to
+  take effect — .cargo/config.toml sets git-fetch-with-cli.
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: git config --global url."https://github.com/hakanaktt/acadrust".insteadOf "https://github.com/HakanSeven12/opencadcodec"
