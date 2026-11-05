@@ -309,6 +309,12 @@ start =
     .view-icons = Икони
     .view-preview = Големи прегледи
 
+donation =
+    .title = Призив за дарение
+    .heading = Дарете за Open CAD Studio
+    .body = Open CAD Studio се нуждае от вашата помощ! Даренията финансират разработката и инфраструктурата, важни за продължаващото съществуване на Open CAD Studio.
+    .decline = Не, благодаря
+
 modal =
     .saving-as-target-cannot-keep = Записът като "__ocs_arg_target__" не може да запази следното, затова то ще бъде загубено:
     .about = Относно

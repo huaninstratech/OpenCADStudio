@@ -309,6 +309,12 @@ start =
     .view-icons = アイコン
     .view-preview = 大きいプレビュー
 
+donation =
+    .title = 寄付のお願い
+    .heading = Open CAD Studio に寄付する
+    .body = Open CAD Studio は皆さまの支援を必要としています！寄付は、Open CAD Studio の存続に重要な開発とインフラの資金に充てられます。
+    .decline = 今はしない
+
 modal =
     .saving-as-target-cannot-keep = "__ocs_arg_target__" として保存すると次の内容を保持できないため、失われます:
     .about = バージョン情報

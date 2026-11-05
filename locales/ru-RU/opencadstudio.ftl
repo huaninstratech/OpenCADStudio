@@ -309,6 +309,12 @@ start =
     .view-icons = Значки
     .view-preview = Крупные эскизы
 
+donation =
+    .title = Просьба о пожертвовании
+    .heading = Поддержите Open CAD Studio
+    .body = Open CAD Studio нужна ваша помощь! Пожертвования финансируют разработку и инфраструктуру, важные для дальнейшего существования Open CAD Studio.
+    .decline = Нет, спасибо
+
 modal =
     .saving-as-target-cannot-keep = При сохранении в формате "__ocs_arg_target__" следующее не сохранится и будет потеряно:
     .about = О программе

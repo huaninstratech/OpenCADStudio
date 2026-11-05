@@ -57,23 +57,6 @@ pub(crate) fn associate(
                 stretch::bind_existing(doc, &native.action.dependencies, &native.points, p.end.z)?;
         }
         DynamicBlockData::PolarStretchAction(native) => {
-            native.connections = [
-                "BaseXDelta",
-                "BaseYDelta",
-                "Base",
-                "End",
-                "UpdatedBase",
-                "UpdatedEnd",
-            ]
-            .map(connection);
-            let stretching = native
-                .action
-                .dependencies
-                .iter()
-                .copied()
-                .filter(|handle| !native.handles.contains(handle))
-                .collect::<Vec<_>>();
-            native.bindings = stretch::bind_existing(doc, &stretching, &native.points, p.end.z)?;
             let key_point = key_point.or_else(|| stretch::polar_key_point(native).ok());
             native.connections = polar_connections(&p, key_point);
             let stretching = native.action.dependencies.iter().copied().filter(|handle| !native.handles.contains(handle)).collect::<Vec<_>>();

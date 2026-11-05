@@ -138,15 +138,6 @@ impl OpenCADStudio {
         let mut staged = self.tabs[i].scene.document.clone();
         match options::set(&mut staged, definition, handle, multiplier, angle) {
             Ok(true) => {
-                let staged =
-                    match crate::scene::block_actions::instance::refresh(&staged, definition) {
-                        Ok(staged) => staged,
-                        Err(error) => {
-                            self.command_line.push_error(crate::t!(error).as_ref());
-                            return Task::none();
-                        }
-                    };
-                self.push_undo_snapshot(i, "Edit block action override");
                 let staged = match crate::scene::block_actions::instance::refresh_after_edit(
                     &staged, &self.tabs[i].scene.document, definition,
                 ) {

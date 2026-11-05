@@ -303,6 +303,12 @@ start =
     .view-icons = Ikonok
     .view-preview = Nagy előnézetek
 
+donation =
+    .title = Adománykérés
+    .heading = Támogassa az Open CAD Studiót
+    .body = Az Open CAD Studiónak szüksége van a segítségére! Az adományok az Open CAD Studio fennmaradásához fontos fejlesztést és infrastruktúrát finanszírozzák.
+    .decline = Nem, köszönöm
+
 modal =
     .saving-as-target-cannot-keep = A(z) "__ocs_arg_target__" formátumba mentés nem tudja megőrizni a következőket, ezért elvesznek:
     .missing-fonts-downloading = Letöltés...

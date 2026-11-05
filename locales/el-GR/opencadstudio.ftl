@@ -309,6 +309,12 @@ start =
     .view-icons = Εικονίδια
     .view-preview = Μεγάλες προεπισκοπήσεις
 
+donation =
+    .title = Έκκληση για δωρεά
+    .heading = Κάντε δωρεά στο Open CAD Studio
+    .body = Το Open CAD Studio χρειάζεται τη βοήθειά σας! Οι δωρεές χρηματοδοτούν την ανάπτυξη και τις υποδομές που είναι σημαντικές για τη συνέχιση της ύπαρξης του Open CAD Studio.
+    .decline = Όχι, ευχαριστώ
+
 modal =
     .saving-as-target-cannot-keep = Η αποθήκευση ως "__ocs_arg_target__" δεν μπορεί να διατηρήσει τα παρακάτω, οπότε θα χαθούν:
     .about = Σχετικά

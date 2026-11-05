@@ -309,6 +309,12 @@ start =
     .view-icons = أيقونات
     .view-preview = معاينات كبيرة
 
+donation =
+    .title = طلب تبرع
+    .heading = تبرّع لـ Open CAD Studio
+    .body = يحتاج Open CAD Studio إلى مساعدتك! تموّل التبرعات أعمال التطوير والبنية التحتية الضرورية لاستمرار Open CAD Studio.
+    .decline = لا، شكرًا
+
 modal =
     .saving-as-target-cannot-keep = الحفظ بتنسيق "__ocs_arg_target__" لا يمكنه الاحتفاظ بما يلي، لذا سيُفقد:
     .about = حول

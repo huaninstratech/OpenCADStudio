@@ -447,29 +447,6 @@ impl OpenCADStudio {
                     return Task::none();
                 }
                 let mut staged = tab.scene.document.clone();
-                let result = actions::retarget_frame_points(
-                    &mut staged,
-                    definition,
-                    action,
-                    &targets,
-                    frame.as_deref(),
-                )
-                .and_then(|changed| {
-                    let rotation_changed = match rotate_only.as_deref() {
-                        Some(targets) => actions::options::set_rotate_only(
-                            &mut staged,
-                            definition,
-                            action,
-                            targets,
-                        )?,
-                        None => false,
-                    };
-                    let changed = changed || rotation_changed;
-                    if changed {
-                        staged = actions::instance::refresh(&staged, definition)?;
-                    }
-                    Ok(changed)
-                });
                 let result = actions::retarget_frame_points(&mut staged, definition, action, &targets, frame.as_deref())
                     .and_then(|changed| {
                         let rotation_changed = match rotate_only.as_deref() {
@@ -551,18 +528,12 @@ impl OpenCADStudio {
                     location,
                     frame.as_deref(),
                     array_offsets,
-                )
-                .and_then(|handle| {
+                ).and_then(|handle| {
                     if let Some((multiplier, angle)) = displacement_overrides {
                         actions::options::set(&mut staged, definition, handle, multiplier, angle)?;
                     }
                     if kind == Kind::PolarStretch {
-                        actions::options::set_rotate_only(
-                            &mut staged,
-                            definition,
-                            handle,
-                            &rotate_only,
-                        )?;
+                        actions::options::set_rotate_only(&mut staged, definition, handle, &rotate_only)?;
                     } else if !rotate_only.is_empty() {
                         return Err("Rotate-only objects require a Polar Stretch action.");
                     }
@@ -780,9 +751,6 @@ impl OpenCADStudio {
         else {
             return false;
         };
-        if p.grip == Handle::NULL {
-            return false;
-        }
         if !actions::has_action(&test.baseline, test.definition, p.handle) { return false; }
         let Ok(value) = actions::instance::test_value(&tab.scene.document, test.insert, &p) else { return false };
         let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, test.insert, &p, true) else { return false };
@@ -878,9 +846,6 @@ impl OpenCADStudio {
         else {
             return false;
         };
-        if p.grip == Handle::NULL {
-            return false;
-        }
         if !actions::has_action(&tab.scene.document, def, p.handle) { return false; }
         let Ok(value) = actions::instance::value(&tab.scene.document, handle, &p) else { return false };
         let Ok(p) = actions::instance::grip_parameter(&tab.scene.document, handle, &p, false) else { return false };

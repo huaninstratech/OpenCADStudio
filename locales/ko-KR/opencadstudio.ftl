@@ -309,6 +309,12 @@ start =
     .view-icons = 아이콘
     .view-preview = 큰 미리 보기
 
+donation =
+    .title = 기부 요청
+    .heading = Open CAD Studio에 기부하기
+    .body = Open CAD Studio는 여러분의 도움이 필요합니다! 기부금은 Open CAD Studio의 지속적인 운영에 중요한 개발과 인프라 비용을 지원합니다.
+    .decline = 괜찮습니다
+
 modal =
     .saving-as-target-cannot-keep = "__ocs_arg_target__"(으)로 저장하면 다음 내용을 유지할 수 없어 손실됩니다:
     .about = 정보

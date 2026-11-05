@@ -309,6 +309,12 @@ start =
     .view-icons = Symbole
     .view-preview = Große Vorschau
 
+donation =
+    .title = Spendenaufruf
+    .heading = Für Open CAD Studio spenden
+    .body = Open CAD Studio braucht Ihre Hilfe! Spenden finanzieren die Entwicklung und Infrastruktur, die für den Fortbestand von Open CAD Studio wichtig sind.
+    .decline = Nein, danke
+
 modal =
     .saving-as-target-cannot-keep = Beim Speichern als "__ocs_arg_target__" kann Folgendes nicht erhalten bleiben und geht verloren:
     .about = Über

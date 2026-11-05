@@ -309,6 +309,12 @@ start =
     .view-icons = ໄອຄອນ
     .view-preview = ຕົວຢ່າງຂະໜາດໃຫຍ່
 
+donation =
+    .title = ຄຳຮ້ອງຂໍການບໍລິຈາກ
+    .heading = ບໍລິຈາກໃຫ້ Open CAD Studio
+    .body = Open CAD Studio ຕ້ອງການຄວາມຊ່ວຍເຫຼືອຈາກທ່ານ! ເງິນບໍລິຈາກຈະນຳໄປສະໜັບສະໜູນການພັດທະນາ ແລະ ພື້ນຖານໂຄງລ່າງທີ່ສຳຄັນຕໍ່ການດຳເນີນງານຕໍ່ເນື່ອງຂອງ Open CAD Studio.
+    .decline = ບໍ່, ຂອບໃຈ
+
 modal =
     .saving-as-target-cannot-keep = ການບັນທຶກເປັນ "__ocs_arg_target__" ບໍ່ສາມາດເກັບຮັກສາສິ່ງຕໍ່ໄປນີ້ໄດ້, ດັ່ງນັ້ນມັນຈະສູນເສຍ:
     .about = ກ່ຽວກັບ
@@ -2712,6 +2718,14 @@ common =
     .parametric-symmetric = Symmetric
     .parametric-equal = Equal
     .parametric-fix = Fix
+
+    .apply-the-annotation-scale-in-model-space = Apply the annotation scale in model space (annotative objects scale as drawn)
+    .download = Download
+    .font-source-leave-empty-for-the-community-repository-or-point-at-any-folder-e-g-your-company-s-font-server = Font source — leave empty for the community repository, or point at any folder (e.g. your company's font server):
+    .missing-fonts = Missing fonts
+    .skip = Skip
+    .this-drawing-uses-fonts-that-are-not-installed-on-this-machine-download-them-from-the-open-cad-studio-community-font-repository = This drawing uses fonts that are not installed on this machine. Download them from the OpenCADStudio community font repository?
+    .https-server-fonts-or-a-github-raw-folder = https://server/fonts or a GitHub raw folder
 
 errors =
     .save-warning = ແຈ້ງເຕືອນການບັນທຶກ

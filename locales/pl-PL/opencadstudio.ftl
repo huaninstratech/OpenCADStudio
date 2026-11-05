@@ -309,6 +309,12 @@ start =
     .view-icons = Ikony
     .view-preview = Duże podglądy
 
+donation =
+    .title = Prośba o darowiznę
+    .heading = Wesprzyj Open CAD Studio
+    .body = Open CAD Studio potrzebuje Twojej pomocy! Darowizny finansują rozwój i infrastrukturę niezbędne do dalszego istnienia Open CAD Studio.
+    .decline = Nie, dziękuję
+
 modal =
     .saving-as-target-cannot-keep = Zapis jako "__ocs_arg_target__" nie może zachować poniższych elementów, więc zostaną utracone:
     .about = Informacje

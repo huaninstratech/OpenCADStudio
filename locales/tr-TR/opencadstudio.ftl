@@ -309,6 +309,12 @@ start =
     .view-icons = Simgeler
     .view-preview = Büyük önizlemeler
 
+donation =
+    .title = Bağış Talebi
+    .heading = Open CAD Studio'ya Bağış Yapın
+    .body = Open CAD Studio'nun yardımınıza ihtiyacı var! Bağışlar, Open CAD Studio'nun varlığını sürdürebilmesi için önemli olan geliştirme çalışmalarını ve altyapıyı finanse eder.
+    .decline = Hayır, Teşekkürler
+
 modal =
     .saving-as-target-cannot-keep = "__ocs_arg_target__" olarak kaydetme aşağıdakileri koruyamaz, bu yüzden kaybolacaklar:
     .about = Hakkında

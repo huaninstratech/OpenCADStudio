@@ -309,6 +309,12 @@ start =
     .view-icons = Icônes
     .view-preview = Grands aperçus
 
+donation =
+    .title = Appel aux dons
+    .heading = Faire un don à Open CAD Studio
+    .body = Open CAD Studio a besoin de votre aide ! Les dons financent le développement et l’infrastructure essentiels à la pérennité d’Open CAD Studio.
+    .decline = Non merci
+
 modal =
     .saving-as-target-cannot-keep = L’enregistrement au format "__ocs_arg_target__" ne peut pas conserver les éléments suivants, qui seront perdus :
     .about = À propos

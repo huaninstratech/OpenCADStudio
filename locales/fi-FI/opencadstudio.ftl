@@ -309,6 +309,12 @@ start =
     .view-icons = Kuvakkeet
     .view-preview = Suuret esikatselut
 
+donation =
+    .title = Lahjoituspyyntö
+    .heading = Lahjoita Open CAD Studiolle
+    .body = Open CAD Studio tarvitsee apuasi! Lahjoituksilla rahoitetaan kehitystyötä ja infrastruktuuria, jotka ovat tärkeitä Open CAD Studion toiminnan jatkumiselle.
+    .decline = Ei kiitos
+
 modal =
     .saving-as-target-cannot-keep = Tallennus muodossa "__ocs_arg_target__" ei voi säilyttää seuraavia, joten ne menetetään:
     .about = Tietoja
