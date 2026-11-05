@@ -41,6 +41,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The codec crate (acadrust) moved to hakanaktt/acadrust and the old
+      # HakanSeven12/opencadcodec URL no longer resolves; the manifests and
+      # Cargo.lock still pin it, and the kernel declares it transitively.
+      # cargo fetches git deps through the git CLI (git-fetch-with-cli in
+      # .cargo/config.toml), so the rewrite below sends those requests to
+      # the renamed repo at the same revs.
+      - name: Rewrite the codec repo URL to its renamed home
+        run: git config --global url."https://github.com/hakanaktt/acadrust".insteadOf "https://github.com/HakanSeven12/opencadcodec"
+
       # LC_ALL=C: a few tests compare English message text. The GPU-backed
       # tests are #[ignore]d and need an adapter, so they do not run here.
       - name: cargo test

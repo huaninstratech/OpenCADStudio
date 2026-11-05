@@ -39,3 +39,14 @@ RUST_MIN_STACK = "67108864"
 # every other parallel `cargo test` run); the software renderer is safe.
 ICED_TEST_BACKEND = "tiny-skia"
 
+
+# The codec crate (acadrust) moved from HakanSeven12/opencadcodec to
+# hakanaktt/acadrust; the old URL no longer resolves. Cargo still pins the
+# old URL in every manifest (and the kernel declares it transitively), so
+# the fetch is rewritten at the git transport layer instead: with
+# git-fetch-with-cli on, cargo shells out to git, and a global
+# `git config --global url."https://github.com/hakanaktt/acadrust".insteadOf
+# "https://github.com/HakanSeven12/opencadcodec"` (set in CI and once per
+# dev machine) sends the old-URL requests to the renamed repo, same revs.
+[net]
+git-fetch-with-cli = true
