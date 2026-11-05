@@ -5591,12 +5591,12 @@ impl CadCommand for ExtendCommand {
             .collect();
         let replacements = extend_box_pass(
             &entities,
+            &self.entity_index,
             &self.geos,
             &self.edge_set,
             fence,
             window,
             crossing,
-            &entities, &self.entity_index, &self.geos, &self.edge_set, fence, window, crossing,
         );
         let mut preview = Vec::new();
         for (handle, extended) in replacements {

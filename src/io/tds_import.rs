@@ -84,11 +84,6 @@ impl TdsScene {
         let mut used: Vec<String> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         for m in &self.materials {
-            if mesh
-                .groups
-                .iter()
-                .any(|(name, faces)| !faces.is_empty() && *name == m.name)
-            {
             if present.contains(m.name.as_str()) {
                 used.push(m.name.clone());
                 seen.insert(m.name.as_str());
@@ -519,24 +514,6 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                 let materials = scene.mesh_materials(mesh);
                 let all: Vec<usize> = (0..mesh.faces.len()).collect();
                 let pieces: Vec<(Option<String>, Vec<usize>)> = if materials.len() > 1 {
-                    match options
-                        .multi
-                        .get(name)
-                        .cloned()
-                        .unwrap_or(MultiMaterial::Split)
-                    {
-                        MultiMaterial::Split => materials
-                            .iter()
-                            .map(|m| {
-                                let faces = mesh
-                                    .groups
-                                    .iter()
-                                    .filter(|(g, _)| g == m)
-                                    .flat_map(|(_, f)| f.iter().copied())
-                                    .collect();
-                                (Some(m.clone()), faces)
-                            })
-                            .collect(),
                     match options.multi.get(name).cloned().unwrap_or(MultiMaterial::Split) {
                         MultiMaterial::Split => {
                             // Index the groups once; the old code scanned the

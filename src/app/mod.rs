@@ -706,6 +706,9 @@ pub(super) struct OpenCADStudio {
     ribbon: Ribbon,
     /// Recently opened files, newest first — backs the Start page panel.
     recent_files: Vec<std::path::PathBuf>,
+    /// Patreon supporters for the Start page's support prompt, fetched once
+    /// at boot and merged with the hand-maintained list.
+    patrons: Vec<(String, i64)>,
     /// Decoded DWG preview thumbnails for the Start page, keyed by path.
     /// `None` = the file has no readable preview (DXF, missing, WMF). Filled
     /// lazily by `refresh_recent_thumbs`; never read from a `view` call.
@@ -3098,6 +3101,7 @@ pub enum ModalKind {
     Shortcuts,
     PluginManager,
     UpdateNotice,
+    DonationPrompt,
     LayerStateManager,
     LayerTranslator,
     DrawingUnits,
@@ -5384,6 +5388,9 @@ pub enum Message {
     Terminate,
     /// User dismissed the update-notice window.
     UpdateNoticeClose,
+    DonationPromptDonate,
+    /// The Patreon supporters list fetched at boot.
+    PatronsFetched(Result<Vec<(String, i64)>, String>),
     /// First-launch default-association prompt: user accepted — register this
     /// app as the default handler for .dwg / .dxf.
     AssocPromptYes,
@@ -5944,6 +5951,7 @@ impl OpenCADStudio {
             // Populated from the consolidated config after construction
             // (`apply_config`); default empty here.
             recent_files: Vec::new(),
+            patrons: Vec::new(),
             recent_thumbs: std::collections::HashMap::new(),
             recent_limit: recent::RECENT_DEFAULT,
             recent_limit_input: recent::RECENT_DEFAULT.to_string(),

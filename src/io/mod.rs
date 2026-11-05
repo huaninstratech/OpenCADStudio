@@ -52,7 +52,6 @@ pub mod svg_import;
 pub mod wmf_import;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod web_recent;
-pub mod wmf_import;
 // Registered on every target so the pure helpers (and their tests) compile on
 // the native host; the OPFS half inside is wasm-only.
 pub(crate) mod web_autosave;
@@ -1055,7 +1054,7 @@ pub fn load_file(path: &Path) -> Result<Document, String> {
 /// PURGELEGACY exists exactly for such files, so `--export` must be able
 /// to open them even though the strict read balks.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_file_recovering(path: &Path) -> Result<CadDocument, String> {
+pub fn load_file_recovering(path: &Path) -> Result<Document, String> {
     load_file(path).or_else(|strict_error| {
         let outcome = read_file_attempt(path, None, true)
             .map_err(|failure| failure.message)

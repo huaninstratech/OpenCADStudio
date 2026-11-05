@@ -604,6 +604,7 @@ pub struct PropertiesPanel {
     /// Linetype items (name + ASCII art) from the document — used for combo_box options.
     pub linetype_items: Vec<LinetypeItem>,
     pub selection_group_combo: combo_box::State<SelectionGroup>,
+    pub choice_combos: HashMap<String, combo_box::State<LocalizedChoice>>,
     pub layer_combo: combo_box::State<String>,
     pub lineweight_combo: combo_box::State<LwItem>,
     pub linetype_combo: combo_box::State<LinetypeItem>,
@@ -687,6 +688,7 @@ impl Default for PropertiesPanel {
             selected_group: None,
             linetype_items: vec![],
             selection_group_combo: combo_box::State::new(vec![]),
+            choice_combos: HashMap::default(),
             layer_combo: combo_box::State::new(vec![]),
             lineweight_combo: combo_box::State::new(lw_options()),
             linetype_combo: combo_box::State::new(vec![]),

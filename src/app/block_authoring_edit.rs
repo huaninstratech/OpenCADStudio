@@ -218,25 +218,6 @@ impl OpenCADStudio {
             return Task::none();
         };
         let key = crate::ui::properties::FieldKey::Geom(field);
-        let mut point = DVec3::new(
-            before.base_point.x,
-            before.base_point.y,
-            before.base_point.z,
-        );
-        let dependent = if field == "authoring_action_base_dependent" {
-            !before.dependent
-        } else {
-            before.dependent
-        };
-        let point = if field == "authoring_action_base_dependent" {
-            None
-        } else {
-            if dependent {
-                return Task::none();
-            }
-            let Some(input) = self.tabs[i].properties.edit_buf.get(&key) else {
-                return Task::none();
-            };
         let editing_offset = matches!(field, "authoring_action_base_offset_x" | "authoring_action_base_offset_y");
         let mut point = if editing_offset { DVec3::new(before.offset.x, before.offset.y, before.offset.z) }
             else { DVec3::new(before.base_point.x, before.base_point.y, before.base_point.z) };

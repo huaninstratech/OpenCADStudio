@@ -2934,11 +2934,6 @@ impl OpenCADStudio {
             // it), "ok" or "cancel".
             "tds_import_dialog" => {
                 use crate::ui::window::import_dialogs::ImportDialogMsg as I;
-                if self.active_modal != Some(crate::app::ModalKind::TdsImport) {
-                    return Err(failure(
-                        "no_dialog",
-                        "The 3D Studio Import window is not open",
-                    ));
                 if !self.focus_dialog(crate::app::ModalKind::TdsImport) {
                     return Err(failure("no_dialog", "The 3D Studio Import window is not open"));
                 }
@@ -2981,11 +2976,6 @@ impl OpenCADStudio {
             // choice too), "remember=on|off", "apply" or "cancel".
             "tds_material_dialog" => {
                 use crate::ui::window::import_dialogs::ImportDialogMsg as I;
-                if self.active_modal != Some(crate::app::ModalKind::TdsMaterial) {
-                    return Err(failure(
-                        "no_dialog",
-                        "The multiple-material window is not open",
-                    ));
                 if !self.focus_dialog(crate::app::ModalKind::TdsMaterial) {
                     return Err(failure("no_dialog", "The multiple-material window is not open"));
                 }

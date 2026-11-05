@@ -441,18 +441,6 @@ fn read_page_with(path: &str, page: &str, images: bool) -> Option<PageVectors> {
             .and_then(|i| names.get(i).cloned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Text".to_string());
-        // Capital height: an embedded font's own, the median capital (or
-        // digit) top so round letters' overshoot does not lift it; a font
-        // the file does not carry is taken at 0.72 of its size, as is a run
-        // with no capital or digit.
-        let own = index
-            .and_then(|i| embedded.get(i).copied())
-            .unwrap_or(false);
-        text.caps.sort_by(f64::total_cmp);
-        text.text.cap_height = match text.caps.get(text.caps.len() / 2) {
-            Some(top) if own => *top,
-            _ => 0.72 * text.em,
-        };
         // Capital height as a size share; PDF import measures its own (see
         // `pdf_import`).
         text.text.cap_height = 0.72 * text.em;
@@ -639,10 +627,6 @@ fn walk_steps<'a>(
     ) {
         let mut ops = TypedIter::new(data);
         while let Some(op) = ops.next() {
-            visit(&op, resources);
-            let TypedInstruction::XObject(x) = &op else {
-                continue;
-            };
             visit(Step::Op(&op), resources);
             let TypedInstruction::XObject(x) = &op else { continue };
             // Nested forms are followed a few levels deep.

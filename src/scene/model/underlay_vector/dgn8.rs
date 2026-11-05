@@ -868,7 +868,6 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
             geom,
             filled: matches!(kind(e), 6 | 14)
                 && e.windows(4).any(|w| w == [0x07, 0x10, 0x41, 0x00]),
-            filled: matches!(kind(e), 6 | 14) && e.windows(4).any(|w| w == [0x07, 0x10, 0x41, 0x00]),
             construction: false,
         };
         let stroke = Some((color, -1.0));
@@ -1244,18 +1243,6 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                 // A large matrix does not fit one element: its values run on
                 // through every data element up to the next header.
                 let data = |family: u32, data_kind: u8, size: usize| {
-                    let d = parts.windows(2).find(|w| {
-                        kind(w[0]) == 101
-                            && u32_at(w[0], 116) == Some(family)
-                            && kind(w[1]) == data_kind
-                    })?[1];
-                    let count = u32_at(d, 104)? as usize;
-                    Some(
-                        d.get(120..)?
-                            .chunks_exact(size)
-                            .take(count)
-                            .collect::<Vec<_>>(),
-                    )
                     let header = parts
                         .iter()
                         .position(|&p| kind(p) == 101 && u32_at(p, 116) == Some(family))?;

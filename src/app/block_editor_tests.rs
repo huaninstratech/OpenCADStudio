@@ -1955,7 +1955,6 @@ fn block_editor_renames_orientation_basepoint_and_visibility_parameters() {
 #[test]
 fn double_clicking_block_parameter_label_starts_rename() {
     use crate::scene::block_actions::{self as actions, Kind};
-    use crate::scene::block_actions::{self as actions, Kind};
     use crate::scene::block_authoring::edit;
     for kind in ["LINEAR", "XY", "POLAR"] {
         let (mut app, reference) = fixture();

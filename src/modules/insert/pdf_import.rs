@@ -1229,20 +1229,11 @@ fn curve_of(points: &[[f64; 2]], bulges: &[f64], closed: bool, z: f64) -> Option
         return None;
     }
     let enough = |inliers: usize| inliers as f64 >= CURVE_INLIERS * n as f64;
+    let _ = enough; // the fork's inlier-threshold fit; upstream fits all-or-nothing
     if !closed {
         if let Some((c, r)) = circle_through(points[0], points[n / 2], points[n - 1]) {
             let on = points
                 .iter()
-                .filter(|p| ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() <= ARC_TOLERANCE * r)
-                .count();
-            if enough(inliers) {
-                return Some(arc(
-                    c,
-                    r,
-                    points[0],
-                    points[n - 1],
-                    sweep_sign(points, c) > 0.0,
-                ));
                 .all(|p| ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() <= ARC_TOLERANCE * r);
             if on {
                 return Some(arc(c, r, points[0], points[n - 1], sweep_sign(points, c) > 0.0));
@@ -1577,12 +1568,6 @@ pub fn convert(
                         let color = color_on(&layer, color_of(rgb));
                         for (mut entity, four) in out.fills {
                             let common = entity.common_mut();
-                            (
-                                common.layer,
-                                common.color,
-                                common.transparency,
-                                common.line_weight,
-                            ) = (layer.clone(), color, fill_transparency, weight);
                             (common.layer, common.color, common.transparency) =
                                 (layer.clone(), color, fill_transparency);
                             if four {
@@ -1639,7 +1624,6 @@ pub fn convert(
                                                 bulges,
                                                 closed,
                                             };
-                                            if settings.join || stroke.straight() || stroke.closed {
                                             if settings.join
                                                 || stroke.straight()
                                                 || stroke.closed

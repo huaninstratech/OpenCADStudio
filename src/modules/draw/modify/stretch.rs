@@ -779,10 +779,9 @@ impl CadCommand for StretchCommand {
 
     fn preview_entities(
         &mut self,
-        document: &codec::CadDocument,
+        document: &codec::Document,
         pt: DVec3,
     ) -> Vec<codec::EntityType> {
-    fn preview_entities(&mut self, document: &codec::Document, pt: DVec3) -> Vec<codec::EntityType> {
         // The base-point step already has the final windows: resolve what
         // moves there, so the drag starts with only those objects hidden.
         if matches!(self.step, Step::Base | Step::Target { .. }) && self.moving.is_none() {

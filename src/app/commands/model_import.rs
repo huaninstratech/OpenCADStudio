@@ -203,8 +203,6 @@ impl OpenCADStudio {
                 .push_error(&format!("File {path} does not exist."));
             return Task::none();
         };
-        let (centre, size, pixel) = self.tabs[i].scene.view_window();
-        let Some(mut picture) = crate::io::wmf_import::read(&bytes, [0.5 * size[0], 0.5 * size[1]])
         let (_, size, _) = self.tabs[i].scene.view_window();
         let Some(mut picture) =
             crate::io::wmf_import::read(&bytes, [0.5 * size[0], 0.5 * size[1]])

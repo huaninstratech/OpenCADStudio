@@ -1629,7 +1629,6 @@ impl OpenCADStudio {
         for tab in &mut self.tabs {
             tab.scene.annotation_scale_modelspace = self.annotation_scale_modelspace;
         }
-        self.ribbon.set_collapse_mode(cfg.ribbon.collapse);
         self.ribbon.set_layout(cfg.ribbon.layout);
         self.plot_dialog = cfg.plot;
         self.context_menu_custom = cfg.context_menu;

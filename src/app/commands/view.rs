@@ -1034,6 +1034,7 @@ impl OpenCADStudio {
                     }
                 } else {
                     // ── Preset viewport layout ───────────────────────────
+                    let layout_name = scene.current_layout.clone();
                     let ((x0, y0), (x1, y1)) = scene
                         .printable_area_limits()
                         .unwrap_or(((0.0, 0.0), (297.0, 210.0)));

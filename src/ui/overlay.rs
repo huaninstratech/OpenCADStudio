@@ -1672,11 +1672,6 @@ fn draw_grip_marker(
         } else {
             palette.primary.base.color
         };
-        let fill = if grip.is_dynamic
-            || matches!(
-                grip.shape,
-                GripShape::Dropdown | GripShape::DropdownAdjacent
-            ) {
         let fill = if grip.is_filled || grip.is_dynamic || matches!(
             grip.shape,
             GripShape::Dropdown | GripShape::DropdownAdjacent | GripShape::Diamond

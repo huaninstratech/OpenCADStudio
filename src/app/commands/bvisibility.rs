@@ -972,8 +972,6 @@ impl OpenCADStudio {
                 self.tabs[i].pending_action_pair = Some((parameter, kind, 0));
                 self.start_parameter_pair_action(parameter, kind, 0)
             }
-            Some(command) if command.starts_with("BACTION ") => self
-                .start_block_action_for_parameter(
             Some("BLOOKUPTABLE") => {
                 // The row asks for its table editor directly: the command of
                 // the same name is the one the action-bar preference refuses,
@@ -1000,7 +998,8 @@ impl OpenCADStudio {
                 self.start_block_action_for_parameter(
                     command.trim_start_matches("BACTION "),
                     parameter,
-                ),
+                )
+            }
             Some(command) => self.dispatch_command(command),
             None => Task::none(),
         }

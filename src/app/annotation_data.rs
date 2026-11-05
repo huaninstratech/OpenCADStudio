@@ -156,24 +156,6 @@ pub(crate) fn extraction_document(path: &str) -> Option<Arc<Document>> {
 
 impl ExtractionRecord {
     fn value(&self, key: &str) -> String {
-        match key {
-            "type" => self.object_type.clone(),
-            "handle" => self.handle.clone(),
-            "layer" => self.layer.clone(),
-            "color" => self.color.clone(),
-            "linetype" => self.linetype.clone(),
-            "details" => self.details.clone(),
-            "position_x" => self
-                .position
-                .map_or_else(String::new, |p| format!("{:.3}", p.x)),
-            "position_y" => self
-                .position
-                .map_or_else(String::new, |p| format!("{:.3}", p.y)),
-            "position_z" => self
-                .position
-                .map_or_else(String::new, |p| format!("{:.3}", p.z)),
-            _ => String::new(),
-        }
         self.values.get(key).cloned().unwrap_or_default()
     }
 }

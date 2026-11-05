@@ -511,19 +511,6 @@ fn ensure_grip(
 }
 
 /// Repair the former three-object append layout, preserving all unrelated nodes.
-pub(crate) fn repair_grip_graph(
-    doc: &mut CadDocument,
-    definition: Handle,
-    table: Handle,
-) -> Result<bool, &'static str> {
-    let graph_handle =
-        authoring::graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
-    let Some(ObjectType::DynamicBlock(table_object)) = doc.objects.get(&table) else {
-        return Ok(false);
-    };
-    let DynamicBlockData::PropertiesTable(table_data) = &table_object.data else {
-        return Ok(false);
-    };
 pub(crate) fn repair_grip_graph(doc: &mut Document, definition: Handle, table: Handle) -> Result<bool, &'static str> {
     let graph_handle = authoring::graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
     let Some(ObjectType::DynamicBlock(table_object)) = doc.objects.get(&table) else { return Ok(false) };

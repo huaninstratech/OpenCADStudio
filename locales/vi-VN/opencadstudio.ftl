@@ -309,6 +309,12 @@ start =
     .view-icons = Biểu tượng
     .view-preview = Xem trước lớn
 
+donation =
+    .title = Đề nghị quyên góp
+    .heading = Quyên góp cho Open CAD Studio
+    .body = Open CAD Studio cần sự giúp đỡ của bạn! Quyên góp giúp tài trợ cho việc phát triển và hạ tầng quan trọng đối với sự tồn tại liên tục của Open CAD Studio.
+    .decline = Không, cảm ơn
+
 modal =
     .saving-as-target-cannot-keep = Lưu dưới dạng "__ocs_arg_target__" không thể giữ lại những nội dung sau, nên chúng sẽ bị mất:
     .about = Giới thiệu

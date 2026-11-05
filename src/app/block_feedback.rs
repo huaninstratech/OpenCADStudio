@@ -102,11 +102,6 @@ impl OpenCADStudio {
         if let Some(test) = tab.block_test.as_ref().filter(|test| test.insert == handle) {
             let p = actions::all_parameters(&test.baseline, test.definition)
                 .into_iter()
-                .nth(index)?;
-            if p.grip == Handle::NULL {
-                return None;
-            }
-            let value = actions::value(&tab.scene.document, &p).ok()?;
                 .find(|p| p.id == node)?;
             let value = actions::instance::test_value(&tab.scene.document, handle, &p).ok()?;
             let p = actions::instance::grip_parameter(&tab.scene.document, handle, &p, true).ok()?;
@@ -116,10 +111,6 @@ impl OpenCADStudio {
             let definition = actions::instance::definition(&tab.scene.document, handle)?;
             let p = actions::all_parameters(&tab.scene.document, definition)
                 .into_iter()
-                .nth(index)?;
-            if p.grip == Handle::NULL {
-                return None;
-            }
                 .find(|p| p.id == node)?;
             let value = actions::instance::value(&tab.scene.document, handle, &p).ok()?;
             let p = actions::instance::grip_parameter(&tab.scene.document, handle, &p, false).ok()?;

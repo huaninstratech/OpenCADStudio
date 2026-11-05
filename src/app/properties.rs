@@ -13,6 +13,29 @@ use codec::{Entity, EntityType, Handle};
 /// shows a count-only summary instead. Bulk edits still go through the ribbon.
 const MAX_PROP_AGGREGATE: usize = 2_000;
 
+fn property_choice_combos(
+    sections: &[crate::scene::model::object::PropSection],
+) -> rustc_hash::FxHashMap<String, iced::widget::combo_box::State<ui::properties::LocalizedChoice>>
+{
+    sections
+        .iter()
+        .flat_map(|section| section.props.iter())
+        .filter_map(|prop| match &prop.value {
+            PropValue::Choice { options, .. } => Some((
+                prop.field.to_string(),
+                iced::widget::combo_box::State::new(
+                    options
+                        .iter()
+                        .cloned()
+                        .map(ui::properties::LocalizedChoice::new)
+                        .collect(),
+                ),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Below this many selected entities the rayon hop plus the per-worker
 /// thread-state transplant cost more than the parallel build saves, so the
 /// fold stays sequential (byte-for-byte the pre-parallel behavior).
@@ -2629,6 +2652,7 @@ impl OpenCADStudio {
                         block_definition: tab
                             .active_block_edit_session()
                             .map(|session| session.br_handle),
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         layer_combo: iced::widget::combo_box::State::new(layer_names.clone()),
                         linetype_combo: iced::widget::combo_box::State::new(linetype_items.clone()),
@@ -2662,6 +2686,7 @@ impl OpenCADStudio {
                         }
                     }
                     ui::PropertiesPanel {
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         title,
                         layer_combo: iced::widget::combo_box::State::new(layer_names.clone()),
@@ -2795,6 +2820,7 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                         retain_compact_solid_sections(&mut sections);
                     }
                     ui::PropertiesPanel {
+                        choice_combos: property_choice_combos(&sections),
                         sections,
                         title: t!("%{count} objects selected", count = selected.len()).into_owned(),
                         selection_group_combo: iced::widget::combo_box::State::new(groups.clone()),

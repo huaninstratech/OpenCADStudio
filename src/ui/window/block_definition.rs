@@ -14,7 +14,6 @@ use crate::app::Message;
 use crate::entities::common::{coordinate_text, parse_length};
 use crate::scene::WireModel;
 use crate::modules::draw::units;
-use crate::scene::WireModel;
 use crate::t;
 use crate::ui::style::common::muted_style;
 use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};

@@ -309,6 +309,12 @@ start =
     .view-icons = Icons
     .view-preview = Large previews
 
+donation =
+    .title = Request for Donation
+    .heading = Donate to Open CAD Studio
+    .body = Open CAD Studio needs your help! Donations fund development and infrastructure important for Open CAD Studio's continued existence.
+    .decline = No Thanks
+
 modal =
     .saving-as-target-cannot-keep = Saving as "__ocs_arg_target__" cannot keep the following, so it will be lost:
     .about = About

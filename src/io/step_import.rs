@@ -1112,12 +1112,6 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         };
         let placement = shape_of
             .get(&occurrence)
-            .and_then(|pds| {
-                ids.iter().copied().find(|&id| {
-                    doc.kind(id) == "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"
-                        && param(id, 1) == Some(*pds)
-                })
-            })
             .and_then(|pds| cdsr_of_shape.get(pds).copied())
             .and_then(|cdsr| param(cdsr, 0))
             .and_then(|relation| {
