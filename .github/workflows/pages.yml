@@ -64,12 +64,12 @@ jobs:
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/codec-url-rewrite
         with:
           ref: ${{ steps.source.outputs.commit }}
           # Full history so build.rs can measure the distance from the
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
+      - uses: ./.github/actions/codec-url-rewrite
 
       - name: Validate release version
         env:
