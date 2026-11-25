@@ -42,7 +42,6 @@ impl ModalKind {
             | K::Options
             | K::XrefHelp
             | K::UpdateNotice
-            | K::DonationPrompt
             | K::GpuWarning
             | K::AssocPrompt
             | K::Unsaved

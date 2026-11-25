@@ -42,5 +42,3 @@ pub const SMALL_TILE_H: f32 = 54.0;
 /// The templates list beside "New from template" and its row.
 pub const TEMPLATE_LIST_W: f32 = 260.0;
 pub const TEMPLATE_ROW_H: f32 = 26.0;
-/// The sponsor logo's height.
-pub const SPONSOR_H: f32 = 120.0;

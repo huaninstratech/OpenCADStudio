@@ -2064,8 +2064,6 @@ pub enum Message {
     PluginRegistryErrorDetailsToggle,
     /// Copy registry URL, platform, version, and raw error details.
     PluginRegistryCopyDiagnostics,
-    /// Patreon supporters fetched at boot for the Start page (name, USD cents).
-    PatronsFetched(Result<Vec<(String, i64)>, String>),
     /// Tutorial-playlist videos fetched at boot for the Start page.
     VideosFetched(Result<Vec<crate::videos::VideoEntry>, String>),
     /// GitHub Discussions fetched at boot for the Start page.
@@ -2381,7 +2379,6 @@ pub enum Message {
     Terminate,
     /// User dismissed the update-notice window.
     UpdateNoticeClose,
-    DonationPromptDonate,
     /// First-launch default-association prompt: user accepted — register this
     /// app as the default handler for .dwg / .dxf.
     AssocPromptYes,

@@ -3,7 +3,6 @@
 pub(crate) mod changelog;
 pub mod clipboard;
 pub mod defaults;
-pub(crate) mod donate;
 pub mod draw;
 pub mod fence;
 pub mod groups;

@@ -6,9 +6,13 @@
 const RELEASES_API: &str =
     "https://api.github.com/repos/huaninstratech/OpenCADStudio/releases/latest";
 pub const RELEASES_PAGE: &str = "https://github.com/huaninstratech/OpenCADStudio/releases/latest";
-/// Where the update notice sends the user: the site's download page, whose
-/// links always name the latest release's files.
-pub const DOWNLOAD_PAGE: &str = "https://www.opencadstudio.com/download/";
+/// This fork's web build. Upstream's address for the same command redirects
+/// to its site.
+pub const WEB_PAGE: &str = "https://huaninstratech.github.io/OpenCADStudio/app/";
+/// Where the update notice sends the user: this fork's latest release, whose
+/// assets are the builds it publishes (never upstream's download page, whose
+/// links name upstream's).
+pub const DOWNLOAD_PAGE: &str = RELEASES_PAGE;
 
 /// Give release assets time to propagate before offering an update.
 #[cfg(not(target_arch = "wasm32"))]

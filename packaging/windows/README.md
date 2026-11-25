@@ -48,7 +48,7 @@ To manually submit or update a release using the [Komac CLI](https://github.com/
 ```powershell
 komac update HakanSeven.OpenCADStudio `
   --version 26.45.0 `
-  --urls "https://github.com/HakanSeven12/OpenCADStudio/releases/download/v2026.45/OpenCADStudio-v2026.45-windows-x86_64-installer.msi" `
-         "https://github.com/HakanSeven12/OpenCADStudio/releases/download/v2026.45/OpenCADStudio-v2026.45-windows-arm64-installer.msi" `
+  --urls "https://github.com/huaninstratech/OpenCADStudio/releases/download/v2026.45/OpenCADStudio-v2026.45-windows-x86_64-installer.msi" `
+         "https://github.com/huaninstratech/OpenCADStudio/releases/download/v2026.45/OpenCADStudio-v2026.45-windows-arm64-installer.msi" `
   --submit
 ```

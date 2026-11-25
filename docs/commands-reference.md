@@ -258,7 +258,6 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `COPYTOLAYER` | — | Menu: Copy Objects to New Layer. |
 | `CUTCLIP` | `CX` | Copies selected entities to clipboard and immediately erases them from drawing. |
 | `DIVIDE` | `DIV` | Places evenly spaced point objects or blocks along the length of an entity. *Tip:* Does not physically cut the object; it inserts point nodes. Use the Blo (B) option to insert repeating symbols along a curve. |
-| `DONATE` | — | Ribbon: Donate. |
 | `DONUT` | `DO` | Draws a filled circle or solid wide ring by specifying inside and outside diameters. *Tip:* Set inside diameter to 0 to create a solid filled circular dot (commonly used for electrical terminal points). |
 | `ELLIPSE` | `EL` | Creates an ellipse or an elliptical arc using major and minor axes. *Tip:* Type A to create an elliptical arc. Set PELLIPSE system variable to 1 if you want the ellipse created as a true polyline. |
 | `ELLIPSE_ARC` | — | Elliptical arc. † |

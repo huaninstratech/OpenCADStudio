@@ -26,7 +26,7 @@ and the web build share one code path for it.
 
 | Scope | Dialogs (`ModalKind`) | On a drawing switch |
 |---|---|---|
-| Program | About, Shortcuts, Aliases, PluginManager, Options, XrefHelp, UpdateNotice, DonationPrompt, GpuWarning, AssocPrompt, Unsaved, BlockEditChanges, SaveDialog, Recovery, RecoveryPrompt, AutosaveRestore, ConversionLoss, AecDropWarning, FileInUse, ExternalChange, ImportFile, DgnImport, TdsImport, TdsMaterial, TdsMissingMap, PdfImportFile, PdfPassword, SheetSet, PluginDialog, ExtractionOutdated, DataExtractionUnsaved | stays open: program settings and notices, and flows that hold a file or tab operation half done |
+| Program | About, Shortcuts, Aliases, PluginManager, Options, XrefHelp, UpdateNotice, GpuWarning, AssocPrompt, Unsaved, BlockEditChanges, SaveDialog, Recovery, RecoveryPrompt, AutosaveRestore, ConversionLoss, AecDropWarning, FileInUse, ExternalChange, ImportFile, DgnImport, TdsImport, TdsMaterial, TdsMissingMap, PdfImportFile, PdfPassword, SheetSet, PluginDialog, ExtractionOutdated, DataExtractionUnsaved | stays open: program settings and notices, and flows that hold a file or tab operation half done |
 | Drawing | every other dialog | closes: it works on the current drawing or on objects picked in it |
 
 ## The keyboard

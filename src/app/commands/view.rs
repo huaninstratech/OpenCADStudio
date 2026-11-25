@@ -245,7 +245,7 @@ impl OpenCADStudio {
                 self.command_line
                     .push_info(crate::t!("Opening OCS Web...").as_ref());
                 return Some(crate::sys::open_url(
-                    "https://hakanseven12.github.io/OpenCADStudio/",
+                    crate::io::update_check::WEB_PAGE,
                     self.main_window,
                 ));
             }
@@ -416,7 +416,7 @@ impl OpenCADStudio {
                 self.command_line
                     .push_info(crate::t!("Opening release notes...").as_ref());
                 return Some(crate::sys::open_url(
-                    "https://github.com/HakanSeven12/OpenCADStudio/releases",
+                    crate::io::update_check::RELEASES_PAGE,
                     self.main_window,
                 ));
             }

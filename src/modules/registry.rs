@@ -449,7 +449,6 @@ pub fn ribbon_commands() -> &'static HashMap<String, (&'static str, IconKind)> {
             super::annotate::dimtedit::tool(),
             super::annotate::leader_cmd::tool(),
             super::draw::changelog::tool(),
-            super::draw::donate::tool(),
             super::draw::report::tool(),
             super::draw::draw::point::tool(),
             super::draw::draw::poly3d::tool(),

@@ -68,7 +68,7 @@ apps:
     plugs:
       - home            # open/save/export drawings in the home directory
       - removable-media # same, on external drives / USB
-      - network         # license / Patreon check
+      - network         # update check, help pages, fonts, plugins
       - opengl
       - graphics-core22
       - icon-themes

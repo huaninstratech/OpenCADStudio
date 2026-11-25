@@ -40,7 +40,7 @@
     <Property Id='ARPPRODUCTICON' Value='AppIcon.ico' />
     <Property Id='ARPHELPLINK' Value='https://github.com/HakanSeven12/OpenCADStudio' />
     <Property Id='ARPURLINFOABOUT' Value='https://github.com/HakanSeven12/OpenCADStudio' />
-    <Property Id='ARPURLUPDATEINFO' Value='https://github.com/HakanSeven12/OpenCADStudio/releases' />
+    <Property Id='ARPURLUPDATEINFO' Value='https://github.com/huaninstratech/OpenCADStudio/releases/latest' />
     <Property Id='ARPCONTACT' Value='Hakan Seven' />
     <Property Id='ARPCOMMENTS' Value='!(loc.ApplicationDescription)' />
     <Property Id='ARPNOREPAIR' Value='1' />

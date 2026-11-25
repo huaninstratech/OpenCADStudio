@@ -555,10 +555,13 @@ struct AddSelectedRestore {
 pub enum StartSection {
     Recent,
     Videos,
-    #[default]
-    Welcome,
     Discussions,
-    Supporters,
+    // `default`, and `other`: a section this build no longer has, but a saved
+    // configuration may still name, loads as the Welcome page instead of
+    // failing. Serde only accepts `other` on the last variant.
+    #[default]
+    #[serde(other)]
+    Welcome,
 }
 
 /// How the Start page lists recent files.
@@ -635,9 +638,6 @@ pub(super) struct OpenCADStudio {
     ribbon: Ribbon,
     /// Recently opened files, newest first — backs the Start page panel.
     recent_files: Vec<std::path::PathBuf>,
-    /// Patreon supporters for the Start page's support prompt, fetched once
-    /// at boot and merged with the hand-maintained list.
-    patrons: Vec<(String, i64)>,
     /// Decoded DWG preview thumbnails for the Start page, keyed by path.
     /// `None` = the file has no readable preview (DXF, missing, WMF). Filled
     /// lazily by `refresh_recent_thumbs`; never read from a `view` call.
@@ -2622,7 +2622,6 @@ pub enum ModalKind {
     Shortcuts,
     PluginManager,
     UpdateNotice,
-    DonationPrompt,
     LayerStateManager,
     LayerTranslator,
     DrawingUnits,
@@ -2861,7 +2860,6 @@ impl OpenCADStudio {
             // Populated from the consolidated config after construction
             // (`apply_config`); default empty here.
             recent_files: Vec::new(),
-            patrons: Vec::new(),
             recent_thumbs: std::collections::HashMap::new(),
             recent_limit: recent::RECENT_DEFAULT,
             recent_limit_input: recent::RECENT_DEFAULT.to_string(),
@@ -4120,14 +4118,6 @@ impl OpenCADStudio {
         if !has_script {
             s.queue_startup_prompts();
         }
-        // Fetch the Patreon supporters list once at boot for the Start page.
-        #[cfg(not(target_arch = "wasm32"))]
-        let patrons_fetch = Task::perform(
-            async { crate::patreon::fetch_patrons() },
-            Message::PatronsFetched,
-        );
-        #[cfg(target_arch = "wasm32")]
-        let patrons_fetch = Task::none();
         // Tutorial videos: show the on-disk cache instantly, refresh from the
         // live playlist in the background. Nothing ships in the binary. The
         // fetch runs on its own OS thread — its several sequential HTTP
@@ -4198,21 +4188,8 @@ impl OpenCADStudio {
         let mut s = Self::new();
         let embed_mode = crate::io::host_bridge::is_embed_mode();
         if embed_mode {
-            s.control.automation_seen = true;
             s.control.enabled = crate::io::host_bridge::is_automation_allowed();
             crate::io::host_bridge::install();
-        }
-        // A web host that intends to automate can opt in before the first
-        // control request by setting `opencadstudio.automation` to "1" in
-        // localStorage (the same pre-load mechanism the settings use): the
-        // startup donation prompt then never queues (#1349).
-        if !embed_mode
-            && web_sys::window()
-                .and_then(|window| window.local_storage().ok().flatten())
-                .and_then(|storage| storage.get_item("opencadstudio.automation").ok().flatten())
-                == Some("1".to_string())
-        {
-            s.control.automation_seen = true;
         }
         s.queue_startup_prompts();
         let focus = s.focus_cmd_input();

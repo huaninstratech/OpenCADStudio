@@ -109,10 +109,6 @@ pub(super) struct State {
     /// The MCP button's last state, restored at the next start (#3126). Only
     /// the button writes it: a client's `stop` must not outlive the session.
     pub start_enabled: bool,
-    /// Set by the first control request of the session (or by a web host's
-    /// boot-time opt-in): while control is enabled, startup prompts that
-    /// would block automation — the donation prompt — are suppressed (#1349).
-    pub automation_seen: bool,
     serial: u64,
     events: VecDeque<Value>,
     /// Monotonic counter bumped on every real selection change, so clients
@@ -712,18 +708,6 @@ impl OpenCADStudio {
     }
 
     fn control_request_unguarded(&mut self, req: Value) -> (Value, Task<Message>) {
-        // First control contact marks the session automated (#1349): a
-        // DonationPrompt that is still queued (not yet shown) is dropped so
-        // automation never waits behind it, and `queue_startup_prompts`
-        // stops queueing one. A prompt already on screen stays — a human
-        // may be reading it; clients close it with `close_modal`.
-        if !self.control.automation_seen && self.control.enabled {
-            self.control.automation_seen = true;
-            if !self.dialog_open(super::ModalKind::DonationPrompt) {
-                self.pending_startup_modals
-                    .retain(|kind| kind != &super::ModalKind::DonationPrompt);
-            }
-        }
         let op = req["op"].as_str().unwrap_or("");
         let query = matches!(
             op,

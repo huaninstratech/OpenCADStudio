@@ -14,7 +14,7 @@ The crate's top-level modules are arranged in layers. Code may use modules in it
 | 3 tool contract | `command`, `plugin` | What a command or plugin is, and how it runs |
 | 4 tools | `modules` | The commands and ribbon tabs themselves |
 | 5 presentation | `ui`, `input` | Windows, widgets, input handling |
-| 6 app shell | `app`, `mcp`, `mcp_intent`, `mcp_ops`, `rest`, `cli`, `discussions`, `patreon`, `videos`, `locale_catalog` | The application and its front doors |
+| 6 app shell | `app`, `mcp`, `mcp_intent`, `mcp_ops`, `rest`, `cli`, `discussions`, `videos`, `locale_catalog` | The application and its front doors |
 
 The rule of thumb: code that many things depend on sits low and changes rarely; code that changes often sits high, and nothing depends on it.
 

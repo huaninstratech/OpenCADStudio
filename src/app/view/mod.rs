@@ -5129,7 +5129,7 @@ fn start_page_content<'a>(
     secondary_items.push(
         button(text(crate::t!("OCS Desktop")).size(crate::ui::style::start_metrics::ACTION_TEXT))
             .on_press(Message::OpenUrl(
-                "https://github.com/HakanSeven12/OpenCADStudio/releases/latest".to_string(),
+                crate::io::update_check::RELEASES_PAGE.to_string(),
             ))
             .padding(crate::ui::style::start_metrics::ACTION_PAD)
             .style(|theme: &Theme, status| start_action_shape(button::primary(theme, status)))
@@ -5179,28 +5179,6 @@ fn start_page_content<'a>(
         })
     });
 
-    let sponsors = column![
-        text(crate::tr!("start", "sponsors")).size(crate::ui::style::start_metrics::SECTION_TITLE),
-        mouse_area(
-            container(
-                iced::widget::svg(iced::widget::svg::Handle::from_memory(include_bytes!(
-                    "../../../assets/sponsors/openaec-logo-dark-on-light.svg"
-                )))
-                .width(Fill)
-                .height(iced::Length::Fixed(
-                    crate::ui::style::start_metrics::SPONSOR_H
-                ))
-                .content_fit(iced::ContentFit::Contain),
-            )
-            .width(Fill.max(300.0)),
-        )
-        .interaction(iced::mouse::Interaction::Pointer)
-        .on_press(Message::OpenUrl("https://open-aec.com/".to_string())),
-    ]
-    .spacing(crate::ui::style::start_metrics::GAP_L)
-    .align_x(iced::alignment::Horizontal::Center)
-    .width(Fill);
-
     let content = column![
         Space::new().height(iced::Length::Fixed(28.0)),
         container(headline).center_x(Fill),
@@ -5210,8 +5188,6 @@ fn start_page_content<'a>(
         container(secondary_row).center_x(Fill),
         Space::new().height(iced::Length::Fixed(crate::ui::style::start_metrics::GAP_L)),
         container(reddit_btn).center_x(Fill),
-        Space::new().height(iced::Length::Fixed(20.0)),
-        sponsors,
         Space::new().height(iced::Length::Fixed(52.0)),
     ]
     .spacing(0)
@@ -5219,7 +5195,7 @@ fn start_page_content<'a>(
     .height(Fill);
 
     // Collapse side panels one at a time as width shrinks: Tutorials first,
-    // then Discussions, Supporters, and Recent Documents last.
+    // then Discussions, and Recent Documents last.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum StartLayout {
         AllPanels,
@@ -5608,9 +5584,6 @@ fn start_page_content<'a>(
                     .height(Fill)
                     .center_x(Fill)
                     .into(),
-                // No longer reachable from the UI (supporters rail removed);
-                // the variant survives so saved configs still deserialize.
-                super::StartSection::Supporters => welcome.into(),
             };
             column![
                 container(tab_bar).center_x(Fill),
@@ -5749,9 +5722,8 @@ pub(super) fn recent_files_panel<'a>(
     width: iced::Length,
 ) -> Element<'a, Message> {
     use super::RecentView;
-    // Title mirrors the Supporters rail: size 15 in the bright text colour,
-    // followed by a 12px gap before the content. The view-mode toggles sit
-    // on the title's right.
+    // The title: size 15 in the bright text colour, followed by a 12px gap
+    // before the content. The view-mode toggles sit on the title's right.
     let mode_button = |icon: &'static [u8], mode: RecentView, tip: String| {
         let active = view == mode;
         iced::widget::tooltip(

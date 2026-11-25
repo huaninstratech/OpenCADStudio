@@ -71,7 +71,7 @@ fn last_dir_store() -> &'static Mutex<Option<PathBuf>> {
 
 /// Managed mode (`OPENAEC_BEHEERD=1`): a host such as a container image
 /// installs, updates and integrates the program, so it asks nothing at
-/// start (default app, donation, GPU notice) and never checks for updates.
+/// start (default app, GPU notice) and never checks for updates.
 pub fn managed() -> bool {
     std::env::var_os("OPENAEC_BEHEERD").is_some_and(|value| value == "1")
 }

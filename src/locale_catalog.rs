@@ -4487,7 +4487,6 @@ pub(super) fn message_attribute(source: &str) -> Option<(&'static str, &'static 
         "Spline Edit" => Some(("modify", "spline-edit")),
         "Spline with arrow" => Some(("properties", "spline-with-arrow")),
         "Spline without arrow" => Some(("properties", "spline-without-arrow")),
-        "Sponsors" => Some(("common", "sponsors")),
         "Standard" => Some(("common", "standard")),
         "Start" => Some(("common", "start")),
         "Start Angle" => Some(("properties", "start-angle")),

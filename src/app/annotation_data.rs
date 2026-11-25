@@ -299,13 +299,31 @@ fn put_data_link_entry(doc: &mut Document, handle: Handle, name: &str) {
     }
 }
 
+/// Days since 1970-01-01 as a Gregorian calendar date.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
 /// The link's last-update time (UTC).
 pub(crate) fn stamp_data_link(link: &mut DataLink) {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let seconds = elapsed.as_secs() as i64;
-    let (year, month, day) = crate::patreon::civil_from_days(seconds.div_euclid(86_400));
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
     let of_day = seconds.rem_euclid(86_400);
     link.year = year as i16;
     link.month = month as i16;
@@ -3356,6 +3374,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn civil_dates_count_from_the_unix_epoch_across_leap_years() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_722), (2023, 12, 31));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        // 2024 is a leap year, so the next two New Years are 366 and 365 days on.
+        assert_eq!(civil_from_days(20_089), (2025, 1, 1));
+        assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
 
     #[test]
     fn cell_ranges_are_normalized_and_missing_cells_are_blank() {

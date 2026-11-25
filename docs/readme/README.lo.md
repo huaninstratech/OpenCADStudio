@@ -189,10 +189,6 @@ OpenCADStudio --mcp
   </picture>
 </a>
 
-## ສະໜັບສະໜູນໂຄງການ
-
-ຖ້າ Open CAD Studio ຊ່ວຍວຽກຂອງທ່ານ, ທ່ານສາມາດສະໜັບສະໜູນການພັດທະນາຜ່ານ [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) ຫຼື [Patreon](https://www.patreon.com/HakanSeven12).
-
 ## ລິຂະສິດ
 
 Open CAD Studio ເຜີຍແຜ່ພາຍໃຕ້ [GNU General Public License v3.0](../../LICENSE).

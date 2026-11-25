@@ -41,6 +41,10 @@ pub mod discussions;
 pub mod entities;
 pub(crate) mod entity_creation;
 pub mod filter;
+/// What this fork ships without, as tests an upstream merge has to keep
+/// passing.
+#[cfg(test)]
+mod fork_surface;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_backend;
 pub mod i18n;
@@ -59,7 +63,6 @@ pub(crate) mod network;
 pub mod par;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parametric;
-pub mod patreon;
 pub mod perf;
 pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]

@@ -262,10 +262,6 @@ Ilova tarjimalari `locales/*/opencadstudio.ftl` fayllarida saqlanadi; manba yorl
   </picture>
 </a>
 
-## Loyihani qöllab-quvvatlaş
-
-Agar Open CAD Studio işingizda yordam bersa, [GitHub Sponsors](https://github.com/sponsors/HakanSeven12) yoki [Patreon](https://www.patreon.com/HakanSeven12) orqali loyiha rivojini qöllab-quvvatlang.
-
 ## Litsenziya
 
 Open CAD Studio [GNU General Public License v3.0](../../LICENSE) litsenziyasi ostida tarqatiladi.

@@ -20,7 +20,7 @@ impl OpenCADStudio {
         let showing = self.tool_windows.iter().any(|tool| {
             matches!(
                 tool.kind,
-                ModalKind::AssocPrompt | ModalKind::DonationPrompt | ModalKind::GpuWarning
+                ModalKind::AssocPrompt | ModalKind::GpuWarning
             )
         }) || self
             .pending_startup_modals
@@ -48,7 +48,7 @@ impl OpenCADStudio {
     }
 
     /// Queue the web crash-recovery prompt behind whatever startup modal is
-    /// already showing (donation, GPU warning…); the after-message hook in
+    /// already showing (the GPU warning…); the after-message hook in
     /// `update` surfaces it as soon as the slot is free. No-op when nothing
     /// is pending: once the autosave OPFS directory merely exists (even with
     /// no entries), queueing unconditionally would show an empty

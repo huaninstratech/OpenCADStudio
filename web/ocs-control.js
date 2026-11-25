@@ -6,10 +6,6 @@
 //   await window.ocsControl.ready            resolves once the bridge exists
 //   window.addEventListener("ocs-ready", …)  fired once, at the same moment
 //   await window.ocsControl.request({...})   one control request -> final reply
-//
-// Hosts that intend to automate from the start should set
-// localStorage["opencadstudio.automation"] = "1" before the page loads so the
-// startup donation prompt never appears (see docs/automation/web.md).
 (() => {
   if (window.ocsControl) return;
   const bridge = () => {
