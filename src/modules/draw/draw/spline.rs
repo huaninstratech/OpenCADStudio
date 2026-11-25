@@ -4,8 +4,8 @@
 //   Click to add fit points. Enter (≥2 pts) → commits EntityType::Spline.
 
 use crate::t;
-use codec::types::Vector3;
-use codec::{Document, EntityType, Handle, Spline};
+use document::types::Vector3;
+use document::{Document, EntityType, Handle, Spline};
 use std::collections::HashMap;
 
 use crate::command::{CadCommand, CmdResult};
@@ -37,6 +37,12 @@ pub struct SplineCommand {
     selected_objects: Vec<Handle>,
     choosing_degree: bool,
     degree: usize,
+}
+
+impl Default for SplineCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SplineCommand {
@@ -93,7 +99,7 @@ impl SplineCommand {
 }
 
 fn control_spline(points: &[[f64; 3]], degree: usize, closed: bool) -> Option<Spline> {
-    let curve = kernel::space::NurbsCurve3::from_control_polygon(degree, points, closed)?;
+    let curve = ocs_geom::space::NurbsCurve3::from_control_polygon(degree, points, closed)?;
     let mut spline = Spline {
         degree: curve.degree() as i32,
         control_points: curve
@@ -580,7 +586,7 @@ mod tests {
 
     #[test]
     fn closed_fitted_polyline_conversion_preserves_a_periodic_spline() {
-        use codec::entities::{
+        use document::entities::{
             Polyline2D, PolylineFlags, SmoothSurfaceType, Vertex2D, VertexFlags,
         };
 

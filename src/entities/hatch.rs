@@ -1,18 +1,18 @@
 use crate::t;
-use codec::entities::{BoundaryEdge, Hatch};
+use document::entities::{BoundaryEdge, Hatch};
 use glam::Vec3;
-use kernel::geom2d::{
+use ocs_geom::geom2d::{
     Arc as KernelArc, Curve as KernelCurve, Ellipse as KernelEllipse,
     EllipseArc as KernelEllipseArc, Line as KernelLine, NurbsCurve as KernelNurbs,
     Parameterization, Polyline as KernelPolyline, PolylineVertex as KernelVertex,
 };
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, circle_grip, edit_angle_prop as edit_angle, edit_prop as edit, parse_f64,
     ro_prop as ro,
 };
 use crate::entities::traits::{FallbackTess, Grippable, PropertyEditable, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::tess_util::FallbackGeometry;
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -156,7 +156,7 @@ fn boundary_centroid(h: &Hatch) -> Option<(f64, f64)> {
 /// Scale a catalog pattern about its intrinsic coordinate origin.
 /// Pattern lines loaded from DXF/DWG are rendered prebaked, so their metadata
 /// scale is not applied again by the renderer.
-pub(crate) fn scale_pattern_geometry(pattern: &mut codec::entities::HatchPattern, factor: f64) {
+pub(crate) fn scale_pattern_geometry(pattern: &mut document::entities::HatchPattern, factor: f64) {
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
         line.base_point.x = origin_x + (line.base_point.x - origin_x) * factor;
@@ -171,7 +171,7 @@ pub(crate) fn scale_pattern_geometry(pattern: &mut codec::entities::HatchPattern
 
 /// Rotate a catalog pattern about its intrinsic coordinate origin.
 /// This keeps the line angle, base point and world-space offset in sync.
-pub(crate) fn rotate_pattern_geometry(pattern: &mut codec::entities::HatchPattern, angle: f64) {
+pub(crate) fn rotate_pattern_geometry(pattern: &mut document::entities::HatchPattern, angle: f64) {
     let (sin, cos) = angle.sin_cos();
     let (origin_x, origin_y) = (0.0, 0.0);
     for line in pattern.lines.iter_mut() {
@@ -187,7 +187,7 @@ pub(crate) fn rotate_pattern_geometry(pattern: &mut codec::entities::HatchPatter
 
 /// Move every stored line by the same amount, preserving the pattern phase.
 pub(crate) fn translate_pattern_geometry(
-    pattern: &mut codec::entities::HatchPattern,
+    pattern: &mut document::entities::HatchPattern,
     dx: f64,
     dy: f64,
 ) {
@@ -200,34 +200,34 @@ pub(crate) fn translate_pattern_geometry(
 /// Read the hatch background colour from its `HATCHBACKGROUNDCOLOR` extended
 /// data (group 1071, packed true colour: high byte = colour method, low three =
 /// RGB). `None` when unset or not a true-colour value.
-pub fn background_color(h: &Hatch) -> Option<codec::types::Color> {
+pub fn background_color(h: &Hatch) -> Option<document::types::Color> {
     let rec = h.common.extended_data.get_record("HATCHBACKGROUNDCOLOR")?;
     let raw = rec.values.iter().find_map(|v| match v {
-        codec::xdata::XDataValue::Integer32(n) => Some(*n as u32),
+        document::xdata::XDataValue::Integer32(n) => Some(*n as u32),
         _ => None,
     })?;
     match (raw >> 24) & 0xFF {
         // Colour-method byte: C0 = ByLayer, C1 = ByBlock, C2 = true colour,
         // C3 = ACI index.
-        0xC0 => Some(codec::types::Color::ByLayer),
-        0xC1 => Some(codec::types::Color::ByBlock),
-        0xC2 => Some(codec::types::Color::Rgb {
+        0xC0 => Some(document::types::Color::ByLayer),
+        0xC1 => Some(document::types::Color::ByBlock),
+        0xC2 => Some(document::types::Color::Rgb {
             r: ((raw >> 16) & 0xFF) as u8,
             g: ((raw >> 8) & 0xFF) as u8,
             b: (raw & 0xFF) as u8,
         }),
-        0xC3 => Some(codec::types::Color::Index((raw & 0xFF) as u8)),
+        0xC3 => Some(document::types::Color::Index((raw & 0xFF) as u8)),
         _ => None,
     }
 }
 
 /// Pack an RGB colour into a `HATCHBACKGROUNDCOLOR` group-1071 true-colour word.
-pub fn pack_background_color(c: &codec::types::Color) -> i32 {
-    use codec::types::Color;
+pub fn pack_background_color(c: &document::types::Color) -> i32 {
+    use document::types::Color;
     (match c {
         Color::ByLayer => 0xC0000000u32,
         Color::ByBlock => 0xC1000000u32,
-        Color::Index(i) => 0xC3000000u32 | (*i as u8 as u32),
+        Color::Index(i) => 0xC3000000u32 | (*i as u32),
         _ => {
             let (r, g, b) = c.rgb().unwrap_or((255, 255, 255));
             0xC2000000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -237,8 +237,8 @@ pub fn pack_background_color(c: &codec::types::Color) -> i32 {
 
 /// Replace (or insert) the hatch's `HATCHBACKGROUNDCOLOR` extended-data record,
 /// preserving every other application's records.
-pub fn set_background_color(h: &mut Hatch, c: &codec::types::Color) {
-    use codec::xdata::{ExtendedDataRecord, XDataValue};
+pub fn set_background_color(h: &mut Hatch, c: &document::types::Color) {
+    use document::xdata::{ExtendedDataRecord, XDataValue};
     const APP: &str = "HATCHBACKGROUNDCOLOR";
     let kept: Vec<ExtendedDataRecord> = h
         .common
@@ -260,7 +260,7 @@ pub fn set_background_color(h: &mut Hatch, c: &codec::types::Color) {
 /// Remove the hatch's `HATCHBACKGROUNDCOLOR` extended-data record (background
 /// off), preserving every other application's records.
 pub fn clear_background_color(h: &mut Hatch) {
-    use codec::xdata::ExtendedDataRecord;
+    use document::xdata::ExtendedDataRecord;
     const APP: &str = "HATCHBACKGROUNDCOLOR";
     let kept: Vec<ExtendedDataRecord> = h
         .common
@@ -301,22 +301,20 @@ fn associative_property(h: &Hatch) -> Property {
 
 fn properties(h: &Hatch) -> Vec<PropSection> {
     let pattern_type = match h.pattern_type {
-        codec::entities::HatchPatternType::Predefined => "Predefined",
-        codec::entities::HatchPatternType::UserDefined => "User Defined",
-        codec::entities::HatchPatternType::Custom => "Custom",
+        document::entities::HatchPatternType::Predefined => "Predefined",
+        document::entities::HatchPatternType::UserDefined => "User Defined",
+        document::entities::HatchPatternType::Custom => "Custom",
     };
     let style = match h.style {
-        codec::entities::HatchStyleType::Normal => "Normal",
-        codec::entities::HatchStyleType::Outer => "Outer",
-        codec::entities::HatchStyleType::Ignore => "Ignore",
+        document::entities::HatchStyleType::Normal => "Normal",
+        document::entities::HatchStyleType::Outer => "Outer",
+        document::entities::HatchStyleType::Ignore => "Ignore",
     };
     let area = boundary_area(h);
     let g = &h.gradient_color;
-    let default_col = codec::types::Color::Index(7);
+    let default_col = document::types::Color::Index(7);
     let grad_c1 = g.colors.first().map(|e| e.color).unwrap_or(default_col);
     let grad_c2 = g.colors.get(1).map(|e| e.color).unwrap_or(default_col);
-    let bg_on = background_color(h).is_some();
-    let bg_col = background_color(h).unwrap_or(default_col);
 
     if g.enabled {
         // ── Gradient fill ──────────────────────────────────────────────────
@@ -425,30 +423,35 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
 
     // ── Hatch (pattern / solid) ────────────────────────────────────────────
     // Show only controls used by the selected fill type.
-    let type_row = if h.is_solid {
-        ro(t!("Type").as_ref(), "fill_kind", t!("Solid").into_owned())
+    // A solid fill is the predefined _SOLID pattern and lists its rows as a
+    // pattern does (measured): angle, scale and origin live, spacing, ISO
+    // pen width and double greyed.
+    let type_row = Property {
+        label: t!("Type").into_owned(),
+        field: "pattern_type_label",
+        value: PropValue::Choice {
+            selected: pattern_type.to_string(),
+            options: vec!["Predefined".into(), "User Defined".into(), "Custom".into()],
+        },
+    };
+    // A user-defined pattern's name is fixed (measured: greyed `_U`).
+    let user_defined = matches!(h.pattern_type, document::entities::HatchPatternType::UserDefined);
+    let pattern_name_row = if user_defined {
+        ro(t!("Pattern name").as_ref(), "pattern_name", h.pattern.name.clone())
     } else {
         Property {
-            label: t!("Type").into_owned(),
-            field: "pattern_type_label",
-            value: PropValue::Choice {
-                selected: pattern_type.to_string(),
-                options: vec!["Predefined".into(), "User Defined".into(), "Custom".into()],
-            },
+            label: t!("Pattern name").into_owned(),
+            field: "pattern_name",
+            value: PropValue::HatchPatternChoice(h.pattern.name.clone()),
         }
-    };
-    let pattern_name_row = Property {
-        label: t!("Pattern name").into_owned(),
-        field: "pattern_name",
-        value: PropValue::HatchPatternChoice(h.pattern.name.clone()),
     };
     let associative_row = associative_property(h);
     let double_row = Property {
         label: t!("Double").into_owned(),
         field: "double",
-        value: PropValue::BoolToggle {
-            field: "double",
-            value: h.is_double,
+        value: PropValue::Choice {
+            selected: if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+            options: vec![t!("Yes").into_owned(), t!("No").into_owned()],
         },
     };
     let island_row = Property {
@@ -463,7 +466,31 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
 
     let mut pattern_props = vec![type_row, pattern_name_row];
     pattern_props.push(ro(t!("Annotative").as_ref(), "annotative", String::new()));
-    if !h.is_solid {
+    if h.is_solid {
+        pattern_props.push(edit_angle(
+            t!("Angle").as_ref(),
+            "pattern_angle",
+            h.pattern_angle.to_degrees(),
+        ));
+        pattern_props.push(edit(t!("Scale").as_ref(), "pattern_scale", h.pattern_scale));
+        pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
+        pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
+        pattern_props.push(ro(
+            t!("Spacing").as_ref(),
+            "spacing",
+            crate::entities::common::format_length(h.pattern_scale),
+        ));
+        pattern_props.push(ro(
+            t!("ISO pen width").as_ref(),
+            "iso_pen_width",
+            format!("{:.2} mm", h.pattern_scale),
+        ));
+        pattern_props.push(ro(
+            t!("Double").as_ref(),
+            "double",
+            if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+        ));
+    } else {
         pattern_props.push(edit_angle(
             t!("Angle").as_ref(),
             "pattern_angle",
@@ -471,36 +498,65 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
         ));
         if matches!(
             h.pattern_type,
-            codec::entities::HatchPatternType::UserDefined
+            document::entities::HatchPatternType::UserDefined
         ) {
+            // Measured order: the scale (the spacing, greyed) and origin
+            // sit between angle and spacing.
+            pattern_props.push(ro(
+                t!("Scale").as_ref(),
+                "pattern_scale",
+                crate::entities::common::format_decimal(h.pattern_scale),
+            ));
+            pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
+            pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
             pattern_props.push(spacing_row);
             pattern_props.push(double_row);
         } else {
+            // A predefined or custom pattern lists spacing, pen width and
+            // double greyed after its origin (measured); an ISO pattern's
+            // pen width stays editable.
             pattern_props.push(edit(t!("Scale").as_ref(), "pattern_scale", h.pattern_scale));
             // Origin edits are relative offsets.
             pattern_props.push(edit(t!("Origin X").as_ref(), "origin_x", 0.0));
             pattern_props.push(edit(t!("Origin Y").as_ref(), "origin_y", 0.0));
+            pattern_props.push(ro(
+                t!("Spacing").as_ref(),
+                "spacing",
+                crate::entities::common::format_length(h.pattern_scale),
+            ));
             if h.pattern.name.to_ascii_uppercase().starts_with("ISO") {
                 pattern_props.push(edit(
                     t!("ISO pen width").as_ref(),
                     "iso_pen_width",
                     h.pattern_scale,
                 ));
+            } else {
+                pattern_props.push(ro(
+                    t!("ISO pen width").as_ref(),
+                    "iso_pen_width",
+                    format!("{:.2} mm", h.pattern_scale),
+                ));
             }
+            pattern_props.push(ro(
+                t!("Double").as_ref(),
+                "double",
+                if h.is_double { t!("Yes") } else { t!("No") }.into_owned(),
+            ));
         }
     }
     pattern_props.push(associative_row);
     pattern_props.push(island_row);
-    pattern_props.push(Property {
-        label: t!("Background").into_owned(),
-        field: "bg_enabled",
-        value: PropValue::BoolToggle {
-            field: "bg_enabled",
-            value: bg_on,
-        },
-    });
+    // A solid fill has no background colour row; a pattern lists its
+    // background colour, None while it has none.
+    if !h.is_solid {
+        pattern_props.push(Property {
+            label: t!("Background color").into_owned(),
+            field: "background_color",
+            value: PropValue::ColorChoice(background_color(h).unwrap_or(document::types::Color::None)),
+        });
+    }
 
-    let mut sections = vec![
+    let sections = vec![
         PropSection {
             title: t!("Pattern").into_owned(),
             props: pattern_props,
@@ -522,20 +578,11 @@ fn properties(h: &Hatch) -> Vec<PropSection> {
             ],
         },
     ];
-    if bg_on {
-        if let Some(sec) = sections.first_mut() {
-            sec.props.push(Property {
-                label: t!("Background color").into_owned(),
-                field: "background_color",
-                value: PropValue::ColorChoice(bg_col),
-            });
-        }
-    }
     sections
 }
 
 fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
-    use codec::entities::{HatchPatternType, HatchStyleType};
+    use document::entities::{HatchPatternType, HatchStyleType};
     // Non-numeric fields (bool toggles / enum choices) — handled before the
     // f64 parse below, which would otherwise reject their string values.
     match field {
@@ -546,7 +593,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             if background_color(h).is_some() {
                 clear_background_color(h);
             } else {
-                set_background_color(h, &codec::types::Color::ByLayer);
+                set_background_color(h, &document::types::Color::ByLayer);
             }
             return;
         }
@@ -554,7 +601,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             h.is_double = if value == "toggle" {
                 !h.is_double
             } else {
-                value == "true"
+                value == "true" || value == t!("Yes").as_ref() || value.eq_ignore_ascii_case("yes")
             };
             return;
         }
@@ -587,7 +634,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
                 match requested {
                     HatchPatternType::UserDefined => {
                         // Rebuild user-defined geometry from its parameters.
-                        h.pattern = codec::entities::HatchPattern::new("_USER");
+                        h.pattern = document::entities::HatchPattern::new("_USER");
                     }
                     HatchPatternType::Predefined => {
                         if let Some(entry) = crate::scene::model::hatch_patterns::find("ANSI31") {
@@ -674,7 +721,7 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
             h.pattern_scale = v;
             if matches!(
                 h.pattern_type,
-                codec::entities::HatchPatternType::UserDefined
+                document::entities::HatchPatternType::UserDefined
             ) {
                 h.pattern.lines.clear();
                 h.pattern.name = "_USER".to_string();
@@ -683,11 +730,11 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
         // Origin rows are relative offsets and return to zero after commit.
         "origin_x" => {
             let origin = h.pattern_origin();
-            h.set_pattern_origin(codec::types::Vector2::new(origin.x + v, origin.y));
+            h.set_pattern_origin(document::types::Vector2::new(origin.x + v, origin.y));
         }
         "origin_y" => {
             let origin = h.pattern_origin();
-            h.set_pattern_origin(codec::types::Vector2::new(origin.x, origin.y + v));
+            h.set_pattern_origin(document::types::Vector2::new(origin.x, origin.y + v));
         }
         "iso_pen_width" if v > 0.0 => {
             let old = h.pattern_scale;
@@ -701,11 +748,185 @@ fn apply_geom_prop(h: &mut Hatch, field: &str, value: &str) {
     }
 }
 
+/// Transparency as the Hatch panel shows it: a percentage, `None` when the
+/// hatch follows its layer or block.
+fn transparency_percent(t: document::types::Transparency) -> Option<u8> {
+    match t {
+        document::types::Transparency::Explicit(alpha) => {
+            Some((f64::from(alpha) * 100.0 / 255.0).round() as u8)
+        }
+        _ => None,
+    }
+}
+
+/// The Hatch panel's settings for an existing hatch, as HATCHEDIT shows
+/// them. A user-defined hatch's spacing is its pattern scale, as in the
+/// Properties palette.
+pub(crate) fn panel_settings(
+    h: &Hatch,
+    annotative: bool,
+) -> crate::modules::draw::draw::hatch::HatchSettings {
+    use crate::modules::draw::draw::hatch::{HatchFill, HatchSettings, GRADIENT_COLORS};
+    use crate::scene::model::hatch_model::GradientKind;
+    let fill = if h.gradient_color.enabled {
+        let (kind, invert) = GradientKind::from_name(&h.gradient_color.name);
+        HatchFill::Gradient(kind, invert)
+    } else if h.is_solid {
+        HatchFill::Solid
+    } else if matches!(
+        h.pattern_type,
+        document::entities::HatchPatternType::UserDefined
+    ) {
+        HatchFill::User {
+            spacing: h.pattern_scale,
+            double: h.is_double,
+        }
+    } else {
+        HatchFill::Pattern(h.pattern.name.clone())
+    };
+    let mut gradient_colors = GRADIENT_COLORS;
+    for (slot, entry) in gradient_colors.iter_mut().zip(&h.gradient_color.colors) {
+        *slot = entry.color;
+    }
+    let origin = h.pattern_origin();
+    HatchSettings {
+        fill,
+        angle_deg: if h.gradient_color.enabled {
+            h.gradient_color.angle
+        } else {
+            h.pattern_angle
+        }
+        .to_degrees(),
+        scale: h.pattern_scale,
+        origin: [origin.x, origin.y],
+        method: 0,
+        islands: h.style,
+        associative: h.is_associative,
+        separate: false,
+        keep_boundaries: false,
+        gap_tolerance: 0.0,
+        color: Some(h.common.color),
+        background: background_color(h),
+        layer: Some(h.common.layer.clone()),
+        transparency: transparency_percent(h.common.transparency),
+        gradient_colors,
+        draw_order: 0,
+        annotative,
+    }
+}
+
+/// Swap the hatch's lines for the predefined pattern `name`, kept at the
+/// hatch's scale, angle and origin.
+fn set_predefined_pattern(h: &mut Hatch, name: &str) {
+    if name.eq_ignore_ascii_case("SOLID") {
+        h.pattern = document::entities::HatchPattern::new("SOLID");
+        h.pattern_type = document::entities::HatchPatternType::Predefined;
+        h.is_solid = true;
+        h.gradient_color.enabled = false;
+        return;
+    }
+    let Some(entry) = crate::scene::model::hatch_patterns::find(name) else {
+        return;
+    };
+    let mut pattern = crate::scene::model::hatch_patterns::build_dxf_pattern(entry);
+    scale_pattern_geometry(&mut pattern, h.pattern_scale.max(1.0e-6));
+    rotate_pattern_geometry(&mut pattern, h.pattern_angle);
+    let origin = h.pattern_origin();
+    translate_pattern_geometry(&mut pattern, origin.x, origin.y);
+    h.pattern = pattern;
+    h.pattern_type = document::entities::HatchPatternType::Predefined;
+    h.is_solid = false;
+    h.gradient_color.enabled = false;
+}
+
+/// Apply what changed on the Hatch panel between `before` and `after` to an
+/// existing hatch (HATCHEDIT's OK). Fields the panel did not change keep
+/// the hatch's own values; colour, layer and transparency are set by the
+/// caller, which owns the layer table.
+pub(crate) fn apply_panel_settings(
+    h: &mut Hatch,
+    before: &crate::modules::draw::draw::hatch::HatchSettings,
+    after: &crate::modules::draw::draw::hatch::HatchSettings,
+) {
+    use crate::modules::draw::draw::hatch::HatchFill;
+    use document::entities::HatchPatternType;
+    let number = |value: f64| value.to_string();
+    if after.fill != before.fill {
+        match &after.fill {
+            HatchFill::Solid => set_predefined_pattern(h, "SOLID"),
+            HatchFill::Pattern(name) => set_predefined_pattern(h, name),
+            HatchFill::User { spacing, double } => {
+                h.gradient_color.enabled = false;
+                if h.pattern_type != HatchPatternType::UserDefined {
+                    apply_geom_prop(h, "pattern_type_label", "User Defined");
+                }
+                h.is_solid = false;
+                apply_geom_prop(h, "spacing", &number(*spacing));
+                h.is_double = *double;
+            }
+            HatchFill::Gradient(kind, invert) => {
+                h.is_solid = true;
+                h.gradient_color.enabled = true;
+                h.gradient_color.name = kind.dxf_name(*invert).to_string();
+                h.gradient_color.angle = after.angle_deg.to_radians();
+                h.gradient_color.is_single_color = false;
+                h.gradient_color.colors = after
+                    .gradient_colors
+                    .iter()
+                    .enumerate()
+                    .map(|(n, color)| document::entities::hatch::GradientColorEntry {
+                        value: n as f64,
+                        color: *color,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+        }
+    } else if after.gradient_colors != before.gradient_colors && h.gradient_color.enabled {
+        for (entry, color) in h
+            .gradient_color
+            .colors
+            .iter_mut()
+            .zip(&after.gradient_colors)
+        {
+            entry.color = *color;
+        }
+    }
+    if after.angle_deg != before.angle_deg {
+        apply_geom_prop(h, "pattern_angle", &number(after.angle_deg));
+    }
+    if after.scale != before.scale && !matches!(after.fill, HatchFill::User { .. }) {
+        apply_geom_prop(h, "pattern_scale", &number(after.scale));
+    }
+    if after.origin != before.origin {
+        h.set_pattern_origin(document::types::Vector2::new(
+            after.origin[0],
+            after.origin[1],
+        ));
+    }
+    if after.islands != before.islands {
+        h.style = after.islands;
+    }
+    if after.associative != before.associative {
+        apply_geom_prop(
+            h,
+            "associative",
+            if after.associative { "true" } else { "false" },
+        );
+    }
+    if after.background != before.background {
+        match &after.background {
+            Some(color) => set_background_color(h, color),
+            None => clear_background_color(h),
+        }
+    }
+}
+
 fn apply_transform(h: &mut Hatch, t: &EntityTransform) {
     crate::scene::view::transform::apply_standard_entity_transform(h, t, |entity, p1, p2| {
         // Keep boundary directions, angles, and sweeps consistent.
         let t = crate::scene::view::transform::reflection_about_xy_line(p1, p2);
-        codec::entities::Entity::apply_transform(entity, &t);
+        document::entities::Entity::apply_transform(entity, &t);
     });
 }
 
@@ -791,7 +1012,10 @@ impl Grippable for Hatch {
                     GripApply::Translate(delta) => (delta.x, delta.y),
                 };
                 let origin = self.pattern_origin();
-                self.set_pattern_origin(codec::types::Vector2::new(origin.x + dx, origin.y + dy));
+                self.set_pattern_origin(document::types::Vector2::new(
+                    origin.x + dx,
+                    origin.y + dy,
+                ));
                 return;
             }
             id += 1;
@@ -875,7 +1099,7 @@ impl Grippable for Hatch {
                     .first()
                     .map(|line| (line.base_point.x, line.base_point.y)),
             ) {
-                self.set_pattern_origin(codec::types::Vector2::new(gx, gy));
+                self.set_pattern_origin(document::types::Vector2::new(gx, gy));
             }
         }
     }
@@ -940,7 +1164,7 @@ impl FallbackTess for Hatch {
                 let Some(curve) = edge_curve(edge) else {
                     continue;
                 };
-                let local = curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+                let local = curve.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE);
                 if local.len() < 2 {
                     continue;
                 }
@@ -1009,7 +1233,7 @@ enum BoundaryPoint {
     },
 }
 
-fn same_point(a: &codec::types::Vector2, b: &codec::types::Vector2) -> bool {
+fn same_point(a: &document::types::Vector2, b: &document::types::Vector2) -> bool {
     let scale = a.x.abs().max(a.y.abs()).max(1.0);
     (a.x - b.x).abs() <= 1e-9 * scale && (a.y - b.y).abs() <= 1e-9 * scale
 }
@@ -1128,7 +1352,7 @@ fn boundary_points(hatch: &Hatch) -> Vec<(BoundaryPoint, [f64; 2])> {
         }
         // A closed chain: the last line ends where the first one starts.
         if let Some(last) = pending_end {
-            let end = line(last).unwrap().end.clone();
+            let end = line(last).unwrap().end;
             match first_start.map(|slot| (slot, &mut out[slot])) {
                 Some((
                     _,
@@ -1173,12 +1397,12 @@ fn set_boundary_point(hatch: &mut Hatch, point: BoundaryPoint, x: f64, y: f64) {
         } => {
             if let Some(edge) = ending {
                 if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
-                    line.end = codec::types::Vector2::new(x, y);
+                    line.end = document::types::Vector2::new(x, y);
                 }
             }
             if let Some(edge) = starting {
                 if let BoundaryEdge::Line(line) = &mut hatch.paths[path].edges[edge] {
-                    line.start = codec::types::Vector2::new(x, y);
+                    line.start = document::types::Vector2::new(x, y);
                 }
             }
         }
@@ -1248,20 +1472,20 @@ fn edit_boundary_vertex(
             match action {
                 A::AddVertex => {
                     if vertex + 1 == n && !polyline.is_closed {
-                        let last = polyline.vertices[vertex].clone();
+                        let last = polyline.vertices[vertex];
                         polyline
                             .vertices
-                            .push(codec::types::Vector3::new(last.x, last.y, 0.0));
+                            .push(document::types::Vector3::new(last.x, last.y, 0.0));
                         return;
                     }
-                    let a = polyline.vertices[vertex].clone();
-                    let b = polyline.vertices[(vertex + 1) % n].clone();
+                    let a = polyline.vertices[vertex];
+                    let b = polyline.vertices[(vertex + 1) % n];
                     let (cx, cy) = (b.x - a.x, b.y - a.y);
                     // The arc's midpoint sits off the chord by the sagitta,
                     // to the right of a positive (counter-clockwise) bulge.
                     let sagitta = a.z * 0.5;
                     let half = (a.z.atan() * 0.5).tan();
-                    let mid = codec::types::Vector3::new(
+                    let mid = document::types::Vector3::new(
                         (a.x + b.x) * 0.5 + cy * sagitta,
                         (a.y + b.y) * 0.5 - cx * sagitta,
                         half,
@@ -1286,13 +1510,13 @@ fn edit_boundary_vertex(
                     let BoundaryEdge::Line(line) = &mut edges[edge] else {
                         return;
                     };
-                    let mid = codec::types::Vector2::new(
+                    let mid = document::types::Vector2::new(
                         (line.start.x + line.end.x) * 0.5,
                         (line.start.y + line.end.y) * 0.5,
                     );
-                    let tail = codec::entities::LineEdge {
-                        start: mid.clone(),
-                        end: line.end.clone(),
+                    let tail = document::entities::LineEdge {
+                        start: mid,
+                        end: line.end,
                     };
                     line.end = mid;
                     edges.insert(edge + 1, BoundaryEdge::Line(tail));
@@ -1319,4 +1543,3 @@ fn edit_boundary_vertex(
         _ => {}
     }
 }
-

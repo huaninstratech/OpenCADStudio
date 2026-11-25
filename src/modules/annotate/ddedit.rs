@@ -7,7 +7,7 @@
 //      the rich MText editor for MText / MultiLeader. A Leader resolves to the
 //      entity it annotates.
 
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
@@ -26,6 +26,12 @@ pub fn tool() -> ToolDef {
 }
 
 pub struct DdeditCommand;
+
+impl Default for DdeditCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DdeditCommand {
     pub fn new() -> Self {

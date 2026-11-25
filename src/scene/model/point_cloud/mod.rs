@@ -6,10 +6,10 @@
 mod rcp;
 mod rcs;
 
-use codec::entities::{PointCloudExCrop, PointCloudExData};
-use codec::objects::{ClassObjectData, ObjectType, PointCloudDefinition};
-use codec::types::{Transform, Vector3};
-use codec::Document;
+use document::entities::{PointCloudExCrop, PointCloudExData};
+use document::objects::{ClassObjectData, ObjectType, PointCloudDefinition};
+use document::types::{Transform, Vector3};
+use document::Document;
 use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -40,18 +40,114 @@ pub struct CloudPoints {
     pub bounds: Option<[[f64; 3]; 2]>,
 }
 
-/// Scan points by file path and modification time. A file that fails to
-/// decode is remembered too, so it is not re-read on every tessellate.
-pub fn load(path: &Path) -> Option<Arc<CloudPoints>> {
-    type Cache = Mutex<FxHashMap<PathBuf, (SystemTime, Option<Arc<CloudPoints>>)>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
-    if let Some((stamp, cloud)) = cache.get(path) {
-        if *stamp == modified {
-            return cloud.clone();
+/// Short: a message that carries a cloud prints its size, not its points.
+impl std::fmt::Debug for CloudPoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudPoints")
+            .field("scans", &self.scans)
+            .field("points", &self.positions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-cache byte budget for decoded scan clouds. Every distinct scan file a
+/// drawing references decodes to a full point set that would otherwise stay
+/// resident for the whole process lifetime; past the budget the least recently
+/// used clouds are dropped and re-decoded on demand. Tunable with
+/// `OCS_POINTCLOUD_CACHE_MB`. The clouds that an open drawing shows are held
+/// outside this budget until no open drawing refers to their file
+/// ([`HeldClouds`]).
+fn point_cloud_cache_budget_bytes() -> usize {
+    const DEFAULT_MIB: usize = 64;
+    std::env::var("OCS_POINTCLOUD_CACHE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Bytes a cached cloud retains: its point arrays dominate. Per-entry Arc,
+/// hash-table and per-scan string overhead is left uncharged.
+fn cloud_cost(path: &Path, cloud: &Option<Arc<CloudPoints>>) -> usize {
+    let arrays = cloud.as_ref().map_or(0, |cloud| {
+        cloud.positions.capacity() * std::mem::size_of::<[f64; 3]>()
+            + cloud.colors.capacity() * std::mem::size_of::<[u8; 3]>()
+            + cloud.intensity.capacity()
+            + cloud.normals.capacity() * std::mem::size_of::<[f32; 3]>()
+            + cloud.scan_ranges.capacity() * std::mem::size_of::<ScanRange>()
+            + cloud
+                .preview
+                .as_ref()
+                .map_or(0, |preview| preview.capacity())
+    });
+    arrays + std::mem::size_of::<CloudPoints>() + path.as_os_str().len()
+}
+
+type CloudCache =
+    super::pdf_raster::BudgetedRasterCache<PathBuf, (SystemTime, Option<Arc<CloudPoints>>)>;
+
+/// The decoded clouds. The lock is held only to look up or to insert, never
+/// during a decode: a read on a worker does not make the UI thread wait, and
+/// a decode that panics does not poison the cache.
+fn cloud_cache() -> std::sync::MutexGuard<'static, CloudCache> {
+    static CACHE: OnceLock<Mutex<CloudCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(CloudCache::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The clouds that the drawing reads (see [`cached`]) keep, outside the
+/// budget of the cache. The budget drops the least recently used clouds
+/// and reads them again on demand; a read on a worker cannot do that on
+/// each frame, so a cloud that a drawing shows stays here until no open
+/// drawing refers to its file ([`release_unreferenced`]).
+type HeldClouds = std::collections::HashMap<PathBuf, (SystemTime, Arc<CloudPoints>)>;
+
+fn held_clouds() -> std::sync::MutexGuard<'static, HeldClouds> {
+    static HELD: OnceLock<Mutex<HeldClouds>> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What the cache or the held clouds have for `path` at `modified`, without
+/// a read: `Some(None)` for a file that failed.
+fn lookup(path: &Path, modified: SystemTime) -> Option<Option<Arc<CloudPoints>>> {
+    let key = path.to_path_buf();
+    {
+        let mut cache = cloud_cache();
+        if let Some((stamp, cloud)) = cache.get(&key) {
+            if stamp == modified {
+                return Some(cloud);
+            }
+            cache.pop(&key);
         }
     }
+    let mut held = held_clouds();
+    match held.get(path) {
+        Some((stamp, cloud)) if *stamp == modified => Some(Some(Arc::clone(cloud))),
+        Some(_) => {
+            held.remove(path);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Scan points by file path and modification time. A file that fails to
+/// decode is remembered too, so it is not re-read on every tessellate.
+/// This reads the file when the cache does not have it: call it off the UI
+/// thread. The drawing uses [`cached`], which never reads.
+pub fn load(path: &Path) -> Option<Arc<CloudPoints>> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    if let Some(hit) = lookup(path, modified) {
+        return hit;
+    }
+    decode_and_cache(path, modified)
+}
+
+fn decode_and_cache(path: &Path, modified: SystemTime) -> Option<Arc<CloudPoints>> {
     let started = crate::perf::enabled().then(iced::time::Instant::now);
     let cloud = decode(path).map(Arc::new);
     crate::perf::record(format_args!(
@@ -60,8 +156,151 @@ pub fn load(path: &Path) -> Option<Arc<CloudPoints>> {
         cloud.as_ref().map_or(0, |cloud| cloud.positions.len()),
         path.display(),
     ));
-    cache.insert(path.to_path_buf(), (modified, cloud.clone()));
+    let budget = point_cloud_cache_budget_bytes();
+    let cost = cloud_cost(path, &cloud);
+    if cost <= budget {
+        cloud_cache().insert_with_budget(
+            path.to_path_buf(),
+            (modified, cloud.clone()),
+            cost,
+            budget,
+        );
+    }
     cloud
+}
+
+/// The cloud of a scan file for the drawing, without a read on this
+/// thread: what the cache or the held clouds have. When they do not have
+/// the file, a worker reads it ([`read_results`] tells the app when the
+/// read ends) and this gives None until then: the drawing shows the
+/// cloud's extents box, as for a file that is not found.
+pub(crate) fn cached(path: &Path) -> Option<Arc<CloudPoints>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // No threads: the web build reads in place, as before.
+        load(path)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        if let Some(hit) = lookup(path, modified) {
+            return hit;
+        }
+        request(path.to_path_buf());
+        None
+    }
+}
+
+/// The end of a read that [`cached`] started: the file, and the panic
+/// message if the reader panicked.
+#[derive(Debug, Clone)]
+pub struct ReadDone {
+    pub path: PathBuf,
+    pub failure: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reads_running() -> std::sync::MutexGuard<'static, std::collections::HashSet<PathBuf>> {
+    static RUNNING: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    RUNNING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+type ReadSender = iced::futures::channel::mpsc::UnboundedSender<ReadDone>;
+
+fn read_listener() -> std::sync::MutexGuard<'static, Option<ReadSender>> {
+    static LISTENER: Mutex<Option<ReadSender>> = Mutex::new(None);
+    LISTENER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The ends of the reads that [`cached`] starts, for a subscription of the
+/// app. The last stream made gets them.
+pub fn read_results() -> impl iced::futures::Stream<Item = ReadDone> + Send + 'static {
+    let (sender, receiver) = iced::futures::channel::mpsc::unbounded();
+    *read_listener() = Some(sender);
+    receiver
+}
+
+/// Reads `path` on a worker thread, once while a read of it runs. The
+/// result goes to the held clouds; a panic is remembered as a failure, so
+/// the drawing does not ask again for the same file version.
+#[cfg(not(target_arch = "wasm32"))]
+fn request(path: PathBuf) {
+    request_with(path, read_and_hold);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn request_with(path: PathBuf, reader: fn(&Path)) {
+    if !reads_running().insert(path.clone()) {
+        return;
+    }
+    let worker_path = path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ocs-point-cloud-read".into())
+        .spawn(move || {
+            let path = worker_path;
+            let failure = std::panic::catch_unwind(|| reader(&path))
+                .err()
+                .map(|payload| {
+                    remember_failure(&path);
+                    panic_text(payload.as_ref())
+                });
+            reads_running().remove(&path);
+            if let Some(listener) = read_listener().as_ref() {
+                let _ = listener.unbounded_send(ReadDone { path, failure });
+            }
+        });
+    if spawned.is_err() {
+        reads_running().remove(&path);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The worker's read: through the cache, then held for the drawing.
+fn read_and_hold(path: &Path) {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return;
+    };
+    let cloud = match lookup(path, modified) {
+        Some(hit) => hit,
+        None => decode_and_cache(path, modified),
+    };
+    if let Some(cloud) = cloud {
+        held_clouds().insert(path.to_path_buf(), (modified, cloud));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A file version whose read panicked: remembered as a file that failed.
+fn remember_failure(path: &Path) {
+    if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
+        let cost = cloud_cost(path, &None);
+        cloud_cache().insert_with_budget(
+            path.to_path_buf(),
+            (modified, None),
+            cost,
+            point_cloud_cache_budget_bytes(),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "the reader stopped".to_string())
+}
+
+/// Drops the held clouds of the files for which `keep` is false: the app
+/// gives the files that its open drawings refer to.
+pub(crate) fn release_unreferenced(keep: impl Fn(&Path) -> bool) {
+    held_clouds().retain(|path, _| keep(path));
 }
 
 fn decode(path: &Path) -> Option<CloudPoints> {
@@ -313,7 +552,7 @@ pub(crate) fn hidden(data: &PointCloudExData) -> Vec<String> {
 /// Whether a cloud draws none of its points: its file is not found, or its
 /// unassigned points or every scan are turned off.
 pub(crate) fn shows_no_points(document: &Document, data: &PointCloudExData) -> bool {
-    let Some(cloud) = resolve_source(document, data).and_then(|path| load(&path)) else {
+    let Some(cloud) = resolve_source(document, data).and_then(|path| cached(&path)) else {
         return true;
     };
     data.hidden_regions.contains(&0)
@@ -334,7 +573,7 @@ pub(crate) fn placed(
     transform: Option<&Transform>,
     hidden: &[String],
 ) -> Option<Arc<PlacedCloud>> {
-    let cloud = load(&resolve_source(document, data)?)?;
+    let cloud = cached(&resolve_source(document, data)?)?;
     let skipped: Vec<std::ops::Range<usize>> = if hidden.iter().any(|h| h == UNASSIGNED_OFF) {
         vec![0..cloud.positions.len()]
     } else {
@@ -957,4 +1196,431 @@ pub(crate) fn setting_value(document: &Document, setting: Setting) -> i64 {
     crate::io::drawing_variable(document, setting.name)
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(setting.default)
+}
+
+/// A scan file of `points` points in the temp folder, for the tests of
+/// other modules.
+#[cfg(test)]
+pub(crate) fn test_scan_file(tag: &str, points: u32) -> PathBuf {
+    tests::budget_scan(tag, points)
+}
+
+/// Waits (up to 10 s) until no read of `path` that [`cached`] started
+/// runs, for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_wait_for_read(path: &Path) {
+    let start = std::time::Instant::now();
+    while reads_running().contains(path) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the read of {} did not end",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Whether the held clouds have `path`, for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_is_held(path: &Path) -> bool {
+    held_clouds().contains_key(path)
+}
+
+/// The held clouds are one set for the process: a test that lets go of
+/// clouds, or that looks at what is held, takes this lock first.
+#[cfg(test)]
+pub(crate) fn test_held_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialises the tests that shrink the process-wide point-cloud budget:
+    /// the env override is shared by every test thread in this process.
+    static POINTCLOUD_BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PointCloudBudgetEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PointCloudBudgetEnvGuard {
+        fn set(mib: &str) -> Self {
+            let previous = std::env::var_os("OCS_POINTCLOUD_CACHE_MB");
+            std::env::set_var("OCS_POINTCLOUD_CACHE_MB", mib);
+            Self { previous }
+        }
+    }
+
+    impl Drop for PointCloudBudgetEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("OCS_POINTCLOUD_CACHE_MB", value),
+                None => std::env::remove_var("OCS_POINTCLOUD_CACHE_MB"),
+            }
+        }
+    }
+
+    /// A minimal single-node indexed scan ("ADOCT") with `points` deterministic
+    /// points, laid out exactly as `rcs::decode` reads it: header transforms and
+    /// flags, a two-entry section directory, one 368-byte node record with every
+    /// octree level empty, then 16-byte records of three 18-bit millimetre
+    /// offsets. Each decoded cloud is a pure function of (seed, index).
+    fn scan_bytes(seed: u32, points: u32) -> Vec<u8> {
+        const DIR: usize = 0x15D;
+        const NODE_RECORD: usize = 368;
+        let data = DIR + 8 + NODE_RECORD;
+        let n = points as usize;
+        let block_size = n * 20;
+        let mut b = vec![0u8; data + block_size];
+        b[0..5].copy_from_slice(b"ADOCT");
+        let put_f64 =
+            |b: &mut [u8], at: usize, v: f64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let put_u32 =
+            |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put_u64 =
+            |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        put_f64(&mut b, 0x40, 1.0);
+        put_f64(&mut b, 0x48, 1.0);
+        put_f64(&mut b, 0x50, 1.0);
+        put_f64(&mut b, 0xB8, 256.0);
+        put_f64(&mut b, 0xC0, 256.0);
+        put_f64(&mut b, 0xC8, 256.0);
+        b[0xE0] = 1; // RGB
+        b[0xE2] = 1; // intensity
+        b[0xE3..0xE3 + 6].copy_from_slice(b"{test}");
+        put_u32(&mut b, 0x129, 2);
+        put_u64(&mut b, 0x12D, 2);
+        put_u64(&mut b, 0x12D + 8, DIR as u64);
+        put_u64(&mut b, 0x12D + 16, (8 + NODE_RECORD) as u64);
+        put_u64(&mut b, 0x12D + 24, 1);
+        put_u64(&mut b, 0x12D + 32, data as u64);
+        put_u64(&mut b, 0x12D + 40, block_size as u64);
+        put_u64(&mut b, DIR, 1);
+        let rec = DIR + 8;
+        put_u32(&mut b, rec + 100, points);
+        put_u32(&mut b, rec + 104, block_size as u32);
+        let records = data + n * 4;
+        for i in 0..n {
+            let at = records + i * 16;
+            let x = (i as u32 + seed) % 200_000;
+            let y = (i as u32 * 7 + seed) % 200_000;
+            let z = (i as u32 * 13 + seed) % 200_000;
+            let v = u64::from(x) | (u64::from(y) << 18) | (u64::from(z) << 36);
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            b[at + 8] = (i % 256) as u8;
+            b[at + 9] = (seed % 256) as u8;
+            b[at + 10] = ((i * 3) % 256) as u8;
+            b[at + 11] = ((i * 5) % 256) as u8;
+        }
+        b
+    }
+
+    /// A 7000-point scan decodes to ~280 KiB of point arrays, so three distinct
+    /// clouds fit a 1 MiB budget and four do not — the window the recency test
+    /// needs to tell a promoting hit from a non-promoting peek.
+    pub(super) fn budget_scan(tag: &str, points: u32) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ocs-pointcloud-budget-{tag}-{}-{}.rcs",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, scan_bytes(0, points)).expect("write budget scan");
+        path
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open scan for mtime")
+            .set_modified(time)
+            .expect("set scan mtime");
+    }
+
+    #[test]
+    fn scan_sweep_past_budget_evicts_the_oldest() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("1");
+        let a = budget_scan("sweep-a", 7000);
+        let oldest = load(&a).expect("decode A");
+        let mut pushed = Vec::new();
+        for tag in ["sweep-b", "sweep-c", "sweep-d", "sweep-e"] {
+            let path = budget_scan(tag, 7000);
+            drop(load(&path).expect("sweep decode"));
+            pushed.push(path);
+        }
+        let again = load(&a).expect("re-decode A");
+        assert!(
+            !Arc::ptr_eq(&oldest, &again),
+            "the oldest cloud must be evicted once the sweep passes the budget"
+        );
+        for path in std::iter::once(a).chain(pushed) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A cache hit must promote the entry: a re-touched older cloud survives a
+    /// sweep that evicts an untouched newer one. Three ~280 KiB clouds fit the
+    /// 1 MiB budget before the sweep pushes past it.
+    #[test]
+    fn re_touching_an_older_cloud_keeps_it_cached_past_the_budget() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("1");
+        let a = budget_scan("recency-a", 7000);
+        let b = budget_scan("recency-b", 7000);
+        let c = budget_scan("recency-c", 7000);
+        let d = budget_scan("recency-d", 7000);
+        let oldest = load(&a).expect("decode A");
+        let middle = load(&b).expect("decode B");
+        let touched = load(&a).expect("re-touch A");
+        assert!(
+            Arc::ptr_eq(&oldest, &touched),
+            "re-touch reads the cached cloud"
+        );
+        drop(touched);
+        for path in [&c, &d] {
+            drop(load(path).expect("push decode"));
+        }
+        let b_again = load(&b).expect("re-decode B");
+        let b_cached = Arc::ptr_eq(&middle, &b_again);
+        let a_again = load(&a).expect("re-decode A");
+        let a_cached = Arc::ptr_eq(&oldest, &a_again);
+        // Recency under a shared budget: A must outlive B, not absolutely
+        // survive — probing B re-inserts it and may evict A in turn.
+        assert!(
+            a_cached || !b_cached,
+            "the re-touched cloud outlives the untouched one under eviction"
+        );
+        for path in [a, b, c, d] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn recent_cloud_survives_a_sweep_within_budget() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("128");
+        let a = budget_scan("within-a", 7000);
+        let b = budget_scan("within-b", 7000);
+        let first = load(&a).expect("decode A");
+        drop(load(&b).expect("decode B"));
+        let again = load(&a).expect("re-read A");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a cloud within the budget stays cached across a sweep"
+        );
+        for path in [a, b] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_cloud_larger_than_the_budget_is_not_retained() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("1");
+        let big = budget_scan("oversized", 40_000);
+        let first = load(&big).expect("decode oversized");
+        let again = load(&big).expect("re-decode oversized");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "a cloud larger than the budget must not be retained"
+        );
+        let _ = std::fs::remove_file(big);
+    }
+
+    /// The budget must not defeat modification-time invalidation: a cloud whose
+    /// file stamp changes re-decodes even when it still fits the budget.
+    #[test]
+    fn a_changed_modification_time_re_decodes_within_budget() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("128");
+        let path = budget_scan("mtime", 7000);
+        let first = load(&path).expect("decode");
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        set_modified(&path, stamp + std::time::Duration::from_secs(2));
+        let again = load(&path).expect("re-decode");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "a new modification time must invalidate the cached cloud"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A memoised decode failure must not outlive its eviction: a corrupt file
+    /// caches `None`, and once the budget sweeps that entry away a file that has
+    /// since been fixed decodes. The stamp is held constant across the fix so
+    /// only eviction — not modification-time invalidation — can trigger retry.
+    #[test]
+    fn an_evicted_decode_failure_retries_when_the_file_is_fixed() {
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("1");
+        let path = budget_scan("late-arrival", 7000);
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"not a scan").expect("write corrupt scan");
+        set_modified(&path, stamp);
+        assert!(load(&path).is_none(), "corrupt file stays None");
+        for i in 0..6 {
+            let push = budget_scan(&format!("late-push-{i}"), 7000);
+            drop(load(&push).expect("push decode"));
+            let _ = std::fs::remove_file(push);
+        }
+        std::fs::write(&path, scan_bytes(99, 7000)).expect("write fixed scan");
+        set_modified(&path, stamp);
+        let loaded = load(&path).expect("the evicted failure must retry");
+        assert_eq!(loaded.positions.len(), 7000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A lock that a panic poisoned does not stop later reads: the cache
+    /// takes the data back from the poisoned lock.
+    #[test]
+    fn a_poisoned_cache_lock_does_not_stop_later_reads() {
+        let path = budget_scan("poisoned", 100);
+        let _ = std::thread::spawn(|| {
+            let _cache = cloud_cache();
+            panic!("a decode bug while the cache is locked");
+        })
+        .join();
+        let cloud = load(&path).expect("the scan reads after the poison");
+        assert_eq!(cloud.positions.len(), 100);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The drawing's lookup does not read: the first call gives None and
+    /// starts a read on a worker, and the cloud is there when it ends.
+    #[test]
+    fn cached_does_not_read_and_a_worker_fills_it() {
+        let _held = test_held_lock();
+        let path = budget_scan("display-read", 50);
+        assert!(cached(&path).is_none(), "nothing is read on this thread");
+        test_wait_for_read(&path);
+        let cloud = cached(&path).expect("the worker read the scan");
+        assert_eq!(cloud.positions.len(), 50);
+        assert!(test_is_held(&path));
+        release_unreferenced(|held| held != path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A held cloud is for one version of its file: when the file
+    /// changes, the drawing gets nothing until a new read ends.
+    #[test]
+    fn a_held_cloud_of_an_older_file_version_is_not_used() {
+        let _held = test_held_lock();
+        let path = budget_scan("display-changed", 10);
+        assert!(cached(&path).is_none());
+        test_wait_for_read(&path);
+        assert!(test_is_held(&path));
+        cloud_cache().pop(&path);
+        set_modified(&path, SystemTime::now() + std::time::Duration::from_secs(5));
+        assert!(cached(&path).is_none(), "the old version is not used");
+        test_wait_for_read(&path);
+        assert!(cached(&path).is_some(), "the new version after its read");
+        release_unreferenced(|held| held != path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The message of a panic, from a literal or a formatted message.
+    #[test]
+    fn panic_text_gives_the_message() {
+        let literal = std::panic::catch_unwind(|| panic!("a reader bug")).unwrap_err();
+        assert_eq!(panic_text(literal.as_ref()), "a reader bug");
+        let formatted = std::panic::catch_unwind(|| panic!("byte {} is bad", 7)).unwrap_err();
+        assert_eq!(panic_text(formatted.as_ref()), "byte 7 is bad");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(7_u8)).unwrap_err();
+        assert_eq!(panic_text(other.as_ref()), "the reader stopped");
+    }
+
+    static SLOW_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn slow_reader(_: &Path) {
+        SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    /// Many lookups during a read start one read, not one for each frame.
+    #[test]
+    fn many_misses_during_a_read_start_one_read() {
+        let path = budget_scan("display-one-read", 10);
+        for _ in 0..20 {
+            request_with(path.clone(), slow_reader);
+        }
+        test_wait_for_read(&path);
+        assert_eq!(SLOW_READS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn panicking_reader(_: &Path) {
+        panic!("a reader bug");
+    }
+
+    /// A read that panics is remembered as a file that failed: the next
+    /// lookup gives None and does not start a read again.
+    #[test]
+    fn a_read_that_panics_is_remembered_as_a_failure() {
+        let path = budget_scan("display-panic", 10);
+        request_with(path.clone(), panicking_reader);
+        test_wait_for_read(&path);
+        assert!(cached(&path).is_none());
+        // A second read would succeed: the file is a good scan.
+        test_wait_for_read(&path);
+        assert!(
+            cached(&path).is_none(),
+            "no read starts again for the same file version"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The clouds a drawing shows stay past the budget of the cache, and
+    /// go when no drawing refers to their file.
+    #[test]
+    fn held_clouds_stay_past_the_budget_until_released() {
+        let _held = test_held_lock();
+        let _lock = POINTCLOUD_BUDGET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _budget = PointCloudBudgetEnvGuard::set("1");
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|n| budget_scan(&format!("display-held-{n}"), 7000))
+            .collect();
+        for path in &paths {
+            assert!(cached(path).is_none());
+            test_wait_for_read(path);
+        }
+        let first: Vec<Arc<CloudPoints>> = paths
+            .iter()
+            .map(|path| cached(path).expect("held past the budget"))
+            .collect();
+        for (path, cloud) in paths.iter().zip(&first) {
+            let again = cached(path).expect("still held");
+            assert!(Arc::ptr_eq(cloud, &again), "no second read");
+        }
+        let keep = paths[0].clone();
+        release_unreferenced(|path| path == keep);
+        assert!(test_is_held(&paths[0]));
+        for path in &paths[1..] {
+            assert!(!test_is_held(path));
+        }
+        release_unreferenced(|_| false);
+        for path in paths {
+            test_wait_for_read(&path);
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

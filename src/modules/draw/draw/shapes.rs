@@ -11,10 +11,10 @@
 //   POLY_E — Edge (pick two endpoints of one edge)
 
 use crate::t;
-use codec::entities::LwVertex;
-use codec::types::Vector2;
-use codec::{EntityType, LwPolyline};
-use kernel::geom2d::{
+use document::entities::LwVertex;
+use document::types::Vector2;
+use document::{EntityType, LwPolyline};
+use ocs_geom::geom2d::{
     arc_span, fillet_between_rays, Curve as KernelCurve, Frame as KernelFrame,
     Polyline as KernelPolyline, PolylineVertex as KernelVertex, Ray as KernelRay,
     Transform as KernelTransform, Vec2 as KernelVec2,
@@ -367,12 +367,20 @@ enum RectStep {
     Thickness,
     Width,
     Rotation,
+    /// Rotation's Pick points: the first point, then the second.
+    RotationPick(Option<DVec3>),
     AreaValue,
     AreaBasis(f64),
-    AreaDimension { area: f64, by_length: bool },
+    AreaDimension {
+        area: f64,
+        by_length: bool,
+    },
     DimensionsLength,
     DimensionsWidth(f64),
-    PlaceSized { width: f64, height: f64 },
+    PlaceSized {
+        width: f64,
+        height: f64,
+    },
 }
 
 pub struct RectCommand {
@@ -386,9 +394,153 @@ pub struct RectCommand {
     thickness: f64,
     width: f64,
     rotation_deg: f64,
+    /// Signed width/height of the last opposite-corner preview, kept so the
+    /// Rotation steps can show the rectangle turning.
+    last_size: Option<(f64, f64)>,
+    /// HATCH's Rectangle: its prompts, and no Thickness or Width.
+    hatch: bool,
+}
+
+impl Default for RectCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RectCommand {
+    /// The rectangle HATCH draws as a boundary, with the same modes.
+    pub fn for_hatch() -> Self {
+        Self {
+            hatch: true,
+            ..Self::new()
+        }
+    }
+
+    /// `Current rectangle modes:` while a chamfer, fillet or elevation is set.
+    pub(crate) fn modes_line(&self) -> Option<String> {
+        // The prompts show four decimals, as the reference does.
+        let format_length = |value: f64| format!("{value:.4}");
+        let mut modes = Vec::new();
+        if self.fillet_radius > 0.0 {
+            modes.push(format!("Fillet={}", format_length(self.fillet_radius)));
+        } else if self.chamfer_first > 0.0 || self.chamfer_second > 0.0 {
+            modes.push(format!(
+                "Chamfer={} x {}",
+                format_length(self.chamfer_first),
+                format_length(self.chamfer_second)
+            ));
+        }
+        if self.elevation != 0.0 {
+            modes.push(format!("Elevation={}", format_length(self.elevation)));
+        }
+        (!modes.is_empty()).then(|| {
+            crate::tr!(
+                "hatch-cmd",
+                "rect-modes",
+                modes = format!("{}  ", modes.join("  "))
+            )
+        })
+    }
+
+    /// The prompt of the current step as HATCH asks it.
+    pub(crate) fn hatch_prompt(&self) -> String {
+        let format_length = |value: f64| format!("{value:.4}");
+        match self.step {
+            RectStep::FirstCorner => crate::tr!("hatch-cmd", "rect-first"),
+            RectStep::Opposite | RectStep::PlaceSized { .. } => {
+                crate::tr!("hatch-cmd", "rect-other")
+            }
+            RectStep::ChamferFirst => crate::tr!(
+                "hatch-cmd",
+                "rect-chamfer-first",
+                value = format_length(self.chamfer_first)
+            ),
+            RectStep::ChamferSecond => crate::tr!(
+                "hatch-cmd",
+                "rect-chamfer-second",
+                value = format_length(self.chamfer_second)
+            ),
+            RectStep::Elevation => crate::tr!(
+                "hatch-cmd",
+                "rect-elevation",
+                value = format_length(self.elevation)
+            ),
+            RectStep::Fillet => crate::tr!(
+                "hatch-cmd",
+                "rect-fillet",
+                value = format_length(self.fillet_radius)
+            ),
+            RectStep::Thickness | RectStep::Width => self.prompt(),
+            RectStep::Rotation => crate::tr!(
+                "hatch-cmd",
+                "rect-rotation",
+                value = crate::entities::common::format_direction(self.rotation_deg.to_radians())
+            ),
+            RectStep::RotationPick(None) => crate::tr!("hatch-cmd", "first-point"),
+            RectStep::RotationPick(Some(_)) => crate::tr!("hatch-cmd", "second-point"),
+            RectStep::AreaValue => crate::tr!(
+                "hatch-cmd",
+                "rect-area",
+                value = format_length(defaults::get_rect_area())
+            ),
+            RectStep::AreaBasis(_) => crate::tr!("hatch-cmd", "rect-area-basis"),
+            RectStep::AreaDimension {
+                by_length: true, ..
+            } => crate::tr!(
+                "hatch-cmd",
+                "rect-area-length",
+                value = format_length(defaults::get_rect_length())
+            ),
+            RectStep::AreaDimension {
+                by_length: false, ..
+            } => crate::tr!(
+                "hatch-cmd",
+                "rect-area-width",
+                value = format_length(defaults::get_rect_side())
+            ),
+            RectStep::DimensionsLength => crate::tr!(
+                "hatch-cmd",
+                "rect-length",
+                value = format_length(defaults::get_rect_length())
+            ),
+            RectStep::DimensionsWidth(_) => crate::tr!(
+                "hatch-cmd",
+                "rect-width",
+                value = format_length(defaults::get_rect_side())
+            ),
+        }
+    }
+
+    /// The rectangle of `area` (plus what its chamfers or fillets cut off)
+    /// that is `value` long or wide, drawn from the first corner along the
+    /// rotated axes.
+    fn area_dimension(&mut self, area: f64, by_length: bool, value: f64) -> Option<CmdResult> {
+        let cut = if self.fillet_radius > 0.0 {
+            (4.0 - PI) * self.fillet_radius * self.fillet_radius
+        } else {
+            2.0 * self.chamfer_first * self.chamfer_second
+        };
+        let other = (area + cut) / value;
+        let (width, height) = if by_length {
+            (value, other)
+        } else {
+            (other, value)
+        };
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        defaults::set_rect_length(width);
+        defaults::set_rect_side(height);
+        let first = self.first?;
+        let rotation = KernelTransform::rotation(self.rotation_deg.to_radians());
+        let [ax, ay] = rotation.apply_vector([width, 0.0]);
+        let [bx, by] = rotation.apply_vector([0.0, height]);
+        let mut local = self.plane.to_local(first);
+        local.x += ax + bx;
+        local.y += ay + by;
+        Some(self.finish(self.plane.to_world(local), Some((width, height))))
+    }
+
     pub fn new() -> Self {
         Self {
             step: RectStep::FirstCorner,
@@ -401,7 +553,19 @@ impl RectCommand {
             thickness: defaults::get_rect_thickness(),
             width: defaults::get_rect_width().max(0.0),
             rotation_deg: defaults::get_rect_rotation(),
+            last_size: None,
+            hatch: false,
         }
+    }
+
+    /// The last previewed rectangle turned to `rotation_deg`.
+    fn rotated_preview(&self, rotation_deg: f64) -> Option<WireModel> {
+        let (first, (width, height)) = (self.first?, self.last_size?);
+        let rotation = KernelTransform::rotation(rotation_deg.to_radians());
+        let [dx, dy] = rotation.apply_vector([width, height]);
+        let cursor = first + self.plane.vector_to_world(DVec3::new(dx, dy, 0.0));
+        let corners = rectangle_corners(first, cursor, self.plane, rotation_deg, None)?;
+        rectangle_wire(corners, self.plane, self.style())
     }
 
     fn style(&self) -> RectStyle {
@@ -479,6 +643,10 @@ impl CadCommand for RectCommand {
                 crate::entities::common::format_direction(self.rotation_deg.to_radians())
             )
             .into_owned(),
+            RectStep::RotationPick(None) => crate::t!("RECT  Specify first point:").into_owned(),
+            RectStep::RotationPick(Some(_)) => {
+                crate::t!("RECT  Specify second point:").into_owned()
+            }
             RectStep::AreaValue => crate::t!("RECT  Specify rectangle area:").into_owned(),
             RectStep::AreaBasis(_) => {
                 crate::t!("RECT  Calculate dimensions based on [Length / Width] <Length>:")
@@ -503,6 +671,12 @@ impl CadCommand for RectCommand {
     fn options(&self) -> Vec<crate::command::CmdOption> {
         use crate::command::CmdOption;
         match self.step {
+            RectStep::FirstCorner if self.hatch => vec![
+                CmdOption::new("Chamfer", "CHAMFER"),
+                CmdOption::new("Elevation", "ELEVATION"),
+                CmdOption::new("Fillet", "FILLET"),
+            ],
+            RectStep::Rotation => vec![CmdOption::new("Pick points", "P")],
             RectStep::FirstCorner => vec![
                 CmdOption::new("Chamfer", "CHAMFER"),
                 CmdOption::new("Elevation", "ELEVATION"),
@@ -534,6 +708,7 @@ impl CadCommand for RectCommand {
     fn dyn_field(&self) -> crate::command::DynField {
         match self.step {
             RectStep::Rotation => crate::command::DynField::Angle,
+            RectStep::RotationPick(_) => crate::command::DynField::Point,
             RectStep::ChamferFirst
             | RectStep::ChamferSecond
             | RectStep::Elevation
@@ -566,6 +741,7 @@ impl CadCommand for RectCommand {
                         self.step = RectStep::Fillet;
                         Some(CmdResult::NeedPoint)
                     }
+                    "T" | "THICKNESS" | "W" | "WIDTH" if self.hatch => None,
                     "T" | "THICKNESS" => {
                         self.step = RectStep::Thickness;
                         Some(CmdResult::NeedPoint)
@@ -616,7 +792,14 @@ impl CadCommand for RectCommand {
             _ => {}
         }
 
+        if matches!(self.step, RectStep::RotationPick(_)) {
+            return None;
+        }
         if matches!(self.step, RectStep::Rotation) {
+            if matches!(upper.as_str(), "P" | "PICK") {
+                self.step = RectStep::RotationPick(None);
+                return Some(CmdResult::NeedPoint);
+            }
             let angle = crate::entities::common::parse_typed_direction(text)?;
             if !angle.is_finite() {
                 return None;
@@ -672,23 +855,18 @@ impl CadCommand for RectCommand {
                 self.step = RectStep::FirstCorner;
             }
             RectStep::AreaValue if value > 0.0 => {
+                defaults::set_rect_area(value);
                 self.step = RectStep::AreaBasis(value);
             }
             RectStep::AreaDimension { area, by_length } if value > 0.0 => {
-                let (width, height) = if by_length {
-                    (value, area / value)
-                } else {
-                    (area / value, value)
-                };
-                if !width.is_finite() || !height.is_finite() {
-                    return None;
-                }
-                self.step = RectStep::PlaceSized { width, height };
+                return self.area_dimension(area, by_length, value);
             }
             RectStep::DimensionsLength if value > 0.0 => {
+                defaults::set_rect_length(value);
                 self.step = RectStep::DimensionsWidth(value);
             }
             RectStep::DimensionsWidth(length) if value > 0.0 => {
+                defaults::set_rect_side(value);
                 self.step = RectStep::PlaceSized {
                     width: length,
                     height: value,
@@ -714,6 +892,20 @@ impl CadCommand for RectCommand {
                     return CmdResult::NeedPoint;
                 };
                 let delta = self.plane.vector_to_local(pt - first);
+                if delta.x.hypot(delta.y) <= 1.0e-9 {
+                    return CmdResult::NeedPoint;
+                }
+                self.rotation_deg = delta.y.atan2(delta.x).to_degrees();
+                defaults::set_rect_rotation(self.rotation_deg);
+                self.step = RectStep::Opposite;
+                CmdResult::NeedPoint
+            }
+            RectStep::RotationPick(None) => {
+                self.step = RectStep::RotationPick(Some(pt));
+                CmdResult::NeedPoint
+            }
+            RectStep::RotationPick(Some(from)) => {
+                let delta = self.plane.vector_to_local(pt - from);
                 if delta.x.hypot(delta.y) <= 1.0e-9 {
                     return CmdResult::NeedPoint;
                 }
@@ -753,6 +945,31 @@ impl CadCommand for RectCommand {
                 };
                 CmdResult::NeedPoint
             }
+            // Enter takes the value shown in angle brackets.
+            RectStep::AreaValue => {
+                self.step = RectStep::AreaBasis(defaults::get_rect_area());
+                CmdResult::NeedPoint
+            }
+            RectStep::AreaDimension { area, by_length } => {
+                let value = if by_length {
+                    defaults::get_rect_length()
+                } else {
+                    defaults::get_rect_side()
+                };
+                self.area_dimension(area, by_length, value)
+                    .unwrap_or(CmdResult::NeedPoint)
+            }
+            RectStep::DimensionsLength => {
+                self.step = RectStep::DimensionsWidth(defaults::get_rect_length());
+                CmdResult::NeedPoint
+            }
+            RectStep::DimensionsWidth(length) => {
+                self.step = RectStep::PlaceSized {
+                    width: length,
+                    height: defaults::get_rect_side(),
+                };
+                CmdResult::NeedPoint
+            }
             _ => CmdResult::NeedPoint,
         }
     }
@@ -768,13 +985,44 @@ impl CadCommand for RectCommand {
         };
         let corners =
             rectangle_corners(first, pt, self.plane, self.rotation_deg, fixed_dimensions)?;
+        if fixed_dimensions.is_none() {
+            let rotation = KernelTransform::rotation(-self.rotation_deg.to_radians());
+            let delta = self.plane.vector_to_local(pt - first);
+            let [width, height] = rotation.apply_vector([delta.x, delta.y]);
+            self.last_size = Some((width, height));
+        }
         rectangle_wire(corners, self.plane, self.style())
+    }
+    fn on_preview_wires(&mut self, pt: DVec3) -> Vec<WireModel> {
+        let from = match self.step {
+            RectStep::Rotation => self.first,
+            RectStep::RotationPick(from) => from,
+            _ => return self.on_mouse_move(pt).into_iter().collect(),
+        };
+        let Some(from) = from else {
+            return self.rotated_preview(self.rotation_deg).into_iter().collect();
+        };
+        let delta = self.plane.vector_to_local(pt - from);
+        let angle = if delta.x.hypot(delta.y) > 1.0e-9 {
+            delta.y.atan2(delta.x).to_degrees()
+        } else {
+            self.rotation_deg
+        };
+        self.rotated_preview(angle)
+            .into_iter()
+            .chain(std::iter::once(wire_seg(from, pt)))
+            .collect()
     }
     fn dyn_spec(&self) -> Option<crate::command::DynSpec> {
         use crate::command::{DynAnchor, DynFieldSpec, DynGuide, DynRole, DynSpec};
-        if !matches!(self.step, RectStep::Opposite) || self.rotation_deg.abs() > 1.0e-9 {
+        if !matches!(self.step, RectStep::Opposite) {
             return None;
         }
+        // A rotated rectangle hands its width direction as the reference, so
+        // W/H measure along its own sides.
+        let rotated = self.rotation_deg.abs() > 1.0e-9;
+        let rotation = self.rotation_deg.to_radians();
+        let width_dir = DVec3::new(rotation.cos(), rotation.sin(), 0.0);
         self.first.map(|first| DynSpec {
             anchor: DynAnchor::Point(first),
             fields: vec![
@@ -782,7 +1030,7 @@ impl CadCommand for RectCommand {
                 DynFieldSpec::new(DynRole::Height),
             ],
             guide: DynGuide::RectSides,
-            ref_point: None,
+            ref_point: rotated.then(|| first + self.plane.vector_to_world(width_dir)),
         })
     }
 }
@@ -797,6 +1045,12 @@ pub struct RectRotCommand {
     a: DVec3,
     b: DVec3,
     plane: WorkingPlane,
+}
+
+impl Default for RectRotCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RectRotCommand {
@@ -925,6 +1179,12 @@ pub struct RectCenCommand {
     plane: WorkingPlane,
 }
 
+impl Default for RectCenCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RectCenCommand {
     pub fn new() -> Self {
         Self {
@@ -1015,6 +1275,12 @@ thread_local! {
     static POLYGON_CIRCUMSCRIBED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+impl Default for PolyCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolyCommand {
     pub fn new() -> Self {
         Self {
@@ -1048,7 +1314,11 @@ impl PolyCommand {
     /// A typed radius sets the size with the bottom edge level.
     fn typed(&self, r: f64) -> (f64, f64) {
         let half = PI / self.sides as f64;
-        let vertex_r = if self.circumscribed { r / half.cos() } else { r };
+        let vertex_r = if self.circumscribed {
+            r / half.cos()
+        } else {
+            r
+        };
         (vertex_r, -PI / 2.0 + half)
     }
 }
@@ -1139,7 +1409,10 @@ impl CadCommand for PolyCommand {
                 Some(CmdResult::NeedPoint)
             }
             _ => {
-                let r = word.parse::<f64>().ok().filter(|r| r.is_finite() && *r > 0.0)?;
+                let r = word
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|r| r.is_finite() && *r > 0.0)?;
                 let (vertex_r, start) = self.typed(r);
                 let vertices = poly_verts(self.center, vertex_r, self.sides, start, self.plane);
                 Some(CmdResult::CommitAndExit(make_pline(&vertices, self.plane)))
@@ -1206,7 +1479,13 @@ impl CadCommand for PolyCommand {
             return None;
         }
         let (vertex_r, start) = self.picked(pt);
-        Some(poly_wire(self.center, vertex_r, self.sides, start, self.plane))
+        Some(poly_wire(
+            self.center,
+            vertex_r,
+            self.sides,
+            start,
+            self.plane,
+        ))
     }
 }
 
@@ -1219,6 +1498,12 @@ pub struct PolyCCommand {
     step: u8,
     center: DVec3,
     plane: WorkingPlane,
+}
+
+impl Default for PolyCCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PolyCCommand {
@@ -1346,6 +1631,12 @@ pub struct PolyECommand {
     step: u8,
     a: DVec3,
     plane: WorkingPlane,
+}
+
+impl Default for PolyECommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PolyECommand {

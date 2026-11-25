@@ -1,9 +1,9 @@
-use codec::entities::{Viewport, ViewportRenderMode};
+use document::entities::{Viewport, ViewportRenderMode};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_prop as edit, parse_f64, ro_prop as ro, square_grip,
 };
+use crate::entities::transform::EntityTransform;
 
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 
@@ -87,8 +87,15 @@ fn properties(vp: &Viewport) -> Vec<PropSection> {
     let shade_opts: Vec<String> = SHADE_PLOT_LABELS.iter().map(|s| s.to_string()).collect();
     let current_shade = shade_plot_label(vp.shade_plot_mode).to_string();
 
+    // A standard label is already a ratio ("10:1", "1:100"); a bare factor
+    // is paper units per drawing unit.
     let annotation_scale = if effective_scale.abs() > 1e-9 {
-        format!("1:{}", scale_label(effective_scale))
+        let label = scale_label(effective_scale);
+        if label.contains(':') {
+            label
+        } else {
+            format!("{label}:1")
+        }
     } else {
         String::new()
     };
@@ -175,11 +182,34 @@ fn properties(vp: &Viewport) -> Vec<PropSection> {
                 ro("Linked to Sheet View", "vp_sheet_view", String::new()),
             ],
         },
+        PropSection {
+            title: "Clipping".into(),
+            props: vec![
+                Property {
+                    label: "Front clip".into(),
+                    field: "vp_front_clipping",
+                    value: PropValue::BoolToggle {
+                        field: "vp_front_clipping",
+                        value: vp.status.front_clipping,
+                    },
+                },
+                edit("Front clip offset", "vp_front_clip", vp.front_clip_z),
+                Property {
+                    label: "Back clip".into(),
+                    field: "vp_back_clipping",
+                    value: PropValue::BoolToggle {
+                        field: "vp_back_clipping",
+                        value: vp.status.back_clipping,
+                    },
+                },
+                edit("Back clip offset", "vp_back_clip", vp.back_clip_z),
+            ],
+        },
     ]
 }
 
 fn apply_geom_prop(vp: &mut Viewport, field: &str, value: &str) {
-    use codec::types::Vector3;
+    use document::types::Vector3;
 
     // Boolean / toggle fields handled first (value = "toggle" or "true"/"false").
     match field {
@@ -225,6 +255,24 @@ fn apply_geom_prop(vp: &mut Viewport, field: &str, value: &str) {
         "vp_ucs_icon" => {
             vp.ucs_icon_visible = if value == "toggle" {
                 !vp.ucs_icon_visible
+            } else {
+                value == "true"
+            };
+            return;
+        }
+        "vp_front_clipping" => {
+            vp.status.front_clipping = if value == "toggle" {
+                !vp.status.front_clipping
+            } else {
+                value == "true"
+            };
+            // The offset typed here places the plane; "at eye" ignores it.
+            vp.status.front_clip_not_at_eye |= vp.status.front_clipping;
+            return;
+        }
+        "vp_back_clipping" => {
+            vp.status.back_clipping = if value == "toggle" {
+                !vp.status.back_clipping
             } else {
                 value == "true"
             };
@@ -321,14 +369,14 @@ fn apply_geom_prop(vp: &mut Viewport, field: &str, value: &str) {
 fn apply_grip(vp: &mut Viewport, grip_id: usize, apply: GripApply) {
     match (grip_id, apply) {
         (0, GripApply::Translate(d)) => {
-            vp.center.x += d.x as f64;
-            vp.center.y += d.y as f64;
-            vp.center.z += d.z as f64;
+            vp.center.x += d.x;
+            vp.center.y += d.y;
+            vp.center.z += d.z;
         }
         (0, GripApply::Absolute(p)) => {
-            vp.center.x = p.x as f64;
-            vp.center.y = p.y as f64;
-            vp.center.z = p.z as f64;
+            vp.center.x = p.x;
+            vp.center.y = p.y;
+            vp.center.z = p.z;
         }
         (1..=4, GripApply::Absolute(p)) => {
             let hw = vp.width * 0.5;
@@ -340,7 +388,7 @@ fn apply_grip(vp: &mut Viewport, grip_id: usize, apply: GripApply) {
                 4 => (vp.center.x - hw, vp.center.y + hh),
                 _ => unreachable!(),
             };
-            resize_from_corners(vp, opposite, (p.x as f64, p.y as f64));
+            resize_from_corners(vp, opposite, (p.x, p.y));
         }
         _ => {}
     }
@@ -459,6 +507,16 @@ fn resize_from_corners(vp: &mut Viewport, a: (f64, f64), b: (f64, f64)) -> bool 
 }
 
 fn apply_transform(vp: &mut Viewport, t: &EntityTransform) {
+    // Moving, scaling or rotating the frame on the sheet leaves the model view
+    // where it was: target, view direction and UCS are model-space values, and
+    // transforming them with the sheet point shifted the content (#3329).
+    let model_view = (
+        vp.view_target,
+        vp.view_direction,
+        vp.ucs_origin,
+        vp.ucs_x_axis,
+        vp.ucs_y_axis,
+    );
     crate::scene::view::transform::apply_standard_entity_transform(vp, t, |entity, p1, p2| {
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.center.x,
@@ -467,6 +525,13 @@ fn apply_transform(vp: &mut Viewport, t: &EntityTransform) {
             p2,
         );
     });
+    (
+        vp.view_target,
+        vp.view_direction,
+        vp.ucs_origin,
+        vp.ucs_x_axis,
+        vp.ucs_y_axis,
+    ) = model_view;
 }
 
 crate::impl_entity_basics!(Viewport);
@@ -491,6 +556,47 @@ impl crate::entities::traits::FallbackTess for Viewport {
             [cx - hw, cy + hh, cz],
             [cx - hw, cy - hh, cz],
         ];
-        (pts, vec![], vec![], vec![])
+        // The corners as key vertices: Endpoint snaps to each corner and
+        // Midpoint to each edge, as on any closed polyline.
+        (pts.clone(), vec![], vec![], pts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2821: a viewport's frame snaps at its corners and edge midpoints.
+    #[test]
+    fn viewport_frame_has_its_corners_as_key_vertices() {
+        use crate::entities::traits::FallbackTess;
+        let mut vp = Viewport::default();
+        vp.center = document::types::Vector3::new(5.0, 2.0, 0.0);
+        vp.width = 10.0;
+        vp.height = 4.0;
+        let (_, _, _, key) = vp.fallback_geometry();
+        assert_eq!(key.first(), Some(&[0.0, 0.0, 0.0]));
+        assert!(key.contains(&[10.0, 4.0, 0.0]));
+        assert_eq!(key.len(), 5, "closed: the last edge has a midpoint too");
+    }
+
+    /// D#2542: a 10× viewport read "1:10:1" as its annotation scale.
+    #[test]
+    fn the_fallback_annotation_scale_is_one_ratio() {
+        let label = |scale: f64| {
+            let mut vp = Viewport::new();
+            vp.height = 100.0;
+            vp.view_height = 100.0 / scale;
+            vp.custom_scale = scale;
+            properties(&vp)
+                .into_iter()
+                .flat_map(|section| section.props)
+                .find(|p| p.field == "vp_anno_scale")
+                .map(|p| format!("{:?}", p.value))
+                .unwrap()
+        };
+        assert!(label(10.0).contains("\"10:1\""), "{}", label(10.0));
+        assert!(label(0.01).contains("\"1:100\""), "{}", label(0.01));
+        assert!(!label(10.0).contains("1:10:1"));
     }
 }

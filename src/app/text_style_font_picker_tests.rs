@@ -7,7 +7,7 @@ use crate::entities::text_support::{TTF_FLAG_BOLD, TTF_FLAG_ITALIC};
 use crate::ui::font_picker::{
     catalogue, FaceStyle, FontChoice, FontPickerEvent, FontPickerState, Section,
 };
-use codec::tables::TextStyle;
+use document::tables::TextStyle;
 
 fn style(name: &str, font_file: &str, family: &str) -> TextStyle {
     let mut style = TextStyle::new(name);
@@ -59,11 +59,12 @@ fn the_drawing_fonts_come_first_and_a_missing_one_is_marked() {
         drawing.contains(&("No Such Family".to_string(), true)),
         "{drawing:?}"
     );
-    // The new drawing's Standard style uses txt.shx: listed once, by name.
+    // The new drawing's Standard and Annotative styles both use Arial:
+    // listed once.
     assert_eq!(
         drawing
             .iter()
-            .filter(|(label, _)| label == "Standard")
+            .filter(|(label, _)| label == "Arial")
             .count(),
         1
     );
@@ -119,6 +120,29 @@ fn a_pick_in_the_manager_writes_the_file_and_closes_the_list() {
     let _ = app.update(Message::TextStyleApply);
     let doc = &app.tabs[app.active_tab].scene.document;
     assert_eq!(doc.text_styles.get("Notes").unwrap().font_file, "isocp.shx");
+}
+
+#[test]
+fn a_bigfont_pick_in_the_manager_writes_the_file_and_closes_the_list() {
+    let mut s = style("Notes", "txt.shx", "");
+    s.big_font_file = "chineset.shx".to_string();
+    let mut app = app_with_styles(vec![s]);
+    open_on(&mut app, "Notes");
+    assert!(app.textstyle_draft.big_font_on);
+    let _ = app.update(Message::TextStyleBigFont(FontPickerEvent::Toggle));
+    assert!(app.textstyle_bigfont_picker.open);
+
+    let _ = app.update(Message::TextStyleBigFont(FontPickerEvent::Pick(
+        FontChoice::Stroke("china1.shx".to_string()),
+    )));
+    assert!(!app.textstyle_bigfont_picker.open);
+    assert_eq!(app.textstyle_draft.style.big_font_file, "china1.shx");
+    let _ = app.update(Message::TextStyleApply);
+    let doc = &app.tabs[app.active_tab].scene.document;
+    assert_eq!(
+        doc.text_styles.get("Notes").unwrap().big_font_file,
+        "china1.shx"
+    );
 }
 
 #[test]

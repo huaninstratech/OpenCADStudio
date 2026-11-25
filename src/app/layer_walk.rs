@@ -21,7 +21,7 @@ use crate::ui::dock::PanelId;
 use crate::ui::window::layer_walk::{
     self, LayerWalkMenuItem, LayerWalkMsg, LayerWalkRow, LayerWalkSession, LayerWalkSort,
 };
-use codec::Handle;
+use document::Handle;
 
 impl OpenCADStudio {
     // ── Open / close ──────────────────────────────────────────────────────
@@ -125,6 +125,7 @@ impl OpenCADStudio {
             tab.layer_walk_rows.len(),
             self.ctrl_down,
             self.shift_down,
+            self.layer_walk_col_w,
             width,
             chrome,
         )
@@ -178,7 +179,7 @@ impl OpenCADStudio {
         // An INSERT holds its attributes inside itself, so their layers are
         // referenced by the instance and appear nowhere in the entity list.
         for e in doc.entities() {
-            if let codec::EntityType::Insert(ins) = e {
+            if let document::EntityType::Insert(ins) = e {
                 for a in &ins.attributes {
                     note(&a.common.layer);
                 }
@@ -406,6 +407,17 @@ impl OpenCADStudio {
                     session.pattern = Some(name.clone());
                     session.saved_active = Some(name);
                 }
+            }
+            LayerWalkMsg::ColumnGrab(col, shown) => {
+                // The drag starts from the width the column shows: a Name
+                // column giving way to a narrow pallet would otherwise jump
+                // to its full width. From then on it keeps the width set.
+                if let Some(w) = self.layer_walk_col_w.get_mut(col) {
+                    *w = shown;
+                }
+                // The dock's pointer capture feeds the drag (see `on_dock`).
+                self.dock_drag = Some(crate::ui::dock::DockDrag::WalkColumn(col));
+                self.dock_drag_last = None;
             }
             LayerWalkMsg::Sort(col) => {
                 {
@@ -814,7 +826,7 @@ impl OpenCADStudio {
             let layers = doc
                 .layers
                 .iter()
-                .map(|l| codec::LayerStateLayer {
+                .map(|l| document::LayerStateLayer {
                     layer_handle: l.handle,
                     layer_name: l.name.clone(),
                     // The walk's decision replaces the table's for every layer
@@ -841,10 +853,10 @@ impl OpenCADStudio {
                     transparency: Some(l.transparency),
                 })
                 .collect::<Vec<_>>();
-            codec::LayerState {
+            document::LayerState {
                 name: self.layer_state_name_buf.clone(),
                 description: String::new(),
-                mask: codec::LayerStateMask::SUPPORTED,
+                mask: document::LayerStateMask::SUPPORTED,
                 hidden: false,
                 current_layer: doc.header.current_layer_name.clone(),
                 layers,

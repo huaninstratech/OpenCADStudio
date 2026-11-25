@@ -3,12 +3,18 @@
 
 use crate::command::{CadCommand, CmdResult};
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 pub struct QuickPrintCommand {
     /// Latest selection set, refreshed on every selection action.
     handles: Vec<Handle>,
+}
+
+impl Default for QuickPrintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QuickPrintCommand {

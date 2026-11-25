@@ -1,8 +1,7 @@
-use codec::entities::Solid3D;
-use codec::objects::SolidHistoryOperation;
-use codec::EntityType;
+use document::entities::Solid3D;
+use document::objects::SolidHistoryOperation;
+use document::EntityType;
 use glam::DVec3;
-use kernel::brep::Body;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DynAnchor, DynFieldSpec, DynGuide, DynRole, DynSpec,
@@ -76,6 +75,12 @@ pub struct CylinderCommand {
     plane: WorkingPlane,
 }
 
+impl Default for CylinderCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CylinderCommand {
     pub fn new() -> Self {
         let remembered = defaults().lock().map(|value| *value).unwrap_or_default();
@@ -133,7 +138,7 @@ impl CylinderCommand {
         let plane = WorkingPlane::new(a, first_axis, second_axis);
         let local_b = plane.to_local(b);
         let local_c = plane.to_local(c);
-        let circle = kernel::geom2d::arc_through_points(
+        let circle = ocs_geom::geom2d::arc_through_points(
             [0.0, 0.0],
             [local_b.x, local_b.y],
             [local_c.x, local_c.y],
@@ -170,7 +175,7 @@ impl CylinderCommand {
         .to_cols_array()
     }
 
-    fn build(&self, axis: DVec3) -> Option<(Body, SolidHistoryOperation, f64)> {
+    fn build(&self, axis: DVec3) -> Option<(ocs_solid::model::Brep, SolidHistoryOperation, f64)> {
         let (frame, height) = self.axis_frame(axis)?;
         let local = solid_model::elliptical_cylinder_solid(
             [0.0; 3],

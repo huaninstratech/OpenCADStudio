@@ -9,16 +9,21 @@
 
 mod dgn7;
 mod dgn8;
-mod dwf;
+pub(crate) mod dwf;
+mod images;
 mod model;
 mod wires;
 
+#[cfg(test)]
+pub(crate) use dwf::samples as dwf_samples;
+pub(crate) use images::{draw_images, images_box, images_density, PRINTED_IMAGE_PIXELS};
+pub(crate) use model::CAP_PER_EM;
 pub(crate) use wires::display_wires;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use codec::entities::UnderlayType;
+use document::entities::UnderlayType;
 
 pub use model::{
     scaled_elements, By, DgnColor, DgnDimLook, DgnDimStyle, DgnElement, DgnGeom, DgnImport,
@@ -28,14 +33,22 @@ pub use model::{
 use super::pdf_raster::{source_bytes, PdfPage};
 
 /// A DGN model element by element, for DGNIMPORT; `None` when the file is
-/// not a V7 or V8 design file.
-pub fn dgn_import(path: &str, item: &str) -> Option<DgnImport> {
+/// not a V7 or V8 design file. A V7 file names no text code page, so
+/// `code_page` supplies it (e.g. 1250 for Czech/Slovak files); `None` keeps
+/// the historical 1252 decoding.
+pub fn dgn_import(path: &str, item: &str, code_page: Option<u16>) -> Option<DgnImport> {
     let bytes = source_bytes(path)?;
     if dgn7::is_v7(&bytes) {
-        dgn7::import(&bytes)
+        dgn7::import(&bytes, code_page)
     } else {
         dgn8::import(&bytes, item)
     }
+}
+
+/// The pages the V7 decoder accepts as its `code_page` argument: every
+/// listed Windows page, the UTF-8 page and the auto-detect sentinel.
+pub fn code_page_supported(code_page: u16) -> bool {
+    dgn7::code_page_encoding(code_page).is_some() || code_page == 0
 }
 
 /// The models DGNIMPORT offers: a V7 file's one model, a V8 file's design
@@ -81,6 +94,33 @@ fn raster_cache() -> &'static Mutex<HashMap<Key, Option<Arc<PdfPage>>>> {
     CACHE.get_or_init(Default::default)
 }
 
+/// The images of a DWF sheet drawn whole, `width` by `height` pixels over
+/// the box they lie in ([`draw_images`]), memoised per size.
+pub fn images_raster(path: &str, item: &str, width: u32, height: u32) -> Option<Arc<PdfPage>> {
+    let key = (path.to_string(), format!("{item}#images@{width}x{height}"));
+    if let Some(hit) = raster_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return hit.clone();
+    }
+    let value = sheet(UnderlayType::Dwf, path, item).and_then(|sheet| {
+        let region = images_box(&sheet)?;
+        Some(Arc::new(PdfPage {
+            pixels: draw_images(&sheet, region, width, height),
+            width,
+            height,
+            dpi: 0.0,
+        }))
+    });
+    raster_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, value.clone());
+    value
+}
+
 /// Forget what was read from `path` (its bytes changed).
 pub fn forget(path: &str) {
     sheet_cache()
@@ -105,7 +145,7 @@ pub fn layer_names(kind: UnderlayType, path: &str) -> Vec<String> {
     match kind {
         // A plotted DWF carries no layers.
         UnderlayType::Dwf | UnderlayType::Pdf => None,
-        UnderlayType::Dgn if dgn7::is_v7(&bytes) => dgn7::layer_names(&bytes),
+        UnderlayType::Dgn if dgn7::is_v7(&bytes) => dgn7::layer_names(&bytes, None),
         UnderlayType::Dgn => dgn8::layer_names(&bytes),
     }
     .unwrap_or_default()
@@ -138,7 +178,7 @@ pub fn sheet_without(
         let mut sheet = match kind {
             UnderlayType::Dwf => dwf::sheet(&bytes, item)?,
             UnderlayType::Dgn if dgn7::is_v7(&bytes) => {
-                dgn7::model(&bytes, hidden).unwrap_or_default()
+                dgn7::model(&bytes, hidden, None).unwrap_or_default()
             }
             UnderlayType::Dgn => dgn8::model(&bytes, item, hidden).unwrap_or_default(),
             UnderlayType::Pdf => return None,
@@ -146,7 +186,7 @@ pub fn sheet_without(
         // A V7 model's extent includes its text: each text's box runs its
         // length along the baseline and its height above it (as the
         // reference measures a model). A V8 model has its stored element
-        // ranges; a DWF sheet keeps its plotted view.
+        // ranges; a DWF sheet keeps its view and its viewports.
         if kind == UnderlayType::Dgn && dgn7::is_v7(&bytes) {
             let mut r = sheet.rect;
             for t in &sheet.texts {

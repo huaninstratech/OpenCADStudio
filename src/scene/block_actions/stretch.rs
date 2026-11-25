@@ -1,7 +1,7 @@
 //! A native Stretch action freezes its vertex membership at authoring time.
 use super::*;
-use codec::objects::{BlockPolarStretchAction, BlockStretchAction, BlockStretchHandle};
-use codec::types::Vector2;
+use document::objects::{BlockPolarStretchAction, BlockStretchAction, BlockStretchHandle};
+use document::types::Vector2;
 
 pub(crate) fn control_points(e: &EntityType) -> Result<Vec<DVec3>, &'static str> {
     let points = match e {
@@ -13,14 +13,49 @@ pub(crate) fn control_points(e: &EntityType) -> Result<Vec<DVec3>, &'static str>
             vec![v(a.start_point_wcs()), v(a.end_point_wcs())]
         }
         EntityType::Circle(c) => {
-            vec![v(codec::types::Matrix3::arbitrary_axis(c.normal) * c.center)]
+            vec![v(
+                document::types::Matrix3::arbitrary_axis(c.normal) * c.center
+            )]
         }
         EntityType::Ellipse(e) => vec![v(e.center)],
         EntityType::Point(p) => vec![v(p.location)],
         EntityType::Text(t) => vec![v(
-            codec::types::Matrix3::arbitrary_axis(t.normal) * t.insertion_point
+            document::types::Matrix3::arbitrary_axis(t.normal) * t.insertion_point
         )],
         EntityType::MText(t) => vec![v(t.insertion_point)],
+        EntityType::AttributeDefinition(t) => vec![v(
+            document::types::Matrix3::arbitrary_axis(t.normal) * t.insertion_point
+        )],
+        EntityType::Insert(i) if supported(e) => vec![v(i.insert_point)],
+        EntityType::Wipeout(w) => crate::entities::raster_image::wipeout_boundary(w)
+            .into_iter()
+            .map(DVec3::from_array)
+            .collect(),
+        EntityType::Spline(s) if supported(e) => s
+            .control_points
+            .iter()
+            .chain(&s.fit_points)
+            .map(|p| v(*p))
+            .collect(),
+        // Both extension-line origins, then the dimension line's two ends.
+        EntityType::Dimension(d) => {
+            let (p1, p2, def, u) = match &**d {
+                document::entities::Dimension::Linear(d) => (
+                    v(d.first_point),
+                    v(d.second_point),
+                    v(d.definition_point),
+                    DVec3::new(d.rotation.cos(), d.rotation.sin(), 0.0),
+                ),
+                document::entities::Dimension::Aligned(d) => (
+                    v(d.first_point),
+                    v(d.second_point),
+                    v(d.definition_point),
+                    (v(d.second_point) - v(d.first_point)).normalize_or_zero(),
+                ),
+                _ => return Err("Select a supported Stretch object."),
+            };
+            vec![p1, p2, def + u * (p1 - def).dot(u), def]
+        }
         EntityType::LwPolyline(p) => {
             let p = crate::entities::curve::lwpolyline_world_xy(p)
                 .ok_or("Stretch requires a planar XY lightweight polyline.")?;
@@ -29,6 +64,15 @@ pub(crate) fn control_points(e: &EntityType) -> Result<Vec<DVec3>, &'static str>
                 .map(|v| DVec3::new(v.location.x, v.location.y, p.elevation))
                 .collect()
         }
+        EntityType::Polyline2D(p) if supported(e) => p
+            .vertices
+            .iter()
+            .map(|v| DVec3::new(v.location.x, v.location.y, p.elevation))
+            .collect(),
+        EntityType::Solid(s) if supported(e) => crate::entities::solid::wcs_corners(s)
+            .into_iter()
+            .map(DVec3::from_array)
+            .collect(),
         _ => return Err("Select a supported Stretch object."),
     };
     if points.is_empty() || points.iter().any(|p| !p.is_finite()) {
@@ -208,8 +252,13 @@ pub(crate) fn validate_options(a: &BlockStretchAction) -> Result<(), &'static st
     Ok(())
 }
 
-pub(crate) fn validate(doc: &Document, definition: Handle, a: &BlockStretchAction) -> Result<(), &'static str> {
+pub(crate) fn validate(
+    doc: &Document,
+    definition: Handle,
+    a: &BlockStretchAction,
+) -> Result<(), &'static str> {
     validate_options(a)?;
+    basepoint_target(doc, definition, a)?;
     if a.points.len() < 2
         || a.points
             .iter()
@@ -222,27 +271,32 @@ pub(crate) fn validate(doc: &Document, definition: Handle, a: &BlockStretchActio
         if !a.action.dependencies.contains(&binding.handle) || !seen.insert(binding.handle) {
             return Err("The Stretch action has invalid target bindings.");
         }
-        let count = control_points(
-            doc.get_entity(binding.handle)
-                .ok_or("A Stretch target is unavailable.")?,
-        )?
-        .len();
+        let entity = doc
+            .get_entity(binding.handle)
+            .ok_or("A Stretch target is unavailable.")?;
+        let count = control_points(entity)?.len();
         let unique = binding
             .indexes
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        // A bound circle moves whole; drawings may list more than its center.
         if unique.len() != binding.indexes.len()
-            || binding
-                .indexes
-                .iter()
-                .any(|i| *i < 0 || *i as usize >= count)
+            || binding.indexes.iter().any(|i| {
+                *i < 0 || (*i as usize >= count && !matches!(entity, EntityType::Circle(_)))
+            })
         {
             return Err("A Stretch vertex binding no longer matches its object.");
         }
     }
     // Selected objects without a partial vertex binding move as a whole.
-    for h in super::targets::geometry(doc, definition, Kind::Stretch, a.connections[0].code, &a.action.dependencies)? {
+    for h in super::targets::geometry(
+        doc,
+        definition,
+        Kind::Stretch,
+        a.connections[0].code,
+        &a.action.dependencies,
+    )? {
         control_points(
             doc.get_entity(h)
                 .ok_or("A Stretch target is unavailable.")?,
@@ -251,15 +305,45 @@ pub(crate) fn validate(doc: &Document, definition: Handle, a: &BlockStretchActio
     Ok(())
 }
 
+fn basepoint_target(
+    doc: &Document,
+    definition: Handle,
+    action: &BlockStretchAction,
+) -> Result<Option<Handle>, &'static str> {
+    let Some((handle, basepoint)) = super::super::block_basepoint::parameter(doc, definition)
+        .filter(|(handle, _)| action.action.dependencies.contains(handle))
+    else {
+        return Ok(None);
+    };
+    let node = basepoint.parameter.parameter.element.eval.node_id;
+    let mut bindings = action.codes.iter().filter(|binding| binding.code == node);
+    if !action.action.action_ids.contains(&node)
+        || bindings.next().is_none_or(|binding| binding.indexes != [0])
+        || bindings.next().is_some()
+    {
+        return Err("The Stretch action has an invalid Base Point binding.");
+    }
+    Ok(Some(handle))
+}
+
 pub(crate) fn polar_key_point(a: &BlockPolarStretchAction) -> Result<XyKeyPoint, &'static str> {
-    let key = match [a.connections[0].name.as_str(), a.connections[1].name.as_str()] {
+    let key = match [
+        a.connections[0].name.as_str(),
+        a.connections[1].name.as_str(),
+    ] {
         ["BaseXDelta", "BaseYDelta"] => XyKeyPoint::Base,
         ["EndXDelta", "EndYDelta"] => XyKeyPoint::End,
         _ => return Err("This Polar Stretch action uses unsupported key-point connections."),
     };
     let connection_code = a.connections[0].code;
     if a.connections.iter().any(|c| c.code != connection_code)
-        || a.connections[2..].iter().map(|c| c.name.as_str()).ne(["Base", "End", "UpdatedBase", "UpdatedEnd"]) {
+        || a.connections[2..].iter().map(|c| c.name.as_str()).ne([
+            "Base",
+            "End",
+            "UpdatedBase",
+            "UpdatedEnd",
+        ])
+    {
         return Err("This Polar Stretch action uses unsupported frame connections.");
     }
     Ok(key)
@@ -281,13 +365,17 @@ pub(crate) fn validate_polar(
     {
         return Err("This Polar Stretch action uses options not supported yet.");
     }
-    let geometric = super::targets::geometry(doc, definition, Kind::PolarStretch, a.connections[0].code, &a.action.dependencies)?;
+    let geometric = super::targets::geometry(
+        doc,
+        definition,
+        Kind::PolarStretch,
+        a.connections[0].code,
+        &a.action.dependencies,
+    )?;
     let mut handles = a.handles.clone();
     handles.sort();
     handles.dedup();
-    if handles.len() != a.handles.len()
-        || handles.iter().any(|h| !geometric.contains(h))
-    {
+    if handles.len() != a.handles.len() || handles.iter().any(|h| !geometric.contains(h)) {
         return Err("The Polar Stretch action has invalid target bindings.");
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -338,7 +426,7 @@ pub(crate) fn apply(
     else {
         crate::scene::view::dispatch::apply_transform(
             e,
-            &crate::command::EntityTransform::Translate(delta),
+            &crate::entities::transform::EntityTransform::Translate(delta),
         );
         return Ok(());
     };
@@ -357,10 +445,12 @@ pub(crate) fn apply(
         | EntityType::Ellipse(_)
         | EntityType::Point(_)
         | EntityType::Text(_)
-        | EntityType::MText(_) => {
+        | EntityType::MText(_)
+        | EntityType::AttributeDefinition(_)
+        | EntityType::Insert(_) => {
             crate::scene::view::dispatch::apply_transform(
                 e,
-                &crate::command::EntityTransform::Translate(delta),
+                &crate::entities::transform::EntityTransform::Translate(delta),
             );
         }
         EntityType::Line(l) => {
@@ -405,6 +495,116 @@ pub(crate) fn apply(
             }
             *p = world;
         }
+        EntityType::Polyline2D(p) => {
+            let before = p
+                .vertices
+                .iter()
+                .map(|v| [v.location.x, v.location.y])
+                .collect::<Vec<_>>();
+            for &index in &binding.indexes {
+                let vertex = p
+                    .vertices
+                    .get_mut(index as usize)
+                    .ok_or("Invalid Stretch polyline vertex.")?;
+                vertex.location.x += delta.x;
+                vertex.location.y += delta.y;
+            }
+            let after = p
+                .vertices
+                .iter()
+                .map(|v| [v.location.x, v.location.y])
+                .collect::<Vec<_>>();
+            let closed = p.is_closed();
+            for (index, vertex) in p.vertices.iter_mut().enumerate() {
+                vertex.bulge = crate::modules::draw::modify::stretch::held_bulge(
+                    vertex.bulge,
+                    &before,
+                    &after,
+                    index,
+                    closed,
+                );
+            }
+        }
+        EntityType::Solid(s) => {
+            let triangle = s.is_triangle();
+            let last_corner_moves = binding.indexes.contains(&2) || binding.indexes.contains(&3);
+            for (index, corner) in [
+                &mut s.first_corner,
+                &mut s.second_corner,
+                &mut s.third_corner,
+                &mut s.fourth_corner,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if binding.indexes.contains(&(index as i32))
+                    || (triangle && index >= 2 && last_corner_moves)
+                {
+                    *corner = *corner + native(delta);
+                }
+            }
+        }
+        EntityType::Dimension(d) => {
+            let moves = |i: i32| binding.indexes.contains(&i);
+            let (p1, p2, def, rotation) = match &mut **d {
+                document::entities::Dimension::Linear(d) => (
+                    &mut d.first_point,
+                    &mut d.second_point,
+                    &mut d.definition_point,
+                    Some(d.rotation),
+                ),
+                document::entities::Dimension::Aligned(d) => {
+                    (&mut d.first_point, &mut d.second_point, &mut d.definition_point, None)
+                }
+                _ => return Err("Unsupported Stretch target."),
+            };
+            for (point, moved) in [(&mut *p1, moves(0)), (&mut *p2, moves(1))] {
+                if moved {
+                    *point = *point + native(delta);
+                }
+            }
+            let u = match rotation {
+                Some(r) => DVec3::new(r.cos(), r.sin(), 0.0),
+                None => (v(*p2) - v(*p1)).normalize_or_zero(),
+            };
+            // A moved end shifts the dimension line across itself; the
+            // definition point stays where the line meets extension line 2.
+            let across = if moves(2) || moves(3) {
+                delta - u * delta.dot(u)
+            } else {
+                DVec3::ZERO
+            };
+            let line = v(*def) + across;
+            *def = native(line + u * (v(*p2) - line).dot(u));
+            d.base_mut().actual_measurement = d.stored_measurement();
+        }
+        // Bound points move through the shared STRETCH code.
+        EntityType::Wipeout(_) | EntityType::Spline(_) => {
+            let points = control_points(e)?;
+            let bound = binding
+                .indexes
+                .iter()
+                .filter_map(|i| points.get(*i as usize).copied())
+                .collect::<Vec<_>>();
+            let in_win = |x: f64, y: f64| {
+                bound
+                    .iter()
+                    .any(|p| (p.x - x).abs() <= 1e-9 && (p.y - y).abs() <= 1e-9)
+            };
+            match e {
+                EntityType::Wipeout(w) => {
+                    crate::entities::raster_image::stretch_wipeout(w, &in_win, delta);
+                }
+                EntityType::Spline(s) => {
+                    for p in s.control_points.iter_mut().chain(s.fit_points.iter_mut()) {
+                        if in_win(p.x, p.y) {
+                            *p = *p + native(delta);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
         _ => return Err("Unsupported Stretch target."),
     }
     Ok(())
@@ -424,9 +624,17 @@ pub(crate) fn apply_polar_frame(
         XyKeyPoint::Base => (old_end, old_base, new_end, new_base),
         _ => unreachable!(),
     };
-    apply_polar(entity, action, pivot, old_tip, pivot + (new_tip - new_pivot))?;
-    super::super::view::dispatch::apply_transform(entity,
-        &crate::command::EntityTransform::Translate(new_pivot - pivot));
+    apply_polar(
+        entity,
+        action,
+        pivot,
+        old_tip,
+        pivot + (new_tip - new_pivot),
+    )?;
+    super::super::view::dispatch::apply_transform(
+        entity,
+        &crate::entities::transform::EntityTransform::Translate(new_pivot - pivot),
+    );
     Ok(())
 }
 
@@ -455,7 +663,7 @@ pub(crate) fn apply_polar(
     if angle != 0. {
         crate::scene::view::dispatch::apply_transform(
             e,
-            &crate::command::EntityTransform::Rotate {
+            &crate::entities::transform::EntityTransform::Rotate {
                 center: base,
                 axis: DVec3::Z,
                 angle_rad: angle,

@@ -358,15 +358,21 @@ impl Ribbon {
         } else {
             (TO_SIDE_ICON, crate::tr!("ribbon-menu", "float-title-side"))
         };
-        iced::widget::row![
-            hover_button(
-                RETURN_ICON,
-                crate::tr!("ribbon-menu", "return-to-ribbon"),
-                FloatMsg::Return(key.clone()),
-            ),
-            hover_button(toggle, tip, FloatMsg::ToggleOrientation(key)),
-        ]
-        .spacing(metrics::FLOAT_HOVER_GAP)
+        let toggle = hover_button(toggle, tip, FloatMsg::ToggleOrientation(key.clone()));
+        // With the ribbon closed there is no ribbon to return to.
+        let row = if self.closed {
+            iced::widget::row![toggle]
+        } else {
+            iced::widget::row![
+                hover_button(
+                    RETURN_ICON,
+                    crate::tr!("ribbon-menu", "return-to-ribbon"),
+                    FloatMsg::Return(key),
+                ),
+                toggle,
+            ]
+        };
+        row.spacing(metrics::FLOAT_HOVER_GAP)
         .into()
     }
 
@@ -609,6 +615,7 @@ impl Ribbon {
                 hover_flag(&mut self.float_ui.tab_hover, key, over);
                 false
             }
+            FloatMsg::Return(_) if self.closed => false,
             FloatMsg::Return(key) => self.dock_floating(&key),
             FloatMsg::ToggleOrientation(key) => {
                 self.float_ui.strip_hover = None;
@@ -667,8 +674,10 @@ impl Ribbon {
                 false
             }
             FloatMsg::Move { at, free } => {
-                let over_ribbon = crate::ui::wrap_bar::recent_bounds(super::TOOL_AREA_ID)
-                    .is_some_and(|area| area.contains(at));
+                // A closed ribbon's last bounds are stale: nothing to dock on.
+                let over_ribbon = !self.closed
+                    && crate::ui::wrap_bar::recent_bounds(super::TOOL_AREA_ID)
+                        .is_some_and(|area| area.contains(at));
                 let Some(drag) = self.float_ui.drag.as_mut() else {
                     return false;
                 };
@@ -693,6 +702,7 @@ impl Ribbon {
                         .collect();
                     let window = Rectangle::new(Point::ORIGIN, Size::new(self.win_w, self.win_h));
                     let ribbon_bottom = crate::ui::wrap_bar::recent_bounds(super::RIBBON_ID)
+                        .filter(|_| !self.closed)
                         .map(|ribbon| ribbon.y + ribbon.height);
                     snap(
                         Rectangle::new(corner, Size::new(size.0, size.1)),
@@ -731,7 +741,10 @@ impl Ribbon {
                 continue;
             }
             for group in self.ordered_groups(index) {
-                let shown = self.layout.floating_panel(module.id(), group.title).is_some();
+                let shown = self
+                    .layout
+                    .floating_panel(module.id(), group.title)
+                    .is_some();
                 out.push((module.id(), group.title, shown));
             }
         }
@@ -1017,14 +1030,7 @@ fn hover_button<'a>(icon: &'static str, tip: String, msg: FloatMsg) -> Element<'
     .width(metrics::FLOAT_HOVER_HIT)
     .height(metrics::FLOAT_HOVER_HIT)
     .padding(0);
-    iced::widget::tooltip(
-        btn,
-        super::widgets::make_tip(tip),
-        iced::widget::tooltip::Position::Top,
-    )
-    .delay(std::time::Duration::from_millis(400))
-    .style(super::widgets::tip_style)
-    .into()
+    crate::ui::kit::tooltip(btn, tip, iced::widget::tooltip::Position::Top)
 }
 
 fn hover_button_style(
@@ -1331,13 +1337,7 @@ fn side_strip<'a>(
     })
     .width(Length::Fill)
     .height(Length::Fill);
-    let vertical = iced::widget::tooltip(
-        vertical,
-        super::widgets::make_tip(label),
-        iced::widget::tooltip::Position::Right,
-    )
-    .delay(std::time::Duration::from_millis(400))
-    .style(super::widgets::tip_style);
+    let vertical = crate::ui::kit::tooltip(vertical, label, iced::widget::tooltip::Position::Right);
     let mut strip = iced::widget::column![vertical].align_x(iced::Center);
     if let Some(launcher) = launcher {
         strip = strip.push(launcher);
@@ -1431,7 +1431,7 @@ impl iced::widget::canvas::Program<Message> for VerticalTitle {
             frame.rotate(std::f32::consts::FRAC_PI_2);
             frame.fill_text(Text {
                 content: label,
-                position: Point::ORIGIN,
+                position: crate::ui::style::text::snap_point(Point::ORIGIN),
                 color,
                 size: size.into(),
                 align_x: iced::alignment::Horizontal::Center.into(),

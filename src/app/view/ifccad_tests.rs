@@ -4,15 +4,15 @@ use crate::app::{SaveContinuation, SavePurpose};
 use iced::Task;
 
 #[test]
-fn ifccad_format_label_keeps_the_ifcx_extension_and_legacy_selection() {
+fn ifccad_format_label_prefers_ifccad_and_keeps_legacy_selection() {
     let options = crate::io::save_format_options();
     assert!(options.contains(&"IFCCAD".to_string()));
     assert!(!options.contains(&"IFCX".to_string()));
     for label in ["IFCCAD", "IFCX", "ifccad"] {
-        assert_eq!(crate::io::parse_save_format(label).0, "ifcx");
+        assert_eq!(crate::io::parse_save_format(label).0, "ifccad");
         assert_eq!(crate::io::canonical_save_format(label), "IFCCAD");
     }
-    assert_eq!(codec::Format::name(&codec::Ifcx), "IFCX");
+    assert_eq!(document::Format::name(&document::Ifcx), "IFCX");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,7 +25,7 @@ fn save(app: &mut OpenCADStudio, tab: usize, ext: &str, purpose: SavePurpose) ->
     app.queue_native_save(
         tab,
         path,
-        codec::DxfVersion::AC1032,
+        document::DxfVersion::AC1032,
         purpose,
         SaveContinuation::None,
         false,
@@ -35,7 +35,7 @@ fn save(app: &mut OpenCADStudio, tab: usize, ext: &str, purpose: SavePurpose) ->
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ask_alpha(app: &mut OpenCADStudio, tab: usize, purpose: SavePurpose) -> Task<Message> {
-    let task = save(app, tab, "ifcx", purpose);
+    let task = save(app, tab, "ifccad", purpose);
     if app.active_modal == Some(crate::app::ModalKind::ConversionLoss) {
         // OCS's initial scene can contain separately diagnosed converter losses.
         app.update(Message::ConversionLossProceed)
@@ -97,7 +97,7 @@ fn ifccad_consent_belongs_to_the_saved_tab_and_includes_conversion_losses() {
         }
     }
     let path = std::env::temp_dir().join(format!(
-        "ocs-ifccad-alpha-{}-{}.ifcx",
+        "ocs-ifccad-alpha-{}-{}.ifccad",
         std::process::id(),
         app.tabs[0].id
     ));
@@ -106,9 +106,9 @@ fn ifccad_consent_belongs_to_the_saved_tab_and_includes_conversion_losses() {
     app.tabs[0]
         .scene
         .document
-        .add_entity(codec::EntityType::Ray(codec::entities::Ray::new(
-            codec::types::Vector3::ZERO,
-            codec::types::Vector3::UNIT_X,
+        .add_entity(document::EntityType::Ray(document::entities::Ray::new(
+            document::types::Vector3::ZERO,
+            document::types::Vector3::UNIT_X,
         )))
         .unwrap();
     let _ = save(&mut app, 0, "ifcx", SavePurpose::Manual);
@@ -182,10 +182,7 @@ fn ifccad_alpha_buttons_are_visible_and_emit_separate_actions() {
                         .visible_bounds()
                         .is_some());
                 }
-                for label in [
-                    t!("Save anyway").into_owned(),
-                    t!("Cancel").into_owned(),
-                ] {
+                for label in [t!("Save anyway").into_owned(), t!("Cancel").into_owned()] {
                     assert!(ui.find(label.as_str()).unwrap().visible_bounds().is_some());
                     ui.click(label.as_str()).unwrap();
                 }

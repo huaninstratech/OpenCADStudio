@@ -3,7 +3,7 @@
 
 use crate::app::Message;
 use crate::ui::style::form::{dialog_button, field_style, hdivider, labeled_field};
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Background, Border, Element, Fill, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub enum DwgPropsMsg {
 pub(crate) struct State {
     pub tab: Tab,
     /// The summary being edited; the document keeps its own until OK.
-    pub summary: codec::document::SummaryInfo,
+    pub summary: document::document::SummaryInfo,
     /// Read-only General tab: label, value.
     pub general: Vec<(String, String)>,
     /// Why OK was refused, shown under the table.
@@ -144,16 +144,18 @@ pub(crate) fn view(state: &State, sizing: crate::ui::modal::ModalSizing) -> Elem
             .into()
         }
         Tab::Custom => {
-            let mut rows = column![row![
-                text(crate::tr!("dwgprops-dialog", "name"))
-                    .size(11)
-                    .width(Fill),
-                text(crate::tr!("dwgprops-dialog", "value"))
-                    .size(11)
-                    .width(Fill),
-                Space::new().width(70),
+            let mut rows = column![
+                row![
+                    text(crate::tr!("dwgprops-dialog", "name"))
+                        .size(11)
+                        .width(Fill),
+                    text(crate::tr!("dwgprops-dialog", "value"))
+                        .size(11)
+                        .width(Fill),
+                    Space::new().width(70),
+                ]
+                .spacing(6)
             ]
-            .spacing(6)]
             .spacing(6);
             for (index, (name, value)) in state.summary.custom_properties.iter().enumerate() {
                 rows = rows.push(

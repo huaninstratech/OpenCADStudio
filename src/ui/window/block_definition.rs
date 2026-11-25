@@ -3,38 +3,33 @@
 
 use std::fmt;
 
-use codec::Handle;
+use document::Handle;
 use iced::widget::{
-    button, checkbox, column, combo_box, container, mouse_area, pick_list, row, stack, text,
-    text_editor, text_input, Space,
+    Space, button, checkbox, column, combo_box, container, mouse_area, pick_list, row, stack, text,
+    text_editor, text_input,
 };
 use iced::{Background, Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
 use crate::entities::common::{coordinate_text, parse_length};
-use crate::scene::WireModel;
 use crate::modules::draw::units;
+use crate::scene::WireModel;
 use crate::t;
 use crate::ui::style::common::muted_style;
 use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};
 
-static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/blocks/pick_point.svg");
+static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/point.svg");
 static ICON_SELECT_OBJECTS: &[u8] =
     include_bytes!("../../../assets/icons/blocks/select_objects.svg");
 static ICON_QUICK_SELECT: &[u8] = include_bytes!("../../../assets/icons/blocks/quick_select.svg");
 static ICON_WARN: &[u8] = include_bytes!("../../../assets/icons/ui/warning_triangle.svg");
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BlockObjectMode {
     Retain,
+    #[default]
     Convert,
     Delete,
-}
-
-impl Default for BlockObjectMode {
-    fn default() -> Self {
-        BlockObjectMode::Convert
-    }
 }
 
 /// Dropdown entry for the Block Unit picker.
@@ -213,7 +208,7 @@ pub(crate) fn group<'a>(
             text(title.into())
                 .size(11)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
             body.into(),
         ]
@@ -475,18 +470,20 @@ pub fn view_window<'a>(
             text(t!("No objects selected"))
                 .size(10)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.75)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
         ]
         .spacing(5)
         .align_y(iced::Center)
         .into()
     } else {
-        row![text(crate::tf!("{count} objects selected"))
-            .size(10)
-            .style(|theme: &Theme| text::Style {
-                color: Some(theme.palette().primary.base.color),
-            }),]
+        row![
+            text(crate::tf!("{count} objects selected"))
+                .size(10)
+                .style(|theme: &Theme| text::Style {
+                    color: Some(theme.palette().primary.base.color),
+                }),
+        ]
         .spacing(5)
         .align_y(iced::Center)
         .into()
@@ -637,7 +634,7 @@ pub fn view_window<'a>(
                     width: 1.0,
                     radius: 3.0.into(),
                 },
-                placeholder: palette.background.base.text.scale_alpha(0.48),
+                placeholder: crate::ui::style::readable::hint_text(theme),
                 value: palette.background.base.text,
                 selection: palette.primary.base.color.scale_alpha(0.5),
             }

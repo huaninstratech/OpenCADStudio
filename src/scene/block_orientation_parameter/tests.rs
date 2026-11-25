@@ -1,6 +1,6 @@
 use super::*;
 use crate::scene::{block_distance_parameter, block_point_parameter, block_visibility, Scene};
-use codec::{entities::Line, EntityType};
+use document::{entities::Line, EntityType};
 
 fn fixture() -> (Scene, Handle) {
     let mut scene = Scene::new();
@@ -37,7 +37,7 @@ fn append_batch(document: &mut Document, definition: Handle) {
         .unwrap();
     }
 }
-fn graph_data(document: &Document, definition: Handle) -> &codec::objects::BlockEvaluationGraph {
+fn graph_data(document: &Document, definition: Handle) -> &document::objects::BlockEvaluationGraph {
     let ObjectType::DynamicBlock(o) =
         &document.objects[&graph_handle(document, definition).unwrap()]
     else {
@@ -292,37 +292,4 @@ fn orientation_parameter_rotation_270_graphic_retains_counterclockwise_arc() {
     .unwrap();
     let g = graphic(&parameters(&scene.document, definition)[0]);
     assert!(g.lines.iter().flatten().any(|p| p.x < -0.99));
-}
-#[test]
-#[ignore = "requires OCS_DYNAMIC_BLOCK_FIXTURES with local DWG fixtures"]
-fn orientation_parameter_fixture_batch_roundtrips() {
-    use sha2::{Digest, Sha256};
-    let directory = std::env::var_os("OCS_DYNAMIC_BLOCK_FIXTURES").expect("fixture directory");
-    let mut paths = std::fs::read_dir(directory)
-        .unwrap()
-        .map(|p| p.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg")))
-        .collect::<Vec<_>>();
-    paths.sort();
-    assert_eq!(paths.len(), 17);
-    for path in paths {
-        let bytes = std::fs::read(&path).unwrap();
-        let digest = Sha256::digest(&bytes);
-        let filename = path.file_name().unwrap().to_string_lossy();
-        let mut document = crate::io::load_bytes(&filename, bytes).unwrap();
-        let definition = document
-            .block_records
-            .iter()
-            .map(|b| b.handle)
-            .find(|h| {
-                authoring::graph(&document, *h).is_ok_and(|g| g.is_some())
-                    && placement_error(&document, *h, Kind::Flip).is_none()
-            })
-            .unwrap();
-        let before = document.clone();
-        append_batch(&mut document, definition);
-        assert_roundtrips(&document, definition, &before);
-        assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()), digest);
-        eprintln!("{filename}: Rotation/Alignment/Flip native DWG/DXF objects and graph append passed; original graph/objects/checksum preserved");
-    }
 }

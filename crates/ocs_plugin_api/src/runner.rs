@@ -25,11 +25,24 @@ use std::rc::Rc;
 use crate::host::{BuiltinPlugin, CommandStep, HostNotification, InteractiveCommand};
 use crate::ipc::client::{InteractiveRegistry, IpcClient, PluginHostApi};
 use crate::ipc::protocol::{
-    HostRequest, HostResponse, HostToPlugin, InteractiveEvent, PluginToHost, PLUGIN_TOKEN_ENV,
+    HostRequest, HostResponse, HostToPlugin, InteractiveEvent, PLUGIN_TOKEN_ENV, PluginToHost,
 };
 use crate::ipc::transport::{recv, send};
 use crate::ipc::v4::client::{RunnerFrame, V4Client};
 use crate::ribbon::owned::{OwnedEntityClasses, OwnedPluginManifest, OwnedRibbonGroup};
+
+/// Bounds ONE notification-drain pass in `run_v4` (P1-20): callbacks run
+/// inline on the runner's read loop, so a chain of slow panel actions used to
+/// delay host requests for the whole queue length. The queue itself stays
+/// count-bounded; the remainder waits for the next pass.
+const DRAIN_WALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Maximum interactive commands a command-less `PanelAction` fans out to
+/// (P1-20): the whole registry was enumerated and each target received a
+/// full clone of the event and value maps inline. Beyond the cap the
+/// remainder is dropped with a loud notice — a plugin that needs broadcast
+/// semantics for its panel actions registers its owning command id.
+const MAX_PANEL_ACTION_TARGETS: usize = 16;
 
 /// Entry point for the plugin runner child process.
 ///
@@ -58,7 +71,7 @@ pub fn run_with_plugin(
     version: u32,
     mut plugin: Box<dyn BuiltinPlugin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::version_info::{wire_schema, SELF_HOSTED_API_VERSION, WIRE_SCHEMA_ENV};
+    use crate::version_info::{SELF_HOSTED_API_VERSION, WIRE_SCHEMA_ENV, wire_schema};
     if version >= SELF_HOSTED_API_VERSION {
         if let Ok(host) = std::env::var(WIRE_SCHEMA_ENV) {
             if host != wire_schema() {
@@ -146,9 +159,121 @@ fn run_v4(
     loop {
         // Drain any host notifications and dispatch them to the plugin's
         // state-only callback. Panics are caught so a bad callback does not
-        // tear down the connection.
-        while let Some((command_id, notification)) = client.try_recv_notification() {
+        // tear down the connection. One drain pass is bounded in wall time
+        // (P1-20): an on_dialog_action / on_notification callback that loops
+        // or stalls cannot monopolize the read loop and starve host requests;
+        // the rest of the queue waits for the next pass (the queue itself is
+        // count-bounded by the transport layer).
+        let drain_deadline = std::time::Instant::now() + DRAIN_WALL_BUDGET;
+        // Bounds BEFORE popping: the wall budget is what limits how much new
+        // work this pass takes on. Evaluating it only after `try_recv` had popped
+        // an item used to DROP that item without dispatching whenever a
+        // preceding callback had already run the pass over budget — a silent
+        // notification loss that the 2026-11-14 firetest diag round measured
+        // at ~16 lost SelectionChangedV4 in one run.
+        while std::time::Instant::now() < drain_deadline {
+            let Some((command_id, notification)) = client.try_recv_notification() else {
+                break;
+            };
             if notification_api_version(&notification) > api_version {
+                continue;
+            }
+            if let HostNotification::PanelAction {
+                panel_id,
+                control_id,
+                action,
+                value,
+            } = &notification
+            {
+                let mut updates_to_send: Vec<(
+                    String,
+                    std::collections::HashMap<String, crate::dialog::DialogValue>,
+                )> = Vec::new();
+                if api_version >= 17 {
+                    let mut registry = interactive.borrow_mut();
+                    let mut target_ids: Vec<u64> = if let Some(cid) = command_id {
+                        vec![cid]
+                    } else {
+                        registry.keys().copied().collect()
+                    };
+                    if target_ids.len() > MAX_PANEL_ACTION_TARGETS {
+                        eprintln!(
+                            "[runner] panel action fan-out to {} interactive commands exceeds \
+                             the {MAX_PANEL_ACTION_TARGETS} budget; the remainder is dropped",
+                            target_ids.len()
+                        );
+                        target_ids.truncate(MAX_PANEL_ACTION_TARGETS);
+                    }
+                    let (event_val, current_vals) = match value {
+                        Some(crate::dialog::DialogValue::Fields(map)) => {
+                            let mut map = map.clone();
+                            let ev = map
+                                .remove("__event_value__")
+                                .or_else(|| map.get(control_id).cloned());
+                            (ev, map)
+                        }
+                        other => (other.clone(), std::collections::HashMap::new()),
+                    };
+                    for cid in target_ids {
+                        if let Some(cmd) = registry.get_mut(&cid) {
+                            let event = crate::dialog::DialogEvent {
+                                control_id: control_id.clone(),
+                                action: action.clone(),
+                                value: event_val.clone(),
+                                current_values: current_vals.clone(),
+                            };
+                            if let Ok(crate::dialog::DialogActionResponse::UpdateValues(vals)) =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    cmd.on_dialog_action(event)
+                                }))
+                            {
+                                updates_to_send.push((panel_id.clone(), vals));
+                            }
+                        }
+                    }
+                }
+                let panel_id_owned = panel_id.clone();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    plugin.on_notification(command_id, notification)
+                }));
+                if api_version >= 7 {
+                    let mut registry = interactive.borrow_mut();
+                    let mut target_ids: Vec<u64> = if let Some(cid) = command_id {
+                        vec![cid]
+                    } else {
+                        registry.keys().copied().collect()
+                    };
+                    if target_ids.len() > MAX_PANEL_ACTION_TARGETS {
+                        eprintln!(
+                            "[runner] panel update fan-out to {} interactive commands exceeds \
+                             the {MAX_PANEL_ACTION_TARGETS} budget; the remainder is dropped",
+                            target_ids.len()
+                        );
+                        target_ids.truncate(MAX_PANEL_ACTION_TARGETS);
+                    }
+                    for cid in target_ids {
+                        if let Some(cmd) = registry.get_mut(&cid) {
+                            if let Ok(pending) =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    cmd.take_pending_panel_updates()
+                                }))
+                            {
+                                updates_to_send.extend(pending);
+                            }
+                        }
+                    }
+                }
+                if !updates_to_send.is_empty() {
+                    let mut proxy = client.plugin_host_api(0, interactive.clone());
+                    for (target_id, vals) in updates_to_send {
+                        let id_to_use = if target_id.is_empty() {
+                            panel_id_owned.as_str()
+                        } else {
+                            target_id.as_str()
+                        };
+                        let _ = crate::host::HostApi::update_panel(&mut proxy, id_to_use, vals);
+                    }
+                }
                 continue;
             }
             // API v15: a quad panel pick routes to the dedicated callback —
@@ -226,7 +351,10 @@ fn notification_api_version(notification: &crate::host::HostNotification) -> u32
     use crate::host::HostNotification as N;
     match notification {
         N::QuadAction { .. } => 15,
+        N::SelectionChangedDigest { .. } => 22,
         N::DocumentChangedRegions { .. } => 13,
+        N::DocumentChangedDelta { .. } => 27,
+        N::PanelSurfaceEvent { .. } => 29,
         N::DocumentOpened { .. } => 9,
         N::CommandStateChanged { .. } | N::DrawingChanged { .. } => 7,
         N::DocumentChangedV4 { .. }
@@ -234,6 +362,54 @@ fn notification_api_version(notification: &crate::host::HostNotification) -> u32
         | N::SelectionChangedV4 { .. } => 4,
         _ => 0,
     }
+}
+
+/// `on_dialog_action` of the interactive command `command_id`; `None` when the
+/// command is gone or panics.
+fn run_dialog_action(
+    interactive: &InteractiveRegistry,
+    command_id: u64,
+    event: crate::dialog::DialogEvent,
+) -> crate::dialog::DialogActionResponse {
+    let mut registry = interactive.borrow_mut();
+    registry
+        .get_mut(&command_id)
+        .and_then(|cmd| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.on_dialog_action(event)))
+                .ok()
+        })
+        .unwrap_or(crate::dialog::DialogActionResponse::None)
+}
+
+/// `on_undo_step` of the interactive command `command_id` (API v24): `None`
+/// when the plugin predates the slot, the command is gone, declines, or
+/// panics. A step that ends the command releases it, as for an input event.
+fn run_undo_step(
+    interactive: &InteractiveRegistry,
+    command_id: u64,
+    api_version: u32,
+) -> Option<Box<CommandStep>> {
+    // A cdylib built against API v23 or older has no slot for this method.
+    if api_version < 24 {
+        return None;
+    }
+    let step = {
+        let mut registry = interactive.borrow_mut();
+        let cmd = registry.get_mut(&command_id)?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.on_undo_step()))
+            .ok()
+            .flatten()?
+    };
+    if matches!(
+        step,
+        CommandStep::Done
+            | CommandStep::Cancel
+            | CommandStep::CommitAndEnd(_)
+            | CommandStep::CommitManyAndEnd(_)
+    ) {
+        interactive.borrow_mut().remove(&command_id);
+    }
+    Some(Box::new(step))
 }
 
 fn handle_host_request(
@@ -297,6 +473,7 @@ fn handle_host_request(
                     }
                     InteractiveEvent::Cancel => CommandStep::Cancel,
                     InteractiveEvent::DialogResponse(res) => cmd_ref.on_dialog_response(res),
+                    InteractiveEvent::TextInput(_) => CommandStep::NeedPoint,
                 }));
                 match res {
                     Ok(s) => {
@@ -363,7 +540,9 @@ fn handle_host_request(
             };
             match result {
                 Some(Ok(b)) => HostResponse::Bool(b),
-                Some(Err(_)) => HostResponse::Error("is_selection_gathering() panicked".to_string()),
+                Some(Err(_)) => {
+                    HostResponse::Error("is_selection_gathering() panicked".to_string())
+                }
                 None => HostResponse::Error(format!("unknown interactive command {command_id}")),
             }
         }
@@ -378,7 +557,9 @@ fn handle_host_request(
             };
             match result {
                 Some(Ok(b)) => HostResponse::Bool(b),
-                Some(Err(_)) => HostResponse::Error("accepts_drag_selection() panicked".to_string()),
+                Some(Err(_)) => {
+                    HostResponse::Error("accepts_drag_selection() panicked".to_string())
+                }
                 None => HostResponse::Error(format!("unknown interactive command {command_id}")),
             }
         }
@@ -393,7 +574,9 @@ fn handle_host_request(
             };
             match result {
                 Some(Ok(b)) => HostResponse::Bool(b),
-                Some(Err(_)) => HostResponse::Error("selection_rejects_locked_layers() panicked".to_string()),
+                Some(Err(_)) => {
+                    HostResponse::Error("selection_rejects_locked_layers() panicked".to_string())
+                }
                 None => HostResponse::Error(format!("unknown interactive command {command_id}")),
             }
         }
@@ -416,14 +599,24 @@ fn handle_host_request(
             let result = {
                 let registry = interactive.borrow();
                 registry.get(&command_id).and_then(|cmd| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cmd.modal_dialog()
-                    }))
-                    .ok()
-                    .flatten()
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.modal_dialog()))
+                        .ok()
+                        .flatten()
                 })
             };
             HostResponse::ModalDialog(result)
+        }
+        HostRequest::DialogAction { command_id, event } => {
+            HostResponse::DialogAction(run_dialog_action(interactive, command_id, event))
+        }
+        // The V3 path serves plugins far older than v24.
+        HostRequest::UndoStep { .. } => HostResponse::UndoStep(None),
+        HostRequest::ListTools => HostResponse::Tools(Vec::new()),
+        HostRequest::CallTool { .. } => {
+            HostResponse::Error("AI tools require the V4 protocol".to_string())
+        }
+        HostRequest::GetInputKind { .. } => {
+            HostResponse::InputKind(crate::host::InteractiveInputKind::Point)
         }
         HostRequest::ExecuteCode { .. } => {
             HostResponse::Error("ExecuteCode requires V4 protocol".to_string())
@@ -471,7 +664,7 @@ fn handle_host_request_v4(
                             Err(_) => {
                                 return Some(HostResponse::Error(
                                     "plugin entity_classes() panicked".to_string(),
-                                ))
+                                ));
                             }
                         };
                     }
@@ -528,6 +721,13 @@ fn handle_host_request_v4(
                     }
                     InteractiveEvent::Cancel => CommandStep::Cancel,
                     InteractiveEvent::DialogResponse(res) => cmd_ref.on_dialog_response(res),
+                    InteractiveEvent::TextInput(text) => {
+                        if api_version >= 28 {
+                            cmd_ref.on_text_input(&text)
+                        } else {
+                            CommandStep::NeedPoint
+                        }
+                    }
                 }));
                 match res {
                     Ok(s) => {
@@ -667,14 +867,70 @@ fn handle_host_request_v4(
             let result = {
                 let registry = interactive.borrow();
                 registry.get(&command_id).and_then(|cmd| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cmd.modal_dialog()
-                    }))
-                    .ok()
-                    .flatten()
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.modal_dialog()))
+                        .ok()
+                        .flatten()
                 })
             };
             Some(HostResponse::ModalDialog(result))
+        }
+        HostRequest::DialogAction { command_id, event } => Some(HostResponse::DialogAction(
+            run_dialog_action(interactive, command_id, event),
+        )),
+        HostRequest::UndoStep { command_id } => Some(HostResponse::UndoStep(run_undo_step(
+            interactive,
+            command_id,
+            api_version,
+        ))),
+        // API v25 gate: an older cdylib's vtable has neither slot.
+        HostRequest::ListTools => {
+            if api_version < 25 {
+                return Some(HostResponse::Tools(Vec::new()));
+            }
+            Some(
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plugin.tools())) {
+                    Ok(tools) => HostResponse::Tools(tools),
+                    Err(_) => HostResponse::Error("plugin tools() panicked".to_string()),
+                },
+            )
+        }
+        HostRequest::CallTool {
+            tab_index,
+            name,
+            arguments,
+        } => {
+            if api_version < 25 {
+                return Some(HostResponse::ToolResult(Err(
+                    "the plugin predates AI tools (API v25)".to_string(),
+                )));
+            }
+            let mut proxy = client.plugin_host_api(tab_index, interactive.clone());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                plugin.call_tool(&mut proxy, &name, &arguments)
+            }));
+            Some(HostResponse::ToolResult(result.unwrap_or_else(|_| {
+                Err(format!("plugin tool '{name}' panicked"))
+            })))
+        }
+        HostRequest::GetInputKind { command_id } => {
+            if api_version < 28 {
+                return Some(HostResponse::InputKind(
+                    crate::host::InteractiveInputKind::Point,
+                ));
+            }
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.input_kind()))
+                })
+            };
+            match result {
+                Some(Ok(kind)) => Some(HostResponse::InputKind(kind)),
+                Some(Err(_)) => Some(HostResponse::Error("input_kind() panicked".to_string())),
+                None => Some(HostResponse::Error(format!(
+                    "unknown interactive command {command_id}"
+                ))),
+            }
         }
         HostRequest::ExecuteCode {
             command_id,
@@ -811,8 +1067,8 @@ mod tests {
     use std::thread;
 
     use interprocess::local_socket::{
-        traits::{Listener, Stream as StreamTrait},
         GenericNamespaced, ListenerOptions, Stream, ToNsName,
+        traits::{Listener, Stream as StreamTrait},
     };
 
     use super::*;
@@ -904,6 +1160,232 @@ mod tests {
             }
             other => panic!("expected unsupported error, got {other:?}"),
         }
+        drop(host_stream);
+    }
+
+    /// A command that replaces its dialog on a button and remembers the event.
+    struct DialogActionCommand {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl InteractiveCommand for DialogActionCommand {
+        fn prompt(&self) -> String {
+            String::new()
+        }
+        fn on_point(&mut self, _pt: [f64; 3]) -> CommandStep {
+            CommandStep::NeedPoint
+        }
+        fn on_dialog_action(
+            &mut self,
+            event: crate::dialog::DialogEvent,
+        ) -> crate::dialog::DialogActionResponse {
+            self.seen
+                .lock()
+                .expect("seen")
+                .push(event.control_id.clone());
+            if event.control_id == "next" {
+                crate::dialog::DialogActionResponse::ReplaceDialog(Box::new(
+                    crate::dialog::DialogDef::new("Page 2"),
+                ))
+            } else {
+                crate::dialog::DialogActionResponse::None
+            }
+        }
+    }
+
+    #[test]
+    fn dialog_action_reaches_the_command_and_returns_its_answer() {
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let interactive: InteractiveRegistry = Rc::new(RefCell::new(HashMap::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        interactive.borrow_mut().insert(
+            7,
+            Box::new(DialogActionCommand { seen: seen.clone() }) as Box<dyn InteractiveCommand>,
+        );
+        let mut plugin = UnsupportedReplPlugin;
+        let event = |id: &str| crate::dialog::DialogEvent {
+            control_id: id.to_string(),
+            action: "click".to_string(),
+            value: None,
+            current_values: HashMap::new(),
+        };
+        let req = HostRequest::DialogAction {
+            command_id: 7,
+            event: event("next"),
+        };
+        match handle_host_request_v4(&mut plugin, &interactive, &client, 1, 19, req) {
+            Some(HostResponse::DialogAction(
+                crate::dialog::DialogActionResponse::ReplaceDialog(dialog),
+            )) => assert_eq!(dialog.title, "Page 2"),
+            other => panic!("expected the replaced dialog, got {other:?}"),
+        }
+        // An unknown command answers None instead of failing.
+        let req = HostRequest::DialogAction {
+            command_id: 8,
+            event: event("next"),
+        };
+        assert!(matches!(
+            handle_host_request_v4(&mut plugin, &interactive, &client, 2, 19, req),
+            Some(HostResponse::DialogAction(
+                crate::dialog::DialogActionResponse::None
+            ))
+        ));
+        assert_eq!(*seen.lock().expect("seen"), ["next"]);
+        drop(host_stream);
+    }
+
+    /// A command that collects points and drops the last one on Ctrl+Z.
+    struct CollectPoints {
+        points: Vec<[f64; 3]>,
+        undo_calls: std::sync::Arc<AtomicU64>,
+    }
+
+    impl InteractiveCommand for CollectPoints {
+        fn prompt(&self) -> String {
+            format!("Point {}", self.points.len() + 1)
+        }
+        fn on_point(&mut self, pt: [f64; 3]) -> CommandStep {
+            self.points.push(pt);
+            CommandStep::NeedPoint
+        }
+        fn on_undo_step(&mut self) -> Option<CommandStep> {
+            self.undo_calls.fetch_add(1, Ordering::SeqCst);
+            self.points.pop().map(|_| CommandStep::NeedPoint)
+        }
+    }
+
+    /// A command whose step back ends it.
+    struct UndoEnds;
+
+    impl InteractiveCommand for UndoEnds {
+        fn prompt(&self) -> String {
+            String::new()
+        }
+        fn on_point(&mut self, _pt: [f64; 3]) -> CommandStep {
+            CommandStep::NeedPoint
+        }
+        fn on_undo_step(&mut self) -> Option<CommandStep> {
+            Some(CommandStep::Cancel)
+        }
+    }
+
+    fn registry_with_two_points(undo_calls: &std::sync::Arc<AtomicU64>) -> InteractiveRegistry {
+        let interactive: InteractiveRegistry = Rc::new(RefCell::new(HashMap::new()));
+        interactive.borrow_mut().insert(
+            7,
+            Box::new(CollectPoints {
+                points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                undo_calls: undo_calls.clone(),
+            }) as Box<dyn InteractiveCommand>,
+        );
+        interactive
+    }
+
+    fn prompt_of(
+        plugin: &mut dyn BuiltinPlugin,
+        interactive: &InteractiveRegistry,
+        client: &V4Client,
+    ) -> String {
+        match handle_host_request_v4(
+            plugin,
+            interactive,
+            client,
+            50,
+            24,
+            HostRequest::GetPrompt { command_id: 7 },
+        ) {
+            Some(HostResponse::Text(prompt)) => prompt,
+            other => panic!("expected the prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_step_reaches_a_v24_command_and_returns_its_step() {
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let undo_calls = std::sync::Arc::new(AtomicU64::new(0));
+        let interactive = registry_with_two_points(&undo_calls);
+        let mut plugin = UnsupportedReplPlugin;
+        let undo = |plugin: &mut UnsupportedReplPlugin, command_id: u64| {
+            handle_host_request_v4(
+                plugin,
+                &interactive,
+                &client,
+                1,
+                24,
+                HostRequest::UndoStep { command_id },
+            )
+        };
+        assert!(matches!(
+            undo(&mut plugin, 7),
+            Some(HostResponse::UndoStep(Some(ref step))) if matches!(**step, CommandStep::NeedPoint)
+        ));
+        assert_eq!(prompt_of(&mut plugin, &interactive, &client), "Point 2");
+        assert!(matches!(
+            undo(&mut plugin, 7),
+            Some(HostResponse::UndoStep(Some(_)))
+        ));
+        // Nothing left to drop: the command declines and stays registered.
+        assert!(matches!(
+            undo(&mut plugin, 7),
+            Some(HostResponse::UndoStep(None))
+        ));
+        assert!(interactive.borrow().contains_key(&7));
+        // An unknown command answers None instead of failing.
+        assert!(matches!(
+            undo(&mut plugin, 8),
+            Some(HostResponse::UndoStep(None))
+        ));
+        assert_eq!(undo_calls.load(Ordering::SeqCst), 3);
+        drop(host_stream);
+    }
+
+    #[test]
+    fn undo_step_that_ends_the_command_releases_it() {
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let interactive: InteractiveRegistry = Rc::new(RefCell::new(HashMap::new()));
+        interactive
+            .borrow_mut()
+            .insert(3, Box::new(UndoEnds) as Box<dyn InteractiveCommand>);
+        let mut plugin = UnsupportedReplPlugin;
+        let resp = handle_host_request_v4(
+            &mut plugin,
+            &interactive,
+            &client,
+            1,
+            24,
+            HostRequest::UndoStep { command_id: 3 },
+        );
+        assert!(matches!(
+            resp,
+            Some(HostResponse::UndoStep(Some(ref step))) if matches!(**step, CommandStep::Cancel)
+        ));
+        assert!(!interactive.borrow().contains_key(&3));
+        drop(host_stream);
+    }
+
+    /// A plugin built against API v23 has no `on_undo_step` slot: the runner
+    /// never calls it and answers that the command declines.
+    #[test]
+    fn undo_step_is_never_asked_of_a_pre_v24_command() {
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let undo_calls = std::sync::Arc::new(AtomicU64::new(0));
+        let interactive = registry_with_two_points(&undo_calls);
+        let mut plugin = UnsupportedReplPlugin;
+        let resp = handle_host_request_v4(
+            &mut plugin,
+            &interactive,
+            &client,
+            1,
+            23,
+            HostRequest::UndoStep { command_id: 7 },
+        );
+        assert!(matches!(resp, Some(HostResponse::UndoStep(None))));
+        assert_eq!(undo_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prompt_of(&mut plugin, &interactive, &client), "Point 3");
         drop(host_stream);
     }
 
@@ -1025,5 +1507,272 @@ mod tests {
             }
             other => panic!("expected error response, got {other:?}"),
         }
+    }
+
+    /// Records every notification the runner gate hands it (the v27 delta
+    /// routing harness). The gate reads the API version NUMERICALLY, so the
+    /// manifest (v4) is irrelevant here and both sides reuse `TEST_MANIFEST`.
+    struct NotifPlugin {
+        delivered: std::sync::Arc<std::sync::Mutex<Vec<HostNotification>>>,
+    }
+
+    impl BuiltinPlugin for NotifPlugin {
+        fn manifest(&self) -> &'static PluginManifest {
+            &TEST_MANIFEST
+        }
+        fn ribbon(&self) -> Box<dyn CadModule> {
+            Box::new(EmptyModule)
+        }
+        fn dispatch(&self, _host: &mut dyn HostApi, _cmd: &str) -> bool {
+            false
+        }
+        fn on_notification(&mut self, _command_id: Option<u64>, notification: HostNotification) {
+            self.delivered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(notification);
+        }
+    }
+
+    /// Deliver the v13 Regions + v27 delta boundary pair at `socket`, then end
+    /// the connection after the frames are certainly queued so `run_v4`
+    /// drains them and sees the disconnect.
+    fn send_boundary_pair(
+        socket: Stream,
+        regions: HostNotification,
+        delta: HostNotification,
+    ) -> thread::JoinHandle<()> {
+        use crate::ipc::transport::send;
+        use crate::ipc::v4::protocol::{HostToPluginV4, NotificationEnvelope};
+
+        thread::spawn(move || {
+            let mut socket = socket;
+            for notification in [regions, delta] {
+                send(
+                    &mut socket,
+                    &HostToPluginV4::Notification(NotificationEnvelope {
+                        command_id: None,
+                        payload: notification,
+                    }),
+                )
+                .expect("send boundary notification");
+            }
+            // Let the client's reader thread pick both frames up before the
+            // socket ends; run_v4's drain hands them to the plugin on the
+            // next pass and disconnects out of the loop hereafter.
+            thread::sleep(std::time::Duration::from_millis(400));
+        })
+    }
+
+    fn drain_boundary_pair_through_run_v4(api_version: u32) -> Vec<HostNotification> {
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let interactive: InteractiveRegistry = Rc::new(RefCell::new(HashMap::new()));
+        let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // The boundary pair of one real change boundary: the legacy v13
+        // Regions stream, and the v27 categorized delta the host routes
+        // INSTEAD OF it to API v27+ endpoints.
+        let regions = HostNotification::DocumentChangedRegions {
+            tab_id: 7,
+            version: 41,
+            entities: Vec::new(),
+            records: Vec::new(),
+        };
+        let delta = HostNotification::DocumentChangedDelta {
+            tab_id: 7,
+            version: 41,
+            added: vec![document::Handle::from(5)],
+            modified: vec![document::Handle::from(9)],
+            deleted: vec![document::Handle::from(11)],
+            records: Vec::new(),
+            snapshot: Some(crate::host::DocumentDeltaSnapshot {
+                version: 41,
+                generation: 2,
+            }),
+            full_refresh_required: true,
+        };
+
+        let sender = send_boundary_pair(host_stream, regions, delta);
+
+        let mut plugin = NotifPlugin {
+            delivered: std::sync::Arc::clone(&delivered),
+        };
+        run_v4(&mut plugin, &interactive, client, api_version).expect("run_v4 drains and exits");
+        sender.join().expect("boundary sender thread");
+        let got = delivered.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        got
+    }
+
+    #[test]
+    fn notification_api_version_pins_document_changed_delta_at_27() {
+        // The v27 delta routes (via the runner gate) to plugins whose
+        // exported `ocs_plugin_api_version` reports 27+: the gate maps the
+        // variant to exactly 27, keeping the v13 Regions stream it replaces
+        // at its legacy 13.
+        assert_eq!(
+            notification_api_version(&HostNotification::DocumentChangedDelta {
+                tab_id: 0,
+                version: 0,
+                added: Vec::new(),
+                modified: Vec::new(),
+                deleted: Vec::new(),
+                records: Vec::new(),
+                snapshot: None,
+                full_refresh_required: false,
+            }),
+            27
+        );
+        assert_eq!(
+            notification_api_version(&HostNotification::DocumentChangedRegions {
+                tab_id: 0,
+                version: 0,
+                entities: Vec::new(),
+                records: Vec::new(),
+            }),
+            13
+        );
+    }
+
+    #[test]
+    fn run_v4_drops_document_changed_delta_from_pre_v27_plugin() {
+        // API v26 runner: the delta is newer than the plugin's ABI — the
+        // runner gate drops it (UB guard) and the legacy Regions stream is
+        // the exact, sole delivery.
+        let from_v26 = drain_boundary_pair_through_run_v4(26);
+        assert_eq!(
+            from_v26.len(),
+            1,
+            "a pre-v27 runner delivers exactly the legacy Regions stream: {from_v26:?}"
+        );
+        assert!(
+            matches!(
+                from_v26.first(),
+                Some(HostNotification::DocumentChangedRegions { .. })
+            ),
+            "the legacy stream is what a v26 plugin sees: {from_v26:?}"
+        );
+        assert!(
+            !from_v26
+                .iter()
+                .any(|n| matches!(n, HostNotification::DocumentChangedDelta { .. })),
+            "a pre-v27 plugin must never see the delta (UB guard)"
+        );
+    }
+
+    #[test]
+    fn run_v4_delivers_document_changed_delta_to_v27_plugin() {
+        // API v27 runner: the categorized delta rides the state-only
+        // on_notification callback exactly like the legacy Regions stream
+        // next to it.
+        let from_v27 = drain_boundary_pair_through_run_v4(27);
+        assert!(
+            matches!(
+                from_v27.first(),
+                Some(HostNotification::DocumentChangedRegions { .. })
+            ),
+            "the legacy Regions stream still arrives: {from_v27:?}"
+        );
+        assert!(
+            from_v27
+                .iter()
+                .any(|n| matches!(n, HostNotification::DocumentChangedDelta { .. })),
+            "a v27 plugin receives the categorized delta: {from_v27:?}"
+        );
+        assert_eq!(
+            from_v27.len(),
+            2,
+            "both boundary notifications arrive once each: {from_v27:?}"
+        );
+    }
+
+    #[test]
+    fn text_input_and_input_kind_are_gated_by_api_version() {
+        struct TextPromptCommand {
+            seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl InteractiveCommand for TextPromptCommand {
+            fn prompt(&self) -> String {
+                "Enter label:".into()
+            }
+            fn on_point(&mut self, _pt: [f64; 3]) -> CommandStep {
+                CommandStep::NeedPoint
+            }
+            fn input_kind(&self) -> crate::host::InteractiveInputKind {
+                crate::host::InteractiveInputKind::FreeText
+            }
+            fn on_text_input(&mut self, text: &str) -> CommandStep {
+                self.seen.lock().expect("seen").push(text.to_string());
+                CommandStep::Done
+            }
+        }
+
+        let (host_stream, runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(runner_stream);
+        let interactive: InteractiveRegistry = Rc::new(RefCell::new(HashMap::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        interactive.borrow_mut().insert(
+            9,
+            Box::new(TextPromptCommand { seen: seen.clone() }) as Box<dyn InteractiveCommand>,
+        );
+        let mut plugin = UnsupportedReplPlugin;
+
+        assert!(matches!(
+            handle_host_request_v4(
+                &mut plugin,
+                &interactive,
+                &client,
+                1,
+                27,
+                HostRequest::GetInputKind { command_id: 9 },
+            ),
+            Some(HostResponse::InputKind(
+                crate::host::InteractiveInputKind::Point
+            ))
+        ));
+        assert!(matches!(
+            handle_host_request_v4(
+                &mut plugin,
+                &interactive,
+                &client,
+                2,
+                27,
+                HostRequest::InteractiveEvent {
+                    command_id: 9,
+                    event: InteractiveEvent::TextInput("ignored".into()),
+                },
+            ),
+            Some(HostResponse::CommandStep(step)) if matches!(*step, CommandStep::NeedPoint)
+        ));
+
+        assert!(matches!(
+            handle_host_request_v4(
+                &mut plugin,
+                &interactive,
+                &client,
+                3,
+                28,
+                HostRequest::GetInputKind { command_id: 9 },
+            ),
+            Some(HostResponse::InputKind(
+                crate::host::InteractiveInputKind::FreeText
+            ))
+        ));
+        assert!(matches!(
+            handle_host_request_v4(
+                &mut plugin,
+                &interactive,
+                &client,
+                4,
+                28,
+                HostRequest::InteractiveEvent {
+                    command_id: 9,
+                    event: InteractiveEvent::TextInput("Hello World".into()),
+                },
+            ),
+            Some(HostResponse::CommandStep(step)) if matches!(*step, CommandStep::Done)
+        ));
+        assert_eq!(*seen.lock().expect("seen"), ["Hello World"]);
+        drop(host_stream);
     }
 }

@@ -7,7 +7,7 @@ use crate::command::StepInput;
 use crate::scene::parametric_constraints::{
     ConstraintKind, ParametricScope, DYNAMIC_DIMENSION_LAYER,
 };
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 /// Whole degrees for the corner's own label: the current dimension style's
@@ -144,7 +144,7 @@ fn label(
     app: &OpenCADStudio,
     tab: usize,
     handle: Handle,
-) -> (Option<String>, String, codec::types::Color) {
+) -> (Option<String>, String, document::types::Color) {
     let entity = app.tabs[tab]
         .scene
         .document
@@ -275,7 +275,7 @@ fn typing_a_value_at_the_angular_prompt_turns_the_second_side() {
         (
             Some("ang1=90".to_string()),
             DYNAMIC_DIMENSION_LAYER.to_string(),
-            codec::types::Color::Rgb {
+            document::types::Color::Rgb {
                 r: 103,
                 g: 109,
                 b: 118,
@@ -387,6 +387,86 @@ fn a_solve_mode_of_zero_edits_the_corner_by_resizing_it() {
         !solved(resized, drawn),
         "at zero the edit is reached by resizing the side it turns, found {resized}"
     );
+}
+
+/// The label a constraint creates names the block that draws it from the
+/// moment it exists, not only once a save bakes one, and prints the value it
+/// was created with.
+fn assert_created_label_is_a_complete_record(
+    app: &OpenCADStudio,
+    tab: usize,
+    dimension: Handle,
+    value: f64,
+) {
+    let document = &app.tabs[tab].scene.document;
+    let Some(EntityType::Dimension(printed)) = document.get_entity(dimension) else {
+        panic!("the constraint's label is a dimension");
+    };
+    assert_eq!(
+        printed.base().common.entity_mode,
+        Some(2),
+        "a label created in model space is a model-space record"
+    );
+    let block = &printed.base().block_name;
+    assert!(
+        block.starts_with("*D"),
+        "the live label names the block it draws: {block:?}"
+    );
+    let record = document
+        .block_records
+        .get(block)
+        .expect("the live document holds the block the label names");
+    assert!(
+        !record.entity_handles.is_empty(),
+        "the live block holds the geometry the label draws"
+    );
+    let text = label(app, tab, dimension)
+        .0
+        .expect("the label carries the value it was created with");
+    let shown = text.rsplit('=').next().unwrap_or(&text);
+    let shown: f64 = shown
+        .parse()
+        .unwrap_or_else(|_| panic!("the label prints a number, found {text:?}"));
+    assert!(
+        solved(shown, value),
+        "the label prints the value it was given, found {text:?}"
+    );
+}
+
+fn created_label(app: &OpenCADStudio, tab: usize) -> Handle {
+    let dimensions = &app.tabs[tab]
+        .scene
+        .parametric_constraint_set(ParametricScope::ModelSpace)
+        .expect("the drawing has a constraint set")
+        .dimensions;
+    assert_eq!(
+        dimensions.len(),
+        1,
+        "the one constraint created drives exactly one label"
+    );
+    dimensions
+        .values()
+        .next()
+        .copied()
+        .expect("the constraint drives a label")
+}
+
+#[test]
+fn a_radius_label_is_a_complete_record_from_creation() {
+    let (mut app, i, shape) = circle_at("10,10", "25");
+    let _ = app.dispatch_command("DCRADIUS");
+    let _ = app.feed_command(StepInput::EntityPick(shape, DVec3::new(35.0, 10.0, 0.0)));
+    let _ = app.feed_command(StepInput::Point(DVec3::new(50.0, 20.0, 0.0)));
+    let _ = app.feed_command(StepInput::Text("40".into()));
+    assert_created_label_is_a_complete_record(&app, i, created_label(&app, i), 40.0);
+}
+
+#[test]
+fn an_angular_label_is_a_complete_record_from_creation() {
+    let (mut app, i, first, second) = two_lines();
+    walk_to_the_angular_prompt(&mut app, first, second);
+    let _ = app.feed_command(StepInput::Text("30".into()));
+    assert_created_label_is_a_complete_record(&app, i, created_label(&app, i), 30.0);
 }
 
 #[test]
@@ -546,7 +626,7 @@ fn typing_a_value_at_the_radius_prompt_moves_the_rim() {
         (
             Some("rad1=40".to_string()),
             DYNAMIC_DIMENSION_LAYER.to_string(),
-            codec::types::Color::Rgb {
+            document::types::Color::Rgb {
                 r: 103,
                 g: 109,
                 b: 118,

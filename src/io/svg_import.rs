@@ -15,11 +15,9 @@
 //! imported into, with its top-left corner at the block's origin; SVG's y
 //! runs down the page, so it runs down the drawing here too.
 
-use codec::entities::{
-    BoundaryEdge, BoundaryPath, Hatch, Polyline2D, PolylineEdge, Vertex2D,
-};
-use codec::types::{Color, Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{BoundaryEdge, BoundaryPath, Hatch, Polyline2D, PolylineEdge, Vertex2D};
+use document::types::{Color, Vector2, Vector3};
+use document::EntityType;
 use resvg::tiny_skia::PathSegment;
 use resvg::usvg::{self, Node, Paint};
 
@@ -207,7 +205,11 @@ impl Flattener {
         hatch.is_solid = true;
         hatch.common.color = color;
         for (k, vertices) in loops.into_iter().enumerate() {
-            let mut boundary = if k == 0 { BoundaryPath::external() } else { BoundaryPath::new() };
+            let mut boundary = if k == 0 {
+                BoundaryPath::external()
+            } else {
+                BoundaryPath::new()
+            };
             boundary.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(vertices, true)));
             hatch.paths.push(boundary);
         }
@@ -254,8 +256,15 @@ fn paint_color(paint: &Paint) -> Option<Color> {
     if (c.red, c.green, c.blue) == (0, 0, 0) || (c.red, c.green, c.blue) == (255, 255, 255) {
         return Some(Color::Index(7));
     }
-    Some(Color::Rgb { r: c.red, g: c.green, b: c.blue })
+    Some(Color::Rgb {
+        r: c.red,
+        g: c.green,
+        b: c.blue,
+    })
 }
+
+/// How deeply an SVG's elements may nest: usvg's own limit.
+const MAX_XML_DEPTH: usize = 1024;
 
 /// Reads an SVG (or gzip-compressed SVGZ), scaled so the picture fits
 /// within `fit` (width and height, drawing units).
@@ -267,20 +276,46 @@ pub fn read(bytes: &[u8], fit: [f64; 2]) -> Result<Picture, Error> {
         resolve_data: Box::new(|_, _, _| None),
         resolve_string: Box::new(|_, _| None),
     };
-    let tree = usvg::Tree::from_data(bytes, &options).map_err(|_| Error::NotSvg)?;
+    let unpacked;
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        unpacked = usvg::decompress_svgz(bytes).map_err(|_| Error::NotSvg)?;
+        &unpacked[..]
+    } else {
+        bytes
+    };
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::NotSvg)?;
+    // usvg refuses deeper documents itself, but only after roxmltree has
+    // parsed them.
+    if !crate::xml_depth::within(text, MAX_XML_DEPTH) {
+        return Err(Error::NotSvg);
+    }
+    let tree = usvg::Tree::from_str(text, &options).map_err(|_| Error::NotSvg)?;
     let size = tree.size();
     let (w, h) = (f64::from(size.width()), f64::from(size.height()));
     if !(w > 0.0 && h > 0.0) {
         return Err(Error::Empty);
     }
     let scale = (fit[0] / w).min(fit[1] / h);
-    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    let mut flattener = Flattener { scale, extent: w.max(h), entities: Vec::new(), outline: true, loops: Vec::new(), outline_start: 0 };
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let mut flattener = Flattener {
+        scale,
+        extent: w.max(h),
+        entities: Vec::new(),
+        outline: true,
+        loops: Vec::new(),
+        outline_start: 0,
+    };
     flattener.group(tree.root());
     if flattener.entities.is_empty() {
         return Err(Error::Empty);
     }
-    Ok(Picture { entities: flattener.entities })
+    Ok(Picture {
+        entities: flattener.entities,
+    })
 }
 
 #[cfg(test)]
@@ -350,5 +385,44 @@ mod tests {
         assert_eq!(read(b"not svg", [1.0, 1.0]).err(), Some(Error::NotSvg));
         let empty = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
         assert_eq!(read(empty, [1.0, 1.0]).err(), Some(Error::Empty));
+    }
+
+    /// A path inside `groups` nested groups.
+    fn nested(groups: usize) -> String {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">{}\
+             <path d=\"M0 0L5 5\" stroke=\"black\"/>{}</svg>",
+            "<g>".repeat(groups),
+            "</g>".repeat(groups)
+        )
+    }
+
+    #[test]
+    fn a_document_nested_deeper_than_usvg_reads_is_refused_before_parsing() {
+        // As deep as usvg reads (the <svg> and 1,023 groups), and one more.
+        assert_eq!(
+            read(nested(1023).as_bytes(), [10.0, 10.0]).map(|p| p.entities.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            read(nested(1024).as_bytes(), [10.0, 10.0]).err(),
+            Some(Error::NotSvg)
+        );
+        // 3,000 levels overflowed a test thread's stack inside the XML
+        // parser, before usvg's own limit.
+        let deep = nested(100_000);
+        assert_eq!(
+            read(deep.as_bytes(), [10.0, 10.0]).err(),
+            Some(Error::NotSvg)
+        );
+        // Compressed (SVGZ), it is checked once unpacked.
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(deep.as_bytes()).unwrap();
+        let svgz = gz.finish().unwrap();
+        assert_eq!(read(&svgz, [10.0, 10.0]).err(), Some(Error::NotSvg));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(SQUARE.as_bytes()).unwrap();
+        assert!(read(&gz.finish().unwrap(), [100.0, 50.0]).is_ok());
     }
 }

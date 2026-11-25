@@ -25,9 +25,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::classes::DxfClass;
-use codec::entities::{EntityType, Insert, Line, Viewport};
-use codec::types::{Handle, Vector3};
+use document::classes::DxfClass;
+use document::entities::{EntityType, Insert, Line, Viewport};
+use document::types::{Handle, Vector3};
 use OpenCADStudio::scene::Scene;
 
 const ENTITIES: usize = 100_000;
@@ -42,7 +42,7 @@ fn fixture() -> (Scene, Handle) {
 
     // A frozen layer keeps the 100k model lines out of every viewport's wire
     // set, so a frame's cost is the hidden-handle lookup, not tessellation.
-    let mut frozen = codec::tables::layer::Layer::new("HIDDEN");
+    let mut frozen = document::tables::layer::Layer::new("HIDDEN");
     frozen.flags.frozen = true;
     scene.document.layers.add_or_replace(frozen);
 
@@ -83,7 +83,10 @@ fn fixture() -> (Scene, Handle) {
             .clone()
     };
     // `add_layout` also gives the sheet its own viewport entity.
-    assert!(content.len() > VIEWPORTS, "every content viewport is registered");
+    assert!(
+        content.len() > VIEWPORTS,
+        "every content viewport is registered"
+    );
 
     // Model space: the many entities, plus one view-representation INSERT per
     // viewport, each bound to a different viewport than the ones it hides in.
@@ -108,7 +111,7 @@ fn fixture() -> (Scene, Handle) {
         dxf_name: "ACIDBLOCKREFERENCE".to_string(),
         cpp_class_name: "AcDbBlockRepresentationContext".to_string(),
         application_name: "ObjectDBX Classes".to_string(),
-        proxy_flags: codec::classes::ProxyFlags(1153),
+        proxy_flags: document::classes::ProxyFlags(1153),
         instance_count: 0,
         was_zombie: false,
         is_an_entity: false,
@@ -150,7 +153,7 @@ fn main() {
     let frame = |scene: &Scene| {
         scene.build_viewports(
             bounds,
-            codec::entities::ViewportRenderMode::Wireframe2D,
+            document::entities::ViewportRenderMode::Wireframe2D,
             None,
             false,
             false,
@@ -169,13 +172,19 @@ fn main() {
         }
         let per_frame = started.elapsed().as_secs_f64() * 1000.0 / ITERATIONS as f64;
         best = best.min(per_frame);
-        println!("paper_viewport_hidden_handles: run {run} {ITERATIONS} frames: {per_frame:.3} ms/frame");
+        println!(
+            "paper_viewport_hidden_handles: run {run} {ITERATIONS} frames: {per_frame:.3} ms/frame"
+        );
     }
 
     // The sheet still resolves its four content viewports, and each still
     // owns the empty VP-frozen list the fixture gave it.
     let listed = scene.viewport_list();
-    assert_eq!(listed.len(), VIEWPORTS, "the sheet keeps its content viewports");
+    assert_eq!(
+        listed.len(),
+        VIEWPORTS,
+        "the sheet keeps its content viewports"
+    );
     assert!(listed.iter().all(|vp| vp.frozen.is_empty()));
     assert!(listed.iter().any(|vp| vp.handle == first));
     assert_eq!(

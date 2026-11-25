@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::{
     CommandSource, CommandStep, CustomGripEvent, CustomGripResponse, GripInfo, HostSettingValue,
-    PluginConstraint, PluginGrip, XRecordEntry, XRecordRead, XRecordUpdate,
+    InteractiveInputKind, PluginConstraint, PluginGrip, XRecordEntry, XRecordRead, XRecordUpdate,
 };
 use crate::manifest::ApiVersion;
 use crate::ribbon::owned::{OwnedEntityClasses, OwnedPluginManifest, OwnedRibbonGroup};
 
 pub use crate::host::PreviewWire;
-pub use codec::xdata::{ExtendedDataRecord, XDataValue};
-pub use codec::{Document, EntityType, Handle};
+pub use document::xdata::{ExtendedDataRecord, XDataValue};
+pub use document::{Document, EntityType, Handle};
 
 /// Events the host forwards to an active plugin `InteractiveCommand`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +43,8 @@ pub enum InteractiveEvent {
     SelectionComplete(Vec<Handle>),
     /// V7 (additive): modal dialog submitted or cancelled.
     DialogResponse(crate::dialog::DialogResponse),
+    /// V27 (additive): command-line text submitted for the interactive step.
+    TextInput(String),
 }
 
 /// Initial handshake sent by the plugin runner immediately after connecting.
@@ -125,6 +127,36 @@ pub enum HostRequest {
     GetModalDialog {
         command_id: u64,
     },
+    /// V19 (additive): an event (choice change, button, toggle, table row)
+    /// inside the interactive command's open modal dialog. The runner answers
+    /// with [`HostResponse::DialogAction`] carrying the command's
+    /// `on_dialog_action` result, so out-of-process plugins can replace,
+    /// submit or close their dialog like in-process ones.
+    DialogAction {
+        command_id: u64,
+        event: crate::dialog::DialogEvent,
+    },
+    /// V24 (additive): mid-command Ctrl+Z. The runner answers with
+    /// [`HostResponse::UndoStep`] carrying the command's `on_undo_step`
+    /// result. A v23 runner cannot decode this request: the host sends it
+    /// only to plugins whose manifest declares v24 or newer.
+    UndoStep {
+        command_id: u64,
+    },
+    /// V25 (additive): the plugin's AI tools. The runner answers with
+    /// [`HostResponse::Tools`]; sent only to plugins declaring v25 or newer.
+    ListTools,
+    /// V25 (additive): run one AI tool on the given tab. The runner answers
+    /// with [`HostResponse::ToolResult`].
+    CallTool {
+        tab_index: usize,
+        name: String,
+        arguments: String,
+    },
+    /// V27 (additive): query the command-line input mode of an interactive step.
+    GetInputKind {
+        command_id: u64,
+    },
 }
 
 /// Responses the plugin runner sends back for `HostRequest`.
@@ -142,6 +174,18 @@ pub enum HostResponse {
     /// preview wire set that replaces its previous live preview.
     CustomGrip(CustomGripResponse),
     ModalDialog(Option<crate::dialog::DialogDef>),
+    /// V19 (additive): answer to [`HostRequest::DialogAction`].
+    DialogAction(crate::dialog::DialogActionResponse),
+    /// V24 (additive): answer to [`HostRequest::UndoStep`]; `None` when the
+    /// command leaves Ctrl+Z to the document undo.
+    UndoStep(Option<Box<CommandStep>>),
+    /// V25 (additive): answer to [`HostRequest::ListTools`].
+    Tools(Vec<crate::host::PluginTool>),
+    /// V25 (additive): answer to [`HostRequest::CallTool`]: the result as
+    /// JSON text, or the plugin's error message.
+    ToolResult(Result<String, String>),
+    /// V27 (additive): answer to [`HostRequest::GetInputKind`].
+    InputKind(InteractiveInputKind),
 }
 
 /// Requests the plugin runner sends to the host.
@@ -377,6 +421,52 @@ pub enum PluginRequest {
     UnregisterQuadPanels {
         panel_ids: Vec<String>,
     },
+    /// Additive: audit a declared chain without staging or mutating host state.
+    ValidateParametricChain {
+        chain: crate::host::ParametricChain,
+        tolerance: f64,
+    },
+    /// Additive: read the current state of an owned dock panel.
+    PanelSnapshot {
+        panel_id: String,
+    },
+    /// V22 (additive): create or update the model-space GEODATA object.
+    SetGeoLocation {
+        location: crate::host::GeoLocation,
+    },
+    /// V22 (additive): remove the model-space GEODATA object.
+    RemoveGeoLocation,
+    /// V29: publish or replace one panel's surface for the authenticated
+    /// owner. The first publish mounts it; a later one replaces it when its
+    /// revision advances, and the same scene at the head is a no-op.
+    PanelSurfacePublish {
+        panel_id: String,
+        surface: crate::scene::PanelSurface,
+    },
+    /// V29 (additive): apply a bounded, revision-checked op list to the
+    /// panel's stored scene atomically (all-or-nothing): a stale base or
+    /// any op failure refuses with the typed rejection and zero mutation;
+    /// success stores the patched scene at exactly one revision past the
+    /// base. Same ownership rules as the publish.
+    PanelSurfacePatch {
+        panel_id: String,
+        patch: crate::scene::ScenePatch,
+    },
+    /// V29 (additive): install a bounded, revision-checked page of widget
+    /// rows into the panel's widget surface atomically (all-or-nothing) —
+    /// the lazy-expansion and paging primitive (finding F4): installing
+    /// another page never replaces the whole surface.
+    PanelSurfacePage {
+        panel_id: String,
+        page: crate::widget::WidgetPage,
+    },
+    /// V29 (additive): apply a bounded, revision-checked table patch
+    /// (cell/row ops) to the panel's stored table atomically
+    /// (all-or-nothing) — the cell-edit and row-update primitive.
+    PanelSurfaceTablePatch {
+        panel_id: String,
+        patch: crate::tables::TablePatch,
+    },
 }
 
 /// Responses the host sends back for `PluginRequest`.
@@ -451,9 +541,7 @@ pub enum PluginResponse {
     StagePluginClassInstanceResult(Result<Vec<Handle>, String>),
     /// V14 (additive): a class instance's declared parameter rows (the
     /// read half of the session's properties pair).
-    PluginClassInstancePropertiesResult(
-        Result<Vec<crate::host::PluginClassParameterRow>, String>,
-    ),
+    PluginClassInstancePropertiesResult(Result<Vec<crate::host::PluginClassParameterRow>, String>),
     DialogResult(crate::dialog::DialogResponse),
     PanelRegistered(bool),
     PanelUpdated(bool),
@@ -467,6 +555,36 @@ pub enum PluginResponse {
         ok: Vec<bool>,
         errors: Vec<String>,
     },
+    /// Additive: outcome of pure parametric-chain validation.
+    ValidateParametricChainResult(Result<(), String>),
+    /// Additive: current state of an owned dock panel.
+    PanelSnapshot(Result<crate::dialog::PanelSnapshot, String>),
+    /// V22 (additive): the GEODATA handle written by `SetGeoLocation`.
+    GeoLocationSet(Result<crate::host::Handle, String>),
+    /// V22 (additive): whether `RemoveGeoLocation` removed an object.
+    GeoLocationRemoved(Result<bool, String>),
+    /// V29: the stored revision, or the reason the publish was refused.
+    PanelSurfacePublished(Result<crate::scene::SceneRevision, crate::scene::SurfaceReject>),
+    /// V29 (additive): outcome of a panel surface patch — the stored
+    /// revision after the atomic apply, or the typed refusal (stale base,
+    /// foreign ownership, unknown ids, budget overflow); the stored scene
+    /// never ends up partially patched.
+    PanelSurfacePatchResult(Result<crate::scene::SceneRevision, crate::scene::SurfaceReject>),
+    /// V29 (additive): outcome of a widget page install — the stored
+    /// widget revision after the atomic install, or the typed refusal.
+    PanelSurfacePageResult(Result<crate::widget::WidgetRevision, crate::widget::WidgetReject>),
+    /// V29 (additive): outcome of a WIDGET surface publish — the stored
+    /// widget revision (the widget tier's independent revision space), or
+    /// the typed refusal.
+    PanelWidgetPublished(Result<crate::widget::WidgetRevision, crate::widget::WidgetReject>),
+    /// V29 (additive): outcome of a TABLE surface publish — the stored
+    /// table revision (the table tier's independent revision space), or
+    /// the typed refusal.
+    PanelTablePublished(Result<crate::tables::TableRevision, crate::tables::TableReject>),
+    /// V29 (additive): outcome of a table patch — the stored revision
+    /// after the atomic apply, or the typed refusal; the stored table
+    /// never ends up partially patched.
+    PanelTablePatchResult(Result<crate::tables::TableRevision, crate::tables::TableReject>),
 }
 
 /// Messages sent from the host to the plugin runner.
@@ -522,5 +640,294 @@ impl OwnedPluginManifest {
         ApiVersion {
             major: self.api_version,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{PanelScene, PanelSurface, SceneRevision, SurfaceReject, SurfaceRejectCode};
+
+    fn discriminant_of<T: Serialize>(value: &T) -> u32 {
+        let bytes = bincode::serialize(value).expect("serialize");
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    #[test]
+    fn plugin_request_v14_to_v16_discriminants_are_preserved() {
+        assert_eq!(
+            discriminant_of(&PluginRequest::ShowDialog(crate::dialog::DialogDef::new(
+                "T"
+            ))),
+            50
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::RegisterPanel(crate::dialog::PanelDef::new(
+                "id", "T"
+            ))),
+            51
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::UpdatePanel {
+                panel_id: "id".into(),
+                values: Default::default(),
+            }),
+            52
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::TogglePanel {
+                panel_id: "id".into(),
+                show: None,
+            }),
+            53
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::BeginUndoGroup {
+                label: "group".into(),
+            }),
+            54
+        );
+        assert_eq!(discriminant_of(&PluginRequest::EndUndoGroup), 55);
+        assert_eq!(
+            discriminant_of(&PluginRequest::QueryEntities { query: "{}".into() }),
+            56
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::RegisterQuadPanels { panels: vec![] }),
+            57
+        );
+        assert_eq!(
+            discriminant_of(&PluginRequest::UnregisterQuadPanels { panel_ids: vec![] }),
+            58
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::GetModalDialog { command_id: 1 }),
+            14
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::DialogAction {
+                command_id: 1,
+                event: crate::dialog::DialogEvent {
+                    control_id: String::new(),
+                    action: String::new(),
+                    value: None,
+                    current_values: Default::default(),
+                },
+            }),
+            15
+        );
+        assert_eq!(
+            discriminant_of(&HostRequest::UndoStep { command_id: 1 }),
+            16
+        );
+        assert_eq!(discriminant(&HostResponse::UndoStep(None)), 11);
+        assert_eq!(
+            discriminant_of(&HostRequest::GetInputKind { command_id: 1 }),
+            19
+        );
+        assert_eq!(
+            discriminant_of(&HostResponse::InputKind(InteractiveInputKind::SingleToken)),
+            14
+        );
+        assert_eq!(
+            discriminant_of(&InteractiveEvent::TextInput(String::new())),
+            6
+        );
+    }
+
+    fn discriminant<T: serde::Serialize>(value: &T) -> u32 {
+        let bytes = bincode::serialize(value).expect("serialize IPC variant");
+        u32::from_le_bytes(bytes[..4].try_into().expect("bincode enum discriminant"))
+    }
+
+    #[test]
+    fn panel_snapshot_variants_append_without_shifting_discriminants() {
+        let request = PluginRequest::PanelSnapshot {
+            panel_id: "alignment".to_owned(),
+        };
+        let response = PluginResponse::PanelSnapshot(Err("unsupported".to_owned()));
+
+        assert_eq!(discriminant(&PluginRequest::PushInfo(String::new())), 0);
+        assert_eq!(
+            discriminant(&PluginRequest::ValidateParametricChain {
+                chain: crate::host::ParametricChain {
+                    plane: crate::host::ParametricPlane::Plan,
+                    segments: Vec::new(),
+                    layer: String::new(),
+                },
+                tolerance: 1e-3,
+            }),
+            59
+        );
+        assert_eq!(discriminant(&request), 60);
+        assert_eq!(discriminant(&PluginResponse::Ok), 0);
+        assert_eq!(
+            discriminant(&PluginResponse::ValidateParametricChainResult(Ok(()))),
+            45
+        );
+        assert_eq!(discriminant(&response), 46);
+
+        let bytes = bincode::serialize(&request).expect("serialize panel snapshot request");
+        match bincode::deserialize::<PluginRequest>(&bytes).expect("deserialize request") {
+            PluginRequest::PanelSnapshot { panel_id } => assert_eq!(panel_id, "alignment"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let bytes = bincode::serialize(&response).expect("serialize panel snapshot response");
+        match bincode::deserialize::<PluginResponse>(&bytes).expect("deserialize response") {
+            PluginResponse::PanelSnapshot(Err(error)) => assert_eq!(error, "unsupported"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The v29 panel-surface tail is pinned: the scene publish is the last
+    /// request variant (after `RemoveGeoLocation` 62), the typed answer is
+    /// the last response variant (after `GeoLocationRemoved` 48), and the
+    /// surface envelope starts at `Scene` = 0. The widget-surface stage
+    /// appends its kind; these never renumber. A v28 runner cannot decode
+    /// tag 63, so a plugin that sends it declares v29 (see manifest).
+    #[test]
+    fn panel_surface_publish_v29_wire_tail_is_pinned() {
+        let scene = PanelScene {
+            revision: SceneRevision(4),
+            elements: Vec::new(),
+        };
+        assert_eq!(discriminant_of(&PluginRequest::RemoveGeoLocation), 62);
+        assert_eq!(
+            discriminant_of(&PluginRequest::PanelSurfacePublish {
+                panel_id: "graph".into(),
+                surface: PanelSurface::Scene(scene.clone()),
+            }),
+            63
+        );
+        assert_eq!(discriminant_of(&PanelSurface::Scene(scene.clone())), 0);
+        assert_eq!(
+            discriminant_of(&PluginResponse::GeoLocationRemoved(Ok(true))),
+            48
+        );
+        assert_eq!(
+            discriminant_of(&PluginResponse::PanelSurfacePublished(Ok(SceneRevision(9)))),
+            49
+        );
+
+        let request = PluginRequest::PanelSurfacePublish {
+            panel_id: "graph".into(),
+            surface: PanelSurface::Scene(scene),
+        };
+        match bincode::deserialize::<PluginRequest>(
+            &bincode::serialize(&request).expect("serialize request"),
+        )
+        .expect("deserialize request")
+        {
+            PluginRequest::PanelSurfacePublish { panel_id, surface } => {
+                assert_eq!(panel_id, "graph");
+                assert!(matches!(surface, PanelSurface::Scene(_)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let reject = PluginResponse::PanelSurfacePublished(Err(SurfaceReject {
+            code: SurfaceRejectCode::NonMonotonicRevision,
+            current_revision: Some(SceneRevision(3)),
+        }));
+        match bincode::deserialize::<PluginResponse>(
+            &bincode::serialize(&reject).expect("serialize response"),
+        )
+        .expect("deserialize response")
+        {
+            PluginResponse::PanelSurfacePublished(Err(SurfaceReject {
+                code,
+                current_revision,
+            })) => {
+                assert_eq!(code, SurfaceRejectCode::NonMonotonicRevision);
+                assert_eq!(current_revision, Some(SceneRevision(3)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The v29 patch tail is pinned: the patch request is variant 64
+    /// (right after the publish 63) and its typed result is response
+    /// variant 50 (right after the publish answer 49). Appends only.
+    #[test]
+    fn panel_surface_patch_v29_wire_tail_is_pinned() {
+        let patch = crate::scene::ScenePatch {
+            base_revision: SceneRevision(4),
+            ops: vec![crate::scene::SceneOp::Remove {
+                id: crate::scene::StableId(7),
+            }],
+        };
+        assert_eq!(
+            discriminant_of(&PluginRequest::PanelSurfacePatch {
+                panel_id: "graph".into(),
+                patch: patch.clone(),
+            }),
+            64
+        );
+        assert_eq!(
+            discriminant_of(&PluginResponse::PanelSurfacePatchResult(Ok(SceneRevision(
+                5
+            )))),
+            50
+        );
+        match bincode::deserialize::<PluginRequest>(
+            &bincode::serialize(&PluginRequest::PanelSurfacePatch {
+                panel_id: "graph".into(),
+                patch,
+            })
+            .expect("serialize patch request"),
+        )
+        .expect("deserialize patch request")
+        {
+            PluginRequest::PanelSurfacePatch { panel_id, patch } => {
+                assert_eq!(panel_id, "graph");
+                assert_eq!(patch.base_revision, SceneRevision(4));
+                assert!(matches!(
+                    patch.ops.as_slice(),
+                    [crate::scene::SceneOp::Remove { id }] if *id == crate::scene::StableId(7)
+                ));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The S05 widget tier is pinned: the surface envelope grows
+    /// `Widgets` = 1 (after `Scene` = 0), the page install is request
+    /// variant 65 (right after the patch 64), and the typed page/widget
+    /// answers are response variants 51 and 52. Appends only.
+    #[test]
+    fn panel_widget_s05_wire_tails_are_pinned() {
+        let surface = crate::widget::WidgetSurface::new(crate::widget::WidgetRevision(1));
+        assert_eq!(
+            discriminant_of(&PanelSurface::Scene(crate::scene::PanelScene {
+                revision: SceneRevision(1),
+                elements: Vec::new(),
+            })),
+            0
+        );
+        assert_eq!(discriminant_of(&PanelSurface::Widgets(surface.clone())), 1);
+        assert_eq!(
+            discriminant_of(&PluginRequest::PanelSurfacePage {
+                panel_id: "acme:tree".into(),
+                page: crate::widget::WidgetPage {
+                    base_revision: crate::widget::WidgetRevision(1),
+                    parent: None,
+                    after: None,
+                    rows: Vec::new(),
+                    next: None,
+                },
+            }),
+            65
+        );
+        assert_eq!(
+            discriminant_of(&PluginResponse::PanelSurfacePageResult(Ok(
+                crate::widget::WidgetRevision(2)
+            ))),
+            51
+        );
+        assert_eq!(
+            discriminant_of(&PluginResponse::PanelWidgetPublished(Ok(
+                crate::widget::WidgetRevision(1)
+            ))),
+            52
+        );
     }
 }

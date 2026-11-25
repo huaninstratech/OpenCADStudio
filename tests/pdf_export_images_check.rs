@@ -1,9 +1,9 @@
 //! #1266: decoded IMAGE/OLE content must survive the shared PDF/preview/print path.
 #![cfg(not(target_arch = "wasm32"))]
 
-use codec::entities::{Insert, Viewport, Wipeout};
-use codec::types::{Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{Insert, Viewport, Wipeout};
+use document::types::{Vector2, Vector3};
+use document::EntityType;
 use std::sync::Arc;
 use OpenCADStudio::io::pdf_export::{
     export_pdf, export_pdf_pages, PdfPageInput, PdfPlotOptions, PlotContent, PlotGroupSplits,
@@ -37,10 +37,12 @@ fn page(images: Vec<PlotImage>) -> PdfPageInput {
         offset_x: 0.0,
         offset_y: 0.0,
         rotation_deg: 0,
+        content_rotation: 0.0,
         scale: 1.0,
         clip: None,
         options: PdfPlotOptions::default(),
         plot_style: None,
+        geopdf: None,
     }
 }
 
@@ -78,11 +80,11 @@ impl Raster {
             &pdf.pages()[page],
             &hayro::RenderCache::new(),
             &hayro::hayro_interpret::InterpreterSettings::default(),
-            &hayro::RenderSettings {
+            &hayro::RenderSettings::default(),
+            &hayro::PixmapSettings {
                 x_scale: scale,
                 y_scale: scale,
                 bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-                ..Default::default()
             },
         );
         Self {
@@ -129,6 +131,7 @@ fn image() -> PlotImage {
     PlotImage {
         image: ImageModel {
             render_instance: None,
+            entity: None,
             file_path: "synthetic".into(),
             pixels: Arc::new(pixels),
             width: 32,
@@ -359,7 +362,7 @@ fn viewport_projection_clips_images_and_respects_frozen_and_nonplot_layers() {
 
 #[test]
 fn linked_image_uses_decoded_pixels_and_its_image_clip_without_reopening() {
-    use codec::entities::{ClipBoundary, RasterImage};
+    use document::entities::{ClipBoundary, RasterImage};
     let path = std::env::temp_dir().join(format!("ocs1266-linked-{}.png", std::process::id()));
     let source = image();
     image::save_buffer(&path, &source.image.pixels, 32, 32, image::ColorType::Rgba8).unwrap();

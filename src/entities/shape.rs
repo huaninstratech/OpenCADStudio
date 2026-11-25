@@ -6,13 +6,13 @@
 // gives a rough indication of the glyph orientation.
 
 use crate::t;
-use codec::entities::Shape;
+use document::entities::Shape;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     edit_angle_prop as edit_angle, edit_prop as edit, ro_prop as ro, square_grip,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -64,7 +64,7 @@ fn shape_marker(
 /// absolute paths are the norm in traded files).
 fn shx_polylines(
     shape: &Shape,
-    document: &codec::Document,
+    document: &document::Document,
 ) -> Option<crate::scene::text::shx::ShapePolylines> {
     let base = document
         .source_path
@@ -76,12 +76,12 @@ fn shx_polylines(
     // Resolve the glyph from one style's shape (.shx) file, preferring the
     // shape NUMBER but falling back to the NAME — a DXF SHAPE carries only the
     // name (code 2), so its `shape_number` is 0.
-    let try_style = |style: &codec::tables::TextStyle| {
+    let try_style = |style: &document::tables::TextStyle| {
         let font = style.font_file.trim();
         if font.is_empty() {
             return None;
         }
-        let resolved = crate::io::resolve_image_file(font, base)?;
+        let resolved = crate::io::linetypes::find_shape_file(font, base)?;
         if let Ok(num) = u16::try_from(shape.shape_number) {
             if num != 0 {
                 if let Some(p) = crate::scene::text::shx::shape_polylines(&resolved, num) {
@@ -132,7 +132,7 @@ fn shx_polylines(
 }
 
 impl RenderConvertible for Shape {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         // SHAPE insertion point is OCS (planar entity) — map through the
         // arbitrary axis so a mirrored shape's marker lands where it renders.
         let (ox, oy, oz) = crate::scene::view::transform::ocs_point_to_wcs(
@@ -234,14 +234,14 @@ impl Grippable for Shape {
         if grip_id == 0 {
             match apply {
                 GripApply::Translate(d) => {
-                    self.insertion_point.x += d.x as f64;
-                    self.insertion_point.y += d.y as f64;
-                    self.insertion_point.z += d.z as f64;
+                    self.insertion_point.x += d.x;
+                    self.insertion_point.y += d.y;
+                    self.insertion_point.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    self.insertion_point.x = p.x as f64;
-                    self.insertion_point.y = p.y as f64;
-                    self.insertion_point.z = p.z as f64;
+                    self.insertion_point.x = p.x;
+                    self.insertion_point.y = p.y;
+                    self.insertion_point.z = p.z;
                 }
             }
         }
@@ -329,12 +329,16 @@ impl PropertyEditable for Shape {
 impl Transformable for Shape {
     fn apply_transform(&mut self, t: &EntityTransform) {
         transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
-            transform::reflect_xy_point(
-                &mut entity.insertion_point.x,
-                &mut entity.insertion_point.y,
-                p1,
-                p2,
+            // The codec mirror flips the rotation, oblique angle and x scale
+            // with the insertion point; MIRRTEXT off restores them afterwards.
+            let mut wrapped = document::entities::EntityType::Shape(entity.clone());
+            wrapped.mirror(
+                document::types::Vector3::new(p1.x, p1.y, p1.z),
+                document::types::Vector3::new(p2.x, p2.y, p2.z),
             );
+            if let document::entities::EntityType::Shape(mirrored) = wrapped {
+                *entity = mirrored;
+            }
         });
     }
 }

@@ -78,7 +78,9 @@ impl OpenCADStudio {
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if name == "BCONSTATUSMODE" { return Some(self.dispatch_constraint_status_mode(i, value)); }
+        if name == "BCONSTATUSMODE" {
+            return Some(self.dispatch_constraint_status_mode(i, value));
+        }
         if let Some(current) = self.block_editor_preferences.display_variable(&name) {
             if let Some(value) = value {
                 match self
@@ -100,7 +102,7 @@ impl OpenCADStudio {
                                 .unwrap()
                         ));
                     }
-                    Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+                    Err(error) => self.command_line.push_rejection(crate::t!(error).as_ref()),
                 }
             } else {
                 self.command_line
@@ -113,7 +115,7 @@ impl OpenCADStudio {
         if name != "BLOCKEDITLOCK" {
             if value.is_some() {
                 self.command_line
-                    .push_error(crate::tf!("{} is read only.", name).as_ref());
+                    .push_rejection(crate::tf!("{} is read only.", name).as_ref());
             } else {
                 self.command_line
                     .push_output(&format!("{name} = {current} (read only)"));
@@ -130,7 +132,7 @@ impl OpenCADStudio {
                 }
                 _ => self
                     .command_line
-                    .push_error(crate::t!("BLOCKEDITLOCK requires 0 or 1.").as_ref()),
+                    .push_rejection(crate::t!("BLOCKEDITLOCK requires 0 or 1.").as_ref()),
             }
         } else {
             self.command_line
@@ -144,7 +146,7 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{entities::Insert, types::Vector3, EntityType, Handle};
+    use document::{entities::Insert, types::Vector3, EntityType, Handle};
 
     fn fixture() -> (OpenCADStudio, Handle, Handle) {
         let mut app = OpenCADStudio::new_for_test();

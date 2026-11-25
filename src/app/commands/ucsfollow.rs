@@ -62,7 +62,7 @@ impl OpenCADStudio {
             }
             Some(_) => {
                 self.command_line
-                    .push_error(crate::t!("UCSFOLLOW: only 0 or 1 is allowed.").as_ref());
+                    .push_rejection(crate::t!("UCSFOLLOW: only 0 or 1 is allowed.").as_ref());
             }
         }
         Some(Task::none())
@@ -126,13 +126,13 @@ mod tests {
         let i = app.active_tab;
         let first = app.tabs[i]
             .scene
-            .add_entity(codec::EntityType::Viewport(Box::new(
-                codec::entities::Viewport::new(),
+            .add_entity(document::EntityType::Viewport(Box::new(
+                document::entities::Viewport::new(),
             )));
         let second = app.tabs[i]
             .scene
-            .add_entity(codec::EntityType::Viewport(Box::new(
-                codec::entities::Viewport::new(),
+            .add_entity(document::EntityType::Viewport(Box::new(
+                document::entities::Viewport::new(),
             )));
         app.tabs[i].scene.active_viewport = Some(first);
         let _ = app.run_command_line("UCSFOLLOW 1");

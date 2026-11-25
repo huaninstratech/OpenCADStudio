@@ -30,6 +30,19 @@ pub struct Path {
     pub fill: Option<[u8; 3]>,
 }
 
+/// A raster image a sheet draws.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetImage {
+    /// min x, min y, max x, max y in sheet units.
+    pub rect: [f64; 4],
+    pub width: u32,
+    pub height: u32,
+    /// RGBA with straight alpha, rows from the top.
+    pub pixels: std::sync::Arc<Vec<u8>>,
+    /// How many of the sheet's paths are drawn before it.
+    pub after: usize,
+}
+
 /// A sheet (DWF) or model (DGN): its extent and what it draws.
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
@@ -37,6 +50,8 @@ pub struct Sheet {
     pub rect: [f64; 4],
     pub paths: Vec<Path>,
     pub texts: Vec<Text>,
+    /// The raster images among the paths, in the order they are drawn.
+    pub images: Vec<SheetImage>,
     /// DGN: sub units per master unit (the scale a Sub conversion offers).
     pub sub_per_master: f64,
     /// DGN: the colours come from the file's own colour table, which the
@@ -259,6 +274,13 @@ fn cubic_extrema(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]) -> Vec<
     out.retain(|t| *t > 0.0 && *t < 1.0);
     out
 }
+
+/// How much placing a DGN model's shared cells may cost: each instance
+/// placed costs one, and one more for each item of its definition. A cell
+/// that places itself, or a chain of cells, many times at each level
+/// otherwise multiplies its copies past any time or memory; placing stops
+/// once this is spent.
+pub const DGN_PLACEMENT_BUDGET: usize = 1_000_000;
 
 /// The colour table a DGN file without one is drawn with (index 255, the
 /// background entry, black).

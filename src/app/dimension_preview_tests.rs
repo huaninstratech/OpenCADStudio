@@ -6,9 +6,9 @@
 use super::viewport_dimension_tests::preview_text as text;
 use super::OpenCADStudio;
 use crate::command::StepInput;
-use codec::entities::{Arc, Circle, Line};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{Arc, Circle, Line};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 use glam::DVec3;
 
 fn app() -> (OpenCADStudio, usize) {
@@ -151,7 +151,7 @@ fn continue_and_baseline_previews_follow_style_inheritance() {
         .header
         .current_dimstyle_name
         .clone();
-    let mut style = codec::tables::DimStyle::new("Inherit");
+    let mut style = document::tables::DimStyle::new("Inherit");
     style.dimlfac = 2.0;
     app.tabs[i].scene.document.dim_styles.add(style).unwrap();
     app.tabs[i].scene.document.header.current_dimstyle_name = "Inherit".into();
@@ -252,9 +252,11 @@ fn annotative_dimension_text_follows_the_scale_once() {
         .header
         .current_dimstyle_name
         .clone();
-    app.load_dimstyle_bufs(i);
-    app.apply_ds_toggle(crate::app::DsField::Annotative);
-    app.apply_dimstyle_bufs(i);
+    let name = app.dimstyle_selected.clone();
+    if let Some(style) = app.tabs[i].scene.document.dim_styles.get_mut(&name) {
+        style.annotative = true;
+        style.dimscale = 0.0;
+    }
     let dimension = place_linear(
         &mut app,
         DVec3::ZERO,
@@ -276,7 +278,7 @@ fn annotative_dimension_text_follows_the_scale_once() {
 
 #[test]
 fn region_radial_dimensions_exact_radius_and_diameter_preview_matches_commit() {
-    use kernel::geom2d::{Circle as KernelCircle, Curve};
+    use ocs_geom::geom2d::{Circle as KernelCircle, Curve};
     let (mut app, i) = app();
     let region = crate::scene::model::presspull_model::region_from_loops(
         &[
@@ -321,7 +323,7 @@ fn region_radial_dimensions_exact_radius_and_diameter_preview_matches_commit() {
 
 #[test]
 fn region_arc_length_preview_and_commit_for_circular_arc_edges() {
-    use kernel::geom2d::{Arc as KernelArc, Circle as KernelCircle, Curve, Line as KernelLine};
+    use ocs_geom::geom2d::{Arc as KernelArc, Circle as KernelCircle, Curve, Line as KernelLine};
     let (mut app, i) = app();
     let arc_loop = vec![
         Curve::Arc(KernelArc {
@@ -383,7 +385,7 @@ fn region_arc_length_preview_and_commit_for_circular_arc_edges() {
 
 #[test]
 fn region_dimension_association_refreshes_after_same_topology_change() {
-    use kernel::geom2d::{Arc as KernelArc, Circle as KernelCircle, Curve, Line as KernelLine};
+    use ocs_geom::geom2d::{Arc as KernelArc, Circle as KernelCircle, Curve, Line as KernelLine};
     let (mut app, i) = app();
     app.tabs[i].scene.document.header.dimension_associativity = 2;
     let initial_region = crate::scene::model::presspull_model::region_from_loops(
@@ -462,10 +464,10 @@ fn region_dimension_association_refreshes_after_same_topology_change() {
 
     // Verify refreshed dimension values
     let refreshed_dims = committed(&app);
-    let refreshed_rad = refreshed_dims.iter().find(|d| matches!(d, EntityType::Dimension(dim) if matches!(**dim, codec::entities::Dimension::Radius(_)))).unwrap();
+    let refreshed_rad = refreshed_dims.iter().find(|d| matches!(d, EntityType::Dimension(dim) if matches!(**dim, document::entities::Dimension::Radius(_)))).unwrap();
     assert_eq!(text(&app, refreshed_rad), "R4");
 
-    let refreshed_arc = refreshed_dims.iter().find(|d| matches!(d, EntityType::Dimension(dim) if matches!(**dim, codec::entities::Dimension::Arc(_)))).unwrap();
+    let refreshed_arc = refreshed_dims.iter().find(|d| matches!(d, EntityType::Dimension(dim) if matches!(**dim, document::entities::Dimension::Arc(_)))).unwrap();
     let new_arc_text = text(&app, refreshed_arc);
     assert!(
         new_arc_text.contains("47,1"),
@@ -475,7 +477,7 @@ fn region_dimension_association_refreshes_after_same_topology_change() {
 
 #[test]
 fn region_dimension_rejection_for_straight_and_noncircular_edges() {
-    use kernel::geom2d::{Arc as KernelArc, Curve, Line as KernelLine};
+    use ocs_geom::geom2d::{Arc as KernelArc, Curve, Line as KernelLine};
     let (mut app, i) = app();
     let loop_pieces = vec![
         Curve::Arc(KernelArc {
@@ -533,7 +535,7 @@ fn region_dimension_rejection_for_straight_and_noncircular_edges() {
 
 #[test]
 fn region_inclined_plane_radial_dimension_reports_world_radius() {
-    use kernel::geom2d::{Circle as KernelCircle, Curve};
+    use ocs_geom::geom2d::{Circle as KernelCircle, Curve};
     let (mut app, i) = app();
     let inclined_plane = crate::command::WorkingPlane::new(
         DVec3::new(100.0, 100.0, 0.0),
@@ -595,7 +597,7 @@ fn baseline_circle_and_arc_dimensions_preserved() {
 
 #[test]
 fn region_dimension_rejection_for_noncircular_and_near_circle_nurbs_edges() {
-    use kernel::geom2d::{Curve, Line as KernelLine, NurbsCurve};
+    use ocs_geom::geom2d::{Curve, Line as KernelLine, NurbsCurve};
     let (mut app, i) = app();
     // Near-circular rational quadratic NURBS:
     // P0 = [10.0, 0.0], P1 = [10.0, 9.9995], P2 = [0.0, 9.9995], w = [1.0, 1/sqrt(2), 1.0].
@@ -658,7 +660,7 @@ fn region_dimension_rejection_for_noncircular_and_near_circle_nurbs_edges() {
 
 #[test]
 fn region_radial_dimensions_large_translated_coordinates_certified() {
-    use kernel::geom2d::{Circle as KernelCircle, Curve};
+    use ocs_geom::geom2d::{Circle as KernelCircle, Curve};
     let (mut app, i) = app();
     let large_plane = crate::command::WorkingPlane::new(
         DVec3::new(1_000_000.0, 1_000_000.0, 0.0),
@@ -689,4 +691,24 @@ fn region_radial_dimensions_large_translated_coordinates_certified() {
     let _ = app.feed_command(StepInput::EntityPick(handle, pick_pt));
     let dim_d = commit_and_compare(&mut app, i, place_pt);
     assert_eq!(text(&app, &dim_d), "∅50");
+}
+
+#[test]
+fn annotative_dimension_follows_the_scale_after_metres_become_millimetres() {
+    // #1939: a new drawing is in metres, so its 1:50 is stored as 1 = 0.05.
+    // Switched to millimetres, 1:50 kept that ratio and drew 2.5 text 0.125
+    // high on a 5000 mm square.
+    let (mut app, i) = app();
+    let _ = app.dispatch_command("INSUNITS 4");
+    app.tabs[i].scene.document.header.current_dimstyle_name = "Annotative".into();
+    app.dimstyle_selected = "Annotative".into();
+    let _ = app.dispatch_command("CANNOSCALE 1:50");
+    let dimension = place_linear(
+        &mut app,
+        DVec3::ZERO,
+        DVec3::new(5000.0, 0.0, 0.0),
+        DVec3::new(2500.0, 400.0, 0.0),
+    );
+    let height = rendered_text_height(&app, dimension);
+    assert!(height > 100.0 && height < 200.0, "text {height} high at 1:50");
 }

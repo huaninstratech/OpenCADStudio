@@ -7,10 +7,8 @@
 //! transport learned this the hard way (`src/rest.rs`); this module is the
 //! shared ceiling for every other line-oriented channel.
 //!
-//! The cap matches the plugin IPC frame budget
-//! (`MAX_MESSAGE_SIZE = 64 MiB` in `crates/ocs_plugin_api`): generous enough
-//! that no legitimate message (base64 images included) is refused, small
-//! enough that memory stays bounded.
+//! 64 MiB is generous enough that no legitimate message (base64 images
+//! included) is refused, small enough that memory stays bounded.
 
 use std::io::{BufRead, Read};
 
@@ -35,7 +33,7 @@ impl std::error::Error for LineTooLong {}
 pub fn is_line_too_long(error: &std::io::Error) -> bool {
     error
         .get_ref()
-        .map_or(false, |inner| inner.is::<LineTooLong>())
+        .is_some_and(|inner| inner.is::<LineTooLong>())
 }
 
 /// `BufRead::read_line` capped at `cap` bytes — the whole line including its

@@ -6,12 +6,59 @@ use std::path::{Path, PathBuf};
 
 use crate::app::settings::PaletteBlockRef;
 use crate::app::{Message, OpenCADStudio};
+use crate::command::{CadCommand, CmdResult, InputKind};
 use crate::modules::insert::insert_block::{BlockCatalog, InsertBlockCommand};
 use crate::ui::window::block_palette::{
     BlockEntry, BlockPaletteMsg, BlockPreview, ChangeHint, Item, LibraryEntry, MenuAction,
     OptionMsg, Tab,
 };
+use glam::DVec3;
 use iced::Task;
+
+/// A one-line prompt for a palette block's new name. The answer runs
+/// through the shared `RENAME` dispatcher, so the palette, the command
+/// line and plugins all re-key the definition and its references the
+/// same way.
+struct PaletteBlockRenameCommand {
+    old: String,
+}
+
+impl CadCommand for PaletteBlockRenameCommand {
+    fn name(&self) -> &'static str {
+        "BLOCKRENAME"
+    }
+
+    fn prompt(&self) -> String {
+        crate::t!("Enter new block name <%{old}>:", old = self.old.as_str()).into_owned()
+    }
+
+    fn input_kind(&self) -> InputKind {
+        InputKind::FreeText
+    }
+
+    fn wants_text_input(&self) -> bool {
+        true
+    }
+
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        let value = text.trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(CmdResult::Dispatch(format!(
+            "RENAME BLOCK {} {value}",
+            self.old
+        )))
+    }
+
+    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        CmdResult::Cancel
+    }
+}
 
 /// Library folders remembered in the Libraries list.
 const MAX_LIBRARIES: usize = 10;
@@ -46,7 +93,10 @@ impl OpenCADStudio {
     pub(super) fn on_block_palette(&mut self, m: BlockPaletteMsg) -> Task<Message> {
         match m {
             BlockPaletteMsg::Search(s) => self.block_palette.search = s,
-            BlockPaletteMsg::Tab(tab) => self.show_block_palette_tab(tab),
+            BlockPaletteMsg::Tab(tab) => {
+                self.show_block_palette_tab(tab);
+                self.persist_settings_if_changed();
+            }
             BlockPaletteMsg::View(v) => {
                 self.block_palette.view = v;
                 self.persist_settings_if_changed();
@@ -123,7 +173,27 @@ impl OpenCADStudio {
             }
             // Browsers expose no folder picker.
             #[cfg(target_arch = "wasm32")]
-            BlockPaletteMsg::LibraryBrowse => {}
+            BlockPaletteMsg::LibraryBrowse | BlockPaletteMsg::LibraryBrowseDrawing => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            BlockPaletteMsg::LibraryBrowseDrawing => {
+                return Task::perform(
+                    async {
+                        match rfd::AsyncFileDialog::new()
+                            .set_title(crate::t!("Select a Drawing to List Its Blocks").as_ref())
+                            .add_filter(
+                                crate::t!("DWG/DXF Files").as_ref(),
+                                &["dwg", "dxf", "DWG", "DXF"],
+                            )
+                            .pick_file()
+                            .await
+                        {
+                            Some(h) => Ok(crate::sys::handle_path(&h)),
+                            None => Err("Cancelled".to_string()),
+                        }
+                    },
+                    |r| Message::BlockPalette(BlockPaletteMsg::LibraryPicked(r)),
+                );
+            }
             #[cfg(not(target_arch = "wasm32"))]
             BlockPaletteMsg::LibraryBrowse => {
                 return Task::perform(
@@ -151,6 +221,7 @@ impl OpenCADStudio {
                 {
                     let parent = parent.to_path_buf();
                     self.list_block_library(parent);
+                    self.persist_settings_if_changed();
                 }
             }
             BlockPaletteMsg::Press(item) => self.block_palette.pressed = Some(item),
@@ -159,6 +230,7 @@ impl OpenCADStudio {
                     return match item {
                         Item::Folder(dir) => {
                             self.list_block_library(dir);
+                            self.persist_settings_if_changed();
                             Task::none()
                         }
                         item => self.palette_insert(item, None),
@@ -190,6 +262,7 @@ impl OpenCADStudio {
             let start = Some(self.block_navigate.trim())
                 .filter(|p| !p.is_empty() && *p != "." && Path::new(p).is_dir())
                 .map(PathBuf::from)
+                .or_else(|| self.block_palette.library_resume.take())
                 .or_else(|| self.block_palette.libraries.first().map(PathBuf::from));
             if let Some(dir) = start {
                 self.list_block_library(dir);
@@ -214,8 +287,39 @@ impl OpenCADStudio {
         self.persist_settings_if_changed();
     }
 
-    /// Show `dir`: its sub-folders, then its drawings, each by name.
+    /// Show `dir`: its sub-folders, then its drawings, each by name. A
+    /// drawing shows its blocks.
     fn list_block_library(&mut self, dir: PathBuf) {
+        if is_drawing(&dir) && dir.is_file() {
+            // ponytail: read on the UI thread, as inserting a block from
+            // another drawing is; move to a worker if big libraries stall.
+            let doc = match crate::io::load_file(&dir) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    self.command_line.push_error(&e.to_string());
+                    return;
+                }
+            };
+            use document::TableEntry;
+            let mut names: Vec<String> = doc
+                .block_records
+                .iter()
+                .filter(|br| !br.is_standard() && !br.is_layout() && !br.is_anonymous())
+                .map(|br| br.name.clone())
+                .collect();
+            names.sort_by_key(|name| name.to_lowercase());
+            self.block_palette.library_entries = names
+                .into_iter()
+                .map(|name| LibraryEntry {
+                    path: dir.clone(),
+                    folder: false,
+                    thumb: None,
+                    block: Some(name),
+                })
+                .collect();
+            self.block_palette.library_dir = Some(dir);
+            return;
+        }
         let mut entries: Vec<LibraryEntry> = std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
@@ -231,6 +335,7 @@ impl OpenCADStudio {
                         path,
                         folder: true,
                         thumb: None,
+                        block: None,
                     })
                 } else if is_drawing(&path) {
                     // The thumbnail is read in the background.
@@ -238,6 +343,7 @@ impl OpenCADStudio {
                         path,
                         folder: false,
                         thumb: None,
+                        block: None,
                     })
                 } else {
                     None
@@ -439,16 +545,16 @@ impl OpenCADStudio {
     /// drawing; with `redefine` an existing definition takes the source's.
     fn import_block_definition(
         &mut self,
-        source: &codec::Document,
+        source: &document::Document,
         name: &str,
         redefine: bool,
     ) -> Result<(), String> {
         if source.block_records.get(name).is_none() {
             return Err(crate::tf!("Block \"{}\" not found.", name).into_owned());
         }
-        let probe = codec::EntityType::Insert(codec::entities::Insert::new(
+        let probe = document::EntityType::Insert(document::entities::Insert::new(
             name.to_string(),
-            codec::types::Vector3::ZERO,
+            document::types::Vector3::ZERO,
         ));
         let deps = crate::app::ClipboardDeps::capture(source, std::slice::from_ref(&probe));
         let i = self.active_tab;
@@ -511,6 +617,18 @@ impl OpenCADStudio {
         };
         match action {
             MenuAction::Insert => return self.palette_insert(item, None),
+            // Opened as a drawing dropped on the window opens: a tab already
+            // showing it comes to the front.
+            MenuAction::OpenDrawing => {
+                if let Some(path) = item.drawing() {
+                    return self.update(Message::FileDropped(path));
+                }
+            }
+            MenuAction::ShowBlocks => {
+                if let Item::File(path) = item {
+                    self.list_block_library(path);
+                }
+            }
             MenuAction::Redefine => {
                 let result = match &item {
                     Item::Ref(r) if r.drawing => {
@@ -554,6 +672,15 @@ impl OpenCADStudio {
                     self.persist_settings_if_changed();
                 }
             }
+            MenuAction::Rename => {
+                let name = item.name();
+                let i = self.active_tab;
+                self.tabs[i].active_cmd = Some(Box::new(PaletteBlockRenameCommand {
+                    old: name.clone(),
+                }));
+                self.command_line
+                    .push_info(&crate::tf!("Enter new block name <{name}>:"));
+            }
             MenuAction::Edit => {
                 let name = item.name();
                 let i = self.active_tab;
@@ -562,7 +689,7 @@ impl OpenCADStudio {
                     .document
                     .entities()
                     .find_map(|e| match e {
-                        codec::EntityType::Insert(ins)
+                        document::EntityType::Insert(ins)
                             if ins.block_name.eq_ignore_ascii_case(&name) =>
                         {
                             Some(ins.common.handle)
@@ -582,12 +709,19 @@ impl OpenCADStudio {
                 Tab::Current => {
                     let name = item.name();
                     let i = self.active_tab;
-                    let open_edits: Vec<codec::Handle> = self.tabs[i]
+                    let open_edits: Vec<document::Handle> = self.tabs[i]
                         .block_edits
                         .iter()
                         .map(|session| session.br_handle)
                         .collect();
-                    self.push_undo_snapshot(i, crate::app::document::HistoryLabel::formatted(format!("Delete block {name}"), "delete-block", name.to_owned().into()));
+                    self.push_undo_snapshot(
+                        i,
+                        crate::app::tab_document::HistoryLabel::formatted(
+                            format!("Delete block {name}"),
+                            "delete-block",
+                            name.to_owned().into(),
+                        ),
+                    );
                     let outcome = crate::scene::block_service::delete(
                         &mut self.tabs[i].scene,
                         &name,
@@ -940,8 +1074,10 @@ impl OpenCADStudio {
 /// layout's, whose contents are the drawing itself and can be large. Unlike
 /// `Scene::custom_block_names`, this keeps anonymous records, because a
 /// generated record can hold a named one and so carries its changes.
-fn palette_records(doc: &codec::Document) -> impl Iterator<Item = &codec::tables::BlockRecord> {
-    use codec::TableEntry;
+fn palette_records(
+    doc: &document::Document,
+) -> impl Iterator<Item = &document::tables::BlockRecord> {
+    use document::TableEntry;
     doc.block_records
         .iter()
         .filter(|br| !br.is_standard() && !br.is_layout())
@@ -950,7 +1086,7 @@ fn palette_records(doc: &codec::Document) -> impl Iterator<Item = &codec::tables
 /// `changed` (upper-cased block names) plus every block of `doc` holding one
 /// of them, directly or through other blocks.
 fn with_holding_blocks(
-    doc: &codec::Document,
+    doc: &document::Document,
     mut changed: std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
     let uses: Vec<(String, Vec<String>)> = palette_records(doc)
@@ -958,7 +1094,7 @@ fn with_holding_blocks(
             let used = doc
                 .entities_in_block(&br.name)
                 .filter_map(|e| match e {
-                    codec::EntityType::Insert(insert) => {
+                    document::EntityType::Insert(insert) => {
                         Some(insert.block_name.to_ascii_uppercase())
                     }
                     _ => None,
@@ -983,8 +1119,8 @@ fn with_holding_blocks(
 /// The blocks of `after` the palette lists whose record or contents differ
 /// from `before`'s (new ones included).
 pub(crate) fn changed_block_names(
-    before: &codec::Document,
-    after: &codec::Document,
+    before: &document::Document,
+    after: &document::Document,
 ) -> Vec<String> {
     palette_records(after)
         .filter(|br| {
@@ -1006,7 +1142,10 @@ fn read_thumbnails(
     let read = |paths: &[PathBuf]| -> Vec<_> {
         paths
             .iter()
-            .map(|p| (p.clone(), crate::io::thumbnail::read_handle(p)))
+            .map(|p| {
+                let thumb = crate::io::thumbnail::read_handle(p).or_else(|| drawn_thumbnail(p));
+                (p.clone(), thumb)
+            })
             .collect()
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -1026,4 +1165,28 @@ fn read_thumbnails(
         let all: Vec<_> = paths.chunks(BATCH).map(read).collect();
         iced::futures::stream::iter(all)
     }
+}
+
+/// A drawing without an embedded preview (a DXF, or a DWG saved without one)
+/// shown by its model-space geometry, drawn the way block previews are.
+fn drawn_thumbnail(path: &Path) -> Option<iced::widget::image::Handle> {
+    const SIZE: usize = 128;
+    let mut scene = crate::scene::Scene::new();
+    scene.document = crate::io::load_file(path).ok()?;
+    let bgra = crate::scene::wire_thumbnail_bgra(
+        &scene.block_preview_wires("*Model_Space"),
+        SIZE,
+    )?;
+    // Bottom-up BGRA rows to top-down RGBA.
+    let rgba: Vec<u8> = bgra
+        .chunks(SIZE)
+        .rev()
+        .flatten()
+        .flat_map(|&[b, g, r, a]| [r, g, b, a])
+        .collect();
+    Some(iced::widget::image::Handle::from_rgba(
+        SIZE as u32,
+        SIZE as u32,
+        rgba,
+    ))
 }

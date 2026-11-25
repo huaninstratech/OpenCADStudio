@@ -1,13 +1,13 @@
 //! Maps parametric constraints to the drawing format's associative object graph.
 
-use codec::objects::{
+use document::objects::{
     Assoc2dConstraintGroup, AssocAction, AssocActionDependency, AssocConstraintNode,
     AssocConstraintNodeData, AssocDependency, AssocDimDependencyBody, AssocEvalValue,
     AssocEvalVariant, AssocGeomDependency, AssocNetwork, AssocPersistentSubentId,
     AssocValueDependency, AssocVariable, AssociativeData, AssociativeObject, ObjectType,
 };
-use codec::types::{Handle, Vector3};
-use codec::{Document, EntityType};
+use document::types::{Handle, Vector3};
+use document::{Document, EntityType};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -627,7 +627,7 @@ impl<'a> GroupBuilder<'a> {
             );
         } else {
             let arc =
-                kernel::geom2d::BulgeArc::from_bulge([start.x, start.y], [end.x, end.y], bulge)?;
+                ocs_geom::geom2d::BulgeArc::from_bulge([start.x, start.y], [end.x, end.y], bulge)?;
             self.push_node(
                 node_id,
                 "AcConstrainedArc",
@@ -1466,19 +1466,19 @@ const ASSOC_CLASSES: &[(&str, &str, i32)] = &[
     ),
 ];
 
-fn ensure_associative_classes_registered(document: &mut Document) {
+pub(super) fn ensure_associative_classes_registered(document: &mut Document) {
     for (dxf_name, cpp_class_name, maintenance_version) in ASSOC_CLASSES {
         if document.classes.get_by_name(dxf_name).is_some() {
             continue;
         }
-        document.classes.add_or_update(codec::classes::DxfClass {
+        document.classes.add_or_update(document::classes::DxfClass {
             dxf_name: dxf_name.to_string(),
             cpp_class_name: cpp_class_name.to_string(),
             application_name: "ObjectDBX Classes".to_string(),
-            proxy_flags: codec::classes::ProxyFlags(
-                codec::classes::ProxyFlags::ERASE_ALLOWED.0
-                    | codec::classes::ProxyFlags::CLONING_ALLOWED.0
-                    | codec::classes::ProxyFlags::DISABLES_PROXY_WARNING_DIALOG.0,
+            proxy_flags: document::classes::ProxyFlags(
+                document::classes::ProxyFlags::ERASE_ALLOWED.0
+                    | document::classes::ProxyFlags::CLONING_ALLOWED.0
+                    | document::classes::ProxyFlags::DISABLES_PROXY_WARNING_DIALOG.0,
             ),
             instance_count: 0,
             was_zombie: false,
@@ -1551,7 +1551,7 @@ fn ensure_global_network_dictionary(document: &mut Document) -> Handle {
 
     remove_dictionary_entry(document, root_handle, NETWORK_DICTIONARY_KEY);
     let dictionary_handle = document.allocate_handle();
-    let mut dictionary = codec::objects::Dictionary::new();
+    let mut dictionary = document::objects::Dictionary::new();
     dictionary.handle = dictionary_handle;
     dictionary.owner = root_handle;
     dictionary.reactors.push(root_handle);
@@ -1782,14 +1782,14 @@ fn group_requires_preservation(document: &Document, group: &Assoc2dConstraintGro
 
 fn work_plane_vector(work_plane: &[Vector3; 3], local: Vector3) -> Option<Vector3> {
     let [origin, axis_x, axis_y] = *work_plane;
-    let plane = kernel::space::Plane::from_axes(
+    let plane = ocs_geom::space::Plane::from_axes(
         [origin.x, origin.y, origin.z],
         [axis_x.x, axis_x.y, axis_x.z],
         [axis_y.x, axis_y.y, axis_y.z],
     );
-    let mut world = kernel::space::Vec3::from(plane.vector_at([local.x, local.y]));
+    let mut world = ocs_geom::space::Vec3::from(plane.vector_at([local.x, local.y]));
     if local.z != 0.0 {
-        world = world + kernel::space::Vec3::from(plane.normal()?) * local.z;
+        world = world + ocs_geom::space::Vec3::from(plane.normal()?) * local.z;
     }
     let world = world.normalize()?;
     Some(Vector3::new(world.x, world.y, world.z))
@@ -2119,7 +2119,7 @@ fn rigid_set_references(
         let Some(reference) = refs.get(geometry_id).copied() else {
             continue;
         };
-        if !entities.iter().any(|existing| *existing == reference) {
+        if !entities.contains(&reference) {
             entities.push(reference);
         }
         let Some(entity) = document.get_entity(reference.entity) else {
@@ -2173,21 +2173,28 @@ pub(super) fn native_constraint_set(
     let mut set = ParametricConstraintSet::new(scope);
     if matches!(scope, ParametricScope::Block(_)) {
         if let Some(network) = native_scope_network_handle(document, owner) {
-            let mut variables: Vec<_> = document.objects.iter().filter_map(|(handle, object)| {
-                match object {
-                    ObjectType::Associative(AssociativeObject { data: AssociativeData::Variable(variable), .. })
-                        if variable.action.owning_network == network => Some((*handle, variable)),
+            let mut variables: Vec<_> = document
+                .objects
+                .iter()
+                .filter_map(|(handle, object)| match object {
+                    ObjectType::Associative(AssociativeObject {
+                        data: AssociativeData::Variable(variable),
+                        ..
+                    }) if variable.action.owning_network == network => Some((*handle, variable)),
                     _ => None,
-                }
-            }).collect();
+                })
+                .collect();
             variables.sort_by_key(|(handle, _)| *handle);
             for (_, variable) in variables {
                 let source = if variable.expression.trim().is_empty() {
                     numeric_value(&variable.value).map(|value| value.to_string())
-                } else { Some(variable.expression.clone()) };
+                } else {
+                    Some(variable.expression.clone())
+                };
                 if let Some(source) = source {
                     if set.local_parameters.set(&variable.name, &source).is_ok() {
-                        set.local_parameters.set_description(&variable.name, &variable.description);
+                        set.local_parameters
+                            .set_description(&variable.name, &variable.description);
                     }
                 }
             }
@@ -2478,8 +2485,10 @@ pub(super) fn native_constraint_set(
             }
         }
     }
-    (!set.constraints.is_empty() || !set.retained_standard_groups.is_empty()
-        || !set.local_parameters.is_empty()).then_some(set)
+    (!set.constraints.is_empty()
+        || !set.retained_standard_groups.is_empty()
+        || !set.local_parameters.is_empty())
+    .then_some(set)
 }
 
 fn sync_retained_group_constraints(document: &mut Document, set: &ParametricConstraintSet) {
@@ -2609,7 +2618,7 @@ fn detach_preserved_scope(
 
     let mut variable_handles = Vec::new();
     // The named variables the kept actions read keep their handles.
-    for (_, object) in &document.objects {
+    for object in document.objects.values() {
         let ObjectType::Associative(AssociativeObject {
             owner,
             data: AssociativeData::ValueDependency(value),
@@ -2661,14 +2670,22 @@ fn detach_preserved_scope(
         index += 1;
         for object in document.objects.values() {
             let ObjectType::Associative(AssociativeObject {
-                owner, data: AssociativeData::ValueDependency(value), ..
-            }) = object else { continue };
-            if *owner != variable { continue; }
+                owner,
+                data: AssociativeData::ValueDependency(value),
+                ..
+            }) = object
+            else {
+                continue;
+            };
+            if *owner != variable {
+                continue;
+            }
             let handle = value.dependency.dependent_on;
             if matches!(document.objects.get(&handle), Some(ObjectType::Associative(AssociativeObject {
                 data: AssociativeData::Variable(value), ..
             })) if value.action.owning_network == network_handle)
-                && !variable_handles.contains(&handle) {
+                && !variable_handles.contains(&handle)
+            {
                 variable_handles.push(handle);
             }
         }
@@ -2734,8 +2751,8 @@ fn pending_swept_surfaces(document: &Document) -> Vec<(Handle, Handle, Handle)> 
     let mut pending = document
         .entities()
         .filter(|entity| {
-            matches!(entity, codec::EntityType::Surface(surface)
-            if matches!(surface.surface_data, codec::entities::SurfaceData::Swept { .. }))
+            matches!(entity, document::EntityType::Surface(surface)
+            if matches!(surface.surface_data, document::entities::SurfaceData::Swept { .. }))
         })
         .filter_map(|entity| {
             let (profile, path) = sweep_model::sweep_sources(entity)?;
@@ -2743,10 +2760,10 @@ fn pending_swept_surfaces(document: &Document) -> Vec<(Handle, Handle, Handle)> 
             (!carried.contains(&surface)
                 && document
                     .get_entity(profile)
-                    .is_some_and(|e| sweep_model::assoc_source_supported(e))
+                    .is_some_and(sweep_model::assoc_source_supported)
                 && document
                     .get_entity(path)
-                    .is_some_and(|e| sweep_model::assoc_source_supported(e)))
+                    .is_some_and(sweep_model::assoc_source_supported))
             .then_some((surface, profile, path))
         })
         .collect::<Vec<_>>();
@@ -2767,7 +2784,7 @@ fn pending_source_surfaces(
         .collect();
     let mut pending = document
         .entities()
-        .filter(|entity| matches!(entity, codec::EntityType::Surface(_)))
+        .filter(|entity| matches!(entity, document::EntityType::Surface(_)))
         .filter_map(|entity| {
             let sources = surface_sources::surface_sources(entity)?;
             let surface = entity.common().handle;
@@ -2775,7 +2792,7 @@ fn pending_source_surfaces(
                 && sources.handles().iter().all(|handle| {
                     document
                         .get_entity(*handle)
-                        .is_some_and(|e| sweep_model::assoc_source_supported(e))
+                        .is_some_and(sweep_model::assoc_source_supported)
                 }))
             .then_some((surface, sources))
         })
@@ -2816,7 +2833,7 @@ fn edge_action_param(
     read: Handle,
     (action_type, subcurve_kind, curve): crate::scene::model::sweep_model::AssocCurve,
 ) -> AssociativeData {
-    use codec::objects::{
+    use document::objects::{
         AssocActionParam, AssocEdgeActionParam, AssocSingleDependencyActionParam,
     };
     AssociativeData::EdgeActionParam(AssocEdgeActionParam {
@@ -2923,7 +2940,7 @@ fn region_subent_entries(loops: &[usize], step: i32, first_id: i32) -> Vec<i32> 
 /// Returns the edges' ids, or `None` when the drawing's manager has a form
 /// this cannot extend.
 fn register_region_subents(document: &mut Document, loops: &[usize]) -> Option<Vec<i32>> {
-    use codec::objects::AssocPersSubentManager;
+    use document::objects::AssocPersSubentManager;
     let root = document.header.named_objects_dict_handle;
     let existing = match document.objects.get(&root) {
         Some(ObjectType::Dictionary(dictionary)) => dictionary.get(SUBENT_MANAGER_KEY),
@@ -3032,7 +3049,9 @@ fn source_reads(
         document,
         source,
         "ACAD_STEPID",
-        Some(vec![codec::xdata::XDataValue::Integer32(ids.first()? - 1)]),
+        Some(vec![document::xdata::XDataValue::Integer32(
+            ids.first()? - 1,
+        )]),
     );
     let curves = loops.into_iter().flatten().collect::<Vec<_>>();
     let pairs = curves
@@ -3088,7 +3107,7 @@ fn materialize_source_surface_actions(
     first_index: i32,
 ) -> Vec<Handle> {
     use crate::scene::model::surface_sources::SurfaceSources;
-    use codec::objects::*;
+    use document::objects::*;
     let mut added = Vec::new();
     for (surface, sources) in pending.iter() {
         let surface = *surface;
@@ -3388,17 +3407,17 @@ fn materialize_swept_surface_actions(
     first_index: i32,
 ) -> Vec<Handle> {
     use crate::scene::model::sweep_model;
-    use codec::objects::*;
+    use document::objects::*;
     let mut added = Vec::new();
     for (surface, profile, path) in pending.iter().copied() {
         let document = &*allocator.document;
         let Some(surface_entity) = document.get_entity(surface) else {
             continue;
         };
-        let codec::EntityType::Surface(surface_value) = surface_entity else {
+        let document::EntityType::Surface(surface_value) = surface_entity else {
             continue;
         };
-        let codec::entities::SurfaceData::Swept { options, .. } = &surface_value.surface_data
+        let document::entities::SurfaceData::Swept { options, .. } = &surface_value.surface_data
         else {
             continue;
         };
@@ -3885,10 +3904,11 @@ fn materialize_scope(
         let Some(entity_nodes) = entities.get(entity_handle) else {
             continue;
         };
-        if entity_nodes.geometry_node_id == 0 {
-            if entity_nodes.segments.is_empty() && entity_nodes.axes.is_empty() {
-                continue;
-            }
+        if entity_nodes.geometry_node_id == 0
+            && entity_nodes.segments.is_empty()
+            && entity_nodes.axes.is_empty()
+        {
+            continue;
         }
         let dep_handle = allocator.geom_dependency(group_handle?, *entity_handle, index as i32 + 1);
         geometry_dependencies.push(dep_handle);
@@ -4060,7 +4080,7 @@ fn materialize_scope(
     // under the owner's extension dictionary; its parameter commands do not
     // find a network stored directly there.
     let holder_handle = allocator.document.allocate_handle();
-    let mut holder = codec::objects::Dictionary::new();
+    let mut holder = document::objects::Dictionary::new();
     holder.handle = holder_handle;
     holder.owner = dictionary_handle;
     holder.duplicate_cloning = 1;
@@ -4104,7 +4124,9 @@ impl Scene {
                 data: AssociativeData::Network(network), ..
             })) if network.action.owning_network.is_null())
         }).collect();
-        if scopes.is_empty() { return Ok(()); }
+        if scopes.is_empty() {
+            return Ok(());
+        }
         scopes.sort();
         let dictionary = ensure_global_network_dictionary(document);
         let root = match document.objects.get(&dictionary) {
@@ -4112,9 +4134,13 @@ impl Scene {
             _ => unreachable!(),
         };
         let root = if let Some(root) = root {
-            if !matches!(document.objects.get(&root), Some(ObjectType::Associative(AssociativeObject {
-                data: AssociativeData::Network(_), ..
-            }))) {
+            if !matches!(
+                document.objects.get(&root),
+                Some(ObjectType::Associative(AssociativeObject {
+                    data: AssociativeData::Network(_),
+                    ..
+                }))
+            ) {
                 return Err("The drawing's associative root network is invalid.".into());
             }
             root
@@ -4125,24 +4151,42 @@ impl Scene {
             object.owner = dictionary;
             object.reactors.push(dictionary);
             object.data = AssociativeData::Network(AssocNetwork {
-                action: AssocAction { class_version: 2, ..Default::default() },
+                action: AssocAction {
+                    class_version: 2,
+                    ..Default::default()
+                },
                 ..Default::default()
             });
-            document.objects.insert(root, ObjectType::Associative(object));
+            document
+                .objects
+                .insert(root, ObjectType::Associative(object));
             set_dictionary_entry(document, dictionary, NETWORK_DICTIONARY_KEY, root);
             root
         };
         for scope in scopes {
             let Some(ObjectType::Associative(AssociativeObject {
-                data: AssociativeData::Network(network), ..
-            })) = document.objects.get_mut(&root) else { unreachable!() };
-            network.network_action_index = network.network_action_index.checked_add(1)
+                data: AssociativeData::Network(network),
+                ..
+            })) = document.objects.get_mut(&root)
+            else {
+                unreachable!()
+            };
+            network.network_action_index = network
+                .network_action_index
+                .checked_add(1)
                 .ok_or("The drawing's associative action index is exhausted.")?;
             let index = network.network_action_index;
-            network.actions.push(AssocActionDependency { is_owned: false, dependency: scope });
+            network.actions.push(AssocActionDependency {
+                is_owned: false,
+                dependency: scope,
+            });
             let Some(ObjectType::Associative(AssociativeObject {
-                data: AssociativeData::Network(network), ..
-            })) = document.objects.get_mut(&scope) else { unreachable!() };
+                data: AssociativeData::Network(network),
+                ..
+            })) = document.objects.get_mut(&scope)
+            else {
+                unreachable!()
+            };
             network.action.owning_network = root;
             network.action.action_index = index;
         }
@@ -4150,38 +4194,7 @@ impl Scene {
     }
 
     pub(crate) fn load_named_parameters_from_document(&mut self) {
-        self.named_parameters = ParameterTable::new();
-        let mut variables: Vec<_> = self
-            .document
-            .objects
-            .values()
-            .filter_map(|object| match object {
-                ObjectType::Associative(AssociativeObject {
-                    handle,
-                    data: AssociativeData::Variable(variable),
-                    ..
-                }) => Some((*handle, variable)),
-                _ => None,
-            })
-            .collect();
-        variables.sort_by_key(|(handle, _)| handle.value());
-        let model_network = native_scope_network_handle(
-            &self.document,
-            self.document.header.model_space_block_handle,
-        );
-        for (_, variable) in variables {
-            if model_network.is_none_or(|network| variable.action.owning_network != network) {
-                continue;
-            }
-            let source = if variable.expression.trim().is_empty() {
-                numeric_value(&variable.value).map(|value| value.to_string())
-            } else {
-                Some(variable.expression.clone())
-            };
-            if let Some(source) = source {
-                let _ = self.named_parameters.set(&variable.name, &source);
-            }
-        }
+        self.named_parameters = model_network_parameters(&self.document);
     }
 
     pub(crate) fn load_parametric_constraints_from_document(&mut self) {
@@ -4256,6 +4269,8 @@ impl Scene {
                 .map(|&owner| native_scope_network_handle(&self.document, owner).is_some())
                 .collect()
         };
+        let raw_dependents = networks_raw_objects_depend_on(&self.document);
+        let mut kept_networks = Vec::new();
         let mut scopes = Vec::new();
         for (owner, existing) in owners.into_iter().zip(existing_networks) {
             let runtime = self
@@ -4263,6 +4278,18 @@ impl Scene {
                 .iter()
                 .find(|set| set.scope.owner_handle(&self.document) == owner)
                 .cloned();
+            if existing {
+                if let Some(network) = stored_network_to_keep(
+                    &self.document,
+                    owner,
+                    runtime.as_ref(),
+                    &self.named_parameters,
+                    &raw_dependents,
+                ) {
+                    kept_networks.push(network);
+                    continue;
+                }
+            }
             let set = match runtime {
                 Some(set) => Some(set),
                 None if existing => {
@@ -4311,6 +4338,7 @@ impl Scene {
         );
         let root_network_handle = self.document.allocate_handle();
         let mut child_networks = Vec::new();
+        let rebuilt_scopes = scopes.len();
         for (index, (owner, set, variables, groups, foreign)) in scopes.into_iter().enumerate() {
             let parameters = if set.local_parameters.is_empty() {
                 &self.named_parameters
@@ -4330,6 +4358,19 @@ impl Scene {
                 owner == model_owner,
             ) {
                 child_networks.push(handle);
+            }
+        }
+        // The kept networks go under the new root after the rebuilt ones,
+        // unchanged apart from where they sit in it.
+        for (offset, network) in kept_networks.into_iter().enumerate() {
+            if let Some(ObjectType::Associative(AssociativeObject {
+                data: AssociativeData::Network(kept),
+                ..
+            })) = self.document.objects.get_mut(&network)
+            {
+                kept.action.owning_network = root_network_handle;
+                kept.action.action_index = (rebuilt_scopes + offset) as i32 + 1;
+                child_networks.push(network);
             }
         }
         if child_networks.is_empty() {
@@ -4387,63 +4428,189 @@ impl Scene {
         let mut hasher = DefaultHasher::new();
         hash_parameter_table(&self.named_parameters, &mut hasher);
         for set in &self.parametric_constraints {
-            set.scope.hash(&mut hasher);
-            for constraint in &set.constraints {
-                constraint.id.hash(&mut hasher);
-                (constraint.kind as u16).hash(&mut hasher);
-                constraint.refs.hash(&mut hasher);
-                match &constraint.driving_param {
-                    None => 0u8.hash(&mut hasher),
-                    Some(DrivingValue::Literal(value)) => {
-                        1u8.hash(&mut hasher);
-                        value.to_bits().hash(&mut hasher);
-                    }
-                    Some(DrivingValue::Named(name)) => {
-                        2u8.hash(&mut hasher);
-                        name.hash(&mut hasher);
-                    }
-                }
-                constraint.enabled.hash(&mut hasher);
-                match constraint.native_origin {
-                    None => 0u8.hash(&mut hasher),
-                    Some(origin) => {
-                        1u8.hash(&mut hasher);
-                        origin.group.hash(&mut hasher);
-                        origin.node.hash(&mut hasher);
-                    }
-                }
-                constraint.rigid_points.len().hash(&mut hasher);
-                for (reference, point) in &constraint.rigid_points {
-                    reference.hash(&mut hasher);
-                    hash_vector(point, &mut hasher);
-                }
-                constraint.distance_direction_type.hash(&mut hasher);
-                match constraint.distance_direction {
-                    None => 0u8.hash(&mut hasher),
-                    Some(direction) => {
-                        1u8.hash(&mut hasher);
-                        hash_vector(&direction, &mut hasher);
-                    }
-                }
-                match constraint.axis_direction {
-                    None => 0u8.hash(&mut hasher),
-                    Some(direction) => {
-                        1u8.hash(&mut hasher);
-                        hash_vector(&direction, &mut hasher);
-                    }
-                }
-                constraint.angle_sector.hash(&mut hasher);
-            }
-            hash_parameter_table(&set.local_parameters, &mut hasher);
-            set.dimensions.len().hash(&mut hasher);
-            for (id, dimension) in &set.dimensions {
-                id.hash(&mut hasher);
-                dimension.hash(&mut hasher);
-            }
-            set.retained_standard_groups.hash(&mut hasher);
+            hash_constraint_set(set, &mut hasher);
         }
         hasher.finish()
     }
+}
+
+/// Hashes one scope's share of the model `constraint_model_fingerprint`
+/// covers. Dimension links are hashed in id order, so two sets with the same
+/// links hash alike whatever order their maps hold them in.
+fn hash_constraint_set(set: &ParametricConstraintSet, hasher: &mut DefaultHasher) {
+    set.scope.hash(hasher);
+    for constraint in &set.constraints {
+        constraint.id.hash(hasher);
+        (constraint.kind as u16).hash(hasher);
+        constraint.refs.hash(hasher);
+        match &constraint.driving_param {
+            None => 0u8.hash(hasher),
+            Some(DrivingValue::Literal(value)) => {
+                1u8.hash(hasher);
+                value.to_bits().hash(hasher);
+            }
+            Some(DrivingValue::Named(name)) => {
+                2u8.hash(hasher);
+                name.hash(hasher);
+            }
+        }
+        constraint.enabled.hash(hasher);
+        match constraint.native_origin {
+            None => 0u8.hash(hasher),
+            Some(origin) => {
+                1u8.hash(hasher);
+                origin.group.hash(hasher);
+                origin.node.hash(hasher);
+            }
+        }
+        constraint.rigid_points.len().hash(hasher);
+        for (reference, point) in &constraint.rigid_points {
+            reference.hash(hasher);
+            hash_vector(point, hasher);
+        }
+        constraint.distance_direction_type.hash(hasher);
+        match constraint.distance_direction {
+            None => 0u8.hash(hasher),
+            Some(direction) => {
+                1u8.hash(hasher);
+                hash_vector(&direction, hasher);
+            }
+        }
+        match constraint.axis_direction {
+            None => 0u8.hash(hasher),
+            Some(direction) => {
+                1u8.hash(hasher);
+                hash_vector(&direction, hasher);
+            }
+        }
+        constraint.angle_sector.hash(hasher);
+    }
+    hash_parameter_table(&set.local_parameters, hasher);
+    let mut dimensions: Vec<_> = set.dimensions.iter().collect();
+    dimensions.sort_unstable_by_key(|(id, _)| **id);
+    dimensions.len().hash(hasher);
+    for (id, dimension) in dimensions {
+        id.hash(hasher);
+        dimension.hash(hasher);
+    }
+    set.retained_standard_groups.hash(hasher);
+}
+
+fn constraint_set_hash(set: &ParametricConstraintSet) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_constraint_set(set, &mut hasher);
+    hasher.finish()
+}
+
+/// The networks whose variables an object kept only as its raw record lists
+/// as a reactor. Such an object reaches the variables by handle and cannot be
+/// re-pointed, so rebuilding the network under new handles would leave it
+/// pointing at erased objects. BricsCAD keeps the visibility states and other
+/// parameters of its parametric blocks this way: its own objects, which this
+/// program reads as raw records, read and drive the block's variables.
+fn networks_raw_objects_depend_on(document: &Document) -> FxHashSet<Handle> {
+    document
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            ObjectType::Associative(AssociativeObject {
+                reactors,
+                data: AssociativeData::Variable(variable),
+                ..
+            }) if reactors.iter().any(|reactor| {
+                matches!(
+                    document.objects.get(reactor),
+                    Some(ObjectType::Unknown { .. })
+                )
+            }) =>
+            {
+                Some(variable.action.owning_network)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The stored network of `owner` when it is written back as it was read: raw
+/// objects depend on it (see `networks_raw_objects_depend_on`) and the
+/// editor's model of the scope still equals the one the network holds. For
+/// model space that includes the drawing's parameter table, which is read
+/// from the model-space network. A scope the user changed is rebuilt as
+/// before.
+fn stored_network_to_keep(
+    document: &Document,
+    owner: Handle,
+    runtime: Option<&ParametricConstraintSet>,
+    named_parameters: &ParameterTable,
+    raw_dependents: &FxHashSet<Handle>,
+) -> Option<Handle> {
+    if raw_dependents.is_empty() {
+        return None;
+    }
+    let network = native_scope_network_handle(document, owner)?;
+    if !raw_dependents.contains(&network) {
+        return None;
+    }
+    let mut parameters = if owner == document.header.model_space_block_handle {
+        let loaded = loaded_named_parameters(document);
+        if has_pending_surfaces(document) || *named_parameters != loaded {
+            return None;
+        }
+        loaded
+    } else {
+        // A block scope reads its parameters into a table of its own.
+        ParameterTable::new()
+    };
+    let Some(runtime) = runtime else {
+        return Some(network);
+    };
+    let stored = native_constraint_set(document, owner, &mut parameters)?;
+    (constraint_set_hash(runtime) == constraint_set_hash(&stored)).then_some(network)
+}
+
+/// The drawing's parameter table as opening the drawing builds it: the
+/// variables of the model-space network, then whatever reading each scope's
+/// constraints adopts into it.
+fn loaded_named_parameters(document: &Document) -> ParameterTable {
+    let mut parameters = model_network_parameters(document);
+    for record in document.block_records.iter() {
+        native_constraint_set(document, record.handle, &mut parameters);
+    }
+    parameters
+}
+
+/// The named variables of the model-space network as a parameter table.
+fn model_network_parameters(document: &Document) -> ParameterTable {
+    let mut parameters = ParameterTable::new();
+    let Some(model_network) =
+        native_scope_network_handle(document, document.header.model_space_block_handle)
+    else {
+        return parameters;
+    };
+    let mut variables: Vec<_> = document
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            ObjectType::Associative(AssociativeObject {
+                handle,
+                data: AssociativeData::Variable(variable),
+                ..
+            }) if variable.action.owning_network == model_network => Some((*handle, variable)),
+            _ => None,
+        })
+        .collect();
+    variables.sort_by_key(|(handle, _)| handle.value());
+    for (_, variable) in variables {
+        let source = if variable.expression.trim().is_empty() {
+            numeric_value(&variable.value).map(|value| value.to_string())
+        } else {
+            Some(variable.expression.clone())
+        };
+        if let Some(source) = source {
+            let _ = parameters.set(&variable.name, &source);
+        }
+    }
+    parameters
 }
 
 /// Hashes a parameter table in insertion order: each parameter's name,
@@ -4465,15 +4632,18 @@ fn hash_vector(vector: &Vector3, hasher: &mut DefaultHasher) {
 }
 
 #[cfg(test)]
+mod raw_dependents_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::parametric_constraints::{
         angle_sector, distance_direction_type, ParametricScope,
     };
     use super::*;
     use crate::scene::ChangeKind;
-    use codec::entities::{Arc, Circle, Insert, Line, LwPolyline, Ray, Spline, XLine};
-    use codec::tables::BlockRecord;
-    use codec::types::Vector2;
+    use document::entities::{Arc, Circle, Insert, Line, LwPolyline, Ray, Spline, XLine};
+    use document::tables::BlockRecord;
+    use document::types::Vector2;
 
     fn line_entity(scene: &mut Scene, start: (f64, f64), end: (f64, f64)) -> Handle {
         scene.add_entity(EntityType::Line(Line::from_points(
@@ -5063,9 +5233,9 @@ mod tests {
         let mut block = BlockRecord::new("fixture");
         block.handle = scene.document.allocate_handle();
         scene.document.block_records.add(block).unwrap();
-        let point = scene.add_entity(EntityType::Point(codec::entities::Point::at(Vector3::new(
-            1.0, 2.0, 0.0,
-        ))));
+        let point = scene.add_entity(EntityType::Point(document::entities::Point::at(
+            Vector3::new(1.0, 2.0, 0.0),
+        )));
         let insert = scene.add_entity(EntityType::Insert(Insert::new(
             "fixture",
             Vector3::new(3.0, 4.0, 0.0),
@@ -5744,7 +5914,7 @@ mod tests {
         for ext in ["dxf", "dwg"] {
             let mut scene = Scene::new();
             let ellipse = scene.add_entity(EntityType::Ellipse(
-                codec::entities::Ellipse::from_center_axes(
+                document::entities::Ellipse::from_center_axes(
                     Vector3::new(0.0, 0.0, 0.0),
                     Vector3::new(4.0, 0.0, 0.0),
                     0.5,

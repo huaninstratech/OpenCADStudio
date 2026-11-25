@@ -2,14 +2,14 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use codec::{entities::Solid3D, EntityType, Handle};
+use document::{entities::Solid3D, EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, ExtrudeExtent, ExtrudeMode, LoftOptions,
     LoftSectionSelection, SelectionEntity, SweepOptions, WorkingPlane,
 };
-use crate::scene::model::presspull_model::{PresspullTarget, PresspullTargetKind};
+use crate::scene::model::presspull_model::{self, PresspullTarget, PresspullTargetKind};
 use crate::scene::WireModel;
 use crate::t;
 
@@ -33,6 +33,8 @@ pub struct ExtrudeCommand {
     injected_profile: Option<EntityType>,
     anchor: DVec3,
     profile_direction: Option<DVec3>,
+    /// The UCS Z axis, which a height extrudes a lone line along.
+    ucs_z: DVec3,
     direction_start: Option<DVec3>,
     mode: ExtrudeMode,
     taper_angle: f64,
@@ -94,6 +96,7 @@ impl ExtrudeCommand {
             injected_profile: None,
             anchor: DVec3::ZERO,
             profile_direction: None,
+            ucs_z: DVec3::Z,
             direction_start: None,
             mode: defaults.mode,
             taper_angle: 0.0,
@@ -154,12 +157,12 @@ impl ExtrudeCommand {
         self.preview_profiles
             .iter()
             .flat_map(|(_, entity)| {
-                let Some((profile, closed)) =
-                    crate::scene::model::sweep_model::extrusion_profile_of(entity)
-                else {
+                use crate::scene::model::sweep_model;
+                let Some((_, closed)) = sweep_model::extrusion_profile_of(entity) else {
                     return Vec::new();
                 };
-                let Some(normal) = profile.plane.normal() else {
+                let Some(normal) = sweep_model::extrusion_axis(entity, self.ucs_z.to_array())
+                else {
                     return Vec::new();
                 };
                 let direction = [normal[0] * height, normal[1] * height, normal[2] * height];
@@ -185,40 +188,14 @@ impl ExtrudeCommand {
 }
 
 fn preview_body_wires(
-    body: &kernel::brep::Body,
+    body: &ocs_solid::model::Brep,
     color: [f32; 4],
     isolines: usize,
 ) -> Vec<WireModel> {
-    // This overlay only consumes curves. Do not triangulate the body's faces
-    // on every cursor event just to discard the resulting surface mesh.
-    let wireframe = kernel::brep::mesh::tessellate_wireframe(
-        body,
-        kernel::brep::mesh::TessellationTolerance::new(kernel::tessellation::DEFAULT_ANGLE, 1e-9)
-            .with_solid_isolines(isolines),
-    );
-    let mut wires = wireframe
-        .edges
+    crate::scene::model::solid_model::preview_curves(body, isolines)
         .into_iter()
-        .filter(|edge| edge.positions.len() >= 2)
-        .map(|edge| {
-            WireModel::solid_f64("EXTRUDE-PREVIEW".to_owned(), edge.positions, color, false)
-        })
-        .collect::<Vec<_>>();
-    wires.extend(
-        wireframe
-            .isolines
-            .into_iter()
-            .filter(|line| line.positions.len() >= 2)
-            .map(|line| {
-                WireModel::solid_f64(
-                    "REVOLVE-PREVIEW-ISOLINE".to_owned(),
-                    line.positions,
-                    color,
-                    false,
-                )
-            }),
-    );
-    wires
+        .map(|points| WireModel::solid_f64("EXTRUDE-PREVIEW".to_owned(), points, color, false))
+        .collect()
 }
 
 impl CadCommand for ExtrudeCommand {
@@ -227,9 +204,7 @@ impl CadCommand for ExtrudeCommand {
     }
     fn prompt(&self) -> String {
         match self.step {
-            ExtrudeStep::Pick => {
-                t!("EXTRUDE  Select objects to extrude or [MOde]:").into_owned()
-            }
+            ExtrudeStep::Pick => t!("EXTRUDE  Select objects to extrude or [MOde]:").into_owned(),
             ExtrudeStep::Mode => format!(
                 "{} <{}>:",
                 t!("EXTRUDE  Creation mode [Solid/Surface]"),
@@ -440,11 +415,11 @@ impl CadCommand for ExtrudeCommand {
                 self.step = self.taper_return;
                 Some(CmdResult::NeedPoint)
             }
-            ExtrudeStep::Expression => crate::app::expr_eval::eval_number(value)
+            ExtrudeStep::Expression => crate::entities::expr_eval::eval_number(value)
                 .filter(|height| height.is_finite() && height.abs() > 1e-6)
                 .map(|height| self.finish(ExtrudeExtent::Height(height))),
             ExtrudeStep::TaperExpression => {
-                let angle = crate::app::expr_eval::eval_number(value)
+                let angle = crate::entities::expr_eval::eval_number(value)
                     .and_then(|value| crate::entities::common::parse_angle(&value.to_string()))?;
                 if !angle.is_finite() || angle.abs() >= std::f64::consts::FRAC_PI_2 {
                     return Some(CmdResult::NeedPoint);
@@ -508,6 +483,9 @@ impl CadCommand for ExtrudeCommand {
     fn selection_forces_add(&self) -> bool {
         self.step == ExtrudeStep::Pick
     }
+    fn set_working_plane(&mut self, plane: WorkingPlane) {
+        self.ucs_z = plane.z;
+    }
     fn inject_selection_entities(&mut self, entities: Vec<SelectionEntity>) {
         if self.step != ExtrudeStep::Pick {
             return;
@@ -522,10 +500,11 @@ impl CadCommand for ExtrudeCommand {
             .find_map(|entry| crate::entities::curve::entity_curve(&entry.entity))
         {
             self.anchor = DVec3::from_array(curve.plane.origin);
-            self.profile_direction = curve.plane.normal().map(DVec3::from_array);
-        } else {
-            self.profile_direction = None;
         }
+        self.profile_direction = entities.iter().find_map(|entry| {
+            crate::scene::model::sweep_model::extrusion_axis(&entry.entity, self.ucs_z.to_array())
+                .map(DVec3::from_array)
+        });
     }
     fn on_selection_complete(&mut self, _handles: Vec<Handle>) -> CmdResult {
         CmdResult::NeedPoint
@@ -712,6 +691,7 @@ impl CadCommand for ThickenCommand {
 pub struct PresspullCommand {
     step: PresspullStep,
     targets: Vec<PresspullTarget>,
+    new_body: bool,
     ctrl: bool,
     shift: bool,
     isolines: usize,
@@ -736,6 +716,7 @@ impl PresspullCommand {
         Self {
             step: PresspullStep::Pick,
             targets: Vec::new(),
+            new_body: false,
             ctrl: false,
             shift: false,
             isolines: 0,
@@ -837,11 +818,36 @@ impl PresspullCommand {
         if self.targets.is_empty() || !distance.is_finite() || distance.abs() <= 1e-6 {
             return CmdResult::NeedPoint;
         }
+        let targets = if self.new_body {
+            match self
+                .targets
+                .iter()
+                .map(presspull_model::detached_target)
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(targets) => targets,
+                None => {
+                    return CmdResult::ReportError(
+                        t!("PRESSPULL: the selected face could not be copied to a new body.")
+                            .into_owned(),
+                    )
+                }
+            }
+        } else {
+            self.targets.clone()
+        };
         CmdResult::PresspullApply {
-            targets: self.targets.clone(),
+            targets,
             distance,
             color: self.color,
         }
+    }
+
+    fn modifies_solid(&self) -> bool {
+        self.targets.iter().any(|target| match &target.kind {
+            PresspullTargetKind::Profile { owner, .. } => owner.is_some(),
+            PresspullTargetKind::Face { .. } => true,
+        })
     }
 
     fn undo_selection(&mut self) -> CmdResult {
@@ -862,11 +868,13 @@ impl CadCommand for PresspullCommand {
 
     fn prompt(&self) -> String {
         match self.step {
-            PresspullStep::Pick => {
-                t!("PRESSPULL  Select object or bounded area:").into_owned()
-            }
+            PresspullStep::Pick => t!("PRESSPULL  Select object or bounded area:").into_owned(),
             PresspullStep::Multiple => t!(
                 "PRESSPULL  Select additional objects or bounded areas [Undo] (Enter for height):"
+            )
+            .into_owned(),
+            PresspullStep::Height if self.new_body && self.modifies_solid() => t!(
+                "PRESSPULL  Specify signed height of the new body or [Multiple/Modify solid/Undo]:"
             )
             .into_owned(),
             PresspullStep::Height => {
@@ -882,10 +890,16 @@ impl CadCommand for PresspullCommand {
                 vec![CmdOption::new("Undo", "UNDO"), CmdOption::enter("Height")]
             }
             PresspullStep::Height => {
-                vec![
-                    CmdOption::new("Multiple", "MULTIPLE"),
-                    CmdOption::new("Undo", "UNDO"),
-                ]
+                let mut options = vec![CmdOption::new("Multiple", "MULTIPLE")];
+                if self.modifies_solid() {
+                    options.push(if self.new_body {
+                        CmdOption::new("Modify solid", "MODIFY")
+                    } else {
+                        CmdOption::new("New body", "NEWBODY")
+                    });
+                }
+                options.push(CmdOption::new("Undo", "UNDO"));
+                options
             }
         }
     }
@@ -968,7 +982,7 @@ impl CadCommand for PresspullCommand {
                     .map(|(plane, loops, _)| (plane, loops))
             }
             PresspullTargetKind::Face { body, face, .. } => {
-                kernel::brep::planar_face_profile(&body, face)
+                ocs_solid::model::planar_face_profile(&body, face)
                     .map(|profile| (profile.plane, profile.loops))
             }
         };
@@ -978,7 +992,7 @@ impl CadCommand for PresspullCommand {
                 .flatten()
                 .filter_map(|curve| {
                     let points = curve
-                        .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+                        .tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
                         .into_iter()
                         .map(|point| plane.point_at(point))
                         .collect::<Vec<_>>();
@@ -998,7 +1012,7 @@ impl CadCommand for PresspullCommand {
         self.hover_cache.clone()
     }
 
-    fn on_entity_pick(&mut self, handle: codec::Handle, point: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: document::Handle, point: DVec3) -> CmdResult {
         if !self.needs_entity_pick() {
             return CmdResult::NeedPoint;
         }
@@ -1057,6 +1071,11 @@ impl CadCommand for PresspullCommand {
                 return Some(CmdResult::NeedPoint);
             }
             "U" | "UNDO" => return Some(self.undo_selection()),
+            keyword @ ("N" | "NEWBODY" | "MODIFY") if self.modifies_solid() => {
+                self.new_body = keyword != "MODIFY";
+                self.invalidate_preview();
+                return Some(CmdResult::NeedPoint);
+            }
             _ => {}
         }
         // The shared picker resolves coordinates and hexadecimal handles.
@@ -1128,8 +1147,12 @@ impl CadCommand for PresspullCommand {
                 .targets
                 .iter()
                 .flat_map(|target| {
-                    crate::scene::model::presspull_model::preview_wires(
-                        target,
+                    let detached = self
+                        .new_body
+                        .then(|| presspull_model::detached_target(target))
+                        .flatten();
+                    presspull_model::preview_wires(
+                        detached.as_ref().unwrap_or(target),
                         height,
                         self.color,
                         self.isolines,
@@ -1371,7 +1394,7 @@ impl RevolveCommand {
 }
 
 fn revolve_axis(entity: &EntityType) -> Option<(DVec3, DVec3)> {
-    let point = |value: &codec::types::Vector3| DVec3::new(value.x, value.y, value.z);
+    let point = |value: &document::types::Vector3| DVec3::new(value.x, value.y, value.z);
     let (start, direction) = match entity {
         EntityType::Line(line) => (point(&line.start), point(&line.end) - point(&line.start)),
         EntityType::Ray(ray) => (point(&ray.base_point), point(&ray.direction)),
@@ -1392,9 +1415,7 @@ impl CadCommand for RevolveCommand {
     }
     fn prompt(&self) -> String {
         match self.step {
-            RevolveStep::Pick => {
-                t!("REVOLVE  Select objects to revolve or [MOde]:").into_owned()
-            }
+            RevolveStep::Pick => t!("REVOLVE  Select objects to revolve or [MOde]:").into_owned(),
             RevolveStep::Mode => format!(
                 "{} <{}>:",
                 t!("REVOLVE  Creation mode [Solid/Surface]"),
@@ -1449,7 +1470,7 @@ impl CadCommand for RevolveCommand {
     fn needs_entity_pick(&self) -> bool {
         self.step == RevolveStep::AxisObject
     }
-    fn on_entity_pick(&mut self, handle: codec::Handle, _pt: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: document::Handle, _pt: DVec3) -> CmdResult {
         if handle.is_null() {
             return CmdResult::NeedPoint;
         }
@@ -1590,7 +1611,7 @@ impl CadCommand for RevolveCommand {
                 Some(CmdResult::NeedPoint)
             }
             RevolveStep::Expression => {
-                let angle = crate::app::expr_eval::eval_number(value)
+                let angle = crate::entities::expr_eval::eval_number(value)
                     .and_then(|value| crate::entities::common::parse_angle(&value.to_string()))?;
                 if !angle.is_finite()
                     || angle.abs() <= 1e-9
@@ -3106,8 +3127,8 @@ pub fn empty_solid3d() -> EntityType {
 }
 
 pub fn empty_extruded_surface(direction: DVec3, taper_angle: f64) -> EntityType {
-    use codec::entities::{Surface, SurfaceData, SurfaceKind};
-    use codec::types::Vector3;
+    use document::entities::{Surface, SurfaceData, SurfaceKind};
+    use document::types::Vector3;
 
     let mut surface = Surface::new(SurfaceKind::Extruded);
     surface.u_isolines = 6;
@@ -3132,8 +3153,8 @@ pub fn empty_revolved_surface(
     angle: f64,
     start_angle: f64,
 ) -> EntityType {
-    use codec::entities::{Surface, SurfaceData, SurfaceKind};
-    use codec::types::Vector3;
+    use document::entities::{Surface, SurfaceData, SurfaceKind};
+    use document::types::Vector3;
 
     let mut surface = Surface::new(SurfaceKind::Revolved);
     let axis = (axis_end - axis_start).normalize_or(DVec3::Z);
@@ -3174,6 +3195,48 @@ inventory::submit!(crate::command::CommandRegistration {
 });
 
 #[cfg(test)]
+mod presspull_command_tests {
+    use super::*;
+
+    fn attached_profile() -> PresspullTarget {
+        PresspullTarget {
+            kind: PresspullTargetKind::Profile {
+                entity: EntityType::Circle(document::entities::Circle::new()),
+                source: None,
+                owner: Some(Handle::new(7)),
+            },
+            anchor: DVec3::ZERO,
+            direction: DVec3::Z,
+        }
+    }
+
+    fn applied_owner(command: &mut PresspullCommand) -> Option<Handle> {
+        match command.on_text_input("5") {
+            Some(CmdResult::PresspullApply { targets, .. }) => match &targets[0].kind {
+                PresspullTargetKind::Profile { owner, .. } => *owner,
+                _ => panic!("expected a profile"),
+            },
+            _ => panic!("expected an apply"),
+        }
+    }
+
+    #[test]
+    fn new_body_option_detaches_the_target_and_can_be_switched_back() {
+        let mut command = PresspullCommand::new([1.0; 4]);
+        command.on_presspull_target(attached_profile());
+        assert_eq!(applied_owner(&mut command), Some(Handle::new(7)));
+        assert!(matches!(
+            command.on_text_input("NEWBODY"),
+            Some(CmdResult::NeedPoint)
+        ));
+        assert!(command.options().iter().any(|o| o.keyword == "MODIFY"));
+        assert_eq!(applied_owner(&mut command), None);
+        command.on_text_input("MODIFY");
+        assert_eq!(applied_owner(&mut command), Some(Handle::new(7)));
+    }
+}
+
+#[cfg(test)]
 mod extrude_command_tests {
     use super::*;
 
@@ -3184,7 +3247,7 @@ mod extrude_command_tests {
         command.set_preselection(
             vec![(
                 Handle::new(1),
-                EntityType::Circle(codec::entities::Circle::new()),
+                EntityType::Circle(document::entities::Circle::new()),
             )],
             DVec3::ZERO,
             Some(DVec3::Z),
@@ -3206,7 +3269,7 @@ mod revolve_tests {
 
     #[test]
     fn cursor_angle_is_measured_about_the_model_axis() {
-        let profile = EntityType::Line(codec::entities::Line::from_coords(
+        let profile = EntityType::Line(document::entities::Line::from_coords(
             2.0, 0.0, 0.0, 2.0, 4.0, 0.0,
         ));
         let mut command = RevolveCommand::new([1.0; 4], 0);
@@ -3241,12 +3304,12 @@ mod thicken_command_tests {
         let mut command = ThickenCommand::new(vec![
             (
                 Handle::new(1),
-                EntityType::Line(codec::entities::Line::default()),
+                EntityType::Line(document::entities::Line::default()),
             ),
             (
                 handle,
-                EntityType::Surface(Box::new(codec::entities::Surface::new(
-                    codec::entities::SurfaceKind::Plane,
+                EntityType::Surface(Box::new(document::entities::Surface::new(
+                    document::entities::SurfaceKind::Plane,
                 ))),
             ),
         ]);

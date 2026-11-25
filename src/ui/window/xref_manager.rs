@@ -10,13 +10,15 @@ use crate::io::xref::collect_entries_with_prev;
 use crate::io::xref_model::{
     normalize_lexical, Pathtype, RefKind, RefStatus, RefType, ReferenceEntry,
 };
+use crate::ui::kit;
+use crate::ui::kit::menu::{self, Item};
 use crate::ui::style::common::muted_style;
-use crate::ui::style::row_button::cell_button_style;
-use crate::ui::ROW_H;
-use codec::Document;
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, tooltip};
+use crate::ui::style::text as ui_text;
+use crate::ui::style::{chrome, kit_metrics as km};
+use document::Document;
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text};
 use iced::Padding;
-use iced::{Background, Border, Element, Fill, Length, Theme};
+use iced::{Background, Element, Fill, Length, Theme};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,8 +28,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// read-only list renders everywhere.
 const IS_WASM: bool = cfg!(target_arch = "wasm32");
 
-/// Font size for table cells (mirrors `layers.rs`).
-const FONT_SZ: f32 = ROW_H * 0.42; // ≈11 px at ROW_H=26
 /// Fixed table height so the details pane below keeps stable space.
 const TABLE_H: f32 = 480.0;
 /// Minimum table area height under split dragging.
@@ -35,11 +35,13 @@ const TABLE_MIN_H: f32 = 120.0;
 /// Minimum table content width so columns stay readable in narrow docks.
 const TABLE_MIN_W: f32 = 480.0;
 /// Inter-column gutter shared by header, rows, and grab zones so columns align.
-const COL_GUTTER: f32 = 6.0;
+const COL_GUTTER: f32 = km::CELL_PAD_X;
 /// Tree-mode text size: a step above the table cells, like the
 /// industry tree.
 /// Indent per tree depth level.
-const INDENT_W: f32 = 16.0;
+const INDENT_W: f32 = km::INDENT;
+/// Height of a reference row, the grid's row.
+const ROW_H: f32 = km::ROW_H;
 
 /// Dashed vertical tree guide (one per ancestor level), stretched to the row.
 const TREE_GUIDE_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 100\" preserveAspectRatio=\"none\"><line x1=\"8\" y1=\"0\" x2=\"8\" y2=\"100\" stroke=\"#808080\" stroke-width=\"1.5\" stroke-dasharray=\"4,4\"/></svg>";
@@ -68,7 +70,33 @@ fn tree_indent(depth: u32) -> iced::widget::Row<'static, crate::app::Message> {
     }
     row
 }
-const TREE_FONT_SZ: f32 = 13.0;
+const TREE_FONT_SZ: f32 = ui_text::UI;
+/// A row's side padding: its text a cell padding in.
+const ROW_PAD: Padding = Padding {
+    top: 0.0,
+    bottom: 0.0,
+    left: km::CELL_PAD_X,
+    right: km::CELL_PAD_X,
+};
+/// A band of its own under the table (the missing-files notice).
+const BAND_PAD: Padding = Padding {
+    top: km::TOOL_GAP,
+    bottom: km::TOOL_GAP,
+    left: km::GRID_INSET_L,
+    right: km::GRID_INSET_R,
+};
+/// The preview image's width and the preview field's height.
+const PREVIEW_W: f32 = 220.0;
+const PREVIEW_H: f32 = 120.0;
+
+/// A table or tree row: `row_selected` when selected, the body otherwise.
+fn row_style(selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme: &Theme| container::Style {
+        background: selected.then(|| Background::Color(chrome::row_selected(theme))),
+        text_color: Some(chrome::text(theme)),
+        ..Default::default()
+    }
+}
 /// Longest edge of a preview image, in pixels.
 const PREVIEW_MAX: u32 = 256;
 
@@ -134,6 +162,13 @@ pub struct XrefManagerPanel {
     /// on every refresh for the anchor entry only, so the per-frame `view`
     /// stays pure and file I/O never happens during rendering.
     pub previews: HashMap<(u64, String), iced::widget::image::Handle>,
+    /// The anchor entry's preview to decode on a worker; the app takes it
+    /// ([`Self::take_preview_request`]).
+    preview_request: Option<PreviewRequest>,
+    /// Previews being decoded, so a selection asks for each one once.
+    preview_pending: std::collections::HashSet<(u64, String)>,
+    /// Counts the refreshes: a decode started before the last one is dropped.
+    preview_generation: u64,
     /// Details (`false`) vs Preview (`true`) lower pane.
     pub show_preview: bool,
 }
@@ -167,6 +202,9 @@ impl Default for XrefManagerPanel {
             path_open: false,
             row_change_path_open: false,
             previews: HashMap::new(),
+            preview_request: None,
+            preview_pending: std::collections::HashSet::new(),
+            preview_generation: 0,
             show_preview: false,
         }
     }
@@ -317,9 +355,13 @@ impl XrefManagerPanel {
                 .iter()
                 .position(|e| e.key == k && e.saved_path == p)
         });
-        // Previews decode here and on selection change (view stays pure):
-        // the anchor entry only, and only under single selection.
+        // Previews decode on a worker, asked for here and on selection change
+        // (view stays pure): the anchor entry only, and only under single
+        // selection. A decode started before this refresh is dropped.
         self.previews.clear();
+        self.preview_request = None;
+        self.preview_pending.clear();
+        self.preview_generation += 1;
         self.ensure_preview_for_anchor();
         self.expanded.retain(|k| live_keys.contains(k));
         self.entries
@@ -443,15 +485,47 @@ impl XrefManagerPanel {
             return;
         };
         let key = (a.key, found.clone());
-        if self.previews.contains_key(&key) {
+        if self.previews.contains_key(&key) || self.preview_pending.contains(&key) {
             return;
         }
-        if let Some(img) = reference_preview(a) {
-            let (w, h) = (img.width(), img.height());
-            self.previews.insert(
-                key,
-                iced::widget::image::Handle::from_rgba(w, h, img.into_raw()),
-            );
+        self.preview_pending.insert(key.clone());
+        self.preview_request = Some(PreviewRequest {
+            generation: self.preview_generation,
+            key,
+            entry: a.clone(),
+        });
+    }
+
+    /// The preview to decode on a worker ([`read_preview`]), if a selection
+    /// or a refresh asked for one.
+    pub fn take_preview_request(&mut self) -> Option<PreviewRequest> {
+        self.preview_request.take()
+    }
+
+    /// A decode ended: its preview goes into the cache, unless the panel
+    /// was refreshed after the decode started. `None`: the file has no
+    /// preview, and the placeholder shows.
+    pub fn preview_read(
+        &mut self,
+        generation: u64,
+        key: (u64, String),
+        preview: Option<iced::widget::image::Handle>,
+    ) {
+        if generation != self.preview_generation {
+            return;
+        }
+        self.preview_pending.remove(&key);
+        if let Some(preview) = preview {
+            self.previews.insert(key, preview);
+        }
+    }
+
+    /// Decode the asked-for preview here, as the app's worker does.
+    #[cfg(test)]
+    fn read_preview_now(&mut self) {
+        if let Some(request) = self.take_preview_request() {
+            let preview = read_preview(&request.entry);
+            self.preview_read(request.generation, request.key, preview);
         }
     }
 
@@ -606,7 +680,8 @@ impl XrefManagerPanel {
         );
         // Table content width: column widths plus gutters, stretched to the
         // dock when wider so rows fill the panel; narrower docks sidescroll.
-        let table_w = (width - 16.0).max(self.table_content_width());
+        let table_w = (width - km::GRID_INSET_L - km::GRID_INSET_R - 2.0 * km::CELL_PAD_X)
+            .max(self.table_content_width());
         // ── Toolbar: split-button groups per spec ───────────────────────
         // Attach ▾ (default DWG), Refresh ▾ (default Refresh), Change Path ▾.
         // The main button runs the default; the triangle opens the rest in an
@@ -617,10 +692,10 @@ impl XrefManagerPanel {
         )
         .into_owned();
         let attach = if IS_WASM {
-            toolbar_tip(crate::t!("Attach DWG").into_owned(), web_tip.clone(), false)
+            toolbar_tip(crate::t!("Attach").into_owned(), web_tip.clone())
         } else {
             split_button(
-                crate::t!("Attach DWG").into_owned(),
+                crate::t!("Attach").into_owned(),
                 Some(Message::XAttachPick),
                 self.attach_open,
                 Message::XrefManagerAttachMenu,
@@ -644,7 +719,7 @@ impl XrefManagerPanel {
             )
         };
         let refresh = if IS_WASM {
-            toolbar_tip(crate::t!("Refresh").into_owned(), web_tip.clone(), false)
+            toolbar_tip(crate::t!("Refresh").into_owned(), web_tip.clone())
         } else {
             split_button(
                 crate::t!("Refresh").into_owned(),
@@ -661,49 +736,14 @@ impl XrefManagerPanel {
         // List / Tree view buttons with active-state coloring: the current
         // mode renders in the primary accent (blue), the other is clickable.
         let mode_btn = |label: String, active: bool| -> Element<'static, Message> {
+            // The mode shown sends nothing (it stays on), but stays enabled
+            // so it reads as the active one, not a disabled one.
             let msg = if active {
-                None
+                Message::Noop
             } else {
-                Some(Message::XrefManagerToggleTree)
+                Message::XrefManagerToggleTree
             };
-            let mut b = button(text(label).size(11))
-                .style(move |theme: &Theme, status| {
-                    let palette = theme.palette();
-                    if active {
-                        button::Style {
-                            background: Some(Background::Color(palette.primary.base.color)),
-                            border: Border {
-                                radius: 3.0.into(),
-                                color: palette.primary.base.color,
-                                width: 1.0,
-                            },
-                            text_color: palette.primary.base.text,
-                            ..Default::default()
-                        }
-                    } else {
-                        let pair = match status {
-                            button::Status::Hovered | button::Status::Pressed => {
-                                palette.background.strong
-                            }
-                            _ => palette.background.weak,
-                        };
-                        button::Style {
-                            background: Some(Background::Color(pair.color)),
-                            border: Border {
-                                radius: 3.0.into(),
-                                color: palette.background.neutral.color,
-                                width: 1.0,
-                            },
-                            text_color: pair.text,
-                            ..Default::default()
-                        }
-                    }
-                })
-                .padding([4, 10]);
-            if let Some(m) = msg {
-                b = b.on_press(m);
-            }
-            b.into()
+            kit::text_button(label, Some(msg), active)
         };
         let list_btn = mode_btn(crate::t!("List").into_owned(), !self.tree);
         let tree_btn = mode_btn(crate::t!("Tree").into_owned(), self.tree);
@@ -740,7 +780,7 @@ impl XrefManagerPanel {
             }
         });
         let change_path = match path_group_gate {
-            Some(reason) => toolbar_tip(crate::t!("Change Path").into_owned(), reason, false),
+            Some(reason) => toolbar_tip(crate::t!("Change Path").into_owned(), reason),
             None => {
                 let relative_gate = if host_saved {
                     None
@@ -799,44 +839,24 @@ impl XrefManagerPanel {
         // Help opens a modal window explaining the manager (and its web
         // shortcomings): the old disabled tip could never be clicked, and
         // an anchored dropdown squeezes the text into the toolbar's width.
-        let help = toolbar_btn(
-            crate::t!("Help").into_owned(),
-            Some(Message::XrefHelpOpen),
-            false,
-        );
-        let toolbar = container(
-            row![attach, refresh, change_path, help]
-                .spacing(4)
-                .align_y(iced::Center),
-        )
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(theme.palette().background.weakest.color)),
-            ..Default::default()
-        })
-        .width(Fill)
-        .padding([4, 8]);
+        let help = toolbar_btn(crate::t!("Help").into_owned(), Some(Message::XrefHelpOpen));
+        let toolbar = kit::toolbar(vec![attach, refresh, change_path, help]);
 
         // ── File References pane title ──────────────────────────────────
         // List / Tree live on this row, right-aligned.
-        let table_title: Element<'_, Message> = container(
+        let table_title: Element<'_, Message> = kit::band(
             row![
-                text(format!("{} :", crate::t!("File References").as_ref()))
-                    .size(11)
+                text(crate::t!("File References"))
+                    .size(ui_text::UI)
+                    .line_height(crate::ui::style::text::line())
+                    .font(kit::SEMIBOLD)
                     .width(Fill),
                 list_btn,
                 tree_btn,
             ]
-            .spacing(4)
+            .spacing(km::TOOL_GAP)
             .align_y(iced::Center),
-        )
-        .width(Fill)
-        .padding(Padding {
-            top: 4.0,
-            right: 8.0,
-            bottom: 0.0,
-            left: 8.0,
-        })
-        .into();
+        );
         // Each divider between header cells grabs for a width drag
         // (`XrefColGrab(i)` resizes column `i`); mirrors the Layers
         // Name-column divider.
@@ -851,16 +871,24 @@ impl XrefManagerPanel {
         ];
         for (i, label) in headers.into_iter().enumerate() {
             header_row = header_row.push(
-                text(label)
-                    .size(10)
-                    .style(muted_style)
+                kit::one_line(text(label))
+                    .size(ui_text::UI)
+                    .line_height(crate::ui::style::text::line())
+                    .font(kit::SEMIBOLD)
                     .width(Length::Fixed(self.col_widths[i])),
             );
             if i + 1 < self.col_widths.len() {
                 let grab = mouse_area(
-                    container(iced::widget::Space::new().width(Length::Fixed(6.0)))
-                        .width(Length::Fixed(6.0))
-                        .height(Length::Fixed(ROW_H * 0.7)),
+                    container(
+                        container(iced::widget::Space::new().width(km::line()).height(Fill)).style(
+                            |theme: &Theme| container::Style {
+                                background: Some(Background::Color(chrome::surface(theme))),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .center_x(Length::Fixed(COL_GUTTER))
+                    .height(Length::Fixed(ROW_H)),
                 )
                 .on_press(Message::XrefColGrab(i))
                 .interaction(iced::mouse::Interaction::ResizingHorizontally);
@@ -869,22 +897,15 @@ impl XrefManagerPanel {
         }
         let col_header: Element<'_, Message> = mouse_area(
             container(header_row.width(Length::Fixed(table_w)))
-                .style(|theme: &Theme| {
-                    let palette = theme.palette();
-                    container::Style {
-                        background: Some(Background::Color(palette.background.weak.color)),
-                        border: Border {
-                            color: palette.background.neutral.color,
-                            width: 1.0,
-                            radius: 0.0.into(),
-                        },
-                        ..Default::default()
-                    }
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(chrome::surface_raised(theme))),
+                    ..Default::default()
                 })
-                .padding([4, 8])
+                .height(Length::Fixed(ROW_H))
+                .padding(ROW_PAD)
                 .width(Fill),
         )
-        .on_move(|p| Message::XrefColMove(p))
+        .on_move(Message::XrefColMove)
         .on_release(Message::XrefColRelease)
         .into();
 
@@ -925,13 +946,9 @@ impl XrefManagerPanel {
         // blank content in this iced rev — verified by screenshot — so the
         // axes stay split across nested scrollables.)
         let table_rows: Element<'_, Message> = if self.entries.is_empty() {
-            container(
-                text(crate::t!("XREF  No external references in this drawing."))
-                    .size(12)
-                    .style(muted_style),
-            )
-            .center_x(Fill)
-            .center_y(Fill)
+            container(kit::empty_state(crate::t!(
+                "XREF  No external references in this drawing."
+            )))
             .width(Fill)
             .height(Length::Fixed(self.table_h))
             .into()
@@ -961,29 +978,36 @@ impl XrefManagerPanel {
                 ));
             }
             scrollable(tree_col)
+                .style(kit::scroll_style)
                 .height(Length::Fixed(self.table_h))
                 .into()
         } else {
             scrollable(
                 column![
                     col_header,
-                    scrollable(rows_col).height(Length::Fixed(self.table_h)),
+                    scrollable(rows_col)
+                        .style(kit::scroll_style)
+                        .height(Length::Fixed(self.table_h)),
                 ]
                 .width(Length::Fixed(table_w)),
             )
             .direction(iced::widget::scrollable::Direction::Horizontal(
-                iced::widget::scrollable::Scrollbar::new(),
+                iced::widget::scrollable::Scrollbar::new()
+                    .width(km::SCROLL_THUMB_W)
+                    .scroller_width(km::SCROLL_THUMB_W),
             ))
+            .style(kit::scroll_style)
             .height(Length::Fixed(self.table_h))
             .into()
         };
         // Thin external padding + darkest surface around the table, like the
         // properties panel content.
         let table_rows: Element<'_, Message> = container(table_rows)
-            .padding(4)
-            .style(|theme: &Theme| container::Style {
-                background: Some(Background::Color(theme.palette().background.weakest.color)),
-                ..Default::default()
+            .padding(Padding {
+                top: km::TOOL_GAP,
+                bottom: 0.0,
+                left: km::GRID_INSET_L,
+                right: km::GRID_INSET_R,
             })
             .width(Fill)
             .into();
@@ -995,7 +1019,7 @@ impl XrefManagerPanel {
                     "{} reference(s) not found — open the reference manager with EXTERNALREFERENCES.",
                     missing
                 )))
-                .padding([6, 8])
+                .padding(BAND_PAD)
                 .width(Fill)
                 .into(),
             )
@@ -1006,27 +1030,21 @@ impl XrefManagerPanel {
         // Toggle buttons mirror the spec's Details/Preview switch. Preview is
         // a placeholder in v1 (no thumbnail pipeline): a grey field, or
         // "Preview not available" — never a broken image control.
-        let details_tab = toolbar_btn(
-            crate::t!("Details").into_owned(),
-            if self.show_preview {
-                Some(Message::XrefManagerTogglePreview)
+        // The tab shown sends nothing: pressing it again keeps it.
+        let flip = |shown: bool| {
+            if shown {
+                Message::Noop
             } else {
-                None
-            },
-            false,
+                Message::XrefManagerTogglePreview
+            }
+        };
+        let pane_tabs = kit::tabs(
+            vec![
+                (crate::t!("Details").into_owned(), flip(!self.show_preview)),
+                (crate::t!("Preview").into_owned(), flip(self.show_preview)),
+            ],
+            usize::from(self.show_preview),
         );
-        let preview_tab = toolbar_btn(
-            crate::t!("Preview").into_owned(),
-            if self.show_preview {
-                None
-            } else {
-                Some(Message::XrefManagerTogglePreview)
-            },
-            false,
-        );
-        let pane_tabs = row![details_tab, preview_tab]
-            .spacing(4)
-            .align_y(iced::Center);
         let lower: Element<'_, Message> = if self.show_preview {
             // Single selection → the decoded image, or "Preview not
             // available" (DXF/PDF/unresolvable). Anything else → the spec's
@@ -1044,63 +1062,72 @@ impl XrefManagerPanel {
                         .and_then(|found| self.previews.get(&(e.key, found.to_string())));
                     match cached {
                         Some(handle) => container(
-                            iced::widget::image(handle.clone()).width(Length::Fixed(220.0)),
+                            iced::widget::image(handle.clone()).width(Length::Fixed(PREVIEW_W)),
                         )
                         .center_x(Fill)
                         .center_y(Fill)
                         .width(Fill)
-                        .height(Length::Fixed(120.0))
+                        .height(Length::Fixed(PREVIEW_H))
                         .into(),
                         None => container(
                             column![
-                                text(e.name.as_str()).size(11),
+                                text(e.name.as_str()).size(crate::ui::style::text::UI),
                                 text(crate::t!("Preview not available"))
-                                    .size(11)
+                                    .size(crate::ui::style::text::UI)
                                     .style(muted_style),
                             ]
-                            .spacing(4)
+                            .spacing(km::TOOL_GAP)
                             .align_x(iced::Center),
                         )
                         .center_x(Fill)
                         .center_y(Fill)
                         .width(Fill)
-                        .height(Length::Fixed(120.0))
+                        .height(Length::Fixed(PREVIEW_H))
                         .into(),
                     }
                 }
-                None => container(text("—").size(11).style(muted_style))
-                    .center_x(Fill)
-                    .center_y(Fill)
-                    .width(Fill)
-                    .height(Length::Fixed(120.0))
-                    .style(|theme: &Theme| container::Style {
-                        background: Some(Background::Color(theme.palette().background.weak.color)),
-                        ..Default::default()
-                    })
-                    .into(),
-            };
-            container(column![pane_tabs, preview_body].spacing(2))
-                .padding([6, 8])
+                None => container(
+                    text("—")
+                        .size(crate::ui::style::text::UI)
+                        .style(muted_style),
+                )
+                .center_x(Fill)
+                .center_y(Fill)
                 .width(Fill)
-                .into()
+                .height(Length::Fixed(PREVIEW_H))
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(chrome::surface_raised(theme))),
+                    ..Default::default()
+                })
+                .into(),
+            };
+            column![pane_tabs, kit::band(preview_body)].into()
         } else {
             let details = details_pane(self.anchor.and_then(|i| self.entries.get(i)), doc);
-            container(column![pane_tabs, details].spacing(2))
-                .padding([6, 8])
-                .width(Fill)
-                .into()
+            column![pane_tabs, kit::band(details)].into()
         };
 
         // Horizontal split divider between the table and the lower pane:
         // grabs vertically to give the table more (or less) height.
         let split = mouse_area(
-            container(iced::widget::Space::new().height(Length::Fixed(6.0)))
+            iced::widget::canvas(crate::ui::dock::SplitterGrip { active: false })
                 .width(Fill)
-                .height(Length::Fixed(6.0)),
+                .height(Length::Fixed(km::SPLITTER_H)),
         )
         .on_press(Message::XrefSplitGrab)
         .interaction(iced::mouse::Interaction::ResizingVertically);
-        let mut content = column![title_bar, toolbar, table_title, table_rows, split];
+        // The toolbar band keeps a tool gap above it; the rest of the top
+        // inset puts it as far from the title bar as from the left.
+        let top_inset =
+            iced::widget::Space::new().height(Length::Fixed(km::TOP_INSET - km::TOOL_GAP));
+        let mut content = column![
+            title_bar,
+            top_inset,
+            toolbar,
+            table_title,
+            table_rows,
+            split
+        ];
         if let Some(notice) = notice {
             content = content.push(notice);
         }
@@ -1108,7 +1135,7 @@ impl XrefManagerPanel {
         // Panel-wide move/release tracking for the split drag (mirrors the
         // header divider tracking for columns).
         let content: Element<'_, Message> = mouse_area(content.spacing(0))
-            .on_move(|p| Message::XrefSplitMove(p))
+            .on_move(Message::XrefSplitMove)
             .on_release(Message::XrefSplitRelease)
             .into();
         // Fixed to the dock width like the block palette: the panel never
@@ -1116,7 +1143,7 @@ impl XrefManagerPanel {
         // setting — and resize — actually takes effect.
         container(content)
             .style(|theme: &Theme| container::Style {
-                background: Some(Background::Color(theme.palette().background.base.color)),
+                background: Some(Background::Color(chrome::surface(theme))),
                 ..Default::default()
             })
             .width(Length::Fixed(width))
@@ -1129,7 +1156,7 @@ impl XrefManagerPanel {
 /// directly — mirrors the three [`collect_entries`] scans so nested entries
 /// (foreign handles) classify correctly even on handle collisions.
 fn direct_identities(doc: &Document) -> HashSet<(u64, String)> {
-    use codec::objects::ObjectType;
+    use document::objects::ObjectType;
 
     let mut ids: HashSet<(u64, String)> = HashSet::new();
     for br in doc.block_records.iter() {
@@ -1146,7 +1173,9 @@ fn direct_identities(doc: &Document) -> HashSet<(u64, String)> {
                 ids.insert((handle.value(), def.file_path.clone()));
             }
             ObjectType::ClassObject(object) => {
-                if let codec::objects::ClassObjectData::PointCloudDefinitionEx(def) = &object.data {
+                if let document::objects::ClassObjectData::PointCloudDefinitionEx(def) =
+                    &object.data
+                {
                     ids.insert((handle.value(), def.source_filename.clone()));
                 }
             }
@@ -1168,7 +1197,7 @@ fn claim_path(seen: &mut HashSet<(String, String)>, saved_path: &str, name: &str
 
 // ── Text helpers ──────────────────────────────────────────────────────────
 
-fn status_text(status: RefStatus) -> std::borrow::Cow<'static, str> {
+pub(crate) fn status_text(status: RefStatus) -> std::borrow::Cow<'static, str> {
     match status {
         RefStatus::Loaded => crate::t!("Loaded"),
         RefStatus::Unloaded => crate::t!("Unloaded"),
@@ -1176,6 +1205,7 @@ fn status_text(status: RefStatus) -> std::borrow::Cow<'static, str> {
         // Unreadable file: the industry palette term is Unresolved.
         RefStatus::Failed => crate::t!("Unresolved"),
         RefStatus::Stale => crate::t!("Stale"),
+        RefStatus::Circular => crate::t!("Circular reference"),
         RefStatus::Orphaned => crate::t!("Orphaned"),
         RefStatus::Unreferenced => crate::t!("Unreferenced"),
     }
@@ -1215,6 +1245,7 @@ fn status_icon_key(status: RefStatus) -> (&'static [u8], StatusTone) {
         RefStatus::Stale => (icons::DIRTY_DOT, T::Warning),
         RefStatus::NotFound => (icons::CLOSE, T::Danger),
         RefStatus::Failed => (icons::DOT, T::Danger),
+        RefStatus::Circular => (icons::DOT, T::Warning),
         RefStatus::Orphaned => (icons::DOT, T::Warning),
         RefStatus::Unreferenced => (icons::DOC, T::Secondary),
     }
@@ -1298,516 +1329,121 @@ fn format_date(modified: Option<SystemTime>) -> String {
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = doy as i64 - (153 * mp as u64 + 2) as i64 / 5 + 1;
+    let d = doy as i64 - (153 * mp + 2) as i64 / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as i64;
     format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ── Widget helpers (layers.rs conventions) ────────────────────────────────
 
-fn toolbar_btn(label: String, msg: Option<Message>, fill: bool) -> Element<'static, Message> {
-    let mut b = button(text(label).size(11))
-        .style(|theme: &Theme, status| {
-            let palette = theme.palette();
-            let pair = match status {
-                button::Status::Hovered | button::Status::Pressed => palette.background.strong,
-                _ => palette.background.weak,
-            };
-            button::Style {
-                background: Some(Background::Color(pair.color)),
-                border: Border {
-                    radius: 3.0.into(),
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                },
-                text_color: pair.text,
-                ..Default::default()
-            }
-        })
-        .padding([4, 10]);
-    if fill {
-        b = b.width(Fill);
-    }
-    if let Some(m) = msg {
-        b = b.on_press(m);
-    }
-    b.into()
+fn toolbar_btn(label: String, msg: Option<Message>) -> Element<'static, Message> {
+    kit::text_button(label, msg, false)
 }
 
 /// Disabled toolbar affordance with an explanatory tooltip (gated
 /// operations, nested-selection blocks, or web-gated mutations).
-fn toolbar_tip(label: String, tip: String, fill: bool) -> Element<'static, Message> {
-    let b = button(
-        text(label)
-            .size(11)
-            .style(|theme: &Theme| iced::widget::text::Style {
-                color: Some(theme.palette().background.base.text.scale_alpha(0.42)),
-            }),
+fn toolbar_tip(label: String, tip: String) -> Element<'static, Message> {
+    kit::tooltip(
+        kit::text_button(label, None, false),
+        tip,
+        kit::TipPosition::Bottom,
     )
-    .style(|theme: &Theme, _| {
-        let palette = theme.palette();
-        button::Style {
-            background: Some(Background::Color(palette.background.weak.color)),
-            border: Border {
-                radius: 3.0.into(),
-                color: palette.background.neutral.color,
-                width: 1.0,
-            },
-            text_color: palette.background.weak.text.scale_alpha(0.42),
-            ..Default::default()
-        }
-    })
-    .padding([4, 10]);
-    let b = if fill { b.width(Fill) } else { b };
-    tooltip(b, text(tip).size(11), tooltip::Position::Bottom).into()
 }
 
-/// Split button: a default action plus a triangle that opens the rest in an
-/// overlay menu (spec toolbar: Attach ▾, Refresh ▾, Change Path ▾).
+/// Split button: a default action plus a caret that opens the rest in the
+/// kit menu (spec toolbar: Attach ▾, Refresh ▾, Change Path ▾).
 ///
-/// Both halves share one bordered group look: the main half keeps only the
-/// left corners rounded (no right border), the caret keeps only the right
-/// corners (no left border), so the pair reads as a single control. Hover
-/// and press states highlight each half independently.
 /// `main_msg` runs the default action; `toggle` flips this menu (closing the
-/// others is handled at the message site); `items` are the menu rows, each
-/// full-width. Dismissal (Escape / outside click) funnels to
+/// others is handled at the message site); `items` are the menu's items.
+/// Dismissal (Escape / outside click) funnels to
 /// [`Message::XrefManagerDismissMenus`].
 fn split_button(
     main_label: String,
     main_msg: Option<Message>,
     menu_open: bool,
     toggle: Message,
-    items: Vec<Element<'static, Message>>,
+    items: Vec<Item>,
 ) -> Element<'static, Message> {
-    use iced::border::Radius;
-    // Triangle matches the main button's height and bordered style so the
-    // group reads as one split control: same padding, icon box fixed to the
-    // 11px text line height.
-    let half_style = |left: bool| {
-        move |theme: &Theme, status| {
-            let palette = theme.palette();
-            let pair = match status {
-                button::Status::Hovered | button::Status::Pressed => palette.background.strong,
-                _ => palette.background.weak,
-            };
-            let radius = if left {
-                Radius {
-                    top_left: 3.0,
-                    top_right: 0.0,
-                    bottom_right: 0.0,
-                    bottom_left: 3.0,
-                }
-            } else {
-                Radius {
-                    top_left: 0.0,
-                    top_right: 3.0,
-                    bottom_right: 3.0,
-                    bottom_left: 0.0,
-                }
-            };
-            button::Style {
-                background: Some(Background::Color(pair.color)),
-                border: Border {
-                    radius: radius.into(),
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                },
-                text_color: pair.text,
-                ..Default::default()
-            }
-        }
-    };
-    let mut main = button(text(main_label).size(11))
-        .style(half_style(true))
-        .padding([4, 10]);
-    if let Some(m) = main_msg {
-        main = main.on_press(m);
-    }
-    let caret = button(
-        container(crate::ui::icons::themed_arrow_down(9.0))
-            .align_y(iced::Center)
-            .height(Length::Fixed(15.0)),
-    )
-    .on_press(toggle)
-    .style(half_style(false))
-    .padding([4, 10]);
-    // Overlap the halves by the 1px shared border so no double line shows
-    // where they meet.
-    let head = row![main, caret].spacing(-1.0).align_y(iced::Center);
-    let popup: Element<'static, Message> = container(
-        column(
-            items
-                .into_iter()
-                .map(|item| container(item).width(Fill).into()),
-        )
-        .spacing(2)
-        .padding(4),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.base.color)),
-        border: Border {
-            color: theme.palette().background.neutral.color,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..Default::default()
-    })
-    .width(Length::Fixed(220.0))
-    .into();
-    iced_aw::DropDown::new(head, popup, menu_open)
+    let main = kit::text_button(main_label, main_msg, false);
+    let caret = button(container(crate::ui::icons::dropdown_arrow()).center(Length::Fill))
+        .on_press(toggle)
+        .style(kit::flat_button_style(menu_open))
+        .width(Length::Fixed(km::BAR_BUTTON))
+        .height(Length::Fixed(km::TOOL_H))
+        .padding(0);
+    let head = row![main, caret].spacing(km::LINE).align_y(iced::Center);
+    let width = menu::width(&items);
+    iced_aw::DropDown::new(head, menu::view(items), menu_open)
+        .width(Length::Fixed(width))
         .alignment(iced_aw::drop_down::Alignment::Bottom)
-        .offset(2.0)
+        .offset(km::LINE * 2.0)
         .on_dismiss(Message::XrefManagerDismissMenus)
         .into()
 }
 
-/// One dropdown-menu row: a full-width button when the option can execute,
-/// otherwise greyed text carrying the reason.
-fn menu_item(
-    label: String,
-    msg: Option<Message>,
-    gate: Option<String>,
-) -> Element<'static, Message> {
+/// One dropdown-menu item: pressable when the option can execute,
+/// otherwise greyed with the reason as its tooltip.
+fn menu_item(label: String, msg: Option<Message>, gate: Option<String>) -> Item {
     match (msg, gate) {
-        (Some(m), None) => toolbar_btn(label, Some(m), true),
-        (_, reason) => toolbar_tip(label, reason.unwrap_or_default(), true),
+        (Some(m), None) => Item::new(label, m),
+        (_, reason) => Item::disabled(label, reason.unwrap_or_default()),
     }
 }
 
-/// Wrapper that publishes a right-click message before delegating to child
-/// (which may capture right-clicks, e.g. `ContextMenu`).
-struct RightClickArea<'a> {
-    child: Element<'a, Message>,
-    on_right_press: Message,
-}
-
-impl<'a> RightClickArea<'a> {
-    pub fn new(child: impl Into<Element<'a, Message>>, on_right_press: Message) -> Self {
-        Self {
-            child: child.into(),
-            on_right_press,
-        }
-    }
-}
-
-impl<'a> iced_core::Widget<Message, Theme, iced::Renderer> for RightClickArea<'a> {
-    fn diff(&mut self, tree: &mut iced_core::widget::Tree) {
-        tree.diff_children(std::slice::from_mut(&mut self.child));
-    }
-
-    fn size(&self) -> iced::Size<Length> {
-        self.child.as_widget().size()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut iced_core::widget::Tree,
-        renderer: &iced::Renderer,
-        limits: &iced_core::layout::Limits,
-    ) -> iced_core::layout::Node {
-        self.child
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut iced_core::widget::Tree,
-        event: &iced_core::Event,
-        layout: iced_core::Layout<'_>,
-        cursor: iced_core::mouse::Cursor,
-        renderer: &iced::Renderer,
-        shell: &mut iced_core::Shell<'_, Message>,
-        viewport: &iced::Rectangle,
-    ) {
-        if let iced_core::Event::Mouse(iced_core::mouse::Event::ButtonPressed(
-            iced_core::mouse::Button::Right,
-        )) = event
-        {
-            if cursor.is_over(layout.bounds()) {
-                shell.publish(self.on_right_press.clone());
-            }
-        }
-        self.child.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            shell,
-            viewport,
-        );
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &iced_core::widget::Tree,
-        layout: iced_core::Layout<'_>,
-        cursor: iced_core::mouse::Cursor,
-        viewport: &iced::Rectangle,
-        renderer: &iced::Renderer,
-    ) -> iced_core::mouse::Interaction {
-        self.child.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut iced_core::widget::Tree,
-        layout: iced_core::Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
-    ) {
-        self.child
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
-    }
-
-    fn draw(
-        &self,
-        tree: &iced_core::widget::Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &iced_core::renderer::Style,
-        layout: iced_core::Layout<'_>,
-        cursor: iced_core::mouse::Cursor,
-        viewport: &iced::Rectangle,
-    ) {
-        self.child.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut iced_core::widget::Tree,
-        layout: iced_core::Layout<'b>,
-        renderer: &iced::Renderer,
-        viewport: &iced::Rectangle,
-        translation: iced::Vector,
-    ) -> Option<iced_core::overlay::Element<'b, Message, Theme, iced::Renderer>> {
-        self.child.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
-    }
-}
-
-impl<'a> From<RightClickArea<'a>> for Element<'a, Message> {
-    fn from(widget: RightClickArea<'a>) -> Self {
-        Element::new(widget)
-    }
-}
-
-const MENU_ROW_H: f32 = 24.0;
-const MENU_SEP_H: f32 = 5.0;
-const MENU_PADDING: f32 = 4.0;
-const MENU_SPACING: f32 = 1.0;
-
-/// One right-click menu row, styled like the model-space context menu:
-/// borderless subtle text rows. Hovering a regular row dismisses any open flyout.
-///
-/// NOTE: this must stay a SINGLE interactive widget (`mouse_area` alone).
-/// Wrapping a `button` in a `mouse_area` here breaks click delivery inside
-/// the `ContextMenu` overlay: the overlay subtree state (including a button's
-/// press state) is wiped on every view rebuild, so a press → release button
-/// never publishes. `on_press` fires in the press batch itself and needs no
-/// saved state.
-fn menu_row(label: String, msg: Message) -> Element<'static, Message> {
-    mouse_area(
-        container(text(label).size(12))
-            .padding([4, 12])
-            .height(Length::Fixed(MENU_ROW_H))
-            .width(Fill),
-    )
-    .on_press(msg)
-    .on_enter(Message::XrefRowChangePathLeave)
-    .interaction(iced::mouse::Interaction::Pointer)
-    .into()
-}
-
-/// One flyout submenu row: does not close the flyout on hover. Same
-/// single-`mouse_area` rule as [`menu_row`] — no nested `button`.
-fn submenu_row(label: String, msg: Message) -> Element<'static, Message> {
-    mouse_area(
-        container(text(label).size(12))
-            .padding([4, 12])
-            .height(Length::Fixed(MENU_ROW_H))
-            .width(Fill),
-    )
-    .on_press(msg)
-    .on_enter(Message::XrefRowChangePathEnter)
-    .on_exit(Message::XrefRowChangePathLeave)
-    .interaction(iced::mouse::Interaction::Pointer)
-    .into()
-}
-
-fn menu_separator() -> Element<'static, Message> {
-    container(
-        container(iced::widget::Space::new().height(Length::Fixed(1.0)))
-            .style(|theme: &Theme| container::Style {
-                background: Some(Background::Color(theme.palette().background.neutral.color)),
-                ..Default::default()
-            })
-            .width(Fill),
-    )
-    .padding([2, 8])
-    .height(Length::Fixed(MENU_SEP_H))
-    .width(Fill)
-    .into()
-}
-
-/// Per-row right-click menu. Eight items exactly: universal tools +
-/// path tools. No Bind, no Attach/Overlay — those are DWG-only and
-/// hidden entirely. Change Path Type shows a right triangle and a
-/// second list adjacent to "Change Path Type" on hover.
-/// Width of the Change Path Type flyout.
-const XREF_FLYOUT_W: f32 = 180.0;
-
-fn row_menu_for(id: XrefRowId, change_path_open: bool) -> Element<'static, Message> {
-    let item = |label: &str, op: XrefPaletteOp| -> Element<'static, Message> {
-        menu_row(label.to_string(), Message::XrefRowOp(id.clone(), op))
+/// Per-row right-click menu, the kit menu: universal tools, then path
+/// tools. No Bind, no Attach/Overlay — those are DWG-only and hidden
+/// entirely. Change Path Type opens its list beside the menu on hover.
+/// `nested` greys everything but Open: a nested reference is changed in its
+/// host drawing. `current` is the path type the reference already has, which
+/// its flyout greys.
+fn row_menu_for(
+    id: XrefRowId,
+    change_path_open: bool,
+    nested: bool,
+    current: Pathtype,
+) -> Element<'static, Message> {
+    let op = |label: &str, op: XrefPaletteOp| {
+        let enabled = !nested || matches!(op, XrefPaletteOp::Open);
+        Item::new(label, Message::XrefRowOp(id.clone(), op)).enabled(enabled)
     };
-    let pathtype_item = |label: &str, pt: Pathtype| -> Element<'static, Message> {
-        submenu_row(
-            label.to_string(),
+    let pathtype = |label: &str, pt: Pathtype| {
+        Item::new(
+            label,
             Message::XrefRowOp(id.clone(), XrefPaletteOp::Pathtype(pt)),
         )
+        .enabled(pt != current)
     };
-    let change_path_row: Element<'static, Message> = mouse_area(
-        container(
-            row![
-                text(crate::t!("Change Path Type").into_owned())
-                    .size(12)
-                    .width(Fill),
-                crate::ui::icons::themed_arrow_right(10.0),
-            ]
-            .align_y(iced::Center)
-            .spacing(8),
+    let items = vec![
+        op(&crate::t!("Open"), XrefPaletteOp::Open),
+        op(&crate::t!("Attach..."), XrefPaletteOp::Attach),
+        op(&crate::t!("Unload"), XrefPaletteOp::Unload),
+        op(&crate::t!("Reload"), XrefPaletteOp::Reload),
+        op(&crate::t!("Detach"), XrefPaletteOp::Detach),
+        Item::Separator,
+        Item::submenu(
+            crate::t!("Change Path Type"),
+            Message::XrefRowChangePathEnter,
+            vec![
+                pathtype(&crate::t!("Make Absolute"), Pathtype::Full),
+                pathtype(&crate::t!("Make Relative"), Pathtype::Relative),
+                pathtype(&crate::t!("Remove Path"), Pathtype::None),
+            ],
         )
-        .style(move |theme: &Theme| {
-            let palette = theme.palette();
-            let bg = if change_path_open {
-                Some(Background::Color(palette.background.weak.color))
-            } else {
-                None
-            };
-            container::Style {
-                background: bg,
-                border: Border {
-                    radius: 2.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        })
-        .padding([4, 12])
-        .height(Length::Fixed(MENU_ROW_H))
-        .width(Fill),
-    )
-    .on_enter(Message::XrefRowChangePathEnter)
-    .into();
-
-    let main: Element<'static, Message> = container(
-        column![
-            item(&crate::t!("Open").into_owned(), XrefPaletteOp::Open),
-            item(&crate::t!("Attach...").into_owned(), XrefPaletteOp::Attach),
-            item(&crate::t!("Unload").into_owned(), XrefPaletteOp::Unload),
-            item(&crate::t!("Reload").into_owned(), XrefPaletteOp::Reload),
-            item(&crate::t!("Detach").into_owned(), XrefPaletteOp::Detach),
-            menu_separator(),
-            change_path_row,
-            menu_separator(),
-            menu_row(
-                crate::t!("Select New Path").into_owned(),
-                Message::XrefRowPathPick(id.clone()),
-            ),
-            menu_row(
-                crate::t!("Find and Replace...").into_owned(),
-                Message::XrefRowFindReplacePrompt(id.clone()),
-            ),
-        ]
-        .spacing(MENU_SPACING)
-        .padding(MENU_PADDING),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.base.color)),
-        border: Border {
-            color: theme.palette().background.neutral.color,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..Default::default()
-    })
-    .width(Length::Fixed(220.0))
-    .into();
-
-    // The menu keeps one width with the flyout open or closed: near the
-    // window edge the overlay is moved in to fit, and a width that changed
-    // with the flyout moved it out from under the pointer, which closed the
-    // flyout and moved it back (#2258).
-    if !change_path_open {
-        return row![
-            main,
-            iced::widget::Space::new().width(Length::Fixed(XREF_FLYOUT_W))
-        ]
-        .into();
-    }
-
-    // Top offset so the flyout top border aligns directly with the "Change Path Type" row.
-    // 5 items * 24.0 + 5 * 1.0 (spacing) + 5.0 (separator) + 1.0 (spacing) + 4.0 (container padding) = 135.0
-    let flyout_offset =
-        MENU_PADDING + 5.0 * MENU_ROW_H + 5.0 * MENU_SPACING + MENU_SEP_H + MENU_SPACING;
-
-    // Plain container on purpose: each submenu row tracks hover itself
-    // (`on_enter` keeps the flyout open, `on_exit` closes it). Wrapping the
-    // clickable rows in an outer `mouse_area` would nest interactives and
-    // break click delivery inside the `ContextMenu` overlay — see `menu_row`.
-    let flyout: Element<'static, Message> = container(
-        column![
-            pathtype_item(&crate::t!("Make Absolute").into_owned(), Pathtype::Full),
-            pathtype_item(&crate::t!("Make Relative").into_owned(), Pathtype::Relative),
-            pathtype_item(&crate::t!("Remove Path").into_owned(), Pathtype::None),
-        ]
-        .spacing(MENU_SPACING)
-        .padding(MENU_PADDING),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.base.color)),
-        border: Border {
-            color: theme.palette().background.neutral.color,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..Default::default()
-    })
-    .width(Length::Fixed(XREF_FLYOUT_W))
-    .into();
-
-    let flyout_column = column![
-        iced::widget::Space::new().height(Length::Fixed(flyout_offset)),
-        flyout,
+        .open(change_path_open)
+        .enabled(!nested),
+        Item::Separator,
+        Item::new(
+            crate::t!("Select New Path"),
+            Message::XrefRowPathPick(id.clone()),
+        )
+        .enabled(!nested),
+        Item::new(
+            crate::t!("Find and Replace..."),
+            Message::XrefRowFindReplacePrompt(id.clone()),
+        )
+        .enabled(!nested),
     ];
-
-    row![main, flyout_column]
-        .spacing(0)
-        .align_y(iced::alignment::Vertical::Top)
-        .into()
+    menu::with_submenus(items, Message::XrefRowChangePathLeave)
 }
 
 fn xref_row<'a>(
@@ -1822,9 +1458,9 @@ fn xref_row<'a>(
 ) -> Element<'a, Message> {
     let mut name = entry.name.clone();
     if display.is_nested {
-        name.push_str(&crate::t!(" (nested — not rendered)"));
+        name.push_str(&crate::t!(" (nested)"));
     }
-    let mut name_cell = row![].spacing(2).align_y(iced::Center);
+    let mut name_cell = row![].align_y(iced::Center);
     if display.depth > 0 {
         name_cell = name_cell
             .push(iced::widget::Space::new().width(Length::Fixed(INDENT_W * display.depth as f32)));
@@ -1833,25 +1469,36 @@ fn xref_row<'a>(
     // expand/collapse arrow. Nested rows never show one.
     if show_expand {
         let key = entry.key;
-        let arrow = button(crate::ui::icons::themed_arrow_toggle(is_expanded, 10.0))
-            .on_press(Message::XrefManagerToggleExpand(key))
-            .style(cell_button_style(is_selected, display.index))
-            .padding(Padding {
-                top: 6.0,
-                bottom: 6.0,
-                left: 2.0,
-                right: 2.0,
-            });
+        let arrow = button(
+            container(if is_expanded {
+                crate::ui::icons::themed_arrow_down(km::CARET)
+            } else {
+                crate::ui::icons::themed_arrow_right(km::CARET)
+            })
+            .center(Length::Fill),
+        )
+        .on_press(Message::XrefManagerToggleExpand(key))
+        .style(kit::cell_button_style)
+        .width(Length::Fixed(km::INDENT))
+        .height(Length::Fixed(ROW_H))
+        .padding(0);
         name_cell = name_cell.push(arrow);
     }
-    let name_text: Element<'_, Message> = text(name).size(FONT_SZ).into();
+    let name_text: Element<'_, Message> = kit::one_line(text(name))
+        .size(ui_text::UI)
+        .line_height(crate::ui::style::text::line())
+        .width(Fill)
+        .into();
     name_cell = name_cell.push(name_text);
     let gutter = || iced::widget::Space::new().width(Length::Fixed(COL_GUTTER));
     let status_cell: Element<'_, Message> = row![
         container(status_icon(entry.status)).align_y(iced::Center),
-        text(status_text(entry.status)).size(FONT_SZ).width(Fill),
+        kit::one_line(text(status_text(entry.status)))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
+            .width(Fill),
     ]
-    .spacing(4)
+    .spacing(km::TOOL_GAP)
     .align_y(iced::Center)
     .width(Length::Fixed(cw[1]))
     .into();
@@ -1860,61 +1507,53 @@ fn xref_row<'a>(
         gutter(),
         status_cell,
         gutter(),
-        text(format_size(entry.size_bytes))
-            .size(FONT_SZ)
+        kit::one_line(text(format_size(entry.size_bytes)))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[2])),
         gutter(),
-        text(type_text(entry))
-            .size(FONT_SZ)
+        kit::one_line(text(type_text(entry)))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[3])),
         gutter(),
-        text(format_date(entry.modified))
-            .size(FONT_SZ)
+        kit::one_line(text(format_date(entry.modified)))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[4])),
         gutter(),
-        text(entry.saved_path.clone())
-            .size(FONT_SZ)
+        kit::one_line(text(entry.saved_path.clone()))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[5])),
     ]
     .spacing(0)
     .width(Length::Fixed(table_w))
     .align_y(iced::Center);
 
-    let index = display.index;
-    // #49: messages carry stable identity; the index stays for zebra striping only.
+    // #49: messages carry stable identity.
     let row_id = XrefRowId::of(entry.key, &entry.saved_path);
     let row = mouse_area(
         container(content)
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                let pair = if is_selected {
-                    palette.primary.weak
-                } else if index % 2 == 0 {
-                    palette.background.base
-                } else {
-                    palette.background.weak
-                };
-                container::Style {
-                    background: Some(Background::Color(pair.color)),
-                    text_color: Some(pair.text),
-                    ..Default::default()
-                }
-            })
-            .padding(Padding {
-                top: 0.0,
-                bottom: 0.0,
-                left: 8.0,
-                right: 8.0,
-            })
+            .style(row_style(is_selected))
+            .padding(ROW_PAD)
             .height(Length::Fixed(ROW_H))
             .width(Fill),
     )
     .on_press(Message::XrefManagerSelect(row_id.clone()));
+    let (nested, current) = (
+        display.is_nested,
+        crate::io::xref_model::pathtype_of(&entry.saved_path),
+    );
     let cm = iced_aw::ContextMenu::new(row, {
         let row_id = row_id.clone();
-        move || row_menu_for(row_id.clone(), change_path_open)
+        move || row_menu_for(row_id.clone(), change_path_open, nested, current)
     });
-    RightClickArea::new(cm, Message::XrefRowRightClick(row_id)).into()
+    kit::press_first(
+        cm,
+        iced::mouse::Button::Right,
+        Message::XrefRowRightClick(row_id),
+    )
 }
 
 /// One tree-mode row: indent + optional expand arrow + file icon + name.
@@ -1927,63 +1566,61 @@ fn tree_row(
     is_expanded: bool,
     change_path_open: bool,
 ) -> Element<'_, Message> {
-    let mut cells = row![].spacing(2).align_y(iced::Center);
+    let mut cells = row![].align_y(iced::Center);
     cells = cells.push(tree_indent(display.depth));
     if show_expand {
         let key = entry.key;
-        let arrow = button(crate::ui::icons::themed_arrow_toggle(is_expanded, 10.0))
-            .on_press(Message::XrefManagerToggleExpand(key))
-            .style(cell_button_style(is_selected, display.index))
-            .padding(Padding {
-                top: 6.0,
-                bottom: 6.0,
-                left: 2.0,
-                right: 2.0,
-            });
+        let arrow = button(
+            container(if is_expanded {
+                crate::ui::icons::themed_arrow_down(km::CARET)
+            } else {
+                crate::ui::icons::themed_arrow_right(km::CARET)
+            })
+            .center(Length::Fill),
+        )
+        .on_press(Message::XrefManagerToggleExpand(key))
+        .style(kit::cell_button_style)
+        .width(Length::Fixed(km::INDENT))
+        .height(Length::Fixed(ROW_H))
+        .padding(0);
         cells = cells.push(arrow);
     }
     cells = cells.push(
         container(crate::ui::icons::themed_secondary(
             crate::ui::icons::DOC,
-            14.0,
+            km::ROW_ICON,
         ))
         .align_y(iced::Center),
     );
-    cells = cells.push(text(entry.name.clone()).size(TREE_FONT_SZ));
-    let index = display.index;
-    // #49: messages carry stable identity; the index stays for zebra striping only.
+    cells = cells.push(
+        kit::one_line(text(entry.name.clone()))
+            .size(TREE_FONT_SZ)
+            .line_height(crate::ui::style::text::line())
+            .width(Fill),
+    );
+    // #49: messages carry stable identity.
     let row_id = XrefRowId::of(entry.key, &entry.saved_path);
     let row = mouse_area(
-        container(cells.spacing(4).width(Fill))
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                let pair = if is_selected {
-                    palette.primary.weak
-                } else if index % 2 == 0 {
-                    palette.background.base
-                } else {
-                    palette.background.weak
-                };
-                container::Style {
-                    background: Some(Background::Color(pair.color)),
-                    text_color: Some(pair.text),
-                    ..Default::default()
-                }
-            })
-            .padding(Padding {
-                top: 5.0,
-                bottom: 5.0,
-                left: 8.0,
-                right: 8.0,
-            })
+        container(cells.spacing(km::TOOL_GAP).width(Fill))
+            .style(row_style(is_selected))
+            .padding(ROW_PAD)
+            .height(Length::Fixed(ROW_H))
             .width(Fill),
     )
     .on_press(Message::XrefManagerSelect(row_id.clone()));
+    let (nested, current) = (
+        display.is_nested,
+        crate::io::xref_model::pathtype_of(&entry.saved_path),
+    );
     let cm = iced_aw::ContextMenu::new(row, {
         let row_id = row_id.clone();
-        move || row_menu_for(row_id.clone(), change_path_open)
+        move || row_menu_for(row_id.clone(), change_path_open, nested, current)
     });
-    RightClickArea::new(cm, Message::XrefRowRightClick(row_id)).into()
+    kit::press_first(
+        cm,
+        iced::mouse::Button::Right,
+        Message::XrefRowRightClick(row_id),
+    )
 }
 
 /// Tree-mode host root: home icon + name with the current-drawing marker.
@@ -1995,25 +1632,20 @@ fn tree_host_row(display: DisplayRow, host_name: &str) -> Element<'_, Message> {
         host_name.to_string()
     };
     name.push('*');
-    let mut cells = row![].spacing(2).align_y(iced::Center);
+    let mut cells = row![].align_y(iced::Center);
     cells = cells.push(tree_indent(display.depth));
-    cells = cells.push(container(crate::ui::icons::themed_home(14.0)).align_y(iced::Center));
-    cells = cells.push(text(name).size(TREE_FONT_SZ));
-    container(cells.spacing(4).width(Fill))
-        .style(|theme: &Theme| {
-            let pair = theme.palette().background.base;
-            container::Style {
-                background: Some(Background::Color(pair.color)),
-                text_color: Some(pair.text),
-                ..Default::default()
-            }
-        })
-        .padding(Padding {
-            top: 5.0,
-            bottom: 5.0,
-            left: 8.0,
-            right: 8.0,
-        })
+    cells =
+        cells.push(container(crate::ui::icons::themed_home(km::ROW_ICON)).align_y(iced::Center));
+    cells = cells.push(
+        kit::one_line(text(name))
+            .size(TREE_FONT_SZ)
+            .line_height(crate::ui::style::text::line())
+            .width(Fill),
+    );
+    container(cells.spacing(km::TOOL_GAP).width(Fill))
+        .style(row_style(false))
+        .padding(ROW_PAD)
+        .height(Length::Fixed(ROW_H))
         .width(Fill)
         .into()
 }
@@ -2034,65 +1666,62 @@ fn host_row<'a>(
     } else {
         host_path
     };
-    let mut name_cell = row![].spacing(2).align_y(iced::Center);
+    let mut name_cell = row![].align_y(iced::Center);
     if display.depth > 0 {
         name_cell = name_cell
             .push(iced::widget::Space::new().width(Length::Fixed(INDENT_W * display.depth as f32)));
     }
     name_cell = name_cell.push({
-        let name_text: Element<'_, Message> = text(name).size(FONT_SZ).into();
+        let name_text: Element<'_, Message> = kit::one_line(text(name))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
+            .width(Fill)
+            .into();
         name_text
     });
     let gutter = || iced::widget::Space::new().width(Length::Fixed(COL_GUTTER));
     let content = row![
         name_cell.width(Length::Fixed(cw[0])),
         gutter(),
-        text(crate::t!("Opened"))
-            .size(FONT_SZ)
+        kit::one_line(text(crate::t!("Opened")))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[1])),
         gutter(),
-        text("—").size(FONT_SZ).width(Length::Fixed(cw[2])),
+        kit::one_line(text("—"))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
+            .width(Length::Fixed(cw[2])),
         gutter(),
-        text(crate::t!("Current"))
-            .size(FONT_SZ)
+        kit::one_line(text(crate::t!("Current")))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
             .width(Length::Fixed(cw[3])),
         gutter(),
-        text("—").size(FONT_SZ).width(Length::Fixed(cw[4])),
+        kit::one_line(text("—"))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
+            .width(Length::Fixed(cw[4])),
         gutter(),
-        text(saved).size(FONT_SZ).width(Length::Fixed(cw[5])),
+        kit::one_line(text(saved))
+            .size(ui_text::UI)
+            .line_height(crate::ui::style::text::line())
+            .width(Length::Fixed(cw[5])),
     ]
     .spacing(0)
     .width(Length::Fixed(table_w))
     .align_y(iced::Center);
     container(content)
-        .style(|theme: &Theme| {
-            let pair = theme.palette().background.base;
-            container::Style {
-                background: Some(Background::Color(pair.color)),
-                text_color: Some(pair.text),
-                ..Default::default()
-            }
-        })
-        .padding(Padding {
-            top: 0.0,
-            bottom: 0.0,
-            left: 8.0,
-            right: 8.0,
-        })
+        .style(row_style(false))
+        .padding(ROW_PAD)
         .height(Length::Fixed(ROW_H))
         .width(Fill)
         .into()
 }
 
-fn details_pane<'a>(
-    entry: Option<&'a ReferenceEntry>,
-    doc: &'a Document,
-) -> Element<'a, Message> {
+fn details_pane<'a>(entry: Option<&'a ReferenceEntry>, doc: &'a Document) -> Element<'a, Message> {
     let inner: Element<'_, Message> = match entry {
-        None => text(crate::t!("Select a reference to inspect its details"))
-            .size(11)
-            .style(muted_style)
-            .into(),
+        None => kit::value_text(crate::t!("Select a reference to inspect its details"), true),
         Some(e) => {
             let found = e.found_at.as_deref().unwrap_or("—");
             let saved = if e.saved_path.is_empty() {
@@ -2110,8 +1739,7 @@ fn details_pane<'a>(
                 detail_row(crate::t!("Date"), date),
                 detail_row(crate::t!("Found At"), found),
                 detail_row(crate::t!("Saved Path"), saved),
-            ]
-            .spacing(1);
+            ];
             // Image-specific properties (read-only). The file format exposes
             // pixel dimensions and resolution units; color system / color
             // depth are not stored by the format and are omitted deliberately.
@@ -2140,25 +1768,7 @@ fn details_pane<'a>(
             rows.into()
         }
     };
-    container(
-        column![
-            text(crate::t!("Details")).size(10).style(muted_style),
-            inner,
-        ]
-        .spacing(2),
-    )
-    .style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.weak.color)),
-        border: Border {
-            color: theme.palette().background.neutral.color,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    })
-    .padding([6, 8])
-    .width(Fill)
-    .into()
+    container(inner).width(Fill).into()
 }
 
 /// Decode one entry's preview image (`None` = placeholder territory).
@@ -2198,21 +1808,41 @@ fn reference_preview(entry: &ReferenceEntry) -> Option<image::RgbaImage> {
     }
 }
 
+/// A preview for the app to decode on a worker: the panel's refresh count
+/// when it was asked for, the cache key, and the entry.
+#[derive(Debug, Clone)]
+pub struct PreviewRequest {
+    pub generation: u64,
+    pub key: (u64, String),
+    pub entry: ReferenceEntry,
+}
+
+/// Decodes an entry's preview ([`read_preview`]).
+pub type PreviewReader = fn(&ReferenceEntry) -> Option<iced::widget::image::Handle>;
+
+/// Decode `entry`'s preview into an image for the panel (run on a worker
+/// thread).
+pub fn read_preview(entry: &ReferenceEntry) -> Option<iced::widget::image::Handle> {
+    let img = reference_preview(entry)?;
+    let (w, h) = (img.width(), img.height());
+    Some(iced::widget::image::Handle::from_rgba(w, h, img.into_raw()))
+}
+
 /// Image definition backing a [`RefKind::Image`] entry, looked up by the
 /// entry key (definition-object handle) for the Details pane extras.
-fn find_image_def(doc: &Document, key: u64) -> Option<&codec::objects::ImageDefinition> {
+fn find_image_def(doc: &Document, key: u64) -> Option<&document::objects::ImageDefinition> {
     doc.objects
-        .get(&codec::types::Handle::from(key))
+        .get(&document::types::Handle::from(key))
         .and_then(|o| match o {
-            codec::objects::ObjectType::ImageDefinition(def) => Some(def),
+            document::objects::ObjectType::ImageDefinition(def) => Some(def),
             _ => None,
         })
 }
 
 fn find_image_display_size(doc: &Document, key: u64) -> Option<(f64, f64)> {
-    let handle = codec::types::Handle::from(key);
+    let handle = document::types::Handle::from(key);
     for entity in doc.entities() {
-        if let codec::EntityType::RasterImage(img) = entity {
+        if let document::EntityType::RasterImage(img) = entity {
             if img.definition_handle == Some(handle) {
                 let w = (img.u_vector.x.powi(2) + img.u_vector.y.powi(2) + img.u_vector.z.powi(2))
                     .sqrt();
@@ -2231,22 +1861,45 @@ fn detail_row<'a>(
 ) -> Element<'a, Message> {
     let label: std::borrow::Cow<'a, str> = label.into();
     let value: std::borrow::Cow<'a, str> = value.into();
-    row![
-        text(label)
-            .size(11)
-            .style(muted_style)
-            .width(Length::Fixed(84.0)),
-        text(value).size(11),
-    ]
-    .spacing(6)
-    .align_y(iced::Center)
-    .into()
+    kit::row_view(
+        kit::name_text(label.into_owned()),
+        kit::value_cell(value.into_owned(), false),
+        false,
+        None,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::xref_model::RefKind;
+
+    #[test]
+    fn nested_row_label_does_not_claim_geometry_is_hidden() {
+        let _guard = crate::headless_ui_lock();
+        let entry = entry(1, "Detail", "detail.ifccad");
+        let element = xref_row(
+            DisplayRow {
+                index: 0,
+                depth: 0,
+                is_nested: true,
+            },
+            &entry,
+            false,
+            false,
+            false,
+            1200.,
+            &[400., 180., 100., 120., 100., 300.],
+            false,
+        );
+        let mut ui =
+            iced_test::Simulator::with_size(iced::Settings::default(), (1400., 900.), element);
+        let expected = format!("Detail{}", crate::t!(" (nested)"));
+        assert!(
+            ui.find(expected.as_str()).is_ok(),
+            "nested geometry must not be labelled not rendered"
+        );
+    }
 
     #[test]
     fn size_formats_without_deps() {
@@ -2477,10 +2130,10 @@ mod tests {
         assert!(!panel.display_rows().iter().any(|r| r.is_nested));
     }
 
-    fn preview_doc2(dir: &std::path::Path) -> codec::Document {
+    fn preview_doc2(dir: &std::path::Path) -> document::Document {
         // Two referenced images → genuine multi-select.
-        use codec::objects::{ImageDefinition, ObjectType};
-        let mut doc = codec::Document::new();
+        use document::objects::{ImageDefinition, ObjectType};
+        let mut doc = document::Document::new();
         for (i, name) in ["a.png", "b.png"].iter().enumerate() {
             let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([9, 9, 9, 255]));
             img.save(dir.join(name)).unwrap();
@@ -2489,33 +2142,39 @@ mod tests {
             let mut def = ImageDefinition::with_dimensions(path.clone(), 8, 8);
             def.handle = h;
             doc.objects.insert(h, ObjectType::ImageDefinition(def));
-            let mut ent = codec::entities::RasterImage::new(
+            let mut ent = document::entities::RasterImage::new(
                 &path,
-                codec::types::Vector3::ZERO,
+                document::types::Vector3::ZERO,
                 8.0 + i as f64,
                 8.0,
             );
             ent.definition_handle = Some(h);
-            doc.add_entity(codec::EntityType::RasterImage(ent)).unwrap();
+            doc.add_entity(document::EntityType::RasterImage(ent))
+                .unwrap();
         }
         doc
     }
 
-    fn preview_doc(dir: &std::path::Path, name: &str) -> codec::Document {
+    fn preview_doc(dir: &std::path::Path, name: &str) -> document::Document {
         // Referenced 8x8 PNG under `dir`; the entry resolves Loaded.
-        use codec::objects::{ImageDefinition, ObjectType};
+        use document::objects::{ImageDefinition, ObjectType};
         let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([9, 9, 9, 255]));
         img.save(dir.join(name)).unwrap();
         let img_path = dir.join(name).to_string_lossy().into_owned();
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         let h = doc.allocate_handle();
         let mut def = ImageDefinition::with_dimensions(img_path.clone(), 8, 8);
         def.handle = h;
         doc.objects.insert(h, ObjectType::ImageDefinition(def));
-        let mut ent =
-            codec::entities::RasterImage::new(&img_path, codec::types::Vector3::ZERO, 8.0, 8.0);
+        let mut ent = document::entities::RasterImage::new(
+            &img_path,
+            document::types::Vector3::ZERO,
+            8.0,
+            8.0,
+        );
         ent.definition_handle = Some(h);
-        doc.add_entity(codec::EntityType::RasterImage(ent)).unwrap();
+        doc.add_entity(document::EntityType::RasterImage(ent))
+            .unwrap();
         doc
     }
 
@@ -2535,12 +2194,45 @@ mod tests {
         let empty = std::collections::HashSet::new();
         let no_prev = std::collections::HashMap::new();
         panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.read_preview_now();
         assert!(panel.previews.is_empty(), "nothing selected → no decode");
         panel.toggle_select(0);
         panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.read_preview_now();
         assert_eq!(panel.previews.len(), 1, "single anchor decodes once");
         let (handle, _) = panel.previews.iter().next().unwrap();
         assert!(panel.entries.iter().any(|e| e.key == handle.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A selection asks for its preview once and decodes nothing itself; a
+    /// decode that ends after a refresh is dropped.
+    #[test]
+    fn a_selection_asks_for_its_preview_and_a_stale_one_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ocs_xref_preview_ask_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = preview_doc(&dir, "img.png");
+        let mut panel = XrefManagerPanel::default();
+        let empty = std::collections::HashSet::new();
+        let no_prev = std::collections::HashMap::new();
+        panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.toggle_select(0);
+        assert!(panel.previews.is_empty(), "no decode during the selection");
+        let request = panel.take_preview_request().expect("a request");
+        let id = XrefRowId::of(panel.entries[0].key, &panel.entries[0].saved_path);
+        panel.click_select(&id, SelectExtend::Single);
+        assert!(
+            panel.take_preview_request().is_none(),
+            "asked once while it decodes"
+        );
+        let preview = read_preview(&request.entry);
+        assert!(preview.is_some());
+        panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.preview_read(request.generation, request.key, preview);
+        assert!(
+            panel.previews.is_empty(),
+            "a decode from before the refresh"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2568,6 +2260,7 @@ mod tests {
         panel.toggle_select(1);
         assert_eq!(panel.selected.len(), 2);
         panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.read_preview_now();
         assert!(
             panel.previews.is_empty(),
             "multi-select → grey field, no decode"
@@ -2589,8 +2282,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.dwg"), b"not-a-real-dwg").unwrap();
-        let mut doc = codec::Document::new();
-        let mut br = codec::tables::BlockRecord::new("PLAN");
+        let mut doc = document::Document::new();
+        let mut br = document::tables::BlockRecord::new("PLAN");
         br.flags.is_xref = true;
         br.xref_path = dir.join("plan.dwg").to_string_lossy().into_owned();
         br.handle = doc.allocate_handle();
@@ -2601,6 +2294,7 @@ mod tests {
         panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
         panel.toggle_select(0);
         panel.refresh(&doc, &dir, &empty, &no_prev, "host", "");
+        panel.read_preview_now();
         assert!(
             panel.previews.is_empty(),
             "undecodable file → placeholder, no cache entry"
@@ -2627,7 +2321,7 @@ mod tests {
             .objects
             .iter()
             .find_map(|(h, o)| match o {
-                codec::objects::ObjectType::ImageDefinition(_) => Some(h.value()),
+                document::objects::ObjectType::ImageDefinition(_) => Some(h.value()),
                 _ => None,
             })
             .unwrap();
@@ -2638,6 +2332,7 @@ mod tests {
         panel.refresh(&doc, &dir, &unloaded, &no_prev, "host", "");
         panel.toggle_select(0);
         panel.refresh(&doc, &dir, &unloaded, &no_prev, "host", "");
+        panel.read_preview_now();
         assert_eq!(panel.previews.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2656,7 +2351,7 @@ mod tests {
     fn open_row_menu(change_path_open: bool) -> MenuSimulator {
         let row_id = XrefRowId::of(0, "");
         let mut ui = iced_test::simulator(iced_aw::ContextMenu::new(text("anchor"), move || {
-            row_menu_for(row_id.clone(), change_path_open)
+            row_menu_for(row_id.clone(), change_path_open, false, Pathtype::Relative)
         }));
         let anchor = ui.find("anchor").expect("anchor underlay present");
         let center = anchor.visible_bounds().expect("anchor visible").center();
@@ -2752,8 +2447,9 @@ mod tests {
         // buttons again.
         use iced_core::Widget;
 
-        let mut menu =
-            iced_aw::ContextMenu::new(text("anchor"), || row_menu_for(XrefRowId::of(0, ""), false));
+        let mut menu = iced_aw::ContextMenu::new(text("anchor"), || {
+            row_menu_for(XrefRowId::of(0, ""), false, false, Pathtype::Relative)
+        });
         let mut tree = iced_core::widget::Tree::new(
             &menu as &dyn Widget<Message, iced::Theme, iced::Renderer>,
         );

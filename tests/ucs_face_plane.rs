@@ -7,11 +7,11 @@
 //! `ucs_from_normal` in `src/app/helpers.rs`, which is `pub(crate)` and so out
 //! of reach from here.
 
-use codec::{entities::Circle, types::Vector3, EntityType};
+use document::{entities::Circle, types::Vector3, EntityType};
 use OpenCADStudio::scene::model::{presspull_model, solid_model};
 
 /// Extrude a disc into a puck 10 units tall, centred on the origin.
-fn puck() -> kernel::brep::Body {
+fn puck() -> ocs_solid::model::Brep {
     let entity = EntityType::Circle(Circle::from_center_radius(
         Vector3::new(0.0, 0.0, 0.0),
         100.0,
@@ -19,7 +19,7 @@ fn puck() -> kernel::brep::Body {
     let body = presspull_model::extrusion_body(&entity, [0.0, 0.0, 10.0])
         .expect("a closed circular profile extrudes");
     assert!(
-        body.validate().is_empty(),
+        ocs_solid::model::check(&body).is_empty(),
         "extrusion produced a valid body"
     );
     body
@@ -98,8 +98,8 @@ fn ucs_pick_command_enables_solid_face_picking() {
         "UCS FACE must use 3D surface point"
     );
     assert!(
-        cmd_face.entity_pick_highlights_hover(),
-        "UCS FACE must highlight hovered solid face"
+        !cmd_face.entity_pick_highlights_hover(),
+        "UCS FACE outlines the hovered face, not the whole solid"
     );
 
     let cmd_obj = UcsPickCommand { face: false };
@@ -109,8 +109,9 @@ fn ucs_pick_command_enables_solid_face_picking() {
         "UCS OBJECT operates on curves, not fills"
     );
     assert!(!cmd_obj.entity_pick_uses_surface_point());
+    assert!(cmd_obj.entity_pick_highlights_hover());
 
-    let handle = codec::Handle::new(0x2A);
+    let handle = document::Handle::new(0x2A);
     let pt = DVec3::new(10.5, 20.25, 30.125);
     let mut cmd = cmd_face;
     match cmd.on_entity_pick(handle, pt) {

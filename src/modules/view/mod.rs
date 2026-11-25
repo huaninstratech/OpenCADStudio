@@ -1,5 +1,6 @@
 // View module — viewport tools, navigation, visual styles, palettes, interface.
 
+mod assistant_palette;
 mod cascade;
 mod count_palette;
 pub mod dview;
@@ -15,6 +16,7 @@ pub mod plot_window;
 mod properties_palette;
 pub mod quick_print;
 mod sheetset;
+pub mod snapang_cmd;
 mod tile_horiz;
 mod tile_vert;
 mod tool_palettes;
@@ -28,6 +30,7 @@ pub(crate) mod view_top;
 mod viewcube;
 pub mod visual_style;
 pub(crate) mod vports_config;
+mod vports_highlight;
 mod vports_join;
 mod vports_named;
 mod vports_restore;
@@ -76,10 +79,11 @@ impl CadModule for ViewModule {
                 RibbonGroup {
                     title: "Model Viewports",
                     tools: vec![
-                        RibbonItem::LargeTool(vports_config::tool()),
+                        vports_config::dropdown(),
                         RibbonItem::Tool(vports_named::tool()),
                         RibbonItem::Tool(vports_join::tool()),
                         RibbonItem::Tool(vports_restore::tool()),
+                        RibbonItem::Tool(vports_highlight::tool()),
                     ],
                 },
                 // ── Visual Style ──────────────────────────────────────────────────
@@ -127,6 +131,7 @@ impl CadModule for ViewModule {
                         RibbonItem::LargeTool(count_palette::tool()),
                         RibbonItem::LargeTool(graphic_attributes_palette::tool()),
                         RibbonItem::LargeTool(sheetset::tool()),
+                        RibbonItem::LargeTool(assistant_palette::tool()),
                     ],
                 },
                 // ── Interface ─────────────────────────────────────────────────────

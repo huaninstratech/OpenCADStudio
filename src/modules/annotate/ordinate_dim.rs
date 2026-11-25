@@ -1,6 +1,6 @@
-use codec::entities::{Dimension, DimensionOrdinate};
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::{Dimension, DimensionOrdinate};
+use document::types::Vector3;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{
@@ -40,6 +40,12 @@ pub struct OrdinateDimCommand {
     awaiting_text: bool,
     text_angle: Option<f64>,
     awaiting_angle: bool,
+}
+
+impl Default for OrdinateDimCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OrdinateDimCommand {

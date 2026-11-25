@@ -28,17 +28,17 @@
 //! curves. They keep their own paths and this returns `None` for them, which
 //! is what lets a caller ask about any entity without checking first.
 
-use codec::entities::{
+use document::entities::{
     Arc as ArcEnt, Circle as CircleEnt, Ellipse as EllipseEnt, LwPolyline as LwPolylineEnt,
     Polyline2D, Spline as SplineEnt,
 };
-use codec::types::Vector3;
-use codec::EntityType;
-use kernel::geom2d::{
+use document::types::Vector3;
+use document::EntityType;
+use ocs_geom::geom2d::{
     characteristic_points, Arc, Circle, Curve, Ellipse, EllipseArc, Line, Polyline, PolylineVertex,
     Ray, SnapKind, Transform, XLine,
 };
-use kernel::space::{are_coplanar, coplanarity_tolerance, PlanarCurve, Plane, Vec3};
+use ocs_geom::space::{are_coplanar, coplanarity_tolerance, PlanarCurve, Plane, Vec3};
 
 use crate::modules::draw::modify::spline_ops::spline_to_nurbs_on;
 use crate::scene::model::wire_model::SnapHint;
@@ -111,12 +111,12 @@ pub fn entity_curve(entity: &EntityType) -> Option<PlanarCurve> {
 
 /// Exact spatial source geometry for commands that traverse nonplanar curves.
 /// Curve construction and arc-length calculations remain in the kernel.
-pub fn entity_spatial_measurement(entity: &EntityType) -> Option<kernel::space::ArcLengthCurve3> {
-    use kernel::space::{ArcLengthCurve3, NurbsCurve3};
+pub fn entity_spatial_measurement(entity: &EntityType) -> Option<ocs_geom::space::ArcLengthCurve3> {
+    use ocs_geom::space::{ArcLengthCurve3, NurbsCurve3};
     let curve = match entity {
         EntityType::Polyline3D(polyline) => {
             if polyline.flags.spline_fit {
-                use codec::entities::polyline3d::SmoothSurfaceType;
+                use document::entities::polyline3d::SmoothSurfaceType;
                 let degree = match polyline.smooth_type {
                     SmoothSurfaceType::QuadraticBSpline => 2,
                     SmoothSurfaceType::CubicBSpline | SmoothSurfaceType::Bezier => 3,
@@ -494,7 +494,7 @@ pub fn entity_with_lwpolyline_world_xy_owned(entity: EntityType) -> EntityType {
 
 /// World-space wire points sampled by the kernel's angular policy.
 pub fn curve_points(curve: &PlanarCurve) -> Vec<[f64; 3]> {
-    curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+    curve.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
 }
 
 /// The snap candidates an entity's curve offers, in the two channels the
@@ -576,9 +576,9 @@ fn normalized(normal: Vector3) -> Vector3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::lwpolyline::LwVertex;
-    use codec::entities::{Line as LineEnt, Ray as RayEnt, XLine as XLineEnt};
-    use codec::types::Vector2;
+    use document::entities::lwpolyline::LwVertex;
+    use document::entities::{Line as LineEnt, Ray as RayEnt, XLine as XLineEnt};
+    use document::types::Vector2;
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
     fn v3(x: f64, y: f64, z: f64) -> Vector3 {
@@ -772,8 +772,8 @@ mod tests {
 
     #[test]
     fn spatial_polyline_measurement_uses_unflagged_fit_controls() {
-        use codec::entities::polyline3d::SmoothSurfaceType;
-        use codec::entities::{Polyline3D, Vertex3DPolyline};
+        use document::entities::polyline3d::SmoothSurfaceType;
+        use document::entities::{Polyline3D, Vertex3DPolyline};
 
         let mut polyline = Polyline3D::new();
         polyline.flags.spline_fit = true;
@@ -919,12 +919,11 @@ mod tests {
     /// where it happens rather than the next time somebody reaches for it.
     #[test]
     fn the_solid_layer_and_the_acis_bridge_are_reachable() {
-        let solid = kernel::brep::make::cuboid([0.0; 3], [1.0; 3])
-            .expect("the kernel builds its own primitives");
-        assert!(solid.validate().is_empty());
-        assert_eq!(solid.euler_characteristic(), 2);
-        let document = codec::entities::acis::types::SatDocument::new();
-        let (bodies, loss) = kernel::acis::lift(&document);
+        let solid = ocs_solid::model::make_box([0.0; 3], [1.0; 3]).expect("Solidcore builds a box");
+        assert!(ocs_solid::model::check(&solid).is_empty());
+        assert_eq!(solid.vertices.len() + solid.faces.len() - solid.edges.len(), 2);
+        let document = document::entities::acis::types::SatDocument::new();
+        let (bodies, loss) = ocs_solid::lift(&document);
         assert!(
             bodies.is_empty() && loss.is_empty(),
             "an empty document lifts to nothing"
@@ -959,14 +958,14 @@ mod tests {
         ray.base_point = v3(1.0, 1.0, 0.0);
         ray.direction = v3(2.0, 0.0, 0.0);
         let curve = entity_curve(&EntityType::Ray(ray)).unwrap();
-        assert_eq!(curve.extent(), kernel::geom2d::Extent::Forward);
+        assert_eq!(curve.extent(), ocs_geom::geom2d::Extent::Forward);
         assert_eq!(curve.point_at(1.0), [3.0, 1.0, 0.0]);
 
         let mut line = XLineEnt::default();
         line.base_point = v3(0.0, 0.0, 0.0);
         line.direction = v3(0.0, 3.0, 0.0);
         let curve = entity_curve(&EntityType::XLine(line)).unwrap();
-        assert_eq!(curve.extent(), kernel::geom2d::Extent::Infinite);
+        assert_eq!(curve.extent(), ocs_geom::geom2d::Extent::Infinite);
         assert_eq!(curve.point_at(-1.0), [0.0, -3.0, 0.0]);
     }
 }

@@ -2,14 +2,14 @@
 //! and a differential test proving `apply_explode_replacements` matches the
 //! legacy per-entity erase/apply loop (including leader-annotation coupling).
 
-use codec::entities::{
+use document::entities::{
     CenterMarkAssociation, CenterMarkSource, CenterMarkSourceKind, Dimension, DimensionLinear,
     Insert, Leader, Line, LwPolyline, LwVertex, MLine, Polyline, Polyline2D, Polyline3D, Vertex2D,
     Vertex3D,
 };
-use codec::tables::BlockRecord;
-use codec::types::{Vector2, Vector3};
-use codec::{Document, EntityType, Handle};
+use document::tables::BlockRecord;
+use document::types::{Vector2, Vector3};
+use document::{Document, EntityType, Handle};
 use OpenCADStudio::modules::draw::modify::explode::{
     apply_explode_replacements, explode_batch, explode_entity, plan_explode,
 };
@@ -68,15 +68,15 @@ fn explode_polyline_family_golden_all_lines() {
 
     let mut p3 = Polyline3D::new();
     p3.vertices = vec![
-        codec::entities::Vertex3DPolyline {
+        document::entities::Vertex3DPolyline {
             position: Vector3::new(0.0, 0.0, 0.0),
             ..Default::default()
         },
-        codec::entities::Vertex3DPolyline {
+        document::entities::Vertex3DPolyline {
             position: Vector3::new(5.0, 0.0, 0.0),
             ..Default::default()
         },
-        codec::entities::Vertex3DPolyline {
+        document::entities::Vertex3DPolyline {
             position: Vector3::new(5.0, 5.0, 0.0),
             ..Default::default()
         },
@@ -497,11 +497,10 @@ fn apply_explode_replacements_matches_legacy_loop() {
 
 #[test]
 fn explode_region_acis_sat_and_binary_sab_with_hole_and_style() {
-    use codec::entities::acis::{SabWriter, SatDocument};
-    use codec::entities::{AcisData, Region};
-    use kernel::brep;
-    use kernel::geom2d::{Arc as KArc, Curve as KCurve, Line as KLine};
-    use kernel::space::Plane;
+    use document::entities::acis::{SabWriter, SatDocument};
+    use document::entities::{AcisData, Region};
+    use ocs_geom::geom2d::{Arc as KArc, Curve as KCurve, Line as KLine};
+    use ocs_geom::space::Plane;
 
     let plane = Plane::from_axes([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
     let outer = vec![
@@ -534,9 +533,9 @@ fn explode_region_acis_sat_and_binary_sab_with_hole_and_style() {
         })
         .collect();
 
-    let body = brep::planar_region(plane, &[outer, hole]).expect("planar region with hole");
+    let body = ocs_solid::model::planar_region(plane, &[outer, hole]).expect("planar region with hole");
     let mut sat = SatDocument::new();
-    kernel::acis::append(&body, &mut sat).expect("sat append");
+    ocs_solid::append(&body, &mut sat).expect("sat append");
     let sat_text = sat.to_sat_string();
     let parsed_sat = SatDocument::parse(&sat_text).expect("sat parse");
     let sab_bytes = SabWriter::write(&parsed_sat);
@@ -557,7 +556,7 @@ fn explode_region_acis_sat_and_binary_sab_with_hole_and_style() {
         let mut region = Region::new();
         region.acis_data = acis_data;
         region.common.layer = "REGIONS".to_string();
-        region.common.color = codec::types::Color::from_index(3);
+        region.common.color = document::types::Color::from_index(3);
         region.common.linetype = "DASHED".to_string();
         region.common.xdictionary_handle = Some(Handle::new(999));
 
@@ -596,7 +595,7 @@ fn explode_region_acis_sat_and_binary_sab_with_hole_and_style() {
             assert_eq!(c.layer, "REGIONS", "{label}: layer preserved");
             assert_eq!(
                 c.color,
-                codec::types::Color::from_index(3),
+                document::types::Color::from_index(3),
                 "{label}: color preserved"
             );
             assert_eq!(c.linetype, "DASHED", "{label}: linetype preserved");
@@ -612,11 +611,10 @@ fn explode_region_acis_sat_and_binary_sab_with_hole_and_style() {
 
 #[test]
 fn explode_region_tilted_plane_arc_and_multi_island() {
-    use codec::entities::acis::SatDocument;
-    use codec::entities::{AcisData, Region};
-    use kernel::brep;
-    use kernel::geom2d::{Arc as KArc, Curve as KCurve, Line as KLine};
-    use kernel::space::Plane;
+    use document::entities::acis::SatDocument;
+    use document::entities::{AcisData, Region};
+    use ocs_geom::geom2d::{Arc as KArc, Curve as KCurve, Line as KLine};
+    use ocs_geom::space::Plane;
 
     // Semicircle + closing chord on tilted plane (XZ plane at y = 4.0).
     let plane = Plane::from_axes([0.0, 4.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
@@ -632,9 +630,9 @@ fn explode_region_tilted_plane_arc_and_multi_island() {
             end_angle: std::f64::consts::PI,
         }),
     ];
-    let body = brep::planar_region(plane, &[d_loop]).expect("tilted D region");
+    let body = ocs_solid::model::planar_region(plane, &[d_loop]).expect("tilted D region");
     let mut sat = SatDocument::new();
-    kernel::acis::append(&body, &mut sat).expect("sat append");
+    ocs_solid::append(&body, &mut sat).expect("sat append");
     let mut region = Region::new();
     region.acis_data = AcisData::from_sat(&sat.to_sat_string());
 
@@ -687,11 +685,11 @@ fn explode_region_tilted_plane_arc_and_multi_island() {
             }),
         ]
     };
-    let r1 = brep::planar_region(xy, &[rect_loop(0.0, 5.0)]).unwrap();
-    let r2 = brep::planar_region(xy, &[rect_loop(10.0, 15.0)]).unwrap();
-    let union_body = brep::union_planar_regions(&[r1, r2], 1e-6).unwrap();
+    let r1 = ocs_solid::model::planar_region(xy, &[rect_loop(0.0, 5.0)]).unwrap();
+    let r2 = ocs_solid::model::planar_region(xy, &[rect_loop(10.0, 15.0)]).unwrap();
+    let union_body = ocs_solid::model::union_regions(&[r1, r2]).unwrap();
     let mut union_sat = SatDocument::new();
-    kernel::acis::append(&union_body, &mut union_sat).unwrap();
+    ocs_solid::append(&union_body, &mut union_sat).unwrap();
     let mut multi_region = Region::new();
     multi_region.acis_data = AcisData::from_sat(&union_sat.to_sat_string());
     let multi_pieces = explode_entity(&EntityType::Region(multi_region), &doc);
@@ -703,7 +701,7 @@ fn explode_region_tilted_plane_arc_and_multi_island() {
 
     // Wire-only fallback region (no ACIS data, display wires present).
     let mut wire_region = Region::new();
-    wire_region.wires = vec![codec::entities::Wire::from_points(vec![
+    wire_region.wires = vec![document::entities::Wire::from_points(vec![
         Vector3::new(0.0, 0.0, 0.0),
         Vector3::new(4.0, 0.0, 0.0),
         Vector3::new(4.0, 3.0, 0.0),
@@ -719,11 +717,10 @@ fn explode_region_tilted_plane_arc_and_multi_island() {
 
 #[test]
 fn explode_region_acis_with_body_transform() {
-    use codec::entities::acis::SatDocument;
-    use codec::entities::{AcisData, Region};
-    use kernel::brep;
-    use kernel::geom2d::{Curve as KCurve, Line as KLine};
-    use kernel::space::Plane;
+    use document::entities::acis::SatDocument;
+    use document::entities::{AcisData, Region};
+    use ocs_geom::geom2d::{Curve as KCurve, Line as KLine};
+    use ocs_geom::space::Plane;
 
     let plane = Plane::from_axes([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
     let rect = vec![
@@ -744,9 +741,9 @@ fn explode_region_acis_with_body_transform() {
             end: [0.0, 0.0],
         }),
     ];
-    let body = brep::planar_region(plane, &[rect]).expect("planar region");
+    let body = ocs_solid::model::planar_region(plane, &[rect]).expect("planar region");
     let mut sat = SatDocument::new();
-    kernel::acis::append(&body, &mut sat).expect("sat append");
+    ocs_solid::append(&body, &mut sat).expect("sat append");
 
     // A placed region carries a body transform record.
     // Translate by [50.0, 100.0, 0.0].
@@ -786,14 +783,13 @@ fn explode_region_acis_with_body_transform() {
 
 #[test]
 fn explode_region_elliptical_and_spline_boundaries() {
-    use codec::entities::acis::SatDocument;
-    use codec::entities::{AcisData, Region};
-    use kernel::brep;
-    use kernel::geom2d::{
+    use document::entities::acis::SatDocument;
+    use document::entities::{AcisData, Region};
+    use ocs_geom::geom2d::{
         Curve as KCurve, Ellipse as KEllipse, EllipseArc as KEllipseArc, Line as KLine,
         NurbsCurve as KNurbs,
     };
-    use kernel::space::Plane;
+    use ocs_geom::space::Plane;
 
     let plane = Plane::from_axes([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
     let doc = Document::new();
@@ -805,9 +801,9 @@ fn explode_region_elliptical_and_spline_boundaries() {
         minor_radius: 4.0,
         major_axis: [1.0, 0.0],
     }))];
-    let body = brep::planar_region(plane, &[ell_loop]).expect("ellipse region");
+    let body = ocs_solid::model::planar_region(plane, &[ell_loop]).expect("ellipse region");
     let mut sat = SatDocument::new();
-    kernel::acis::append(&body, &mut sat).expect("sat append");
+    ocs_solid::append(&body, &mut sat).expect("sat append");
     let mut region = Region::new();
     region.acis_data = AcisData::from_sat(&sat.to_sat_string());
     region.common.layer = "ELLIPSES".to_string();
@@ -844,9 +840,9 @@ fn explode_region_elliptical_and_spline_boundaries() {
             end: [0.0, 0.0],
         }),
     ];
-    let body_spline = brep::planar_region(plane, &[spline_loop]).expect("spline region");
+    let body_spline = ocs_solid::model::planar_region(plane, &[spline_loop]).expect("spline region");
     let mut sat_spline = SatDocument::new();
-    kernel::acis::append(&body_spline, &mut sat_spline).expect("sat append");
+    ocs_solid::append(&body_spline, &mut sat_spline).expect("sat append");
     let mut region_spline = Region::new();
     region_spline.acis_data = AcisData::from_sat(&sat_spline.to_sat_string());
     region_spline.common.layer = "SPLINES".to_string();
@@ -892,9 +888,9 @@ fn explode_region_elliptical_and_spline_boundaries() {
             end: [0.0, 0.0],
         }),
     ];
-    let body_arc = brep::planar_region(plane, &[d_equal_loop]).expect("equal-radii ellipse region");
+    let body_arc = ocs_solid::model::planar_region(plane, &[d_equal_loop]).expect("equal-radii ellipse region");
     let mut sat_arc = SatDocument::new();
-    kernel::acis::append(&body_arc, &mut sat_arc).expect("sat append");
+    ocs_solid::append(&body_arc, &mut sat_arc).expect("sat append");
     let mut region_arc = Region::new();
     region_arc.acis_data = AcisData::from_sat(&sat_arc.to_sat_string());
 

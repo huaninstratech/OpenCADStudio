@@ -1,11 +1,11 @@
 use crate::app::Message;
 use crate::scene::WireModel;
-use iced::widget::{button, column, container, pick_list, row, text, text_input, Space};
+use iced::widget::{Space, button, column, container, pick_list, row, text, text_input};
 use iced::{Element, Fill};
 
 pub(crate) struct State {
     pub document_id: u64,
-    pub source: codec::Handle,
+    pub source: document::Handle,
     pub name: String,
     pub existing_names: Vec<String>,
     pub preview: Vec<WireModel>,

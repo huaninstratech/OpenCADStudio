@@ -2,7 +2,7 @@
 //! variable dictionary; empty means the current layer.
 
 use crate::app::{Message, OpenCADStudio};
-use codec::Handle;
+use document::Handle;
 use iced::Task;
 
 const NAME: &str = "TEXTLAYER";
@@ -15,7 +15,11 @@ impl OpenCADStudio {
     }
 
     pub(crate) fn set_text_layer(&mut self, i: usize, layer: &str) {
-        let value = if layer.trim() == "." { "" } else { layer.trim() };
+        let value = if layer.trim() == "." {
+            ""
+        } else {
+            layer.trim()
+        };
         if self.text_layer(i).as_deref().unwrap_or("") == value {
             return;
         }
@@ -27,7 +31,10 @@ impl OpenCADStudio {
     pub(super) fn dispatch_text_layer(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         let rest = cmd.strip_prefix("SETVAR ").map(str::trim).unwrap_or(cmd);
         let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        if !name.trim_start_matches(['_', '.']).eq_ignore_ascii_case(NAME) {
+        if !name
+            .trim_start_matches(['_', '.'])
+            .eq_ignore_ascii_case(NAME)
+        {
             return None;
         }
         let value = value.trim();
@@ -48,12 +55,15 @@ impl OpenCADStudio {
                 ])
             {
                 self.command_line
-                    .push_error(crate::t!("Cannot set TEXTLAYER to that value.").as_ref());
+                    .push_rejection(crate::t!("Cannot set TEXTLAYER to that value.").as_ref());
                 let current = self
                     .text_layer(i)
                     .unwrap_or_else(|| crate::tr!("text-layer", "use-current"));
-                self.command_line
-                    .push_output(&crate::tr!("text-layer", "prompt", current = current));
+                self.command_line.push_output(&crate::tr!(
+                    "text-layer",
+                    "prompt",
+                    current = current
+                ));
                 self.pending_setvar = Some(NAME.to_string());
             } else {
                 self.set_text_layer(i, value);
@@ -64,7 +74,7 @@ impl OpenCADStudio {
 
     /// Commit a TEXT or MTEXT the TEXT / MTEXT commands made: on TEXTLAYER
     /// (created when it does not exist yet) when one is set.
-    pub(crate) fn commit_new_text(&mut self, mut entity: codec::EntityType) -> Option<Handle> {
+    pub(crate) fn commit_new_text(&mut self, mut entity: document::EntityType) -> Option<Handle> {
         let i = self.active_tab;
         match self.text_layer(i) {
             Some(layer) => {

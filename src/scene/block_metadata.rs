@@ -1,7 +1,7 @@
 //! Definition-level annotation metadata shared by block creation and editing.
 
-use codec::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
-use codec::{Document, EntityType, Handle};
+use document::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
+use document::{Document, EntityType, Handle};
 
 fn flag(data: Option<&ExtendedData>, app: &str) -> Option<bool> {
     data?
@@ -12,11 +12,12 @@ fn flag(data: Option<&ExtendedData>, app: &str) -> Option<bool> {
             XDataValue::Integer16(value) => Some(*value != 0),
             _ => None,
         })
-        .last()
+        .next_back()
 }
 
 fn link(data: Option<&ExtendedData>) -> Option<(String, String)> {
-    let link = super::hyperlink::Link::from_values(&data?.get_record(super::hyperlink::APP)?.values)?;
+    let link =
+        super::hyperlink::Link::from_values(&data?.get_record(super::hyperlink::APP)?.values)?;
     Some((link.url.trim().to_string(), link.text.trim().to_string()))
 }
 
@@ -35,9 +36,9 @@ pub(crate) fn hyperlink(document: &Document, name: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
-fn ensure_application(document: &mut Document, app: &str) {
+pub(crate) fn ensure_application(document: &mut Document, app: &str) {
     if !document.app_ids.contains(app) {
-        let mut entry = codec::tables::AppId::new(app);
+        let mut entry = document::tables::AppId::new(app);
         entry.handle = document.allocate_handle();
         document
             .app_ids
@@ -67,7 +68,11 @@ pub(crate) fn set_hyperlink(
         let link = super::hyperlink::Link {
             url,
             text: description.trim().into(),
-            location: if location.is_empty() { current.location.clone() } else { location },
+            location: if location.is_empty() {
+                current.location.clone()
+            } else {
+                location
+            },
             ..current
         };
         let mut record = ExtendedDataRecord::new("PE_URL");

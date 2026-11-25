@@ -3,7 +3,7 @@
 //! address is stored. Used by HYPERLINK, the Properties Hyperlink row and
 //! the block definition windows.
 
-use iced::widget::{button, column, container, row, scrollable, svg, text, text_input, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -73,13 +73,9 @@ pub fn resolved_path(address: &str, base: &str) -> String {
 }
 
 fn icon<'a>(bytes: &'static [u8], size: f32) -> Element<'a, Message> {
-    svg(crate::ui::icons::themed_handle(bytes))
-        .width(size)
-        .height(size)
-        .style(|theme: &Theme, _| svg::Style {
-            color: Some(theme.palette().primary.base.color),
-        })
-        .into()
+    crate::ui::icons::tinted(bytes, size, |theme: &Theme| {
+        theme.palette().primary.base.color
+    })
 }
 
 /// File or web page / view of this drawing, as joined buttons.
@@ -93,8 +89,16 @@ fn target_switch<'a>(view_target: bool) -> Element<'a, Message> {
     };
     container(
         row![
-            part(crate::tr!("hyperlink-dialog", "target-file"), !view_target, false),
-            part(crate::tr!("hyperlink-dialog", "target-view"), view_target, true),
+            part(
+                crate::tr!("hyperlink-dialog", "target-file"),
+                !view_target,
+                false
+            ),
+            part(
+                crate::tr!("hyperlink-dialog", "target-view"),
+                view_target,
+                true
+            ),
         ]
         .spacing(2),
     )
@@ -146,9 +150,13 @@ fn file_card<'a>(address: &'a str, options: &'a HyperlinkOptions) -> Element<'a,
             .into()
     };
     let mut rows = column![
-        row![label(crate::tr!("hyperlink-dialog", "address")), input, browse]
-            .spacing(6)
-            .align_y(iced::Center),
+        row![
+            label(crate::tr!("hyperlink-dialog", "address")),
+            input,
+            browse
+        ]
+        .spacing(6)
+        .align_y(iced::Center),
         row![
             label(crate::tr!("hyperlink-dialog", "path")),
             text(path).size(11).style(muted_style).width(Fill)
@@ -199,12 +207,20 @@ fn counts<'a>(options: &HyperlinkOptions) -> Element<'a, Message> {
     let selected = if options.selected == 1 {
         crate::tr!("hyperlink-dialog", "selected-one")
     } else {
-        format!("{} {}", options.selected, crate::tr!("hyperlink-dialog", "selected-many"))
+        format!(
+            "{} {}",
+            options.selected,
+            crate::tr!("hyperlink-dialog", "selected-many")
+        )
     };
     let linked = if options.with_links == 1 {
         crate::tr!("hyperlink-dialog", "linked-one")
     } else {
-        format!("{} {}", options.with_links, crate::tr!("hyperlink-dialog", "linked-many"))
+        format!(
+            "{} {}",
+            options.with_links,
+            crate::tr!("hyperlink-dialog", "linked-many")
+        )
     };
     row![
         text(selected).size(11).style(muted_style),
@@ -243,9 +259,11 @@ pub fn view<'a>(
     .spacing(10);
     if mixed {
         body = body.push(
-            text(crate::t!("Selected objects have different hyperlink values."))
-                .size(11)
-                .style(muted_style),
+            text(crate::t!(
+                "Selected objects have different hyperlink values."
+            ))
+            .size(11)
+            .style(muted_style),
         );
     }
     if options.selected > 0 {

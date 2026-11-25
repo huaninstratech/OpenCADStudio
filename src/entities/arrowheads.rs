@@ -6,9 +6,9 @@
 //! standard names itself; the block still needs its geometry so other
 //! programs draw the same arrow. It is created the first time it is picked.
 
-use codec::entities::{Circle, Line, LwPolyline, LwVertex, Solid};
-use codec::types::{Color, LineWeight, Vector3};
-use codec::{Document, EntityType, Handle};
+use document::entities::{Arc, Circle, Line, LwPolyline, LwVertex, Solid};
+use document::types::{Color, LineWeight, Vector3};
+use document::{Document, EntityType, Handle};
 
 /// Name shown, block name (empty: closed filled, the null handle).
 pub(crate) const STANDARD: &[(&str, &str)] = &[
@@ -26,10 +26,11 @@ pub(crate) const STANDARD: &[(&str, &str)] = &[
     ("Dot small", "_DotSmall"),
     ("Dot blank", "_DotBlank"),
     ("Dot small blank", "_Small"),
-    ("Box blank", "_BoxBlank"),
+    ("Box", "_BoxBlank"),
     ("Box filled", "_BoxFilled"),
     ("Datum triangle", "_DatumBlank"),
     ("Datum triangle filled", "_DatumFilled"),
+    ("Integral", "_Integral"),
     ("None", "_None"),
 ];
 
@@ -212,14 +213,35 @@ fn standard_geometry(name: &str) -> Option<Vec<EntityType>> {
             line(0.0, -d, 0.0, d),
         ],
         "_DatumFilled" => vec![solid([[0.0, d], [-1.0, 0.0], [0.0, -d], [0.0, -d]])],
+        // Two shallow arcs meeting at the tip, the integral sign laid on
+        // its side.
+        "_Integral" => {
+            let arc = |cx: f64, cy: f64, start: f64, end: f64| {
+                EntityType::Arc(Arc::from_center_radius_angles(
+                    Vector3::new(cx, cy, 0.0),
+                    0.45416667,
+                    start,
+                    end,
+                ))
+            };
+            vec![
+                arc(0.44488802, -0.09133463, 1.780235837, 2.932153143),
+                arc(-0.44488802, 0.09133463, 4.921828491, 6.073745797),
+            ]
+        }
         "_None" => Vec::new(),
         _ => return None,
     };
-    // Arrowheads take the dimension's colour and lineweight.
+    // Arrowheads take the dimension's colour and linetype; lines, arcs and
+    // circles also its lineweight (polylines and solids keep the layer's).
     for entity in &mut entities {
+        let own_weight = matches!(entity, EntityType::LwPolyline(_) | EntityType::Solid(_));
         let common = entity.common_mut();
         common.color = Color::ByBlock;
-        common.line_weight = LineWeight::ByBlock;
+        common.linetype = "ByBlock".to_string();
+        if !own_weight {
+            common.line_weight = LineWeight::ByBlock;
+        }
     }
     Some(entities)
 }

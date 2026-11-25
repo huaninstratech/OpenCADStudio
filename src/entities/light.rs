@@ -1,7 +1,7 @@
 //! Light entity display glyph (point / spot / distant).
 //!
 //! Lights are nonprint helper entities: the DWG reader decodes the source
-//! position and aim point (see `opencadcodec`'s `Light`); here we synthesize a
+//! position and aim point (see `document`'s `Light`); here we synthesize a
 //! wireframe glyph so the light is visible and selectable in the editor, the
 //! same way AutoCAD shows a light symbol.
 //!
@@ -10,14 +10,14 @@
 //! no world-per-pixel factor is available (e.g. snapshot tessellation).
 
 use crate::t;
-use codec::entities::Light;
-use codec::EntityType;
+use document::entities::Light;
+use document::EntityType;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_angle_prop, edit_prop as edit, ro_prop, square_grip,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -190,7 +190,7 @@ fn build(l: &Light, r: f64) -> RenderEntity {
 /// available (the caller then falls back to the fixed-world [`to_render`]).
 pub fn relative_render(
     entity: &EntityType,
-    _document: &codec::Document,
+    _document: &document::Document,
     wpp: Option<f32>,
 ) -> Option<RenderEntity> {
     let EntityType::Light(l) = entity else {
@@ -201,7 +201,7 @@ pub fn relative_render(
 }
 
 impl RenderConvertible for Light {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(build(self, FIXED_WORLD))
     }
 }
@@ -221,17 +221,17 @@ impl Grippable for Light {
         match (grip_id, apply) {
             // Grip 0 — light source: moves the whole light (aim preserved).
             (0, GripApply::Translate(d)) => {
-                self.position.x += d.x as f64;
-                self.position.y += d.y as f64;
-                self.position.z += d.z as f64;
-                self.target.x += d.x as f64;
-                self.target.y += d.y as f64;
-                self.target.z += d.z as f64;
+                self.position.x += d.x;
+                self.position.y += d.y;
+                self.position.z += d.z;
+                self.target.x += d.x;
+                self.target.y += d.y;
+                self.target.z += d.z;
             }
             (0, GripApply::Absolute(p)) => {
-                let dx = p.x as f64 - self.position.x;
-                let dy = p.y as f64 - self.position.y;
-                let dz = p.z as f64 - self.position.z;
+                let dx = p.x - self.position.x;
+                let dy = p.y - self.position.y;
+                let dz = p.z - self.position.z;
                 self.position.x += dx;
                 self.position.y += dy;
                 self.position.z += dz;
@@ -241,14 +241,14 @@ impl Grippable for Light {
             }
             // Grip 1 — spot target: re-aims the light.
             (1, GripApply::Translate(d)) => {
-                self.target.x += d.x as f64;
-                self.target.y += d.y as f64;
-                self.target.z += d.z as f64;
+                self.target.x += d.x;
+                self.target.y += d.y;
+                self.target.z += d.z;
             }
             (1, GripApply::Absolute(p)) => {
-                self.target.x = p.x as f64;
-                self.target.y = p.y as f64;
-                self.target.z = p.z as f64;
+                self.target.x = p.x;
+                self.target.y = p.y;
+                self.target.z = p.z;
             }
             _ => {}
         }

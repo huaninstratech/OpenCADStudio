@@ -1,5 +1,5 @@
 use crate::t;
-use codec::{EntityType, Handle, Transparency};
+use document::{EntityType, Handle, Transparency};
 
 use crate::scene::model::object::{PropSection, PropValue, Property};
 
@@ -34,7 +34,7 @@ pub fn general_section(entity: &EntityType) -> PropSection {
         .map(|link| link.label())
         .unwrap_or_default();
 
-    let section = PropSection {
+    PropSection {
         title: t!("General").into_owned(),
         props: vec![
             Property {
@@ -90,9 +90,7 @@ pub fn general_section(entity: &EntityType) -> PropSection {
                 value: PropValue::Hyperlink(hyperlink),
             },
         ],
-    };
-
-    section
+    }
 }
 
 /// The "3D Visualization" group (Material), common to every graphical object.
@@ -118,7 +116,7 @@ pub fn visualization_section(entity: &EntityType) -> Option<PropSection> {
     ) || matches!(
         entity,
         EntityType::Extended(extended)
-            if matches!(extended.data, codec::entities::ExtendedEntityData::PointCloudEx(_))
+            if matches!(extended.data, document::entities::ExtendedEntityData::PointCloudEx(_))
     ) {
         return None;
     }

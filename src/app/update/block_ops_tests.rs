@@ -19,14 +19,14 @@
 //! shared outcome.
 
 use crate::app::OpenCADStudio;
-use codec::entities::{
+use document::entities::{
     Block as BlockEntity, BlockEnd, Dimension, DimensionAligned, Insert, LeaderContentType, Line,
     MultiLeader,
 };
-use codec::objects::Dictionary;
-use codec::tables::{BlockRecord, DimStyle};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::objects::Dictionary;
+use document::tables::{BlockRecord, DimStyle};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 
 fn app() -> OpenCADStudio {
     let mut app = OpenCADStudio::new_for_test();
@@ -322,14 +322,14 @@ fn attach_dynamic_block(app: &mut OpenCADStudio, record: &str) -> (Handle, Handl
     dictionary.owner = record_handle;
     dictionary.add_entry("ACAD_ENHANCEDBLOCK", variants);
     doc.objects
-        .insert(xdict, codec::objects::ObjectType::Dictionary(dictionary));
+        .insert(xdict, document::objects::ObjectType::Dictionary(dictionary));
     let mut variants_dictionary = Dictionary::new();
     variants_dictionary.handle = variants;
     variants_dictionary.owner = xdict;
     variants_dictionary.add_entry("VisibilityState1", variant_handle);
     doc.objects.insert(
         variants,
-        codec::objects::ObjectType::Dictionary(variants_dictionary),
+        document::objects::ObjectType::Dictionary(variants_dictionary),
     );
     (record_handle, variant_handle)
 }
@@ -1287,7 +1287,10 @@ fn control_entities_create_lands_in_the_definition_open_in_the_editor() {
         .as_ref()
         .map(|h| h.main.undo_stack.len())
         .unwrap_or(app.tabs[i].history.undo_stack.len());
-    assert_eq!(main_depth_after, main_depth, "no drawing undo entry may be pushed");
+    assert_eq!(
+        main_depth_after, main_depth,
+        "no drawing undo entry may be pushed"
+    );
     let _ = app.dispatch_command("BEDIT_DISCARD");
     assert!(
         app.tabs[i].scene.document.get_entity(created).is_none(),
@@ -1311,7 +1314,11 @@ fn control_entities_create_refuses_nesting_the_open_definition_inside_itself() {
     );
     assert_eq!(response["ok"], false, "{response}");
     assert_eq!(response["code"], "block_cycle", "{response}");
-    assert_eq!(entity_count(&app), depth, "nothing from the batch may be added");
+    assert_eq!(
+        entity_count(&app),
+        depth,
+        "nothing from the batch may be added"
+    );
     let _ = app.dispatch_command("BEDIT_DISCARD");
 }
 
@@ -1339,7 +1346,10 @@ fn definition_children_are_selectable_while_their_editor_is_open() {
             Vector3::ZERO,
             vec![
                 line([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
-                EntityType::Insert(Insert::new("BO_CLOSED".to_string(), Vector3::new(2.0, 0.0, 0.0))),
+                EntityType::Insert(Insert::new(
+                    "BO_CLOSED".to_string(),
+                    Vector3::new(2.0, 0.0, 0.0),
+                )),
             ],
         );
     }
@@ -1370,7 +1380,9 @@ fn definition_children_are_selectable_while_their_editor_is_open() {
     let grips = control_request(&mut app, json!({"op":"grips"}));
     assert_eq!(grips["ok"], true, "{grips}");
     assert!(
-        grips["grips"].as_array().is_some_and(|grips| !grips.is_empty()),
+        grips["grips"]
+            .as_array()
+            .is_some_and(|grips| !grips.is_empty()),
         "the selected definition child must enumerate its grips: {grips}"
     );
 
@@ -1422,7 +1434,7 @@ fn locked_purge_removes_an_unreferenced_block_and_undo_restores_it() {
 
 #[test]
 fn locked_purge_keeps_unresolved_xref_dependent_symbols() {
-    use codec::tables::{Layer, LineType, TextStyle};
+    use document::tables::{Layer, LineType, TextStyle};
     let mut app = app();
     let i = tab(&app);
     let doc = &mut app.tabs[i].scene.document;
@@ -1448,8 +1460,8 @@ fn locked_purge_keeps_unresolved_xref_dependent_symbols() {
 
 #[test]
 fn purge_keeps_symbols_used_only_by_an_inserted_attribute() {
-    use codec::entities::AttributeEntity;
-    use codec::tables::{Layer, LineType, TextStyle};
+    use document::entities::AttributeEntity;
+    use document::tables::{Layer, LineType, TextStyle};
     let mut app = app();
     let i = tab(&app);
     {
@@ -1468,14 +1480,23 @@ fn purge_keeps_symbols_used_only_by_an_inserted_attribute() {
     app.tabs[i].scene.add_entity(EntityType::Insert(insert));
     let _ = app.dispatch_command("PURGE ALL");
     let doc = &app.tabs[i].scene.document;
-    assert!(doc.layers.get("TITLE").is_some(), "purged the attribute's layer");
-    assert!(doc.line_types.get("TITLE_DASH").is_some(), "purged the attribute's linetype");
-    assert!(doc.text_styles.get("TITLE_TEXT").is_some(), "purged the attribute's text style");
+    assert!(
+        doc.layers.get("TITLE").is_some(),
+        "purged the attribute's layer"
+    );
+    assert!(
+        doc.line_types.get("TITLE_DASH").is_some(),
+        "purged the attribute's linetype"
+    );
+    assert!(
+        doc.text_styles.get("TITLE_TEXT").is_some(),
+        "purged the attribute's text style"
+    );
 }
 
 #[test]
 fn purge_keeps_the_current_layer_and_dimstyle_linetypes() {
-    use codec::tables::{Layer, LineType};
+    use document::tables::{Layer, LineType};
     let mut app = app();
     let i = tab(&app);
     {
@@ -1491,17 +1512,25 @@ fn purge_keeps_the_current_layer_and_dimstyle_linetypes() {
         doc.dim_styles.add(style).unwrap();
         doc.layers.add(Layer::new("Unused")).unwrap();
     }
-    let _ = app.dispatch_command("PURGE ALL");
+    // ALL would purge the unused dimstyle first and its linetype with it.
+    let _ = app.dispatch_command("PURGE LAYERS");
+    let _ = app.dispatch_command("PURGE LINETYPES");
     let doc = &app.tabs[i].scene.document;
     assert!(doc.layers.get("WORK").is_some(), "purged the current layer");
-    assert!(doc.line_types.get("DIM_DASH").is_some(), "purged a dimstyle's linetype");
-    assert!(doc.layers.get("Unused").is_none(), "a plain unused layer still purges");
+    assert!(
+        doc.line_types.get("DIM_DASH").is_some(),
+        "purged a dimstyle's linetype"
+    );
+    assert!(
+        doc.layers.get("Unused").is_none(),
+        "a plain unused layer still purges"
+    );
 }
 
 #[test]
 fn purge_keeps_text_styles_used_only_by_leader_and_table_styles() {
-    use codec::objects::{MultiLeaderStyle, ObjectType, TableStyle};
-    use codec::tables::TextStyle;
+    use document::objects::{MultiLeaderStyle, ObjectType, TableStyle};
+    use document::tables::TextStyle;
     let mut app = app();
     let i = tab(&app);
     {
@@ -1515,19 +1544,31 @@ fn purge_keeps_text_styles_used_only_by_leader_and_table_styles() {
         let mut leader_style = MultiLeaderStyle::new("BO_LEADER");
         leader_style.handle = doc.allocate_handle();
         leader_style.text_style_handle = Some(leader_text_handle);
-        doc.objects
-            .insert(leader_style.handle, ObjectType::MultiLeaderStyle(leader_style));
+        doc.objects.insert(
+            leader_style.handle,
+            ObjectType::MultiLeaderStyle(leader_style),
+        );
         let mut table_style = TableStyle::new("BO_TABLE");
         table_style.handle = doc.allocate_handle();
         table_style.data_row_style.text_style_name = "TABLE_TEXT".to_string();
         doc.objects
             .insert(table_style.handle, ObjectType::TableStyle(table_style));
     }
-    let _ = app.dispatch_command("PURGE ALL");
+    // ALL would purge the unused styles first and their text styles with them.
+    let _ = app.dispatch_command("PURGE STYLES");
     let doc = &app.tabs[i].scene.document;
-    assert!(doc.text_styles.get("LEADER_TEXT").is_some(), "purged a multileader style's text style");
-    assert!(doc.text_styles.get("TABLE_TEXT").is_some(), "purged a table style's text style");
-    assert!(doc.text_styles.get("UNUSED_TEXT").is_none(), "a plain unused text style still purges");
+    assert!(
+        doc.text_styles.get("LEADER_TEXT").is_some(),
+        "purged a multileader style's text style"
+    );
+    assert!(
+        doc.text_styles.get("TABLE_TEXT").is_some(),
+        "purged a table style's text style"
+    );
+    assert!(
+        doc.text_styles.get("UNUSED_TEXT").is_none(),
+        "a plain unused text style still purges"
+    );
 }
 
 #[test]
@@ -1632,8 +1673,8 @@ fn locked_purge_skips_a_block_with_an_open_bedit_session() {
 #[test]
 fn locked_attedit_attribute_flags_cases() {
     use crate::ui::window::attribute_editor::AttrRow;
-    use codec::entities::{AttributeDefinition, AttributeEntity};
-    use codec::tables::BlockRecord;
+    use document::entities::{AttributeDefinition, AttributeEntity};
+    use document::tables::BlockRecord;
 
     // Verify flag behavior in ATTEDIT conversion and apply:
     // 1. Normal attribute: editable, modifies value
@@ -1648,15 +1689,21 @@ fn locked_attedit_attribute_flags_cases() {
         rotation: "0".to_string(),
         width_factor: "1".to_string(),
         oblique: "0".to_string(),
-        h_align: codec::entities::HorizontalAlignment::Left,
-        v_align: codec::entities::VerticalAlignment::Baseline,
+        h_align: document::entities::HorizontalAlignment::Left,
+        v_align: document::entities::VerticalAlignment::Baseline,
         backwards: false,
         upside_down: false,
         layer: "0".to_string(),
-        color: codec::types::Color::ByLayer,
+        color: document::types::Color::ByLayer,
         linetype: "ByLayer".to_string(),
-        line_weight: codec::types::LineWeight::ByLayer,
+        line_weight: document::types::LineWeight::ByLayer,
         is_constant: false,
+        index: 0,
+        multiline: false,
+        boundary_width: "0".to_string(),
+        annotative: false,
+        field: None,
+        field_changed: false,
     };
     assert!(!normal_row.is_constant);
 
@@ -1688,7 +1735,7 @@ fn locked_attedit_attribute_flags_cases() {
     preset_row.is_constant = false;
 
     // Verify metadata mapping from Document
-    let mut doc = codec::Document::new();
+    let mut doc = document::Document::new();
     let next = doc.next_handle();
     let br_h = Handle::new(next);
     let mut br = BlockRecord::new("FLAG_BLOCK");
@@ -1878,7 +1925,11 @@ fn state_names_the_definition_open_in_the_editor() {
     assert_eq!(app.control_state()["block_editor"], json!(null));
     begin_bedit(&mut app, insert);
     let state = app.control_state();
-    assert_eq!(state["block_editor"]["name"], json!("BEDIT_STATE"), "{state}");
+    assert_eq!(
+        state["block_editor"]["name"],
+        json!("BEDIT_STATE"),
+        "{state}"
+    );
     assert_eq!(
         state["block_editor"]["handle"],
         json!(format!("{:X}", record_handle(&app, "BEDIT_STATE").value())),

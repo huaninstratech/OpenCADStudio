@@ -27,7 +27,7 @@ pub(super) fn setvar_listing() -> String {
 }
 
 /// EXPLMODE of the drawing (default 1).
-pub(crate) fn explmode(document: &codec::Document) -> i16 {
+pub(crate) fn explmode(document: &document::Document) -> i16 {
     crate::io::drawing_variable(document, "EXPLMODE")
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(1)
@@ -78,7 +78,9 @@ impl OpenCADStudio {
                         }
                     }
                     None => {
-                        self.command_line.push_output(&crate::ui::command_line::value_prompt_or_none(&name, &current));
+                        self.command_line.push_output(
+                            &crate::ui::command_line::value_prompt_or_none(&name, &current),
+                        );
                         self.pending_setvar = Some(name);
                     }
                 }
@@ -100,11 +102,12 @@ impl OpenCADStudio {
                     None => ask(self, name),
                     Some(v) => match v.parse::<i32>() {
                         Err(_) => {
-                            self.command_line.push_error("Requires an integer value.");
+                            self.command_line
+                                .push_rejection("Requires an integer value.");
                             ask(self, name);
                         }
                         Ok(n) if !(0..=max).contains(&n) => {
-                            self.command_line.push_error(&if max == 1 {
+                            self.command_line.push_rejection(&if max == 1 {
                                 "Requires 0 or 1 only.".to_string()
                             } else {
                                 format!("Requires an integer between 0 and {max}.")

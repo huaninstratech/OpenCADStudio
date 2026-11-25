@@ -5,7 +5,7 @@
 
 use super::mtext_editor::{MTextEditorState, ValueOrigin};
 use super::*;
-use codec::tables::TextStyle;
+use document::tables::TextStyle;
 use glam::DVec3;
 
 /// A drawing whose current style "Notes" has a fixed height of 2.5, width
@@ -14,7 +14,7 @@ use glam::DVec3;
 fn editing(raw: &str, height: f64) -> OpenCADStudio {
     let mut app = OpenCADStudio::new_for_test();
     app.tabs
-        .push(crate::app::document::DocumentTab::new_drawing(1));
+        .push(crate::app::tab_document::DocumentTab::new_drawing(1));
     app.active_tab = 1;
     let doc = &mut app.tabs[1].scene.document;
     let mut notes = TextStyle::new("Notes");
@@ -28,6 +28,7 @@ fn editing(raw: &str, height: f64) -> OpenCADStudio {
     tall.handle = doc.allocate_handle();
     doc.text_styles.add(tall).unwrap();
     doc.header.current_text_style_name = "Notes".to_string();
+    app.tabs[1].scene.selection.borrow_mut().view.vp_size = (1280.0, 650.0);
     app.open_mtext_editor(DVec3::ZERO, None, raw, height, None);
     app
 }
@@ -101,6 +102,10 @@ fn typing_the_style_oblique_writes_no_code_and_zero_writes_one() {
 fn a_new_style_brings_its_height_and_oblique_to_the_fields_that_follow() {
     let mut app = editing("Text", 2.5);
     let _ = app.update(Message::MTextStyle("Tall".to_string()));
+    // With nothing selected the style change is asked about first.
+    let _ = app.update(Message::MTextDialog(
+        crate::ui::window::mtext_dialogs::MTextDialogMsg::StyleYes,
+    ));
     let shown = ed(&app);
     assert_eq!(
         (shown.height.as_str(), shown.oblique.as_str()),
@@ -126,6 +131,7 @@ fn a_right_click_on_a_custom_field_offers_reset_to_style() {
     );
     let caption = crate::t!("Oblique").into_owned();
     let bounds = ui.find(caption).unwrap().visible_bounds().unwrap();
+    assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
     ui.point_at(bounds.center());
     ui.simulate([
         iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Right)),

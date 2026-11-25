@@ -1,4 +1,4 @@
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
@@ -8,6 +8,12 @@ use crate::t;
 pub struct ConcentricConstraintCommand {
     first: Option<ParametricRef>,
     picked_entity: Option<EntityType>,
+}
+
+impl Default for ConcentricConstraintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConcentricConstraintCommand {
@@ -59,8 +65,8 @@ impl ConcentricConstraintCommand {
                 let planar = crate::entities::curve::entity_curve(entity)?;
                 let local = planar.plane.project(point.to_array())?;
                 let segments = planar.curve.segments();
-                let (index, _) = kernel::geom2d::nearest_of(segments.iter(), local)?;
-                matches!(segments.get(index), Some(kernel::geom2d::Curve::Arc(_)))
+                let (index, _) = ocs_geom::geom2d::nearest_of(segments.iter(), local)?;
+                matches!(segments.get(index), Some(ocs_geom::geom2d::Curve::Arc(_)))
                     .then(|| ParametricRef::segment_center(handle, index))
             }
             _ => None,
@@ -168,11 +174,11 @@ mod tests {
     #[test]
     fn polyline_pick_keeps_the_selected_arc_center() {
         let handle = Handle::new(13);
-        let mut polyline = codec::entities::LwPolyline::new();
+        let mut polyline = document::entities::LwPolyline::new();
         polyline.vertices = vec![
-            codec::entities::LwVertex::from_coords(0.0, 0.0),
-            codec::entities::LwVertex::with_bulge(codec::types::Vector2::new(5.0, 0.0), 1.0),
-            codec::entities::LwVertex::from_coords(10.0, 0.0),
+            document::entities::LwVertex::from_coords(0.0, 0.0),
+            document::entities::LwVertex::with_bulge(document::types::Vector2::new(5.0, 0.0), 1.0),
+            document::entities::LwVertex::from_coords(10.0, 0.0),
         ];
 
         let reference = ConcentricConstraintCommand::picked_reference(

@@ -17,7 +17,7 @@ pub struct PdfLayer {
     pub name: String,
     /// Shown by the file's default configuration.
     pub on_by_default: bool,
-    object: (i32, i32),
+    object: (u32, i32),
 }
 
 /// A PDF text string: UTF-16 with a byte-order mark (big-endian per the
@@ -64,7 +64,7 @@ pub fn layers(path: &str) -> Vec<PdfLayer> {
         return Vec::new();
     };
     let config = props.get::<Dict<'_>>(b"D").unwrap_or_default();
-    let ids = |key: &[u8]| -> Vec<(i32, i32)> {
+    let ids = |key: &[u8]| -> Vec<(u32, i32)> {
         config
             .get::<Array<'_>>(key)
             .map(|a| {
@@ -114,10 +114,7 @@ pub fn source_with_layers(path: &str, hidden: &[String]) -> String {
     if all.is_empty() {
         return path.to_string();
     }
-    let off: Vec<&PdfLayer> = all
-        .iter()
-        .filter(|l| hidden.iter().any(|h| *h == l.name))
-        .collect();
+    let off: Vec<&PdfLayer> = all.iter().filter(|l| hidden.contains(&l.name)).collect();
     if off.is_empty() && all.iter().all(|l| l.on_by_default) {
         return path.to_string();
     }
@@ -264,7 +261,7 @@ pub const LAYER_OVERRIDE_APP: &str = "AdeskUnderlayLayerOverrideData";
 /// The first string of a DGN underlay's layer overrides, before the names.
 pub const DGN_OVERRIDE_PLACEHOLDER: &str = "???DGN_Placeholder???";
 
-pub fn hidden_layers(u: &codec::entities::Underlay) -> Vec<String> {
+pub fn hidden_layers(u: &document::entities::Underlay) -> Vec<String> {
     u.common
         .extended_data
         .records()
@@ -272,14 +269,16 @@ pub fn hidden_layers(u: &codec::entities::Underlay) -> Vec<String> {
         .filter(|r| r.application_name.eq_ignore_ascii_case(LAYER_OVERRIDE_APP))
         .flat_map(|r| r.values.iter())
         .filter_map(|v| match v {
-            codec::xdata::XDataValue::String(s) if s != DGN_OVERRIDE_PLACEHOLDER => Some(s.clone()),
+            document::xdata::XDataValue::String(s) if s != DGN_OVERRIDE_PLACEHOLDER => {
+                Some(s.clone())
+            }
             _ => None,
         })
         .collect()
 }
 
 /// The source an underlay's page is read from, with its layer overrides.
-pub fn underlay_source(u: &codec::entities::Underlay, file_path: &str) -> String {
+pub fn underlay_source(u: &document::entities::Underlay, file_path: &str) -> String {
     let hidden = hidden_layers(u);
     if hidden.is_empty() {
         return file_path.to_string();

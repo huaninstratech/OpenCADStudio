@@ -4,7 +4,7 @@ use super::*;
 impl Scene {
     // ── Group helpers ──────────────────────────────────────────────────────
 
-    pub fn groups(&self) -> impl Iterator<Item = &codec::objects::Group> {
+    pub fn groups(&self) -> impl Iterator<Item = &document::objects::Group> {
         self.document.objects.values().filter_map(|obj| match obj {
             ObjectType::Group(g) => Some(g),
             _ => None,
@@ -22,7 +22,7 @@ impl Scene {
     /// Creates a named group from the given handles and registers it in the group dictionary.
     pub fn create_group(&mut self, name: String, handles: Vec<Handle>) -> Handle {
         let group_dict_handle = self.document.header.acad_group_dict_handle;
-        let mut group = codec::objects::Group::new(&name);
+        let mut group = document::objects::Group::new(&name);
         group.handle = self.document.allocate_handle();
         group.owner = group_dict_handle;
         group.add_entities(handles);
@@ -39,7 +39,72 @@ impl Scene {
         {
             dict.add_entry(&name, gh);
         }
+        self.bump_groups_epoch();
         gh
+    }
+
+    /// Rename a group by its current name. The group dictionary keeps one
+    /// entry per group, keyed by name, so the entry moves with the rename.
+    pub fn rename_group_named(&mut self, old_name: &str, new_name: &str) -> bool {
+        let Some(group) = self
+            .groups()
+            .find(|g| g.name.eq_ignore_ascii_case(old_name))
+        else {
+            return false;
+        };
+        let handle = group.handle;
+        let mut updated = group.clone();
+        updated.name = new_name.to_string();
+        self.document
+            .objects
+            .insert(handle, ObjectType::Group(updated));
+        let dict_handle = self.document.header.acad_group_dict_handle;
+        if let Some(ObjectType::Dictionary(dict)) = self.document.objects.get_mut(&dict_handle) {
+            if dict.remove(old_name).is_some() {
+                dict.insert(new_name, handle);
+            }
+        }
+        true
+    }
+
+    /// Add one entity to the group called `group_name`.
+    pub fn add_entity_to_group_named(&mut self, group_name: &str, handle: Handle) -> bool {
+        let Some(group) = self
+            .groups()
+            .find(|g| g.name.eq_ignore_ascii_case(group_name))
+        else {
+            return false;
+        };
+        let mut updated = group.clone();
+        updated.add_entity(handle);
+        let group_handle = updated.handle;
+        self.set_group_member_reactors(group_handle, &updated.entities, true);
+        self.document
+            .objects
+            .insert(group_handle, ObjectType::Group(updated));
+        self.bump_groups_epoch();
+        true
+    }
+
+    /// Remove one entity from the group called `group_name`.
+    pub fn remove_entity_from_group_named(&mut self, group_name: &str, handle: Handle) -> bool {
+        let Some(group) = self
+            .groups()
+            .find(|g| g.name.eq_ignore_ascii_case(group_name))
+        else {
+            return false;
+        };
+        let mut updated = group.clone();
+        if !updated.remove_entity(handle) {
+            return false;
+        }
+        let group_handle = updated.handle;
+        self.set_group_member_reactors(group_handle, &updated.entities, false);
+        self.document
+            .objects
+            .insert(group_handle, ObjectType::Group(updated));
+        self.bump_groups_epoch();
+        true
     }
 
     /// Keep member back-links and their first-touch undo images together.
@@ -114,7 +179,7 @@ impl Scene {
     /// the copy lands in the same drawing or a different file.
     pub fn recreate_groups(
         &mut self,
-        sources: Vec<codec::objects::Group>,
+        sources: Vec<document::objects::Group>,
         handle_map: &rustc_hash::FxHashMap<Handle, Handle>,
     ) -> usize {
         let group_dict_handle = self.document.header.acad_group_dict_handle;
@@ -152,6 +217,9 @@ impl Scene {
                 dict.add_entry(&name, gh);
             }
             copied += 1;
+        }
+        if copied > 0 {
+            self.bump_groups_epoch();
         }
         copied
     }
@@ -215,6 +283,9 @@ impl Scene {
             }
             self.document.objects.remove(gh);
         }
+        if count > 0 {
+            self.bump_groups_epoch();
+        }
         count
     }
 
@@ -222,20 +293,53 @@ impl Scene {
     /// of them. Selection and rollover highlighting share this expansion so the
     /// preview matches what a click will select.
     /// With PICKSTYLE group selection off a pick takes the object alone.
+    ///
+    /// Reads the lazily built selectable-group snapshot instead of scanning all
+    /// document objects: this runs on every pointer move, box-preview tick and
+    /// rendered frame, so an O(all objects) sweep per call showed up directly
+    /// in rollover / marquee latency on large drawings.
     pub fn handles_expanded_for_selectable_groups(&self, handles: &[Handle]) -> HashSet<Handle> {
         let mut expanded: HashSet<Handle> = handles.iter().copied().collect();
         if self.document.header.pick_style & 1 == 0 {
             return expanded;
         }
         let wanted: HashSet<Handle> = handles.iter().copied().collect();
-        for obj in self.document.objects.values() {
-            if let ObjectType::Group(g) = obj {
-                if g.selectable && g.entities.iter().any(|e| wanted.contains(e)) {
-                    expanded.extend(g.entities.iter().copied());
-                }
+        for (_, members) in self.selectable_group_snapshot().iter() {
+            if members.iter().any(|e| wanted.contains(e)) {
+                expanded.extend(members.iter().copied());
             }
         }
         expanded
+    }
+
+    /// Every selectable group's member list, snapshotted per
+    /// `(groups_epoch, PICKSTYLE group bit)`. Rebuilt (one O(all objects)
+    /// sweep) only after a group edit / undo / redo invalidates the epoch.
+    fn selectable_group_snapshot(
+        &self,
+    ) -> std::sync::Arc<Vec<(Handle, std::sync::Arc<Vec<Handle>>)>> {
+        let epoch = self.groups_epoch;
+        let group_select = self.document.header.pick_style & 1 != 0;
+        let mut snapshot = self.groups_snapshot.borrow_mut();
+        if let Some((cached_epoch, cached_group_select, groups)) = snapshot.as_ref() {
+            if *cached_epoch == epoch && *cached_group_select == group_select {
+                return std::sync::Arc::clone(groups);
+            }
+        }
+        let groups: Vec<(Handle, std::sync::Arc<Vec<Handle>>)> = self
+            .document
+            .objects
+            .values()
+            .filter_map(|obj| match obj {
+                ObjectType::Group(g) if g.selectable && !g.entities.is_empty() => {
+                    Some((g.handle, std::sync::Arc::new(g.entities.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+        let groups = std::sync::Arc::new(groups);
+        *snapshot = Some((epoch, group_select, std::sync::Arc::clone(&groups)));
+        groups
     }
 
     /// How many selectable groups have a member among `handles`, under
@@ -265,8 +369,13 @@ impl Scene {
             .filter_map(|group| {
                 let mut min = glam::DVec3::splat(f64::INFINITY);
                 let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
-                for entity in group.entities.iter().filter_map(|h| self.document.get_entity(*h)) {
-                    let (a, b) = crate::scene::convert::tess::entity_bounds_in(&self.document, entity);
+                for entity in group
+                    .entities
+                    .iter()
+                    .filter_map(|h| self.document.get_entity(*h))
+                {
+                    let (a, b) =
+                        crate::scene::convert::tess::entity_bounds_in(&self.document, entity);
                     min = min.min(glam::DVec3::from_array(a));
                     max = max.max(glam::DVec3::from_array(b));
                 }
@@ -325,8 +434,8 @@ impl Scene {
 #[cfg(test)]
 mod group_reactor_tests {
     use super::*;
-    use codec::entities::{EntityType, Line};
-    use codec::types::Vector3;
+    use document::entities::{EntityType, Line};
+    use document::types::Vector3;
 
     fn two_lines() -> (Scene, [Handle; 2]) {
         let mut scene = Scene::new();
@@ -462,8 +571,8 @@ mod group_expansion_tests {
 
     #[test]
     fn group_expansion_pulls_in_siblings_and_nothing_else() {
-        use codec::entities::{EntityType, Line};
-        use codec::types::Vector3;
+        use document::entities::{EntityType, Line};
+        use document::types::Vector3;
 
         let mut scene = Scene::new();
         let mut line = |x: f64| {
@@ -506,8 +615,8 @@ mod group_expansion_tests {
     /// each other.
     #[test]
     fn selected_object_units_keep_a_complete_group_together() {
-        use codec::entities::{EntityType, Line};
-        use codec::types::Vector3;
+        use document::entities::{EntityType, Line};
+        use document::types::Vector3;
 
         let mut scene = Scene::new();
         let mut line = |x: f64| {

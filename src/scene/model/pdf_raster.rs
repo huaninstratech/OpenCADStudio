@@ -1,12 +1,15 @@
 //! Cross-platform PDF underlay rasterisation.
 
 use std::collections::HashMap;
+use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::{TRANSPARENT, WHITE};
-use hayro::{RenderCache, RenderSettings};
+use hayro::{PixmapSettings, RenderCache, RenderSettings};
+use lru::LruCache;
 
 /// One rasterised PDF page. `dpi` ties its pixel size to its physical size.
 pub struct PdfPage {
@@ -28,9 +31,91 @@ const MAX_PRINT_RASTER_PIXELS: f64 = 268_435_456.0;
 /// Source path, page, DPI bits and whether the page background is transparent.
 type PageKey = (String, String, u32, bool);
 
-fn page_cache() -> &'static Mutex<HashMap<PageKey, Option<Arc<PdfPage>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PageKey, Option<Arc<PdfPage>>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Per-cache byte budget for the derived rasters (page and adjusted caches
+/// each get one). Every zoom band a page is shown at adds a full-page RGBA
+/// that would otherwise stay resident for the whole process lifetime; past
+/// the budget the least recently used rasters are dropped and re-rasterised
+/// on demand. Tunable with `OCS_PDF_RASTER_CACHE_MB`.
+fn raster_cache_budget_bytes() -> usize {
+    const DEFAULT_MIB: usize = 64;
+    std::env::var("OCS_PDF_RASTER_CACHE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// LRU memo with a byte budget, counted from each entry's reported cost.
+pub(crate) struct BudgetedRasterCache<K: std::hash::Hash + Eq, V> {
+    entries: LruCache<K, (V, usize)>,
+    bytes: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> BudgetedRasterCache<K, V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(4096).expect("nonzero cache capacity")),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn get(&mut self, key: &K) -> Option<V> {
+        self.entries.get(key).map(|(value, _)| value.clone())
+    }
+
+    pub(crate) fn pop(&mut self, key: &K) -> Option<V> {
+        let (value, old_bytes) = self.entries.pop(key)?;
+        self.bytes -= old_bytes;
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V, bytes: usize) {
+        self.insert_with_budget(key, value, bytes, raster_cache_budget_bytes());
+    }
+
+    pub(crate) fn insert_with_budget(&mut self, key: K, value: V, bytes: usize, budget: usize) {
+        if bytes > budget {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.pop(&key) {
+            self.bytes -= old_bytes;
+        }
+        while self.bytes > budget - bytes {
+            let Some((_, (_, old_bytes))) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= old_bytes;
+        }
+        if let Some((_, (_, old_bytes))) = self.entries.push(key, (value, bytes)) {
+            self.bytes -= old_bytes;
+        }
+        self.bytes += bytes;
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        let stale: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| !keep(key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            if let Some((_, old_bytes)) = self.entries.pop(&key) {
+                self.bytes -= old_bytes;
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+fn page_cache() -> &'static Mutex<BudgetedRasterCache<PageKey, Option<Arc<PdfPage>>>> {
+    static CACHE: OnceLock<Mutex<BudgetedRasterCache<PageKey, Option<Arc<PdfPage>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BudgetedRasterCache::new()))
 }
 
 fn source_cache() -> &'static Mutex<HashMap<String, Arc<Vec<u8>>>> {
@@ -60,11 +145,11 @@ pub fn register_source(path: &str, bytes: Arc<Vec<u8>>) {
     page_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .retain(|(cached_path, _, _, _), _| cached_path != path);
+        .retain(|(cached_path, _, _, _)| cached_path != path);
     adjusted_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .retain(|key, _| key.0 != path);
+        .retain(|key| key.0 != path);
 }
 
 /// Register bytes under a derived source name (a layer override of a
@@ -103,6 +188,118 @@ pub fn rasterize_page_display_at(path: &str, page: &str, dpi: f32) -> Option<Arc
 /// The DPI of the full-size display raster.
 pub const DISPLAY_DPI: f32 = RASTER_DPI;
 
+/// The DPI an underlay page is drawn at for a plot.
+pub const PRINT_DPI: f32 = 300.0;
+
+/// The underlay raster for a plot: the display raster's transparent page at
+/// [`PRINT_DPI`]. `None` for a page too large to draw at that DPI.
+pub fn rasterize_page_print(path: &str, page: &str) -> Option<Arc<PdfPage>> {
+    rasterize_cached(path, page, PRINT_DPI, true)
+}
+
+/// Longest side of a zoomed-in region raster, pixels.
+pub const REGION_SIDE: f64 = 4096.0;
+
+/// Part of a page for display at `dpi`: `region` is min x, min y, max x,
+/// max y in page inches from the lower-left corner of the shown page. The
+/// last region is kept, so other entities' reseeds do not draw it again.
+/// `None` for rotated or encrypted pages (they show the whole-page raster).
+pub fn rasterize_page_region(
+    path: &str,
+    page: &str,
+    region: [f64; 4],
+    dpi: f32,
+) -> Option<Arc<PdfPage>> {
+    type RegionKey = (String, String, [u64; 4], u32);
+    static LAST: OnceLock<Mutex<Option<(RegionKey, Option<Arc<PdfPage>>)>>> = OnceLock::new();
+    let key = (
+        path.to_string(),
+        page.to_string(),
+        region.map(f64::to_bits),
+        dpi.to_bits(),
+    );
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    if let Some((k, hit)) = last.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key {
+            return hit.clone();
+        }
+    }
+    let built = region_uncached(path, page, region, dpi);
+    *last.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, built.clone()));
+    built
+}
+
+fn region_uncached(path: &str, page: &str, region: [f64; 4], dpi: f32) -> Option<Arc<PdfPage>> {
+    use hayro::hayro_syntax::page::Rotation;
+    let bytes = source_bytes(path)?;
+    if super::pdf_password::is_encrypted(&bytes) {
+        return None;
+    }
+    let index = page.trim().parse::<usize>().unwrap_or(1).max(1) - 1;
+    let cropped = {
+        let pdf = Pdf::new(bytes.clone()).ok()?;
+        let page = pdf.pages().get(index)?;
+        if !matches!(page.rotation(), Rotation::None) {
+            return None;
+        }
+        let id = page.raw().obj_id()?;
+        let dict = page.raw().data();
+        let close = dict.iter().rposition(|&c| c == b'>')?;
+        if close == 0 || dict[close - 1] != b'>' {
+            return None;
+        }
+        let crop = page.intersected_crop_box();
+        let r = [
+            crop.x0 + region[0] * 72.0,
+            crop.y0 + region[1] * 72.0,
+            crop.x0 + region[2] * 72.0,
+            crop.y0 + region[3] * 72.0,
+        ];
+        if !r.iter().all(|v| v.is_finite()) || r[2] <= r[0] || r[3] <= r[1] {
+            return None;
+        }
+        let prev = last_startxref(&bytes)?;
+        let root = pdf.xref().root_id();
+        // An incremental update giving the page a box around the region; the
+        // last definition of a dictionary key wins, so the old boxes give way.
+        let mut out = bytes.as_ref().clone();
+        out.push(b'\n');
+        let offset = out.len();
+        out.extend_from_slice(format!("{} {} obj\n", id.obj_number, id.gen_number).as_bytes());
+        out.extend_from_slice(&dict[..close - 1]);
+        let boxed = format!("[{} {} {} {}]", r[0], r[1], r[2], r[3]);
+        out.extend_from_slice(format!(" /MediaBox {boxed} /CropBox {boxed} >>\nendobj\n").as_bytes());
+        let xref = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n{} 1\n{offset:010} {:05} n\r\ntrailer\n<< /Size {} /Root {} {} R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n",
+                id.obj_number,
+                id.gen_number,
+                (id.obj_number as usize + 1).max(pdf.len() + 1),
+                root.obj_number,
+                root.gen_number,
+            )
+            .as_bytes(),
+        );
+        out
+    };
+    let pdf = Pdf::new(Arc::new(cropped)).ok()?;
+    raster_pdf_page(&pdf, index, dpi, true)
+}
+
+/// Offset after the file's last `startxref`.
+fn last_startxref(bytes: &[u8]) -> Option<usize> {
+    let tail = &bytes[bytes.len().saturating_sub(2048)..];
+    let at = tail.windows(9).rposition(|w| w == b"startxref")?;
+    let digits: String = tail[at + 9..]
+        .iter()
+        .skip_while(|c| c.is_ascii_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .map(|&c| c as char)
+        .collect();
+    digits.parse().ok()
+}
+
 fn rasterize_cached(path: &str, page: &str, dpi: f32, transparent: bool) -> Option<Arc<PdfPage>> {
     let key = (
         path.to_string(),
@@ -114,16 +311,19 @@ fn rasterize_cached(path: &str, page: &str, dpi: f32, transparent: bool) -> Opti
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&key)
-        .cloned()
     {
         return hit;
     }
 
     let built = rasterize_uncached(path, page, dpi, transparent);
+    let bytes = size_of::<PageKey>()
+        + built
+            .as_ref()
+            .map_or(0, |raster| size_of::<PdfPage>() + raster.pixels.capacity());
     page_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(key, built.clone());
+        .insert(key, built.clone(), bytes);
     built
 }
 
@@ -176,11 +376,11 @@ fn raster_pdf_page(pdf: &Pdf, index: usize, dpi: f32, transparent: bool) -> Opti
         page,
         &RenderCache::new(),
         &InterpreterSettings::default(),
-        &RenderSettings {
+        &RenderSettings::default(),
+        &PixmapSettings {
             x_scale: scale,
             y_scale: scale,
             bg_color: if transparent { TRANSPARENT } else { WHITE },
-            ..Default::default()
         },
     );
     let width = u32::from(pixmap.width());
@@ -345,9 +545,9 @@ pub struct PageAdjust {
 
 type AdjustKey = (String, String, PageAdjust);
 
-fn adjusted_cache() -> &'static Mutex<HashMap<AdjustKey, Arc<Vec<u8>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<AdjustKey, Arc<Vec<u8>>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn adjusted_cache() -> &'static Mutex<BudgetedRasterCache<AdjustKey, Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<BudgetedRasterCache<AdjustKey, Arc<Vec<u8>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BudgetedRasterCache::new()))
 }
 
 /// One colour (0..=1 channels) with the underlay's contrast / monochrome /
@@ -408,11 +608,35 @@ pub fn adjusted_pixels(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&key)
-        .cloned()
     {
         return hit;
     }
     let mut pixels = raster.pixels.as_ref().clone();
+    adjust_in_place(&mut pixels, &adjust);
+    let bytes = size_of::<AdjustKey>() + pixels.capacity();
+    let pixels = Arc::new(pixels);
+    adjusted_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, pixels.clone(), bytes);
+    pixels
+}
+
+/// [`adjusted_pixels`] for a one-off raster (a zoomed-in region), not memoised.
+pub fn adjusted_pixels_uncached(raster: &PdfPage, adjust: PageAdjust) -> Arc<Vec<u8>> {
+    if adjust.contrast >= 100
+        && !adjust.monochrome
+        && !adjust.adjust_for_background
+        && adjust.fade_before_contrast.is_none()
+    {
+        return raster.pixels.clone();
+    }
+    let mut pixels = raster.pixels.as_ref().clone();
+    adjust_in_place(&mut pixels, &adjust);
+    Arc::new(pixels)
+}
+
+fn adjust_in_place(pixels: &mut [u8], adjust: &PageAdjust) {
     for px in pixels.chunks_exact_mut(4) {
         if px[3] == 0 {
             continue;
@@ -423,18 +647,12 @@ pub fn adjusted_pixels(
                 px[1] as f32 / 255.0,
                 px[2] as f32 / 255.0,
             ],
-            &adjust,
+            adjust,
         );
         for (dst, c) in px[..3].iter_mut().zip(rgb) {
             *dst = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
     }
-    let pixels = Arc::new(pixels);
-    adjusted_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(key, pixels.clone());
-    pixels
 }
 
 /// Upper bound on one previewed page's pixel edge. Rasteriser dimensions
@@ -535,6 +753,202 @@ mod tests {
     use printpdf::{Mm, PdfDocument, PdfPage as OutputPage, PdfSaveOptions};
 
     use super::*;
+
+    /// Serialises the tests that shrink the process-wide raster budget: the
+    /// env override is shared by every test thread in this process.
+    static BUDGET_LOCK: Mutex<()> = Mutex::new(());
+
+    struct BudgetEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl BudgetEnvGuard {
+        fn set(mib: &str) -> Self {
+            let previous = std::env::var_os("OCS_PDF_RASTER_CACHE_MB");
+            std::env::set_var("OCS_PDF_RASTER_CACHE_MB", mib);
+            Self { previous }
+        }
+    }
+
+    impl Drop for BudgetEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("OCS_PDF_RASTER_CACHE_MB", value),
+                None => std::env::remove_var("OCS_PDF_RASTER_CACHE_MB"),
+            }
+        }
+    }
+
+    /// One square page with a filled rectangle: at 150 DPI a 100 mm page
+    /// rasterises to ~1.3 MiB, so a handful of zoom bands passes a 2 MiB
+    /// budget.
+    fn budget_test_pdf(side_mm: f32) -> Vec<u8> {
+        use printpdf::{
+            Color, LinePoint, Op, PaintMode, Point, Polygon, PolygonRing, Rgb, WindingOrder,
+        };
+        let mut document = PdfDocument::new("PDF underlay budget test");
+        let lo = side_mm * 0.1;
+        let hi = side_mm * 0.9;
+        let ops = vec![
+            Op::SetFillColor {
+                col: Color::Rgb(Rgb {
+                    r: 0.1,
+                    g: 0.4,
+                    b: 0.8,
+                    icc_profile: None,
+                }),
+            },
+            Op::DrawPolygon {
+                polygon: Polygon {
+                    rings: vec![PolygonRing {
+                        points: vec![
+                            LinePoint {
+                                p: Point {
+                                    x: Mm(lo).into(),
+                                    y: Mm(lo).into(),
+                                },
+                                bezier: false,
+                            },
+                            LinePoint {
+                                p: Point {
+                                    x: Mm(hi).into(),
+                                    y: Mm(lo).into(),
+                                },
+                                bezier: false,
+                            },
+                            LinePoint {
+                                p: Point {
+                                    x: Mm(hi).into(),
+                                    y: Mm(hi).into(),
+                                },
+                                bezier: false,
+                            },
+                            LinePoint {
+                                p: Point {
+                                    x: Mm(lo).into(),
+                                    y: Mm(hi).into(),
+                                },
+                                bezier: false,
+                            },
+                        ],
+                    }],
+                    mode: PaintMode::Fill,
+                    winding_order: WindingOrder::NonZero,
+                },
+            },
+        ];
+        document
+            .pages
+            .push(OutputPage::new(Mm(side_mm), Mm(side_mm), ops));
+        document.save(&PdfSaveOptions::default(), &mut Vec::new())
+    }
+
+    const SWEEP_BANDS: [f32; 6] = [106.066, 75.0, 53.033, 37.5, 26.517, 18.75];
+
+    #[test]
+    fn zoom_sweep_past_budget_evicts_the_oldest_page_raster() {
+        let _lock = BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _budget = BudgetEnvGuard::set("2");
+        let path = "memory://pdf-budget-evict-page.pdf";
+        register_source(path, Arc::new(budget_test_pdf(100.0)));
+
+        let first = rasterize_page_display_at(path, "1", 150.0).expect("150 DPI raster");
+        for dpi in SWEEP_BANDS {
+            drop(rasterize_page_display_at(path, "1", dpi).expect("band raster"));
+        }
+
+        let refetched = rasterize_page_display_at(path, "1", 150.0).expect("refetched raster");
+        assert!(
+            !Arc::ptr_eq(&first, &refetched),
+            "the oldest raster must be evicted once the sweep passes the budget"
+        );
+    }
+
+    #[test]
+    fn zoom_sweep_past_budget_evicts_the_oldest_adjusted_copy() {
+        let _lock = BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _budget = BudgetEnvGuard::set("2");
+        let path = "memory://pdf-budget-evict-adjust.pdf";
+        register_source(path, Arc::new(budget_test_pdf(100.0)));
+        let adjust = PageAdjust {
+            contrast: 50,
+            contrast_pivot: 500,
+            monochrome: false,
+            adjust_for_background: false,
+            dark_background: false,
+            fade_before_contrast: None,
+        };
+
+        let raster = rasterize_page_display_at(path, "1", 150.0).expect("150 DPI raster");
+        let first = adjusted_pixels(path, "1", &raster, adjust);
+        for dpi in SWEEP_BANDS {
+            let band = rasterize_page_display_at(path, "1", dpi).expect("band raster");
+            drop(adjusted_pixels(path, "1", &band, adjust));
+        }
+
+        let again = adjusted_pixels(path, "1", &raster, adjust);
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "the oldest adjusted copy must be evicted once the sweep passes the budget"
+        );
+    }
+
+    /// A cache hit must promote the entry: a re-touched older raster survives
+    /// a sweep that evicts an untouched newer one. A 90 mm page keeps the
+    /// first two rasters (~1.6 MiB) safely inside the 2 MiB budget before the
+    /// sweep pushes past it.
+    #[test]
+    fn re_touching_an_older_raster_keeps_it_cached_past_the_budget() {
+        let _lock = BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _budget = BudgetEnvGuard::set("2");
+        let path = "memory://pdf-budget-recency.pdf";
+        register_source(path, Arc::new(budget_test_pdf(90.0)));
+
+        let oldest = rasterize_page_display_at(path, "1", 150.0).expect("150 DPI raster");
+        let middle = rasterize_page_display_at(path, "1", 106.066).expect("106 DPI raster");
+        let touched = rasterize_page_display_at(path, "1", 150.0).expect("re-touch hit");
+        assert!(
+            Arc::ptr_eq(&oldest, &touched),
+            "re-touch reads the cached raster"
+        );
+        drop(touched);
+        for dpi in [75.0, 53.033] {
+            drop(rasterize_page_display_at(path, "1", dpi).expect("band raster"));
+        }
+
+        let refetched = rasterize_page_display_at(path, "1", 150.0).expect("refetched raster");
+        assert!(
+            Arc::ptr_eq(&oldest, &refetched),
+            "the re-touched raster survives eviction as the most recently used"
+        );
+        let middle_again = rasterize_page_display_at(path, "1", 106.066).expect("middle refetch");
+        assert!(
+            !Arc::ptr_eq(&middle, &middle_again),
+            "the untouched middle raster is the least recently used victim"
+        );
+    }
+
+    /// Regression guard (passes with and without eviction): a sweep that
+    /// stays inside the budget keeps its most recent raster cached.
+    #[test]
+    fn recent_raster_survives_a_sweep_within_budget() {
+        let _lock = BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _budget = BudgetEnvGuard::set("128");
+        let path = "memory://pdf-budget-recent.pdf";
+        register_source(path, Arc::new(budget_test_pdf(100.0)));
+
+        let mut recent = None;
+        for dpi in [150.0].into_iter().chain(SWEEP_BANDS) {
+            recent = Some(rasterize_page_display_at(path, "1", dpi).expect("band raster"));
+        }
+        let recent = recent.expect("last band raster");
+
+        let refetched = rasterize_page_display_at(path, "1", 18.75).expect("refetched raster");
+        assert!(
+            Arc::ptr_eq(&recent, &refetched),
+            "the most recent raster stays cached while the sweep fits the budget"
+        );
+    }
 
     #[test]
     fn registered_pdf_bytes_render_without_a_filesystem_path() {

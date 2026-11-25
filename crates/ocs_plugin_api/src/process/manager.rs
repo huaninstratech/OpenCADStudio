@@ -16,13 +16,18 @@
 //! and must not block. For heavy work, forward the notification to a channel.
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::host::{HostApi, HostNotification, PluginNotification};
 use crate::process::{PluginError, PluginProcess};
-use crate::ribbon::owned::{to_shared_module, OwnedEntityClasses, SharedCadModule};
+use crate::ribbon::owned::{OwnedEntityClasses, SharedCadModule, to_shared_module};
+
+/// Maximum notifications parked in the boot-window `attach.pending` queue
+/// (review finding 6): a plugin that never acks its ChannelReady cannot grow
+/// host memory without bound during the grace period.
+const MAX_PENDING_ATTACH: usize = 256;
 
 /// Callback the host installs to receive plugin-to-host notifications.
 pub type NotificationHandler = Arc<dyn Fn(&str, Option<u64>, PluginNotification) + Send + Sync>;
@@ -31,6 +36,23 @@ pub type NotificationHandler = Arc<dyn Fn(&str, Option<u64>, PluginNotification)
 pub struct PluginManager {
     plugins: Vec<LoadedPlugin>,
     notification_handler: Option<NotificationHandler>,
+}
+
+thread_local! {
+    /// Ids of plugins whose spawn/bootstrap is IN FLIGHT (`load_with_expected_id`
+    /// began and has not returned): owner-scoped declarations (entity classes,
+    /// quad panels, custom grips) arrive as nested requests during that window —
+    /// the host is actively authenticated with the very process making them —
+    /// but the registry entry does not exist until the load returns, and the
+    /// empty-identity manifest call used to refuse them. Cleared when the load
+    /// finishes (entry inserted) or fails, so a marker never outlives a plugin.
+    ///
+    /// Kept per THREAD, not per manager (#3602): the host's startup load fills
+    /// a local manager and installs it only after every plugin has loaded, so
+    /// a marker on that manager was invisible to the installed (empty) one the
+    /// declaration law asks. Boot and its nested requests run on one thread.
+    static BOOTING: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 struct LoadedPlugin {
@@ -129,23 +151,86 @@ impl PluginManager {
         cdylib_path: &Path,
         host: &mut dyn HostApi,
     ) -> Result<String, PluginError> {
+        self.load_with_expected_id(cdylib_path, None, host)
+    }
+
+    /// Like [`PluginManager::load`], but with the package's expected plugin id:
+    /// the runner's self-declared manifest id must match (the transport stays
+    /// the verified identity), the id must not collide with an already-loaded
+    /// plugin, and the spawn bootstrap's declaration window carries it.
+    pub fn load_with_expected_id(
+        &mut self,
+        cdylib_path: &Path,
+        expected_id: Option<&str>,
+        host: &mut dyn HostApi,
+    ) -> Result<String, PluginError> {
+        if let Some(expected) = expected_id {
+            if self
+                .plugins
+                .iter()
+                .any(|p| p.process.id().eq_ignore_ascii_case(expected))
+            {
+                return Err(PluginError::Runner(format!(
+                    "a plugin with id `{expected}` is already loaded; refusing duplicate \
+                     registration"
+                )));
+            }
+        }
         let handler: NotificationHandler = match self.notification_handler.as_ref() {
             Some(h) => Arc::clone(h),
             None => Arc::new(|_id, _cmd, _notif| {}),
         };
-        let process = PluginProcess::spawn(cdylib_path, host, handler)?;
-        let id = process.id().to_string();
-        let name = process.manifest().name.clone();
-        let module = to_shared_module(id.clone(), name, process.ribbon().to_vec());
-        self.plugins.push(LoadedPlugin {
-            process: Arc::new(process),
-            module,
-            attach: std::sync::Mutex::new(NotificationAttach {
-                grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
-                ..Default::default()
-            }),
-        });
-        Ok(id)
+        // A notification that arrives before the spawn pins the manifest id
+        // carries the empty placeholder. The package-declared id names this
+        // process from the start, so the ChannelReady ack of one of several
+        // plugins booting together is not ambiguous (#3581).
+        let handler: NotificationHandler = match expected_id {
+            Some(expected) if !expected.is_empty() => {
+                let expected = expected.to_string();
+                Arc::new(move |id, command, notification| {
+                    let id = if id.is_empty() { expected.as_str() } else { id };
+                    handler(id, command, notification)
+                })
+            }
+            _ => handler,
+        };
+        // The spawn bootstrap IS the declaration window: quad panels/classes/
+        // grips register while GetManifest is still in flight (the spawn
+        // attributes them to the package-declared id). Mark the boot so the
+        // declaration law sees a live transport; every exit path closes it.
+        let booting: Option<String> = expected_id.map(str::to_string);
+        if let Some(id) = &booting {
+            self.begin_boot(id);
+        }
+        let load = (|| {
+            let process = PluginProcess::spawn(cdylib_path, host, handler, expected_id)?;
+            let id = process.id().to_string();
+            if self
+                .plugins
+                .iter()
+                .any(|p| p.process.id().eq_ignore_ascii_case(&id))
+            {
+                process.shutdown();
+                return Err(PluginError::Runner(format!(
+                    "a plugin with id `{id}` is already loaded; refusing duplicate registration"
+                )));
+            }
+            let name = process.manifest().name.clone();
+            let module = to_shared_module(id.clone(), name, process.ribbon().to_vec());
+            self.plugins.push(LoadedPlugin {
+                process: Arc::new(process),
+                module,
+                attach: std::sync::Mutex::new(NotificationAttach {
+                    grace_deadline: Some(std::time::Instant::now() + notification_boot_grace()),
+                    ..Default::default()
+                }),
+            });
+            Ok(id)
+        })();
+        if let Some(id) = &booting {
+            self.end_boot(id);
+        }
+        load
     }
 
     /// Fan out a host notification to every alive V4 plugin. Per-process errors
@@ -159,19 +244,28 @@ impl PluginManager {
     /// queue flushes once (logged), and the process is treated as attached
     /// from then on.
     pub fn broadcast_notification(&self, command_id: Option<u64>, notification: HostNotification) {
+        self.broadcast_for_api(command_id, &|_| Some(notification.clone()));
+    }
+
+    /// Fan out a notification chosen PER PLUGIN by its manifest API major
+    /// (`None` skips the endpoint entirely). Same deferral/boot-window
+    /// semantics and best-effort error handling as
+    /// [`Self::broadcast_notification`]; the per-endpoint choice lets a v22+
+    /// plugin receive an O(1) digest while pre-v22 plugins keep the exact
+    /// legacy streams.
+    pub fn broadcast_for_api(
+        &self,
+        command_id: Option<u64>,
+        for_api: &dyn Fn(u32) -> Option<HostNotification>,
+    ) {
         for p in &self.plugins {
-            if !p.process.is_alive() {
+            if !p.process.is_alive() || !p.process.is_v4() {
                 continue;
             }
-            if !p.process.is_v4() {
-                if crate::process::verbose() {
-                    eprintln!(
-                        "[plugin] skipping notification for {} (not V4)",
-                        p.process.id()
-                    );
-                }
-                continue;
-            }
+            let notification = match for_api(p.process.manifest().api_version) {
+                Some(notification) => notification,
+                None => continue,
+            };
             let flush_now = {
                 let mut attach = p.attach.lock().unwrap_or_else(|e| e.into_inner());
                 if attach.attached {
@@ -207,6 +301,21 @@ impl PluginManager {
                     // send path.
                     true
                 } else {
+                    // Bounded park (review finding 6): a never-acking plugin
+                    // during the boot grace cannot grow host memory without
+                    // bound; the OLDEST parked is dropped (the plugin's
+                    // listener never saw it anyway).
+                    if attach.pending.len() >= MAX_PENDING_ATTACH {
+                        attach.pending.remove(0);
+                        if crate::process::verbose() {
+                            eprintln!(
+                                "[plugin] dropped the oldest boot-window notification for {} \
+                                 ({} parked)",
+                                p.process.id(),
+                                attach.pending.len()
+                            );
+                        }
+                    }
                     attach.pending.push((command_id, notification.clone()));
                     if crate::process::verbose() {
                         eprintln!(
@@ -226,6 +335,39 @@ impl PluginManager {
                     p.process.id()
                 );
             }
+        }
+    }
+
+    /// Selection-boundary router (v22): API-22+ endpoints receive the O(1)
+    /// `SelectionChangedDigest`; older endpoints keep the tab-tagged handle
+    /// list (`SelectionChangedV4`) and, when `legacy_plain` is set (the app's
+    /// own selection boundary), the plain `SelectionChanged` after it, as
+    /// before v22.
+    pub fn broadcast_selection_changed(
+        &self,
+        tab_id: u64,
+        handles: &[crate::ipc::protocol::Handle],
+        revision: u64,
+        legacy_plain: bool,
+    ) {
+        let count = handles.len() as u64;
+        self.broadcast_for_api(None, &|api: u32| match api {
+            22.. => Some(HostNotification::SelectionChangedDigest {
+                tab_id,
+                revision,
+                count,
+            }),
+            _ => Some(HostNotification::SelectionChangedV4 {
+                tab_id,
+                handles: handles.to_vec(),
+            }),
+        });
+        if legacy_plain {
+            self.broadcast_for_api(None, &|api: u32| {
+                (api < 22).then(|| HostNotification::SelectionChanged {
+                    handles: handles.to_vec(),
+                })
+            });
         }
     }
 
@@ -256,7 +398,7 @@ impl PluginManager {
         match self
             .plugins
             .iter()
-            .position(|p| p.process.id() == plugin_id)
+            .position(|p| p.process.id().eq_ignore_ascii_case(plugin_id))
         {
             Some(index) => self.attach_by_index(index),
             None => AttachOutcome::UnknownPlugin,
@@ -378,6 +520,15 @@ impl PluginManager {
             .collect()
     }
 
+    /// The process of the loaded plugin `id`, for host calls that outlive a
+    /// manager borrow (AI tool calls serve nested HostApi requests).
+    pub fn process(&self, id: &str) -> Option<Arc<PluginProcess>> {
+        self.plugins
+            .iter()
+            .find(|p| p.process.id() == id)
+            .map(|p| Arc::clone(&p.process))
+    }
+
     /// Ids of loaded plugins whose processes are currently alive (API v11).
     pub fn alive_ids(&self) -> Vec<String> {
         self.plugins
@@ -398,6 +549,33 @@ impl PluginManager {
                 p.process.is_alive(),
             )
         })
+    }
+
+    /// Mark a plugin's boot as in flight: between this and [`Self::end_boot`],
+    /// the owner-scoped declaration laws treat `id` as a live, authenticated
+    /// transport (the spawn is actively talking to that process — see the
+    /// docs on `BOOTING`). Callers must pair this with `end_boot` on
+    /// every return path (a leaked marker would make a never-loaded id
+    /// declare owner-scoped state forever).
+    pub fn begin_boot(&self, id: &str) {
+        BOOTING.with(|b| b.borrow_mut().insert(id.to_string()));
+    }
+
+    /// Close the in-flight boot marker for `id` (idempotent).
+    pub fn end_boot(&self, id: &str) {
+        BOOTING.with(|b| b.borrow_mut().remove(id));
+    }
+
+    /// Whether owner-scoped declarations from `id` are attributable to a real,
+    /// current transport: either the loaded registry entry is alive, or the
+    /// plugin's spawn/bootstrap is in flight right now (its manifest will
+    /// confirm the id before the load returns). This is the declaration law's
+    /// gate ONLY — grip event routing keeps the stricter live-channel check.
+    pub fn declaration_endpoint_alive(&self, id: &str) -> bool {
+        if self.grip_endpoint(id).is_some_and(|(_, _, alive)| alive) {
+            return true;
+        }
+        BOOTING.with(|b| b.borrow().contains(id))
     }
 
     /// Command names advertised by every alive, non-disabled plugin: each
@@ -455,6 +633,14 @@ impl PluginManager {
             if let Err(e) = p.process.drain_requests(host, on_start_interactive) {
                 eprintln!("[plugin] drain_requests failed for {}: {e}", p.process.id());
             }
+        }
+    }
+
+    /// Show the command-line messages plugins sent during calls that had no
+    /// host surface (an interactive step, a prompt query).
+    pub fn replay_held_messages(&self, host: &mut dyn HostApi) {
+        for p in &self.plugins {
+            p.process.replay_held_messages(host);
         }
     }
 
@@ -528,10 +714,10 @@ mod tests {
                 0
             }
             fn for_each_entity(&self, _f: &mut dyn FnMut(crate::host::ReaderEntity<'_>)) {}
-            fn layer_name(&self, _handle: codec::Handle) -> Option<&str> {
+            fn layer_name(&self, _handle: document::Handle) -> Option<&str> {
                 None
             }
-            fn app_id_name(&self, _handle: codec::Handle) -> Option<&str> {
+            fn app_id_name(&self, _handle: document::Handle) -> Option<&str> {
                 None
             }
         }
@@ -541,34 +727,34 @@ mod tests {
             fn tab_index(&self) -> usize {
                 0
             }
-            fn document(&self) -> &codec::Document {
+            fn document(&self) -> &document::Document {
                 panic!("not used")
             }
-            fn document_mut(&mut self) -> &mut codec::Document {
+            fn document_mut(&mut self) -> &mut document::Document {
                 panic!("not used")
             }
             fn document_reader(&self) -> Box<dyn crate::host::DocumentReader + '_> {
                 Box::new(EmptyReader)
             }
-            fn add_entity(&mut self, _entity: codec::EntityType) -> codec::Handle {
+            fn add_entity(&mut self, _entity: document::EntityType) -> document::Handle {
                 panic!("not used")
             }
             fn bump_geometry(&mut self) {}
             fn read_record(
                 &self,
-                _handle: codec::Handle,
+                _handle: document::Handle,
                 _app_name: &str,
-            ) -> Option<&codec::xdata::ExtendedDataRecord> {
+            ) -> Option<&document::xdata::ExtendedDataRecord> {
                 None
             }
             fn write_record(
                 &mut self,
-                _handle: codec::Handle,
-                _record: codec::xdata::ExtendedDataRecord,
+                _handle: document::Handle,
+                _record: document::xdata::ExtendedDataRecord,
             ) -> bool {
                 false
             }
-            fn remove_record(&mut self, _handle: codec::Handle, _app_name: &str) -> bool {
+            fn remove_record(&mut self, _handle: document::Handle, _app_name: &str) -> bool {
                 false
             }
             fn push_undo(&mut self, _label: &str) {}
@@ -717,6 +903,212 @@ mod tests {
         assert!(
             manager.entity_class_declarations(|_| false).is_empty(),
             "a dead plugin process must contribute no declarations"
+        );
+    }
+
+    fn owned_manifest_with_api(
+        id: &str,
+        api_version: u32,
+    ) -> crate::ribbon::owned::OwnedPluginManifest {
+        crate::ribbon::owned::OwnedPluginManifest {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            version: "0.1.0".to_string(),
+            description: "test".to_string(),
+            api_version,
+            ribbon_order: 0,
+            xdata_apps: vec![],
+            command_prefixes: vec![],
+            entity_classes: None,
+        }
+    }
+
+    /// A V4-connected fake like [`crate::process::PluginProcess::fake`], but
+    /// with a real `V4Connection` over a local socket pair (no subprocess, no
+    /// cdylib): the sibling of the plain fake that `broadcast_for_api` can
+    /// fan out to. Returns the runner-side peer stream the test reads the
+    /// delivered frames from.
+    fn v4_connected_process(
+        manifest: crate::ribbon::owned::OwnedPluginManifest,
+    ) -> (PluginProcess, interprocess::local_socket::Stream) {
+        use interprocess::local_socket::{
+            GenericNamespaced, ListenerOptions, ToNsName,
+            traits::{Listener, Stream as StreamTrait},
+        };
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "ocs_manager_v4_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let name_ref = name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("valid name");
+        let listener = ListenerOptions::new()
+            .name(name_ref)
+            .create_sync()
+            .expect("listener");
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || {
+            StreamTrait::connect(client_name.to_ns_name::<GenericNamespaced>().unwrap())
+                .expect("connect")
+        });
+        let host_stream = listener.accept().expect("accept");
+        let runner_stream = client.join().expect("client thread");
+
+        // No runner child to watch (the test peer keeps the socket open), and
+        // the V3 stream cell stays empty: the V4 path moved the stream into
+        // the connection, exactly like `PluginProcess::spawn` does.
+        let v4_connection = crate::process::v4::V4Connection::new(
+            host_stream,
+            Arc::new(|_: Option<u64>, _: PluginNotification| {}),
+            None,
+        )
+        .expect("V4 connection over the socket pair");
+        let process = PluginProcess {
+            stream: Arc::new(std::sync::Mutex::new(None)),
+            v4: Some(v4_connection),
+            child: Arc::new(std::sync::Mutex::new(None)),
+            id: manifest.id.clone(),
+            manifest,
+            ribbon: vec![],
+            io_lines: std::sync::Mutex::new(None),
+            held_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        (process, runner_stream)
+    }
+
+    /// Read the host→plugin frames the way a REAL runner would: notifications
+    /// are collected, and the graceful `HostRequest::Shutdown` directive ends
+    /// the connection (the peer closing its own socket is what unblocks the
+    /// host's reader, so EOF-awaiting would deadlock the harness).
+    fn collect_delivered_notifications(
+        mut socket: interprocess::local_socket::Stream,
+    ) -> Vec<HostNotification> {
+        use crate::ipc::protocol::HostRequest;
+        use crate::ipc::transport::recv;
+        use crate::ipc::v4::protocol::{HostToPluginV4, NotificationEnvelope};
+
+        let mut notifications = Vec::new();
+        loop {
+            match recv::<HostToPluginV4>(&mut socket) {
+                Ok(HostToPluginV4::Notification(NotificationEnvelope {
+                    command_id: _,
+                    payload,
+                })) => notifications.push(payload),
+                Ok(HostToPluginV4::Request {
+                    payload: HostRequest::Shutdown,
+                    ..
+                }) => return notifications,
+                Ok(_) => continue,
+                Err(_) => return notifications,
+            }
+        }
+    }
+
+    /// The per-endpoint routing of one document boundary ([`LoadedPlugin`]
+    /// manifest api majors: 26 keeps the exact legacy v13 Regions stream, 27
+    /// receives the categorized `DocumentChangedDelta` instead — and neither
+    /// endpoint ever receives both).
+    #[test]
+    fn document_delta_broadcast_routes_per_endpoint_api_version() {
+        let mut manager = PluginManager::new();
+        let (pre27_process, pre27_peer) =
+            v4_connected_process(owned_manifest_with_api("test.delta.pre27", 26));
+        let (v27_process, v27_peer) =
+            v4_connected_process(owned_manifest_with_api("test.delta.v27", 27));
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(pre27_process),
+            module: to_shared_module("test.delta.pre27".into(), "Pre27".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                attached: true,
+                ..Default::default()
+            }),
+        });
+        manager.plugins.push(LoadedPlugin {
+            process: Arc::new(v27_process),
+            module: to_shared_module("test.delta.v27".into(), "V27".into(), vec![]),
+            attach: std::sync::Mutex::new(NotificationAttach {
+                attached: true,
+                ..Default::default()
+            }),
+        });
+        let handle_pre27 = std::thread::spawn(move || collect_delivered_notifications(pre27_peer));
+        let handle_v27 = std::thread::spawn(move || collect_delivered_notifications(v27_peer));
+
+        // One boundary, both representations — the exact pair
+        // `publish_document_delta` offers to `broadcast_for_api`.
+        let regions = HostNotification::DocumentChangedRegions {
+            tab_id: 7,
+            version: 41,
+            entities: vec![document::Handle::from(0x2A)],
+            records: vec![(document::Handle::from(0x8A), "CVIFC".to_owned())],
+        };
+        let delta = HostNotification::DocumentChangedDelta {
+            tab_id: 7,
+            version: 41,
+            added: vec![document::Handle::from(5)],
+            modified: vec![document::Handle::from(9)],
+            deleted: vec![document::Handle::from(11)],
+            records: Vec::new(),
+            snapshot: Some(crate::host::DocumentDeltaSnapshot {
+                version: 41,
+                generation: 2,
+            }),
+            full_refresh_required: false,
+        };
+        manager.broadcast_for_api(None, &|api: u32| {
+            if api >= 27 {
+                Some(delta.clone())
+            } else {
+                Some(regions.clone())
+            }
+        });
+
+        // Dropping the manager requests the graceful shutdown (a
+        // `HostRequest::Shutdown` frame per endpoint); the peer collectors end
+        // on it — mirroring a real runner — and return what they gathered.
+        // Every frame written above is still readable (the socket buffers
+        // hold it), so nothing is lost to the teardown.
+        drop(manager);
+        let pre27 = handle_pre27.join().expect("pre-27 collector thread");
+        let v27 = handle_v27.join().expect("v27 collector thread");
+
+        // A pre-27 endpoint receives EXACTLY the legacy v13 Regions stream —
+        // never the new variant.
+        assert_eq!(
+            pre27.len(),
+            1,
+            "a pre-27 endpoint receives exactly one notification: {pre27:?}"
+        );
+        assert!(
+            matches!(pre27[0], HostNotification::DocumentChangedRegions { .. }),
+            "a pre-27 endpoint keeps the v13 Regions stream: {pre27:?}"
+        );
+        assert!(
+            !pre27
+                .iter()
+                .any(|n| matches!(n, HostNotification::DocumentChangedDelta { .. })),
+            "a pre-27 endpoint must never receive the delta: {pre27:?}"
+        );
+
+        // A v27 endpoint receives EXACTLY the categorized delta — the
+        // Regions stream is replaced, never duplicated.
+        assert_eq!(
+            v27.len(),
+            1,
+            "a v27 endpoint receives exactly one notification: {v27:?}"
+        );
+        assert!(
+            matches!(v27[0], HostNotification::DocumentChangedDelta { .. }),
+            "a v27 endpoint receives the categorized delta: {v27:?}"
+        );
+        assert!(
+            !v27.iter()
+                .any(|n| matches!(n, HostNotification::DocumentChangedRegions { .. })),
+            "a v27 endpoint must never receive the legacy Regions stream: {v27:?}"
         );
     }
 }

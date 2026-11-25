@@ -280,7 +280,8 @@ pub fn discard_guard<'a>(
     .on_press(on_keep.clone());
     let panel = container(
         column![
-            iced::widget::text(crate::t!("Unsaved changes will be discarded.")).size(13.5),
+            iced::widget::text(crate::t!("Unsaved changes will be discarded."))
+                .size(crate::ui::style::text::UI_LARGE),
             Space::new().height(12),
             row![
                 button(iced::widget::text(crate::t!("Discard & close")).size(12))
@@ -509,7 +510,7 @@ pub fn tool_frame<'a>(
     ]
     .width(Length::Fill)
     .height(Length::Fixed(24.0));
-    let measured_content = sensor(content).on_resize(move |size| measured(size));
+    let measured_content = sensor(content).on_resize(measured);
     let body_base = column![Space::new().height(Length::Fixed(24.0)), measured_content].spacing(6);
     let grip = mouse_area(
         container(crate::ui::icons::themed_primary(
@@ -529,20 +530,22 @@ pub fn tool_frame<'a>(
             .align_x(iced::alignment::Horizontal::Right)
             .align_y(iced::alignment::Vertical::Bottom),
     ];
-    let framed = container(body).padding(10).style(|theme: &Theme| container::Style {
-        background: Some(Background::Color(theme.palette().background.base.color)),
-        border: Border {
-            color: theme.palette().background.neutral.color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        shadow: iced::Shadow {
-            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 14.0,
-        },
-        ..Default::default()
-    });
+    let framed = container(body)
+        .padding(10)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(theme.palette().background.base.color)),
+            border: Border {
+                color: theme.palette().background.neutral.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                offset: Vector::new(0.0, 4.0),
+                blur_radius: 14.0,
+            },
+            ..Default::default()
+        });
     // The frame is opaque to the pointer; around it the drawing takes it.
     let framed = opaque(mouse_area(framed).on_press(raise));
     let pad = Padding {

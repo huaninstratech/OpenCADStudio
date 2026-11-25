@@ -41,7 +41,7 @@ impl OpenCADStudio {
                 .push_error(crate::t!("Specify a finite parameter location.").as_ref());
             return Task::none();
         }
-        let location = codec::types::Vector3::new(location.x, location.y, location.z);
+        let location = document::types::Vector3::new(location.x, location.y, location.z);
         if kind == Kind::Basepoint
             && block_basepoint::parameter(&self.tabs[i].scene.document, definition).is_some_and(
                 |(_, p)| {
@@ -55,7 +55,14 @@ impl OpenCADStudio {
             self.tabs[i].scene.clear_preview_wire();
             return Task::none();
         }
-        self.push_undo_snapshot(i, super::document::HistoryLabel::formatted(format!("{} parameter", kind.name()), "parameter", super::document::HistoryLabel::Message(kind.name())));
+        self.push_undo_snapshot(
+            i,
+            super::tab_document::HistoryLabel::formatted(
+                format!("{} parameter", kind.name()),
+                "parameter",
+                super::tab_document::HistoryLabel::Message(kind.name()),
+            ),
+        );
         let parameter = match kind {
             Kind::Basepoint => {
                 block_basepoint::create(&mut self.tabs[i].scene.document, definition, location)
@@ -89,7 +96,7 @@ impl OpenCADStudio {
             if let Some(name) = options.name.as_deref() {
                 record(
                     &mut option_error,
-                    metadata::set_text(document, definition, parameter, Field::Name, name),
+                    metadata::set_parameter_name(document, definition, parameter, name),
                 );
             }
             if let Some(description) = options.description.as_deref() {
@@ -104,6 +111,12 @@ impl OpenCADStudio {
                     ),
                 );
             }
+            if let Some(label) = options.label.as_deref() {
+                record(
+                    &mut option_error,
+                    metadata::set_text(document, definition, parameter, Field::Name, label),
+                );
+            }
             if let Some(palette) = options.palette {
                 record(
                     &mut option_error,
@@ -114,7 +127,7 @@ impl OpenCADStudio {
         if let Some(error) = option_error {
             self.command_line.push_error(crate::t!(error).as_ref());
         }
-        self.tabs[i].scene.bump_geometry();
+        self.tabs[i].scene.bump_block_definition(definition);
         self.tabs[i].dirty = true;
         self.tabs[i].active_cmd = None;
         self.tabs[i].scene.clear_preview_wire();
@@ -146,12 +159,15 @@ impl OpenCADStudio {
     pub(in crate::app) fn open_lookup_table_from_action(
         &mut self,
         document: u64,
-        definition: codec::Handle,
+        definition: document::Handle,
         name: String,
     ) -> Task<Message> {
         let i = self.active_tab;
         if self.tabs[i].id != document
-            || self.tabs[i].active_block_edit_session().map(|s| s.br_handle) != Some(definition)
+            || self.tabs[i]
+                .active_block_edit_session()
+                .map(|s| s.br_handle)
+                != Some(definition)
         {
             self.command_line.push_error(
                 crate::t!("The action's Block Editor session is no longer active.").as_ref(),
@@ -336,9 +352,11 @@ impl OpenCADStudio {
             return Task::none();
         }
         if changed {
-            self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Lookup tables"));
-            self.tabs[i].scene.document = working;
-            self.tabs[i].scene.bump_geometry();
+            self.push_undo_snapshot(
+                i,
+                super::tab_document::HistoryLabel::Message("Lookup tables"),
+            );
+            self.apply_action_document_and_bump(i, working);
             self.tabs[i].dirty = true;
             self.finish_pending_history(i);
             self.refresh_properties();

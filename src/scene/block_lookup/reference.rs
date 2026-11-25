@@ -75,6 +75,8 @@ pub(crate) fn reference_properties(
                         document: document_id,
                         definition,
                         insert,
+                        batch_generation: None,
+                        editor_session: None,
                         parameter: *owner,
                         component: Component::LookupOutput {
                             column,

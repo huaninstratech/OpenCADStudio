@@ -382,7 +382,7 @@ impl Security {
 
     /// Revision 5 (SHA-256) or 6 (algorithm 2.B) password hash.
     fn hash_r56(&self, password: &[u8], salt: &[u8], user_key: &[u8]) -> Option<[u8; 32]> {
-        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
         use sha2::{Digest, Sha256, Sha384, Sha512};
         let password = &password[..password.len().min(127)];
         let mut k: Vec<u8> = Sha256::new()
@@ -407,7 +407,10 @@ impl Security {
                     for (b, v) in block.iter_mut().zip(iv) {
                         *b ^= v;
                     }
-                    cipher.encrypt_block(block.into());
+                    let Ok(block): Result<&mut aes::Block, _> = block.try_into() else {
+                        return None;
+                    };
+                    cipher.encrypt_block(&mut *block);
                     iv.copy_from_slice(block);
                 }
                 let modulo = k1[..16].iter().map(|b| u32::from(*b)).sum::<u32>() % 3;
@@ -452,6 +455,11 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether the file declares an encryption dictionary.
+pub(crate) fn is_encrypted(data: &[u8]) -> bool {
+    rfind_key(data, b"/Encrypt").is_some()
 }
 
 /// The last `key` name that is not the start of a longer name
@@ -503,14 +511,19 @@ fn parse_dict(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
         }
         let key = String::from_utf8_lossy(&data[start..i]).into_owned();
         i = skip_ws(data, i);
-        let end = value_end(data, i)?;
+        let end = value_end(data, i, 0)?;
         out.push((key, data[i..end].to_vec()));
         i = end;
     }
 }
 
-/// Where the value starting at `i` ends.
-fn value_end(data: &[u8], i: usize) -> Option<usize> {
+/// How deeply arrays may nest in an encryption dictionary; real ones nest
+/// one or two levels.
+const MAX_ARRAY_DEPTH: usize = 64;
+
+/// Where the value starting at `i`, inside `arrays` arrays, ends; `None` when
+/// none starts there or arrays nest more than [`MAX_ARRAY_DEPTH`] deep.
+fn value_end(data: &[u8], i: usize, arrays: usize) -> Option<usize> {
     match *data.get(i)? {
         b'(' => {
             let (mut depth, mut j) = (0, i);
@@ -542,7 +555,7 @@ fn value_end(data: &[u8], i: usize) -> Option<usize> {
                         return Some(j);
                     }
                 } else if data[j] == b'(' {
-                    j = value_end(data, j)?;
+                    j = value_end(data, j, arrays)?;
                 } else {
                     j += 1;
                 }
@@ -551,13 +564,16 @@ fn value_end(data: &[u8], i: usize) -> Option<usize> {
         }
         b'<' => Some(i + find(&data[i..], b">")? + 1),
         b'[' => {
+            if arrays == MAX_ARRAY_DEPTH {
+                return None;
+            }
             let mut j = i + 1;
             loop {
                 j = skip_ws(data, j);
                 if *data.get(j)? == b']' {
                     return Some(j + 1);
                 }
-                j = value_end(data, j)?;
+                j = value_end(data, j, arrays + 1)?;
             }
         }
         b'/' => {
@@ -578,6 +594,10 @@ fn value_end(data: &[u8], i: usize) -> Option<usize> {
                 .is_some_and(|c| !c.is_ascii_whitespace() && !b"/<>[]()".contains(c))
             {
                 j += 1;
+            }
+            if j == i {
+                // A delimiter that starts no value, such as a stray `>`.
+                return None;
             }
             let save = j;
             let reference = read_int(data, skip_ws(data, j)).filter(|_| data[i].is_ascii_digit());
@@ -686,5 +706,50 @@ mod tests {
         assert_eq!((s.revision, s.key_len), (2, 5));
         assert_eq!(s.owner, b"a)b");
         assert_eq!(s.user, [1, 2]);
+    }
+
+    /// A file whose trailer holds the encryption dictionary `dict`.
+    fn with_encrypt(dict: &str) -> Vec<u8> {
+        format!("%PDF-1.4\ntrailer\n<< /Encrypt {dict} >>\n%%EOF\n").into_bytes()
+    }
+
+    /// `f`'s result, run on its own thread, so that a read that never ends
+    /// fails the test instead of stopping the run.
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read did not end")
+    }
+
+    #[test]
+    fn a_value_that_is_only_a_delimiter_ends_the_read() {
+        for value in ["[>]", "[)]", "[(a) >]", "[[)]]"] {
+            let dict = format!("<< /Filter /Standard /V 1 /R 2 /O {value} /U (x) >>");
+            let file = with_encrypt(&dict);
+            assert!(
+                within_ten_seconds(move || Security::read(&file).is_none()),
+                "{value}"
+            );
+        }
+        // The file prompts of PDFATTACH and PDFIMPORT read every file so.
+        let path = "pdf-password-stray-delimiter.pdf";
+        let file = with_encrypt("<< /Filter /Standard /O [>] >>");
+        crate::scene::model::pdf_raster::register_source(path, Arc::new(file));
+        assert_eq!(within_ten_seconds(move || gate(path, true)), Gate::Open);
+        assert_eq!(within_ten_seconds(move || reopened_notice(path)), None);
+    }
+
+    #[test]
+    fn arrays_nested_too_deeply_end_the_read() {
+        let entries = |depth: usize| {
+            let o = format!("{}(a){}", "[".repeat(depth), "]".repeat(depth));
+            parse_dict(format!("<< /O {o} /U (x) >>").as_bytes()).map(|e| e.len())
+        };
+        assert_eq!(entries(1), Some(2));
+        assert_eq!(entries(MAX_ARRAY_DEPTH), Some(2));
+        assert_eq!(entries(MAX_ARRAY_DEPTH + 1), None);
+        // Each level was a call: this many overflowed the stack.
+        assert_eq!(entries(1_000_000), None);
     }
 }

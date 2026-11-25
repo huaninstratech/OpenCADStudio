@@ -6,10 +6,12 @@
 //! [`complex_lt`] returns the complex segment catalog for CPU-side rendering.
 
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 
-use codec::tables::linetype::{LineType, LineTypeComplexContent, LineTypeElement};
-use codec::{Document, TableEntry};
+use document::tables::linetype::{LineType, LineTypeComplexContent, LineTypeElement};
+use document::{Document, TableEntry};
+
+pub mod writer;
 
 // ── Complex linetype types ────────────────────────────────────────────────
 
@@ -28,7 +30,7 @@ pub enum LtRotation {
 }
 
 impl LtRotation {
-    fn of(data: &codec::tables::linetype::LineTypeComplexData) -> Self {
+    fn of(data: &document::tables::linetype::LineTypeComplexData) -> Self {
         if data.upright {
             Self::Upright
         } else if data.absolute_rotation {
@@ -93,14 +95,70 @@ pub struct ComplexLt {
     pub segments: Vec<LtSegment>,
 }
 
-static COMPLEX_CATALOG: OnceLock<HashMap<String, ComplexLt>> = OnceLock::new();
+/// Everything read from the bundled and the user's `.lin` files. Replaced as
+/// one piece by [`refresh_catalog`], so a reader never sees half of a reload.
+struct Catalog {
+    source: String,
+    complex: HashMap<String, ComplexLt>,
+    /// (name, description), the first definition of a name only.
+    entries: Vec<(String, String)>,
+}
+
+impl Catalog {
+    fn from_source(source: String) -> Self {
+        let complex = parse_complex(&source);
+        let mut seen = std::collections::HashSet::new();
+        let entries = parse(&source)
+            .into_iter()
+            .filter(|lt| seen.insert(lt.name.to_ascii_uppercase()))
+            .map(|lt| (lt.name, lt.description))
+            .collect();
+        Self {
+            source,
+            complex,
+            entries,
+        }
+    }
+
+    /// The bundled linetypes followed by the user's own `.lin` files.
+    fn load() -> Self {
+        Self::from_source(format!(
+            "{LIN_SOURCE}\n{}",
+            crate::io::patterns::user_definitions("linetypes", "lin")
+        ))
+    }
+}
+
+static CATALOG: RwLock<Option<Arc<Catalog>>> = RwLock::new(None);
+
+fn catalog() -> Arc<Catalog> {
+    let current = CATALOG
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    current.unwrap_or_else(|| {
+        let loaded = Arc::new(Catalog::load());
+        CATALOG
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert(loaded)
+            .clone()
+    })
+}
+
+/// Read the user's `.lin` files again. A drawing keeps the definitions it
+/// already holds; only what it would load next changes.
+pub fn refresh_catalog() {
+    let loaded = Arc::new(Catalog::load());
+    *CATALOG
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(loaded);
+}
 
 /// Look up a complex linetype by name (case-insensitive).
 /// Returns `None` for simple (dash-only) linetypes or unknown names.
-pub fn complex_lt(name: &str) -> Option<&'static ComplexLt> {
-    COMPLEX_CATALOG
-        .get_or_init(|| parse_complex(lin_source()))
-        .get(&name.to_ascii_uppercase())
+pub fn complex_lt(name: &str) -> Option<ComplexLt> {
+    catalog().complex.get(&name.to_ascii_uppercase()).cloned()
 }
 
 /// Build the full segment list — dashes, spaces, dots **and** embedded
@@ -185,12 +243,7 @@ pub fn document_lt_segments(document: &Document, name: &str) -> Option<ComplexLt
                         .map(std::path::Path::new)
                         .and_then(|p| p.parent());
                     let resolved = (!font.is_empty())
-                        .then(|| {
-                            crate::io::resolve_image_file(&font, base).or_else(|| {
-                                crate::io::font_repo::local_font_file(&font)
-                                    .map(|path| path.to_string_lossy().into_owned())
-                            })
-                        })
+                        .then(|| find_shape_file(&font, base))
                         .flatten();
                     // The standard ltypeshp.shx numbers (and the bundled
                     // catalog's own) map to the LFF substitute shapes, so the
@@ -232,23 +285,31 @@ pub fn document_complex_lt(document: &Document, name: &str) -> Option<ComplexLt>
         .line_types
         .iter()
         .find(|l| l.name.eq_ignore_ascii_case(name))?;
-    // Treat the linetype as complex only when an element carries *renderable*
-    // embedded content — a non-empty text string, or a shape backed by a shape
-    // file. Some DWGs store dash elements with a placeholder `complex` (shape
-    // #0, null style handle, zero scale) that draws nothing; routing those
-    // through the CPU complex-linetype path needlessly skips the normal dash
-    // shader — and with it the "A"-type endpoint alignment. Fall through to the
-    // ordinary `resolve_pattern` path for them.
-    let has_real_complex = lt.elements.iter().any(|e| {
+    if !has_real_complex(lt) {
+        return None;
+    }
+    document_lt_segments(document, name)
+}
+
+/// Treat a linetype as complex only when an element carries *renderable*
+/// embedded content — a non-empty text string, or a shape backed by a shape
+/// file. Some DWGs store dash elements with a placeholder `complex` (shape
+/// #0, null style handle, zero scale) that draws nothing; routing those
+/// through the CPU complex-linetype path needlessly skips the normal dash
+/// shader — and with it the "A"-type endpoint alignment. Fall through to the
+/// ordinary `resolve_pattern` path for them.
+fn has_real_complex(lt: &LineType) -> bool {
+    lt.elements.iter().any(|e| {
         e.complex.as_ref().is_some_and(|cx| match &cx.content {
             LineTypeComplexContent::Text { text } => !text.trim().is_empty(),
             LineTypeComplexContent::Shape { .. } => !cx.style_handle.is_null(),
         })
-    });
-    if !has_real_complex {
-        return None;
-    }
-    document_lt_segments(document, name)
+    })
+}
+
+/// Whether the drawing's linetype table holds a complex linetype.
+pub fn defines_complex_lt(document: &Document) -> bool {
+    document.line_types.iter().any(has_real_complex)
 }
 
 /// Resolve a complex linetype honouring "**document first, bundled catalog
@@ -263,22 +324,11 @@ pub fn resolve_complex_lt(document: &Document, name: &str) -> Option<ComplexLt> 
     if in_document {
         document_complex_lt(document, name)
     } else {
-        complex_lt(name).cloned()
+        complex_lt(name)
     }
 }
 
 const LIN_SOURCE: &str = include_str!("../../assets/linetypes/OpenCADStudio.lin");
-
-/// The bundled linetypes followed by the user's own `.lin` files.
-fn lin_source() -> &'static str {
-    static SOURCE: OnceLock<String> = OnceLock::new();
-    SOURCE.get_or_init(|| {
-        format!(
-            "{LIN_SOURCE}\n{}",
-            crate::io::patterns::user_definitions("linetypes", "lin")
-        )
-    })
-}
 
 // ── Pattern art extraction ────────────────────────────────────────────────
 
@@ -303,43 +353,144 @@ pub fn extract_pattern(desc: &str) -> String {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Add all standard OpenCADStudio linetypes to `doc`, skipping existing ones.
+/// Add the standard OpenCADStudio linetypes to `doc`, skipping existing ones.
+/// Linetypes drawing a shape only the bundled substitutes define (see
+/// [`is_own_shape`]) stay out: a new drawing would name a shape file no other
+/// reader can supply. The pickers still offer them ([`catalog_missing_from`]).
 pub fn populate_document(doc: &mut Document) {
-    populate_document_from_source(doc, lin_source(), None);
+    let source = &catalog().source;
+    let complex = parse_complex(source);
+    populate_matching(doc, source, None, |name| {
+        complex
+            .get(&name.to_ascii_uppercase())
+            .is_none_or(|lt| {
+                !lt.segments.iter().any(|seg| {
+                    matches!(seg, LtSegment::Shape { name, shx_file, .. }
+                        if is_own_shape(shx_file, name))
+                })
+            })
+    });
+}
+
+/// Whether `name` in shape file `file` is one of the bundled shapes whose
+/// file or number exists only in this application (everything in
+/// [`BUNDLED_SHAPES`] but the standard `ltypeshp` 130–134).
+fn is_own_shape(file: &str, name: &str) -> bool {
+    let stem = shape_file_stem(file);
+    BUNDLED_SHAPES.iter().any(|(f, shape, number)| {
+        *f == stem && shape.eq_ignore_ascii_case(name) && !(*f == "ltypeshp" && *number <= 134)
+    })
 }
 
 /// Repair the catalog linetypes `doc` already has (see
 /// [`populate_document_from_source`]) without adding any: an opened drawing
 /// keeps exactly its own linetypes, so a purged one stays purged.
 pub fn repair_document(doc: &mut Document) {
-    populate_matching(doc, lin_source(), None, |_| false);
+    populate_matching(doc, &catalog().source, None, |_| false);
 }
 
 /// The catalog linetypes `doc` does not have, as (name, description): what a
 /// picker offers beside the drawing's own. Picking one loads it with
 /// [`ensure_catalog_linetype`].
 pub fn catalog_missing_from(doc: &Document) -> Vec<(String, String)> {
-    static CATALOG: OnceLock<Vec<(String, String)>> = OnceLock::new();
-    CATALOG
-        .get_or_init(|| {
-            parse(lin_source())
-                .into_iter()
-                .map(|lt| (lt.name, lt.description))
-                .collect()
-        })
+    catalog()
+        .entries
         .iter()
         .filter(|(name, _)| !doc.line_types.contains(name))
         .cloned()
         .collect()
 }
 
+/// Whether the catalog defines a linetype called `name`.
+pub fn catalog_has(name: &str) -> bool {
+    catalog()
+        .entries
+        .iter()
+        .any(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+}
+
 /// Load catalog linetype `name` into `doc` when the drawing lacks it.
 /// Returns whether it was added.
 pub fn ensure_catalog_linetype(doc: &mut Document, name: &str) -> bool {
     !doc.line_types.contains(name)
-        && populate_matching(doc, lin_source(), None, |candidate| {
+        && populate_matching(doc, &catalog().source, None, |candidate| {
             candidate.eq_ignore_ascii_case(name)
         }) > 0
+}
+
+/// The program's linetype definitions (the bundled ones and the user's own
+/// `.lin` files), as a `.lin` source.
+pub fn catalog_source() -> String {
+    catalog().source.clone()
+}
+
+/// The linetypes a `.lin` source defines, in file order, the first
+/// definition of a name only: name, description and dash lengths.
+pub fn source_entries(source: &str) -> Vec<(String, String, Vec<f64>)> {
+    let mut seen = std::collections::HashSet::new();
+    parse(source)
+        .into_iter()
+        .filter(|lt| seen.insert(lt.name.to_ascii_uppercase()))
+        .map(|lt| {
+            let lengths = lt.elements.iter().map(|e| e.length).collect();
+            (lt.name, lt.description, lengths)
+        })
+        .collect()
+}
+
+/// Add the linetypes `names` of a `.lin` source the drawing does not have
+/// yet (see [`populate_document_from_source`]). Returns how many were added.
+pub fn populate_document_named(
+    doc: &mut Document,
+    source: &str,
+    lin_dir: Option<&std::path::Path>,
+    names: &[String],
+) -> usize {
+    populate_matching(doc, source, lin_dir, |candidate| {
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(candidate))
+    })
+}
+
+/// Read the linetypes `names` the drawing has again from a `.lin` source:
+/// their description and pattern become the source's, their handle and
+/// name stay. Returns how many were read.
+pub fn reload_document_named(
+    doc: &mut Document,
+    source: &str,
+    lin_dir: Option<&std::path::Path>,
+    names: &[String],
+) -> usize {
+    if names.is_empty() {
+        return 0;
+    }
+    let complex = parse_complex(source);
+    let mut seen = std::collections::HashSet::new();
+    let mut reloaded = 0;
+    for mut lt in parse(source) {
+        // The first definition of a name is the one offered.
+        if !seen.insert(lt.name.to_ascii_uppercase())
+            || !names.iter().any(|name| name.eq_ignore_ascii_case(&lt.name))
+            || doc.line_types.get(&lt.name).is_none()
+        {
+            continue;
+        }
+        if let Some(elements) = complex
+            .get(&lt.name.to_ascii_uppercase())
+            .and_then(|s| complex_elements(doc, s, &lt.elements, lin_dir))
+        {
+            lt.elements = elements;
+        }
+        if let Some(existing) = doc.line_types.get_mut(&lt.name) {
+            existing.description = lt.description;
+            existing.elements = lt.elements;
+            existing.pattern_length = lt.pattern_length;
+            existing.alignment = lt.alignment;
+            reloaded += 1;
+        }
+    }
+    reloaded
 }
 
 /// Add the linetypes of a caller-supplied `.lin` source, embedded shapes and
@@ -460,21 +611,37 @@ pub fn is_bundled_shape_file(file: &str) -> bool {
     BUNDLED_SHAPES.iter().any(|(f, _, _)| *f == stem)
 }
 
-/// The shape file a `.lin` names, found as written, next to the `.lin`
-/// (in any letter case, as the names in a `.lin` rarely match the files'),
-/// or in the fonts folder.
-fn find_shape_file(file: &str, lin_dir: Option<&std::path::Path>) -> Option<String> {
+fn file_named(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name)
+        })
+        .map(|entry| entry.path())
+}
+
+/// A shape file found as written, next to its drawing or `.lin` catalog (in
+/// any letter case, as stored references rarely match the files' case), in an
+/// AutoCAD-style transmittal `Fonts` folder, or in the configured font folders.
+pub(crate) fn find_shape_file(file: &str, lin_dir: Option<&std::path::Path>) -> Option<String> {
     if let Some(found) = crate::io::resolve_image_file(file, lin_dir) {
         return Some(found);
     }
     let name = file.rsplit(['/', '\\']).next()?;
     lin_dir
-        .and_then(|dir| {
-            std::fs::read_dir(dir)
-                .ok()?
-                .filter_map(Result::ok)
-                .find(|entry| entry.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-                .map(|entry| entry.path())
+        .and_then(|dir| file_named(dir, name))
+        .or_else(|| {
+            crate::io::font_repo::packaged_font_dirs(lin_dir)
+                .into_iter()
+                .find_map(|dir| file_named(&dir, name))
         })
         .or_else(|| crate::io::font_repo::local_font_file(name))
         .map(|path| path.to_string_lossy().into_owned())
@@ -482,7 +649,7 @@ fn find_shape_file(file: &str, lin_dir: Option<&std::path::Path>) -> Option<Stri
 
 /// The drawing's shape-file STYLE for `file`, added when missing (an empty
 /// name, as shape files are stored).
-fn shape_file_style(doc: &mut Document, file: &str) -> codec::Handle {
+fn shape_file_style(doc: &mut Document, file: &str) -> document::Handle {
     if let Some(style) = doc
         .text_styles
         .iter()
@@ -490,7 +657,7 @@ fn shape_file_style(doc: &mut Document, file: &str) -> codec::Handle {
     {
         return style.handle;
     }
-    let mut style = codec::tables::TextStyle::new("");
+    let mut style = document::tables::TextStyle::new("");
     style.handle = doc.allocate_handle();
     style.is_shape_file = true;
     style.font_file = file.to_string();
@@ -514,7 +681,7 @@ fn complex_elements(
     plain: &[LineTypeElement],
     lin_dir: Option<&std::path::Path>,
 ) -> Option<Vec<LineTypeElement>> {
-    use codec::tables::linetype::LineTypeComplexData;
+    use document::tables::linetype::LineTypeComplexData;
     let mut out: Vec<LineTypeElement> = Vec::new();
     let mut lengths = plain.iter();
     for segment in &lt.segments {
@@ -708,9 +875,8 @@ fn parse_complex(src: &str) -> HashMap<String, ComplexLt> {
         }
 
         if let Some(rest) = line.strip_prefix('*') {
-            if let Some((name, desc)) = rest.split_once(',') {
-                current = Some((name.trim().to_string(), desc.trim().to_string()));
-            }
+            let (name, desc) = rest.split_once(',').unwrap_or((rest, ""));
+            current = Some((name.trim().to_string(), desc.trim().to_string()));
         } else if line.to_ascii_uppercase().starts_with('A') {
             let Some((name, _desc)) = current.take() else {
                 continue;
@@ -927,7 +1093,7 @@ fn push_lt_segment(token: &str, out: &mut Vec<LtSegment>) {
 #[cfg(test)]
 mod header_tests {
     use super::{parse, populate_document_from_source};
-    use codec::Document;
+    use document::Document;
 
     /// A `.lin` header's description is optional, and without one the comma
     /// goes too: `*PLAIN` followed by its `A,` line is a whole definition.
@@ -979,7 +1145,11 @@ mod rotation_tests {
 #[cfg(test)]
 mod shape_file_tests {
     use super::{document_complex_lt, populate_document_from_source, LtSegment};
-    use codec::Document;
+    use document::tables::linetype::{
+        LineType, LineTypeComplexContent, LineTypeComplexData, LineTypeElement,
+    };
+    use document::tables::TextStyle;
+    use document::Document;
 
     /// A `.lin` shape from its own shape file (not one of the bundled
     /// substitutes) loads with the shape it names, the file found next to
@@ -1002,12 +1172,57 @@ mod shape_file_tests {
         populate_document_from_source(&mut doc, source, Some(&dir));
         let lt = document_complex_lt(&doc, "TICKS").expect("the shape was dropped");
         let shape = lt.segments.iter().find_map(|s| match s {
-            LtSegment::Shape { number, shx_file, .. } => Some((*number, shx_file.clone())),
+            LtSegment::Shape {
+                number, shx_file, ..
+            } => Some((*number, shx_file.clone())),
             _ => None,
         });
         let _ = std::fs::remove_dir_all(&dir);
         let (number, file) = shape.expect("no shape segment");
         assert_eq!(number, 7);
         assert!(file.to_ascii_lowercase().ends_with("tst.shx"), "{file}");
+    }
+
+    /// A document linetype uses the same case-insensitive sibling lookup as a
+    /// `.lin` catalog (#2804's `NLCS.SHX` reference and `NLCS.shx` file).
+    #[test]
+    fn a_document_shape_is_found_next_to_the_drawing_in_any_letter_case() {
+        let dir = std::env::temp_dir().join(format!("ocs-dwg-lt-shx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("NLCS.shx"), b"shape file").unwrap();
+
+        let mut doc = Document::new();
+        doc.source_path = Some(dir.join("drawing.dwg").to_string_lossy().into_owned());
+        let mut style = TextStyle::new("");
+        style.handle = doc.allocate_handle();
+        style.is_shape_file = true;
+        style.font_file = "NLCS.SHX".into();
+        let style_handle = style.handle;
+        doc.text_styles.add(style).unwrap();
+        let mut lt = LineType::new("XX-WERKGRENS");
+        lt.handle = doc.allocate_handle();
+        lt.add_element(LineTypeElement {
+            length: 0.0,
+            complex: Some(LineTypeComplexData {
+                content: LineTypeComplexContent::Shape { shape_number: 137 },
+                style_handle,
+                scale: 0.5,
+                ..Default::default()
+            }),
+        });
+        lt.add_element(LineTypeElement::space(30.0));
+        doc.line_types.add(lt).unwrap();
+
+        let lt = document_complex_lt(&doc, "XX-WERKGRENS").expect("complex linetype");
+        let file = lt.segments.iter().find_map(|segment| match segment {
+            LtSegment::Shape { shx_file, .. } => Some(shx_file.clone()),
+            _ => None,
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            file.as_ref()
+                .is_some_and(|file| file.to_ascii_lowercase().ends_with("nlcs.shx")),
+            "{file:?}"
+        );
     }
 }

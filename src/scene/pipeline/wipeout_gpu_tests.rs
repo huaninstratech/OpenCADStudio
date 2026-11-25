@@ -69,6 +69,8 @@ fn thousand_wipeouts_share_bind_groups() {
     });
     let models: Vec<_> = (0..1000)
         .map(|index| HatchModel {
+            entity: None,
+            effective_layer: None,
             pattern_origin: None,
             render_instance: None,
             world_origin: [index as f64 * 2.0, 0.0],
@@ -79,7 +81,7 @@ fn thousand_wipeouts_share_bind_groups() {
             boundary_exterior: None,
             boundary_sources: None,
             boundary_paths: None,
-            style: codec::entities::HatchStyleType::Normal,
+            style: document::entities::HatchStyleType::Normal,
             pattern: HatchPattern::Solid,
             name: "WIPEOUT".into(),
             color: [0.0, 0.0, 0.0, 1.0],

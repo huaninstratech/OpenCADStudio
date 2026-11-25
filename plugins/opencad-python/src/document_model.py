@@ -154,8 +154,9 @@ class _Solids:
     def union(self, first, second, layer=None, keep_operands=False):
         """Join two solids into a new one. The operands are consumed unless
         `keep_operands`. The kernel may refuse (the error says why) and a
-        refusal changes nothing. Curved operands can take a second or two,
-        and a whole script has a 30 second budget."""
+        refusal changes nothing.         Curved operands can take a second or two,
+        and a whole script has a 60 second budget (the host's ExecuteCode
+        floor; OCS_PLUGIN_EXECUTE_TIMEOUT_SECS can only raise it)."""
         return self._boolean("union", first, second, layer, keep_operands)
 
     def subtract(self, first, second, layer=None, keep_operands=False):
@@ -579,6 +580,14 @@ class _Layouts(_Named):
         ocs.layout_operation("set_page", str(name), options)
         return self[name]
 
+    def set_tab_order(self, names):
+        """Put the paper-space layout tabs in this order: `names` lists every
+        paper-space layout once (`Model` stays first and is not listed)."""
+        if isinstance(names, str):
+            raise TypeError("set_tab_order takes a list of layout names")
+        ocs.layout_operation("set_tab_order", "", {"names": [str(n) for n in names]})
+        return self.names()
+
 
 def _pt(value):
     """A point as [x, y, z] from a tuple, list or {"x", "y", "z"} dict."""
@@ -892,7 +901,7 @@ class _Modify:
             c.token("J")
             self._select(others)
             c.selection()
-            if c.waiting and "Join" in c.outcome["prompt"]:
+            if c.waiting:
                 c.enter()
         return self._pedit(entity, [join], at)
 
@@ -980,6 +989,16 @@ class _Document:
 
     def poll_input(self, token):
         return ocs.poll_input(token)
+
+    def request_drag(self, prompts, wires=(), preview="line", state="", resume=True):
+        if isinstance(prompts, str):
+            raise TypeError("prompts must be a list of strings, one per point")
+        wires = [[[float(value) for value in point] for point in wire] for wire in wires]
+        return ocs.request_drag([str(prompt) for prompt in prompts], wires, str(preview), str(state), bool(resume))
+
+    def resume(self):
+        token = ocs.resume_token()
+        return None if token is None else ocs.poll_input(token)
 
     @property
     def selection(self):

@@ -3,9 +3,7 @@
 #![allow(unused_imports)]
 use super::util::*;
 use super::{format_size, VIEWCUBE_HIT_SIZE};
-use crate::app::helpers::{
-    parse_coord, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind,
-};
+use crate::app::helpers::{parse_coord, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind};
 use crate::app::{Message, OpenCADStudio, POLY_START_DELAY_MS};
 use crate::modules::ModuleEvent;
 use crate::scene::model::object::GripApply;
@@ -14,8 +12,8 @@ use crate::scene::{
     self, hover_id, CubeRegion, Scene, VIEWCUBE_DRAW_PX, VIEWCUBE_PAD, VIEWCUBE_PX,
 };
 use crate::ui::PropertiesPanel;
-use codec::types::Color as AcadColor;
-use codec::{EntityType as AcadEntityType, Handle};
+use document::types::Color as AcadColor;
+use document::{EntityType as AcadEntityType, Handle};
 use iced::time::Instant;
 use iced::{mouse, Point, Task};
 
@@ -69,7 +67,7 @@ impl OpenCADStudio {
     /// command's `dyn_field()` or the presence of a base point changes;
     /// existing typed buffers survive an unchanged shape.
     pub(in crate::app) fn sync_dyn_fields(&mut self) {
-        use crate::app::document::{DynComponent, DynFieldEntry};
+        use crate::app::tab_document::{DynComponent, DynFieldEntry};
         let i = self.active_tab;
 
         if !self.dyn_input {
@@ -119,6 +117,14 @@ impl OpenCADStudio {
                     (grip.origin_world, None)
                 }
             });
+        // A plugin grip drags like a native stretch grip.
+        #[cfg(not(target_arch = "wasm32"))]
+        let grip_input = grip_input.or_else(|| {
+            self.tabs[i]
+                .active_plugin_grip
+                .as_ref()
+                .map(|grip| (grip.origin_world, None))
+        });
 
         if let Some((origin, scalar_role)) = grip_input {
             let wanted_roles: Vec<crate::command::DynRole> = if rectangle_frame.is_some() {
@@ -230,10 +236,21 @@ impl OpenCADStudio {
             // command line — show no scalar box, so digits reach the command
             // line instead of being captured into a dyn buffer.
             crate::command::DynField::Point if wants_text || picks_object => vec![],
-            crate::command::DynField::Point if has_base => {
-                vec![DynComponent::Distance, DynComponent::Angle]
+            // A second point: dimension input when it is on, else pointer
+            // input in its format for second points.
+            crate::command::DynField::Point
+                if has_base && (self.dyn_dimension_input() || !self.dyn_pointer_cartesian) =>
+            {
+                if self.dyn_dimension_input() || self.dyn_pointer_input() {
+                    vec![DynComponent::Distance, DynComponent::Angle]
+                } else {
+                    vec![]
+                }
             }
-            crate::command::DynField::Point => vec![DynComponent::X, DynComponent::Y],
+            crate::command::DynField::Point if self.dyn_pointer_input() => {
+                vec![DynComponent::X, DynComponent::Y]
+            }
+            crate::command::DynField::Point => vec![],
         };
         // Multiple shapes can satisfy the same command request — e.g. a
         // `Point` is happy with either `[Distance, Angle]` (polar) or
@@ -297,9 +314,8 @@ impl OpenCADStudio {
     /// Apply an explicit per-step [`DynSpec`](crate::command::DynSpec): rebuild
     /// the boxes from its roles (preserving typed buffers when the role set is
     /// unchanged), and set the guide + anchor.
-
     pub(in crate::app) fn apply_dyn_spec(&mut self, i: usize, spec: crate::command::DynSpec) {
-        use crate::app::document::DynFieldEntry;
+        use crate::app::tab_document::DynFieldEntry;
         let new_roles: Vec<crate::command::DynRole> = spec.fields.iter().map(|f| f.role).collect();
         let cur_roles: Vec<crate::command::DynRole> =
             self.tabs[i].dyn_fields.iter().map(|f| f.role).collect();
@@ -319,13 +335,13 @@ impl OpenCADStudio {
         self.tabs[i].dyn_ref = spec.ref_point;
     }
 
-    /// Track cursor dwell over a selected entity's grip. Sets
-    /// `grip_hover` while the cursor sits within `GRIP_THRESHOLD_PX` of
-    /// a grip and opens `grip_popup` once the dwell exceeds the
-    /// threshold. Cursor drift clears both.
-    /// After the active Model tile changes, mirror its stored visual style
-    /// into the tab so the picker shows it and the tile renders with it
-    /// (the active tile draws with the tab's live render mode).
+    // Track cursor dwell over a selected entity's grip. Sets
+    // `grip_hover` while the cursor sits within `GRIP_THRESHOLD_PX` of
+    // a grip and opens `grip_popup` once the dwell exceeds the
+    // threshold. Cursor drift clears both.
+    // After the active Model tile changes, mirror its stored visual style
+    // into the tab so the picker shows it and the tile renders with it
+    // (the active tile draws with the tab's live render mode).
 
     /// Resolve the world point implied by the current dynamic-input field
     /// values. Locked fields use their typed buffer; the rest fall back to
@@ -356,13 +372,13 @@ impl OpenCADStudio {
     /// following `ARC_CONT` starts tangentially from where drawing ended. Set to
     /// `None` for any other entity kind. Uses `last_point` (the final pick) to
     /// pick the endpoint the pen actually finished on.
-    pub(in crate::app) fn update_cont_anchor(&mut self, entity: &codec::EntityType) {
+    pub(in crate::app) fn update_cont_anchor(&mut self, entity: &document::EntityType) {
         let last = self.last_point;
         self.cont_anchor = crate::modules::draw::draw::arc::continue_anchor(entity, last);
     }
 
     pub(in crate::app) fn dyn_resolve_point(&self) -> Option<glam::DVec3> {
-        use crate::app::document::DynComponent;
+        use crate::app::tab_document::DynComponent;
         let i = self.active_tab;
         let fields = &self.tabs[i].dyn_fields;
         if fields.is_empty() {
@@ -417,6 +433,7 @@ impl OpenCADStudio {
         let dy = d_ucs.y;
         let dz = d_ucs.z;
         let live_d = (dx * dx + dy * dy).sqrt();
+        let along_z = dz.abs() > 0.0 && live_d <= dz.abs() * 1e-6;
         let live_a = dy.atan2(dx); // radians, in the UCS plane
                                    // A typed angle is shown unsigned (0..180); give it the sign of the
                                    // cursor's current side so an entry made below the X axis sweeps
@@ -439,6 +456,18 @@ impl OpenCADStudio {
             }
         };
         let comps: Vec<DynComponent> = fields.iter().map(|f| f.component).collect();
+        // A rotated rectangle step: W/H measure along the rectangle's own axes.
+        if self.tabs[i].active_grip.is_none()
+            && !comma_cartesian
+            && comps == [DynComponent::X, DynComponent::Y]
+        {
+            if let Some((corner, width_axis, height_axis)) = self.tabs[i].dyn_rect_frame() {
+                let delta = w - corner;
+                let width = val(0, delta.dot(width_axis));
+                let height = val(1, delta.dot(height_axis));
+                return Some(corner + width_axis * width + height_axis * height);
+            }
+        }
         // Perpendicular offset: a single distance measured square to the
         // reference line (anchor → dyn_ref). The committed point lies on the
         // perpendicular through the anchor at that offset; the command projects
@@ -470,15 +499,31 @@ impl OpenCADStudio {
             [DynComponent::X, DynComponent::Y] if relative => {
                 Some(rel(glam::DVec3::new(val(0, dx), val(1, dy), 0.0)))
             }
+            [DynComponent::X, DynComponent::Y] if self.dyn_coord_wcs => {
+                Some(glam::DVec3::new(val(0, w.x), val(1, w.y), 0.0))
+            }
             [DynComponent::X, DynComponent::Y] => {
                 Some(xf.to_wcs(glam::DVec3::new(val(0, w_ucs.x), val(1, w_ucs.y), 0.0)))
             }
             [DynComponent::X, DynComponent::Y, DynComponent::Z] if relative => {
                 Some(rel(glam::DVec3::new(val(0, dx), val(1, dy), val(2, dz))))
             }
+            [DynComponent::X, DynComponent::Y, DynComponent::Z] if self.dyn_coord_wcs => {
+                Some(glam::DVec3::new(val(0, w.x), val(1, w.y), val(2, w.z)))
+            }
             [DynComponent::X, DynComponent::Y, DynComponent::Z] => Some(xf.to_wcs(
                 glam::DVec3::new(val(0, w_ucs.x), val(1, w_ucs.y), val(2, w_ucs.z)),
             )),
+            // Tracking straight up or down (#2796): the cursor has no
+            // direction in the plane, so a typed distance goes along Z.
+            [DynComponent::Distance, DynComponent::Angle]
+                if along_z && fields[1].buffer.is_none() =>
+            {
+                Some(rel(glam::DVec3::Z * val(0, dz.abs()).copysign(dz)))
+            }
+            [DynComponent::Distance] if along_z => {
+                Some(rel(glam::DVec3::Z * val(0, dz.abs()).copysign(dz)))
+            }
             [DynComponent::Distance, DynComponent::Angle] => {
                 let d = val(0, live_d);
                 let a = angle_rad(1);
@@ -515,9 +560,8 @@ impl OpenCADStudio {
     /// configuration becomes cartesian `[X(buf), Y]`, and a cartesian
     /// `[X, Y]` configuration extends to `[X, Y, Z]`. Default fallthrough
     /// is "advance to next field", matching `Tab`. See #35.
-
     pub(in crate::app) fn dyn_comma_advance(&mut self) {
-        use crate::app::document::{DynComponent, DynFieldEntry};
+        use crate::app::tab_document::{DynComponent, DynFieldEntry};
         let i = self.active_tab;
         if self.tabs[i].dyn_fields.is_empty() {
             return;
@@ -564,10 +608,30 @@ impl OpenCADStudio {
         }
     }
 
+    /// DYNPIVIS 0: a pointer input tooltip stays hidden until a coordinate is
+    /// typed. Pointer input is a coordinate set, or the polar pair standing
+    /// in for dimension input when that is off.
+    pub(in crate::app) fn dyn_pointer_tooltip_hidden(&self, i: usize) -> bool {
+        use crate::app::tab_document::DynComponent;
+        let fields = &self.tabs[i].dyn_fields;
+        if !self.dyn_pointer_on_type
+            || fields.is_empty()
+            || fields.iter().any(|field| field.buffer.is_some())
+        {
+            return false;
+        }
+        let comps: Vec<DynComponent> = fields.iter().map(|field| field.component).collect();
+        comps
+            .iter()
+            .all(|c| matches!(c, DynComponent::X | DynComponent::Y | DynComponent::Z))
+            || (!self.dyn_dimension_input()
+                && comps == [DynComponent::Distance, DynComponent::Angle])
+    }
+
     /// Whether the current dynamic field set represents a point coordinate
     /// that can be switched with `@` / `#`.
     pub(in crate::app) fn dyn_has_coordinate_fields(&self, i: usize) -> bool {
-        use crate::app::document::DynComponent;
+        use crate::app::tab_document::DynComponent;
         let comps: Vec<DynComponent> = self.tabs[i]
             .dyn_fields
             .iter()
@@ -588,7 +652,7 @@ impl OpenCADStudio {
     /// absolute (`#`) UCS coordinates. Polar fields become cartesian because
     /// the selected mode applies to coordinate components, not distance/angle.
     pub(in crate::app) fn dyn_set_coordinate_mode(&mut self, absolute: bool) {
-        use crate::app::document::{DynComponent, DynFieldEntry};
+        use crate::app::tab_document::{DynComponent, DynFieldEntry};
         let i = self.active_tab;
         self.dyn_coord_absolute = absolute;
 
@@ -622,7 +686,6 @@ impl OpenCADStudio {
     /// way the cursor is dragging. Only applies to steps with an `Angle` field;
     /// an explicit `+`/`-` is left untouched. Returns the (possibly re-signed)
     /// text to feed `on_text_input`.
-
     pub(in crate::app) fn dyn_sign_angle_text(&self, i: usize, text: String) -> String {
         let has_angle = self.tabs[i]
             .dyn_fields
@@ -693,7 +756,8 @@ impl OpenCADStudio {
                         }
                         self.tabs[i].dyn_active = 0;
                         self.dyn_user_reshaped = false;
-                        self.dyn_coord_absolute = false;
+                        self.dyn_coord_absolute = self.dyn_pointer_absolute;
+                        self.dyn_coord_wcs = false;
                         self.sync_dyn_fields();
                         self.reset_tracking_after_point();
                         self.snapper.clear_override();
@@ -768,7 +832,8 @@ impl OpenCADStudio {
         }
         self.last_point = Some(pt);
         self.dyn_user_reshaped = false;
-        self.dyn_coord_absolute = false;
+        self.dyn_coord_absolute = self.dyn_pointer_absolute;
+        self.dyn_coord_wcs = false;
         self.sync_dyn_fields();
         self.reset_tracking_after_point();
         self.snapper.clear_override();
@@ -798,7 +863,7 @@ impl OpenCADStudio {
         }
     }
 
-    /// Mutable access to the currently selected table style.
+    // Mutable access to the currently selected table style.
 
     /// Point modifiers keep their parked command's live wires and source hide-set.
     pub(in crate::app) fn point_modifier_preview(
@@ -806,10 +871,10 @@ impl OpenCADStudio {
         i: usize,
         cursor: glam::DVec3,
         tangent: Option<crate::command::TangentObject>,
-    ) -> Option<(Vec<crate::scene::WireModel>, Vec<codec::Handle>)> {
+    ) -> Option<(Vec<crate::scene::WireModel>, Vec<document::Handle>)> {
         let tab = &mut self.tabs[i];
         let modifier = tab.active_cmd.as_ref()?;
-        if !matches!(modifier.name(), "FROM" | "MTP") {
+        if !matches!(modifier.name(), "FROM" | "MTP" | "POINTFILTER" | "TRACKING") {
             return None;
         }
         tab.suspended_cmd.as_ref()?;
@@ -835,8 +900,10 @@ impl OpenCADStudio {
         } else {
             let mut wires = parent.on_preview_wires_with_tangent(cursor, tangent);
             wires.extend(parent.persistent_preview_wires());
-            let entities = parent.preview_entities(&tab.scene.document, cursor);
-            wires.extend(tab.scene.wires_for_entities(&entities));
+            if !parent.preview_wires_replace_entities() {
+                let entities = parent.preview_entities(&tab.scene.document, cursor);
+                wires.extend(tab.scene.wires_for_entities(&entities));
+            }
             (wires, parent.preview_hidden_handles().to_vec())
         };
         hidden.extend_from_slice(modifier.preview_hidden_handles());
@@ -899,7 +966,9 @@ impl OpenCADStudio {
             parameter_hidden = Some(hidden);
             wires
         } else if let Some(preview) = parameter_preview {
-            self.tabs[i].scene.set_command_preview_hatches(preview.hatches);
+            self.tabs[i]
+                .scene
+                .set_command_preview_hatches(preview.hatches);
             parameter_hidden = Some(preview.hidden);
             preview.wires
         } else if let Some(wires) = self.dimension_preview_wires(i, cur) {
@@ -914,8 +983,10 @@ impl OpenCADStudio {
                     }
                     let mut wires = c.on_preview_wires(cur);
                     wires.extend(c.persistent_preview_wires());
-                    let entities = c.preview_entities(&tab.scene.document, cur);
-                    wires.extend(tab.scene.wires_for_entities(&entities));
+                    if !c.preview_wires_replace_entities() {
+                        let entities = c.preview_entities(&tab.scene.document, cur);
+                        wires.extend(tab.scene.wires_for_entities(&entities));
+                    }
                     wires
                 })
                 .unwrap_or_default()
@@ -938,21 +1009,25 @@ impl OpenCADStudio {
                         display_visible: true,
                         plot_visible: true,
                         name: "__polar_guide__".into(),
-                        points: vec![
-                            [far_neg.x, far_neg.y, far_neg.z],
-                            [far_pos.x, far_pos.y, far_pos.z],
-                        ],
                         color: [0.2, 0.7, 0.9, 0.6],
                         pattern_length: 0.8,
                         pattern: [0.5, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                         line_weight_px: 1.0,
                         aabb: crate::scene::WireModel::UNBOUNDED_AABB,
                         plinegen: true,
+                        geom: std::sync::Arc::new(crate::scene::WireGeom {
+                            points: vec![
+                                [far_neg.x, far_neg.y, far_neg.z],
+                                [far_pos.x, far_pos.y, far_pos.z],
+                            ],
+                            ..crate::scene::WireGeom::default()
+                        }),
                         ..Default::default()
                     });
                 }
             }
         }
+        self.tint_creation_preview(i, &mut previews);
         let preview_count = previews.len();
         let compute_ms = crate::perf::elapsed_ms(compute_started);
         let preview_hidden = parameter_hidden.unwrap_or_else(|| {
@@ -978,11 +1053,67 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod tests {
     use super::eval_dynamic_angle;
-    use crate::entities::common::{set_unit_context, unit_context};
     use crate::app::OpenCADStudio;
     use crate::command::{CadCommand, CmdResult, FromPointCommand};
+    use crate::entities::common::{set_unit_context, unit_context};
     use crate::scene::WireModel;
     use glam::DVec3;
+
+    /// #2796: tracking straight up, a typed distance goes along +Z, not
+    /// off into the plane in whatever direction the cursor's noise points.
+    #[test]
+    fn a_typed_distance_tracking_along_z_goes_along_z() {
+        use crate::app::tab_document::{DynComponent, DynFieldEntry};
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.last_point = Some(DVec3::new(1.0, 2.0, 3.0));
+        app.tabs[i].last_cursor_world = DVec3::new(1.0, 2.0, 13.0);
+        for comps in [
+            vec![DynComponent::Distance, DynComponent::Angle],
+            vec![DynComponent::Distance],
+        ] {
+            app.tabs[i].dyn_fields = comps.into_iter().map(DynFieldEntry::new).collect();
+            app.tabs[i].dyn_fields[0].buffer = Some("5".into());
+            assert_eq!(app.dyn_resolve_point(), Some(DVec3::new(1.0, 2.0, 8.0)));
+        }
+    }
+
+    /// #3641: in the tooltip a second point's `x,y` is relative, and a
+    /// leading `*` makes it absolute (world) instead.
+    #[test]
+    fn a_typed_star_makes_the_tooltip_point_absolute() {
+        use crate::app::Message;
+        use crate::command::StepInput;
+        for (typed, end) in [
+            ("5,7", DVec3::new(15.0, 17.0, 0.0)),
+            ("*5,7", DVec3::new(5.0, 7.0, 0.0)),
+        ] {
+            let mut app = OpenCADStudio::new_for_test();
+            let _ = app.automation_op(r#"{"op":"new"}"#);
+            app.dyn_input = true;
+            let i = app.active_tab;
+            let _ = app.run_command_line("LINE");
+            let _ = app.feed_command(StepInput::Point(DVec3::new(10.0, 10.0, 0.0)));
+            app.last_point = Some(DVec3::new(10.0, 10.0, 0.0));
+            app.tabs[i].last_cursor_world = DVec3::new(30.0, 10.0, 0.0);
+            app.sync_dyn_fields();
+            for c in typed.chars() {
+                let _ = app.update(Message::CommandAppendChar(c.to_string()));
+            }
+            let _ = app.update(Message::CommandSubmit);
+            let line = app.tabs[i]
+                .scene
+                .document
+                .entities()
+                .find_map(|e| match e {
+                    document::EntityType::Line(l) => Some(l.end),
+                    _ => None,
+                })
+                .expect("a line");
+            assert_eq!(DVec3::new(line.x, line.y, line.z), end, "{typed}");
+        }
+    }
 
     #[test]
     fn point_modifiers_keep_move_and_line_previews_at_the_incoming_cursor() {
@@ -1059,10 +1190,48 @@ mod tests {
         }
     }
 
+    /// While a point filter asks for its two points, LINE's rubber band
+    /// still follows the cursor.
+    #[test]
+    fn point_filter_keeps_the_line_preview_at_the_cursor() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let mut line: Box<dyn CadCommand> =
+            Box::new(crate::modules::draw::draw::line::LineCommand::new());
+        line.on_point(DVec3::new(2.0, 3.0, 0.0));
+        app.tabs[i].active_cmd = Some(line);
+        app.start_point_filter_modifier(i, crate::command::PointFilter::parse(".X").unwrap());
+        for first_point_given in [false, true] {
+            if first_point_given {
+                app.tabs[i]
+                    .active_cmd
+                    .as_mut()
+                    .unwrap()
+                    .on_point(DVec3::new(30.0, 7.0, 0.0));
+            }
+            for cursor in [DVec3::new(10.0, 20.0, 0.0), DVec3::new(40.0, 50.0, 0.0)] {
+                let expected = app.tabs[i]
+                    .suspended_cmd
+                    .as_mut()
+                    .unwrap()
+                    .on_preview_wires(cursor);
+                assert!(!expected.is_empty());
+                app.tabs[i].last_cursor_world = cursor;
+                app.refresh_active_cmd_preview(i);
+                let actual = &app.tabs[i].scene.preview_wires;
+                assert_eq!(actual.len(), expected.len());
+                for (wire, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(wire.points, expected.points);
+                }
+            }
+        }
+    }
+
     #[test]
     fn point_modifier_preserves_stationary_ghost_persistence_and_hidden_sources() {
         struct Parent {
-            hidden: [codec::Handle; 1],
+            hidden: [document::Handle; 1],
         }
         impl CadCommand for Parent {
             fn name(&self) -> &'static str {
@@ -1077,7 +1246,7 @@ mod tests {
             fn on_enter(&mut self) -> CmdResult {
                 CmdResult::Cancel
             }
-            fn preview_hidden_handles(&self) -> &[codec::Handle] {
+            fn preview_hidden_handles(&self) -> &[document::Handle] {
                 &self.hidden
             }
             fn persistent_preview_wires(&self) -> Vec<WireModel> {
@@ -1090,12 +1259,12 @@ mod tests {
             }
             fn preview_entities(
                 &mut self,
-                _: &codec::Document,
+                _: &document::Document,
                 pt: DVec3,
-            ) -> Vec<codec::EntityType> {
-                vec![codec::EntityType::Line(codec::Line::from_points(
-                    codec::types::Vector3::ZERO,
-                    codec::types::Vector3::new(pt.x, pt.y, pt.z),
+            ) -> Vec<document::EntityType> {
+                vec![document::EntityType::Line(document::Line::from_points(
+                    document::types::Vector3::ZERO,
+                    document::types::Vector3::new(pt.x, pt.y, pt.z),
                 ))]
             }
         }
@@ -1103,14 +1272,14 @@ mod tests {
         let _ = app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
         app.tabs[i].suspended_cmd = Some(Box::new(Parent {
-            hidden: [codec::Handle::new(123)],
+            hidden: [document::Handle::new(123)],
         }));
         app.tabs[i].active_cmd = Some(Box::new(FromPointCommand::new(None)));
         app.tabs[i].last_cursor_world = DVec3::new(10.0, 20.0, 0.0);
         let (_, hidden) = app
             .point_modifier_preview(i, DVec3::new(10.0, 20.0, 0.0), None)
             .unwrap();
-        assert_eq!(hidden, vec![codec::Handle::new(123)]);
+        assert_eq!(hidden, vec![document::Handle::new(123)]);
         app.refresh_active_cmd_preview(i);
         let scene = &app.tabs[i].scene;
         assert_eq!(scene.preview_wires.len(), 2);
@@ -1152,9 +1321,9 @@ mod tests {
         let handle =
             app.tabs[i]
                 .scene
-                .add_entity(codec::EntityType::Line(codec::Line::from_points(
-                    codec::types::Vector3::ZERO,
-                    codec::types::Vector3::new(2.0, 0.0, 0.0),
+                .add_entity(document::EntityType::Line(document::Line::from_points(
+                    document::types::Vector3::ZERO,
+                    document::types::Vector3::new(2.0, 0.0, 0.0),
                 )));
         let source = app.tabs[i].scene.wire_models_for(&[handle]);
         let mut parent = crate::modules::draw::modify::stretch::StretchCommand::preselected(

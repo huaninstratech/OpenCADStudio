@@ -4,7 +4,7 @@
 //! every other object wholly outside it is erased. Objects across its
 //! boundary that cannot be cut stay whole.
 
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 use rustc_hash::FxHashMap;
 
@@ -14,7 +14,7 @@ use super::Scene;
 #[derive(Default)]
 pub struct SectionCull {
     /// Bodies the section crosses, with what stays of each.
-    pub cut: Vec<(Handle, kernel::brep::Body)>,
+    pub cut: Vec<(Handle, ocs_solid::model::Brep)>,
     /// Open meshes the section crosses, clipped to it.
     pub clipped: Vec<EntityType>,
     /// Objects wholly outside the section.
@@ -29,7 +29,7 @@ enum Place {
 
 const TOLERANCE: f64 = 1e-9;
 
-fn place(planes: &[kernel::space::Plane], points: &[[f64; 3]]) -> Place {
+fn place(planes: &[ocs_geom::space::Plane], points: &[[f64; 3]]) -> Place {
     let mut inside = true;
     for plane in planes {
         let behind = points
@@ -48,8 +48,8 @@ fn place(planes: &[kernel::space::Plane], points: &[[f64; 3]]) -> Place {
     }
 }
 
-fn same_extent(a: &kernel::brep::Body, b: &kernel::brep::Body) -> bool {
-    match (kernel::brep::body_bounds(a), kernel::brep::body_bounds(b)) {
+fn same_extent(a: &ocs_solid::model::Brep, b: &ocs_solid::model::Brep) -> bool {
+    match (ocs_solid::model::aabb(a), ocs_solid::model::aabb(b)) {
         (Some(a), Some(b)) => (0..3).all(|axis| {
             (a.min[axis] - b.min[axis]).abs() <= 1e-7 && (a.max[axis] - b.max[axis]).abs() <= 1e-7
         }),
@@ -67,7 +67,7 @@ impl Scene {
                 Some(EntityType::Extended(extended))
                     if matches!(
                         extended.data,
-                        codec::entities::ExtendedEntityData::SectionObject(_)
+                        document::entities::ExtendedEntityData::SectionObject(_)
                     )
             )
         };
@@ -83,7 +83,7 @@ impl Scene {
             .entities()
             .filter(|entity| match entity {
                 EntityType::Extended(extended) => match &extended.data {
-                    codec::entities::ExtendedEntityData::SectionObject(data) => {
+                    document::entities::ExtendedEntityData::SectionObject(data) => {
                         let owner = extended.common.owner_handle;
                         data.flags & 1 != 0
                             && !extended.common.invisible
@@ -103,7 +103,7 @@ impl Scene {
         let Some(EntityType::Extended(extended)) = self.document.get_entity(section) else {
             return None;
         };
-        let codec::entities::ExtendedEntityData::SectionObject(data) = &extended.data else {
+        let document::entities::ExtendedEntityData::SectionObject(data) = &extended.data else {
             return None;
         };
         let slice_depth = crate::entities::extended::section_is_slice(extended)
@@ -114,14 +114,15 @@ impl Scene {
         // its shaded mesh.
         let block = self.current_layout_block_handle();
         let mut points: FxHashMap<Handle, Vec<[f64; 3]>> = FxHashMap::default();
-        let wires = self.wires_for_block_culled(block, None, None, None, None, None, true, None, None);
+        let wires =
+            self.wires_for_block_culled(block, None, None, None, None, None, true, None, None);
         for wire in &wires {
             let Some(handle) = Self::handle_from_wire_name(&wire.name) else {
                 continue;
             };
             let entry = points.entry(handle).or_default();
             for (index, &[x, y, z]) in wire.points.iter().enumerate() {
-                let [lx, ly, lz] = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
+                let [lx, ly, lz] = wire.points_low.get(index).unwrap_or([0.0; 3]);
                 let point = DVec3::new(
                     f64::from(x) + f64::from(lx),
                     f64::from(y) + f64::from(ly),

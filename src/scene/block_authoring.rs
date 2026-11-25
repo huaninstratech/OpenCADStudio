@@ -2,11 +2,11 @@
 pub(crate) mod edit;
 pub(crate) mod graph;
 pub(crate) mod metadata;
-use codec::objects::{
+use document::objects::{
     BlockEvalExpression, BlockEvalValue, DynamicBlockData, DynamicBlockObject, ObjectType,
 };
-use codec::xdata::{ExtendedDataRecord, XDataValue};
-use codec::{Document, EntityType, Handle};
+use document::xdata::{ExtendedDataRecord, XDataValue};
+use document::{Document, EntityType, Handle};
 
 pub(super) const MAJOR: i32 = 33;
 pub(super) const MINOR: i32 = 329;
@@ -150,14 +150,16 @@ pub(super) fn graph(
         return Err("The block authoring graph has an invalid owner.");
     }
     let nodes: rustc_hash::FxHashSet<_> = graph.nodes.iter().map(|node| node.id).collect();
-    let edges: rustc_hash::FxHashSet<_> = graph.edges.iter().map(|edge| edge.id).collect();
+    // An erased edge keeps its slot with id -1; it links nothing.
+    let live = || graph.edges.iter().filter(|edge| edge.id != -1);
+    let edges: rustc_hash::FxHashSet<_> = live().map(|edge| edge.id).collect();
     if nodes.len() != graph.nodes.len()
-        || edges.len() != graph.edges.len()
+        || edges.len() != live().count()
         || graph
             .nodes
             .iter()
             .any(|node| node.id < 0 || document.objects.get(&node.expression).is_none())
-        || graph.edges.iter().any(|edge| {
+        || live().any(|edge| {
             edge.id < 0
                 || !nodes.contains(&edge.source_node)
                 || !nodes.contains(&edge.destination_node)
@@ -169,7 +171,7 @@ pub(super) fn graph(
     Ok(Some(handle))
 }
 
-fn slots(graph: Option<&codec::objects::BlockEvaluationGraph>) -> Result<Slots, &'static str> {
+fn slots(graph: Option<&document::objects::BlockEvaluationGraph>) -> Result<Slots, &'static str> {
     let node = graph
         .and_then(|graph| graph.nodes.iter().map(|node| node.id).max())
         .unwrap_or(-1)
@@ -258,7 +260,7 @@ pub(super) fn prepare(
         dictionary,
         "ACDB_DYNAMICBLOCKPURGEPREVENTER_VERSION",
         "AcDbDynamicBlockPurgePreventer",
-        DynamicBlockData::Representation(codec::objects::BlockRepresentationData {
+        DynamicBlockData::Representation(document::objects::BlockRepresentationData {
             flags: 1,
             block: definition,
         }),
@@ -330,7 +332,7 @@ pub(super) fn append_single(
     let DynamicBlockData::EvaluationGraph(graph) = &mut object.data else {
         unreachable!()
     };
-    graph.nodes.push(codec::objects::BlockEvaluationNode {
+    graph.nodes.push(document::objects::BlockEvaluationNode {
         id: slots.node,
         next_id: slots.eval,
         expression,
@@ -351,7 +353,7 @@ pub(super) fn append_components(
     expressions: &[Handle],
     components: &[usize],
 ) {
-    use codec::objects::{BlockEvaluationEdge, BlockEvaluationNode};
+    use document::objects::{BlockEvaluationEdge, BlockEvaluationNode};
     let ObjectType::DynamicBlock(object) = document.objects.get_mut(&handle).unwrap() else {
         unreachable!()
     };
@@ -411,16 +413,16 @@ pub(super) fn append_components(
 pub(super) fn register_classes(document: &mut Document, classes: &[(&str, &str, i32)]) {
     for &(dxf_name, cpp_class_name, maintenance_version) in classes {
         if let Some(existing) = document.classes.get_mut_by_name(dxf_name) {
-            existing.proxy_flags = codec::classes::ProxyFlags(1153);
+            existing.proxy_flags = document::classes::ProxyFlags(1153);
             existing.dwg_version = 25;
             existing.maintenance_version = maintenance_version;
             continue;
         }
-        document.classes.add_or_update(codec::classes::DxfClass {
+        document.classes.add_or_update(document::classes::DxfClass {
             dxf_name: dxf_name.to_string(),
             cpp_class_name: cpp_class_name.to_string(),
             application_name: "ObjectDBX Classes".to_string(),
-            proxy_flags: codec::classes::ProxyFlags(1153),
+            proxy_flags: document::classes::ProxyFlags(1153),
             instance_count: 0,
             was_zombie: false,
             is_an_entity: false,
@@ -436,7 +438,7 @@ pub(super) fn register_classes(document: &mut Document, classes: &[(&str, &str, 
 
 pub(super) fn ensure_app_id(document: &mut Document, name: &str) {
     if !document.app_ids.contains(name) {
-        let mut app = codec::tables::AppId::new(name);
+        let mut app = document::tables::AppId::new(name);
         app.handle = document.allocate_handle();
         let _ = document.app_ids.add(app);
     }
@@ -479,7 +481,7 @@ pub(super) fn dynamic(
 pub(crate) fn export_graph(
     document: &Document,
     definition: Handle,
-) -> Option<codec::BlockGraph> {
+) -> Option<document::BlockGraph> {
     if let Some(graph) = document.export_block_graph(definition) {
         return Some(graph);
     }
@@ -487,7 +489,11 @@ pub(crate) fn export_graph(
     let Some(ObjectType::Dictionary(dictionary)) = document.objects.get(&root) else {
         return None;
     };
-    if !dictionary.entries.iter().any(|(key, _)| key == "ACAD_ENHANCEDBLOCK") {
+    if !dictionary
+        .entries
+        .iter()
+        .any(|(key, _)| key == "ACAD_ENHANCEDBLOCK")
+    {
         return None;
     }
     let left = |key: &str| matches!(key, "ACAD_SORTENTS" | "ACAD_ASSOCNETWORK");
@@ -503,7 +509,11 @@ pub(crate) fn export_graph(
         .objects
         .keys()
         .copied()
-        .filter(|handle| dropped.iter().any(|top| document.owner_chain_reaches(*handle, *top)))
+        .filter(|handle| {
+            dropped
+                .iter()
+                .any(|top| document.owner_chain_reaches(*handle, *top))
+        })
         .collect();
     let mut document = document.clone();
     for handle in gone {
@@ -557,11 +567,7 @@ pub(super) fn element_id(entity: &EntityType) -> Option<i32> {
         })
 }
 
-pub(super) fn set_entity_tag(
-    document: &mut Document,
-    handle: Handle,
-    record: ExtendedDataRecord,
-) {
+pub(super) fn set_entity_tag(document: &mut Document, handle: Handle, record: ExtendedDataRecord) {
     let app = document
         .app_ids
         .get(&record.application_name)

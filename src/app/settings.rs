@@ -117,6 +117,10 @@ pub struct SpellPrefs {
     pub options: crate::ui::window::spell_dialog::SpellOptions,
     /// Words added to the user's dictionary.
     pub custom: Vec<String>,
+    /// Custom dictionary files (one word per line).
+    pub custom_files: Vec<String>,
+    /// The custom dictionary file in use; None: the word list above.
+    pub current_custom: Option<usize>,
 }
 
 /// TXT2MTXT (Combine Text) settings, the profile values
@@ -297,14 +301,14 @@ where
     Ok(clamp_quad_hover_delay_ms(raw.max(0) as u64))
 }
 
-/// Hold a ZOOMFACTOR inside the range the application can store, wherever it
-/// arrives from — the slider, the Options field, or a configuration file
-/// written by hand or by an older build.
-/// Interface scale in percent, kept to the range the Options slider offers.
+/// Interface scale in percent, kept to the range the Options list offers.
 pub fn clamp_ui_scale(percent: u16) -> u16 {
     percent.clamp(75, 200)
 }
 
+/// Hold a ZOOMFACTOR inside the range the application can store, wherever it
+/// arrives from — the slider, the Options field, or a configuration file
+/// written by hand or by an older build.
 pub fn clamp_zoom_factor(v: i32) -> i32 {
     v.clamp(ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX)
 }
@@ -623,6 +627,22 @@ pub(crate) fn snaps_from_osmode(osmode: i32) -> (Vec<SnapType>, bool) {
     (modes, osmode & OSMODE_SUPPRESS == 0)
 }
 
+fn deserialize_link_display<'de, D>(
+    deserializer: D,
+) -> Result<crate::ui::node_graph::LinkDisplay, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::ui::node_graph::LinkDisplay;
+    use serde::Deserialize;
+    let name = String::deserialize(deserializer).unwrap_or_default();
+    Ok(match name.as_str() {
+        "labels" => LinkDisplay::Labels,
+        "selection" => LinkDisplay::Selection,
+        _ => LinkDisplay::Wires,
+    })
+}
+
 fn deserialize_options_tab<'de, D>(
     deserializer: D,
 ) -> Result<crate::ui::window::options::OptionsTab, D::Error>
@@ -813,6 +833,9 @@ pub struct UserSettings {
     pub spacemouse: crate::input::spacemouse::Preferences,
     pub dyn_input: bool,
     pub dyn_mode: i16,
+    pub dyn_pointer_cartesian: bool,
+    pub dyn_pointer_absolute: bool,
+    pub dyn_pointer_on_type: bool,
     pub polar: bool,
     pub polar_increment_deg: f32,
     pub zoom_wheel_reversed: bool,
@@ -823,15 +846,23 @@ pub struct UserSettings {
     /// Scrolling pans and Ctrl+scroll (a touchpad pinch) zooms, for a
     /// touchpad that reports two-finger drags as wheel scrolls.
     pub touchpad_pan: bool,
+    /// The numeric keypad's decimal key always types a decimal point; off,
+    /// it types the layout's character (a comma then separates coordinates).
+    pub keypad_decimal_point: bool,
     /// Interface scale in percent, on top of the display's own scale.
     pub ui_scale_percent: u16,
     pub zoom_factor: i32,
     /// CURSORSIZE: normalized crosshair reach; 5 retains the original 60 px arms.
     pub cursor_size: i32,
-    /// PICKBOX: normalized visible-box and click-aperture size.
+    /// PICKBOX: the pick box half-size in screen pixels. Stored under a
+    /// new name: the old key held a scaled value (3 drew 8 pixels).
+    #[serde(rename = "pickbox")]
     pub pick_box: i32,
     /// APERTURE: object-snap capture radius in screen pixels.
     pub aperture: f32,
+    /// The Magnet of AUTOSNAP (bit 4): while an object snap marker shows,
+    /// the crosshairs are drawn on the snap point, not at the pointer.
+    pub autosnap_magnet: bool,
     /// HPASSOC: new hatches follow their boundary objects.
     pub hatch_associative: bool,
     /// HPGAPTOL: largest boundary gap HATCH/BOUNDARY picks treat as closed.
@@ -839,6 +870,14 @@ pub struct UserSettings {
     /// HATCH starts with the boundary method used last (0 pick internal
     /// point, 1 select objects, 2 draw).
     pub hatch_start_method: u8,
+    /// HATCH's draw mode is Path (else Area).
+    pub hatch_draw_path: bool,
+    /// HATCH's Path width.
+    pub hatch_path_width: f64,
+    /// HATCH's Path alignment (0 center, 1 inside, 2 outside).
+    pub hatch_path_alignment: u8,
+    /// "Do not show this message again" on the hatch boundary warning.
+    pub hatch_boundary_warning_off: bool,
     /// MENUBAR: the classic pull-down menus show above the ribbon.
     pub show_menu_bar: bool,
     /// RIBBONCLOSE hid the ribbon; RIBBON brings it back.
@@ -847,6 +886,9 @@ pub struct UserSettings {
     pub command_line_hidden: bool,
     /// The Layer Manager's column order; a hidden column is led by `-`.
     pub layer_columns: Vec<String>,
+    /// The ribbon's layer list shows the layers of the Layer manager's
+    /// chosen tree node only (#2610 LM-25).
+    pub ribbon_layers_follow_filter: bool,
     /// When true, double-clicking a block reference starts REFEDIT instead of BEDIT.
     pub double_click_block_refedit: bool,
     /// When true, double-clicking a block with attributes opens ATTEDIT.
@@ -876,7 +918,10 @@ pub struct UserSettings {
     /// QUADWIDTH: columns the expanded quad lays out (2..=12, default 6).
     /// The reader is the tolerant one above: a hand-written out-of-range
     /// number loads clamped instead of failing the whole config parse.
-    #[serde(default = "default_quad_width", deserialize_with = "deserialize_quad_width")]
+    #[serde(
+        default = "default_quad_width",
+        deserialize_with = "deserialize_quad_width"
+    )]
     pub quad_width: u8,
     /// QUADCOMMANDLAUNCH: a right-click over an entity without entering the
     /// quad launches the entity's default command directly.
@@ -885,7 +930,10 @@ pub struct UserSettings {
     /// appears, in milliseconds (0..=2000; 0 = immediately). The reader is
     /// the tolerant one above: a negative or oversized hand-written number
     /// loads clamped instead of failing the whole config parse.
-    #[serde(default = "default_quad_hover_delay_ms", deserialize_with = "deserialize_quad_hover_delay_ms")]
+    #[serde(
+        default = "default_quad_hover_delay_ms",
+        deserialize_with = "deserialize_quad_hover_delay_ms"
+    )]
     pub quad_hover_delay_ms: u64,
     /// GRIPOBJLIMIT: past this many selected objects, no grips are drawn at
     /// all. 0 means no limit. The drawing header carries no slot for it.
@@ -913,19 +961,43 @@ pub struct UserSettings {
     pub wblock_object_mode: u8,
     /// FIELDDISPLAY: fields show on a gray background.
     pub field_display: bool,
+    /// The annotation scale is asked for before a session's first annotative
+    /// text ("Don't ask again" turns it off).
+    pub annotation_scale_prompt: bool,
     /// HYPERLINKOPTIONS: the hyperlink cursor, tooltip and shortcut menu.
     pub hyperlink_options: bool,
     /// XDWGFADECTL: how much referenced drawings fade (-90..=90; negative is off).
     pub xref_fade: i32,
+    /// LAYLOCKFADECTL: how much objects on locked layers fade (-90..=90;
+    /// negative is off).
+    pub layer_lock_fade: i32,
     /// FILEDIA: file dialogs of commands that have a command-line form.
     pub file_dia: bool,
     /// OLEHIDE: which OLE objects show (0 all, 1 paper space, 2 model space, 3 none).
     pub ole_hide: i16,
     /// OLEQUALITY: the plot quality of new OLE objects (3 automatic).
     pub ole_quality: i16,
+    /// MTEXTTOOLBAR: the in-place text editor's floating toolbar (0 never,
+    /// 1 always, 2 while the ribbon's Text Editor tab is not on show).
+    pub mtext_toolbar: i16,
+    /// The in-place text editor's own settings (lists, AutoStack, spell
+    /// checking, display).
+    pub mtext_editor: super::mtext_editor::prefs::MTextEditorPrefs,
     /// GROUPDISPLAYMODE: a picked group shows member grips (0), a centre
     /// grip (1) or a centre grip and a box (2).
     pub group_display_mode: i16,
+    /// SELECTIONANNODISPLAY: a selected annotative object shows its other
+    /// scale representations dimmed (1) or not (0).
+    pub selection_anno_display: i16,
+    /// ANNOMONITOR: the annotation monitor (-2 to 2).
+    pub anno_monitor: i16,
+    /// LOGFILEMODE: the command line is also written to a log file.
+    pub log_file_mode: bool,
+    /// LOGFILEPATH: the folder log files go to; empty for the default.
+    pub log_file_path: String,
+    /// SAVEFILEPATH: the folder recovery copies (`.sv$`) go to; empty for
+    /// the default.
+    pub save_file_path: String,
     /// OFFSETGAPTYPE: how a polyline offset outward closes its corners
     /// (0 extend, 1 fillet, 2 chamfer).
     pub offset_gap_type: u8,
@@ -957,6 +1029,8 @@ pub struct UserSettings {
     /// LAYOUTCREATEVIEWPORT: a layout opened for the first time gets a
     /// viewport.
     pub layout_create_viewport: bool,
+    /// PICKLOCKED: objects on a locked layer can be selected.
+    pub pick_locked: bool,
     /// PDFSHXTEXT's recognition settings (fonts, threshold, PDFSHXLAYER,
     /// PDFSHXBESTFONT, PDFSHXTEXTSETTINGS).
     pub pdf_shx_text: crate::modules::insert::pdf_shx_text::ShxTextSettings,
@@ -964,18 +1038,27 @@ pub struct UserSettings {
     pub dgn_import: crate::modules::insert::dgn_import::DgnImportSettings,
     /// Nested-copy symbol handling: false inserts, true binds.
     pub ncopy_bind: bool,
+    /// How the node graph shows links (wires, labels, or labels with the
+    /// selected node's wires); unknown names fall back to wires.
+    #[serde(default, deserialize_with = "deserialize_link_display")]
+    pub node_graph_links: crate::ui::node_graph::LinkDisplay,
     /// Last Options page; unknown saved names fall back without rejecting the config.
     #[serde(default, deserialize_with = "deserialize_options_tab")]
     pub options_tab: crate::ui::window::options::OptionsTab,
     /// Show the navigation cube (NAVVCUBE).
     pub show_viewcube: bool,
+    /// NAVVCUBEOPACITY: the cube's opacity in percent while inactive.
+    pub navvcube_opacity: u8,
     /// Show the UCS icon (UCSICON).
     pub show_ucs_icon: bool,
+    /// Show the viewport controls in the drawing's corner (VPCONTROL).
+    pub show_viewport_controls: bool,
     /// Draw the UCS icon at the origin rather than in the corner
     /// (UCSICON ORigin / NOorigin).
     pub ucs_icon_at_origin: bool,
     /// Selection cycling: a click where objects overlap opens a picker.
     pub selection_cycling: bool,
+    pub selection_cycling_mode: Option<i16>,
     /// OSNAPZ: object snaps take the current elevation instead of the
     /// snapped object's Z.
     pub osnap_z: bool,
@@ -1023,6 +1106,9 @@ pub struct UserSettings {
     /// Drawing new tabs start from (QNEW template); empty = a blank drawing.
     #[serde(default)]
     pub qnew_template: String,
+    /// Preserve source paths, group resources by type, or keep every file flat.
+    #[serde(default)]
+    pub transmittal_layout: crate::io::transmit::TransmittalLayout,
     /// The graphics verdict (`GpuStatus::identity()`) whose warning popup the
     /// user chose not to see again. Empty = always show. Keyed by verdict so
     /// silencing "software rendering on llvmpipe" does not silence a later,
@@ -1113,9 +1199,12 @@ pub struct UserSettings {
     /// (Shift removes); `false` = OS-style — a click REPLACES the selection
     /// and Shift+click toggles membership.
     pub pick_add: bool,
-    /// PICKDRAG (#226): `false` (default) = press-drag draws the freeform
-    /// lasso; `true` = press-drag draws a rectangle marquee instead.
+    pub pick_add_retains: bool,
+    /// Legacy rectangle flag, read when an older profile has no PICKDRAG mode.
     pub pick_drag_rect: bool,
+    pub pick_drag_mode: Option<u8>,
+    pub pick_auto: u8,
+    pub pick_first: bool,
     /// Show the floating Quick Properties panel when objects are selected.
     pub quick_properties: bool,
     /// QPLOCATION 1: the Quick Properties panel floats where it was last
@@ -1190,6 +1279,14 @@ pub struct UserSettings {
     /// 4 details, 5 list.
     #[serde(default = "default_block_view")]
     pub block_palette_view: u8,
+    /// Blocks palette: the tab it was left on (0 Current Drawing, 1 Recent,
+    /// 2 Favorites, 3 Libraries).
+    #[serde(default)]
+    pub block_palette_tab: u8,
+    /// Blocks palette: the library folder the Libraries tab showed last; it
+    /// opens there again unless BLOCKNAVIGATE names a folder.
+    #[serde(default)]
+    pub block_library_folder: String,
     /// Blocks palette insertion options.
     #[serde(default)]
     pub block_insert: BlockInsertOptions,
@@ -1226,6 +1323,9 @@ pub struct UserSettings {
     /// QuickCalc: the global variables, the open sections and the angle mode.
     #[serde(default)]
     pub quick_calc: crate::ui::window::quick_calc::QuickCalcSettings,
+    /// Tool Palettes: reusable block tools, tabs and placement options.
+    #[serde(default)]
+    pub tool_palettes: crate::ui::window::tool_palettes::ToolPalettesData,
 }
 
 /// A block the Blocks palette lists from outside the current drawing (a
@@ -1423,6 +1523,9 @@ impl Default for UserSettings {
             spacemouse: crate::input::spacemouse::Preferences::default(),
             dyn_input: true,
             dyn_mode: 3,
+            dyn_pointer_cartesian: false,
+            dyn_pointer_absolute: false,
+            dyn_pointer_on_type: false,
             polar: false,
             polar_increment_deg: 45.0,
             zoom_wheel_reversed: false,
@@ -1430,23 +1533,35 @@ impl Default for UserSettings {
             dynamic_ucs: true,
             // A Mac's built-in trackpad is the common case there.
             touchpad_pan: cfg!(target_os = "macos"),
+            keypad_decimal_point: true,
             ui_scale_percent: 100,
             zoom_factor: 60,
             cursor_size: 5,
-            pick_box: 3,
+            pick_box: 5,
             aperture: crate::snap::DEFAULT_OSNAP_RADIUS_PX,
+            // On, as in the initial AUTOSNAP value 63.
+            autosnap_magnet: true,
             hatch_associative: true,
             hatch_gap_tolerance: 0.0,
             hatch_start_method: 0,
+            hatch_draw_path: false,
+            hatch_path_width: 0.25,
+            hatch_path_alignment: 0,
+            hatch_boundary_warning_off: false,
             show_menu_bar: false,
             ribbon_closed: false,
             command_line_hidden: false,
             layer_columns: Vec::new(),
+            ribbon_layers_follow_filter: false,
+            node_graph_links: crate::ui::node_graph::LinkDisplay::Wires,
             options_tab: crate::ui::window::options::OptionsTab::General,
             show_viewcube: true,
+            navvcube_opacity: 50,
             show_ucs_icon: true,
+            show_viewport_controls: true,
             ucs_icon_at_origin: true,
             selection_cycling: false,
+            selection_cycling_mode: None,
             osnap_z: false,
             select_similar_mode: crate::scene::SELECT_SIMILAR_DEFAULT,
             double_click_block_refedit: false,
@@ -1475,16 +1590,25 @@ impl Default for UserSettings {
             block_open_in_editor: false,
             wblock_object_mode: 0,
             field_display: true,
+            annotation_scale_prompt: true,
             hyperlink_options: true,
             xref_fade: 50,
+            layer_lock_fade: 50,
             file_dia: true,
             ole_hide: 0,
             ole_quality: 3,
+            mtext_toolbar: 2,
+            mtext_editor: Default::default(),
             group_display_mode: 2,
+            selection_anno_display: 1,
+            anno_monitor: -2,
+            log_file_mode: false,
+            log_file_path: String::new(),
+            save_file_path: String::new(),
             offset_gap_type: 0,
             trim_extend_quick: true,
             match_mode: crate::entities::match_props::MatchOpts::DEFAULT_MODE,
-            measuregeom_quick: true,
+            measuregeom_quick: false,
             revcloud_create_mode: 1,
             revcloud_arc_variance: true,
             revcloud_grips: true,
@@ -1496,6 +1620,7 @@ impl Default for UserSettings {
             ucs_ortho: true,
             ucs_view: true,
             layout_create_viewport: true,
+            pick_locked: true,
             pdf_shx_text: Default::default(),
             dgn_import: Default::default(),
             ncopy_bind: false,
@@ -1512,6 +1637,7 @@ impl Default for UserSettings {
             check_missing_fonts: true,
             font_source_url: String::new(),
             qnew_template: String::new(),
+            transmittal_layout: crate::io::transmit::TransmittalLayout::Structured,
             gpu_warning_silenced: String::new(),
             disabled_plugins: Vec::new(),
             plugin_repos: Vec::new(),
@@ -1543,7 +1669,11 @@ impl Default for UserSettings {
             script_commands: true,
             default_save_format: crate::io::DEFAULT_SAVE_FORMAT.to_string(),
             pick_add: true,
+            pick_add_retains: true,
             pick_drag_rect: false,
+            pick_drag_mode: None,
+            pick_auto: 5,
+            pick_first: true,
             quick_properties: false,
             quick_properties_float: false,
             quick_properties_pos: [40.0, 40.0],
@@ -1567,6 +1697,8 @@ impl Default for UserSettings {
             block_favorites: Vec::new(),
             block_libraries: Vec::new(),
             block_palette_view: 1,
+            block_palette_tab: 0,
+            block_library_folder: String::new(),
             block_insert: BlockInsertOptions::default(),
             block_mru_list: 50,
             block_redefine_mode: 1,
@@ -1579,6 +1711,7 @@ impl Default for UserSettings {
             count_invalid_area: 0,
             sheet_set: Default::default(),
             quick_calc: Default::default(),
+            tool_palettes: Default::default(),
         }
     }
 }
@@ -1807,8 +1940,7 @@ mod tests {
 
         // Absent keys keep the in-code defaults (struct-level serde
         // default untouched).
-        let minimal: UserSettings =
-            serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
+        let minimal: UserSettings = serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
         assert_eq!(minimal.quad_width, 6);
         assert_eq!(minimal.quad_hover_delay_ms, 300);
     }
@@ -1820,6 +1952,61 @@ mod tests {
         assert_eq!(clamp_quad_hover_delay_ms(0), 0);
         assert_eq!(clamp_quad_hover_delay_ms(300), 300);
         assert_eq!(clamp_quad_hover_delay_ms(9999), 2000);
+    }
+
+    #[test]
+    fn node_graph_links_default_to_wires_and_round_trip() {
+        use crate::ui::node_graph::LinkDisplay;
+
+        let old: UserSettings = serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
+        assert_eq!(old.node_graph_links, LinkDisplay::Wires);
+        let unknown: UserSettings =
+            serde_json::from_str(r#"{"node_graph_links": "ribbons"}"#).unwrap();
+        assert_eq!(unknown.node_graph_links, LinkDisplay::Wires);
+        for links in LinkDisplay::ALL {
+            let settings = UserSettings {
+                node_graph_links: links,
+                ..UserSettings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            let back: UserSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.node_graph_links, links);
+        }
+    }
+
+    #[test]
+    fn the_autosnap_magnet_defaults_to_on_and_round_trips() {
+        let old: UserSettings = serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
+        assert!(old.autosnap_magnet);
+        let settings = UserSettings {
+            autosnap_magnet: false,
+            ..UserSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: UserSettings = serde_json::from_str(&json).unwrap();
+        assert!(!back.autosnap_magnet);
+    }
+
+    #[test]
+    fn transmittal_layout_defaults_and_round_trips() {
+        use crate::io::transmit::TransmittalLayout;
+
+        let old: UserSettings = serde_json::from_str(r#"{"pick_add": true}"#).unwrap();
+        assert_eq!(old.transmittal_layout, TransmittalLayout::Structured);
+        for (layout, encoded) in [
+            (TransmittalLayout::Preserve, "\"preserve\""),
+            (TransmittalLayout::Structured, "\"structured\""),
+            (TransmittalLayout::Flat, "\"flat\""),
+        ] {
+            assert_eq!(serde_json::to_string(&layout).unwrap(), encoded);
+            let settings = UserSettings {
+                transmittal_layout: layout,
+                ..UserSettings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            let back: UserSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.transmittal_layout, layout);
+        }
     }
 
     #[test]

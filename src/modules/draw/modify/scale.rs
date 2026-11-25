@@ -13,7 +13,7 @@
 //   from the scale base.
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, DynField, EntityTransform};
@@ -59,6 +59,8 @@ pub struct ScaleCommand {
     wire_models: Vec<WireModel>,
     step: Step,
     default_factor: f64,
+    /// The Copy option: transform a duplicate and leave the source in place.
+    copy: bool,
 }
 
 impl ScaleCommand {
@@ -68,25 +70,34 @@ impl ScaleCommand {
             wire_models,
             step: Step::Base,
             default_factor: defaults::get_scale_factor(),
+            copy: false,
         }
     }
 
     /// Commit a uniform scale about `base` and end the command.
     fn commit(&self, base: DVec3, factor: f64) -> CmdResult {
         defaults::set_scale_factor(factor);
-        CmdResult::TransformSelected(
-            self.handles.clone(),
-            EntityTransform::Scale {
-                center: base,
-                factor,
-            },
-        )
+        let transform = EntityTransform::Scale {
+            center: base,
+            factor,
+        };
+        if self.copy {
+            CmdResult::CopySelectedAndExit(self.handles.clone(), transform)
+        } else {
+            CmdResult::TransformSelected(self.handles.clone(), transform)
+        }
     }
 }
 
 impl CadCommand for ScaleCommand {
     fn name(&self) -> &'static str {
         "SCALE"
+    }
+
+    fn point_rejection(&self) -> Option<String> {
+        matches!(self.step, Step::Factor { .. }).then(|| {
+            t!("Requires numeric distance, second point, or option keyword.").into_owned()
+        })
     }
 
     fn prompt(&self) -> String {
@@ -98,7 +109,11 @@ impl CadCommand for ScaleCommand {
             .into_owned(),
             Step::Factor { .. } => {
                 let f = format!("{:.4}", self.default_factor);
-                t!("SCALE  Specify scale factor  <%{f}>:", f = f).into_owned()
+                t!(
+                    "SCALE  Specify scale factor or [Copy/Reference]  <%{f}>:",
+                    f = f
+                )
+                .into_owned()
             }
             Step::RefFirst { .. } => {
                 t!("SCALE  Specify first reference point or type reference length:").into_owned()
@@ -118,8 +133,11 @@ impl CadCommand for ScaleCommand {
     fn options(&self) -> Vec<crate::command::CmdOption> {
         use crate::command::CmdOption;
         match &self.step {
-            // The reference-scaling keyword is only offered at the factor step.
-            Step::Factor { .. } => vec![CmdOption::new(t!("Reference").as_ref(), "R")],
+            // Copy and reference scaling are offered at the factor step.
+            Step::Factor { .. } => vec![
+                CmdOption::new(t!("Copy").as_ref(), "C"),
+                CmdOption::new(t!("Reference").as_ref(), "R"),
+            ],
             _ => vec![],
         }
     }
@@ -180,8 +198,14 @@ impl CadCommand for ScaleCommand {
         match &self.step {
             Step::Factor { base } => {
                 let base = *base;
+                // `C` / `Copy` keeps the source and scales a duplicate; the
+                // prompt stays at the factor step so the value follows.
                 // `R` / `Reference` switches to reference scaling.
                 let low = t.to_ascii_lowercase();
+                if low == "c" || low == "copy" {
+                    self.copy = true;
+                    return Some(CmdResult::NeedPoint);
+                }
                 if low == "r" || low == "reference" {
                     self.step = Step::RefFirst { base };
                     return Some(CmdResult::NeedPoint);
@@ -210,20 +234,17 @@ impl CadCommand for ScaleCommand {
     }
 
     fn on_preview_wires(&mut self, pt: DVec3) -> Vec<WireModel> {
-        let (base, factor): (DVec3, f32) = match &self.step {
+        let (base, factor): (DVec3, f64) = match &self.step {
             // Default flow: scale live by cursor distance from the base.
-            Step::Factor { base } => (*base, base.distance(pt).max(1e-6) as f32),
+            Step::Factor { base } => (*base, base.distance(pt)),
             // Reference flow, new-length step: factor = cursor_dist / ref_dist.
-            Step::RefNew { base, ref_dist } => (*base, (base.distance(pt) / ref_dist) as f32),
+            Step::RefNew { base, ref_dist } => (*base, base.distance(pt) / ref_dist),
             // The reference length is measured between two points independent
             // of the scale base.
             Step::RefSecond { first, .. } => {
-                return vec![WireModel::solid(
+                return vec![WireModel::solid_f64(
                     "rubber_band".into(),
-                    vec![
-                        [first.x as f32, first.y as f32, first.z as f32],
-                        [pt.x as f32, pt.y as f32, pt.z as f32],
-                    ],
+                    vec![first.to_array(), pt.to_array()],
                     WireModel::CYAN,
                     false,
                 )];
@@ -233,14 +254,11 @@ impl CadCommand for ScaleCommand {
         let mut out: Vec<WireModel> = self
             .wire_models
             .iter()
-            .map(|w| w.scaled(base.as_vec3(), factor))
+            .map(|w| w.scaled_precise(base, factor))
             .collect();
-        out.push(WireModel::solid(
+        out.push(WireModel::solid_f64(
             "rubber_band".into(),
-            vec![
-                [base.x as f32, base.y as f32, base.z as f32],
-                [pt.x as f32, pt.y as f32, pt.z as f32],
-            ],
+            vec![base.to_array(), pt.to_array()],
             WireModel::CYAN,
             false,
         ));
@@ -294,3 +312,7 @@ impl CadCommand for ScaleCommand {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "scale/scaling_tests.rs"]
+mod scaling_tests;

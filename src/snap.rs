@@ -8,8 +8,8 @@ use glam::{DVec3, Mat4, Vec3};
 use iced::time::Instant;
 use iced::{Point, Rectangle};
 
-use codec::types::Handle;
-use kernel::geom2d::Curve;
+use document::types::Handle;
+use ocs_geom::geom2d::Curve;
 
 use crate::command::{DimensionAssociationSource, TangentObject};
 use crate::scene::model::wire_model::{SnapHint, TangentGeom, WireModel};
@@ -384,6 +384,11 @@ pub struct Snapper {
     /// normal: the current UCS at the current elevation) instead of keeping
     /// the snapped object's height. `None` keeps the object's point.
     pub osnap_z_plane: Option<(DVec3, DVec3)>,
+    /// Whether Tangent also lands on straight lines. Only the tangent object
+    /// pick (TTR, TTT) and a command that takes a touched object as a pick
+    /// (CIRCLE 2P, 3P) want a line; elsewhere a running Tangent snap does
+    /// not, since a line has no tangent point from a base point.
+    pub(crate) tangent_lines: bool,
 }
 
 impl Default for Snapper {
@@ -428,6 +433,7 @@ impl Default for Snapper {
             parallel_dwell: None,
             override_saved: None,
             osnap_z_plane: None,
+            tangent_lines: false,
         }
     }
 }
@@ -458,10 +464,8 @@ impl<'a> InRangeWires<'a> {
         } else {
             if self.heap.is_empty() {
                 self.heap.reserve(16);
-                for slot in &self.stack {
-                    if let Some(w) = slot {
-                        self.heap.push(*w);
-                    }
+                for w in self.stack.iter().flatten() {
+                    self.heap.push(*w);
                 }
             }
             self.heap.push(wire);
@@ -572,6 +576,17 @@ impl Snapper {
         }
         self.enabled.clear();
         self.snap_enabled = false;
+    }
+
+    /// The one-shot override waiting for the next point: `Some(Some(t))` for
+    /// a mode, `Some(None)` for the None override, `None` when none is set.
+    pub fn pending_override(&self) -> Option<Option<SnapType>> {
+        self.override_saved.as_ref()?;
+        Some(if self.snap_enabled {
+            self.enabled.iter().next().copied()
+        } else {
+            None
+        })
     }
 
     /// Restore the pre-override snap configuration. No-op when inactive.
@@ -910,8 +925,17 @@ impl Snapper {
         ucs_y: DVec3,
     ) -> Option<OtrackHit> {
         self.otrack_snap_stable(
-            cursor_world, view_rot, eye, bounds, polar_step_deg, last_point,
-            required_crossing_ray, ortho, ucs_x, ucs_y, None,
+            cursor_world,
+            view_rot,
+            eye,
+            bounds,
+            polar_step_deg,
+            last_point,
+            required_crossing_ray,
+            ortho,
+            ucs_x,
+            ucs_y,
+            None,
         )
     }
 
@@ -1135,13 +1159,14 @@ impl Snapper {
                 }
                 let sd = screen_dist(x);
                 if sd < r {
-                    let ranking_ray = if rays[i].group != POLAR_GROUP && rays[i].group != ORTHO_GROUP {
-                        &rays[i]
-                    } else {
-                        &rays[j]
-                    };
+                    let ranking_ray =
+                        if rays[i].group != POLAR_GROUP && rays[i].group != ORTHO_GROUP {
+                            &rays[i]
+                        } else {
+                            &rays[j]
+                        };
                     let score = rank_ray(ranking_ray.origin, ranking_ray.dir, sd);
-                    if !best_x.as_ref().map_or(true, |(bd, _)| score < *bd) {
+                    if !best_x.as_ref().is_none_or(|(bd, _)| score < *bd) {
                         continue;
                     }
                     // Report an acquired tracking ray (not an auxiliary
@@ -1206,7 +1231,7 @@ impl Snapper {
             );
             let sd = screen_dist(aligned);
             let score = rank_ray(ray.origin, ray.dir, sd);
-            if sd < r && best.as_ref().map_or(true, |(bd, _)| score < *bd) {
+            if sd < r && best.as_ref().is_none_or(|(bd, _)| score < *bd) {
                 let dir_out = if t >= 0.0 { ray.dir } else { -ray.dir };
                 best = Some((
                     score,
@@ -1284,7 +1309,7 @@ impl Snapper {
         };
         // Restart the dwell when the hovered line changes (different direction,
         // or a parallel line far from the candidate's point on screen).
-        let same_candidate = self.parallel_dwell.map_or(false, |(cd, cp, _, _)| {
+        let same_candidate = self.parallel_dwell.is_some_and(|(cd, cp, _, _)| {
             parallel(cd, dir)
                 && screen_perp_dist(pt, cp, cd, view_rot, eye, bounds) < self.osnap_radius_px
         });
@@ -1293,7 +1318,7 @@ impl Snapper {
                 if !fired && now.duration_since(since).as_millis() >= PAR_DWELL_MS {
                     // Dwelt long enough: acquire this line, or remove it if it is
                     // already the reference (hovering it a second time toggles).
-                    let is_ref = self.parallel_ref.map_or(false, |(rd, rp)| {
+                    let is_ref = self.parallel_ref.is_some_and(|(rd, rp)| {
                         parallel(rd, dir)
                             && screen_perp_dist(pt, rp, rd, view_rot, eye, bounds)
                                 < self.osnap_radius_px
@@ -1390,6 +1415,7 @@ impl Snapper {
             parallel_dwell: None,
             override_saved: None,
             osnap_z_plane: None,
+            tangent_lines: true,
         };
         // Tangent-only: Grid is disabled here, so the grid basis is irrelevant.
         tmp.snap(
@@ -1419,9 +1445,7 @@ impl Snapper {
         eye: DVec3,
         bounds: Rectangle,
     ) -> Option<SnapResult> {
-        self.snap_discrete_preview_stable(
-            cursor_screen, wires, view_rot, eye, bounds, None,
-        )
+        self.snap_discrete_preview_stable(cursor_screen, wires, view_rot, eye, bounds, None)
     }
 
     /// Keep an acquired discrete point only while it is independently found
@@ -1465,13 +1489,23 @@ impl Snapper {
                 }
                 let (tier, sub) = (snap_tier(snap_type), snap_priority(snap_type));
                 if previous.is_some_and(|old| same_discrete_snap(old, world, snap_type)) {
-                    retained = Some((SnapResult {
-                        world, screen, snap_type, tangent_obj: None,
-                        extension_base: None, extension_base2: None,
-                        extension_origin: None, extension_dir: None,
-                        viewport: None, source: src, secondary_source: None,
-                        model_point: None,
-                    }, d2));
+                    retained = Some((
+                        SnapResult {
+                            world,
+                            screen,
+                            snap_type,
+                            tangent_obj: None,
+                            extension_base: None,
+                            extension_base2: None,
+                            extension_origin: None,
+                            extension_dir: None,
+                            viewport: None,
+                            source: src,
+                            secondary_source: None,
+                            model_point: None,
+                        },
+                        d2,
+                    ));
                 }
                 if snap_better(tier, d2, sub, (best_rank, best_d2, best_sub)) {
                     best_rank = tier;
@@ -1671,8 +1705,16 @@ impl Snapper {
         construction_ray: Option<(glam::DVec3, glam::DVec3)>,
     ) -> Option<SnapResult> {
         self.snap_stable(
-            cursor_world, cursor_screen, wires, view_rot, eye, bounds,
-            grid_origin, grid_axes, construction_ray, None,
+            cursor_world,
+            cursor_screen,
+            wires,
+            view_rot,
+            eye,
+            bounds,
+            grid_origin,
+            grid_axes,
+            construction_ray,
+            None,
         )
     }
 
@@ -1737,8 +1779,17 @@ impl Snapper {
         additional_construction_rays: &[(glam::DVec3, glam::DVec3)],
     ) -> Option<SnapResult> {
         self.snap_with_additional_construction_rays_stable(
-            cursor_world, cursor_screen, wires, view_rot, eye, bounds,
-            grid_origin, grid_axes, construction_ray, additional_construction_rays, None,
+            cursor_world,
+            cursor_screen,
+            wires,
+            view_rot,
+            eye,
+            bounds,
+            grid_origin,
+            grid_axes,
+            construction_ray,
+            additional_construction_rays,
+            None,
         )
     }
 
@@ -1996,13 +2047,23 @@ impl Snapper {
             }
             let (tier, sub) = (snap_tier(snap_type), snap_priority(snap_type));
             if previous.is_some_and(|old| same_discrete_snap(old, world, snap_type)) {
-                retained.set(Some((SnapResult {
-                    world, screen, snap_type, tangent_obj: None,
-                    extension_base: None, extension_base2: None,
-                    extension_origin: None, extension_dir: None,
-                    viewport: None, source: src, secondary_source: secondary,
-                    model_point: None,
-                }, d2)));
+                retained.set(Some((
+                    SnapResult {
+                        world,
+                        screen,
+                        snap_type,
+                        tangent_obj: None,
+                        extension_base: None,
+                        extension_base2: None,
+                        extension_origin: None,
+                        extension_dir: None,
+                        viewport: None,
+                        source: src,
+                        secondary_source: secondary,
+                        model_point: None,
+                    },
+                    d2,
+                )));
             }
             // Coincident 3D features share pixels (top and bottom face
             // centres coincide in plan view): break exact ties by eye depth
@@ -2583,7 +2644,12 @@ impl Snapper {
                                 );
                                 let screen = world_to_screen(world_pt, view_rot, eye, bounds);
                                 if in_bounds(screen) && dist2(screen, cursor_screen) < radius2 {
-                                    pending.push((world_pt, screen, segment_a.wire, segment_b.wire));
+                                    pending.push((
+                                        world_pt,
+                                        screen,
+                                        segment_a.wire,
+                                        segment_b.wire,
+                                    ));
                                 }
                                 if dist2(apparent_screen, cursor_screen) <= f32::EPSILON {
                                     break 'apparent_sweep;
@@ -2655,6 +2721,9 @@ impl Snapper {
                         TangentGeom::Line { p1, p2 } => {
                             let (lp1, lp2) =
                                 tangent_line_endpoints(wire, *p1, *p2, &mut line_cursor);
+                            if !self.tangent_lines {
+                                continue;
+                            }
                             let sp0 = world_to_screen(lp1, view_rot, eye, bounds);
                             let sp1 = world_to_screen(lp2, view_rot, eye, bounds);
                             let d2 = dist2_to_segment(cursor_screen, sp0, sp1);
@@ -3002,7 +3071,9 @@ impl Snapper {
         // the cursor is to the curve. Runs here, after `try_pt`'s borrow ends,
         // so it can update the candidate state directly. (#152)
         // 2D master applies (this direct-evaluation pass bypasses `try_pt`).
-        if self.snap_enabled && self.is_on(SnapType::Center) {
+        // With Nearest on, the point under the cursor on the curve wins, as the
+        // nearer snap; the centre is then taken at the centre itself.
+        if self.snap_enabled && self.is_on(SnapType::Center) && !self.is_on(SnapType::Nearest) {
             // A polyline drawn piece by piece keeps its arc centres on one of
             // its wires: the one with the same name that carries them.
             let carries = |w: &WireModel| {
@@ -3166,7 +3237,7 @@ impl Snapper {
                     |world, snap_type, source| {
                         let screen = world_to_screen(world, view_rot, eye, bounds);
                         let d2 = dist2(screen, cursor_screen);
-                        if in_bounds(screen) && nearest.as_ref().map_or(true, |(n, _)| d2 < *n) {
+                        if in_bounds(screen) && nearest.as_ref().is_none_or(|(n, _)| d2 < *n) {
                             nearest = Some((
                                 d2,
                                 SnapResult {
@@ -3307,8 +3378,7 @@ fn otrack_ray_score(
     distance_px: f32,
 ) -> f32 {
     let retained = previous.is_some_and(|(old_base, old_dir)| {
-        (old_base - base).length_squared() < 1e-12
-            && old_dir.dot(dir).abs() > 0.9999
+        (old_base - base).length_squared() < 1e-12 && old_dir.dot(dir).abs() > 0.9999
     });
     distance_px - if retained { 4.0 } else { 0.0 }
 }
@@ -3347,6 +3417,21 @@ fn keep_stable_snap(
     } else {
         Some(challenger)
     }
+}
+
+/// The snap that moves the drawn point. A marker farther than the aperture
+/// (the hovered object's nearest point, #1914) is only shown: the rubber band
+/// stays on the cursor until the cursor comes near it, and a click still takes
+/// it (#2882). Grid snap always moves the point. `cursor` and the marker must
+/// share one pixel frame.
+pub(crate) fn pulling_snap(
+    snap: Option<SnapResult>,
+    cursor: Point,
+    radius_px: f32,
+) -> Option<SnapResult> {
+    snap.filter(|hit| {
+        hit.snap_type == SnapType::Grid || dist2(hit.screen, cursor) <= radius_px * radius_px
+    })
 }
 
 /// Merge paper and viewport snaps using the engine's ordering.
@@ -3597,7 +3682,7 @@ fn indexed_segments<W: WireSource + ?Sized>(wires: &W) -> Option<Vec<IndexedSegm
 #[inline]
 fn wp_f64(wire: &WireModel, i: usize) -> glam::DVec3 {
     let h = wire.points[i];
-    let l = wire.points_low.get(i).copied().unwrap_or([0.0; 3]);
+    let l = wire.points_low.get(i).unwrap_or([0.0; 3]);
     glam::DVec3::new(
         h[0] as f64 + l[0] as f64,
         h[1] as f64 + l[1] as f64,
@@ -3807,7 +3892,7 @@ fn tangent_line_endpoints(
 }
 
 fn curves_in_frame(wire: &WireModel, frame: &WirePlane, tol: f64) -> Option<Vec<Curve>> {
-    use kernel::geom2d::{
+    use ocs_geom::geom2d::{
         Arc as KArc, Circle as KCircle, Ellipse as KEllipse, EllipseArc as KEllipseArc,
         Line as KLine,
     };
@@ -3976,7 +4061,7 @@ fn exact_perpendicular_feet(wire: &WireModel, from: DVec3) -> Option<Vec<DVec3>>
     Some(
         curves
             .iter()
-            .flat_map(|curve| kernel::geom2d::perpendicular_from(curve, from))
+            .flat_map(|curve| ocs_geom::geom2d::perpendicular_from(curve, from))
             .map(|foot| frame.to_3d(foot.point))
             .collect(),
     )
@@ -4000,11 +4085,11 @@ pub(crate) fn exact_curve_intersections(
         return None;
     }
 
-    let tolerance = kernel::geom2d::Tolerance::new(1e-9_f64.max(PLANE_TOL));
+    let tolerance = ocs_geom::geom2d::Tolerance::new(1e-9_f64.max(PLANE_TOL));
     let mut points: Vec<DVec3> = Vec::new();
     for ca in &curves_a {
         for cb in &curves_b {
-            let crossings = kernel::geom2d::intersect(ca, cb, tolerance);
+            let crossings = ocs_geom::geom2d::intersect(ca, cb, tolerance);
             for c in crossings {
                 let pt = frame.to_3d(c.point);
                 if !points
@@ -4111,11 +4196,11 @@ fn seg_intersect_2d(a0: Point, a1: Point, b0: Point, b1: Point) -> Option<(f32, 
 
 /// Returns the two external tangent points on an XY circle.
 fn circle_tangent_points(p: Vec3, center: Vec3, radius: f32) -> Option<(Vec3, Vec3)> {
-    let curve = kernel::geom2d::Curve::Circle(kernel::geom2d::Circle {
+    let curve = ocs_geom::geom2d::Curve::Circle(ocs_geom::geom2d::Circle {
         centre: [center.x as f64, center.y as f64],
         radius: radius as f64,
     });
-    let points = kernel::geom2d::tangent_from(&curve, [p.x as f64, p.y as f64]);
+    let points = ocs_geom::geom2d::tangent_from(&curve, [p.x as f64, p.y as f64]);
     let [first, second] = points.as_slice() else {
         return None;
     };
@@ -4132,15 +4217,15 @@ fn planar_circle_tangent_points(
     axis_y: [f64; 3],
     radius: f64,
 ) -> Vec<DVec3> {
-    let plane = kernel::space::Plane::from_axes(center, axis_x, axis_y);
+    let plane = ocs_geom::space::Plane::from_axes(center, axis_x, axis_y);
     let Some(from) = plane.project(from.to_array()) else {
         return Vec::new();
     };
-    let curve = kernel::geom2d::Curve::Circle(kernel::geom2d::Circle {
+    let curve = ocs_geom::geom2d::Curve::Circle(ocs_geom::geom2d::Circle {
         centre: [0.0, 0.0],
         radius,
     });
-    kernel::geom2d::tangent_from(&curve, from)
+    ocs_geom::geom2d::tangent_from(&curve, from)
         .into_iter()
         .map(|point| DVec3::from_array(plane.point_at(point.point)))
         .collect()
@@ -4155,17 +4240,17 @@ fn arc_tangent_points(
     start_angle: f64,
     end_angle: f64,
 ) -> Vec<DVec3> {
-    let plane = kernel::space::Plane::from_axes(center, axis_x, axis_y);
+    let plane = ocs_geom::space::Plane::from_axes(center, axis_x, axis_y);
     let Some(from) = plane.project(from.to_array()) else {
         return Vec::new();
     };
-    let curve = kernel::geom2d::Curve::Arc(kernel::geom2d::Arc {
+    let curve = ocs_geom::geom2d::Curve::Arc(ocs_geom::geom2d::Arc {
         centre: [0.0, 0.0],
         radius,
         start_angle,
         end_angle,
     });
-    kernel::geom2d::tangent_from(&curve, from)
+    ocs_geom::geom2d::tangent_from(&curve, from)
         .into_iter()
         .map(|point| DVec3::from_array(plane.point_at(point.point)))
         .collect()
@@ -4296,7 +4381,7 @@ fn extension_bases_screen(
     }
     // Nearest-fit first, then keep up to two with distinct origins (collinear
     // segments sharing an endpoint must not draw the same guide twice).
-    found.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    found.sort_by(|x, y| x.0.total_cmp(&y.0));
     let mut bases: [Option<Point>; 2] = [None, None];
     let mut origins: Vec<glam::DVec3> = Vec::new();
     let mut directions: Vec<glam::DVec3> = Vec::new();
@@ -4669,25 +4754,56 @@ mod ext_tests {
         let make = |x: f64, kind| SnapResult {
             world: DVec3::new(x, 0.0, 0.0),
             screen: Point::new(x as f32, 0.0),
-            snap_type: kind, tangent_obj: None,
-            extension_base: None, extension_base2: None,
-            extension_origin: None, extension_dir: None,
-            viewport: None, source: None, secondary_source: None,
+            snap_type: kind,
+            tangent_obj: None,
+            extension_base: None,
+            extension_base2: None,
+            extension_origin: None,
+            extension_dir: None,
+            viewport: None,
+            source: None,
+            secondary_source: None,
             model_point: None,
         };
         let previous = make(8.0, SnapType::Endpoint);
-        assert!(same_discrete_snap(previous, previous.world, SnapType::Endpoint));
-        assert!(!same_discrete_snap(previous, previous.world + DVec3::X, SnapType::Endpoint));
-        assert!(!same_discrete_snap(previous, previous.world, SnapType::Midpoint));
-        assert!(!same_discrete_snap(make(8.0, SnapType::Nearest), previous.world, SnapType::Nearest));
+        assert!(same_discrete_snap(
+            previous,
+            previous.world,
+            SnapType::Endpoint
+        ));
+        assert!(!same_discrete_snap(
+            previous,
+            previous.world + DVec3::X,
+            SnapType::Endpoint
+        ));
+        assert!(!same_discrete_snap(
+            previous,
+            previous.world,
+            SnapType::Midpoint
+        ));
+        assert!(!same_discrete_snap(
+            make(8.0, SnapType::Nearest),
+            previous.world,
+            SnapType::Nearest
+        ));
 
         let challenger = make(10.0, SnapType::Midpoint);
-        let held = keep_stable_snap(Some(challenger), Some((previous, 8.0 * 8.0)), Point::new(0.0, 0.0));
+        let held = keep_stable_snap(
+            Some(challenger),
+            Some((previous, 8.0 * 8.0)),
+            Point::new(0.0, 0.0),
+        );
         assert_eq!(held.unwrap().snap_type, SnapType::Endpoint);
-        let released = keep_stable_snap(Some(challenger), Some((previous, 20.0 * 20.0)), Point::new(0.0, 0.0));
+        let released = keep_stable_snap(
+            Some(challenger),
+            Some((previous, 20.0 * 20.0)),
+            Point::new(0.0, 0.0),
+        );
         assert_eq!(released.unwrap().snap_type, SnapType::Midpoint);
         assert_eq!(
-            keep_stable_snap(Some(challenger), None, Point::new(0.0, 0.0)).unwrap().snap_type,
+            keep_stable_snap(Some(challenger), None, Point::new(0.0, 0.0))
+                .unwrap()
+                .snap_type,
             SnapType::Midpoint,
         );
     }
@@ -4718,30 +4834,87 @@ mod ext_tests {
         // The view/grid spacing must not merge two real vertices 10m apart.
         snapper.grid_spacing = 1000.0;
         let wire = WireModel {
-            points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = [wire];
         let view = Mat4::from_scale(Vec3::splat(0.01));
-        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
         let make_hit = |x: f64| SnapResult {
             world: DVec3::new(x, 0.0, 0.0),
             screen: world_to_screen(DVec3::new(x, 0.0, 0.0), view, DVec3::ZERO, bounds),
             snap_type: SnapType::Endpoint,
-            tangent_obj: None, extension_base: None, extension_base2: None,
-            extension_origin: None, extension_dir: None, viewport: None,
-            source: None, secondary_source: None, model_point: None,
+            tangent_obj: None,
+            extension_base: None,
+            extension_base2: None,
+            extension_origin: None,
+            extension_dir: None,
+            viewport: None,
+            source: None,
+            secondary_source: None,
+            model_point: None,
         };
         let start = Instant::now();
         let dt = |millis| start + std::time::Duration::from_millis(millis);
-        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(0));
-        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(300));
+        snapper.update_otrack_dwell(
+            Some(make_hit(0.0)),
+            &wires,
+            view,
+            DVec3::ZERO,
+            bounds,
+            dt(0),
+        );
+        snapper.update_otrack_dwell(
+            Some(make_hit(0.0)),
+            &wires,
+            view,
+            DVec3::ZERO,
+            bounds,
+            dt(300),
+        );
         assert_eq!(snapper.tracking_points.len(), 1);
-        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(650));
-        assert_eq!(snapper.tracking_points.len(), 1, "repeated dwell must not toggle off a source");
-        snapper.update_otrack_dwell(Some(make_hit(10.0)), &wires, view, DVec3::ZERO, bounds, dt(700));
-        snapper.update_otrack_dwell(Some(make_hit(10.0)), &wires, view, DVec3::ZERO, bounds, dt(1000));
-        assert_eq!(snapper.tracking_points.len(), 2, "both crossing origins remain acquired");
+        snapper.update_otrack_dwell(
+            Some(make_hit(0.0)),
+            &wires,
+            view,
+            DVec3::ZERO,
+            bounds,
+            dt(650),
+        );
+        assert_eq!(
+            snapper.tracking_points.len(),
+            1,
+            "repeated dwell must not toggle off a source"
+        );
+        snapper.update_otrack_dwell(
+            Some(make_hit(10.0)),
+            &wires,
+            view,
+            DVec3::ZERO,
+            bounds,
+            dt(700),
+        );
+        snapper.update_otrack_dwell(
+            Some(make_hit(10.0)),
+            &wires,
+            view,
+            DVec3::ZERO,
+            bounds,
+            dt(1000),
+        );
+        assert_eq!(
+            snapper.tracking_points.len(),
+            2,
+            "both crossing origins remain acquired"
+        );
         assert!(snapper.has_tracking_point(DVec3::new(0.0, 0.0, 0.0)));
         assert!(snapper.has_tracking_point(DVec3::new(10.0, 0.0, 0.0)));
     }
@@ -4749,13 +4922,24 @@ mod ext_tests {
     #[test]
     fn extension_allows_inward_and_outward_from_an_acquired_endpoint() {
         let view = Mat4::from_scale(Vec3::splat(0.01));
-        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
         let origin = DVec3::ZERO;
         let outward = -DVec3::X;
         let inward = DVec3::new(4.0, 0.0, 0.0);
         let beyond = DVec3::new(-4.0, 0.0, 0.0);
-        assert_eq!(extension_snap(inward, origin, outward, view, DVec3::ZERO, bounds, 25.0), Some(inward));
-        assert_eq!(extension_snap(beyond, origin, outward, view, DVec3::ZERO, bounds, 25.0), Some(beyond));
+        assert_eq!(
+            extension_snap(inward, origin, outward, view, DVec3::ZERO, bounds, 25.0),
+            Some(inward)
+        );
+        assert_eq!(
+            extension_snap(beyond, origin, outward, view, DVec3::ZERO, bounds, 25.0),
+            Some(beyond)
+        );
         assert!(extension_snap(origin, origin, outward, view, DVec3::ZERO, bounds, 25.0).is_none());
     }
 
@@ -4767,12 +4951,27 @@ mod ext_tests {
         snapper.tracking_points = vec![DVec3::ZERO, DVec3::new(5.0, 5.0, 0.0)];
         snapper.tracking_dirs = vec![vec![-DVec3::X], vec![DVec3::Y]];
         let view = Mat4::from_scale(Vec3::splat(0.01));
-        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
         let cursor = DVec3::new(5.01, 0.02, 0.0);
-        let hit = snapper.otrack_snap(
-            cursor, view, DVec3::ZERO, bounds, None, None, None,
-            false, DVec3::X, DVec3::Y,
-        ).expect("acquired lines must intersect even behind the stored outward directions");
+        let hit = snapper
+            .otrack_snap(
+                cursor,
+                view,
+                DVec3::ZERO,
+                bounds,
+                None,
+                None,
+                None,
+                false,
+                DVec3::X,
+                DVec3::Y,
+            )
+            .expect("acquired lines must intersect even behind the stored outward directions");
         assert!(hit.cross.is_some());
         assert!((hit.aligned - DVec3::new(5.0, 0.0, 0.0)).length() < 1e-7);
     }
@@ -4783,8 +4982,11 @@ mod ext_tests {
         // A single line segment (0,0)-(10,0): its endpoints are vertices, its
         // midpoint and any extension foot are not.
         let wire = WireModel {
-            text_verts: Vec::new(),
-            points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                text_verts: Vec::new(),
+                points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = [wire];
@@ -5122,21 +5324,27 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_matches_the_3_4_5_report() {
         let c1 = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let c2 = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [3.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 5.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [3.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 5.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts =
@@ -5166,23 +5374,29 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_respects_an_arcs_own_sweep() {
         let arc = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-                start_angle: 0.0,
-                end_angle: std::f64::consts::FRAC_PI_2,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                    start_angle: 0.0,
+                    end_angle: std::f64::consts::FRAC_PI_2,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [3.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 5.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [3.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 5.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         // Full-circle math gives (0,4,0) [on the 0..90° arc] and (0,-4,0)
@@ -5195,21 +5409,27 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_is_none_for_non_coplanar_circles() {
         let flat = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let tilted = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 0.0, 1.0],
-                radius: 4.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 0.0, 1.0],
+                    radius: 4.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         assert!(
@@ -5221,21 +5441,27 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_resolves_disjoint_circles() {
         let near = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 1.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 1.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let far = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [100.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 1.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [100.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 1.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         assert!(exact_curve_intersections(&near, &far).unwrap().is_empty());
@@ -5245,25 +5471,31 @@ mod ext_tests {
     fn exact_curve_intersections_handles_two_arcs_in_differently_rotated_frames() {
         // Arc A: quarter circle 0..90°, axis_x along world +X.
         let arc_a = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-                start_angle: 0.0,
-                end_angle: std::f64::consts::FRAC_PI_2,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                    start_angle: 0.0,
+                    end_angle: std::f64::consts::FRAC_PI_2,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let arc_b = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [3.0, 0.0, 0.0],
-                axis_x: [0.0, 1.0, 0.0],
-                axis_y: [-1.0, 0.0, 0.0],
-                radius: 5.0,
-                start_angle: std::f64::consts::FRAC_PI_2,
-                end_angle: 3.0 * std::f64::consts::FRAC_PI_2,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [3.0, 0.0, 0.0],
+                    axis_x: [0.0, 1.0, 0.0],
+                    axis_y: [-1.0, 0.0, 0.0],
+                    radius: 5.0,
+                    start_angle: std::f64::consts::FRAC_PI_2,
+                    end_angle: 3.0 * std::f64::consts::FRAC_PI_2,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         assert!(exact_curve_intersections(&arc_a, &arc_b)
@@ -5274,14 +5506,17 @@ mod ext_tests {
         // (0,-4,0) is on both A's and B's own sweep, independently checked
         // in each one's own (differently rotated) frame.
         let arc_a_lower = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-                start_angle: 3.0 * std::f64::consts::FRAC_PI_2,
-                end_angle: std::f64::consts::TAU,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                    start_angle: 3.0 * std::f64::consts::FRAC_PI_2,
+                    end_angle: std::f64::consts::TAU,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts =
@@ -5296,11 +5531,14 @@ mod ext_tests {
 
     fn plain_line(a: [f64; 3], b: [f64; 3]) -> WireModel {
         WireModel {
-            points: vec![
-                [a[0] as f32, a[1] as f32, a[2] as f32],
-                [b[0] as f32, b[1] as f32, b[2] as f32],
-            ],
-            points_low: vec![],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![
+                    [a[0] as f32, a[1] as f32, a[2] as f32],
+                    [b[0] as f32, b[1] as f32, b[2] as f32],
+                ],
+                points_low: Default::default(),
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         }
     }
@@ -5309,12 +5547,15 @@ mod ext_tests {
     fn exact_curve_intersections_handles_a_line_against_a_circle() {
         let line = plain_line([-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 5.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 5.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts = exact_curve_intersections(&line, &circle)
@@ -5334,14 +5575,17 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_handles_a_line_against_an_arcs_own_sweep() {
         let arc = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 4.0,
-                start_angle: 0.0,
-                end_angle: std::f64::consts::FRAC_PI_2,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 4.0,
+                    start_angle: 0.0,
+                    end_angle: std::f64::consts::FRAC_PI_2,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let line = plain_line([0.0, -10.0, 0.0], [0.0, 10.0, 0.0]);
@@ -5356,14 +5600,17 @@ mod ext_tests {
         // x^2/16 + y^2/4 = 1 -- a vertical line at x=0 crosses it exactly at
         // y = +-2.
         let ellipse = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center: [0.0, 0.0, 0.0],
-                major_axis: [4.0, 0.0, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                minor_axis_ratio: 0.5,
-                start_param: 0.0,
-                end_param: std::f64::consts::TAU,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center: [0.0, 0.0, 0.0],
+                    major_axis: [4.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    minor_axis_ratio: 0.5,
+                    start_param: 0.0,
+                    end_param: std::f64::consts::TAU,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let line = plain_line([0.0, -10.0, 0.0], [0.0, 10.0, 0.0]);
@@ -5384,23 +5631,29 @@ mod ext_tests {
         // independently (not via this module's own math) as crossing at
         // exactly x = 3.75, y = +-sqrt(63)/4.
         let ellipse = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center: [0.0, 0.0, 0.0],
-                major_axis: [5.0, 0.0, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                minor_axis_ratio: 0.6,
-                start_param: 0.0,
-                end_param: std::f64::consts::TAU,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center: [0.0, 0.0, 0.0],
+                    major_axis: [5.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    minor_axis_ratio: 0.6,
+                    start_param: 0.0,
+                    end_param: std::f64::consts::TAU,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [6.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 3.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [6.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 3.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts =
@@ -5422,26 +5675,32 @@ mod ext_tests {
         // 1.0, i.e. a circle) at (6,0,0) — same pair as the full-ellipse
         // test above, crossing at (3.75, +-1.9843...).
         let ellipse = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center: [0.0, 0.0, 0.0],
-                major_axis: [5.0, 0.0, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                minor_axis_ratio: 0.6,
-                start_param: 0.0,
-                end_param: std::f64::consts::TAU,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center: [0.0, 0.0, 0.0],
+                    major_axis: [5.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    minor_axis_ratio: 0.6,
+                    start_param: 0.0,
+                    end_param: std::f64::consts::TAU,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let deg = std::f64::consts::PI / 180.0;
         let make_arc = |normal_z: f64| WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center: [6.0, 0.0, 0.0],
-                major_axis: [3.0, 0.0, 0.0],
-                normal: [0.0, 0.0, normal_z],
-                minor_axis_ratio: 1.0,
-                start_param: 100.0 * deg,
-                end_param: 170.0 * deg,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center: [6.0, 0.0, 0.0],
+                    major_axis: [3.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, normal_z],
+                    minor_axis_ratio: 1.0,
+                    start_param: 100.0 * deg,
+                    end_param: 170.0 * deg,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
 
@@ -5470,28 +5729,34 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_arc_respects_normal_direction_against_an_ellipse_frame() {
         let ellipse = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center: [0.0, 0.0, 0.0],
-                major_axis: [5.0, 0.0, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                minor_axis_ratio: 0.6,
-                start_param: 0.0,
-                end_param: std::f64::consts::TAU,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center: [0.0, 0.0, 0.0],
+                    major_axis: [5.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    minor_axis_ratio: 0.6,
+                    start_param: 0.0,
+                    end_param: std::f64::consts::TAU,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let deg = std::f64::consts::PI / 180.0;
         // normal=-Z arc: axis_x/axis_y chosen so axis_x x axis_y = (0,0,-1),
         // mirroring the ellipse test's make_arc(-1.0) exactly.
         let arc_minus_z = WireModel {
-            tangent_geoms: vec![TangentGeom::Arc {
-                center: [6.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, -1.0, 0.0],
-                radius: 3.0,
-                start_angle: 100.0 * deg,
-                end_angle: 170.0 * deg,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::Arc {
+                    center: [6.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, -1.0, 0.0],
+                    radius: 3.0,
+                    start_angle: 100.0 * deg,
+                    end_angle: 170.0 * deg,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts =
@@ -5611,7 +5876,7 @@ mod ext_tests {
         let a = [origin - 10.0, origin, 0.0];
         let b = [origin + 10.0, origin, 0.0];
         let points = [a, b].map(|point| point.map(|value| value as f32));
-        let low = [a, b]
+        let low: Vec<_> = [a, b]
             .into_iter()
             .zip(points)
             .map(|(point, high)| {
@@ -5619,21 +5884,27 @@ mod ext_tests {
             })
             .collect();
         let line = WireModel {
-            points: points.to_vec(),
-            points_low: low,
-            tangent_geoms: vec![TangentGeom::Line {
-                p1: points[0],
-                p2: points[1],
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: points.to_vec(),
+                points_low: low.into(),
+                tangent_geoms: vec![TangentGeom::Line {
+                    p1: points[0],
+                    p2: points[1],
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [origin, origin, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 3.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [origin, origin, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 3.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let points = exact_curve_intersections(&line, &circle).unwrap();
@@ -5644,7 +5915,7 @@ mod ext_tests {
     }
 
     #[test]
-    fn test_unindexed_snap_endpoint_and_midpoint_accuracy() {
+    fn unindexed_snap_endpoint_and_midpoint_accuracy() {
         let mut snapper = Snapper::default();
         snapper.snap_enabled = true;
         snapper.enabled = [SnapType::Endpoint, SnapType::Midpoint]
@@ -5652,13 +5923,16 @@ mod ext_tests {
             .collect();
 
         let line = WireModel {
-            points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
-            key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
             aabb: [0.0, 0.0, 100.0, 100.0],
-            tangent_geoms: vec![TangentGeom::Line {
-                p1: [0.0, 0.0, 0.0],
-                p2: [100.0, 100.0, 0.0],
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                tangent_geoms: vec![TangentGeom::Line {
+                    p1: [0.0, 0.0, 0.0],
+                    p2: [100.0, 100.0, 0.0],
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![line];
@@ -5719,13 +5993,19 @@ mod ext_tests {
             .into_iter()
             .collect();
         let line = WireModel {
-            points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
-            key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
             aabb: [0.0, 0.0, 100.0, 100.0],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let node = WireModel {
-            snap_pts: vec![(DVec3::new(50.0, 50.0, 0.0), SnapHint::Node)],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                snap_pts: vec![(DVec3::new(50.0, 50.0, 0.0), SnapHint::Node)],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![line, node];
@@ -5763,15 +6043,18 @@ mod ext_tests {
     }
 
     #[test]
-    fn test_unindexed_snap_empty_space_early_out() {
+    fn unindexed_snap_empty_space_early_out() {
         let mut snapper = Snapper::default();
         snapper.snap_enabled = true;
         snapper.enable_all();
 
         let line = WireModel {
-            points: vec![[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]],
-            key_vertices: vec![[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]],
             aabb: [0.0, 0.0, 10.0, 10.0],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]],
+                key_vertices: vec![[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![line];
@@ -5803,21 +6086,27 @@ mod ext_tests {
     }
 
     #[test]
-    fn test_unindexed_snap_intersection_pair() {
+    fn unindexed_snap_intersection_pair() {
         let mut snapper = Snapper::default();
         snapper.snap_enabled = true;
         snapper.enabled = [SnapType::Intersection].into_iter().collect();
 
         let line1 = WireModel {
-            points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
-            key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
             aabb: [0.0, 0.0, 100.0, 100.0],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                key_vertices: vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let line2 = WireModel {
-            points: vec![[0.0, 100.0, 0.0], [100.0, 0.0, 0.0]],
-            key_vertices: vec![[0.0, 100.0, 0.0], [100.0, 0.0, 0.0]],
             aabb: [0.0, 0.0, 100.0, 100.0],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[0.0, 100.0, 0.0], [100.0, 0.0, 0.0]],
+                key_vertices: vec![[0.0, 100.0, 0.0], [100.0, 0.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![line1, line2];
@@ -5852,7 +6141,7 @@ mod ext_tests {
     }
 
     #[test]
-    fn test_unindexed_snap_dense_cluster_fallback() {
+    fn unindexed_snap_dense_cluster_fallback() {
         let mut snapper = Snapper::default();
         snapper.snap_enabled = true;
         snapper.enabled = [SnapType::Endpoint].into_iter().collect();
@@ -5870,14 +6159,17 @@ mod ext_tests {
             let p1_f64 = [0.0f64, 0.0, 0.0];
             let p2_f64 = [angle.cos() * 50.0, angle.sin() * 50.0, 0.0];
             wires.push(WireModel {
-                points: vec![p1, p2],
-                key_vertices: vec![p1_f64, p2_f64],
                 aabb: [
                     p1[0].min(p2[0]),
                     p1[1].min(p2[1]),
                     p1[0].max(p2[0]),
                     p1[1].max(p2[1]),
                 ],
+                geom: std::sync::Arc::new(crate::scene::WireGeom {
+                    points: vec![p1, p2],
+                    key_vertices: vec![p1_f64, p2_f64],
+                    ..crate::scene::WireGeom::default()
+                }),
                 ..Default::default()
             });
         }
@@ -5963,26 +6255,32 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_handles_multisegment_polyline_against_circle_at_vertex() {
         let polyline = WireModel {
-            key_vertices: vec![[-10.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
-            tangent_geoms: vec![
-                TangentGeom::Line {
-                    p1: [-10.0, 0.0, 0.0],
-                    p2: [0.0, 0.0, 0.0],
-                },
-                TangentGeom::Line {
-                    p1: [0.0, 0.0, 0.0],
-                    p2: [0.0, 10.0, 0.0],
-                },
-            ],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                key_vertices: vec![[-10.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                tangent_geoms: vec![
+                    TangentGeom::Line {
+                        p1: [-10.0, 0.0, 0.0],
+                        p2: [0.0, 0.0, 0.0],
+                    },
+                    TangentGeom::Line {
+                        p1: [0.0, 0.0, 0.0],
+                        p2: [0.0, 10.0, 0.0],
+                    },
+                ],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 5.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 5.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 5.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 5.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts = exact_curve_intersections(&polyline, &circle)
@@ -6013,29 +6311,35 @@ mod ext_tests {
     #[test]
     fn exact_curve_intersections_handles_polyline_with_bulge_arc_against_circle() {
         let polyline = WireModel {
-            tangent_geoms: vec![
-                TangentGeom::Line {
-                    p1: [-10.0, 0.0, 0.0],
-                    p2: [0.0, 0.0, 0.0],
-                },
-                TangentGeom::Arc {
-                    center: [0.0, 4.0, 0.0],
-                    axis_x: [1.0, 0.0, 0.0],
-                    axis_y: [0.0, 1.0, 0.0],
-                    radius: 4.0,
-                    start_angle: -std::f64::consts::FRAC_PI_2,
-                    end_angle: std::f64::consts::FRAC_PI_2,
-                },
-            ],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![
+                    TangentGeom::Line {
+                        p1: [-10.0, 0.0, 0.0],
+                        p2: [0.0, 0.0, 0.0],
+                    },
+                    TangentGeom::Arc {
+                        center: [0.0, 4.0, 0.0],
+                        axis_x: [1.0, 0.0, 0.0],
+                        axis_y: [0.0, 1.0, 0.0],
+                        radius: 4.0,
+                        start_angle: -std::f64::consts::FRAC_PI_2,
+                        end_angle: std::f64::consts::FRAC_PI_2,
+                    },
+                ],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let circle = WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [0.0, 0.0, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius: 5.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [0.0, 0.0, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius: 5.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let pts = exact_curve_intersections(&polyline, &circle)
@@ -6052,12 +6356,15 @@ mod ext_tests {
 
     fn xy_circle(cx: f64, cy: f64, radius: f64) -> WireModel {
         WireModel {
-            tangent_geoms: vec![TangentGeom::PlanarCircle {
-                center: [cx, cy, 0.0],
-                axis_x: [1.0, 0.0, 0.0],
-                axis_y: [0.0, 1.0, 0.0],
-                radius,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                tangent_geoms: vec![TangentGeom::PlanarCircle {
+                    center: [cx, cy, 0.0],
+                    axis_x: [1.0, 0.0, 0.0],
+                    axis_y: [0.0, 1.0, 0.0],
+                    radius,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         }
     }
@@ -6114,17 +6421,20 @@ mod ext_tests {
         let (a0, a1) = ([-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
         let (b0, b1) = ([20.0, -10.0, 0.0], [20.0, 10.0, 0.0]);
         let block = WireModel {
-            key_vertices: vec![a0, a1, b0, b1],
-            tangent_geoms: vec![
-                line_geom(a0, a1),
-                line_geom(b0, b1),
-                TangentGeom::PlanarCircle {
-                    center: [30.0, 0.0, 0.0],
-                    axis_x: [1.0, 0.0, 0.0],
-                    axis_y: [0.0, 1.0, 0.0],
-                    radius: 1.0,
-                },
-            ],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                key_vertices: vec![a0, a1, b0, b1],
+                tangent_geoms: vec![
+                    line_geom(a0, a1),
+                    line_geom(b0, b1),
+                    TangentGeom::PlanarCircle {
+                        center: [30.0, 0.0, 0.0],
+                        axis_x: [1.0, 0.0, 0.0],
+                        axis_y: [0.0, 1.0, 0.0],
+                        radius: 1.0,
+                    },
+                ],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
 
@@ -6155,8 +6465,11 @@ mod ext_tests {
             [ox, oy, 0.0],
         ];
         let square = WireModel {
-            key_vertices: v.to_vec(),
-            tangent_geoms: (0..4).map(|i| line_geom(v[i], v[(i + 1) % 4])).collect(),
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                key_vertices: v.to_vec(),
+                tangent_geoms: (0..4).map(|i| line_geom(v[i], v[(i + 1) % 4])).collect(),
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
 
@@ -6179,8 +6492,11 @@ mod ext_tests {
         let n = 64;
         let verts: Vec<[f64; 3]> = (0..=n).map(|i| [i as f64, (i % 3) as f64, 0.0]).collect();
         let wire = WireModel {
-            key_vertices: verts.clone(),
-            tangent_geoms: (0..n).map(|i| line_geom(verts[i], verts[i + 1])).collect(),
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                key_vertices: verts.clone(),
+                tangent_geoms: (0..n).map(|i| line_geom(verts[i], verts[i + 1])).collect(),
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let mut cursor = 0usize;
@@ -6271,13 +6587,16 @@ mod ext_tests {
             })
             .collect();
         let circle = WireModel {
-            points,
             aabb: [-50.0, -50.0, 50.0, 50.0],
-            snap_pts: vec![(DVec3::ZERO, SnapHint::Center)],
-            tangent_geoms: vec![TangentGeom::Circle {
-                center: [0.0, 0.0, 0.0],
-                radius: 50.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points,
+                snap_pts: vec![(DVec3::ZERO, SnapHint::Center)],
+                tangent_geoms: vec![TangentGeom::Circle {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 50.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![circle];
@@ -6329,23 +6648,29 @@ mod ext_tests {
             })
             .collect();
         let circle = WireModel {
-            points,
             aabb: [-50.0, -50.0, 50.0, 50.0],
-            // The quadrant hint marks it closed: its seam is no endpoint.
-            snap_pts: vec![
-                (DVec3::ZERO, SnapHint::Center),
-                (DVec3::new(0.0, 50.0, 0.0), SnapHint::Quadrant),
-            ],
-            tangent_geoms: vec![TangentGeom::Circle {
-                center: [0.0, 0.0, 0.0],
-                radius: 50.0,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points,
+                // The quadrant hint marks it closed: its seam is no endpoint.
+                snap_pts: vec![
+                    (DVec3::ZERO, SnapHint::Center),
+                    (DVec3::new(0.0, 50.0, 0.0), SnapHint::Quadrant),
+                ],
+                tangent_geoms: vec![TangentGeom::Circle {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 50.0,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         // Ends 3 px left of the foot (1 px = 1 unit at this zoom).
         let line = WireModel {
-            points: vec![[47.0, -30.0, 0.0], [47.0, 0.0, 0.0]],
             aabb: [47.0, -30.0, 47.0, 0.0],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points: vec![[47.0, -30.0, 0.0], [47.0, 0.0, 0.0]],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![circle, line];
@@ -6380,7 +6705,7 @@ mod ext_tests {
     }
 
     #[test]
-    fn test_ellipse_arc_tangent_snap_ignores_break() {
+    fn ellipse_arc_tangent_snap_ignores_break() {
         use std::f64::consts::PI;
         let mut snapper = Snapper::default();
         snapper.snap_enabled = true;
@@ -6403,16 +6728,19 @@ mod ext_tests {
         }
 
         let ellipse_arc = WireModel {
-            points,
             aabb: [-100.0, -50.0, 100.0, 50.0],
-            tangent_geoms: vec![TangentGeom::PlanarEllipse {
-                center,
-                major_axis,
-                normal,
-                minor_axis_ratio,
-                start_param,
-                end_param,
-            }],
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points,
+                tangent_geoms: vec![TangentGeom::PlanarEllipse {
+                    center,
+                    major_axis,
+                    normal,
+                    minor_axis_ratio,
+                    start_param,
+                    end_param,
+                }],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
         let wires = vec![ellipse_arc];

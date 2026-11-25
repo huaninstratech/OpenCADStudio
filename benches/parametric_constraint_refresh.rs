@@ -36,8 +36,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::entities::{EntityType, Line};
-use codec::types::{Handle, Vector3};
+use document::entities::{EntityType, Line};
+use document::types::{Handle, Vector3};
 use OpenCADStudio::scene::parametric_constraints::{
     ConstraintKind, ParametricRef, ParametricScope,
 };
@@ -165,13 +165,15 @@ fn run_scenario(fixture: &mut Fixture, scenario: &Scenario) -> (f64, u64, u64) {
             };
             fixture.scene.begin_undo_recording();
             let start = Instant::now();
-            let result = fixture.scene.refresh_parametric_constraints_with_initial_policy(
-                black_box(&scenario.changes),
-                black_box(&[]),
-                false,
-                black_box(&[]),
-                black_box(&[]),
-            );
+            let result = fixture
+                .scene
+                .refresh_parametric_constraints_with_initial_policy(
+                    black_box(&scenario.changes),
+                    black_box(&[]),
+                    false,
+                    black_box(&[]),
+                    black_box(&[]),
+                );
             acc_ms += start.elapsed().as_secs_f64() * 1000.0;
             sink_result += result.len() as u64;
             if scenario.reset_after_call {

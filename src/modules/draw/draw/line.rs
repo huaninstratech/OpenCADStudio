@@ -2,13 +2,13 @@
 //
 // Command:  LINE — OpenCADStudio behaviour:
 //   1. First click  → stores start point, prompts for next point
-//   2. Each further click → immediately commits an codec::Line entity
+//   2. Each further click → immediately commits an document::Line entity
 //      (start→end) to the document; end becomes the new start point
 //   3. Enter / Escape → ends the command
 
 use crate::t;
-use codec::types::Vector3;
-use codec::{EntityType, Line};
+use document::types::Vector3;
+use document::{EntityType, Line};
 
 use crate::command::{CadCommand, CmdResult, TangentObject};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -40,6 +40,12 @@ pub struct LineCommand {
     /// gives a direction — and resolved on that next pick as either a common
     /// tangent of two circles or a tangent from a point to the circle. (#274)
     deferred_tangent: Option<(TangentObject, DVec3)>,
+}
+
+impl Default for LineCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineCommand {

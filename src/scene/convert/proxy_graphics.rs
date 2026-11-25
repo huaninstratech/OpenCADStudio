@@ -20,7 +20,9 @@
 //!   4 arc (centre, radius, normal, start vector, sweep, arc type); 5 arc
 //!   through 3 points (+ arc type); 6 poly-line / 7 poly-gon (`u32 n`,
 //!   `[f64;3]×n`); 9 shell (`u32 n` verts, then `u32` face-list length and
-//!   `[i32 count, u32 idx…]` faces, a negative count marking a hole); 32 a
+//!   `[i32 count, u32 idx…]` faces, a negative count marking a hole, then
+//!   `u32` edge flags; flag 0x40 alone is a `u32` visibility per edge, 0
+//!   hidden, in face-list order); 32 a
 //!   poly-line followed by its normal; 33 an embedded LWPOLYLINE (`u32` byte
 //!   count, then the entity's bit-coded body: flags, width, elevation,
 //!   thickness, normal, points, bulges, vertex ids, widths).
@@ -102,6 +104,9 @@ pub struct ProxyText {
     pub text: String,
     pub font: String,
     pub style: ProxyStyle,
+    /// Where `position` sits on the text, as fractions of its width and
+    /// height: `[0, 0]` is the baseline start, `[1, 0.5]` middle right.
+    pub align: [f64; 2],
 }
 
 /// Everything a preview decodes to.
@@ -143,6 +148,8 @@ const REC_TEXT2_UNICODE: u32 = 38;
 
 /// Fill trait value meaning "fill closed primitives".
 const FILL_ALWAYS: u32 = 1;
+/// Shell edge-data flag: one `u32` visibility per edge.
+const EDGE_VISIBILITIES: u32 = 0x40;
 
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 4)
@@ -222,18 +229,9 @@ impl State {
         if local.len() < 2 {
             return;
         }
-        let mut pts: Vec<[f64; 3]> = local
-            .iter()
-            .map(|&p| self.xform.transform_point3(p).to_array())
-            .collect();
-        if closed && self.fill && pts.len() >= 3 {
-            let tris = crate::entities::mesh::triangulate_planar(&pts);
-            if !tris.is_empty() {
-                self.out.fills.push(ProxyFill {
-                    tris,
-                    style: self.style,
-                });
-            }
+        let mut pts = self.world(&local);
+        if closed {
+            self.push_fill(&pts);
         }
         if closed {
             pts.push(pts[0]);
@@ -242,6 +240,42 @@ impl State {
             points: pts,
             style: self.style,
         });
+    }
+
+    fn world(&self, local: &[DVec3]) -> Vec<[f64; 3]> {
+        local
+            .iter()
+            .map(|&p| self.xform.transform_point3(p).to_array())
+            .collect()
+    }
+
+    /// A closed run under the fill trait as a filled area.
+    fn push_fill(&mut self, pts: &[[f64; 3]]) {
+        if self.fill && pts.len() >= 3 {
+            let tris = crate::entities::mesh::triangulate_planar(pts);
+            if !tris.is_empty() {
+                self.out.fills.push(ProxyFill {
+                    tris,
+                    style: self.style,
+                });
+            }
+        }
+    }
+
+    /// A shell face: filled under the fill trait, outlined by its visible
+    /// edges only (edge `k` runs from vertex `k` to the next).
+    fn push_face(&mut self, local: Vec<DVec3>, visible: Option<Vec<bool>>) {
+        let Some(visible) = visible.filter(|v| v.iter().any(|shown| !shown)) else {
+            return self.push(local, true);
+        };
+        let pts = self.world(&local);
+        self.push_fill(&pts);
+        for (k, _) in visible.iter().enumerate().filter(|(_, shown)| **shown) {
+            self.out.polylines.push(ProxyPolyline {
+                points: vec![pts[k], pts[(k + 1) % pts.len()]],
+                style: self.style,
+            });
+        }
     }
 
     fn push_text(&mut self, mut t: ProxyText, dir: DVec3) {
@@ -337,8 +371,8 @@ pub fn decode(blob: &[u8]) -> Decoded {
                 }
             }
             REC_SHELL => {
-                for face in decode_shell(d) {
-                    st.push(face, true);
+                for (face, visible) in decode_shell(d) {
+                    st.push_face(face, visible);
                 }
             }
             REC_CIRCLE => {
@@ -407,8 +441,9 @@ fn decode_points(d: &[u8]) -> Option<Vec<DVec3>> {
     (0..n).map(|i| pt3_at(d, 4 + i * 24)).collect()
 }
 
-/// Read a shell record and return each face (holes included) as a vertex run.
-fn decode_shell(d: &[u8]) -> Vec<Vec<DVec3>> {
+/// Read a shell record and return each face (holes included) as a vertex run,
+/// with its edges' visibility when the record carries it.
+fn decode_shell(d: &[u8]) -> Vec<(Vec<DVec3>, Option<Vec<bool>>)> {
     let mut faces = Vec::new();
     let Some(n) = u32_at(d, 0).map(|n| n as usize) else {
         return faces;
@@ -426,6 +461,7 @@ fn decode_shell(d: &[u8]) -> Vec<Vec<DVec3>> {
     let entries = u32_at(d, fp).unwrap_or(0) as usize;
     fp += 4;
     let mut read = 0;
+    let mut runs = Vec::new();
     while read < entries {
         // A negative count marks a hole loop; it is drawn all the same.
         let Some(fc) = u32_at(d, fp).map(|c| (c as i32).unsigned_abs() as usize) else {
@@ -438,11 +474,24 @@ fn decode_shell(d: &[u8]) -> Vec<Vec<DVec3>> {
             .map(|k| u32_at(d, fp + 4 + k * 4).and_then(|i| verts.get(i as usize).copied()))
             .collect();
         match face {
-            Some(face) => faces.push(face),
+            Some(face) => runs.push(face),
             None => break,
         }
         read += 1 + fc;
         fp += 4 + fc * 4;
+    }
+    // Edge data follows a complete face list. Only a visibility array on its
+    // own is read: the other edge arrays' sizes are not modelled.
+    let edges: usize = runs.iter().map(Vec::len).sum();
+    let visible: Option<Vec<bool>> = (read == entries
+        && u32_at(d, fp) == Some(EDGE_VISIBILITIES))
+    .then(|| (0..edges).map(|k| u32_at(d, fp + 4 + k * 4).map(|v| v != 0)).collect())
+    .flatten();
+    let mut next = 0;
+    for face in runs {
+        let shown = visible.as_ref().map(|v| v[next..next + face.len()].to_vec());
+        next += face.len();
+        faces.push((face, shown));
     }
     faces
 }
@@ -491,7 +540,12 @@ fn arc_points(
         .normalize();
     let v = n.cross(u);
     let closed = sweep.abs() >= std::f64::consts::TAU - 1e-9;
-    let segs = ((sweep.abs() / std::f64::consts::TAU * 64.0).ceil() as usize).clamp(2, 512);
+    // Steps short enough that a chord strays at most a thousandth of a unit
+    // from the arc, between 64 and 512 steps a turn: a large-radius arc in a
+    // display cache (an alignment curve) otherwise shows its chords.
+    let tau = std::f64::consts::TAU;
+    let step = (2.0 * (1.0 - (1e-3 / radius).min(1.0)).acos()).clamp(tau / 512.0, tau / 64.0);
+    let segs = ((sweep.abs() / step).ceil() as usize).clamp(2, 512);
     // A full circle is closed by the caller; don't repeat its first point.
     let last = if closed { segs - 1 } else { segs };
     Some(
@@ -507,11 +561,11 @@ fn arc_points(
 /// Decode an embedded LWPOLYLINE body into its (local) vertex run, arc
 /// segments flattened, and whether it is closed. Widths are not drawn.
 fn decode_lwpolyline(d: &[u8]) -> Option<(Vec<DVec3>, bool)> {
-    use codec::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
-    use codec::io::dwg::dwg_version::DwgVersion;
+    use document::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
+    use document::io::dwg::dwg_version::DwgVersion;
     let body = d.get(4..)?.to_vec();
     let max_items = body.len() * 4;
-    let mut r = DwgBitReader::new(body, DwgVersion::AC24, codec::types::DxfVersion::AC1032);
+    let mut r = DwgBitReader::new(body, DwgVersion::AC24, document::types::DxfVersion::AC1032);
     let flags = r.read_bit_short() as u16;
     if flags & 4 != 0 {
         r.read_bit_double(); // constant width
@@ -604,6 +658,7 @@ fn decode_text(d: &[u8], unicode: bool) -> Option<(ProxyText, DVec3)> {
             text,
             font: String::new(),
             style: ProxyStyle::default(),
+            align: [0.0, 0.0],
         },
         dir,
     ))
@@ -634,6 +689,7 @@ fn decode_text2(d: &[u8], unicode: bool) -> Option<(ProxyText, DVec3)> {
             text,
             font,
             style: ProxyStyle::default(),
+            align: [0.0, 0.0],
         },
         dir,
     ))
@@ -800,6 +856,23 @@ mod tests {
         assert_eq!(dec.fills[0].tris.len(), 6);
     }
 
+    /// A large-radius arc keeps its chords close to the curve.
+    #[test]
+    fn large_arcs_are_finely_divided() {
+        let mut arc = f64s(&[0., 0., 0., 1000., 0., 0., 1., 1., 0., 0., 0.25]);
+        arc.extend(0u32.to_le_bytes());
+        let dec = decode(&blob(&[(REC_ARC, arc)]));
+        let pts = &dec.polylines[0].points;
+        let worst = pts
+            .windows(2)
+            .map(|w| {
+                let (mx, my) = ((w[0][0] + w[1][0]) / 2.0, (w[0][1] + w[1][1]) / 2.0);
+                1000.0 - (mx * mx + my * my).sqrt()
+            })
+            .fold(0.0, f64::max);
+        assert!(worst < 0.02, "chord strays {worst}");
+    }
+
     /// A styled unicode label: height comes from its own field, not the
     /// (unit) direction vector, and the font name follows the typeface.
     #[test]
@@ -831,9 +904,9 @@ mod tests {
     /// An embedded LWPOLYLINE: closed, one bulged (semicircle) segment.
     #[test]
     fn decodes_embedded_lwpolyline_with_bulge() {
-        use codec::io::dwg::dwg_stream_writers::bit_writer::DwgBitWriter;
-        use codec::io::dwg::dwg_version::DwgVersion;
-        let mut w = DwgBitWriter::new(DwgVersion::AC24, codec::types::DxfVersion::AC1032);
+        use document::io::dwg::dwg_stream_writers::bit_writer::DwgBitWriter;
+        use document::io::dwg::dwg_version::DwgVersion;
+        let mut w = DwgBitWriter::new(DwgVersion::AC24, document::types::DxfVersion::AC1032);
         w.write_bit_short(512 | 16 | 8); // closed, has bulges, elevation
         w.write_bit_double(2.0);
         w.write_bit_long(2);
@@ -854,6 +927,20 @@ mod tests {
         assert_eq!(pts.first(), pts.last());
         // Bulge 1 from (0,0) to (4,0): a semicircle of radius 2 about (2,0).
         assert!(pts.iter().any(|p| (p[1].abs() - 2.0).abs() < 1e-9));
+    }
+
+    /// A wall fill stored as a two-triangle shell draws only the edges marked
+    /// visible, not its triangles (discussion #1734).
+    #[test]
+    fn shell_draws_only_visible_edges() {
+        let u32s = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut d = u32s(&[4]);
+        d.extend(f64s(&[0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.]));
+        d.extend(u32s(&[8, 3, 0, 1, 2, 3, 0, 2, 3]));
+        d.extend(u32s(&[EDGE_VISIBILITIES, 1, 1, 0, 0, 1, 1, 0, 0, 0]));
+        let dec = decode(&blob(&[(REC_SHELL, d)]));
+        assert_eq!(dec.polylines.len(), 4);
+        assert!(dec.polylines.iter().all(|p| p.points.len() == 2));
     }
 
     #[test]

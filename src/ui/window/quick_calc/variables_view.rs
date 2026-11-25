@@ -3,16 +3,16 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip, Space};
-use iced::{font, Background, Border, Color, Element, Fill, Font, Theme};
+use iced::widget::{Space, button, column, container, mouse_area, row, text, text_input, tooltip};
+use iced::{Background, Border, Color, Element, Fill, Font, Theme, font};
 
 use super::view::{
-    field_style, icon, m, mix, muted, segment, segmented, strong, text_button, tokens,
-    CHEVRON_DOWN, CHEVRON_RIGHT, STRONG,
+    STRONG, field_style, icon, m, mix, muted, segment, segmented, strong, text_button, tokens,
 };
 use super::{FormMsg, QuickCalcMsg, QuickCalcPalette, VarForm, VarKind, VarMsg, Variable};
-use crate::app::calc::{CalcContext, CalcError, Value};
 use crate::app::Message;
+use crate::app::calc::{CalcContext, CalcError, Value};
+use crate::ui::icons::{TRI_DOWN, TRI_RIGHT};
 
 const NEW: &[u8] = include_bytes!("../../../../assets/icons/quickcalc/var_new.svg");
 const EDIT: &[u8] = include_bytes!("../../../../assets/icons/quickcalc/var_edit.svg");
@@ -414,14 +414,7 @@ fn row_of<'a>(
         lines.push(error.message.clone());
     }
     lines.push(crate::t!("Double-click to insert").into_owned());
-    tooltip(
-        area,
-        crate::ui::ribbon::tooltip_content(lines.join("\n")),
-        tooltip::Position::Bottom,
-    )
-    .delay(std::time::Duration::from_millis(400))
-    .style(crate::ui::ribbon::tooltip_style)
-    .into()
+    crate::ui::kit::tooltip(area, lines.join("\n"), tooltip::Position::Bottom)
 }
 
 pub(super) fn variables<'a>(
@@ -444,8 +437,7 @@ pub(super) fn variables<'a>(
             .collect();
         let header = button(
             row![
-                icon(if open { CHEVRON_DOWN } else { CHEVRON_RIGHT }, 9.0, |t| t
-                    .muted),
+                icon(if open { TRI_DOWN } else { TRI_RIGHT }, 9.0, |t| t.muted),
                 strong(category.clone(), 11.0).width(Fill),
                 muted(members.len().to_string(), 11.0),
             ]

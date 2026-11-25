@@ -426,6 +426,14 @@ impl CadCommand for DashViewCommand {
         }
     }
 
+    fn input_kind(&self) -> crate::command::InputKind {
+        // A view name may hold spaces: Space types one instead of ending it.
+        match self.step {
+            Step::Save | Step::WindowName | Step::Restore => crate::command::InputKind::FreeText,
+            _ => crate::command::InputKind::SingleToken,
+        }
+    }
+
     fn wants_text_input(&self) -> bool {
         true
     }
@@ -434,7 +442,7 @@ impl CadCommand for DashViewCommand {
         let t = text.trim();
         // The window corners take typed coordinates as points.
         if matches!(self.step, Step::WindowFirst(_) | Step::WindowSecond(..))
-            && crate::app::helpers::parse_coord(t).is_some()
+            && crate::entities::coord_parse::parse_coord(t).is_some()
         {
             return None;
         }

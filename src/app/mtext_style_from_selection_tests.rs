@@ -7,9 +7,9 @@ use super::mtext_editor::{EditorMenu, MTextEditorState, ValueOrigin};
 use super::*;
 use crate::entities::text_support::TTF_FLAG_BOLD;
 use crate::ui::font_picker::FontChoice;
-use codec::entities::{EntityType, Text};
-use codec::tables::TextStyle;
-use codec::types::Vector3;
+use document::entities::{EntityType, Text};
+use document::tables::TextStyle;
+use document::types::Vector3;
 use glam::DVec3;
 
 /// A drawing whose style "Notes" has a fixed height of 2.5, width 0.8 and a
@@ -123,8 +123,8 @@ fn updating_the_style_reaches_its_texts_in_one_undo_step() {
     let notes = style(&app, "Notes").unwrap();
     assert!(close(notes.oblique_angle.to_degrees(), 20.0));
     assert!((notes.height, notes.width_factor) == (2.5, 0.8));
-    // The TEXT followed the old angle, so it takes the new one.
-    assert!(close(text_values(&app).2, 20.0));
+    // The TEXT keeps the angle it stores.
+    assert!(close(text_values(&app).2, 15.0));
     // The `\Q` formats one character only, so it stays.
     assert_eq!(ed(&app).content.text(), "a{\\Q20;b}c");
     assert_eq!(ed(&app).oblique, "20");
@@ -186,6 +186,10 @@ fn a_taken_name_and_a_referenced_style_are_refused() {
     let doc = &mut app.tabs[app.active_tab].scene.document;
     doc.text_styles.get_mut("Notes").unwrap().xref_dependent = true;
     let _ = app.update(Message::MTextStyle("Notes".into()));
+    // With nothing selected the style change is asked about first.
+    let _ = app.update(Message::MTextDialog(
+        crate::ui::window::mtext_dialogs::MTextDialogMsg::StyleYes,
+    ));
     assert!(ed(&app).object_style.read_only);
     let _ = app.update(Message::MTextUpdateStyleFromSelection);
     assert!(close(

@@ -1,12 +1,12 @@
 // WIPEOUT command — draw a polygonal mask or derive one from a closed polyline.
 
 use crate::t;
-use codec::entities::{Wipeout, WipeoutClipType};
-use codec::types::{Vector2, Vector3};
-use codec::{Document, EntityType, Handle};
+use document::entities::{Wipeout, WipeoutClipType};
+use document::types::{Vector2, Vector3};
+use document::{Document, EntityType, Handle};
 use glam::DVec3;
-use kernel::geom2d::{polygon_frame, Tolerance};
-use kernel::space::Plane;
+use ocs_geom::geom2d::{polygon_frame, Tolerance};
+use ocs_geom::space::Plane;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -187,8 +187,8 @@ impl CadCommand for WipeoutCommand {
                 if let Some(first) = self.points.first() {
                     let first = self.plane.to_local(*first);
                     let point = self.plane.to_local(point);
-                    let distance = kernel::geom2d::Vec2::new(point.x, point.y)
-                        .distance(kernel::geom2d::Vec2::new(first.x, first.y));
+                    let distance = ocs_geom::geom2d::Vec2::new(point.x, point.y)
+                        .distance(ocs_geom::geom2d::Vec2::new(first.x, first.y));
                     if self.points.len() >= 3 && distance <= Tolerance::default().linear() {
                         return self.finish_draw();
                     }
@@ -255,7 +255,10 @@ impl CadCommand for WipeoutCommand {
         };
         // Only a polyline is taken; anything else is asked for again. A
         // polyline that is open or has arcs ends the command.
-        if !matches!(entity, EntityType::LwPolyline(_) | EntityType::Polyline2D(_)) {
+        if !matches!(
+            entity,
+            EntityType::LwPolyline(_) | EntityType::Polyline2D(_)
+        ) {
             return CmdResult::NeedPoint;
         }
         if !straight_and_closed(&entity) || wipeout_from_polyline(&entity).is_none() {
@@ -324,7 +327,10 @@ impl CadCommand for WipeoutCommand {
                     .trim_start_matches('_')
                     .starts_with(|c: char| c.is_ascii_alphabetic()) =>
                 {
-                    Some(CmdResult::ReportError(crate::tr!("wipeout-cmd", "point-or-keyword")))
+                    Some(CmdResult::ReportError(crate::tr!(
+                        "wipeout-cmd",
+                        "point-or-keyword"
+                    )))
                 }
                 _ => None,
             },
@@ -429,9 +435,15 @@ fn straight_and_closed(entity: &EntityType) -> bool {
                 .iter()
                 .map(|vertex| [vertex.location.x, vertex.location.y])
                 .collect();
-            let count = if polyline.is_closed { points.len() } else { points.len().saturating_sub(1) };
+            let count = if polyline.is_closed {
+                points.len()
+            } else {
+                points.len().saturating_sub(1)
+            };
             (polyline.is_closed || explicitly_closed(&points))
-                && polyline.vertices[..count].iter().all(|vertex| vertex.bulge.abs() < 1.0e-12)
+                && polyline.vertices[..count]
+                    .iter()
+                    .all(|vertex| vertex.bulge.abs() < 1.0e-12)
         }
         EntityType::Polyline2D(polyline) => {
             let points: Vec<[f64; 2]> = polyline
@@ -439,9 +451,15 @@ fn straight_and_closed(entity: &EntityType) -> bool {
                 .iter()
                 .map(|vertex| [vertex.location.x, vertex.location.y])
                 .collect();
-            let count = if polyline.is_closed() { points.len() } else { points.len().saturating_sub(1) };
+            let count = if polyline.is_closed() {
+                points.len()
+            } else {
+                points.len().saturating_sub(1)
+            };
             (polyline.is_closed() || explicitly_closed(&points))
-                && polyline.vertices[..count].iter().all(|vertex| vertex.bulge.abs() < 1.0e-12)
+                && polyline.vertices[..count]
+                    .iter()
+                    .all(|vertex| vertex.bulge.abs() < 1.0e-12)
         }
         _ => false,
     }
@@ -497,8 +515,8 @@ fn make_poly_wipeout(points: &[[f64; 2]], plane: Plane) -> Option<EntityType> {
 
 fn explicitly_closed(points: &[[f64; 2]]) -> bool {
     points.len() >= 4
-        && kernel::geom2d::Vec2::from(points[0])
-            .distance(kernel::geom2d::Vec2::from(*points.last().unwrap()))
+        && ocs_geom::geom2d::Vec2::from(points[0])
+            .distance(ocs_geom::geom2d::Vec2::from(*points.last().unwrap()))
             <= Tolerance::default().linear()
 }
 
@@ -599,7 +617,7 @@ inventory::submit!(crate::command::CommandRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::LwPolyline;
+    use document::entities::LwPolyline;
 
     #[test]
     fn command_undo_never_removes_the_first_point() {

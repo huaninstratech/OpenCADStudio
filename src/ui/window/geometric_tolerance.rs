@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use codec::Handle;
-use iced::widget::{button, checkbox, column, container, row, text, text_input, Space};
+use document::Handle;
+use iced::widget::{Space, button, checkbox, column, container, row, text, text_input};
 use iced::{Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -389,7 +389,7 @@ impl State {
 
 fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.65)),
+        color: Some(crate::ui::style::readable::muted_text(theme)),
     }
 }
 
@@ -436,14 +436,14 @@ pub fn view_window<'a>(
     let symbol_selected = selected(&SYMBOLS, &state.symbol);
     let symbol = panel(
         t!("Geometric characteristic").into_owned(),
-        crate::ui::dropdown_list::pick_list(symbol_selected, symbol_options, |choice| choice.to_string())
-            .on_select(|choice| {
-                Message::ToleranceDialogField(Field::Symbol(choice.code.to_string()))
-            })
-            .text_size(12)
-            .padding([4, 6])
-            .width(Fill)
-            .into(),
+        crate::ui::dropdown_list::pick_list(symbol_selected, symbol_options, |choice| {
+            choice.to_string()
+        })
+        .on_select(|choice| Message::ToleranceDialogField(Field::Symbol(choice.code.to_string())))
+        .text_size(12)
+        .padding([4, 6])
+        .width(Fill)
+        .into(),
     );
 
     let tolerance_rows =

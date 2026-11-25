@@ -1,11 +1,11 @@
-use codec::entities::Point;
-use codec::EntityType;
-use kernel::geom2d::{Circle, Curve, Line};
-use kernel::space::{curve::bezier_points, PlanarCurve, Plane, Vec3};
+use document::entities::Point;
+use document::EntityType;
+use ocs_geom::geom2d::{Circle, Curve, Line};
+use ocs_geom::space::{curve::bezier_points, PlanarCurve, Plane, Vec3};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{edit_prop as edit, parse_f64, square_grip};
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::{PointMarker, SnapHint};
@@ -75,7 +75,7 @@ fn point_render(pt: &Point, pdmode: i16, s: f64) -> RenderEntity {
 /// so zooming and resizing do not require retessellation.
 pub fn relative_render(
     entity: &EntityType,
-    document: &codec::Document,
+    document: &document::Document,
     _wpp: Option<f32>,
 ) -> Option<RenderEntity> {
     let EntityType::Point(pt) = entity else {
@@ -101,7 +101,7 @@ pub fn relative_world_size(pdsize: f64, wpp: f32, viewport_height_px: f32) -> f6
 /// viewport scaling. A zero PDSIZE means the standard five-percent size.
 pub fn relative_marker_spec(
     entity: &EntityType,
-    document: &codec::Document,
+    document: &document::Document,
 ) -> Option<PointMarker> {
     let EntityType::Point(pt) = entity else {
         return None;
@@ -240,7 +240,7 @@ fn effective_pdmode(pt: &Point, pdmode: i16) -> i16 {
     }
 }
 
-fn to_render(pt: &Point, document: &codec::Document) -> RenderEntity {
+fn to_render(pt: &Point, document: &document::Document) -> RenderEntity {
     let pdmode = effective_pdmode(pt, document.header.point_display_mode);
     let s = pdsize_world(document.header.point_display_size) * 0.5;
     point_render(pt, pdmode, s)
@@ -277,14 +277,14 @@ fn apply_geom_prop(pt: &mut Point, field: &str, value: &str) {
 fn apply_grip(pt: &mut Point, _grip_id: usize, apply: GripApply) {
     match apply {
         GripApply::Absolute(p) => {
-            pt.location.x = p.x as f64;
-            pt.location.y = p.y as f64;
-            pt.location.z = p.z as f64;
+            pt.location.x = p.x;
+            pt.location.y = p.y;
+            pt.location.z = p.z;
         }
         GripApply::Translate(d) => {
-            pt.location.x += d.x as f64;
-            pt.location.y += d.y as f64;
-            pt.location.z += d.z as f64;
+            pt.location.x += d.x;
+            pt.location.y += d.y;
+            pt.location.z += d.z;
         }
     }
 }
@@ -301,7 +301,7 @@ fn apply_transform(pt: &mut Point, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Point {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         Some(to_render(self, document))
     }
 }
@@ -315,13 +315,13 @@ mod tests {
     fn point_on(layer: &str) -> Point {
         let mut pt = Point::default();
         pt.common.layer = layer.to_string();
-        pt.location = codec::types::Vector3::new(1.0, 2.0, 0.0);
+        pt.location = document::types::Vector3::new(1.0, 2.0, 0.0);
         pt
     }
 
     #[test]
     fn definition_points_ignore_the_point_style() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         doc.header.point_display_mode = 34;
         doc.header.point_display_size = 2.0;
 
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn definition_points_ignore_the_point_style_at_relative_pdsize() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         doc.header.point_display_mode = 34;
         doc.header.point_display_size = -5.0;
 

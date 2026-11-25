@@ -4,11 +4,12 @@
 use crate::app::{Message, OpenCADStudio};
 use crate::command::CadCommand;
 use crate::modules::insert::hyperlink_cmd::{
-    DashHyperlinkCommand, HyperlinkOptionsCommand, HyperlinkRemovePick, HyperlinkSelectCommand,
+    clipboard_hyperlink, DashHyperlinkCommand, HyperlinkOptionsCommand, HyperlinkRemovePick,
+    HyperlinkSelectCommand, PasteAsHyperlinkSelect,
 };
 use crate::scene::hyperlink::{self, Link};
 use crate::ui::window::hyperlink_dialog::{HyperlinkMsg, HyperlinkOptions};
-use codec::Handle;
+use document::Handle;
 use iced::Task;
 
 /// The layer -HYPERLINK Area draws its rectangle on (red).
@@ -67,7 +68,27 @@ impl OpenCADStudio {
                     .push_output(crate::tf!("HYPERLINK: attached to {n} object(s).").as_ref());
                 Some(Task::none())
             }
-            "-HYPERLINK" => Some(self.start_hyperlink_command(i, Box::new(DashHyperlinkCommand::new()))),
+            // PASTEASHYPERLINK: the system clipboard's text becomes the
+            // hyperlink of the selected objects, once it has been read
+            // (Message::PasteAsHyperlink).
+            "PASTEASHYPERLINK" => {
+                #[cfg(target_arch = "wasm32")]
+                let read =
+                    Task::perform(crate::sys::read_clipboard_text(), Message::PasteAsHyperlink);
+                #[cfg(not(target_arch = "wasm32"))]
+                let read = iced::clipboard::read_text().map(|result| {
+                    Message::PasteAsHyperlink(result.ok().map(|text| (*text).clone()))
+                });
+                Some(read)
+            }
+            "_PASTEASHYPERLINKAPPLY" => {
+                let (handles, url) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                self.attach_pasted_hyperlink(i, &parse_handles(handles), url.trim());
+                Some(Task::none())
+            }
+            "-HYPERLINK" => {
+                Some(self.start_hyperlink_command(i, Box::new(DashHyperlinkCommand::new())))
+            }
             "_HYPERLINKDIALOG" => {
                 let handles = parse_handles(rest);
                 self.tabs[i].scene.deselect_all();
@@ -82,7 +103,11 @@ impl OpenCADStudio {
                 let entries: Vec<(Handle, Link)> = parse_handles(rest)
                     .into_iter()
                     .filter_map(|handle| {
-                        let link = self.tabs[i].scene.document.get_entity(handle).and_then(Link::of)?;
+                        let link = self.tabs[i]
+                            .scene
+                            .document
+                            .get_entity(handle)
+                            .and_then(Link::of)?;
                         Some((handle, link))
                     })
                     .collect();
@@ -92,8 +117,12 @@ impl OpenCADStudio {
                     return Some(Task::none());
                 }
                 for (n, (_, link)) in entries.iter().enumerate() {
-                    self.command_line
-                        .push_output(&format!("{}.  {} ({})", n + 1, link.url, link.text));
+                    self.command_line.push_output(&format!(
+                        "{}.  {} ({})",
+                        n + 1,
+                        link.url,
+                        link.text
+                    ));
                 }
                 let entries = entries.into_iter().map(|(h, link)| (h, link.url)).collect();
                 Some(self.start_hyperlink_command(i, Box::new(HyperlinkRemovePick::new(entries))))
@@ -106,7 +135,11 @@ impl OpenCADStudio {
                 let message = if handles.len() == 1 {
                     crate::tr!("hyperlink-cmd", "deleted-one")
                 } else {
-                    format!("{} {}", handles.len(), crate::tr!("hyperlink-cmd", "deleted-many"))
+                    format!(
+                        "{} {}",
+                        handles.len(),
+                        crate::tr!("hyperlink-cmd", "deleted-many")
+                    )
                 };
                 self.command_line.push_output(&message);
                 Some(Task::none())
@@ -134,7 +167,7 @@ impl OpenCADStudio {
                     }
                     None => {
                         self.command_line
-                            .push_error(&crate::tr!("hyperlink-cmd", "invalid-keyword"));
+                            .push_rejection(&crate::tr!("hyperlink-cmd", "invalid-keyword"));
                     }
                 }
                 Some(Task::none())
@@ -149,7 +182,11 @@ impl OpenCADStudio {
                     self.pending_setvar = Some("HYPERLINKBASE".into());
                     return Some(Task::none());
                 }
-                let value = if rest == "." { String::new() } else { rest.to_string() };
+                let value = if rest == "." {
+                    String::new()
+                } else {
+                    rest.to_string()
+                };
                 if value != current {
                     self.push_undo_snapshot(i, "HYPERLINKBASE");
                     let document = &mut self.tabs[i].scene.document;
@@ -172,6 +209,51 @@ impl OpenCADStudio {
 
     fn start_hyperlink_command(&mut self, i: usize, command: Box<dyn CadCommand>) -> Task<Message> {
         self.start_count_command(i, command)
+    }
+
+    /// PASTEASHYPERLINK once the system clipboard has been read: its text
+    /// is the address; the selected objects get it at once, otherwise the
+    /// command asks for objects. Nothing to paste ends the command with a
+    /// message.
+    pub(in crate::app) fn paste_as_hyperlink(&mut self, text: Option<String>) -> Task<Message> {
+        let i = self.active_tab;
+        let Some(url) = text.as_deref().and_then(clipboard_hyperlink) else {
+            self.command_line.push_error(
+                crate::t!(
+                    "PASTEASHYPERLINK: there is no text on the clipboard to paste as a hyperlink."
+                )
+                .as_ref(),
+            );
+            return Task::none();
+        };
+        let preselected = self.tabs[i].scene.selected_handles_in_order();
+        if !preselected.is_empty() {
+            self.attach_pasted_hyperlink(i, &preselected, &url);
+            return Task::none();
+        }
+        self.start_hyperlink_command(i, Box::new(PasteAsHyperlinkSelect::new(url)))
+    }
+
+    /// Attach `url` as the hyperlink of `handles`, as one undo step; objects
+    /// on locked layers are left alone.
+    fn attach_pasted_hyperlink(&mut self, i: usize, handles: &[Handle], url: &str) {
+        let handles: Vec<Handle> = handles
+            .iter()
+            .copied()
+            .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
+            .collect();
+        if handles.is_empty() || url.is_empty() {
+            self.command_line.push_error(
+                crate::t!("PASTEASHYPERLINK: no objects to attach the hyperlink to.").as_ref(),
+            );
+            return;
+        }
+        self.apply_property_op(i, "PASTEASHYPERLINK", &handles, |app, handle| {
+            hyperlink::set_url(&mut app.tabs[i].scene.document, handle, url);
+        });
+        let n = handles.len();
+        self.command_line
+            .push_output(crate::tf!("PASTEASHYPERLINK: {url} attached to {n} object(s).").as_ref());
     }
 
     /// The folder a relative address resolves against: HYPERLINKBASE, else
@@ -220,13 +302,21 @@ impl OpenCADStudio {
         let base = self.hyperlink_base(i);
         self.hyperlink_editor_block = None;
         self.hyperlink_editor_handles = handles;
-        self.hyperlink_editor_url = if view_target { String::new() } else { link.address() };
+        self.hyperlink_editor_url = if view_target {
+            String::new()
+        } else {
+            link.address()
+        };
         self.hyperlink_editor_description = link.text.clone();
         self.hyperlink_editor_mixed = mixed;
         self.hyperlink_editor_dirty = false;
         self.hyperlink_options = HyperlinkOptions {
             view_target,
-            view: if view_target { link.location.clone() } else { String::new() },
+            view: if view_target {
+                link.location.clone()
+            } else {
+                String::new()
+            },
             views: self.hyperlink_views(i),
             // A new link is stored relative where it can be; an existing one
             // keeps the form it has.
@@ -275,7 +365,10 @@ impl OpenCADStudio {
         }
     }
 
-    pub(in crate::app) fn update_hyperlink_dialog(&mut self, message: HyperlinkMsg) -> Task<Message> {
+    pub(in crate::app) fn update_hyperlink_dialog(
+        &mut self,
+        message: HyperlinkMsg,
+    ) -> Task<Message> {
         let options = &mut self.hyperlink_options;
         match message {
             HyperlinkMsg::ViewTarget(on) => {
@@ -337,19 +430,21 @@ impl OpenCADStudio {
             if !scene.document.layers.contains(AREA_LAYER) {
                 scene.ensure_layer(AREA_LAYER);
                 if let Some(layer) = scene.document.layers.get_mut(AREA_LAYER) {
-                    layer.color = codec::types::Color::from_index(1);
+                    layer.color = document::types::Color::from_index(1);
                 }
             }
             let z = a[2];
-            let mut rectangle = codec::entities::Polyline3D::from_points(vec![
-                codec::types::Vector3::new(a[0], a[1], z),
-                codec::types::Vector3::new(b[0], a[1], z),
-                codec::types::Vector3::new(b[0], b[1], z),
-                codec::types::Vector3::new(a[0], b[1], z),
+            let mut rectangle = document::entities::Polyline3D::from_points(vec![
+                document::types::Vector3::new(a[0], a[1], z),
+                document::types::Vector3::new(b[0], a[1], z),
+                document::types::Vector3::new(b[0], b[1], z),
+                document::types::Vector3::new(a[0], b[1], z),
             ]);
             rectangle.close();
             rectangle.common.layer = AREA_LAYER.to_string();
-            if let Some(handle) = self.commit_entity_handle_preserve_layer(codec::EntityType::Polyline3D(rectangle)) {
+            if let Some(handle) = self
+                .commit_entity_handle_preserve_layer(document::EntityType::Polyline3D(rectangle))
+            {
                 handles = vec![handle];
             }
         }
@@ -380,4 +475,103 @@ fn relative_address(url: &str, base: &str) -> String {
         crate::io::xref_model::Pathtype::Relative,
     )
     .unwrap_or_else(|_| url.to_string())
+}
+
+#[cfg(test)]
+mod paste_as_hyperlink_tests {
+    use crate::app::OpenCADStudio;
+    use crate::scene::hyperlink::Link;
+    use document::entities::Line;
+    use document::types::Vector3;
+    use document::{EntityType, Handle};
+
+    fn app_with_line() -> (OpenCADStudio, Handle) {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let line = app.tabs[i]
+            .scene
+            .add_entity(EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::UNIT_X,
+            )));
+        (app, line)
+    }
+
+    fn url_of(app: &OpenCADStudio, handle: Handle) -> Option<String> {
+        let entity = app.tabs[app.active_tab].scene.document.get_entity(handle)?;
+        Link::of(entity).map(|link| link.url)
+    }
+
+    #[test]
+    fn paste_as_hyperlink_is_a_registered_command() {
+        assert!(crate::ui::menu_bar::implemented("PASTEASHYPERLINK"));
+    }
+
+    #[test]
+    fn the_clipboard_text_becomes_the_link_of_the_selected_objects() {
+        let (mut app, line) = app_with_line();
+        let i = app.active_tab;
+        app.tabs[i].scene.select_entity(line, true);
+        let _ = app.paste_as_hyperlink(Some("\n  https://open-cad.studio/docs  \nsecond".into()));
+        assert_eq!(
+            url_of(&app, line).as_deref(),
+            Some("https://open-cad.studio/docs")
+        );
+        // One undo step takes it off again.
+        let _ = app.automation_op(r#"{"op":"undo"}"#);
+        assert_eq!(url_of(&app, line), None);
+    }
+
+    #[test]
+    fn nothing_on_the_clipboard_attaches_nothing() {
+        for text in [None, Some(String::new()), Some("  \n \t".into())] {
+            let (mut app, line) = app_with_line();
+            let i = app.active_tab;
+            app.tabs[i].scene.select_entity(line, true);
+            let _ = app.paste_as_hyperlink(text);
+            assert_eq!(url_of(&app, line), None);
+            assert!(
+                app.tabs[i].active_cmd.is_none(),
+                "no command is left running"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_selection_it_asks_for_objects_then_attaches() {
+        let (mut app, line) = app_with_line();
+        let i = app.active_tab;
+        let _ = app.paste_as_hyperlink(Some("C:/drawings/detail.dwg".into()));
+        let command = app.tabs[i].active_cmd.as_ref().expect("Select objects:");
+        assert_eq!(command.name(), "PASTEASHYPERLINK");
+        // What the command dispatches once the objects are picked.
+        let apply = crate::modules::insert::hyperlink_cmd::paste_as_hyperlink_apply(
+            &[line],
+            "C:/drawings/detail.dwg",
+        );
+        app.tabs[i].active_cmd = None;
+        let _ = app.dispatch_command(&apply);
+        assert_eq!(
+            url_of(&app, line).as_deref(),
+            Some("C:/drawings/detail.dwg")
+        );
+    }
+
+    #[test]
+    fn objects_on_a_locked_layer_keep_their_link() {
+        let (mut app, line) = app_with_line();
+        let i = app.active_tab;
+        let doc = &mut app.tabs[i].scene.document;
+        let mut layer = document::tables::Layer::new("LOCKED");
+        layer.handle = doc.allocate_handle();
+        layer.flags.locked = true;
+        let _ = doc.layers.add(layer);
+        if let Some(entity) = doc.get_entity_mut(line) {
+            entity.common_mut().layer = "LOCKED".into();
+        }
+        app.tabs[i].scene.select_entity(line, true);
+        let _ = app.paste_as_hyperlink(Some("https://example.org".into()));
+        assert_eq!(url_of(&app, line), None);
+    }
 }

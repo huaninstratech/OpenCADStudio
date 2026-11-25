@@ -6,12 +6,12 @@
 // plot printed the block as bare monochrome outlines. `synced_hatch_models`
 // (the viewport) explodes visible INSERTs and materializes their fills; both
 // paths now share `exploded_insert_hatch_models`.
-use codec::entities::hatch::{
+use document::entities::hatch::{
     BoundaryEdge, BoundaryPath, BoundaryPathFlags, HatchPatternLine, LineEdge,
 };
-use codec::entities::Hatch;
-use codec::types::{Color as AcadColor, Vector2};
-use codec::EntityType;
+use document::entities::Hatch;
+use document::types::{Color as AcadColor, Vector2};
+use document::EntityType;
 use OpenCADStudio::scene::model::hatch_model::HatchPattern;
 use OpenCADStudio::scene::Scene;
 
@@ -76,7 +76,7 @@ fn block_internal_hatch_reaches_export() {
     // A blue hatch, wrapped into a block and inserted in model space — the
     // minimal shape of "coloured fill nested in a block".
     let h = scene.add_entity(EntityType::Hatch(Box::new(square_hatch(5))));
-    let identity = codec::types::Transform::identity();
+    let identity = document::types::Transform::identity();
     scene
         .create_block_from_entities(&[h], "LOGO", &identity, &identity)
         .expect("wrap hatch into a block + insert");
@@ -89,6 +89,62 @@ fn block_internal_hatch_reaches_export() {
         "block-internal hatch dropped from the export set (len={}) — a plot \
          would print the block without its colours",
         hatches.len()
+    );
+}
+
+#[test]
+fn block_hatches_keep_placement_and_nonzero_child_layers() {
+    use document::entities::Insert;
+    use document::tables::{BlockRecord, Layer};
+    use document::types::Vector3;
+
+    let mut scene = Scene::new();
+    for name in ["FIRST", "SECOND", "STICKY"] {
+        scene.document.layers.add(Layer::new(name)).unwrap();
+    }
+    let mut record = BlockRecord::new("HATCHES");
+    record.handle = scene.document.allocate_handle();
+    let owner = record.handle;
+    scene.document.block_records.add(record).unwrap();
+
+    let mut inherited = square_hatch(5);
+    inherited.common.owner_handle = owner;
+    inherited.common.layer = "0".into();
+    let raw_handle = scene
+        .document
+        .add_entity(EntityType::Hatch(Box::new(inherited)))
+        .unwrap();
+    let mut sticky = square_hatch(3);
+    sticky.common.owner_handle = owner;
+    sticky.common.layer = "STICKY".into();
+    scene
+        .document
+        .add_entity(EntityType::Hatch(Box::new(sticky)))
+        .unwrap();
+
+    for (layer, x) in [("FIRST", 0.0), ("SECOND", 100.0)] {
+        let mut insert = Insert::new("HATCHES", Vector3::new(x, 0.0, 0.0));
+        insert.common.layer = layer.into();
+        scene.add_entity(EntityType::Insert(insert));
+    }
+    scene.populate_hatches_from_document();
+    let mut layers: Vec<String> = scene
+        .paper_plot_hatches()
+        .iter()
+        .filter_map(|hatch| hatch.effective_layer.as_deref())
+        .map(str::to_string)
+        .collect();
+    layers.sort();
+    layers.dedup();
+    assert_eq!(layers, ["FIRST", "SECOND", "STICKY"]);
+    assert_eq!(
+        scene
+            .document
+            .get_entity(raw_handle)
+            .unwrap()
+            .common()
+            .layer,
+        "0"
     );
 }
 
@@ -244,6 +300,8 @@ fn app_created_hatch_roundtrips_catalog_spacing() {
     let mut scene = Scene::new();
     let boundary: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
     let model = HatchModel {
+        entity: None,
+        effective_layer: None,
         pattern_origin: None,
         render_instance: None,
         world_origin: [0.0, 0.0],
@@ -254,7 +312,7 @@ fn app_created_hatch_roundtrips_catalog_spacing() {
         boundary_exterior: None,
         boundary_sources: None,
         boundary_paths: None,
-        style: codec::entities::HatchStyleType::Normal,
+        style: document::entities::HatchStyleType::Normal,
         pattern: entry.gpu.clone(),
         name: "ANSI31".into(),
         color: [0.75, 0.75, 0.75, 0.85],
@@ -305,6 +363,8 @@ fn nested_hatch_serializes_only_outer_as_external() {
     let boundary_f32: Vec<[f32; 2]> = wcs.iter().map(|&[x, y]| [x as f32, y as f32]).collect();
 
     let model = HatchModel {
+        entity: None,
+        effective_layer: None,
         pattern_origin: None,
         render_instance: None,
         world_origin: [0.0, 0.0],
@@ -315,7 +375,7 @@ fn nested_hatch_serializes_only_outer_as_external() {
         boundary_exterior: None,
         boundary_sources: None,
         boundary_paths: None,
-        style: codec::entities::HatchStyleType::Normal,
+        style: document::entities::HatchStyleType::Normal,
         pattern: HatchPattern::Solid,
         name: "SOLID".into(),
         color: [0.45, 0.45, 0.45, 0.60],

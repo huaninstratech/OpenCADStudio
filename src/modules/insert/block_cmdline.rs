@@ -2,7 +2,7 @@
 //! -BEDIT and ATTSYNC, with the reference's prompts and messages, and the
 //! choices the Block Definition / Write Block dialogs remember.
 
-use codec::{Document, Handle};
+use document::{Document, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -125,7 +125,7 @@ impl BlockTable {
                 && br.entity_handles.iter().any(|h| {
                     matches!(
                         doc.get_entity(*h),
-                        Some(codec::EntityType::AttributeDefinition(_))
+                        Some(document::EntityType::AttributeDefinition(_))
                     )
                 })
             {
@@ -134,7 +134,7 @@ impl BlockTable {
             entries.push((br.name.clone(), kind));
         }
         entries.sort_by(|a, b| sort_key(&a.0).cmp(&sort_key(&b.0)));
-        attributed.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        attributed.sort_by_key(|a| sort_key(a));
         Self {
             entries,
             attributed,
@@ -241,7 +241,7 @@ enum BlockStep {
 pub struct DashBlockCommand {
     step: BlockStep,
     table: BlockTable,
-    ucs: crate::app::helpers::UcsXform,
+    ucs: crate::entities::ucs_xform::UcsXform,
     name: String,
     redefine: bool,
     mode: BlockObjectMode,
@@ -257,7 +257,7 @@ pub struct DashBlockCommand {
 impl DashBlockCommand {
     pub fn new(
         table: BlockTable,
-        ucs: crate::app::helpers::UcsXform,
+        ucs: crate::entities::ucs_xform::UcsXform,
         preselected: Vec<Handle>,
         units: i16,
     ) -> Self {
@@ -1047,14 +1047,120 @@ impl CadCommand for AttsyncCommand {
     }
 }
 
+// ── BLOCKREPLACE ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+enum BlockReplaceStep {
+    Old,
+    New(String),
+}
+
+/// BLOCKREPLACE — ask for the old block, then the new one, and hand the pair
+/// to the app, which retargets every reference and rebuilds its attributes.
+pub struct BlockReplaceCommand {
+    step: BlockReplaceStep,
+    table: BlockTable,
+}
+
+impl BlockReplaceCommand {
+    pub fn new(table: BlockTable) -> Self {
+        Self {
+            step: BlockReplaceStep::Old,
+            table,
+        }
+    }
+
+    fn names(&self) -> String {
+        self.table
+            .entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn resolve(&self, name: &str) -> Option<String> {
+        self.table
+            .entries
+            .iter()
+            .find(|(block, _)| block.eq_ignore_ascii_case(name))
+            .map(|(block, _)| block.clone())
+    }
+}
+
+impl CadCommand for BlockReplaceCommand {
+    fn name(&self) -> &'static str {
+        "BLOCKREPLACE"
+    }
+
+    fn prompt(&self) -> String {
+        match &self.step {
+            BlockReplaceStep::Old => "Enter name of the block to replace or [?]:".to_string(),
+            BlockReplaceStep::New(old) => {
+                format!("Enter name of the block to replace {old} with or [?]:")
+            }
+        }
+    }
+
+    fn options(&self) -> Vec<CmdOption> {
+        vec![CmdOption::new("?", "?")]
+    }
+
+    fn wants_text_input(&self) -> bool {
+        true
+    }
+
+    fn input_kind(&self) -> InputKind {
+        InputKind::FreeText
+    }
+
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        let name = text.trim();
+        if name == "?" {
+            return Some(CmdResult::ReportMeasurement(format!(
+                "Blocks: {}",
+                self.names()
+            )));
+        }
+        if name.is_empty() {
+            return Some(CmdResult::Cancel);
+        }
+        let Some(block) = self.resolve(name) else {
+            return Some(CmdResult::ReportError(format!(
+                "Block table contains no block named {name}."
+            )));
+        };
+        match &self.step {
+            BlockReplaceStep::Old => {
+                self.step = BlockReplaceStep::New(block);
+                Some(CmdResult::NeedPoint)
+            }
+            BlockReplaceStep::New(old) => {
+                let old = old.clone();
+                Some(CmdResult::Dispatch(format!(
+                    "_BLOCKREPLACE_APPLY {old}\t{block}"
+                )))
+            }
+        }
+    }
+
+    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        self.on_text_input("").unwrap_or(CmdResult::Cancel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::helpers::UcsXform;
+    use crate::entities::ucs_xform::UcsXform;
 
     fn plan_table() -> BlockTable {
         let mut document = Document::new();
-        let mut record = codec::tables::BlockRecord::new("PLAN");
+        let mut record = document::tables::BlockRecord::new("PLAN");
         record.handle = document.allocate_handle();
         document
             .block_records

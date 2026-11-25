@@ -1,5 +1,5 @@
-use codec::objects::{ObjectType, RasterVariables, WipeoutVariables};
-use codec::{Document, EntityType, Handle};
+use document::objects::{ObjectType, RasterVariables, WipeoutVariables};
+use document::{Document, EntityType, Handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameKind {
@@ -131,12 +131,15 @@ pub(crate) fn mode(document: &Document, kind: FrameKind) -> i16 {
 
 pub(crate) fn master_mode(document: &Document) -> i16 {
     let first = mode(document, ALL_KINDS[0]);
-    ALL_KINDS
+    if ALL_KINDS
         .iter()
         .skip(1)
         .all(|kind| mode(document, *kind) == first)
-        .then_some(first)
-        .unwrap_or(3)
+    {
+        first
+    } else {
+        3
+    }
 }
 
 fn attach_root_entry(document: &mut Document, name: &str, handle: Handle) {
@@ -235,11 +238,11 @@ pub(crate) fn entity_kind(entity: &EntityType) -> Option<FrameKind> {
     }
 }
 
-fn underlay_kind(underlay: &codec::entities::Underlay) -> FrameKind {
+fn underlay_kind(underlay: &document::entities::Underlay) -> FrameKind {
     match underlay.underlay_type {
-        codec::entities::UnderlayType::Pdf => FrameKind::Pdf,
-        codec::entities::UnderlayType::Dwf => FrameKind::Dwf,
-        codec::entities::UnderlayType::Dgn => FrameKind::Dgn,
+        document::entities::UnderlayType::Pdf => FrameKind::Pdf,
+        document::entities::UnderlayType::Dwf => FrameKind::Dwf,
+        document::entities::UnderlayType::Dgn => FrameKind::Dgn,
     }
 }
 
@@ -257,8 +260,8 @@ pub(crate) fn affected(entity: &EntityType, kind: FrameKind) -> bool {
             EntityType::Extended(extended)
                 if matches!(
                     &extended.data,
-                    codec::entities::ExtendedEntityData::PointCloud(_)
-                        | codec::entities::ExtendedEntityData::PointCloudEx(_)
+                    document::entities::ExtendedEntityData::PointCloud(_)
+                        | document::entities::ExtendedEntityData::PointCloudEx(_)
                 )
         ),
     }

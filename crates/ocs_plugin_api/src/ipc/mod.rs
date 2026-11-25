@@ -1,6 +1,6 @@
 //! Inter-process communication layer for out-of-process plugins.
 //!
-//! Built only with the `host` feature because it needs `opencadcodec`-typed
+//! Built only with the `host` feature because it needs `document`-typed
 //! messages and the plugin runner binary.
 //!
 //! Submodules:
@@ -13,6 +13,8 @@
 //!   proxy.
 //! - [`server`](crate::ipc::server) — host-side handler that applies a
 //!   `PluginRequest` to a `HostApi` implementation.
+//! - `snapshot_patch` — keeps a client's cached document snapshot current
+//!   after the plugin's own edits instead of refetching it.
 //! - [`v4`](crate::ipc::v4) — multiplexed V4 frames, notifications, and
 //!   correlation ids.
 //! - [`proxy`](crate::ipc::proxy) — optional TCP proxy so plugin child
@@ -27,6 +29,8 @@ pub mod proxy;
 #[cfg(feature = "host")]
 pub mod server;
 #[cfg(feature = "host")]
+mod snapshot_patch;
+#[cfg(feature = "host")]
 pub mod transport;
 #[cfg(feature = "host")]
 pub mod v4;
@@ -37,8 +41,8 @@ mod tests {
     use std::thread;
 
     use interprocess::local_socket::{
-        traits::{Listener, Stream as StreamTrait},
         GenericNamespaced, ListenerOptions, Stream, ToNsName,
+        traits::{Listener, Stream as StreamTrait},
     };
 
     use crate::ipc::protocol::{HostRequest, HostResponse, HostToPlugin, PluginToHost};
@@ -297,8 +301,9 @@ mod tests {
         // and a settle event with its preview-wire answer.
         let grips = vec![crate::host::PluginGrip {
             grip_id: 42,
-            anchor: Some(codec::Handle::from(0x8A)),
+            anchor: Some(document::Handle::from(0x8A)),
             point: [12.5, -3.25, 0.0],
+            xy_plane: false,
             axis: Some([
                 std::f64::consts::FRAC_1_SQRT_2,
                 std::f64::consts::FRAC_1_SQRT_2,
@@ -313,7 +318,7 @@ mod tests {
             crate::ipc::protocol::PluginRequest::SetPluginGrips { grips } => {
                 assert_eq!(grips.len(), 1);
                 assert_eq!(grips[0].grip_id, 42);
-                assert_eq!(grips[0].anchor, Some(codec::Handle::from(0x8A)));
+                assert_eq!(grips[0].anchor, Some(document::Handle::from(0x8A)));
                 assert_eq!(grips[0].shape, crate::host::PluginGripShape::Triangle);
             }
             other => panic!("unexpected: {other:?}"),
@@ -346,10 +351,10 @@ mod tests {
             // API v12: the live-geometry channel rides the same response;
             // an old (v11) answer without it decodes default-empty above.
             live_entities: vec![(
-                codec::Handle::from(2),
-                codec::EntityType::Line(codec::entities::Line::from_points(
-                    codec::types::Vector3::new(0.0, 0.0, 0.0),
-                    codec::types::Vector3::new(3.0, 0.0, 0.0),
+                document::Handle::from(2),
+                document::EntityType::Line(document::entities::Line::from_points(
+                    document::types::Vector3::new(0.0, 0.0, 0.0),
+                    document::types::Vector3::new(3.0, 0.0, 0.0),
                 )),
             )],
             descriptor: None,
@@ -361,7 +366,7 @@ mod tests {
             HostResponse::CustomGrip(resp) => {
                 assert_eq!(resp.preview.len(), 1);
                 assert_eq!(resp.live_entities.len(), 1);
-                assert_eq!(resp.live_entities[0].0, codec::Handle::from(2));
+                assert_eq!(resp.live_entities[0].0, document::Handle::from(2));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -375,8 +380,8 @@ mod tests {
         let regions = HostNotification::DocumentChangedRegions {
             tab_id: 12,
             version: 93,
-            entities: vec![codec::Handle::from(0x2A)],
-            records: vec![(codec::Handle::from(0x8A), "CVIFC".to_string())],
+            entities: vec![document::Handle::from(0x2A)],
+            records: vec![(document::Handle::from(0x8A), "CVIFC".to_string())],
         };
         let bytes = bincode::serialize(&regions).unwrap();
         let got: HostNotification = bincode::deserialize(&bytes).unwrap();
@@ -388,10 +393,10 @@ mod tests {
                 records,
             } => {
                 assert_eq!((tab_id, version), (12, 93));
-                assert_eq!(entities, vec![codec::Handle::from(0x2A)]);
+                assert_eq!(entities, vec![document::Handle::from(0x2A)]);
                 assert_eq!(
                     records,
-                    vec![(codec::Handle::from(0x8A), "CVIFC".to_string())]
+                    vec![(document::Handle::from(0x8A), "CVIFC".to_string())]
                 );
             }
             other => panic!("unexpected: {other:?}"),
@@ -412,7 +417,7 @@ mod tests {
         }
         // The per-entity read frames round-trip too (API v12).
         let req = crate::ipc::protocol::PluginRequest::GetEntitiesBatch {
-            handles: vec![codec::Handle::from(1), codec::Handle::from(2)],
+            handles: vec![document::Handle::from(1), document::Handle::from(2)],
         };
         let bytes = bincode::serialize(&req).unwrap();
         let got: crate::ipc::protocol::PluginRequest = bincode::deserialize(&bytes).unwrap();
@@ -433,6 +438,7 @@ mod tests {
             grip_id: 1,
             anchor: None,
             point: [0.0; 3],
+            xy_plane: false,
             axis: None,
             shape: Default::default(),
         };
@@ -462,10 +468,12 @@ mod tests {
 
     #[test]
     fn transport_rejects_oversized_message() {
-        let (mut a, _b) = connect_pair();
-        // A Vec<u8> larger than MAX_MESSAGE_SIZE should be rejected on send.
-        let huge = vec![0u8; 65 * 1024 * 1024];
-        let err = send(&mut a, &huge).unwrap_err();
+        let (mut a, mut b) = connect_pair();
+        // A frame header announcing more than MAX_MESSAGE_SIZE is refused
+        // before anything is allocated (no 1 GiB buffer in the test).
+        let len: u64 = 1025 * 1024 * 1024;
+        std::io::Write::write_all(&mut a, &len.to_le_bytes()).expect("write header");
+        let err = recv::<Vec<u8>>(&mut b).unwrap_err();
         assert!(format!("{err}").contains("too large"));
     }
 
@@ -514,6 +522,235 @@ mod tests {
         let got: PluginToHost = bincode::deserialize(&bytes).unwrap();
         match got {
             PluginToHost::Response(HostResponse::Bool(b)) => assert!(b),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_notification_tags_preserve_legacy_discriminants() {
+        // Twin of `v4_additions_preserve_legacy_discriminants` for the
+        // host→plugin notification enum: `HostNotification` serializes as a
+        // bincode `Vec<u8>` wrapper (a u64 LE length prefix, then the tag
+        // byte, then the field-wise payload), so its tag reads at byte 8 of a
+        // full serialization. Every variant 0..=14 stays on its exact tag
+        // byte, and the v27 `DocumentChangedDelta` took the NEXT free tag
+        // byte (15) without shifting one of them.
+        fn tag(notification: &crate::host::HostNotification) -> u8 {
+            let bytes = bincode::serialize(notification).unwrap();
+            bytes[8]
+        }
+
+        // Legacy discriminants 0..=14 — every one still serializes to its
+        // exact tag byte.
+        assert_eq!(
+            tag(&crate::host::HostNotification::InputLine {
+                line: "LINE".to_owned()
+            }),
+            0
+        );
+        assert_eq!(tag(&crate::host::HostNotification::Cancel), 1);
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentChanged { version: 1 }),
+            2
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::SelectionChanged {
+                handles: vec![document::Handle::from(0x2A)]
+            }),
+            3
+        );
+        assert_eq!(tag(&crate::host::HostNotification::Raw(vec![1, 2, 3])), 4);
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentChangedV4 {
+                tab_id: 1,
+                version: 2
+            }),
+            5
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentTabClosed { tab_id: 1 }),
+            6
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::SelectionChangedV4 {
+                tab_id: 1,
+                handles: vec![document::Handle::from(0x2A)]
+            }),
+            7
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::CommandStateChanged {
+                tab_id: 1,
+                command: None
+            }),
+            8
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::DrawingChanged {
+                tab_id: 1,
+                epoch: 2
+            }),
+            9
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentOpened { tab_id: 1 }),
+            10
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentChangedRegions {
+                tab_id: 1,
+                version: 2,
+                entities: vec![document::Handle::from(0x2A)],
+                records: vec![(document::Handle::from(0x8A), "CVIFC".to_owned())]
+            }),
+            11
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::PanelAction {
+                panel_id: "p".to_owned(),
+                control_id: "c".to_owned(),
+                action: "click".to_owned(),
+                value: None
+            }),
+            12
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::QuadAction {
+                panel_id: "p".to_owned(),
+                control_id: "c".to_owned(),
+                handles: vec![document::Handle::from(0x2A)],
+                type_keys: vec!["LWPOLYLINE".to_owned()],
+                pick_point: [0.0; 3]
+            }),
+            13
+        );
+        assert_eq!(
+            tag(&crate::host::HostNotification::SelectionChangedDigest {
+                tab_id: 1,
+                revision: 2,
+                count: 3
+            }),
+            14
+        );
+        // API v27: the delta sits at the next free tag byte and the legacy
+        // Regions stream (tag 11) stays exactly where it was.
+        assert_eq!(
+            tag(&crate::host::HostNotification::DocumentChangedDelta {
+                tab_id: 1,
+                version: 2,
+                added: vec![document::Handle::from(0x2A)],
+                modified: vec![],
+                deleted: vec![],
+                records: vec![],
+                snapshot: None,
+                full_refresh_required: false
+            }),
+            15
+        );
+        assert_eq!(
+            bincode::serialize(&crate::host::HostNotification::DocumentChangedRegions {
+                tab_id: 1,
+                version: 2,
+                entities: vec![],
+                records: vec![]
+            })
+            .unwrap()[8],
+            11
+        );
+    }
+
+    #[test]
+    fn v27_document_changed_delta_roundtrips_like_the_regions_precedent() {
+        use crate::host::HostNotification;
+        // Twin of the DocumentChangedRegions round-trip above (a host→plugin
+        // notification): the categorized v27 delta survives one bincode hop
+        // with every list, the snapshot correlation and the honesty flag
+        // intact.
+        let delta = HostNotification::DocumentChangedDelta {
+            tab_id: 12,
+            version: 93,
+            added: vec![document::Handle::from(0x2A)],
+            modified: vec![document::Handle::from(0x2B)],
+            deleted: vec![document::Handle::from(0x15)],
+            records: vec![(document::Handle::from(0x8A), "CVIFC".to_string())],
+            snapshot: Some(crate::host::DocumentDeltaSnapshot {
+                version: 93,
+                generation: 2,
+            }),
+            full_refresh_required: true,
+        };
+        let bytes = bincode::serialize(&delta).unwrap();
+        let got: HostNotification = bincode::deserialize(&bytes).unwrap();
+        match got {
+            HostNotification::DocumentChangedDelta {
+                tab_id,
+                version,
+                added,
+                modified,
+                deleted,
+                records,
+                snapshot,
+                full_refresh_required,
+            } => {
+                assert_eq!((tab_id, version), (12, 93));
+                assert_eq!(added, vec![document::Handle::from(0x2A)]);
+                assert_eq!(modified, vec![document::Handle::from(0x2B)]);
+                assert_eq!(deleted, vec![document::Handle::from(0x15)]);
+                assert_eq!(
+                    records,
+                    vec![(document::Handle::from(0x8A), "CVIFC".to_string())]
+                );
+                assert_eq!(
+                    snapshot,
+                    Some(crate::host::DocumentDeltaSnapshot {
+                        version: 93,
+                        generation: 2
+                    })
+                );
+                assert!(full_refresh_required);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The v29 panel-surface event notification is pinned at tag 16
+    /// (appended after the v27 delta's 15) and round-trips with its
+    /// sequence (the explicit event identity) and typed event payload.
+    #[test]
+    fn panel_surface_event_notification_tag_is_sixteen() {
+        let notification = crate::host::HostNotification::PanelSurfaceEvent {
+            panel_id: "acme:graph".to_owned(),
+            sequence: 42,
+            event: crate::scene::SurfaceEvent::DragSettled {
+                element: crate::scene::StableId(3),
+                pos: crate::scene::Vec2([7.0, 9.0]),
+            },
+        };
+        fn tag(notification: &crate::host::HostNotification) -> u8 {
+            // The wire frame is [u64 length][tag byte][fields] — the tag
+            // sits after the bincode length prefix (the v27 comment above
+            // explains the append-only tag story).
+            let bytes = bincode::serialize(notification).unwrap();
+            bytes[8]
+        }
+        assert_eq!(tag(&notification), 16);
+        let bytes = bincode::serialize(&notification).expect("serialize notification");
+        match bincode::deserialize::<crate::host::HostNotification>(&bytes)
+            .expect("deserialize notification")
+        {
+            crate::host::HostNotification::PanelSurfaceEvent {
+                panel_id,
+                sequence,
+                event,
+            } => {
+                assert_eq!(panel_id, "acme:graph");
+                assert_eq!(sequence, 42);
+                assert!(matches!(
+                    event,
+                    crate::scene::SurfaceEvent::DragSettled { element, pos }
+                        if element == crate::scene::StableId(3) && pos == crate::scene::Vec2([7.0, 9.0])
+                ));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

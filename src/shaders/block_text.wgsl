@@ -37,7 +37,7 @@ struct VertIn {
 }
 
 struct VertOut {
-    @builtin(position) clip_pos: vec4<f32>,
+    @invariant @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) pen: f32,
@@ -46,7 +46,7 @@ struct VertOut {
 @vertex
 fn vs_main(v: VertIn) -> VertOut {
     var out: VertOut;
-    let rel = (v.pos + v.translation - u.eye_high)
+    let rel = (v.pos - u.eye_high + v.translation)
         + (v.pos_low + v.translation_low - u.eye_low);
     out.clip_pos = u.view_rot * vec4<f32>(rel, 1.0);
     out.clip_pos = apply_draw_order(out.clip_pos, v.source_depth + v.instance_depth);
@@ -56,13 +56,20 @@ fn vs_main(v: VertIn) -> VertOut {
     return out;
 }
 
+// The height, in texels, atlas V coordinates are baked against
+// (`sdf_atlas::MAX_ATLAS_PX`).
+const ATLAS_V_EXTENT: f32 = 8192.0;
+
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let uv_dx = dpdx(in.uv);
-    let uv_dy = dpdy(in.uv);
     let dims = vec2<f32>(textureDimensions(atlas_tex));
+    // V is baked against the atlas's largest height, so a growth leaves
+    // every glyph quad valid; the texture is only as tall as it has grown.
+    let uv = vec2<f32>(in.uv.x, in.uv.y * ATLAS_V_EXTENT / dims.y);
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
     let footprint = max(length(uv_dx * dims), length(uv_dy * dims));
-    let sd_center = textureSampleLevel(atlas_tex, atlas_samp, in.uv, 0.0).r;
+    let sd_center = textureSampleLevel(atlas_tex, atlas_samp, uv, 0.0).r;
     let aa = max(fwidth(sd_center), 1e-4);
     var alpha = smoothstep(0.5 - aa, 0.5 + aa, sd_center);
 
@@ -74,7 +81,7 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
             for (var x = 0; x < samples; x += 1) {
                 let offset = (vec2<f32>(f32(x), f32(y)) + 0.5) / f32(samples) - 0.5;
                 let sd = textureSampleLevel(
-                    atlas_tex, atlas_samp, in.uv + uv_dx * offset.x + uv_dy * offset.y, 0.0
+                    atlas_tex, atlas_samp, uv + uv_dx * offset.x + uv_dy * offset.y, 0.0
                 ).r;
                 sum += smoothstep(0.5 - aa, 0.5 + aa, sd);
             }

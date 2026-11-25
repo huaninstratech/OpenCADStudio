@@ -11,11 +11,72 @@ Internal-facing architecture documentation for `crates/ocs_plugin_api`. For plug
 | Tier | Feature | Dependencies | Purpose |
 |------|---------|--------------|---------|
 | **Core** | default | none | `PluginManifest`, `ApiVersion`, ribbon vocabulary, type registry, version info. Engine crates and external tooling can depend on this cheaply. |
-| **Runtime host surface** | `host` | `opencadcodec`, `interprocess`, `memmap2`, `rkyv`, etc. | `HostApi`, `BuiltinPlugin`, out-of-process spawn, IPC, shared-memory snapshots, runner. |
+| **Runtime host surface** | `host` | `document`, `interprocess`, `memmap2`, `rkyv`, etc. | `HostApi`, `BuiltinPlugin`, out-of-process spawn, IPC, shared-memory snapshots, runner. |
 
 The host and each plugin run in separate OS processes. The host re-executes itself in `--ocs-plugin-runner` mode, the runner dynamically loads the plugin `cdylib`, and the two sides talk over a local socket. Process isolation keeps plugin crashes from affecting the host or other plugins.
 
 ---
+
+## API 19 — styled text and SVG images in dialogs and panels
+
+API v19 appends two presentation controls to `DialogControl`:
+
+- `StyledText { text, style, align_h }` with `TextStyle` = `normal`, `muted`,
+  `strong`, `heading`, `success`, `warning`, `danger`. The host maps the style
+  onto its theme (bold weight, a larger heading size, the theme's own
+  success/warning/danger colour moved in hue only as far as it needs to read
+  on the panel surface), so plugins state intent rather than colours.
+- `Svg { id, svg, height }`: a static, plugin-rendered SVG document (for
+  example a chart), scaled to the available width keeping its aspect ratio,
+  or to `height` logical pixels. The handle is parsed once when the panel or
+  dialog is registered or updated, not per frame. External references are not
+  loaded.
+
+Both are display only: they contribute no `DialogValue` and no snapshot value
+(an `Svg` id is declared for duplicate-id checks and `Visible` updates). They
+are appended at the enum tail, so every older variant keeps its bincode tag
+and older plugins decode unchanged; a v18 host cannot decode them, so a plugin
+that sends them declares v19.
+
+Implementation references: `dialog.rs` (`TextStyle`, the two variants and a
+wire-tag test), `src/ui/window/plugin_dialog.rs` (`styled_text`,
+`svg_image`, `collect_svg_handles`, shared with the panel renderer) and
+`src/ui/window/plugin_panel.rs`.
+
+## API 18 — synchronous panel form snapshots (2026-11-11)
+
+API v18 adds `PanelSnapshot` and `HostApi::panel_snapshot` so a normal,
+document-bound command can read a registered docked panel's complete current
+form. The snapshot contains typed `DialogValue`s, exact raw text for
+text/number/file controls, collection errors, the host-authenticated panel
+owner and the serving session's real tab id. It is an input candidate, never
+document truth: the plugin must re-read its records, validate ownership and
+run its own geometry/proof gates before writing. A malformed or incomplete
+form is rejected, not defaulted.
+
+`PanelAction` remains an asynchronous notification and never becomes a
+document write channel. Existing `PanelDef`, registration, update, toggle,
+class mirrors, legacy callbacks and API-v16 plugins remain supported. The new
+IPC `PluginRequest::PanelSnapshot` / `PluginResponse::PanelSnapshot` variants
+are appended at enum tails. An old v17 host refuses a v18-only plugin rather
+than accepting a request it cannot decode; a host without the method refuses
+the snapshot without a document write. The transport's authenticated plugin
+id is used by `register_panel_for_plugin`, `update_panel_for_plugin`,
+`toggle_panel_for_plugin` and `panel_snapshot_for_plugin`; title/command
+aliases remain owner-checked. The built-in Reset action preserves ownership.
+
+The host does not auto-commit form values, create an IFC undo scope, or infer
+a record transaction. The ordinary command's plugin owns its records,
+candidate proofs, display refresh and exactly its own undo scope. Panel
+refresh on selection is a read-only projection, never a record mutation.
+
+Implementation references: `dialog.rs` (`PanelSnapshot`), `host.rs` (appended
+`HostApi` methods), `ipc/protocol.rs` (appended variants), `ipc/server.rs`
+(authenticated forwarding), `ipc/client.rs` and `ipc/v4/client.rs`
+(forwarding), `src/ui/window/plugin_panel.rs` (recursive collection), and
+`src/app/plugin_host.rs` (owner/tab-bound snapshots). Tests cover nested
+controls, raw numeric drafts, duplicate ids, transport ownership, idempotent
+registration, Reset, aliases and two-document tab isolation.
 
 ## Module map
 
@@ -38,7 +99,7 @@ The host and each plugin run in separate OS processes. The host re-executes itse
 | [`src/shm.rs`](src/shm.rs) | Shared-memory document snapshot layout, `DocumentSnapshotStore`, `SharedDocumentReader`, V3/V4 view data. |
 | [`src/host_v4.rs`](src/host_v4.rs) | Host-side per-tab V4 snapshot manager. |
 | [`src/type_registry.rs`](src/type_registry.rs) / [`src/type_registry_types.rs`](src/type_registry_types.rs) | Build-time `serde-reflection` registry, embedded JSON, schema types. |
-| [`src/version_info.rs`](src/version_info.rs) | Embedded version metadata and opencadcodec source-compatibility helper. |
+| [`src/version_info.rs`](src/version_info.rs) | Embedded version metadata and codec (`acadrust`) source-compatibility helper. |
 
 ---
 
@@ -48,7 +109,7 @@ The host and each plugin run in separate OS processes. The host re-executes itse
 - `API_VERSION_MIN_SUPPORTED` (currently `2`) is the oldest plugin major the host loads.
 - `OCS_PLUGIN_MAX_API_VERSION` can cap the accepted major at runtime (e.g. `5` to disable V6).
 - A plugin built against major `N` runs on a host whose major is `>= N` because new vtable entries and enum variants are appended at the end.
-- V4 introduces the **opencadcodec gate**: plugins targeting API v4 or later must resolve the same `opencadcodec` source as the host (see [`src/version_info.rs`](src/version_info.rs)).
+- V4 introduces the **codec gate**: plugins targeting API v4 or later must resolve the same codec (`acadrust`) source as the host (see [`src/version_info.rs`](src/version_info.rs)).
 - V5 introduces `BuiltinPlugin::on_load` and tab-keyed document paths.
 - V6 appends typed system-variable access to `HostApi`; the host currently
   supports `CLAYER` and `SNAPANG` (plus a read-only `CTAB`).
@@ -197,7 +258,7 @@ sequenceDiagram
 
 ## Notifications
 
-- **Host → plugin:** `HostNotification` in [`src/host.rs`](src/host.rs). V4-only delivery via `PluginManager::broadcast_notification`. Currently emitted examples: `DocumentChangedV4`, `SelectionChangedV4`, `DocumentTabClosed`.
+- **Host → plugin:** `HostNotification` in [`src/host.rs`](src/host.rs). V4-only delivery via `PluginManager::broadcast_notification`. Currently emitted examples: `DocumentChangedV4`, `SelectionChangedV4`, `DocumentTabClosed`, and — routed per endpoint instead of the legacy `DocumentChangedRegions` stream to manifests declaring API 27+ — `DocumentChangedDelta` (`broadcast_for_api`).
 - **Plugin → host:** `PluginNotification` in [`src/host.rs`](src/host.rs). Examples: `Output`, `Progress`, `Log`. Handler installed via `PluginManager::set_notification_handler`.
 
 Broadcasting is V4-gated inside `PluginManager::broadcast_notification`: V2/V3 processes are skipped. The handler runs on the V4 reader thread and must not block.
@@ -222,7 +283,7 @@ Broadcasting is V4-gated inside `PluginManager::broadcast_notification`: V2/V3 p
 The crate embeds two JSON blobs at build time:
 
 - **Type registry** (`OUT_DIR/type_registry.json`) — a language-binding-friendly schema for every editor record root and its dependent types, generated by `serde-reflection` in `build.rs`. See [`src/type_registry.rs`](src/type_registry.rs).
-- **Version info** (`OUT_DIR/version_info.json`) — host version, `ocs_plugin_api` version, `opencadcodec` version and source, `rustc` version, API versions, build timestamp. See [`src/version_info.rs`](src/version_info.rs).
+- **Version info** (`OUT_DIR/version_info.json`) — host version, `ocs_plugin_api` version, codec (`acadrust`) version and source, `rustc` version, API versions, build timestamp. See [`src/version_info.rs`](src/version_info.rs).
 
 Both are accessible without enabling the `host` feature.
 

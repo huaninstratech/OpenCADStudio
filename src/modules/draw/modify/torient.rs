@@ -6,12 +6,12 @@
 //   Step 2: If first point picked, pick second point to define angle vector.
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, DynField};
 use crate::scene::model::wire_model::WireModel;
-use codec::EntityType;
+use document::EntityType;
 
 // ── Command implementation ─────────────────────────────────────────────────
 
@@ -50,10 +50,9 @@ impl TorientCommand {
                     changed = true;
                 }
                 EntityType::MText(mtext) => {
-                    let angle = new_angle_rad.unwrap_or_else(|| {
-                        most_readable_angle(mtext.rotation as f64, self.view_twist)
-                    });
-                    mtext.rotation = angle as f64;
+                    let angle = new_angle_rad
+                        .unwrap_or_else(|| most_readable_angle(mtext.rotation, self.view_twist));
+                    mtext.rotation = angle;
                     changed = true;
                 }
                 EntityType::AttributeDefinition(attdef) => {

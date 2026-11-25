@@ -2,7 +2,7 @@ use crate::app::Message;
 use crate::modules::draw::modify::overkill::Settings;
 use crate::t;
 use crate::ui::style::form::{dialog_button, dialog_button_styled_opt};
-use iced::widget::{button, checkbox, column, row, text, text_input, Space};
+use iced::widget::{Space, button, checkbox, column, row, text, text_input};
 use iced::{Element, Fill, Length, Shrink};
 
 /// Properties that can be left out of the comparison, by ignore bit.
@@ -65,7 +65,11 @@ pub(crate) fn view_window(
             .label(t!(label))
             .on_toggle(move |value| {
                 let mut next = s;
-                next.ignore = if value { s.ignore | bit } else { s.ignore & !bit };
+                next.ignore = if value {
+                    s.ignore | bit
+                } else {
+                    s.ignore & !bit
+                };
                 Message::OverkillSettingsChanged(next)
             })
             .width(150)
@@ -100,7 +104,9 @@ pub(crate) fn view_window(
         ]
         .spacing(8),
         text(t!("Options")).size(13),
-        toggle("Optimize segments within polylines", s.optimize, |s, v| s.optimize = v),
+        toggle("Optimize segments within polylines", s.optimize, |s, v| s
+            .optimize =
+            v),
         toggle(
             "Combine co-linear objects that partially overlap",
             s.overlap,

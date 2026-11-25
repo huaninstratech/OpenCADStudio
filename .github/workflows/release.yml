@@ -25,9 +25,14 @@ on:
           - all
           - snap
           - macos
+          - windows
       # Rebuild an already-published release from the commit its tag points at.
       tag:
         description: Existing release tag to rebuild (optional)
+        default: ''
+        type: string
+      commit:
+        description: Commit on top of the tag to build instead of the tag (optional)
         default: ''
         type: string
 
@@ -39,8 +44,8 @@ env:
 
 jobs:
   build-appimage:
-    # `macos` rebuilds only the dmg of an existing release.
-    if: inputs.target != 'macos'
+    # `macos` and `windows` rebuild only that platform of an existing release.
+    if: inputs.target != 'macos' && inputs.target != 'windows'
     # x86_64 and ARM64 each build natively; the x86_64 payload also feeds
     # the snap.
     strategy:
@@ -49,15 +54,17 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-22.04
+            linuxdeploy_sha256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
           - arch: aarch64
             runner: ubuntu-22.04-arm
+            linuxdeploy_sha256: 620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
           # Full history so build.rs can measure the distance from the
@@ -71,7 +78,9 @@ jobs:
         run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: Install dependencies
         run: |
@@ -82,8 +91,6 @@ jobs:
             librsvg2-bin fuse libfuse2 zsync
 
       - name: Build
-        env:
-          OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         run: cargo build --locked --release
 
       - name: Prepare AppDir
@@ -104,16 +111,19 @@ jobs:
 
       - name: Upload shared Linux payload
         if: matrix.arch == 'x86_64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-payload
           path: linux-payload.tar.gz
           if-no-files-found: error
           retention-days: 7
 
+      # A fixed release checked against its digest: the `continuous` asset is
+      # replaced in place, so what it packs could change without a commit here.
       - name: Download linuxdeploy
         run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-${{ matrix.arch }}.AppImage
+          echo "${{ matrix.linuxdeploy_sha256 }}  linuxdeploy-${{ matrix.arch }}.AppImage" | sha256sum -c -
           chmod +x linuxdeploy-${{ matrix.arch }}.AppImage
 
       # The AppImage carries update information so AppImageUpdate and
@@ -161,7 +171,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
           # Full history so build.rs can measure the distance from the
@@ -175,7 +185,7 @@ jobs:
         run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
 
       - name: Download shared Linux payload
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-payload
           path: .
@@ -190,7 +200,7 @@ jobs:
 
       - name: Build snap
         id: snapcraft
-        uses: snapcore/action-build@v1
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1
 
       - name: Normalize snap package name
         id: snap_package
@@ -211,7 +221,7 @@ jobs:
 
       - name: Upload snap as workflow artifact
         if: env.RELEASE_TAG == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: OpenCADStudio-v${{ steps.package.outputs.version }}-linux-x86_64-snap
           path: ${{ steps.snap_package.outputs.snap }}
@@ -219,7 +229,7 @@ jobs:
 
       - name: Publish snap to edge
         if: env.RELEASE_TAG != '' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
-        uses: snapcore/action-publish@v1
+        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1
         with:
           snap: ${{ steps.snap_package.outputs.snap }}
           release: edge
@@ -249,7 +259,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
           # Full history so build.rs can measure the distance from the
@@ -263,8 +273,9 @@ jobs:
         run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Convert SVG icon to ICO
@@ -289,8 +300,6 @@ jobs:
             packaging/windows/dxf.ico
 
       - name: Build
-        env:
-          OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         shell: bash
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
@@ -305,7 +314,7 @@ jobs:
       # Azure Trusted Signing (upstream setup) -> PFX certificate -> unsigned.
       - name: Sign executable (Azure Trusted Signing)
         if: env.AZURE_SIGNING_CONFIGURED == 'true'
-        uses: azure/artifact-signing-action@v2
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -390,7 +399,7 @@ jobs:
         # The installer itself must be signed separately - light produces a
         # fresh, unsigned .msi even though the .exe inside is already signed.
         if: env.AZURE_SIGNING_CONFIGURED == 'true'
-        uses: azure/artifact-signing-action@v2
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -440,7 +449,7 @@ jobs:
             --clobber --repo ${{ github.repository }}
 
   build-macos:
-    if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all' || inputs.target == 'macos'
+    if: (github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all' || inputs.target == 'macos') && inputs.target != 'windows'
     # Both builds run on the Apple Silicon runner; Intel is cross-built and
     # checked under Rosetta.
     strategy:
@@ -459,7 +468,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
           # Full history so build.rs can measure the distance from the
@@ -473,8 +482,9 @@ jobs:
         run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install librsvg (for rsvg-convert)
@@ -483,8 +493,6 @@ jobs:
         run: brew install librsvg
 
       - name: Build
-        env:
-          OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
           cargo build --locked --release --target ${{ matrix.target }} -p dwg-thumbnailer
@@ -592,7 +600,7 @@ jobs:
       # The check script comes from the workflow's own commit, so rebuilding
       # an older tag runs today's check rather than the one it shipped with.
       - name: Checkout check scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: ci-scripts
           sparse-checkout: docs/automation
@@ -647,7 +655,7 @@ jobs:
 
       - name: Upload .dmg as workflow artifact
         if: env.RELEASE_TAG == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: OpenCADStudio-macos-${{ matrix.arch }}-dmg
           path: OpenCADStudio.dmg
@@ -679,12 +687,14 @@ jobs:
 
   verify:
     needs: [build-appimage, build-snap, build-windows, build-macos]
-    if: github.event_name == 'release' || inputs.tag != ''
+    # A single-platform rebuild skips the other jobs; the check still covers
+    # every asset of the release.
+    if: ${{ !cancelled() && !failure() && (github.event_name == 'release' || inputs.tag != '') }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit || inputs.tag || github.sha }}
       - uses: ./.github/actions/codec-url-rewrite

@@ -8,6 +8,7 @@ use iced::{Background, Element, Fill, Theme};
 use crate::app::Message;
 use crate::io::ifc::IfcTreeNode;
 use crate::ui::dock::{self, Chrome, PanelId};
+use crate::ui::kit;
 
 const INDENT: f32 = 14.0;
 
@@ -27,7 +28,7 @@ pub fn view<'a>(tree: &'a [IfcTreeNode], width: f32, chrome: Chrome) -> Element<
         }
     }
     let body: Element<'_, Message> = container(content).width(Fill).padding([6, 8]).into();
-    dock::frame(title_bar, body, width)
+    kit::palette(title_bar, body, width)
 }
 
 fn push_nodes<'a>(

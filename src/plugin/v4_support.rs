@@ -3,16 +3,21 @@
 use std::sync::Arc;
 
 use ocs_plugin_api::host::{HostNotification, PluginNotification};
-use ocs_plugin_api::host_v4::{manager, HostV4SnapshotManager};
+use ocs_plugin_api::host_v4::{HostV4SnapshotManager, manager};
 use ocs_plugin_api::process::NotificationHandler;
 use ocs_plugin_api::shm::DocumentViewInfo;
 
 fn mgr() -> std::sync::MutexGuard<'static, HostV4SnapshotManager> {
-    manager().lock().unwrap()
+    // Poisoned-lock tolerance: a publication panic elsewhere must not turn
+    // every later plugin IPC into a panic cascade (`unwrap()` would).
+    manager().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Open (or refresh) the V4 shared document view for `tab_id`.
-pub fn open_document_view_v4(tab_id: u64, doc: &codec::Document) -> Option<DocumentViewInfo> {
+pub fn open_document_view_v4(
+    tab_id: u64,
+    doc: &document::Document,
+) -> Result<DocumentViewInfo, String> {
     mgr().open(tab_id, doc)
 }
 
@@ -23,13 +28,29 @@ pub fn close_document_view_v4(tab_id: u64) {
 
 /// Publish the latest document to the V4 shared view for `tab_id` and broadcast
 /// a change notification when successful.
-pub fn publish_document_view_v4(tab_id: u64, doc: &codec::Document) {
-    let info = mgr().publish(tab_id, doc);
-    if let Some(info) = info {
-        broadcast(HostNotification::DocumentChangedV4 {
-            tab_id,
-            version: info.version,
-        });
+///
+/// Returns the snapshot correlation of what THIS call published — the
+/// `(version, generation)` pair the boundary's `DocumentChangedDelta`
+/// carries, read atomically with the publication. `Ok(None)` covers BOTH a
+/// real publication and the legitimate no-op (no V4 consumer has opened a
+/// snapshot for this tab — nothing to publish, no notification to send, and
+/// the mutation boundary still settles) plus the no-store case where there
+/// is nothing to correlate. `Err` is a real failure the caller must report
+/// instead of claiming a boundary that plugins cannot observe.
+pub fn publish_document_view_v4(
+    tab_id: u64,
+    doc: &document::Document,
+) -> Result<Option<ocs_plugin_api::host::DocumentDeltaSnapshot>, String> {
+    match mgr().publish_correlated(tab_id, doc) {
+        Ok(Some(correlation)) => {
+            broadcast(HostNotification::DocumentChangedV4 {
+                tab_id,
+                version: correlation.version,
+            });
+            Ok(Some(correlation))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -44,15 +65,43 @@ pub fn on_tab_closed(tab_id: u64) {
 /// `HostNotification::SelectionChangedV4` carries the active tab id and the
 /// current selection set. The caller is responsible for only calling this when
 /// the selection actually changed; see `OpenCADStudio::notify_plugins_selection_changed`.
-pub fn publish_selection_changed_v4(tab_id: u64, handles: Vec<codec::Handle>) {
+pub fn publish_selection_changed_v4(tab_id: u64, handles: Vec<document::Handle>) {
     broadcast(HostNotification::SelectionChangedV4 { tab_id, handles });
+}
+
+/// Broadcast a selection change with per-endpoint API routing (v22): v22+
+/// runners receive the O(1) `SelectionChangedDigest` ({tab_id, revision,
+/// count}); older endpoints keep their exact legacy notification streams
+/// (`SelectionChangedV4`, plus the plain `SelectionChanged` when
+/// `legacy_plain`).
+pub fn publish_selection_changed_versioned(
+    tab_id: u64,
+    handles: Vec<document::Handle>,
+    revision: u64,
+    legacy_plain: bool,
+) {
+    #[cfg(test)]
+    {
+        record_test_dispatch(&HostNotification::SelectionChangedV4 {
+            tab_id,
+            handles: Vec::new(),
+        });
+        if legacy_plain {
+            record_test_dispatch(&HostNotification::SelectionChanged {
+                handles: handles.clone(),
+            });
+        }
+    }
+    crate::plugin::external::with_manager(|mgr| {
+        mgr.broadcast_selection_changed(tab_id, &handles, revision, legacy_plain);
+    });
 }
 
 /// Broadcast the tab-independent `HostNotification::SelectionChanged` to every
 /// loaded native plugin (API v9): the plain-handle variant of the selection
 /// event, dispatched at the same fingerprint-guarded message boundary as the
 /// tab-scoped one above (`OpenCADStudio::notify_plugins_selection_changed`).
-pub fn publish_selection_changed(handles: Vec<codec::Handle>) {
+pub fn publish_selection_changed(handles: Vec<document::Handle>) {
     broadcast(HostNotification::SelectionChanged { handles });
 }
 
@@ -62,6 +111,90 @@ pub fn publish_selection_changed(handles: Vec<codec::Handle>) {
 /// message boundary (`OpenCADStudio::notify_plugins_document_changed`).
 pub fn publish_document_changed(version: u64) {
     broadcast(HostNotification::DocumentChanged { version });
+}
+
+/// Exact, categorized change payload of one document boundary (API v27),
+/// classified from the scene journal between the last published boundary and
+/// now: `added` handles were absent before and present after, `modified`
+/// handles existed on both sides with changed data, and `deleted` handles
+/// existed before and are absent after — deleted handles STAY in the list
+/// even though lookup now fails (the deletion itself is the information).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocumentBoundary {
+    pub added: Vec<document::Handle>,
+    pub modified: Vec<document::Handle>,
+    pub deleted: Vec<document::Handle>,
+    pub records: Vec<(document::Handle, String)>,
+    /// The drained legacy dirty set (identity of what the pre-27 v13 Regions
+    /// notification would carry): empty at built-in boundaries = the
+    /// documented "walk everything" degradation — never a wrong claim.
+    pub legacy_entities: Vec<document::Handle>,
+    /// V4 snapshot-store correlation published for this same boundary: the
+    /// exact (version, generation) a plugin can match against its loaded
+    /// mapping. `None` when no snapshot was published for the boundary (no
+    /// V4 store was open, its publication failed, or the boundary could not
+    /// be proven exact — see `full_refresh_required`).
+    pub snapshot: Option<ocs_plugin_api::host::DocumentDeltaSnapshot>,
+    /// True when the journal cannot prove the entity sets complete: a journal
+    /// gap ( eviction past the cap, whole-snapshot restore) or a failed
+    /// snapshot publication. Consumers must resynchronize the whole document
+    /// and never trust the lists in this case.
+    pub full_refresh_required: bool,
+}
+
+/// Publish the exact categorized boundary delta, routed per endpoint
+/// (the [`HostNotification::SelectionChangedDigest`] discipline): API v27+
+/// endpoints receive `DocumentChangedDelta` INSTEAD OF the legacy Regions
+/// notification — one notification per boundary, never a duplicate Regions +
+/// delta stream — while pre-27 endpoints keep their exact legacy
+/// `DocumentChangedRegions` stream (whose empty set keeps its documented
+/// "unknown, walk everything" meaning).
+pub fn publish_document_delta(tab_id: u64, version: u64, boundary: DocumentBoundary) {
+    let DocumentBoundary {
+        added,
+        modified,
+        deleted,
+        records,
+        legacy_entities,
+        snapshot,
+        full_refresh_required,
+    } = boundary;
+    // Legacy v13 payload: the drained region sets, exactly as the v13
+    // boundary always published them (empty at built-in boundaries = the
+    // documented "walk everything" degradation — never a wrong claim).
+    let legacy = HostNotification::DocumentChangedRegions {
+        tab_id,
+        version,
+        entities: legacy_entities,
+        records: records.clone(),
+    };
+    // Exact categorized delta for API v27+ endpoints: the classified
+    // added/modified/deleted sets with the snapshot correlation of the
+    // state the classification was computed from.
+    let delta_notification = HostNotification::DocumentChangedDelta {
+        tab_id,
+        version,
+        added,
+        modified,
+        deleted,
+        records: records.clone(),
+        snapshot,
+        full_refresh_required,
+    };
+    #[cfg(test)]
+    {
+        record_test_dispatch(&legacy);
+        record_test_dispatch(&delta_notification);
+    }
+    crate::plugin::external::with_manager(|mgr| {
+        mgr.broadcast_for_api(None, &|api: u32| {
+            if api >= 27 {
+                Some(delta_notification.clone())
+            } else {
+                Some(legacy.clone())
+            }
+        });
+    });
 }
 
 /// Broadcast the DIRTY REGION payload (API v13): the identity set of what
@@ -74,8 +207,8 @@ pub fn publish_document_changed(version: u64) {
 pub fn publish_document_changed_regions(
     tab_id: u64,
     version: u64,
-    entities: Vec<codec::Handle>,
-    records: Vec<(codec::Handle, String)>,
+    entities: Vec<document::Handle>,
+    records: Vec<(document::Handle, String)>,
 ) {
     broadcast(HostNotification::DocumentChangedRegions {
         tab_id,
@@ -119,6 +252,66 @@ pub fn publish_panel_action(
     });
 }
 
+/// Deliver a panel or dialog control interaction to a specific owning plugin
+/// (when `plugin_id` is `Some`), or broadcast it to all plugins when `None`.
+pub fn publish_panel_action_to_plugin(
+    plugin_id: Option<&str>,
+    command_id: Option<u64>,
+    panel_id: String,
+    control_id: String,
+    action: String,
+    value: Option<ocs_plugin_api::dialog::DialogValue>,
+) {
+    match plugin_id {
+        Some(pid) => {
+            let notification = HostNotification::PanelAction {
+                panel_id,
+                control_id,
+                action,
+                value,
+            };
+            #[cfg(test)]
+            record_test_dispatch(&notification);
+            crate::plugin::external::with_manager(|mgr| {
+                if let Some((process, _api_version, alive)) = mgr.grip_endpoint(pid) {
+                    if alive {
+                        let _ = process.notify_plugin(command_id, notification);
+                    }
+                }
+            });
+        }
+        None => publish_panel_action(panel_id, control_id, action, value),
+    }
+}
+
+/// Deliver a semantic panel-surface event to the OWNING plugin only
+/// (api v29). Panel surfaces are plugin-owned: only the owner may act on
+/// its events (no fan-out). Best-effort by contract — a dead owner's
+/// event drops silently (the same law as every v4 notification), and the
+/// runner-side `notification_api_version` gate keeps v28 runners from
+/// receiving tag 16.
+pub fn publish_surface_event_to_plugin(
+    plugin_id: &str,
+    panel_id: String,
+    sequence: u64,
+    event: ocs_plugin_api::scene::SurfaceEvent,
+) {
+    let notification = HostNotification::PanelSurfaceEvent {
+        panel_id,
+        sequence,
+        event,
+    };
+    #[cfg(test)]
+    record_test_dispatch(&notification);
+    crate::plugin::external::with_manager(|mgr| {
+        if let Some((process, _api_version, alive)) = mgr.grip_endpoint(plugin_id) {
+            if alive {
+                let _ = process.notify_plugin(None, notification);
+            }
+        }
+    });
+}
+
 /// Deliver a quad cursor menu pick to the OWNING plugin only (API v15).
 ///
 /// The quad is not an active command: the pick path resolves the item's
@@ -139,7 +332,7 @@ pub fn publish_quad_action(
     plugin_id: &str,
     panel_id: &str,
     control_id: &str,
-    handles: Vec<codec::Handle>,
+    handles: Vec<document::Handle>,
     type_keys: Vec<String>,
     pick_point: [f64; 3],
 ) {
@@ -236,9 +429,7 @@ pub fn drain_channel_ready_acks() {
                     );
                 }
                 ocs_plugin_api::process::AttachOutcome::AlreadyAttached => {
-                    eprintln!(
-                        "[{plugin_id}] ChannelReady duplicate for a live channel; ignored"
-                    );
+                    eprintln!("[{plugin_id}] ChannelReady duplicate for a live channel; ignored");
                 }
                 ocs_plugin_api::process::AttachOutcome::Ambiguous(waiting) => {
                     eprintln!(
@@ -306,7 +497,36 @@ fn record_test_dispatch(notification: &HostNotification) {
             control_id,
             handles,
             ..
-        } => format!("QuadAction({panel_id}.{control_id}, {} handles)", handles.len()),
+        } => format!(
+            "QuadAction({panel_id}.{control_id}, {} handles)",
+            handles.len()
+        ),
+        HostNotification::DocumentChangedDelta {
+            added,
+            modified,
+            deleted,
+            records,
+            full_refresh_required,
+            ..
+        } => format!(
+            "DocumentChangedDelta(+{}, ~{}, -{}, {} records{})",
+            added.len(),
+            modified.len(),
+            deleted.len(),
+            records.len(),
+            if *full_refresh_required {
+                ", FULL REFRESH REQUIRED"
+            } else {
+                ""
+            }
+        ),
+        // API v29 (S08 equivalence): one entry per owner-targeted surface
+        // event; identity is the per-surface sequence, so the log keeps it.
+        HostNotification::PanelSurfaceEvent {
+            panel_id,
+            sequence,
+            event,
+        } => format!("PanelSurfaceEvent({panel_id}, seq {sequence}, {event:?})"),
         _ => "Other".to_string(),
     };
     TEST_DISPATCH_LOG.with(|log| log.borrow_mut().push(kind));

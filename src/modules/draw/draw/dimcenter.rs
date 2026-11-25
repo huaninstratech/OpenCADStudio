@@ -1,9 +1,9 @@
 // Legacy centre cross and associative centre mark commands.
 
 use crate::t;
-use codec::entities::{CenterMarkAssociation, CenterMarkSource};
-use codec::types::Vector3;
-use codec::{EntityType, Handle, Line};
+use document::entities::{CenterMarkAssociation, CenterMarkSource};
+use document::types::Vector3;
+use document::{EntityType, Handle, Line};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
@@ -31,6 +31,12 @@ pub struct DimCenterCommand {
     /// The picked entity, injected by the host before `on_entity_pick` runs.
     /// `None` until the host injects it.
     picked: Option<EntityType>,
+}
+
+impl Default for DimCenterCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DimCenterCommand {
@@ -233,7 +239,10 @@ impl CadCommand for CenterMarkCommand {
             return self.layer.on_text(text);
         }
         if matches!(
-            text.trim().trim_start_matches('_').to_ascii_uppercase().as_str(),
+            text.trim()
+                .trim_start_matches('_')
+                .to_ascii_uppercase()
+                .as_str(),
             "L" | "LAYER"
         ) {
             self.layer.active = true;
@@ -280,6 +289,12 @@ pub struct CenterReassociateCommand {
     picked: Option<EntityType>,
 }
 
+impl Default for CenterReassociateCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CenterReassociateCommand {
     pub fn new() -> Self {
         Self {
@@ -324,8 +339,10 @@ impl CadCommand for CenterReassociateCommand {
                     Some(true)
                 }
                 EntityType::Line(line)
-                    if codec::entities::CenterLineAssociation::read(&line.common.extended_data)
-                        .is_some() =>
+                    if document::entities::CenterLineAssociation::read(
+                        &line.common.extended_data,
+                    )
+                    .is_some() =>
                 {
                     Some(false)
                 }
@@ -339,7 +356,9 @@ impl CadCommand for CenterReassociateCommand {
         if mark {
             let valid = picked
                 .as_ref()
-                .and_then(|entity| crate::scene::centermark::picked_mark_source(entity, handle, point))
+                .and_then(|entity| {
+                    crate::scene::centermark::picked_mark_source(entity, handle, point)
+                })
                 .is_some();
             if !valid {
                 return CmdResult::ReportError(crate::tr!("center-cmd", "mark-invalid"));

@@ -59,7 +59,7 @@ fn table_fixture_with_limits(
     )
     .unwrap();
     // Properties remains usable when the table's display grip is disabled.
-    let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[source]
+    let document::objects::ObjectType::DynamicBlock(object) = app.tabs[source]
         .scene
         .document
         .objects
@@ -68,12 +68,12 @@ fn table_fixture_with_limits(
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PropertiesTable(table) = &mut object.data else {
+    let document::objects::DynamicBlockData::PropertiesTable(table) = &mut object.data else {
         panic!()
     };
     table.parameter.property_count = 0;
     if limits {
-        let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[source]
+        let document::objects::ObjectType::DynamicBlock(object) = app.tabs[source]
             .scene
             .document
             .objects
@@ -82,7 +82,8 @@ fn table_fixture_with_limits(
         else {
             panic!()
         };
-        let codec::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data else {
+        let document::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data
+        else {
             panic!()
         };
         parameter.value_set.flags = 8;
@@ -267,12 +268,12 @@ fn block_table_properties_reject_stale_hidden_locked_and_invalid_choices() {
     assert_eq!(app.tabs[i].scene.document, edited);
     app.refresh_properties();
     let key = row(&app).0;
-    let codec::objects::ObjectType::DynamicBlock(object) =
+    let document::objects::ObjectType::DynamicBlock(object) =
         app.tabs[i].scene.document.objects.get_mut(&handle).unwrap()
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PropertiesTable(table) = &mut object.data else {
+    let document::objects::DynamicBlockData::PropertiesTable(table) = &mut object.data else {
         panic!()
     };
     table.parameter.parameter.show_properties = false;
@@ -439,7 +440,7 @@ fn block_table_properties_wrap_angles_and_display_degrees_without_actions() {
 }
 
 #[test]
-fn block_table_properties_reject_shared_scratch_references_and_nested_editor_edits() {
+fn block_table_properties_reject_shared_scratch_references_and_edit_nested_rows() {
     let (mut app, _, _, insert, _, _) = table_fixture(true);
     let i = app.active_tab;
     let key = row(&app).0;
@@ -459,7 +460,7 @@ fn block_table_properties_reject_shared_scratch_references_and_nested_editor_edi
     assert_eq!(app.tabs[i].scene.document, before);
     assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
 
-    let (mut app, _, _, _, _, _) = table_fixture(false);
+    let (mut app, _, _, other, _, _) = table_fixture(false);
     let i = app.active_tab;
     app.tabs[i].scene.define_block_raw(
         "OUTER",
@@ -483,16 +484,22 @@ fn block_table_properties_reject_shared_scratch_references_and_nested_editor_edi
     app.tabs[i].scene.select_entity(nested, true);
     app.tabs[i].selected_handle = Some(nested);
     app.refresh_properties();
-    let property = app.tabs[i]
-        .properties
-        .sections
-        .iter()
-        .flat_map(|section| &section.props)
-        .find(|property| property.field == "dyn_table")
-        .unwrap();
-    assert!(
-        matches!(&property.value,PropValue::ReadOnlyWithTooltip { value,.. } if value.starts_with("1:"))
+    let (key, selected, _) = row(&app);
+    assert_eq!(key.insert, nested);
+    assert!(key.editor_session.is_some());
+    assert_eq!(selected, 0);
+    let _ = app.update(Message::PropBlockChoice { key, index: 2 });
+    assert_eq!(row(&app).1, 2);
+    assert_eq!(
+        crate::scene::block_parameter_properties::current_table_row(
+            &app.tabs[i].scene.document,
+            None,
+            other,
+        ),
+        Some(0),
     );
+    app.undo_steps(1);
+    assert_eq!(row(&app).1, 0);
 }
 
 #[test]
@@ -655,10 +662,11 @@ fn a_value_list_is_not_painted_when_its_grip_is_gone() {
         "the open list hangs from the grip while the grip is drawn"
     );
     let doc = &mut app.tabs[i].scene.document;
-    let Some(codec::objects::ObjectType::DynamicBlock(native)) = doc.objects.get_mut(&table) else {
+    let Some(document::objects::ObjectType::DynamicBlock(native)) = doc.objects.get_mut(&table)
+    else {
         panic!("the fixture's table is a dynamic block object");
     };
-    let codec::objects::DynamicBlockData::PropertiesTable(rows) = &mut native.data else {
+    let document::objects::DynamicBlockData::PropertiesTable(rows) = &mut native.data else {
         panic!("the table object holds the properties table");
     };
     rows.parameter.property_count = 0;
@@ -766,12 +774,85 @@ fn the_value_list_follows_its_grip_when_the_view_moves() {
     );
 }
 
+/// Inside a floating viewport the grips are drawn through that viewport's own
+/// camera and rectangle, so the list that hangs from one is placed there too,
+/// not through the sheet camera over the whole canvas.
+#[test]
+fn the_value_list_hangs_from_the_grip_a_floating_viewport_draws() {
+    let (mut app, _, def, _, _, table) = table_fixture(false);
+    let i = app.active_tab;
+    crate::scene::block_grips::config::set(&mut app.tabs[i].scene.document, def, table, Some(1))
+        .unwrap();
+    app.refresh_properties();
+    app.open_table_popup();
+    assert!(
+        app.table_popup.is_some(),
+        "the list opens for the lone selected reference"
+    );
+
+    let world = app.tabs[i]
+        .table_grip
+        .as_ref()
+        .expect("the selected reference still draws its grip")
+        .world;
+
+    let scene = &mut app.tabs[i].scene;
+    scene.document.add_layout("Sheet").unwrap();
+    scene.set_current_layout("Sheet".into());
+    let mut viewport = document::entities::Viewport::new();
+    viewport.id = 2;
+    viewport.center = Vector3::new(50., 50., 0.);
+    viewport.width = 100.;
+    viewport.height = 100.;
+    viewport.view_height = 1000.;
+    viewport.view_target = Vector3::new(world.x, world.y, world.z);
+    viewport.view_direction = Vector3::UNIT_Z;
+    viewport.turn_on();
+    let viewport = scene.add_entity(EntityType::Viewport(Box::new(viewport)));
+    scene.active_viewport = Some(viewport);
+
+    let canvas = iced::Rectangle {
+        x: 0.,
+        y: 0.,
+        width: 1600.,
+        height: 900.,
+    };
+    let (camera, rect) = app.tabs[i]
+        .scene
+        .viewport_edit_frame((canvas.width, canvas.height))
+        .expect("the active floating viewport has an editing frame");
+    let projected = camera
+        .project(world, rect)
+        .expect("the grip projects through the viewport");
+    let expected = iced::Point::new(rect.x + projected.x, rect.y + projected.y);
+    assert!(
+        rect.contains(expected),
+        "the viewport draws the grip inside its own rectangle: {expected:?} in {rect:?}"
+    );
+    let sheet = app.tabs[i]
+        .scene
+        .camera
+        .borrow()
+        .project(world, canvas)
+        .expect("the grip projects through the sheet camera too");
+    assert!(
+        iced::Point::new(canvas.x + sheet.x, canvas.y + sheet.y).distance(expected) > 1.0,
+        "the viewport and the sheet place the grip apart, so the choice matters"
+    );
+    assert_eq!(
+        app.table_popup_anchor(i, canvas)
+            .expect("the open list has an anchor"),
+        expected,
+        "the list hangs from the grip where the viewport draws it"
+    );
+}
+
 #[test]
 fn the_value_list_closes_when_its_drawing_tab_is_left() {
     let (mut app, _, def, _, _, table) = table_fixture(false);
     let home = app.active_tab;
     app.tabs
-        .push(crate::app::document::DocumentTab::new_drawing(1));
+        .push(crate::app::tab_document::DocumentTab::new_drawing(1));
     let other = app.tabs.len() - 1;
     crate::scene::block_grips::config::set(&mut app.tabs[home].scene.document, def, table, Some(1))
         .unwrap();
@@ -793,7 +874,7 @@ fn the_value_list_closes_when_its_drawing_tab_is_closed() {
     let (mut app, _, def, _, _, table) = table_fixture(false);
     let home = app.active_tab;
     app.tabs
-        .push(crate::app::document::DocumentTab::new_drawing(1));
+        .push(crate::app::tab_document::DocumentTab::new_drawing(1));
     crate::scene::block_grips::config::set(&mut app.tabs[home].scene.document, def, table, Some(1))
         .unwrap();
     app.refresh_properties();
@@ -916,12 +997,12 @@ fn block_table_row_history_preserves_transported_linear_frames() {
                 Vector3::new(5., 7., 0.),
             )
             .unwrap();
-            let codec::objects::ObjectType::DynamicBlock(object) =
+            let document::objects::ObjectType::DynamicBlock(object) =
                 doc.objects.get_mut(&child).unwrap()
             else {
                 panic!()
             };
-            let codec::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data
+            let document::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data
             else {
                 panic!()
             };
@@ -1019,9 +1100,10 @@ fn block_table_row_history_preserves_transported_linear_frames() {
 
 #[test]
 fn drawing1_dxf_and_berb_dwg_stretch_grips_evaluate_without_error() {
-    let dxf_path = r"C:\Users\Atelier La Medina\AppData\Local\Temp\Rar$DRa40168.24845.rartemp\Drawing1.dxf";
+    let dxf_path =
+        r"C:\Users\Atelier La Medina\AppData\Local\Temp\Rar$DRa40168.24845.rartemp\Drawing1.dxf";
     if std::path::Path::new(dxf_path).exists() {
-        let doc = codec::DxfReader::from_file(std::path::Path::new(dxf_path))
+        let doc = document::DxfReader::from_file(std::path::Path::new(dxf_path))
             .unwrap()
             .read()
             .unwrap();
@@ -1061,7 +1143,7 @@ fn drawing1_dxf_and_berb_dwg_stretch_grips_evaluate_without_error() {
 
     let dwg_path = r"C:\Users\Atelier La Medina\Desktop\berb.dwg";
     if std::path::Path::new(dwg_path).exists() {
-        let doc = codec::DwgReader::from_file(std::path::Path::new(dwg_path))
+        let doc = document::DwgReader::from_file(std::path::Path::new(dwg_path))
             .unwrap()
             .read()
             .unwrap();

@@ -1,22 +1,17 @@
 //! Handle order inside a block definition: one handle per record, in file order.
 
-use codec::entities::{
-    CenterMarkAssociation, CenterMarkSource, CenterMarkSourceKind, Line,
-};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{CenterMarkAssociation, CenterMarkSource, CenterMarkSourceKind, Line};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 
 use crate::scene::{CreateBlockOptions, Scene};
 use crate::ui::window::block_definition::BlockObjectMode;
 
 fn line(x: f64) -> EntityType {
-    EntityType::Line(Line::from_points(
-        Vector3::ZERO,
-        Vector3::new(x, 0.0, 0.0),
-    ))
+    EntityType::Line(Line::from_points(Vector3::ZERO, Vector3::new(x, 0.0, 0.0)))
 }
 
-fn assert_ends_after_body(document: &codec::Document, name: &str) {
+fn assert_ends_after_body(document: &document::Document, name: &str) {
     let record = document
         .block_records
         .get(name)
@@ -38,7 +33,10 @@ fn assert_ends_after_body(document: &codec::Document, name: &str) {
         "the ENDBLK handle follows the body: marker {marker}, body {body:?}, end {end}"
     );
     assert!(
-        matches!(document.get_entity(Handle::new(end)), Some(EntityType::BlockEnd(_))),
+        matches!(
+            document.get_entity(Handle::new(end)),
+            Some(EntityType::BlockEnd(_))
+        ),
         "the record's end handle names an ENDBLK entity"
     );
 }
@@ -78,8 +76,8 @@ fn the_block_command_path_also_ends_after_its_body() {
         .create_block_from_entities(
             &[source],
             "COMMAND",
-            &codec::types::Transform::identity(),
-            &codec::types::Transform::identity(),
+            &document::types::Transform::identity(),
+            &document::types::Transform::identity(),
         )
         .expect("the definition is created");
     let record = scene
@@ -110,7 +108,7 @@ fn a_copied_definition_also_ends_after_its_body() {
     let name = scene
         .define_transformed_block(
             &[line(1.0), line(2.0)],
-            &crate::command::EntityTransform::Translate(glam::DVec3::ZERO),
+            &crate::entities::transform::EntityTransform::Translate(glam::DVec3::ZERO),
         )
         .expect("the copy's definition is created");
     assert_ends_after_body(&scene.document, &name);
@@ -123,8 +121,8 @@ fn a_redefined_definition_ends_after_its_new_body() {
         name: "REDEFINED".to_string(),
         handles,
         base_point: glam::DVec3::ZERO,
-        world_to_block: codec::types::Transform::identity(),
-        block_to_world: codec::types::Transform::identity(),
+        world_to_block: document::types::Transform::identity(),
+        block_to_world: document::types::Transform::identity(),
         mode: BlockObjectMode::Retain,
         annotative: false,
         match_orientation: false,
@@ -136,7 +134,10 @@ fn a_redefined_definition_ends_after_its_new_body() {
         hyperlink_desc: String::new(),
         redefine,
     };
-    let first = scene.document.add_entity(line(1.0)).expect("the first line");
+    let first = scene
+        .document
+        .add_entity(line(1.0))
+        .expect("the first line");
     scene
         .create_block_with_options(options(vec![first], false))
         .expect("the definition is created");
@@ -146,7 +147,10 @@ fn a_redefined_definition_ends_after_its_new_body() {
         .get("REDEFINED")
         .expect("the record is added")
         .block_end_handle;
-    let second = scene.document.add_entity(line(2.0)).expect("the second line");
+    let second = scene
+        .document
+        .add_entity(line(2.0))
+        .expect("the second line");
     scene
         .create_block_with_options(options(vec![second], true))
         .expect("the definition is redefined");
@@ -164,8 +168,8 @@ fn a_definition_rejected_for_its_body_still_ends_with_an_end_block() {
         name: "REJECTED".to_string(),
         handles: vec![Handle::new(9_999_999)],
         base_point: glam::DVec3::ZERO,
-        world_to_block: codec::types::Transform::identity(),
-        block_to_world: codec::types::Transform::identity(),
+        world_to_block: document::types::Transform::identity(),
+        block_to_world: document::types::Transform::identity(),
         mode: BlockObjectMode::Retain,
         annotative: false,
         match_orientation: false,
@@ -183,7 +187,7 @@ fn a_definition_rejected_for_its_body_still_ends_with_an_end_block() {
 
 #[test]
 fn an_exported_centre_mark_ends_after_its_picture() {
-    let mut document = codec::Document::new();
+    let mut document = document::Document::new();
     let association = CenterMarkAssociation {
         source: CenterMarkSource {
             handle: Handle::new(9_999),
@@ -240,11 +244,7 @@ fn a_raw_redefine_also_ends_after_its_new_body() {
         .expect("the record is added")
         .block_end_handle;
     scene
-        .redefine_block_raw(
-            "RAW_REDEFINE",
-            Vector3::ZERO,
-            vec![line(2.0), line(3.0)],
-        )
+        .redefine_block_raw("RAW_REDEFINE", Vector3::ZERO, vec![line(2.0), line(3.0)])
         .expect("the definition is redefined");
     assert_ends_after_body(&scene.document, "RAW_REDEFINE");
     assert!(
@@ -254,16 +254,16 @@ fn a_raw_redefine_also_ends_after_its_new_body() {
 }
 
 /// A definition whose terminator handle names one of its own body lines.
-fn corrupt_definition() -> (codec::Document, Handle) {
-    let mut document = codec::Document::new();
-    let mut record = codec::tables::BlockRecord::new("CORRUPT");
+fn corrupt_definition() -> (document::Document, Handle) {
+    let mut document = document::Document::new();
+    let mut record = document::tables::BlockRecord::new("CORRUPT");
     record.handle = document.allocate_handle();
     let br = record.handle;
     document
         .block_records
         .add(record)
         .expect("the record is added");
-    let mut marker = codec::entities::Block::new("CORRUPT", Vector3::ZERO);
+    let mut marker = document::entities::Block::new("CORRUPT", Vector3::ZERO);
     marker.common.handle = document.allocate_handle();
     marker.common.owner_handle = br;
     let marker_handle = marker.common.handle;

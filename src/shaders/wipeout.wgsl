@@ -96,14 +96,14 @@ struct VIn  {
     @location(3) draw_depth: f32,
 }
 struct VOut {
-    @builtin(position) clip: vec4<f32>,
+    @invariant @builtin(position) clip: vec4<f32>,
     @location(0)       xz:   vec2<f32>,
 }
 
 @vertex fn vs_main(v: VIn) -> VOut {
     var o: VOut;
     let local_world = h.plane_x.xyz * v.pos.x + h.plane_y.xyz * v.pos.y;
-    let hi = h.plane_origin_high.xyz + v.translation - u.eye_high;
+    let hi = h.plane_origin_high.xyz - u.eye_high + v.translation;
     let lo = local_world + h.plane_origin_low.xyz + v.translation_low - u.eye_low;
     o.clip = u.view_rot * vec4<f32>(hi + lo, 1.0);
     // Draw-order bias (see draw_order.wgsl): the mask erases what draws BELOW its

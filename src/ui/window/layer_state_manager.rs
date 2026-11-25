@@ -2,16 +2,16 @@
 
 use crate::app::{LayerStateLayerFlag, LayerStateProperty, Message};
 use crate::t;
-use crate::ui::properties::{lw_options, LwItem};
-use crate::ui::style::form::{hdivider, LABEL_WIDTH};
-use codec::{LayerState, LayerStateMask};
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Space};
+use crate::ui::properties::{LwItem, lw_options};
+use crate::ui::style::form::{LABEL_WIDTH, hdivider};
+use document::{LayerState, LayerStateMask};
+use iced::widget::{Space, button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{Background, Border, Element, Fill, Length, Theme};
 use std::borrow::Cow;
 use std::fmt;
 
 #[derive(Clone, PartialEq, Debug)]
-struct TransparencyItem(Option<codec::types::Transparency>);
+struct TransparencyItem(Option<document::types::Transparency>);
 
 impl fmt::Display for TransparencyItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -22,11 +22,11 @@ impl fmt::Display for TransparencyItem {
     }
 }
 
-fn transparency_options(current: Option<codec::types::Transparency>) -> Vec<TransparencyItem> {
+fn transparency_options(current: Option<document::types::Transparency>) -> Vec<TransparencyItem> {
     let mut options = vec![TransparencyItem(None)];
     for percent in (0..=90).step_by(10) {
         options.push(TransparencyItem(Some(
-            codec::types::Transparency::from_percent(percent as f64 / 100.0),
+            document::types::Transparency::from_percent(percent as f64 / 100.0),
         )));
     }
     let current = TransparencyItem(current);
@@ -38,7 +38,7 @@ fn transparency_options(current: Option<codec::types::Transparency>) -> Vec<Tran
 
 fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.65)),
+        color: Some(crate::ui::style::readable::muted_text(theme)),
     }
 }
 
@@ -67,7 +67,8 @@ fn mask_summary(mask: LayerStateMask) -> String {
     ];
     properties
         .into_iter()
-        .filter_map(|(flag, label)| mask.contains(flag).then(|| t!(label)))
+        .filter(|&(flag, _label)| mask.contains(flag))
+        .map(|(_flag, label)| t!(label))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -409,7 +410,7 @@ fn editor_header<'a>() -> Element<'a, Message> {
 
 fn editor_layer_row<'a>(
     index: usize,
-    layer: &'a codec::LayerStateLayer,
+    layer: &'a document::LayerStateLayer,
     color_open: bool,
     linetypes: std::sync::Arc<[String]>,
 ) -> Element<'a, Message> {
@@ -444,18 +445,20 @@ fn editor_layer_row<'a>(
                 54.0
             ),
             container(color).width(Length::Fixed(135.0)),
-            crate::ui::dropdown_list::pick_list(current_linetype, linetypes, |value| value.to_string(),)
-                .on_select(move |value| Message::LayerStateEditorLayerLinetype(index, value))
-                .text_size(11)
-                .padding([3, 5])
-                .width(Length::Fixed(150.0)),
-            crate::ui::dropdown_list::pick_list(current_lineweight, lw_options(), |value| value.to_string(),)
-                .on_select(move |item: LwItem| {
-                    Message::LayerStateEditorLayerLineweight(index, item.0)
-                })
-                .text_size(11)
-                .padding([3, 5])
-                .width(Length::Fixed(115.0)),
+            crate::ui::dropdown_list::pick_list(current_linetype, linetypes, |value| value
+                .to_string(),)
+            .on_select(move |value| Message::LayerStateEditorLayerLinetype(index, value))
+            .text_size(11)
+            .padding([3, 5])
+            .width(Length::Fixed(150.0)),
+            crate::ui::dropdown_list::pick_list(current_lineweight, lw_options(), |value| value
+                .to_string(),)
+            .on_select(move |item: LwItem| {
+                Message::LayerStateEditorLayerLineweight(index, item.0)
+            })
+            .text_size(11)
+            .padding([3, 5])
+            .width(Length::Fixed(115.0)),
             text_input(t!("Default").as_ref(), &layer.plot_style)
                 .on_input(move |value| Message::LayerStateEditorLayerPlotStyle(index, value))
                 .size(11)
@@ -559,9 +562,11 @@ pub fn view_editor<'a>(
                     .style(muted),
                 Space::new().width(sizing.width),
                 text(t!("Current layer")).size(10).style(muted),
-                crate::ui::dropdown_list::pick_list(Some(state.current_layer.clone()), layer_names, |value| {
-                    value.to_string()
-                },)
+                crate::ui::dropdown_list::pick_list(
+                    Some(state.current_layer.clone()),
+                    layer_names,
+                    |value| { value.to_string() },
+                )
                 .on_select(Message::LayerStateEditorCurrentLayer)
                 .text_size(11)
                 .padding([3, 6])
@@ -636,10 +641,10 @@ mod borrowed_linetypes_tests {
 
     #[test]
     fn view_editor_accepts_shared_linetypes() {
-        let state = codec::LayerState {
+        let state = document::LayerState {
             name: String::new(),
             description: String::new(),
-            mask: codec::LayerStateMask::default(),
+            mask: document::LayerStateMask::default(),
             hidden: false,
             current_layer: String::new(),
             layers: Vec::new(),

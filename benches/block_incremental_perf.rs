@@ -1,0 +1,259 @@
+//! OpenCADStudio incremental block-invalidation benchmark suite.
+//!
+//! Measures end-to-end app update + next-frame `Scene::entity_wires()` rebuild
+//! across paths targeted by scoped block invalidation:
+//! 1. `undo_redo_block_def`: undo + redo of a block-definition entity edit
+//! 2. `undo_redo_vis_state`: undo + redo of a block `visibility_states` switch
+//! 3. `show_visibility_state`: interactive BEDIT `show_visibility_state` switch
+//! 4. `dynamic_action_eval`: interactive dynamic-block stretch parameter commit
+//! 5. `prop_edit_in_block`: `invalidate_property_targets_or_blocks` on a block member
+//! 6. `bedit_save`: `save_block_edit` inside BEDIT on a block with many other blocks
+//! 7. `find_replace_text`: `find_replace_all` replacing top-level + block text
+//! 8. `battman_apply`: `BATTMAN` tag rename + attribute sync
+//! 9. `bcycleorder_apply`: `BCYCLEORDER` grip cycling apply inside BEDIT
+//! 10. `define_block_owned`: `Scene::define_block_from_owned_entities`
+//! 11. `redefine_block`: `Scene::define_block_raw` replacing an existing block
+//! 12. `rename_block`: `block_service::rename`
+//! 13. `delete_block`: `block_service::delete`
+//! 14. `laydel_in_block`: `LAYDEL` erasing entities inside a block definition
+//! 15. `update_block_member`: `Scene::update_entity` on a block member entity
+//! 16. `paste_new_block`: `finalize_paste` bringing in an unseen block definition
+//! 17. `toggle_visibility_reveal`: `Scene::set_block_visibility_reveal` in BEDIT
+//! 18. `toggle_construction_shown`: `Scene::set_construction_shown` in BEDIT
+//!
+//! Run: `cargo bench --bench block_incremental_perf`
+
+use std::hint::black_box;
+use std::time::Instant;
+
+use OpenCADStudio::app::BlockBenchHarness;
+
+const BACKGROUND_LINES: usize = 10_000;
+const OTHER_BLOCKS: usize = 40;
+const ENTITIES_PER_BLOCK: usize = 25;
+const RUNS: usize = 5;
+const ITERATIONS: usize = 5;
+const WARMUP: usize = 2;
+
+fn report(name: &str, samples_ns: &[u64], sink: usize) {
+    let mut sorted = samples_ns.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    println!(
+        "{name:<26} median={:.3} ms  min={:.3} ms  max={:.3} ms  (sink={sink})",
+        median as f64 / 1_000_000.0,
+        min as f64 / 1_000_000.0,
+        max as f64 / 1_000_000.0,
+    );
+}
+
+fn bench_op(name: &str, mut f: impl FnMut(usize) -> usize) {
+    let mut sink = 0usize;
+    for i in 0..WARMUP {
+        sink = sink.wrapping_add(f(i));
+    }
+    let mut samples = Vec::with_capacity(RUNS);
+    for r in 0..RUNS {
+        let start = Instant::now();
+        for it in 0..ITERATIONS {
+            sink = sink.wrapping_add(f(black_box(r * ITERATIONS + it)));
+        }
+        samples.push((start.elapsed().as_nanos() / ITERATIONS as u128) as u64);
+    }
+    report(name, &samples, sink);
+}
+
+fn run() {
+    println!(
+        "Block incremental perf bench (bg_lines={BACKGROUND_LINES}, other_blocks={OTHER_BLOCKS}x{ENTITIES_PER_BLOCK})"
+    );
+
+    let mut undo_app = BlockBenchHarness::setup_block_edit_undo(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("undo_redo_block_def", |_| undo_app.undo_redo_cycle());
+
+    let (mut vis_app, vis_def, vis_param) = BlockBenchHarness::setup_visibility(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("undo_redo_vis_state", |_| vis_app.undo_redo_cycle());
+    bench_op("show_visibility_state", |step| {
+        vis_app.show_visibility_state(vis_def, vis_param, step % 2)
+    });
+
+    let (mut action_app, insert, action_def, stretch_param) =
+        BlockBenchHarness::setup_dynamic_action(
+            BACKGROUND_LINES,
+            OTHER_BLOCKS,
+            ENTITIES_PER_BLOCK,
+        );
+    bench_op("dynamic_action_eval", |step| {
+        let x = 11.0 + ((step % 10) as f64) * 0.5;
+        action_app.evaluate_dynamic_action(insert, action_def, stretch_param, x)
+    });
+
+    let (mut prop_app, prop_member) = BlockBenchHarness::setup_block_prop_edit(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("prop_edit_in_block", |step| {
+        prop_app.prop_edit_in_block(prop_member, step)
+    });
+
+    let (mut bedit_app, bedit_member) = BlockBenchHarness::setup_bedit_save(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("bedit_save", |step| {
+        bedit_app.bedit_save_step(bedit_member, step)
+    });
+
+    let mut find_app = BlockBenchHarness::setup_find_replace(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("find_replace_text", |step| {
+        find_app.find_replace_cycle(step)
+    });
+
+    let mut att_app = BlockBenchHarness::setup_battman(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("battman_apply", |step| att_app.battman_apply(step));
+
+    let mut cycle_app = BlockBenchHarness::setup_bcycleorder(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("bcycleorder_apply", |_| cycle_app.bcycleorder_apply());
+
+    let total_steps = WARMUP + RUNS * ITERATIONS;
+    let mut seq;
+
+    let mut define_app = BlockBenchHarness::setup_background(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    seq = 0;
+    bench_op("define_block_owned", |_| {
+        let s = seq;
+        seq += 1;
+        define_app.define_block_owned_step(s, ENTITIES_PER_BLOCK)
+    });
+
+    let (mut redefine_app, _) = BlockBenchHarness::setup_edit_block(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("redefine_block", |step| {
+        redefine_app.redefine_block_step(step, ENTITIES_PER_BLOCK)
+    });
+
+    let (mut rename_app, _) = BlockBenchHarness::setup_edit_block(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    seq = 0;
+    bench_op("rename_block", |_| {
+        let s = seq;
+        seq += 1;
+        rename_app.rename_block_step(s)
+    });
+
+    let mut delete_app = BlockBenchHarness::setup_delete_blocks(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+        total_steps,
+    );
+    seq = 0;
+    bench_op("delete_block", |_| {
+        let s = seq;
+        seq += 1;
+        delete_app.delete_block_step(s)
+    });
+
+    let mut laydel_app = BlockBenchHarness::setup_laydel_in_block(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+        total_steps,
+    );
+    seq = 0;
+    bench_op("laydel_in_block", |_| {
+        let s = seq;
+        seq += 1;
+        laydel_app.laydel_in_block_step(s)
+    });
+
+    let (mut member_app, edit_member) = BlockBenchHarness::setup_edit_block(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    bench_op("update_block_member", |step| {
+        member_app.update_block_member_step(edit_member, step)
+    });
+
+    let (mut paste_app, paste_snaps) = BlockBenchHarness::setup_paste_new_block(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+        total_steps,
+    );
+    seq = 0;
+    bench_op("paste_new_block", |_| {
+        let s = seq;
+        seq += 1;
+        paste_app.paste_new_block_step(&paste_snaps[s], s)
+    });
+
+    let mut reveal_app = BlockBenchHarness::setup_visibility_reveal(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    seq = 0;
+    bench_op("toggle_visibility_reveal", |_| {
+        let s = seq;
+        seq += 1;
+        reveal_app.toggle_visibility_reveal_step(s)
+    });
+
+    let (mut const_app, const_def) = BlockBenchHarness::setup_construction_shown(
+        BACKGROUND_LINES,
+        OTHER_BLOCKS,
+        ENTITIES_PER_BLOCK,
+    );
+    seq = 0;
+    bench_op("toggle_construction_shown", |_| {
+        let s = seq;
+        seq += 1;
+        const_app.toggle_construction_shown_step(const_def, s)
+    });
+}
+
+fn main() {
+    std::thread::Builder::new()
+        .name("block_incremental_perf".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn bench thread")
+        .join()
+        .expect("bench thread panicked");
+}

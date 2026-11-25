@@ -1,6 +1,30 @@
 use super::*;
 
 /// The symbol-kind words `XBIND` accepts.
+/// The source of the reference named `name`, resolved against `base_dir`;
+/// `Err` keeps the message honest for the command line.
+fn xref_source_path(
+    doc: &document::Document,
+    name: &str,
+    base_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let Some(record) = doc.block_records.get(name) else {
+        return Err(format!("XOPEN: no definition for \"{name}\"."));
+    };
+    if !record.flags.is_xref && !record.flags.is_xref_overlay {
+        return Err("XOPEN: select an external reference (xref) to open.".to_string());
+    }
+    let raw = &record.xref_path;
+    if raw.is_empty() {
+        return Err(format!(
+            "XOPEN: \"{}\" is not a reference to a file.",
+            record.name
+        ));
+    }
+    crate::io::xref::resolve_path(raw, base_dir)
+        .ok_or_else(|| format!("XOPEN: cannot find \"{raw}\". The reference is missing."))
+}
+
 fn xbind_kind(word: &str) -> Option<crate::io::xref::XbindKind> {
     use crate::io::xref::XbindKind;
     match word.to_ascii_uppercase().as_str() {
@@ -21,6 +45,16 @@ impl OpenCADStudio {
             crate::io::xref::XrefStatus::Loaded => {
                 self.command_line
                     .push_output(crate::tf!("XREF  Reloaded \"{}\"", info.name).as_ref());
+                if info.other_drawing {
+                    self.command_line.push_warning(
+                        crate::tf!(
+                            "XREF  \"{}\" now loads a different drawing ({})",
+                            info.name,
+                            info.path
+                        )
+                        .as_ref(),
+                    );
+                }
             }
             crate::io::xref::XrefStatus::Recovered => {
                 self.command_line.push_error(
@@ -49,9 +83,10 @@ impl OpenCADStudio {
     pub(in crate::app) fn copy_svg_to_system_clipboard(
         &self,
         i: usize,
-        handles: &[codec::Handle],
+        handles: &[document::Handle],
     ) -> Task<Message> {
-        let Some(svg) = crate::io::svg_clipboard::selection_svg(&self.tabs[i].scene, handles) else {
+        let strokes = crate::io::svg_clipboard::selection_strokes(&self.tabs[i].scene, handles);
+        let Some(svg) = crate::io::svg_clipboard::strokes_svg(&strokes) else {
             return Task::none();
         };
         #[cfg(target_arch = "wasm32")]
@@ -61,14 +96,22 @@ impl OpenCADStudio {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            iced::clipboard::write(svg).discard()
+            // Where the platform has a registered SVG format, the markup
+            // goes there as well as text, in one write; drawing programs
+            // read it from there (#2018); on Windows a metafile goes with it
+            // (#3431). Elsewhere the toolkit writes text.
+            if crate::sys::clipboard_svg::write(&svg, &strokes) {
+                Task::none()
+            } else {
+                iced::clipboard::write(svg).discard()
+            }
         }
     }
 
     pub(in crate::app) fn copy_entities_to_clipboard(
         &mut self,
         i: usize,
-        handles: &[codec::Handle],
+        handles: &[document::Handle],
         base: glam::DVec3,
     ) -> usize {
         // Clone + dep-capture live in the shared kernel; storage stays here.
@@ -80,6 +123,7 @@ impl OpenCADStudio {
         self.clipboard_base = base;
         self.clipboard = entities;
         self.clipboard_deps = deps;
+        self.clipboard_source_tab = self.tabs.get(i).map(|tab| tab.id);
         count
     }
 
@@ -140,23 +184,33 @@ impl OpenCADStudio {
         }
     }
 
-    /// PASTESPEC with the formats on hand: the copied objects, and `text`
-    /// from the system clipboard once it has been read.
+    /// PASTESPEC with the formats on hand: the copied objects, and `text`,
+    /// `link` and `picture` from the system clipboard once it has been read.
+    /// Text in rows of cells is also a table, in the current table style at
+    /// the column width TABLE uses; `link` names the file those cells were
+    /// copied from.
     pub(in crate::app) fn paste_special_command(
         &self,
         i: usize,
         text: Option<&str>,
+        link: Option<crate::sys::clipboard_link::SourceLink>,
+        picture: Option<crate::io::ole_embed::EmbeddedImage>,
     ) -> Box<dyn CadCommand> {
+        use crate::modules::draw::clipboard::pastespec;
         let document = &self.tabs[i].scene.document;
         let defaults = crate::scene::creation_style::current_text_defaults(document);
-        Box::new(
-            crate::modules::draw::clipboard::pastespec::PasteSpecCommand::new(
-                !self.clipboard.is_empty(),
-                text,
-                defaults.style_name,
-                defaults.height,
-            ),
-        )
+        let table = text
+            .and_then(pastespec::grid_cells)
+            .map(|cells| crate::app::annotation_data::pasted_table(document, &cells));
+        Box::new(pastespec::PasteSpecCommand::new(
+            !self.clipboard.is_empty(),
+            text,
+            table,
+            link,
+            picture,
+            defaults.style_name,
+            defaults.height,
+        ))
     }
 
     /// Draw the selected objects, or else the existing definition the name
@@ -181,7 +235,7 @@ impl OpenCADStudio {
                 match scene.document.get_entity(*handle) {
                     // A reference is drawn from its definition, placed by the
                     // reference's transform.
-                    Some(codec::EntityType::Insert(insert)) => {
+                    Some(document::EntityType::Insert(insert)) => {
                         let base = crate::scene::render_graph::block_base_point(
                             &scene.document,
                             &insert.block_name,
@@ -191,7 +245,7 @@ impl OpenCADStudio {
                         for mut wire in scene.block_preview_wires(&insert.block_name) {
                             for p in &mut wire.points {
                                 if p.iter().all(|v| v.is_finite()) {
-                                    let q = xform.apply(codec::types::Vector3::new(
+                                    let q = xform.apply(document::types::Vector3::new(
                                         f64::from(p[0]),
                                         f64::from(p[1]),
                                         f64::from(p[2]),
@@ -226,13 +280,13 @@ impl OpenCADStudio {
                     self.tabs[i].active_cmd = Some(Box::new(c));
                 } else {
                     let nums: Vec<f64> = rest
-                        .split(|ch| ch == ' ' || ch == ',')
+                        .split([' ', ','])
                         .filter(|s| !s.is_empty())
                         .filter_map(|s| s.parse::<f64>().ok())
                         .collect();
                     if nums.len() >= 2 {
                         let z = nums.get(2).copied().unwrap_or(0.0);
-                        let pt = codec::types::Vector3::new(nums[0], nums[1], z);
+                        let pt = document::types::Vector3::new(nums[0], nums[1], z);
                         let is_paper = self.tabs[i].scene.current_layout != "Model";
                         self.push_undo_snapshot(i, "BASE");
                         if is_paper {
@@ -414,7 +468,7 @@ impl OpenCADStudio {
             // Block Editor; every item follows when it is saved.
             cmd if cmd.starts_with("ARRAYEDIT_SOURCE:") => {
                 let handle =
-                    codec::Handle::new(cmd["ARRAYEDIT_SOURCE:".len()..].parse().unwrap_or(0));
+                    document::Handle::new(cmd["ARRAYEDIT_SOURCE:".len()..].parse().unwrap_or(0));
                 let document = &self.tabs[i].scene.document;
                 let source = crate::scene::assoc_array::array_of_insert(document, handle).and_then(
                     |array| {
@@ -442,7 +496,7 @@ impl OpenCADStudio {
             cmd if cmd.starts_with("ARRAYEDIT_ITEM:") => {
                 use crate::scene::assoc_array::{self, ItemEdit};
                 let mut parts = cmd["ARRAYEDIT_ITEM:".len()..].split(':');
-                let handle = codec::Handle::new(parts.next()?.parse().unwrap_or(0));
+                let handle = document::Handle::new(parts.next()?.parse().unwrap_or(0));
                 let op = parts.next().unwrap_or("");
                 let points: Vec<glam::DVec3> = parts
                     .filter_map(|p| {
@@ -450,7 +504,8 @@ impl OpenCADStudio {
                         (v.len() == 3).then(|| glam::DVec3::new(v[0], v[1], v[2]))
                     })
                     .collect();
-                let Some(array) = assoc_array::array_of_insert(&self.tabs[i].scene.document, handle)
+                let Some(array) =
+                    assoc_array::array_of_insert(&self.tabs[i].scene.document, handle)
                 else {
                     self.command_line.push_error(
                         crate::t!("ARRAYEDIT: the selected object is not an associative array.")
@@ -458,9 +513,9 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 };
-                let location = points
-                    .first()
-                    .and_then(|p| assoc_array::nearest_item(&self.tabs[i].scene.document, &array, *p));
+                let location = points.first().and_then(|p| {
+                    assoc_array::nearest_item(&self.tabs[i].scene.document, &array, *p)
+                });
                 self.push_undo_snapshot(i, "ARRAYEDIT");
                 let scene = &mut self.tabs[i].scene;
                 let result = match (op, location, points.get(1)) {
@@ -484,15 +539,19 @@ impl OpenCADStudio {
             }
 
             // PASTESPEC — offer the copied objects now; the system clipboard's
-            // text joins the formats once read (Message::PasteSpecial).
+            // text and picture join the formats once read
+            // (Message::PasteSpecial), and the prompt that lists them is
+            // shown then.
             "PASTESPEC" => {
-                let command = self.paste_special_command(i, None);
-                let started = self.start_count_command(i, command);
-                #[cfg(target_arch = "wasm32")]
-                let read = Task::perform(crate::sys::read_clipboard_text(), Message::PasteSpecial);
-                #[cfg(not(target_arch = "wasm32"))]
-                let read = iced::clipboard::read_text()
-                    .map(|result| Message::PasteSpecial(result.ok().map(|text| (*text).clone())));
+                let command = crate::modules::draw::clipboard::pastespec::PasteSpecCommand::reading(
+                    !self.clipboard.is_empty(),
+                );
+                self.reset_command_start_state(i);
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                self.push_ucs_to_cmd(i);
+                self.sync_dyn_fields();
+                let started = self.focus_cmd_input();
+                let read = self.read_system_clipboard_formats();
                 return Some(Task::batch([started, read]));
             }
 
@@ -550,9 +609,9 @@ impl OpenCADStudio {
                     }
                     match self.tabs[i]
                         .scene
-                        .define_block_from_owned_entities(entities, &name, base)
+                        .define_block_from_owned_entities_unbumped(entities, &name, base)
                     {
-                        Ok(entity_handles) => {
+                        Ok((br_handle, entity_handles)) => {
                             let remaps: Vec<_> = ext_roots
                                 .iter()
                                 .filter_map(|(&idx, &root)| {
@@ -577,12 +636,21 @@ impl OpenCADStudio {
                                     -base,
                                 );
                             }
-                            scene.bump_geometry();
+                            let changes: Vec<(document::Handle, crate::scene::ChangeKind)> =
+                                entity_handles
+                                    .iter()
+                                    .copied()
+                                    .map(|h| (h, crate::scene::ChangeKind::Added))
+                                    .collect();
+                            scene.bump_entities_restyled_with_block_deps(
+                                &changes,
+                                &[br_handle],
+                                std::slice::from_ref(&name),
+                            );
                             // Block defined; now place it interactively so the
                             // user picks the drop point (insertion uses the
                             // clipboard lower-left corner as the block's base). The
                             // clipboard wires rubber-band under the cursor.
-                            self.tabs[i].scene.populate_meshes_from_document();
                             self.tabs[i].dirty = true;
                             let wires = self.tabs[i].scene.wires_for_entities(&self.clipboard);
                             use crate::modules::insert::insert_block::InsertBlockCommand;
@@ -797,34 +865,9 @@ impl OpenCADStudio {
                 }
             }
 
-            // ADCENTER / CONTENTBROWSER — report the drawing's named content
-            // (blocks and layers) from the command line in place of the browser
-            // panel.
-            "ADCENTER" | "CONTENTBROWSER" => {
-                let blocks = self.tabs[i].scene.custom_block_names();
-                let layers: Vec<String> = self.tabs[i]
-                    .scene
-                    .document
-                    .layers
-                    .names()
-                    .map(|s| s.to_string())
-                    .collect();
-                self.command_line.push_output(
-                    crate::tf!(
-                        "Blocks ({}): {}",
-                        blocks.len(),
-                        if blocks.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            blocks.join(", ")
-                        }
-                    )
-                    .as_ref(),
-                );
-                self.command_line.push_output(
-                    crate::tf!("Layers ({}): {}", layers.len(), layers.join(", ")).as_ref(),
-                );
-            }
+            // ADCENTER / CONTENTBROWSER — browse another drawing's named
+            // content and add it to this one.
+            "ADCENTER" | "CONTENTBROWSER" => self.open_design_center(),
 
             // BLOCKSPALETTE opens the Blocks palette; BLOCKSPALETTECLOSE
             // closes it. `_BLOCKSPALETTE <tab>` opens it on a tab.
@@ -889,9 +932,9 @@ impl OpenCADStudio {
             "PDFCLIP" | "DWFCLIP" | "DGNCLIP" => {
                 use crate::command::CadCommand;
                 let kind = match cmd {
-                    "DWFCLIP" => codec::entities::UnderlayType::Dwf,
-                    "DGNCLIP" => codec::entities::UnderlayType::Dgn,
-                    _ => codec::entities::UnderlayType::Pdf,
+                    "DWFCLIP" => document::entities::UnderlayType::Dwf,
+                    "DGNCLIP" => document::entities::UnderlayType::Dgn,
+                    _ => document::entities::UnderlayType::Pdf,
                 };
                 let command = crate::modules::insert::pdf_clip::PdfClipCommand::for_kind(kind);
                 self.command_line.push_info(&command.prompt());
@@ -931,11 +974,11 @@ impl OpenCADStudio {
             "XCLIP" => {
                 use crate::command::CadCommand;
                 use crate::modules::insert::xclip::XclipCommand;
-                let inserts: Vec<codec::Handle> = self.tabs[i]
+                let inserts: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
-                    .filter(|(_, e)| matches!(e, codec::EntityType::Insert(_)))
+                    .filter(|(_, e)| matches!(e, document::EntityType::Insert(_)))
                     .map(|(h, _)| *h)
                     .collect();
                 let command = if inserts.is_empty() {
@@ -975,7 +1018,7 @@ impl OpenCADStudio {
                     if let Some(crate::command::CmdResult::ReportError(message)) =
                         command.on_text_input(rest)
                     {
-                        self.command_line.push_error(&message);
+                        self.command_line.push_rejection(&message);
                     }
                 }
                 self.command_line.push_info(&command.prompt());
@@ -1139,7 +1182,8 @@ impl OpenCADStudio {
                     return Some(self.finish_dispatch(cmd));
                 }
                 if matched.len() > 1 {
-                    let names: Vec<&str> = matched.iter().map(|entry| entry.name.as_str()).collect();
+                    let names: Vec<&str> =
+                        matched.iter().map(|entry| entry.name.as_str()).collect();
                     self.command_line.push_error(
                         crate::tf!(
                             "XBIND: '{}' matches more than one reference ({}).",
@@ -1160,10 +1204,7 @@ impl OpenCADStudio {
                         continue;
                     }
                     match kind {
-                        Some(kind) => requests.push((
-                            kind,
-                            word.trim_matches('"').to_string(),
-                        )),
+                        Some(kind) => requests.push((kind, word.trim_matches('"').to_string())),
                         None => {
                             parse_error = Some(word.to_string());
                             break;
@@ -1259,8 +1300,8 @@ impl OpenCADStudio {
                 // (modern CAD opens the palette on `XREF`); bare `XREF` keeps
                 // this repo's legacy list output for compatibility.
                 let rest = cmd
-                    .splitn(2, char::is_whitespace)
-                    .nth(1)
+                    .split_once(char::is_whitespace)
+                    .map(|x| x.1)
                     .unwrap_or("")
                     .trim();
                 let mut parts = rest.split_whitespace();
@@ -1273,23 +1314,11 @@ impl OpenCADStudio {
                     return Some(self.finish_dispatch(cmd));
                 }
                 if op.is_empty() || op == "?" {
-                    // List every reference via collect_entries_with_prev. The
-                    // base dir is the drawing's parent (or "." unsaved); the
-                    // tab's session sets keep CLI and palette in agreement.
-                    // Header lines stay byte-identical to the legacy listing;
-                    // each entry line gains an " [Attach]" / " [Overlay]"
-                    // type suffix.
-                    let base_dir: std::path::PathBuf = self.tabs[i]
-                        .current_path
-                        .as_ref()
-                        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let entries = crate::io::xref::collect_entries_with_prev(
-                        &self.tabs[i].scene.document,
-                        &base_dir,
-                        self.tabs[i].xref_unloaded.as_set(),
-                        &self.tabs[i].xref_stat_cache.0,
-                    );
+                    // List every reference with the live status the
+                    // Reference Manager shows. The refresh also rebuilds the
+                    // automation report, so `state.xrefs` answers a status
+                    // query with the same rows.
+                    let entries = self.refresh_xref_report(i);
                     if entries.is_empty() {
                         self.command_line.push_output(
                             crate::t!("XREF  No external references in this drawing.").as_ref(),
@@ -1307,8 +1336,38 @@ impl OpenCADStudio {
                                 crate::io::xref_model::RefType::Overlay => " [Overlay]",
                                 crate::io::xref_model::RefType::Attach => " [Attach]",
                             };
-                            self.command_line
-                                .push_output(&format!("  {} — {}{}", entry.name, path, suffix));
+                            self.command_line.push_output(&format!(
+                                "  {} — {}{} [{}]",
+                                entry.name,
+                                path,
+                                suffix,
+                                crate::ui::window::xref_manager::status_text(entry.status)
+                            ));
+                        }
+                        // A reference whose source is gone, or changed since
+                        // it was loaded, is the one thing the author must not
+                        // miss; the palette shows the same two states.
+                        let missing = entries
+                            .iter()
+                            .filter(|e| e.status == crate::io::xref_model::RefStatus::NotFound)
+                            .count();
+                        let stale = entries
+                            .iter()
+                            .filter(|e| e.status == crate::io::xref_model::RefStatus::Stale)
+                            .count();
+                        if missing > 0 {
+                            self.command_line.push_output(
+                                crate::tf!("XREF  {} reference(s) not found.", missing).as_ref(),
+                            );
+                        }
+                        if stale > 0 {
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "XREF  {} reference(s) stale — the source changed since it was loaded.",
+                                    stale
+                                )
+                                .as_ref(),
+                            );
                         }
                     }
                 } else if op.eq_ignore_ascii_case("Reload") {
@@ -1348,6 +1407,7 @@ impl OpenCADStudio {
                             // Reloaded keys leave the session-unloaded set
                             // (so the listing agrees) with fresh stat
                             // baselines on the next palette refresh.
+                            let mut image_keys: Vec<u64> = Vec::new();
                             let reload_keys: Vec<u64> = {
                                 let entries = crate::io::xref::collect_entries_with_prev(
                                     &self.tabs[i].scene.document,
@@ -1373,6 +1433,8 @@ impl OpenCADStudio {
                                             "XREF: cannot reload nested reference '{}'. Reload it in its host drawing.",
                                             e.name
                                         ).as_ref());
+                                    } else if e.kind == crate::io::xref_model::RefKind::Image {
+                                        image_keys.push(e.key);
                                     } else if e.kind != crate::io::xref_model::RefKind::DwgXref {
                                         self.command_line.push_error(
                                             crate::tf!(
@@ -1392,6 +1454,9 @@ impl OpenCADStudio {
                             // return before snapshot + resolve so no empty
                             // undo entry is pushed and no spurious
                             // no-match error follows the per-entry reports.
+                            if !image_keys.is_empty() {
+                                self.reload_image_refs(i, &image_keys);
+                            }
                             if reload_keys.is_empty() && !pattern.is_empty() && pattern != "*" {
                                 return Some(self.finish_dispatch(cmd));
                             }
@@ -1400,7 +1465,8 @@ impl OpenCADStudio {
                                 self.tabs[i].xref_unloaded.remove(key);
                                 self.tabs[i].xref_stat_cache.remove(key);
                             }
-                            let handles: rustc_hash::FxHashSet<codec::types::Handle> = self.tabs[i]
+                            let handles: rustc_hash::FxHashSet<document::types::Handle> = self.tabs
+                                [i]
                                 .scene
                                 .document
                                 .block_records
@@ -1408,10 +1474,12 @@ impl OpenCADStudio {
                                 .filter(|br| reload_keys.contains(&br.handle.value()))
                                 .map(|br| br.handle)
                                 .collect();
-                            let infos = crate::io::xref::resolve_xrefs_for_keys(
+                            let xref_session = self.tabs[i].ifccad_session.clone();
+                            let infos = crate::io::xref::resolve_xrefs_for_keys_in_session(
                                 &mut self.tabs[i].scene.document,
                                 base_dir,
                                 &handles,
+                                xref_session.as_ref(),
                             );
                             // Targeted reload updates only the selected rows.
                             {
@@ -1592,7 +1660,7 @@ impl OpenCADStudio {
                             // Find the exact token index for old to avoid substring
                             // contamination (e.g. "in" matching inside "Find").
                             if let Some(idx) =
-                                toks.iter().position(|t| t.eq_ignore_ascii_case(&toks[1]))
+                                toks.iter().position(|t| t.eq_ignore_ascii_case(toks[1]))
                             {
                                 let pos = after_op.find(toks[idx]).unwrap_or(0) + toks[idx].len();
                                 (toks[idx].to_string(), after_op[pos..].trim().to_string())
@@ -1905,7 +1973,7 @@ impl OpenCADStudio {
                     if after.is_empty() {
                         return Some(Task::done(Message::XAttachPick));
                     }
-                    self.start_xref_attach(
+                    return Some(self.start_xref_attach(
                         i,
                         crate::modules::insert::xattach::XrefAttachRequest {
                             path: after.trim_matches('"').to_string(),
@@ -1914,7 +1982,7 @@ impl OpenCADStudio {
                         },
                         crate::modules::insert::xattach::XrefPlacement::on_screen(),
                         "-XREF",
-                    );
+                    ));
                 } else {
                     self.command_line.push_error(crate::tf!(
                         "XREF: unknown option '{}'. Options: ? Reload Unload Detach Path Pathtype Bind Overlay Attach",
@@ -1956,7 +2024,7 @@ impl OpenCADStudio {
                         }
                         let infos = crate::io::xref::resolve_xrefs(
                             &mut self.tabs[i].scene.document,
-                            &base_dir,
+                            base_dir,
                         );
                         // `resolve_xrefs` re-merges ALL references — refresh stat
                         // baselines for every currently-Loaded entry so no row
@@ -1999,33 +2067,111 @@ impl OpenCADStudio {
             }
 
             // XOPEN — open the source file of the selected external reference in
-            // a new tab (reuses the existence-checked OpenRecent path).
+            // a new tab (reuses the existence-checked OpenRecent path). With
+            // nothing selected it asks to pick one under the point.
             "XOPEN" => {
-                let names: Vec<String> = self.tabs[i]
+                let base_dir = self.tabs[i]
+                    .current_path
+                    .as_deref()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let selected: Vec<(document::Handle, document::EntityType)> = self.tabs[i]
                     .scene
                     .selected_entities()
-                    .iter()
-                    .filter_map(|(_, e)| match e {
-                        codec::EntityType::Insert(ins) => Some(ins.block_name.clone()),
+                    .into_iter()
+                    .map(|(handle, entity)| (handle, entity.clone()))
+                    .collect();
+                let had_selection = !selected.is_empty();
+                if let Some((_, document::EntityType::Insert(insert))) = selected
+                    .into_iter()
+                    .find(|(_, e)| matches!(e, document::EntityType::Insert(_)))
+                {
+                    return Some(
+                        match xref_source_path(
+                            &self.tabs[i].scene.document,
+                            &insert.block_name,
+                            &base_dir,
+                        ) {
+                            Ok(path) => {
+                                self.command_line.push_output(
+                                    crate::tf!("XOPEN: opening \"{}\".", path.display()).as_ref(),
+                                );
+                                Task::done(Message::OpenRecent(path))
+                            }
+                            Err(message) => {
+                                self.command_line.push_error(&message);
+                                self.finish_dispatch(cmd)
+                            }
+                        },
+                    );
+                }
+                if had_selection {
+                    self.command_line.push_error(
+                        crate::t!("XOPEN: select an external reference (xref) to open.").as_ref(),
+                    );
+                    return Some(self.finish_dispatch(cmd));
+                }
+                let references: std::collections::HashSet<document::Handle> = self.tabs[i]
+                    .scene
+                    .document
+                    .entities()
+                    .filter_map(|entity| match entity {
+                        document::EntityType::Insert(insert) => self.tabs[i]
+                            .scene
+                            .document
+                            .block_records
+                            .get(&insert.block_name)
+                            .filter(|record| record.flags.is_xref || record.flags.is_xref_overlay)
+                            .map(|_| insert.common.handle),
                         _ => None,
                     })
                     .collect();
-                let path = names.iter().find_map(|bn| {
-                    let br = self.tabs[i].scene.document.block_records.get(bn)?;
-                    if br.xref_path.is_empty() {
-                        None
-                    } else {
-                        Some(br.xref_path.clone())
+                use crate::command::CadCommand;
+                let command = crate::modules::insert::xref_cmd::XOpenPickCommand::new(references);
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                return Some(Task::none());
+            }
+
+            cmd if cmd.starts_with("XOPEN_PICK:") => {
+                let value = cmd.trim_start_matches("XOPEN_PICK:").trim();
+                let handle = document::Handle::new(
+                    value
+                        .parse::<u64>()
+                        .or_else(|_| u64::from_str_radix(value, 16))
+                        .unwrap_or(0),
+                );
+                let base_dir = self.tabs[i]
+                    .current_path
+                    .as_deref()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let insert = match self.tabs[i].scene.document.get_entity(handle) {
+                    Some(document::EntityType::Insert(insert)) => insert,
+                    _ => {
+                        self.command_line
+                            .push_error(crate::t!("XOPEN: the reference is gone.").as_ref());
+                        return Some(self.finish_dispatch(cmd));
                     }
-                });
-                match path {
-                    Some(p) => {
-                        return Some(Task::done(Message::OpenRecent(std::path::PathBuf::from(p))))
-                    }
-                    None => self.command_line.push_error(
-                        crate::t!("XOPEN: select an external reference (xref) to open.").as_ref(),
-                    ),
-                }
+                };
+                return Some(
+                    match xref_source_path(
+                        &self.tabs[i].scene.document,
+                        &insert.block_name,
+                        &base_dir,
+                    ) {
+                        Ok(path) => {
+                            self.command_line.push_output(
+                                crate::tf!("XOPEN: opening \"{}\".", path.display()).as_ref(),
+                            );
+                            Task::done(Message::OpenRecent(path))
+                        }
+                        Err(message) => {
+                            self.command_line.push_error(&message);
+                            self.finish_dispatch(cmd)
+                        }
+                    },
+                );
             }
 
             "NCOPY" | "NCOPYALL" => {
@@ -2091,11 +2237,13 @@ mod tests {
         app.tabs[i].scene.document.header.linear_unit_precision = 2;
         app.tabs[i].scene.define_block_raw(
             "PRE_BASE",
-            codec::Vector3::new(10.0, 5.0, 0.0),
-            vec![codec::EntityType::Line(codec::entities::Line::from_points(
-                codec::Vector3::new(10.0, 5.0, 0.0),
-                codec::Vector3::new(30.0, 5.0, 0.0),
-            ))],
+            document::Vector3::new(10.0, 5.0, 0.0),
+            vec![document::EntityType::Line(
+                document::entities::Line::from_points(
+                    document::Vector3::new(10.0, 5.0, 0.0),
+                    document::Vector3::new(30.0, 5.0, 0.0),
+                ),
+            )],
         );
         let _ = app.run_command_line("BLOCK");
         let state = app
@@ -2148,13 +2296,13 @@ mod tests {
     }
 
     fn define_line_block(app: &mut OpenCADStudio, tab: usize, name: &str) {
-        let mut line = codec::entities::Line::new();
-        line.start = codec::types::Vector3::ZERO;
-        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.start = document::types::Vector3::ZERO;
+        line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[tab]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 name,
                 glam::DVec3::ZERO,
             )
@@ -2175,7 +2323,7 @@ mod tests {
         define_line_block(&mut app, first, "ALPHA");
         app.record_block_insert("ALPHA");
         app.tabs
-            .push(crate::app::document::DocumentTab::new_drawing(2));
+            .push(crate::app::tab_document::DocumentTab::new_drawing(2));
         app.active_tab = 1;
         define_line_block(&mut app, 1, "BETA");
         app.record_block_insert("BETA");
@@ -2232,6 +2380,67 @@ mod tests {
         assert!(out.contains("Enter block name or [?]:"), "{out}");
     }
 
+    /// A drawing named at -INSERT's block prompt comes in at the scale its
+    /// INSUNITS asks for against the host's, as an XREF of it does: a 10 m
+    /// line in a millimetre drawing is 10,000 mm long. (#3474)
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn insert_of_a_drawing_file_converts_its_units() {
+        const MILLIMETERS: i16 = 4;
+        let cases = [
+            ("metres", 6, 1000.0),
+            ("feet", 2, 304.8),
+            ("inches", 1, 25.4),
+            ("millimetres", MILLIMETERS, 1.0),
+            ("unitless", 0, 1.0),
+        ];
+        let mut scales = Vec::new();
+        for (name, units, _) in cases {
+            let mut source = fresh_app();
+            let s = source.active_tab;
+            let mut line = document::entities::Line::new();
+            line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
+            source.tabs[s]
+                .scene
+                .add_entity(document::EntityType::Line(line));
+            source.tabs[s].scene.document.header.insertion_units = units;
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let path = dir.path().join(format!("{name}.dwg"));
+            crate::io::save(&source.tabs[s].scene.document, &path).expect("write the source drawing");
+
+            let mut app = fresh_app();
+            let i = app.active_tab;
+            app.tabs[i].scene.document.header.insertion_units = MILLIMETERS;
+            let _ = app.run_command_line(&format!("-INSERT {} 0,0 1 1 0", path.display()));
+            let transcript = app
+                .command_line
+                .history
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let scale = app.tabs[i]
+                .scene
+                .document
+                .entities()
+                .find_map(|entity| match entity {
+                    document::EntityType::Insert(insert) => Some(insert.x_scale()),
+                    _ => None,
+                });
+            scales.push((name, scale, transcript));
+        }
+        for ((name, _, expected), (_, scale, transcript)) in cases.iter().zip(&scales) {
+            let scale =
+                scale.unwrap_or_else(|| panic!("{name}: no block reference was inserted: {transcript}"));
+            assert!(
+                (scale - expected).abs() < 1e-9,
+                "{name} drawing inserted into a millimetre drawing at scale {scale}, expected \
+                 {expected}; all scales: {:?}",
+                scales.iter().map(|(n, s, _)| (n, s)).collect::<Vec<_>>()
+            );
+        }
+    }
+
     // ATTMAN and BATTMAN open the Block Attribute Manager. A drawing without
     // attributed blocks has nothing to manage, which both report instead of
     // opening it.
@@ -2268,13 +2477,13 @@ mod tests {
         let mut app = fresh_app();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut line = codec::entities::Line::new();
-        line.start = codec::types::Vector3::ZERO;
-        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.start = document::types::Vector3::ZERO;
+        line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -2293,13 +2502,13 @@ mod tests {
         app.refresh_block_palette();
         assert!(app.block_palette.blocks.is_empty());
         let i = app.active_tab;
-        let mut line = codec::entities::Line::new();
-        line.start = codec::types::Vector3::ZERO;
-        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.start = document::types::Vector3::ZERO;
+        line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -2313,12 +2522,12 @@ mod tests {
         let mut app = fresh_app();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut line = codec::entities::Line::new();
-        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -2344,21 +2553,29 @@ mod tests {
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
         let line = |x: f64| {
-            let mut line = codec::entities::Line::new();
-            line.end = codec::types::Vector3::new(x, 0.0, 0.0);
-            codec::EntityType::Line(line)
+            let mut line = document::entities::Line::new();
+            line.end = document::types::Vector3::new(x, 0.0, 0.0);
+            document::EntityType::Line(line)
         };
         let insert = |name: &str| {
-            codec::EntityType::Insert(codec::entities::Insert::new(
+            document::EntityType::Insert(document::entities::Insert::new(
                 name.to_string(),
-                codec::types::Vector3::ZERO,
+                document::types::Vector3::ZERO,
             ))
         };
         let scene = &mut app.tabs[i].scene;
-        scene.define_block_raw("Part", codec::types::Vector3::ZERO, vec![line(1.0)]);
-        scene.define_block_raw("Holder", codec::types::Vector3::ZERO, vec![insert("Part")]);
-        scene.define_block_raw("Outer", codec::types::Vector3::ZERO, vec![insert("Holder")]);
-        scene.define_block_raw("Other", codec::types::Vector3::ZERO, vec![line(2.0)]);
+        scene.define_block_raw("Part", document::types::Vector3::ZERO, vec![line(1.0)]);
+        scene.define_block_raw(
+            "Holder",
+            document::types::Vector3::ZERO,
+            vec![insert("Part")],
+        );
+        scene.define_block_raw(
+            "Outer",
+            document::types::Vector3::ZERO,
+            vec![insert("Holder")],
+        );
+        scene.define_block_raw("Other", document::types::Vector3::ZERO, vec![line(2.0)]);
         app.refresh_block_palette();
         let preview = |app: &crate::app::OpenCADStudio, name: &str| {
             Rc::clone(&app.block_palette.current_entry(name).unwrap().preview)
@@ -2387,7 +2604,7 @@ mod tests {
         let fresh = !app.block_palette_stale();
         app.tabs[i]
             .scene
-            .redefine_block_raw("Part", codec::types::Vector3::ZERO, vec![line(5.0)])
+            .redefine_block_raw("Part", document::types::Vector3::ZERO, vec![line(5.0)])
             .unwrap();
         app.note_block_changes(fresh, ["Part"]);
         app.refresh_block_palette();
@@ -2427,12 +2644,12 @@ mod tests {
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
         for k in 0..300 {
-            let mut line = codec::entities::Line::new();
-            line.end = codec::types::Vector3::new(1.0 + k as f64, 0.0, 0.0);
+            let mut line = document::entities::Line::new();
+            line.end = document::types::Vector3::new(1.0 + k as f64, 0.0, 0.0);
             app.tabs[i].scene.define_block_raw(
                 &format!("B{k:03}"),
-                codec::types::Vector3::ZERO,
-                vec![codec::EntityType::Line(line)],
+                document::types::Vector3::ZERO,
+                vec![document::EntityType::Line(line)],
             );
         }
         app.show_block_palette = true;
@@ -2488,8 +2705,8 @@ mod tests {
         let define = |app: &mut crate::app::OpenCADStudio, name: &str| {
             app.tabs[i].scene.define_block_raw(
                 name,
-                codec::types::Vector3::ZERO,
-                vec![codec::EntityType::Line(codec::entities::Line::new())],
+                document::types::Vector3::ZERO,
+                vec![document::EntityType::Line(document::entities::Line::new())],
             );
         };
         for k in 0..300 {
@@ -2626,7 +2843,7 @@ mod tests {
 
     fn add_dwg_xref(app: &mut OpenCADStudio, name: &str, saved: &str) {
         let i = app.active_tab;
-        let mut br = codec::tables::BlockRecord::new(name);
+        let mut br = document::tables::BlockRecord::new(name);
         br.flags.is_xref = true;
         br.xref_path = saved.to_string();
         br.handle = app.tabs[i].scene.document.allocate_handle();
@@ -2664,7 +2881,7 @@ mod tests {
 
     #[test]
     fn xref_overlay_on_image_errors() {
-        use codec::objects::{ImageDefinition, ObjectType};
+        use document::objects::{ImageDefinition, ObjectType};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -2676,13 +2893,17 @@ mod tests {
             .objects
             .insert(h, ObjectType::ImageDefinition(def));
         // Reference it so collect_entries lists it.
-        let mut img =
-            codec::entities::RasterImage::new("img.png", codec::types::Vector3::ZERO, 8.0, 8.0);
+        let mut img = document::entities::RasterImage::new(
+            "img.png",
+            document::types::Vector3::ZERO,
+            8.0,
+            8.0,
+        );
         img.definition_handle = Some(h);
         app.tabs[i]
             .scene
             .document
-            .add_entity(codec::EntityType::RasterImage(img))
+            .add_entity(document::EntityType::RasterImage(img))
             .unwrap();
         let out = run_capture(&mut app, "XREF Overlay img.png");
         assert!(
@@ -2692,11 +2913,10 @@ mod tests {
     }
 
     #[test]
-    fn xref_reload_image_keeps_flag_no_spurious_match() {
-        // CLI mirror of the palette F7 guard: reloading an image row reports
-        // the drawing-only error, leaves its unloaded flag untouched, and
-        // does not follow with a spurious no-match error.
-        use codec::objects::{ImageDefinition, ObjectType};
+    fn xref_reload_image_reloads_it_no_spurious_match() {
+        // Reloading an unloaded image row loads it again (#3368) and does not
+        // follow with a spurious no-match error.
+        use document::objects::{ImageDefinition, ObjectType};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -2707,19 +2927,23 @@ mod tests {
             .document
             .objects
             .insert(h, ObjectType::ImageDefinition(def));
-        let mut img =
-            codec::entities::RasterImage::new("img.png", codec::types::Vector3::ZERO, 8.0, 8.0);
+        let mut img = document::entities::RasterImage::new(
+            "img.png",
+            document::types::Vector3::ZERO,
+            8.0,
+            8.0,
+        );
         img.definition_handle = Some(h);
         app.tabs[i]
             .scene
             .document
-            .add_entity(codec::EntityType::RasterImage(img))
+            .add_entity(document::EntityType::RasterImage(img))
             .unwrap();
         app.tabs[i].current_path = Some(std::path::PathBuf::from("C:/Drawings/host.dwg"));
         app.tabs[i].xref_unloaded.add(h.value());
         let out = run_capture(&mut app, "XREF Reload img.png");
         assert!(
-            out.contains("reload applies to drawing references only"),
+            !out.contains("reload applies to drawing references only"),
             "got: {out:?}"
         );
         assert!(
@@ -2727,8 +2951,8 @@ mod tests {
             "spurious no-match, got: {out:?}"
         );
         assert!(
-            app.tabs[i].xref_unloaded.is_unloaded(h.value()),
-            "image flag must stay untouched"
+            !app.tabs[i].xref_unloaded.is_unloaded(h.value()),
+            "image must be loaded again"
         );
     }
 
@@ -2761,7 +2985,7 @@ mod tests {
 
     #[test]
     fn xref_detach_nested_guard_errors() {
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         // Host file on disk containing its own xref "INNER".
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_nested_{}_{}",
@@ -2772,7 +2996,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = codec::Document::new();
+        let mut host_doc = document::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -2802,14 +3026,16 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::Document::new();
+        let mut xref_doc = document::Document::new();
         xref_doc
             .layers
-            .add(codec::tables::Layer::new("WALLS"))
+            .add(document::tables::Layer::new("WALLS"))
             .unwrap();
-        let mut line = codec::entities::Line::new();
+        let mut line = document::entities::Line::new();
         line.common.layer = "WALLS".to_string();
-        xref_doc.add_entity(codec::EntityType::Line(line)).unwrap();
+        xref_doc
+            .add_entity(document::EntityType::Line(line))
+            .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
         std::fs::write(&xref_path, &bytes).unwrap();
@@ -2838,11 +3064,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::Document::new();
-        let mut line = codec::entities::Line::new();
+        let mut xref_doc = document::Document::new();
+        let mut line = document::entities::Line::new();
         line.common.plotstyle_flags = 0b11;
         line.common.plotstyle_handle = Some(xref_doc.allocate_handle());
-        xref_doc.add_entity(codec::EntityType::Line(line)).unwrap();
+        xref_doc
+            .add_entity(document::EntityType::Line(line))
+            .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
         std::fs::write(&xref_path, &bytes).unwrap();
@@ -2861,7 +3089,7 @@ mod tests {
 
     #[test]
     fn xref_bind_pdf_errors() {
-        use codec::objects::{ObjectType, UnderlayDefinition};
+        use document::objects::{ObjectType, UnderlayDefinition};
         let mut app = fresh_app();
         let i = app.active_tab;
         let h = app.tabs[i].scene.document.allocate_handle();
@@ -2882,7 +3110,7 @@ mod tests {
 
     #[test]
     fn xref_bind_nested_guard_errors() {
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_bind_nested_{}_{}",
             std::process::id(),
@@ -2892,7 +3120,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = codec::Document::new();
+        let mut host_doc = document::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -3076,14 +3304,16 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::Document::new();
+        let mut xref_doc = document::Document::new();
         xref_doc
             .layers
-            .add(codec::tables::Layer::new("WALLS"))
+            .add(document::tables::Layer::new("WALLS"))
             .unwrap();
-        let mut line = codec::entities::Line::new();
+        let mut line = document::entities::Line::new();
         line.common.layer = "WALLS".to_string();
-        xref_doc.add_entity(codec::EntityType::Line(line)).unwrap();
+        xref_doc
+            .add_entity(document::EntityType::Line(line))
+            .unwrap();
         let bytes = crate::io::save_to_bytes(&xref_doc, "dwg", xref_doc.version).unwrap();
         let xref_path = dir.join("plan.dwg");
         std::fs::write(&xref_path, &bytes).unwrap();
@@ -3132,12 +3362,12 @@ mod tests {
         let mut app = fresh_app();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut line = codec::entities::Line::new();
-        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.end = document::types::Vector3::new(10.0, 0.0, 0.0);
         app.tabs[i]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -3147,14 +3377,14 @@ mod tests {
         let first_tab_id = app.tabs[i].id;
 
         app.tabs
-            .push(crate::app::document::DocumentTab::new_drawing(99));
+            .push(crate::app::tab_document::DocumentTab::new_drawing(99));
         let other = app.tabs.len() - 1;
-        let mut line = codec::entities::Line::new();
-        line.end = codec::types::Vector3::new(50.0, 0.0, 0.0);
+        let mut line = document::entities::Line::new();
+        line.end = document::types::Vector3::new(50.0, 0.0, 0.0);
         app.tabs[other]
             .scene
             .define_block_from_owned_entities(
-                vec![codec::EntityType::Line(line)],
+                vec![document::EntityType::Line(line)],
                 "Widget",
                 glam::DVec3::ZERO,
             )
@@ -3167,6 +3397,83 @@ mod tests {
         assert_eq!(
             app.block_palette.source_block_epoch,
             app.tabs[other].scene.block_epoch
+        );
+    }
+}
+
+/// Ctrl+C puts the selection on the system clipboard as SVG for other
+/// programs (#2018). They look for it under the `image/svg+xml` format (a
+/// registered clipboard format on Windows, a selection target on X11);
+/// text alone is pasted as text or not at all.
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+mod svg_clipboard_format_tests {
+    use crate::app::OpenCADStudio;
+    use document::entities::Line;
+    use document::EntityType;
+
+    /// The clipboard writes a task leaves to the GUI toolkit, which writes
+    /// text only.
+    fn toolkit_clipboard_writes(task: iced::Task<crate::app::Message>) -> Vec<String> {
+        use iced::futures::StreamExt;
+        let mut writes = Vec::new();
+        let Some(mut stream) = iced_runtime::task::into_stream(task) else {
+            return writes;
+        };
+        while let Some(action) = iced::futures::executor::block_on(stream.next()) {
+            if let iced_runtime::Action::Clipboard(iced_runtime::clipboard::Action::Write {
+                content,
+                ..
+            }) = action
+            {
+                writes.push(format!("{content:?}"));
+            }
+        }
+        writes
+    }
+
+    #[test]
+    fn copyclip_does_not_leave_the_svg_to_a_text_only_write() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let line = app.tabs[i]
+            .scene
+            .add_entity(EntityType::Line(Line::from_coords(
+                0.0, 0.0, 0.0, 40.0, 20.0, 0.0,
+            )));
+        app.tabs[i].scene.select_entity(line, true);
+        let task = app.dispatch_command("COPYCLIP");
+        let writes = toolkit_clipboard_writes(task);
+        let written = crate::sys::clipboard_svg::test_record::take();
+        assert_eq!(written.len(), 1, "one write of the system clipboard");
+        let formats: Vec<&str> = written[0]
+            .iter()
+            .map(|(format, _)| format.as_ref())
+            .collect();
+        if cfg!(target_os = "windows") {
+            assert_eq!(formats, ["CF_UNICODETEXT", "image/svg+xml"]);
+        } else {
+            assert_eq!(
+                formats,
+                ["UTF8_STRING", "text/plain;charset=utf-8", "image/svg+xml"]
+            );
+        }
+        let (_, svg) = written[0]
+            .iter()
+            .find(|(format, _)| *format == "image/svg+xml")
+            .expect("the SVG format");
+        let svg = std::str::from_utf8(svg).expect("UTF-8 markup");
+        assert!(
+            svg.starts_with("<?xml") && svg.contains("<svg"),
+            "{svg:.60}"
+        );
+        assert!(
+            writes.is_empty(),
+            "the SVG went to the clipboard as text only: {:?}",
+            writes
+                .iter()
+                .map(|write| write.chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
         );
     }
 }

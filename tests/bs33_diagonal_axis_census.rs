@@ -2,16 +2,16 @@
 // the bs33 screenshot real drawing content or renderer artifacts? Census the
 // document: layer states, entity-type counts, every XLine/Ray, every red/green
 // line near the origin, and every hatch with its pattern angle.
-use codec::EntityType;
+use document::EntityType;
 use OpenCADStudio::io::load_bytes_finalized;
 
-fn color_tag(c: &codec::types::Color) -> String {
+fn color_tag(c: &document::types::Color) -> String {
     match c {
-        codec::types::Color::ByLayer => "ByLayer".into(),
-        codec::types::Color::ByBlock => "ByBlock".into(),
-        codec::types::Color::None => "None".into(),
-        codec::types::Color::Index(i) => format!("ACI{i}"),
-        codec::types::Color::Rgb { r, g, b } => format!("RGB({r},{g},{b})"),
+        document::types::Color::ByLayer => "ByLayer".into(),
+        document::types::Color::ByBlock => "ByBlock".into(),
+        document::types::Color::None => "None".into(),
+        document::types::Color::Index(i) => format!("ACI{i}"),
+        document::types::Color::Rgb { r, g, b } => format!("RGB({r},{g},{b})"),
     }
 }
 

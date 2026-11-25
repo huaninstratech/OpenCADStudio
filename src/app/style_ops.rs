@@ -18,15 +18,15 @@
 //! style added without a handle (dropped on DWG save, issue #67).
 
 use super::OpenCADStudio;
-use codec::objects::{Dictionary, MLineStyle, MultiLeaderStyle, ObjectType, TableStyle};
-use codec::tables::{DimStyle, TextStyle};
-use codec::types::Handle;
+use document::objects::{Dictionary, MLineStyle, MultiLeaderStyle, ObjectType, TableStyle};
+use document::tables::{DimStyle, TextStyle};
+use document::types::Handle;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 const MLEADERSTYLE_DICT_NAME: &str = "ACAD_MLEADERSTYLE";
 
-fn mleaderstyle_dict_handle(doc: &codec::Document) -> Option<Handle> {
+fn mleaderstyle_dict_handle(doc: &document::Document) -> Option<Handle> {
     let root_h = doc.header.named_objects_dict_handle;
 
     let root = match doc.objects.get(&root_h) {
@@ -41,7 +41,7 @@ fn mleaderstyle_dict_handle(doc: &codec::Document) -> Option<Handle> {
         .filter(|handle| matches!(doc.objects.get(handle), Some(ObjectType::Dictionary(_))))
 }
 
-fn import_mleaderstyle_names_from_dictionary(doc: &mut codec::Document) {
+fn import_mleaderstyle_names_from_dictionary(doc: &mut document::Document) {
     let Some(dict_h) = mleaderstyle_dict_handle(doc) else {
         return;
     };
@@ -59,7 +59,7 @@ fn import_mleaderstyle_names_from_dictionary(doc: &mut codec::Document) {
     }
 }
 
-pub(crate) fn sync_mleaderstyle_dictionary(doc: &mut codec::Document) {
+pub(crate) fn sync_mleaderstyle_dictionary(doc: &mut document::Document) {
     let root_h = crate::scene::annotative::root_named_dict_handle(doc);
 
     let existing = match doc.objects.get(&root_h) {
@@ -133,7 +133,7 @@ pub(crate) fn sync_mleaderstyle_dictionary(doc: &mut codec::Document) {
 /// broken with no way to recover, and new text/dimensions have nothing to
 /// reference (#366). Missing entries are re-seeded with the app defaults.
 /// Called on every file open; a no-op for healthy documents.
-pub(crate) fn ensure_standard_styles(doc: &mut codec::Document) {
+pub(crate) fn ensure_standard_styles(doc: &mut document::Document) {
     import_mleaderstyle_names_from_dictionary(doc);
     if !doc
         .text_styles
@@ -153,7 +153,7 @@ pub(crate) fn ensure_standard_styles(doc: &mut codec::Document) {
         s.handle = doc.allocate_handle();
         let _ = doc.dim_styles.add(s);
     }
-    let has = |doc: &codec::Document, pred: fn(&ObjectType) -> Option<&str>| {
+    let has = |doc: &document::Document, pred: fn(&ObjectType) -> Option<&str>| {
         doc.objects
             .values()
             .filter_map(pred)
@@ -197,12 +197,13 @@ pub enum StyleKind {
     Table,
     MLeader,
     MLine,
+    Linetype,
 }
 
 impl StyleKind {
     /// True when this style feeds the ribbon's quick-set dropdown.
     fn in_ribbon(self) -> bool {
-        !matches!(self, StyleKind::MLine)
+        !matches!(self, StyleKind::MLine | StyleKind::Linetype)
     }
 }
 
@@ -220,7 +221,7 @@ impl OpenCADStudio {
                 .filter_map(pick)
                 .map(str::to_string)
                 .collect();
-            v.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            v.sort_by_key(|a| a.to_lowercase());
             v
         };
         match kind {
@@ -245,6 +246,19 @@ impl OpenCADStudio {
                 ObjectType::MLineStyle(s) => Some(s.name.as_str()),
                 _ => None,
             }),
+            // The built-ins first, then by name.
+            StyleKind::Linetype => {
+                let mut names: Vec<String> =
+                    doc.line_types.iter().map(|l| l.name.clone()).collect();
+                let builtin_rank = |name: &str| match name.to_ascii_uppercase().as_str() {
+                    "BYLAYER" => 0,
+                    "BYBLOCK" => 1,
+                    "CONTINUOUS" => 2,
+                    _ => 3,
+                };
+                names.sort_by_key(|name| (builtin_rank(name), name.to_lowercase()));
+                names
+            }
         }
     }
 
@@ -255,6 +269,7 @@ impl OpenCADStudio {
             StyleKind::Table => self.tablestyle_selected.clone(),
             StyleKind::MLeader => self.mleaderstyle_selected.clone(),
             StyleKind::MLine => self.mlstyle_selected.clone(),
+            StyleKind::Linetype => self.linetype_selected.clone(),
         }
     }
 
@@ -265,6 +280,7 @@ impl OpenCADStudio {
             StyleKind::Table => self.tablestyle_selected = name,
             StyleKind::MLeader => self.mleaderstyle_selected = name,
             StyleKind::MLine => self.mlstyle_selected = name,
+            StyleKind::Linetype => self.linetype_selected = name,
         }
     }
 
@@ -276,8 +292,13 @@ impl OpenCADStudio {
 
     /// First free `Style{n}` name for a fresh style.
     fn unique_new_name(&self, kind: StyleKind) -> String {
+        let stem = if kind == StyleKind::Linetype {
+            "Linetype"
+        } else {
+            "Style"
+        };
         (1u32..)
-            .map(|n| format!("Style{n}"))
+            .map(|n| format!("{stem}{n}"))
             .find(|c| !self.style_exists(kind, c))
             .unwrap()
     }
@@ -297,16 +318,22 @@ impl OpenCADStudio {
         let i = self.active_tab;
         match kind {
             StyleKind::Text => self.load_textstyle_draft(i),
-            StyleKind::Dim => self.load_dimstyle_bufs(i),
+            StyleKind::Dim => {}
             StyleKind::MLeader => self.load_mleaderstyle_bufs(i),
             StyleKind::Table => self.load_tablestyle_bufs(i),
             StyleKind::MLine => self.load_mlstyle_bufs(i),
+            StyleKind::Linetype => self.load_linetype_bufs(i),
         }
     }
 
     /// Refresh anything that mirrors the style list / current style after a
     /// mutation (ribbon dropdowns, geometry that depends on the style).
     pub(super) fn after_style_change(&mut self, kind: StyleKind) {
+        // A new, renamed or deleted multileader style keeps its dictionary
+        // entry and owner, whether or not the change is applied before a save.
+        if kind == StyleKind::MLeader {
+            sync_mleaderstyle_dictionary(&mut self.tabs[self.active_tab].scene.document);
+        }
         if kind.in_ribbon() {
             self.sync_ribbon_styles();
         }
@@ -333,6 +360,8 @@ impl OpenCADStudio {
             }
             StyleKind::MLeader => {
                 let mut s = MultiLeaderStyle::new(name);
+                s.description = name.to_string();
+                s.align_space = s.text_height;
                 s.handle = handle;
                 doc.objects.insert(handle, ObjectType::MultiLeaderStyle(s));
             }
@@ -342,12 +371,30 @@ impl OpenCADStudio {
                 s.handle = handle;
                 doc.objects.insert(handle, ObjectType::MLineStyle(s));
             }
+            StyleKind::Linetype => {
+                let plan = crate::scene::linetype_service::plan_create(
+                    doc,
+                    name,
+                    "",
+                    &crate::app::update::linetype_manager::NEW_PATTERN,
+                );
+                if let Ok(mut s) = plan {
+                    s.handle = handle;
+                    let _ = doc.line_types.add(s);
+                }
+            }
         }
     }
 
     /// Clone the style named `src` under `name` with a fresh `handle`.
     /// Returns false if `src` no longer exists.
-    fn clone_style_as(&mut self, kind: StyleKind, src: &str, name: &str, handle: Handle) -> bool {
+    pub(super) fn clone_style_as(
+        &mut self,
+        kind: StyleKind,
+        src: &str,
+        name: &str,
+        handle: Handle,
+    ) -> bool {
         let doc = &mut self.tabs[self.active_tab].scene.document;
         match kind {
             StyleKind::Text => {
@@ -378,11 +425,13 @@ impl OpenCADStudio {
                     s.handle = handle;
                     s.raw_dxf_codes = None;
                     // The copy gets its own starting table.
-                    let template = s.template().and_then(|template| match doc.objects.get(&template) {
-                        Some(ObjectType::TableTemplate(table)) => Some(table.clone()),
-                        _ => None,
-                    });
-                    s.modern_cell_style_handle = codec::Handle::NULL;
+                    let template =
+                        s.template()
+                            .and_then(|template| match doc.objects.get(&template) {
+                                Some(ObjectType::TableTemplate(table)) => Some(table.clone()),
+                                _ => None,
+                            });
+                    s.modern_cell_style_handle = document::Handle::NULL;
                     if let Some(mut table) = template {
                         let copy = doc.allocate_handle();
                         table.common.handle = copy;
@@ -401,6 +450,8 @@ impl OpenCADStudio {
                     ObjectType::MultiLeaderStyle(s) => Some((s.name.as_str(), s.clone())),
                     _ => None,
                 }) {
+                    // The copy keeps the description of the style it
+                    // starts from.
                     s.name = name.to_string();
                     s.handle = handle;
                     doc.objects.insert(handle, ObjectType::MultiLeaderStyle(s));
@@ -418,153 +469,41 @@ impl OpenCADStudio {
                     return true;
                 }
             }
+            StyleKind::Linetype => {
+                if let Some(mut s) = doc.line_types.get(src).cloned() {
+                    s.name = name.to_string();
+                    s.handle = handle;
+                    // A copy of a referenced linetype is the drawing's own.
+                    s.xref_dependent = false;
+                    s.xref_block_record_handle = Handle::NULL;
+                    // A copy of Continuous needs a pattern to edit.
+                    if s.elements.is_empty() {
+                        for length in crate::app::update::linetype_manager::NEW_PATTERN {
+                            s.add_element(document::tables::linetype::LineTypeElement {
+                                length,
+                                complex: None,
+                            });
+                        }
+                        s.pattern_length = crate::app::update::linetype_manager::NEW_PATTERN
+                            .iter()
+                            .map(|v| v.abs())
+                            .sum();
+                    }
+                    let _ = doc.line_types.add(s);
+                    return true;
+                }
+            }
         }
         false
     }
 
     pub(super) fn remove_style_storage(&mut self, kind: StyleKind, name: &str) -> bool {
-        let doc = &mut self.tabs[self.active_tab].scene.document;
-        match kind {
-            StyleKind::Text => doc.text_styles.remove(name).is_some(),
-            StyleKind::Dim => doc.dim_styles.remove(name).is_some(),
-            StyleKind::Table | StyleKind::MLeader | StyleKind::MLine => {
-                let kind2 = kind;
-                if let Some(h) = object_handle(doc, name, kind2) {
-                    // A table style takes its starting table with it.
-                    if let Some(ObjectType::TableStyle(style)) = doc.objects.get(&h) {
-                        if let Some(template) = style.template() {
-                            doc.objects.remove(&template);
-                        }
-                    }
-                    doc.objects.remove(&h).is_some()
-                } else {
-                    false
-                }
-            }
-        }
+        remove_style(&mut self.tabs[self.active_tab].scene.document, kind, name)
     }
 
     pub(super) fn style_in_use(&self, kind: StyleKind, name: &str) -> bool {
-        use codec::entities::EntityType;
-
-        let i = self.active_tab;
-        let doc = &self.tabs[i].scene.document;
-        match kind {
-            StyleKind::Text => {
-                if doc
-                    .header
-                    .current_text_style_name
-                    .eq_ignore_ascii_case(name)
-                {
-                    return true;
-                }
-                let style_handle = doc.text_styles.get(name).map(|style| style.handle);
-                let referenced_by_entity = doc.entities().any(|entity| match entity {
-                    EntityType::Text(text) => text.style.eq_ignore_ascii_case(name),
-                    EntityType::MText(text) => text.style.eq_ignore_ascii_case(name),
-                    EntityType::AttributeEntity(attribute) => {
-                        attribute.text_style.eq_ignore_ascii_case(name)
-                    }
-                    EntityType::AttributeDefinition(attribute) => {
-                        attribute.text_style.eq_ignore_ascii_case(name)
-                    }
-                    EntityType::Insert(insert) => insert
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.text_style.eq_ignore_ascii_case(name)),
-                    EntityType::MultiLeader(leader) => {
-                        [leader.text_style_handle, leader.context.text_style_handle]
-                            .into_iter()
-                            .flatten()
-                            .any(|handle| Some(handle) == style_handle)
-                    }
-                    EntityType::Table(table) => table.rows.iter().any(|row| {
-                        row.style
-                            .as_ref()
-                            .and_then(|style| style.text_style_handle)
-                            .is_some_and(|handle| Some(handle) == style_handle)
-                            || row.cells.iter().any(|cell| {
-                                cell.style
-                                    .as_ref()
-                                    .and_then(|style| style.text_style_handle)
-                                    .is_some_and(|handle| Some(handle) == style_handle)
-                                    || cell.contents.iter().any(|content| {
-                                        content
-                                            .text_style_handle
-                                            .is_some_and(|handle| Some(handle) == style_handle)
-                                    })
-                            })
-                    }),
-                    _ => false,
-                });
-                referenced_by_entity
-                    || doc
-                        .dim_styles
-                        .iter()
-                        .any(|style| style.dimtxsty.eq_ignore_ascii_case(name))
-                    || doc.objects.values().any(|object| match object {
-                        ObjectType::TableStyle(style) => [
-                            &style.data_row_style,
-                            &style.header_row_style,
-                            &style.title_row_style,
-                        ]
-                        .into_iter()
-                        .any(|row| row.text_style_name.eq_ignore_ascii_case(name)),
-                        ObjectType::MultiLeaderStyle(style) => {
-                            style.text_style_handle == style_handle
-                        }
-                        _ => false,
-                    })
-            }
-            StyleKind::Dim => {
-                doc.header.current_dimstyle_name.eq_ignore_ascii_case(name)
-                    || doc.entities().any(|entity| match entity {
-                        EntityType::Dimension(dimension) => {
-                            dimension.base().style_name.eq_ignore_ascii_case(name)
-                        }
-                        EntityType::Leader(leader) => {
-                            leader.dimension_style.eq_ignore_ascii_case(name)
-                        }
-                        EntityType::Tolerance(tolerance) => {
-                            tolerance.dimension_style_name.eq_ignore_ascii_case(name)
-                        }
-                        _ => false,
-                    })
-            }
-            StyleKind::Table | StyleKind::MLeader | StyleKind::MLine => {
-                let Some(handle) = object_handle(doc, name, kind) else {
-                    return false;
-                };
-                let is_current = match kind {
-                    StyleKind::Table => doc
-                        .header
-                        .current_table_style_name
-                        .eq_ignore_ascii_case(name),
-                    StyleKind::MLeader => {
-                        doc.header
-                            .current_mleader_style_name
-                            .eq_ignore_ascii_case(name)
-                            || self.tabs[i].active_mleader_style.eq_ignore_ascii_case(name)
-                    }
-                    StyleKind::MLine => doc.header.multiline_style.eq_ignore_ascii_case(name),
-                    StyleKind::Text | StyleKind::Dim => false,
-                };
-                is_current
-                    || doc.entities().any(|entity| match (kind, entity) {
-                        (StyleKind::Table, EntityType::Table(table)) => {
-                            table.table_style_handle == Some(handle)
-                        }
-                        (StyleKind::MLeader, EntityType::MultiLeader(leader)) => {
-                            leader.style_handle == Some(handle)
-                        }
-                        (StyleKind::MLine, EntityType::MLine(line)) => {
-                            line.style_handle == Some(handle)
-                                || line.style_name.eq_ignore_ascii_case(name)
-                        }
-                        _ => false,
-                    })
-            }
-        }
+        let tab = &self.tabs[self.active_tab];
+        style_in_use(&tab.scene.document, kind, name, &tab.active_mleader_style)
     }
 
     /// Rename `old`→`new` in the backing store, re-keying table entries and
@@ -602,15 +541,15 @@ impl OpenCADStudio {
                         stage.entities.entry(handle).or_insert(before);
                     }
                     match doc.get_entity_mut(handle) {
-                        Some(codec::entities::EntityType::Text(t)) => t.style = new.to_string(),
-                        Some(codec::entities::EntityType::MText(t)) => t.style = new.to_string(),
-                        Some(codec::entities::EntityType::AttributeEntity(a)) => {
+                        Some(document::entities::EntityType::Text(t)) => t.style = new.to_string(),
+                        Some(document::entities::EntityType::MText(t)) => t.style = new.to_string(),
+                        Some(document::entities::EntityType::AttributeEntity(a)) => {
                             a.text_style = new.to_string()
                         }
-                        Some(codec::entities::EntityType::AttributeDefinition(a)) => {
+                        Some(document::entities::EntityType::AttributeDefinition(a)) => {
                             a.text_style = new.to_string()
                         }
-                        Some(codec::entities::EntityType::Insert(insert)) => {
+                        Some(document::entities::EntityType::Insert(insert)) => {
                             for attribute in &mut insert.attributes {
                                 if attribute.text_style.eq_ignore_ascii_case(old) {
                                     attribute.text_style = new.to_string();
@@ -644,33 +583,70 @@ impl OpenCADStudio {
             }
             StyleKind::Dim => {
                 let doc = &mut self.tabs[i].scene.document;
-                if let Some(mut s) = doc.dim_styles.get(old).cloned() {
-                    s.name = new.to_string();
-                    if !s.handle.is_valid() {
-                        s.handle = doc.allocate_handle();
+                // The family members (`NAME$0` linear, `$2` angular, ...)
+                // follow their parent's name.
+                let renames: Vec<(String, String)> = doc
+                    .dim_styles
+                    .iter()
+                    .filter_map(|style| {
+                        if style.name.eq_ignore_ascii_case(old) {
+                            return Some((style.name.clone(), new.to_string()));
+                        }
+                        let (parent, member) = style.name.rsplit_once('$')?;
+                        (parent.eq_ignore_ascii_case(old)
+                            && !member.is_empty()
+                            && member.chars().all(|c| c.is_ascii_digit()))
+                        .then(|| (style.name.clone(), format!("{new}${member}")))
+                    })
+                    .collect();
+                for (from, to) in &renames {
+                    if let Some(mut s) = doc.dim_styles.get(from).cloned() {
+                        s.name = to.clone();
+                        if !s.handle.is_valid() {
+                            s.handle = doc.allocate_handle();
+                        }
+                        if doc.dim_styles.add(s).is_ok() {
+                            doc.dim_styles.remove(from);
+                        }
                     }
-                    let _ = doc.dim_styles.add(s);
                 }
-                doc.dim_styles.remove(old);
                 if doc.header.current_dimstyle_name.eq_ignore_ascii_case(old) {
                     doc.header.current_dimstyle_name = new.to_string();
                 }
-                for e in doc.entities_mut() {
-                    match e {
-                        codec::entities::EntityType::Dimension(d)
-                            if d.base().style_name.eq_ignore_ascii_case(old) =>
-                        {
-                            d.base_mut().style_name = new.to_string();
+                // Only the objects naming the style change, each through
+                // `get_entity_mut`: a bulk `entities_mut` pass would drop the
+                // stored record of every entity in the drawing.
+                let handles: Vec<Handle> = doc
+                    .entities()
+                    .filter(|entity| match entity {
+                        document::entities::EntityType::Dimension(d) => {
+                            d.base().style_name.eq_ignore_ascii_case(old)
                         }
-                        codec::entities::EntityType::Leader(l)
-                            if l.dimension_style.eq_ignore_ascii_case(old) =>
-                        {
-                            l.dimension_style = new.to_string();
+                        document::entities::EntityType::Leader(l) => {
+                            l.dimension_style.eq_ignore_ascii_case(old)
                         }
-                        codec::entities::EntityType::Tolerance(t)
-                            if t.dimension_style_name.eq_ignore_ascii_case(old) =>
-                        {
-                            t.dimension_style_name = new.to_string();
+                        document::entities::EntityType::Tolerance(t) => {
+                            t.dimension_style_name.eq_ignore_ascii_case(old)
+                        }
+                        _ => false,
+                    })
+                    .map(|entity| entity.common().handle)
+                    .collect();
+                for handle in handles {
+                    if let (Some(stage), Some(before)) =
+                        (self.style_stage.as_mut(), doc.get_entity_arc(handle))
+                    {
+                        stage.entities.entry(handle).or_insert(before);
+                    }
+                    match doc.get_entity_mut(handle) {
+                        Some(document::entities::EntityType::Dimension(d)) => {
+                            d.base_mut().style_name = new.to_string()
+                        }
+                        Some(document::entities::EntityType::Leader(l)) => {
+                            l.dimension_style = new.to_string()
+                        }
+                        Some(document::entities::EntityType::Tolerance(t)) => {
+                            t.dimension_style_name = new.to_string()
                         }
                         _ => {}
                     }
@@ -699,6 +675,10 @@ impl OpenCADStudio {
                     let doc = &mut self.tabs[i].scene.document;
                     if let Some(h) = object_handle(doc, old, kind) {
                         if let Some(ObjectType::MultiLeaderStyle(s)) = doc.objects.get_mut(&h) {
+                            // The description written with the style is its name.
+                            if s.description.is_empty() || s.description == s.name {
+                                s.description = new.to_string();
+                            }
                             s.name = new.to_string();
                         }
                     }
@@ -728,12 +708,32 @@ impl OpenCADStudio {
                     doc.header.multiline_style = new.to_string();
                 }
                 for entity in doc.entities_mut() {
-                    if let codec::entities::EntityType::MLine(line) = entity {
+                    if let document::entities::EntityType::MLine(line) = entity {
                         if line.style_name.eq_ignore_ascii_case(old) {
                             line.style_name = new.to_string();
                         }
                     }
                 }
+            }
+            StyleKind::Linetype => {
+                use crate::scene::linetype_service as service;
+                let doc = &mut self.tabs[i].scene.document;
+                if doc.line_types.rename(old, new.to_string()).is_err() {
+                    return;
+                }
+                for handle in service::entities_naming(doc, old) {
+                    // The open manager restores these on Close and puts them
+                    // in the Apply undo step.
+                    if let (Some(stage), Some(before)) =
+                        (self.style_stage.as_mut(), doc.get_entity_arc(handle))
+                    {
+                        stage.entities.entry(handle).or_insert(before);
+                    }
+                    if let Some(entity) = doc.get_entity_mut(handle) {
+                        service::retarget_entity(entity, old, new);
+                    }
+                }
+                service::rename_table_references(doc, old, new);
             }
         }
     }
@@ -752,13 +752,20 @@ impl OpenCADStudio {
         if kind == StyleKind::Text {
             self.flush_textstyle_draft();
         }
+        if kind == StyleKind::Linetype {
+            self.flush_linetype_draft();
+        }
     }
 
     /// The text style editor holds a value it cannot apply: leaving the style
     /// would drop it, so New, Copy, Delete, Rename and switching wait until it
     /// is fixed (the window says why beside Apply).
     pub(super) fn style_editor_blocked(&self, kind: StyleKind) -> bool {
-        kind == StyleKind::Text && self.textstyle_draft.invalid_fields() > 0
+        match kind {
+            StyleKind::Text => self.textstyle_draft.invalid_fields() > 0,
+            StyleKind::Linetype => self.linetype_draft_error().is_some(),
+            _ => false,
+        }
     }
 
     /// An external-reference style: flagged, or merged in as `XREF|Name`.
@@ -768,6 +775,7 @@ impl OpenCADStudio {
             StyleKind::Text => {
                 name.contains('|') || doc.text_styles.get(name).is_some_and(|s| s.xref_dependent)
             }
+            StyleKind::Linetype => self.linetype_is_locked(name),
             _ => false,
         }
     }
@@ -887,8 +895,19 @@ impl OpenCADStudio {
         let Some(old) = self.style_rename.take() else {
             return;
         };
-        let new = self.style_rename_buf.trim().to_string();
-        self.style_rename_buf.clear();
+        let typed = std::mem::take(&mut self.style_rename_buf);
+        let new = typed.trim().to_string();
+        // A text style name follows the window's naming rules; a refusal is
+        // shown on a card and the style keeps its name.
+        if kind == StyleKind::Text && !new.eq_ignore_ascii_case(&old) {
+            let notice = crate::ui::style::textstyle::name_notice(&typed, |trimmed| {
+                self.style_exists(kind, trimmed)
+            });
+            if let Some(notice) = notice {
+                self.textstyle_card = Some(crate::ui::style::textstyle::Card::Name(notice));
+                return;
+            }
+        }
         if new.is_empty() || new.eq_ignore_ascii_case(&old) {
             return;
         }
@@ -903,6 +922,13 @@ impl OpenCADStudio {
                 .push_error(crate::t!("Referenced style · Read only").as_ref());
             return;
         }
+        if kind == StyleKind::Linetype {
+            let doc = &self.tabs[self.active_tab].scene.document;
+            if let Err(error) = crate::scene::linetype_service::plan_rename(doc, &old, &new) {
+                self.command_line.push_error(&error.to_string());
+                return;
+            }
+        }
         if self.style_exists(kind, &new) {
             self.command_line
                 .push_error(crate::tf!("Style '{new}' already exists.").as_ref());
@@ -914,8 +940,12 @@ impl OpenCADStudio {
         }
         self.load_style_bufs(kind);
         self.after_style_change(kind);
-        self.command_line
-            .push_output(crate::tf!("Renamed '{old}' → '{new}'.").as_ref());
+        // The text style window renames without a line, as it creates and
+        // deletes.
+        if kind != StyleKind::Text {
+            self.command_line
+                .push_output(crate::tf!("Renamed '{old}' → '{new}'.").as_ref());
+        }
     }
 
     pub(super) fn style_rename_cancel(&mut self) {
@@ -933,7 +963,7 @@ impl OpenCADStudio {
     // window without Apply discards by restoring the snapshot.
 
     /// Snapshot the style-related document state into a transferable record.
-    fn capture_style_state(&self) -> StyleStateSnapshot {
+    pub(super) fn capture_style_state(&self, linetypes: bool) -> StyleStateSnapshot {
         let i = self.active_tab;
         let doc = &self.tabs[i].scene.document;
         let style_objects = doc
@@ -962,6 +992,36 @@ impl OpenCADStudio {
             active_table: self.ribbon.active_table_style.clone(),
             active_mleader: self.ribbon.active_mleader_style.clone(),
             tab_active_mleader: self.tabs[i].active_mleader_style.clone(),
+            dim_overrides: self.tabs[i].scene.dim_overrides.clone(),
+            dim_style_xdata: doc
+                .dim_styles
+                .iter()
+                .filter_map(|style| {
+                    doc.object_xdata(style.handle)
+                        .map(|data| (style.handle, data.clone()))
+                })
+                .collect(),
+            text_orientation: doc
+                .text_styles
+                .iter()
+                .filter(|style| crate::scene::annotative::text_style_orientation(doc, style.handle))
+                .map(|style| style.handle)
+                .collect(),
+            linetypes: linetypes.then(|| LinetypeState {
+                table: doc.line_types.clone(),
+                layer_linetypes: doc
+                    .layers
+                    .iter()
+                    .map(|layer| (layer.handle, layer.line_type.clone()))
+                    .collect(),
+                layer_states: doc.layer_states(),
+                current_name: doc.header.current_linetype_name.clone(),
+                current_handle: doc.header.current_linetype_handle,
+                ltscale: doc.header.linetype_scale,
+                celtscale: doc.header.current_entity_linetype_scale,
+                psltscale: doc.header.paper_space_linetype_scaling,
+                msltscale: self.tabs[i].scene.model_linetype_scaling(),
+            }),
         }
     }
 
@@ -994,6 +1054,56 @@ impl OpenCADStudio {
             self.ribbon.active_mleader_style = snap.active_mleader.clone();
         }
         self.tabs[i].active_mleader_style = snap.tab_active_mleader.clone();
+        self.tabs[i].scene.dim_overrides = snap.dim_overrides.clone();
+        // The extended data of the dimension styles (break size, jog
+        // height, DIMTALN) goes back with them.
+        let doc = &mut self.tabs[i].scene.document;
+        for (handle, data) in &snap.dim_style_xdata {
+            for record in data.records() {
+                doc.set_object_xdata_record(*handle, record.clone());
+            }
+        }
+        let handles: Vec<Handle> = doc.text_styles.iter().map(|style| style.handle).collect();
+        for handle in handles {
+            crate::scene::annotative::set_text_style_orientation(
+                doc,
+                handle,
+                snap.text_orientation.contains(&handle),
+            );
+        }
+        if let Some(state) = &snap.linetypes {
+            let scene = &mut self.tabs[i].scene;
+            let doc = &mut scene.document;
+            doc.line_types = state.table.clone();
+            for layer in doc.layers.iter_mut() {
+                if let Some((_, linetype)) = state
+                    .layer_linetypes
+                    .iter()
+                    .find(|(handle, _)| *handle == layer.handle)
+                {
+                    layer.line_type.clone_from(linetype);
+                }
+            }
+            let live = doc.layer_states();
+            for saved in &state.layer_states {
+                if live.iter().find(|s| s.name == saved.name) != Some(saved) {
+                    doc.store_layer_state(saved.clone());
+                }
+            }
+            doc.header.current_linetype_name = state.current_name.clone();
+            doc.header.current_linetype_handle = state.current_handle;
+            doc.header.linetype_scale = state.ltscale;
+            doc.header.current_entity_linetype_scale = state.celtscale;
+            doc.header.paper_space_linetype_scaling = state.psltscale;
+            if scene.model_linetype_scaling() != state.msltscale {
+                scene.set_model_linetype_scaling(state.msltscale);
+            }
+            scene.bump_geometry();
+            if i == self.active_tab {
+                self.sync_ribbon_layers();
+                self.sync_ribbon_from_selection();
+            }
+        }
     }
 
     /// The text style with this handle as it was before the open manager's
@@ -1007,15 +1117,48 @@ impl OpenCADStudio {
             .find(|style| style.handle == handle)
     }
 
+    /// The open manager's transaction keeps `handle` as it is now: Close
+    /// restores it and Apply puts it in the undo step.
+    pub(super) fn style_stage_keep_entity(&mut self, tab: usize, handle: Handle) {
+        if let (Some(stage), Some(before)) = (
+            self.style_stage.as_mut(),
+            self.tabs[tab].scene.document.get_entity_arc(handle),
+        ) {
+            stage.entities.entry(handle).or_insert(before);
+        }
+    }
+
     /// Begin a staging transaction for a freshly-opened style manager.
     pub(super) fn style_stage_begin(&mut self) {
+        self.begin_style_stage(false);
+    }
+
+    /// As [`Self::style_stage_begin`], for the Linetype Manager. Only it
+    /// snapshots the linetype table, layers' linetypes and layer states:
+    /// dialogs do not block the drawing, so another manager's Close must not
+    /// undo an unrelated edit made while it was open.
+    pub(super) fn style_stage_begin_linetypes(&mut self) {
+        self.begin_style_stage(true);
+    }
+
+    fn begin_style_stage(&mut self, linetypes: bool) {
         let dirty_at_open = self.tabs[self.active_tab].dirty;
-        let baseline = self.capture_style_state();
+        let baseline = self.capture_style_state(linetypes);
         self.style_stage = Some(StyleStage {
             dirty_at_open,
             baseline,
             entities: FxHashMap::default(),
+            linetypes,
+            one_step: false,
+            merge_at: None,
         });
+    }
+
+    /// Whether the open transaction covers linetypes.
+    pub(super) fn linetypes_are_staged(&self) -> bool {
+        self.style_stage
+            .as_ref()
+            .is_some_and(|stage| stage.linetypes)
     }
 
     /// Commit the staged changes (Apply): make them permanent with a single
@@ -1028,33 +1171,18 @@ impl OpenCADStudio {
             return;
         };
         sync_mleaderstyle_dictionary(&mut self.tabs[i].scene.document);
-        // A changed text style carries its new values over to the texts that
-        // follow it, in the same undo step.
-        let doc = &mut self.tabs[i].scene.document;
-        let changed: Vec<(TextStyle, TextStyle)> = doc
-            .text_styles
-            .iter()
-            .filter_map(|new| {
-                let old = stage
-                    .baseline
-                    .text_styles
-                    .iter()
-                    .find(|old| new.handle.is_valid() && old.handle == new.handle)?;
-                (old != new).then(|| (old.clone(), new.clone()))
-            })
-            .collect();
-        for (old, new) in changed {
-            super::text_style_users::update_texts(doc, &old, &new, &mut stage.entities);
-        }
 
-        let edited = self.capture_style_state();
+        let linetypes = stage.linetypes;
+        let edited = self.capture_style_state(linetypes);
         let doc = &self.tabs[i].scene.document;
         let entities: Vec<_> = stage
             .entities
             .into_iter()
             .filter_map(|(handle, before)| {
                 let after = doc.get_entity_arc(handle);
-                let same = after.as_ref().is_some_and(|after| Arc::ptr_eq(after, &before));
+                let same = after
+                    .as_ref()
+                    .is_some_and(|after| Arc::ptr_eq(after, &before));
                 (!same).then_some((handle, Some(before), after))
             })
             .collect();
@@ -1062,11 +1190,11 @@ impl OpenCADStudio {
         if changed {
             self.tabs[i].dirty = true;
             let (text_names, dim_names, object_handles) = edited.changed_keys(&stage.baseline);
-            let changed_mleader_styles: Vec<codec::objects::MultiLeaderStyle> = object_handles
+            let changed_mleader_styles: Vec<document::objects::MultiLeaderStyle> = object_handles
                 .iter()
                 .filter_map(
                     |handle| match self.tabs[i].scene.document.objects.get(handle) {
-                        Some(codec::objects::ObjectType::MultiLeaderStyle(style)) => {
+                        Some(document::objects::ObjectType::MultiLeaderStyle(style)) => {
                             Some(style.clone())
                         }
                         _ => None,
@@ -1077,12 +1205,12 @@ impl OpenCADStudio {
             let mut changed_mleaders = Vec::new();
 
             for style in changed_mleader_styles {
-                let entity_handles: Vec<codec::Handle> = {
+                let entity_handles: Vec<document::Handle> = {
                     let doc = &self.tabs[i].scene.document;
 
                     doc.entities()
                         .filter_map(|entity| match entity {
-                            codec::EntityType::MultiLeader(ml)
+                            document::EntityType::MultiLeader(ml)
                                 if ml.style_handle == Some(style.handle) =>
                             {
                                 Some(ml.common.handle)
@@ -1120,17 +1248,31 @@ impl OpenCADStudio {
                 .map(|(handle, _, _)| (*handle, crate::scene::ChangeKind::Modified))
                 .collect();
             self.tabs[i].scene.bump_entities(&renamed);
+            if linetypes {
+                if let (Some(new_lt), Some(old_lt)) =
+                    (edited.linetypes.as_ref(), stage.baseline.linetypes.as_ref())
+                {
+                    new_lt.invalidate_diff(old_lt, &mut self.tabs[i].scene);
+                }
+            }
+            let merge_at = stage.merge_at.filter(|_| stage.one_step);
             self.commit_style_undo(
                 i,
                 stage.baseline,
                 edited,
                 entities,
                 stage.dirty_at_open,
+                merge_at,
             );
+            stage.merge_at = Some(self.tabs[i].history.undo_stack.len());
         } else {
             self.tabs[i].dirty = stage.dirty_at_open;
         }
         self.sync_ribbon_styles();
+        if linetypes {
+            self.sync_ribbon_layers();
+            self.sync_ribbon_from_selection();
+        }
         // An open MTEXT editor shows its style's new values.
         self.mtext_follow_style_table();
         // Re-baseline so further edits in the still-open window stage afresh.
@@ -1138,9 +1280,44 @@ impl OpenCADStudio {
         // styles: a second untouched Apply must find nothing changed.
         self.style_stage = Some(StyleStage {
             dirty_at_open: self.tabs[i].dirty,
-            baseline: self.capture_style_state(),
+            baseline: self.capture_style_state(linetypes),
             entities: FxHashMap::default(),
+            linetypes,
+            one_step: stage.one_step,
+            merge_at: stage.merge_at,
         });
+    }
+
+    /// A child manager's Apply: its changes stay staged in the parent's
+    /// transaction (one undo step when the parent closes) and become what
+    /// the child's Close keeps. `false` when there is no parent.
+    pub(super) fn style_stage_child_apply(&mut self) -> bool {
+        let Some(parent) = self.style_parent_stage.as_mut() else {
+            return false;
+        };
+        if let Some(child) = self.style_stage.take() {
+            // The parent keeps each entity as it was before either opened.
+            for (handle, before) in child.entities {
+                parent.entities.entry(handle).or_insert(before);
+            }
+            self.style_stage = Some(StyleStage {
+                dirty_at_open: child.dirty_at_open,
+                baseline: self.capture_style_state(child.linetypes),
+                entities: FxHashMap::default(),
+                linetypes: child.linetypes,
+                one_step: child.one_step,
+                merge_at: child.merge_at,
+            });
+        }
+        self.sync_ribbon_styles();
+        true
+    }
+
+    /// A child manager closes: what it did not apply is taken back and the
+    /// parent's transaction goes on.
+    pub(super) fn style_stage_child_close(&mut self) {
+        self.style_stage_discard();
+        self.style_stage = self.style_parent_stage.take();
     }
 
     /// Discard staged changes (window closed without Apply): restore the
@@ -1171,8 +1348,8 @@ impl OpenCADStudio {
 /// Snapshot of every document field a style manager can touch.
 #[derive(Clone, PartialEq)]
 pub(super) struct StyleStateSnapshot {
-    text_styles: codec::tables::Table<TextStyle>,
-    dim_styles: codec::tables::Table<DimStyle>,
+    text_styles: document::tables::Table<TextStyle>,
+    dim_styles: document::tables::Table<DimStyle>,
     style_objects: Vec<(Handle, ObjectType)>,
     current_text: String,
     current_dim: String,
@@ -1182,6 +1359,87 @@ pub(super) struct StyleStateSnapshot {
     active_table: String,
     active_mleader: String,
     tab_active_mleader: String,
+    /// The current style's overrides for new dimensions.
+    dim_overrides: Option<(String, Vec<(i16, document::xdata::XDataValue)>)>,
+    dim_style_xdata: Vec<(Handle, document::xdata::ExtendedData)>,
+    /// The text styles that match their text orientation to the layout.
+    text_orientation: Vec<Handle>,
+    linetypes: Option<LinetypeState>,
+}
+
+/// What the Linetype Manager can touch beyond the style tables.
+#[derive(Clone, PartialEq)]
+pub(super) struct LinetypeState {
+    table: document::tables::Table<document::tables::LineType>,
+    layer_linetypes: Vec<(Handle, String)>,
+    layer_states: Vec<document::LayerState>,
+    current_name: String,
+    current_handle: Handle,
+    ltscale: f64,
+    celtscale: f64,
+    psltscale: bool,
+    msltscale: bool,
+}
+
+fn diff_table_names<T: document::tables::TableEntry + PartialEq>(
+    a: &document::tables::Table<T>,
+    b: &document::tables::Table<T>,
+) -> Vec<String> {
+    a.iter()
+        .filter(|entry| b.get(entry.name()) != Some(*entry))
+        .map(|entry| entry.name().to_string())
+        .chain(
+            b.iter()
+                .filter(|entry| a.get(entry.name()) != Some(*entry))
+                .map(|entry| entry.name().to_string()),
+        )
+        .collect::<rustc_hash::FxHashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+impl LinetypeState {
+    fn invalidate_diff(&self, other: &Self, scene: &mut crate::scene::Scene) {
+        if (self.ltscale - other.ltscale).abs() > f64::EPSILON
+            || self.psltscale != other.psltscale
+            || self.msltscale != other.msltscale
+        {
+            scene.bump_geometry();
+            return;
+        }
+        let linetype_names = diff_table_names(&self.table, &other.table);
+        if !linetype_names.is_empty() {
+            scene.invalidate_linetype_dependencies(&linetype_names);
+        }
+        let self_layers: rustc_hash::FxHashMap<_, _> = self
+            .layer_linetypes
+            .iter()
+            .map(|(h, lt)| (*h, lt.as_str()))
+            .collect();
+        let other_layers: rustc_hash::FxHashMap<_, _> = other
+            .layer_linetypes
+            .iter()
+            .map(|(h, lt)| (*h, lt.as_str()))
+            .collect();
+        let layer_names: Vec<String> = self_layers
+            .iter()
+            .chain(other_layers.iter())
+            .filter(|(handle, _)| self_layers.get(*handle) != other_layers.get(*handle))
+            .filter_map(|(handle, _)| {
+                scene
+                    .document
+                    .layers
+                    .iter()
+                    .find(|layer| layer.handle == *handle)
+                    .map(|layer| layer.name.clone())
+            })
+            .collect::<rustc_hash::FxHashSet<_>>()
+            .into_iter()
+            .collect();
+        if !layer_names.is_empty() {
+            scene.invalidate_layer_dependencies(&layer_names);
+        }
+    }
 }
 
 impl StyleStateSnapshot {
@@ -1192,39 +1450,16 @@ impl StyleStateSnapshot {
             .saturating_mul(320)
             .saturating_add(self.dim_styles.iter().count().saturating_mul(1024))
             .saturating_add(self.style_objects.len().saturating_mul(512))
+            .saturating_add(
+                self.linetypes
+                    .as_ref()
+                    .map_or(0, |state| state.table.iter().count().saturating_mul(256)),
+            )
     }
 
     pub(super) fn changed_keys(&self, other: &Self) -> (Vec<String>, Vec<String>, Vec<Handle>) {
-        let text_names = self
-            .text_styles
-            .iter()
-            .filter(|style| other.text_styles.get(&style.name) != Some(*style))
-            .map(|style| style.name.clone())
-            .chain(
-                other
-                    .text_styles
-                    .iter()
-                    .filter(|style| self.text_styles.get(&style.name) != Some(*style))
-                    .map(|style| style.name.clone()),
-            )
-            .collect::<rustc_hash::FxHashSet<_>>()
-            .into_iter()
-            .collect();
-        let dim_names = self
-            .dim_styles
-            .iter()
-            .filter(|style| other.dim_styles.get(&style.name) != Some(*style))
-            .map(|style| style.name.clone())
-            .chain(
-                other
-                    .dim_styles
-                    .iter()
-                    .filter(|style| self.dim_styles.get(&style.name) != Some(*style))
-                    .map(|style| style.name.clone()),
-            )
-            .collect::<rustc_hash::FxHashSet<_>>()
-            .into_iter()
-            .collect();
+        let text_names = diff_table_names(&self.text_styles, &other.text_styles);
+        let dim_names = diff_table_names(&self.dim_styles, &other.dim_styles);
         let self_objects: rustc_hash::FxHashMap<_, _> =
             self.style_objects.iter().map(|(h, o)| (*h, o)).collect();
         let other_objects: rustc_hash::FxHashMap<_, _> =
@@ -1248,12 +1483,19 @@ pub(super) struct StyleStage {
     baseline: StyleStateSnapshot,
     /// Entities the transaction changed (a rename rewrites their style name,
     /// Apply their by-style values), as they were when the manager opened.
-    entities: FxHashMap<Handle, Arc<codec::EntityType>>,
+    entities: FxHashMap<Handle, Arc<document::EntityType>>,
+    /// Whether this is the Linetype Manager's transaction.
+    linetypes: bool,
+    /// The window's whole session is one undo step: a later Apply folds into
+    /// the step an earlier one made.
+    pub(super) one_step: bool,
+    /// The undo stack's height right after this session's last step.
+    merge_at: Option<usize>,
 }
 
 /// True when the entity, or one of an insert's attributes, names the text style.
-fn names_text_style(entity: &codec::EntityType, name: &str) -> bool {
-    use codec::EntityType;
+fn names_text_style(entity: &document::EntityType, name: &str) -> bool {
+    use document::EntityType;
     match entity {
         EntityType::Text(text) => text.style.eq_ignore_ascii_case(name),
         EntityType::MText(text) => text.style.eq_ignore_ascii_case(name),
@@ -1274,7 +1516,7 @@ fn names_text_style(entity: &codec::EntityType, name: &str) -> bool {
 /// Find the object-backed style named `name` and return a clone. `pick` maps a
 /// matching variant to `(its name, a clone of the inner style)`.
 fn find_object_style<T>(
-    doc: &codec::Document,
+    doc: &document::Document,
     name: &str,
     pick: impl Fn(&ObjectType) -> Option<(&str, T)>,
 ) -> Option<T> {
@@ -1284,7 +1526,199 @@ fn find_object_style<T>(
     })
 }
 
-fn object_handle(doc: &codec::Document, name: &str, kind: StyleKind) -> Option<Handle> {
+/// Whether anything in `doc` uses the style: the current one, an object
+/// that names it, or a style that refers to it. `active_mleader` is the
+/// session's current multileader style. Shared by the style managers'
+/// delete and by PURGE.
+pub(crate) fn style_in_use(
+    doc: &document::Document,
+    kind: StyleKind,
+    name: &str,
+    active_mleader: &str,
+) -> bool {
+    use document::entities::EntityType;
+
+    match kind {
+        StyleKind::Text => {
+            if doc
+                .header
+                .current_text_style_name
+                .eq_ignore_ascii_case(name)
+            {
+                return true;
+            }
+            let style_handle = doc.text_styles.get(name).map(|style| style.handle);
+            let referenced_by_entity = doc.entities().any(|entity| match entity {
+                EntityType::Text(text) => text.style.eq_ignore_ascii_case(name),
+                EntityType::MText(text) => text.style.eq_ignore_ascii_case(name),
+                EntityType::AttributeEntity(attribute) => {
+                    attribute.text_style.eq_ignore_ascii_case(name)
+                }
+                EntityType::AttributeDefinition(attribute) => {
+                    attribute.text_style.eq_ignore_ascii_case(name)
+                }
+                EntityType::Insert(insert) => insert
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.text_style.eq_ignore_ascii_case(name)),
+                EntityType::MultiLeader(leader) => {
+                    [leader.text_style_handle, leader.context.text_style_handle]
+                        .into_iter()
+                        .flatten()
+                        .any(|handle| Some(handle) == style_handle)
+                }
+                EntityType::Table(table) => table.rows.iter().any(|row| {
+                    row.style
+                        .as_ref()
+                        .and_then(|style| style.text_style_handle)
+                        .is_some_and(|handle| Some(handle) == style_handle)
+                        || row.cells.iter().any(|cell| {
+                            cell.style
+                                .as_ref()
+                                .and_then(|style| style.text_style_handle)
+                                .is_some_and(|handle| Some(handle) == style_handle)
+                                || cell.contents.iter().any(|content| {
+                                    content
+                                        .text_style_handle
+                                        .is_some_and(|handle| Some(handle) == style_handle)
+                                })
+                        })
+                }),
+                _ => false,
+            });
+            referenced_by_entity
+                || doc
+                    .dim_styles
+                    .iter()
+                    .any(|style| style.dimtxsty.eq_ignore_ascii_case(name))
+                || doc.objects.values().any(|object| match object {
+                    ObjectType::TableStyle(style) => [
+                        &style.data_row_style,
+                        &style.header_row_style,
+                        &style.title_row_style,
+                    ]
+                    .into_iter()
+                    .any(|row| row.text_style_name.eq_ignore_ascii_case(name)),
+                    ObjectType::MultiLeaderStyle(style) => style.text_style_handle == style_handle,
+                    _ => false,
+                })
+        }
+        StyleKind::Dim => {
+            doc.header.current_dimstyle_name.eq_ignore_ascii_case(name)
+                || doc.entities().any(|entity| match entity {
+                    EntityType::Dimension(dimension) => {
+                        dimension.base().style_name.eq_ignore_ascii_case(name)
+                    }
+                    EntityType::Leader(leader) => leader.dimension_style.eq_ignore_ascii_case(name),
+                    EntityType::Tolerance(tolerance) => {
+                        tolerance.dimension_style_name.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                })
+        }
+        StyleKind::Linetype => doc.line_types.get(name).is_some_and(|linetype| {
+            crate::scene::linetype_service::LinetypeUsage::of(doc).contains(linetype)
+        }),
+        StyleKind::Table | StyleKind::MLeader | StyleKind::MLine => {
+            let Some(handle) = object_handle(doc, name, kind) else {
+                return false;
+            };
+            let is_current = match kind {
+                StyleKind::Table => doc
+                    .header
+                    .current_table_style_name
+                    .eq_ignore_ascii_case(name),
+                StyleKind::MLeader => {
+                    doc.header
+                        .current_mleader_style_name
+                        .eq_ignore_ascii_case(name)
+                        || active_mleader.eq_ignore_ascii_case(name)
+                }
+                StyleKind::MLine => doc.header.multiline_style.eq_ignore_ascii_case(name),
+                StyleKind::Text | StyleKind::Dim | StyleKind::Linetype => false,
+            };
+            is_current
+                || doc.entities().any(|entity| match (kind, entity) {
+                    (StyleKind::Table, EntityType::Table(table)) => {
+                        table.table_style_handle == Some(handle)
+                    }
+                    (StyleKind::MLeader, EntityType::MultiLeader(leader)) => {
+                        leader.style_handle == Some(handle)
+                    }
+                    (StyleKind::MLine, EntityType::MLine(line)) => {
+                        line.style_handle == Some(handle)
+                            || line.style_name.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                })
+        }
+    }
+}
+
+/// Removes the style named `name` from `doc`. Shared by the style
+/// managers' delete and by PURGE.
+pub(crate) fn remove_style(doc: &mut document::Document, kind: StyleKind, name: &str) -> bool {
+    match kind {
+        StyleKind::Text => doc.text_styles.remove(name).is_some(),
+        StyleKind::Dim => {
+            // Its family members (`NAME$0`, `$2`, ...) go with it.
+            let members: Vec<String> = doc
+                .dim_styles
+                .iter()
+                .filter(|style| {
+                    style.name.rsplit_once('$').is_some_and(|(parent, member)| {
+                        parent.eq_ignore_ascii_case(name)
+                            && !member.is_empty()
+                            && member.chars().all(|c| c.is_ascii_digit())
+                    })
+                })
+                .map(|style| style.name.clone())
+                .collect();
+            let removed = doc.dim_styles.remove(name).is_some();
+            if removed {
+                for member in members {
+                    doc.dim_styles.remove(&member);
+                }
+            }
+            removed
+        }
+        StyleKind::Linetype => {
+            use crate::scene::linetype_service as service;
+            match service::plan_delete(doc, name) {
+                Ok(linetype) => {
+                    service::apply_delete(doc, &linetype);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        StyleKind::Table | StyleKind::MLeader | StyleKind::MLine => {
+            let Some(h) = object_handle(doc, name, kind) else {
+                return false;
+            };
+            // A table style takes its starting table with it.
+            if let Some(ObjectType::TableStyle(style)) = doc.objects.get(&h) {
+                if let Some(template) = style.template() {
+                    remove_object(doc, template);
+                }
+            }
+            remove_object(doc, h)
+        }
+    }
+}
+
+/// Removes a non-graphical object and every dictionary entry naming it, so
+/// no dictionary is written with a pointer to an object that is gone.
+pub(crate) fn remove_object(doc: &mut document::Document, handle: Handle) -> bool {
+    for object in doc.objects.values_mut() {
+        if let ObjectType::Dictionary(dict) = object {
+            dict.entries.retain(|(_, h)| *h != handle);
+        }
+    }
+    doc.objects.remove(&handle).is_some()
+}
+
+fn object_handle(doc: &document::Document, name: &str, kind: StyleKind) -> Option<Handle> {
     doc.objects.iter().find_map(|(&h, o)| {
         let matches = match (kind, o) {
             (StyleKind::Table, ObjectType::TableStyle(s)) => s.name.eq_ignore_ascii_case(name),
@@ -1463,7 +1897,7 @@ impl OpenCADStudio {
 mod rename_follow_tests {
     // #42: renaming a text style must follow into dimstyle dimtxsty.
     use super::{OpenCADStudio, StyleKind};
-    use codec::tables::{DimStyle, TextStyle};
+    use document::tables::{DimStyle, TextStyle};
 
     #[test]
     fn text_rename_follows_dimtxsty() {

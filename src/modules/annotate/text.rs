@@ -1,6 +1,6 @@
-use codec::entities::{Text, TextHorizontalAlignment as HA, TextVerticalAlignment as VA};
-use codec::tables::TextStyle;
-use codec::types::Vector3;
+use document::entities::{Text, TextHorizontalAlignment as HA, TextVerticalAlignment as VA};
+use document::tables::TextStyle;
+use document::types::Vector3;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
@@ -198,7 +198,11 @@ impl TextCommand {
                     .any(|part| crate::io::xref_model::wildcard_match(&style.name, part.trim()))
             })
             .collect();
-        let width = listed.iter().map(|s| s.name.chars().count() + 2).max().unwrap_or(0);
+        let width = listed
+            .iter()
+            .map(|s| s.name.chars().count() + 2)
+            .max()
+            .unwrap_or(0);
         for style in listed {
             let name = format!("\"{}\"", style.name);
             let font = if style.true_type_font.trim().is_empty() {
@@ -392,6 +396,14 @@ impl CadCommand for TextCommand {
         "TEXT"
     }
 
+    fn point_rejection(&self) -> Option<String> {
+        match self.step {
+            Step::Height => Some(t!("Requires numeric distance or second point.").into_owned()),
+            Step::Rotation => Some(t!("Requires valid numeric angle or second point.").into_owned()),
+            _ => None,
+        }
+    }
+
     fn prompt(&self) -> String {
         let text = match self.step {
             Step::Start if self.justified => self.point_prompt(),
@@ -487,7 +499,10 @@ impl CadCommand for TextCommand {
             },
             Step::Justification => {
                 if !self.set_justification(&upper) {
-                    return Some(CmdResult::ReportError(crate::tr!("text-cmd", "invalid-keyword")));
+                    return Some(CmdResult::ReportError(crate::tr!(
+                        "text-cmd",
+                        "invalid-keyword"
+                    )));
                 }
                 self.justified = true;
                 self.step = Step::Start;

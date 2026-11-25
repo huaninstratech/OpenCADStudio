@@ -1,7 +1,7 @@
-use codec::entities::{Dimension, DimensionLinear};
-use codec::types::Vector3;
-use codec::EntityType;
-use kernel::geom2d::{closest_point, Circle as KernelCircle, Curve, Line as KernelLine};
+use document::entities::{Dimension, DimensionLinear};
+use document::types::Vector3;
+use document::EntityType;
+use ocs_geom::geom2d::{closest_point, Circle as KernelCircle, Curve, Line as KernelLine};
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview, InputKind,
@@ -87,8 +87,14 @@ pub struct LinearDimensionCommand {
     axis_mode: AxisMode,
     selecting_object: bool,
     picked_entity: Option<EntityType>,
-    source_handle: Option<codec::Handle>,
+    source_handle: Option<document::Handle>,
     mtext_override: bool,
+}
+
+impl Default for LinearDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LinearDimensionCommand {
@@ -152,6 +158,11 @@ impl CadCommand for LinearDimensionCommand {
         "DIMLINEAR"
     }
 
+    /// A dimension's point prompts refuse unusable input this way (measured).
+    fn point_rejection(&self) -> Option<String> {
+        Some(t!("Invalid point input.").into_owned())
+    }
+
     fn set_working_plane(&mut self, plane: WorkingPlane) {
         self.plane = plane;
     }
@@ -179,7 +190,7 @@ impl CadCommand for LinearDimensionCommand {
         }
         match self.step {
             Step::FirstPoint => {
-                t!("DIMLINEAR  Specify first extension line origin or press Enter to select object:")
+                t!("DIMLINEAR  Specify first extension line origin or <select object>:")
                     .into_owned()
             }
             Step::SecondPoint(_) => {
@@ -391,7 +402,7 @@ impl CadCommand for LinearDimensionCommand {
         self.picked_entity = Some(entity);
     }
 
-    fn on_entity_pick(&mut self, handle: codec::Handle, point: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: document::Handle, point: DVec3) -> CmdResult {
         let Some(entity) = self.picked_entity.take() else {
             return CmdResult::NeedPoint;
         };

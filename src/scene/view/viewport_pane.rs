@@ -20,7 +20,7 @@ pub struct ViewportPane<'a> {
     /// Render mode applied to the active Model tile or active paper viewport.
     /// The app may supply a temporary gallery-hover mode; inactive viewports
     /// keep the values stored on their own tile/entity.
-    pub render_mode: codec::entities::ViewportRenderMode,
+    pub render_mode: document::entities::ViewportRenderMode,
     /// `Some(tile_idx)` → this widget renders a single Model pane (one shader
     /// per `pane_grid` pane, filling its own bounds). `None` → the unified
     /// full-canvas path (paper layout, or the whole-canvas Model fallback).
@@ -35,7 +35,7 @@ impl<'a> ViewportPane<'a> {
         scene: &'a Scene,
         show_viewcube: bool,
         show_interaction: bool,
-        render_mode: codec::entities::ViewportRenderMode,
+        render_mode: document::entities::ViewportRenderMode,
         viewcube_text_color: [f32; 4],
     ) -> Self {
         Self {
@@ -54,7 +54,7 @@ impl<'a> ViewportPane<'a> {
         scene: &'a Scene,
         show_viewcube: bool,
         show_interaction: bool,
-        render_mode: codec::entities::ViewportRenderMode,
+        render_mode: document::entities::ViewportRenderMode,
         tile_idx: usize,
         viewcube_text_color: [f32; 4],
     ) -> Self {
@@ -134,6 +134,29 @@ impl<'a, Msg: std::fmt::Debug + Clone> shader::Program<Msg> for ViewportPane<'a>
             self.scene.viewcube_mouse_interaction(state)
         } else {
             mouse::Interaction::default()
+        }
+    }
+}
+
+/// A Start-tab primitive lets the existing renderer reclaim the closed
+/// document's GPU slots even when there is no drawing viewport to prepare.
+pub(crate) struct ReleaseClosedViewports;
+
+impl<Msg> shader::Program<Msg> for ReleaseClosedViewports {
+    type State = ();
+    type Primitive = Primitive;
+
+    fn draw(&self, _: &(), _: mouse::Cursor, _: Rectangle) -> Primitive {
+        Primitive {
+            scene_owner: std::sync::Weak::new(),
+            viewports: Vec::new(),
+            bg_color: [0.0; 4],
+            viewcube_text_color: [0.0; 4],
+            selection_color: [0.0; 4],
+            selection_effect: false,
+            selection_widen: 0.0,
+            nav_perf: None,
+            geometry_epoch: 0,
         }
     }
 }

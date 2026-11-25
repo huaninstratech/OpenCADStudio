@@ -37,7 +37,7 @@ impl UnitContext {
     /// The settings as this drawing holds them. Every place that formats or
     /// reads a number seeds the context from here, so none of them can be
     /// working from a different idea of the drawing's conventions.
-    pub fn from_header(header: &codec::document::HeaderVariables) -> Self {
+    pub fn from_header(header: &document::document::HeaderVariables) -> Self {
         Self {
             lunits: header.linear_unit_format,
             luprec: header.linear_unit_precision,
@@ -80,7 +80,7 @@ thread_local! {
 }
 
 /// Record which text styles fix their height, from the drawing's style table.
-pub fn set_fixed_text_heights(document: &codec::Document) {
+pub fn set_fixed_text_heights(document: &document::Document) {
     FIXED_TEXT_HEIGHTS.with(|cell| {
         let mut map = cell.borrow_mut();
         map.clear();
@@ -187,10 +187,11 @@ fn format_signed_length(value: f64) -> String {
             }
         }
         4 | 5 => {
-            // Architectural and fractional formats use 1/64-inch resolution.
+            // Architectural and fractional read LUPREC as the power of two
+            // of the smallest fraction: 4 rounds to 1/16, 8 to 1/256.
             let sign = if value < 0.0 { "-" } else { "" };
             let abs = value.abs();
-            let denom = 64.0;
+            let denom = 2f64.powi(ctx.luprec.clamp(0, 8) as i32);
             let ticks = (abs * denom).round();
             let (feet, rest) = if ctx.lunits == 4 {
                 let per_foot = 12.0 * denom;
@@ -201,7 +202,7 @@ fn format_signed_length(value: f64) -> String {
             let whole = (rest / denom).floor();
             let mut n = (rest - whole * denom).round() as u64;
             let mut d = denom as u64;
-            while d > 1 && n % 2 == 0 && d % 2 == 0 {
+            while d > 1 && n.is_multiple_of(2) && d.is_multiple_of(2) {
                 n /= 2;
                 d /= 2;
             }
@@ -229,7 +230,11 @@ fn format_signed_length(value: f64) -> String {
 fn fixed(value: f64, precision: usize) -> String {
     let scale = 10f64.powi(precision as i32);
     let rounded = (value * scale).round() / scale;
-    format!("{:.*}", precision, if rounded.is_finite() { rounded } else { value })
+    format!(
+        "{:.*}",
+        precision,
+        if rounded.is_finite() { rounded } else { value }
+    )
 }
 
 /// Drop the trailing zeros of a decimal (and a bare point) when DIMZIN asks
@@ -766,6 +771,43 @@ pub fn num_prop(label: &str, field: &'static str, value: f64, editable: bool) ->
     }
 }
 
+/// Height row for a text or attribute entity. When its text style fixes a
+/// non-zero height, the row is read-only with a tooltip explaining how to make
+/// it editable (set the style height to 0 in STYLE or choose another style).
+pub fn text_height_prop(
+    label: &str,
+    field: &'static str,
+    height: f64,
+    style: &str,
+    editable_when_unfixed: bool,
+) -> Property {
+    if style_fixed_height(style).is_some() {
+        let style_name = style.trim();
+        let tooltip = if style_name.is_empty() {
+            crate::t!(
+                "Height is fixed by the text style. Set the style height to 0 in STYLE or choose another style to edit."
+            )
+            .into_owned()
+        } else {
+            crate::tf!(
+                "Height is fixed by text style \"{style}\". Set the style height to 0 in STYLE or choose another style to edit.",
+                style = style_name
+            )
+            .into_owned()
+        };
+        Property {
+            label: label.into(),
+            field,
+            value: PropValue::ReadOnlyWithTooltip {
+                value: format_length(height),
+                tooltip,
+            },
+        }
+    } else {
+        num_prop(label, field, height, editable_when_unfixed)
+    }
+}
+
 /// A ◀ / ▶ index navigator row (e.g. a polyline's Current Vertex). `display` is
 /// the label shown between the arrows (e.g. "2 / 7").
 pub fn stepper_prop(label: &str, field: &'static str, display: impl Into<String>) -> Property {
@@ -843,7 +885,7 @@ fn parse_angle_deg_unbounded(value: &str) -> Option<f64> {
 /// Re-exported rather than imported at each call site so the twelve modules
 /// that already reach for `entities::common::BulgeArc` keep working, and so
 /// there is one obvious place to see that the maths moved out.
-pub use kernel::geom2d::BulgeArc;
+pub use ocs_geom::geom2d::BulgeArc;
 
 /// Convert a 2D BulgeArc into a 3D TangentGeom::Arc with its world center,
 /// plane axes, radius, and counter-clockwise start/end sweep angles.
@@ -885,7 +927,7 @@ pub fn bulge_arc_to_tangent(
 /// Falls back to `triangulate_planar` if the vertex count is odd or less than 4.
 pub(crate) fn triangulate_band_ring(ring: &[[f64; 3]]) -> Vec<[f64; 3]> {
     let n = ring.len();
-    if n >= 4 && n % 2 == 0 {
+    if n >= 4 && n.is_multiple_of(2) {
         let m = n / 2;
         let mut tris = Vec::with_capacity((m - 1) * 6);
         for j in 0..m - 1 {
@@ -1042,7 +1084,7 @@ pub(crate) fn tapered_band_points(
         if bulge.abs() < 1e-9 {
             push(Some((p1[0], p1[1])), ew0 as f32);
         } else if let Some(arc) = BulgeArc::from_bulge(p0, p1, bulge) {
-            let samples = arc.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+            let samples = arc.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE);
             let segments = samples.len().saturating_sub(1).max(1);
             for (index, s) in samples.into_iter().enumerate().skip(1) {
                 let t = index as f64 / segments as f64;
@@ -1068,10 +1110,10 @@ pub(crate) fn wide_band_outline(
     restart_per_segment: bool,
     to_wcs: &dyn Fn(f64, f64) -> (f64, f64, f64),
 ) -> WideBandOutline {
-    let source = kernel::geom2d::Polyline {
+    let source = ocs_geom::geom2d::Polyline {
         vertices: verts
             .iter()
-            .map(|(position, bulge, _, _)| kernel::geom2d::PolylineVertex {
+            .map(|(position, bulge, _, _)| ocs_geom::geom2d::PolylineVertex {
                 position: *position,
                 bulge: *bulge,
             })
@@ -1088,10 +1130,10 @@ pub(crate) fn wide_band_outline(
         .take(segment_count)
         .map(|(_, _, start, end)| [*start, *end])
         .collect();
-    let boundary = kernel::geom2d::polyline_band_boundary(
+    let boundary = ocs_geom::geom2d::polyline_band_boundary(
         &source,
         &widths,
-        kernel::tessellation::DEFAULT_ANGLE,
+        ocs_geom::tessellation::DEFAULT_ANGLE,
     );
     let mut points = Vec::new();
     let mut stations = Vec::new();
@@ -1314,8 +1356,8 @@ pub(crate) fn polyline_segment_fill(
         let sign = b.signum();
         let cx = (mx + sign * d_perp * perp_x) as f32;
         let cy = (my + sign * d_perp * perp_y) as f32;
-        let a0 = ((p0[1] - cy) as f32).atan2((p0[0] - cx) as f32);
-        let a1 = ((p1[1] - cy) as f32).atan2((p1[0] - cx) as f32);
+        let a0 = (p0[1] - cy).atan2(p0[0] - cx);
+        let a1 = (p1[1] - cy).atan2(p1[0] - cx);
         let (sa, mut ea) = if bulge > 0.0 { (a0, a1) } else { (a1, a0) };
         if ea < sa {
             ea += std::f32::consts::TAU;
@@ -1375,25 +1417,25 @@ mod length_format_tests {
 
     #[test]
     fn fractional_carries_a_rounded_up_fraction() {
-        assert_eq!(with_units(5, 4, 5.99), "5 63/64");
-        assert_eq!(with_units(5, 4, 5.995), "6");
-        assert_eq!(with_units(5, 4, 0.995), "1");
-        assert_eq!(with_units(5, 4, 11.999), "12");
-        assert_eq!(with_units(5, 4, -5.995), "-6");
-        assert_eq!(with_units(5, 4, 0.5), "0 1/2");
-        assert_eq!(with_units(5, 4, 9.25), "9 1/4");
-        assert_eq!(with_units(5, 4, 3.0e17), "300000000000000000");
+        assert_eq!(with_units(5, 6, 5.99), "5 63/64");
+        assert_eq!(with_units(5, 6, 5.995), "6");
+        assert_eq!(with_units(5, 6, 0.995), "1");
+        assert_eq!(with_units(5, 6, 11.999), "12");
+        assert_eq!(with_units(5, 6, -5.995), "-6");
+        assert_eq!(with_units(5, 6, 0.5), "0 1/2");
+        assert_eq!(with_units(5, 6, 9.25), "9 1/4");
+        assert_eq!(with_units(5, 6, 3.0e17), "300000000000000000");
     }
 
     #[test]
     fn architectural_carries_into_feet() {
-        assert_eq!(with_units(4, 4, 11.99), "11 63/64\"");
-        assert_eq!(with_units(4, 4, 0.5), "0 1/2\"");
-        assert_eq!(with_units(4, 4, -9.25), "-9 1/4\"");
-        assert_eq!(with_units(4, 4, 11.999), "1'-0\"");
-        assert_eq!(with_units(4, 4, 23.999), "2'-0\"");
-        assert_eq!(with_units(4, 4, 66.5), "5'-6 1/2\"");
-        assert_eq!(with_units(4, 4, -11.999), "-1'-0\"");
+        assert_eq!(with_units(4, 6, 11.99), "11 63/64\"");
+        assert_eq!(with_units(4, 6, 0.5), "0 1/2\"");
+        assert_eq!(with_units(4, 6, -9.25), "-9 1/4\"");
+        assert_eq!(with_units(4, 6, 11.999), "1'-0\"");
+        assert_eq!(with_units(4, 6, 23.999), "2'-0\"");
+        assert_eq!(with_units(4, 6, 66.5), "5'-6 1/2\"");
+        assert_eq!(with_units(4, 6, -11.999), "-1'-0\"");
     }
 
     #[test]
@@ -1411,7 +1453,7 @@ mod length_format_tests {
     fn formatted_lengths_read_back() {
         for lunits in [3, 4, 5] {
             for value in [0.995f64, 5.995, 11.999, 23.999, 66.5, 9.25] {
-                let shown = with_units(lunits, if lunits == 3 { 4 } else { 4 }, value);
+                let shown = with_units(lunits, 4, value);
                 let read = parse_length(&shown).unwrap_or_else(|| {
                     panic!("lunits {lunits} wrote {shown:?}, which does not read back")
                 });
@@ -1581,12 +1623,22 @@ mod negative_zero_format_tests {
 /// reference shows it.
 pub(crate) fn enabled_choice(on: bool) -> crate::scene::model::object::PropValue {
     crate::scene::model::object::PropValue::Choice {
-        selected: if on { crate::t!("Enabled") } else { crate::t!("Disabled") }.into_owned(),
-        options: vec![crate::t!("Enabled").into_owned(), crate::t!("Disabled").into_owned()],
+        selected: if on {
+            crate::t!("Enabled")
+        } else {
+            crate::t!("Disabled")
+        }
+        .into_owned(),
+        options: vec![
+            crate::t!("Enabled").into_owned(),
+            crate::t!("Disabled").into_owned(),
+        ],
     }
 }
 
 /// Reads an Enabled / Disabled (or true / false) choice back.
 pub(crate) fn enabled_value(value: &str) -> bool {
-    value == "true" || value.eq_ignore_ascii_case("enabled") || value == crate::t!("Enabled").as_ref()
+    value == "true"
+        || value.eq_ignore_ascii_case("enabled")
+        || value == crate::t!("Enabled").as_ref()
 }

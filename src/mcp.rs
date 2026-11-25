@@ -4,9 +4,9 @@
 //! to the authenticated GUI control bridge; this module contains no geometry.
 
 use crate::mcp_ops::{batch_bindings, validate_execute_request};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(any(windows, target_os = "macos"))]
 use std::collections::HashSet;
@@ -45,8 +45,28 @@ const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// `table_cell_warning`, `table_cell_tab` and `command_submit`.
 /// `set_properties` lists its `name` selector and takes a colour as a
 /// number or `{"rgb":[r,g,b]}`, which its example shows on a layer.
+/// `command_escape` presses Esc once, where `cancel` ends the command.
+/// The Block Definition dialog is driveable from a script: its `block_def_dialog`
+/// fields cover mode, annotative, orientation, uniform scale, exploding, unit,
+/// description and hyperlink. `dialog_ok`, `dialog_discard` and `dialog_cancel`
+/// now answer the dirty-close (`BlockEditChanges`) prompt; the Write Block
+/// dialog is driveable from a script: `wblock_dialog` fields cover source,
+/// block, base point, unit, object mode and path, and `dialog_ok` applies it.
+/// Native dock panels are driven through `panel_input` and `panel_button`:
+/// form-only input, then the declared synchronous document-bound command.
+/// The attribute form pages fifteen rows at a time: `dialog_page`.
+/// Layout list/read operations joined the read facade; rename, activate and
+/// delete joined layout creation and page-setup writes in the execute facade.
+/// Atomic entity common-property writes and direct DGN import joined execute.
+/// Fresh xref reads joined the read facade; six direct-reference lifecycle
+/// writes joined execute with operation-local unknown-field rejection.
+/// The Text Editor tab's windows are driveable from a script: `mtext_dialog`.
+/// The enhanced attribute editor joined them: `attr_editor`.
+/// Find and Replace is driveable from a script: `find_replace_dialog`.
+/// `save` describes its `target_version` as the DWG version.
+/// `ocs_capture` / `ocs_render` gained `layout`, `aspect_fit`, and `renderer` (`document_id` on `ocs_capture`) for headless off-screen capture.
 #[cfg(test)]
-const TOOL_SCHEMA_DIGEST: &str = "1905d2a2aec5fd0c4054794404ed797ba107a7558ccc3392eea9a327dd0c2f34";
+const TOOL_SCHEMA_DIGEST: &str = "b6f40c032594c2626b6eeb04d4eb0c1532c3722a3d2dca3368ee5b73983ec3cc";
 const MAX_REQUEST: usize = 1_048_576;
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 3_600_000;
@@ -54,11 +74,13 @@ const CACHE_TTL_MS: u64 = 3_600_000;
 /// land. Tools and discovery are static by comparison, so they keep the hour.
 const RESOURCE_TTL_MS: u64 = 60_000;
 const TASK_TTL_MS: u64 = 3_600_000;
-pub(crate) const INSTRUCTIONS: &str = "Prefer intent tools: ocs_inspect, ocs_query, ocs_run, ocs_new/open/save, ocs_render. Use ocs_read/ocs_execute for advanced work and explicit envelopes. ocs_session_id is optional with one session. Intent calls need no request_id, but reuse one to retry a mutation; after an uncertain outcome query the operation, and never replay a mutation with a new id. Read capabilities and record_schema before unfamiliar ops; use entity_schema for creation, validate for preflight. Preserve document_id and revision from state. running/waiting_input are not completion: follow state.command.accepts, options, input_example. Let the geometry kernel do the math. Before delivery audit the target format/version, then save_verified or ocs_save_verified to an absolute path. Announce the bridge build on connection and change. For batches use response_detail: summary; bindings reuse earlier results. Read guides via cad://guides/{name} or ocs_read op: guide, parameters.name: workflow, architecture, capture, batch-bindings. Read architecture before floorplan vectorization; capture before visual verification.";
+pub(crate) const INSTRUCTIONS: &str = "Prefer intent tools: ocs_inspect, ocs_query, ocs_run, ocs_new/open/save, ocs_render. Inspect and drive plugin panel surfaces with ocs_panels and ocs_panel_action. Use ocs_read/ocs_execute for advanced work and explicit envelopes. ocs_session_id is optional with one session. Intent calls need no request_id, but reuse one to retry a mutation; after an uncertain outcome query the operation, and never replay a mutation with a new id. Read capabilities and record_schema before unfamiliar ops; use entity_schema for creation, validate for preflight. Preserve document_id and revision from state. running/waiting_input are not completion: follow state.command.accepts, options, input_example. Let the geometry kernel do the math. Before delivery audit the target format/version, then save_verified or ocs_save_verified to an absolute path. Announce the bridge build on connection and change. For batches use response_detail: summary; bindings reuse earlier results. Read guides via cad://guides/{name} or ocs_read op: guide, parameters.name: workflow, architecture, capture, plugin-panels, batch-bindings. Read architecture before floorplan vectorization; capture before visual verification.";
 const READ_OPS: &[&str] = &[
     "state",
     "hello",
     "query",
+    "civil_station_offset",
+    "civil_surface_stats",
     "records",
     "record_schema",
     "capabilities",
@@ -66,6 +88,9 @@ const READ_OPS: &[&str] = &[
     "entities",
     "blocks",
     "layers",
+    "layouts",
+    "xrefs",
+    "page_setup_get",
     "header",
     "properties",
     "measure",
@@ -84,7 +109,9 @@ const READ_OPS: &[&str] = &[
     "text_search",
     "text_audit",
     "keytips",
+    "plugins",
     "capture",
+    "plugin_panels",
 ];
 const EXECUTE_OPS: &[&str] = &[
     "new",
@@ -103,11 +130,23 @@ const EXECUTE_OPS: &[&str] = &[
     "click",
     "pointer",
     "set_properties",
+    "panel_input",
+    "panel_button",
+    "panel_action",
+    "plugin_panel_action",
     "action",
     "embed_image",
+    "dgn_import",
     "wblock",
     "plot",
     "entities_create",
+    "entities_set",
+    "xref_reload",
+    "xref_unload",
+    "xref_detach",
+    "xref_bind",
+    "xref_set_path",
+    "xref_set_type",
     "entities_delete",
     "entities_transform",
     "node_graph",
@@ -124,7 +163,11 @@ const EXECUTE_OPS: &[&str] = &[
     "getpoint",
     "close",
     "sysvar",
+    "plugin_call",
     "layout_create",
+    "layout_rename",
+    "layout_activate",
+    "layout_delete",
     "page_setup_set",
     "file_identity",
     "save",
@@ -354,7 +397,7 @@ fn is_cancel_for(line: &str, mkey: &str) -> bool {
     message
         .get("params")
         .and_then(|params| params.get("requestId"))
-        .is_some_and(|id| id.to_string() == mkey)
+        .is_some_and(|id| mcp_key(id) == mkey)
 }
 
 fn wait_deadline(op: &str, wait_seconds: f64) -> Duration {
@@ -450,6 +493,39 @@ struct CachedSnapshot {
     metadata: Value,
 }
 
+fn encode_uri_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_uri_segment(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            let val = u8::from_str_radix(hex, 16).ok()?;
+            out.push(val);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[derive(Default)]
 struct ResourceStore {
     snapshots: HashMap<String, CachedSnapshot>,
@@ -458,6 +534,7 @@ struct ResourceStore {
     tiles: HashMap<String, CachedSnapshot>,
     tile_order: VecDeque<String>,
     pyramid_manifests: HashMap<String, Value>,
+    layout_manifests: HashMap<(String, String), Value>,
 }
 
 const MAX_STORED_SNAPSHOTS: usize = 32;
@@ -471,6 +548,18 @@ impl ResourceStore {
         data_base64: String,
         bytes_len: usize,
         metadata: Value,
+    ) -> String {
+        self.insert_with_latest(session_id, hash, data_base64, bytes_len, metadata, true)
+    }
+
+    fn insert_with_latest(
+        &mut self,
+        session_id: &str,
+        hash: &str,
+        data_base64: String,
+        bytes_len: usize,
+        metadata: Value,
+        update_latest: bool,
     ) -> String {
         let uri = format!("cad://session/{session_id}/snapshot/{hash}.png");
         let now = iso8601_now();
@@ -493,25 +582,25 @@ impl ResourceStore {
             self.order.push_back(uri.clone());
         }
         self.snapshots.insert(uri.clone(), snapshot);
-        self.latest.insert(session_id.to_string(), uri.clone());
+        if update_latest {
+            self.latest.insert(session_id.to_string(), uri.clone());
+        }
         uri
     }
 
-    fn insert_tile(
+    fn insert_tile_entry(
         &mut self,
         session_id: &str,
-        level: u32,
-        x: u32,
-        y: u32,
+        uri: String,
+        hash: String,
         data_base64: String,
         bytes_len: usize,
         metadata: Value,
     ) -> String {
-        let uri = format!("cad://session/{session_id}/tile/{level}/{x}/{y}.png");
         let now = iso8601_now();
         let snapshot = CachedSnapshot {
             session_id: session_id.to_string(),
-            hash: format!("tile-{level}-{x}-{y}"),
+            hash,
             created_at: now,
             mime_type: "image/png".to_string(),
             data_base64,
@@ -531,11 +620,97 @@ impl ResourceStore {
         uri
     }
 
+    fn insert_tile(
+        &mut self,
+        session_id: &str,
+        level: u32,
+        x: u32,
+        y: u32,
+        data_base64: String,
+        bytes_len: usize,
+        metadata: Value,
+    ) -> String {
+        let uri = format!("cad://session/{session_id}/tile/{level}/{x}/{y}.png");
+        let hash = format!("tile-{level}-{x}-{y}");
+        self.insert_tile_entry(session_id, uri, hash, data_base64, bytes_len, metadata)
+    }
+
+    fn tile_uri_for(session_id: &str, layout: Option<&str>, level: u32, x: u32, y: u32) -> String {
+        match layout.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(lay) => {
+                let enc = encode_uri_segment(lay);
+                format!("cad://session/{session_id}/layout/{enc}/tile/{level}/{x}/{y}.png")
+            }
+            None => format!("cad://session/{session_id}/tile/{level}/{x}/{y}.png"),
+        }
+    }
+
+    fn manifest_uri_for(session_id: &str, layout: Option<&str>) -> String {
+        match layout.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(lay) => {
+                let enc = encode_uri_segment(lay);
+                format!("cad://session/{session_id}/layout/{enc}/pyramid/manifest.json")
+            }
+            None => format!("cad://session/{session_id}/pyramid/manifest.json"),
+        }
+    }
+
+    fn insert_tile_for_layout(
+        &mut self,
+        session_id: &str,
+        layout: Option<&str>,
+        level: u32,
+        x: u32,
+        y: u32,
+        data_base64: String,
+        bytes_len: usize,
+        metadata: Value,
+    ) -> String {
+        match layout.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(lay) => {
+                let enc = encode_uri_segment(lay);
+                let uri = Self::tile_uri_for(session_id, Some(lay), level, x, y);
+                let hash = format!("tile-{enc}-{level}-{x}-{y}");
+                self.insert_tile_entry(session_id, uri, hash, data_base64, bytes_len, metadata)
+            }
+            None => self.insert_tile(session_id, level, x, y, data_base64, bytes_len, metadata),
+        }
+    }
+
     fn insert_pyramid_manifest(&mut self, session_id: &str, manifest: Value) -> String {
         let uri = format!("cad://session/{session_id}/pyramid/manifest.json");
         self.pyramid_manifests
             .insert(session_id.to_string(), manifest);
         uri
+    }
+
+    fn insert_layout_manifest(
+        &mut self,
+        session_id: &str,
+        layout: &str,
+        mut manifest: Value,
+    ) -> String {
+        let enc = encode_uri_segment(layout);
+        let uri = Self::manifest_uri_for(session_id, Some(layout));
+        if let Some(obj) = manifest.as_object_mut() {
+            obj.insert("layout".into(), Value::String(layout.to_string()));
+            obj.insert(
+                "tile_uri_template".into(),
+                Value::String(format!(
+                    "cad://session/{session_id}/layout/{enc}/tile/{{level}}/{{x}}/{{y}}.png"
+                )),
+            );
+        }
+        self.layout_manifests.insert(
+            (session_id.to_string(), layout.to_ascii_lowercase()),
+            manifest,
+        );
+        uri
+    }
+
+    fn get_layout_manifest(&self, session_id: &str, layout: &str) -> Option<&Value> {
+        self.layout_manifests
+            .get(&(session_id.to_string(), layout.to_ascii_lowercase()))
     }
 
     fn get_by_uri(&self, uri: &str) -> Option<&CachedSnapshot> {
@@ -571,6 +746,26 @@ impl ResourceStore {
                 "description": format!("Multiscale DeepZoom pyramidal tiling manifest for session {session_id}."),
                 "mimeType": "application/json"
             }));
+            let mut session_layouts: Vec<(&str, &Value)> = self
+                .layout_manifests
+                .iter()
+                .filter_map(|((sess, key_layout), manifest)| {
+                    (sess == session_id).then_some((key_layout.as_str(), manifest))
+                })
+                .collect();
+            session_layouts.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (key_layout, manifest) in session_layouts {
+                let layout_name = manifest
+                    .get("layout")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key_layout);
+                list.push(json!({
+                    "uri": Self::manifest_uri_for(session_id, Some(layout_name)),
+                    "name": format!("Layout Pyramid Manifest ({session_id}: {layout_name})"),
+                    "description": format!("Multiscale DeepZoom pyramidal tiling manifest for session {session_id}, layout {layout_name}."),
+                    "mimeType": "application/json"
+                }));
+            }
             if let Some(latest_uri) = self.latest.get(session_id) {
                 if let Some(snap) = self.snapshots.get(latest_uri) {
                     list.push(json!({
@@ -1382,6 +1577,12 @@ impl GuiClient {
             batch.results.push(compact);
             batch.next += 1;
 
+            // Nothing ran: forget the batch so the same request_id can retry
+            // against the state this reply just refreshed (#2488).
+            if stale_before_first_step(&batch, &response) {
+                return Ok(batch_result(&batch, "failed", false));
+            }
+
             if response["ok"].as_bool() == Some(false)
                 || matches!(response["status"].as_str(), Some("failed" | "cancelled"))
             {
@@ -1410,6 +1611,33 @@ impl GuiClient {
             }
         }
     }
+}
+
+/// `stale_state` on a batch's first step: the GUI refused before running
+/// anything. On a later step, earlier steps have already run.
+fn stale_before_first_step(batch: &BatchExecution, response: &Value) -> bool {
+    batch.next == 1 && response["code"] == "stale_state"
+}
+
+/// A fresh `state` for each held connection, so an idle one is not left stale.
+/// A connection whose active document changed keeps its state: the bridge
+/// must not silently retarget its next edit.
+fn refresh_client_states(clients: &mut HashMap<String, GuiClient>) {
+    for client in clients.values_mut() {
+        if let Ok(state) = exchange(
+            &client.descriptor,
+            json!({"op":"state"}),
+            Duration::from_secs(5),
+        ) {
+            if adopt_refreshed_state(&client.state, &state) {
+                client.state = state;
+            }
+        }
+    }
+}
+
+fn adopt_refreshed_state(current: &Value, fresh: &Value) -> bool {
+    fresh["ok"] == true && fresh["document_id"] == current["document_id"]
 }
 
 fn batch_step_id(id: &str, step: usize) -> String {
@@ -1732,6 +1960,11 @@ const GUIDES: &[(&str, &str, &str)] = &[
         include_str!("../docs/automation/guides/capture.md"),
     ),
     (
+        "plugin-panels",
+        "Plugin panel surfaces",
+        include_str!("../docs/automation/guides/plugin-panels.md"),
+    ),
+    (
         "batch-bindings",
         "Dependent batch steps",
         include_str!("../docs/automation/batch-bindings.md"),
@@ -1750,6 +1983,168 @@ fn guide_resource(name: &str) -> Result<Value, String> {
     Ok(
         json!({"contents":[{"uri":format!("cad://guides/{name}"),"mimeType":"text/markdown","text":text}]}),
     )
+}
+
+fn parse_tile_subpath(trimmed: &str) -> Option<(u32, u32, u32, bool)> {
+    let is_json = trimmed.ends_with(".json");
+    let core = trimmed.trim_end_matches(".png").trim_end_matches(".json");
+    let parts: Vec<&str> = core.split('/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let level = parts[0].parse::<u32>().ok()?;
+    let x = parts[1].parse::<u32>().ok()?;
+    let y = parts[2].parse::<u32>().ok()?;
+    Some((level, x, y, is_json))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_tile_resource(
+    uri: &str,
+    session_id: &str,
+    layout_opt: Option<&str>,
+    level: u32,
+    x: u32,
+    y: u32,
+    is_json: bool,
+    clients: &mut HashMap<String, GuiClient>,
+    resources: &mut ResourceStore,
+    pump: &mut CancelPump,
+    mcp_id: Option<&Value>,
+) -> Result<Value, String> {
+    let png_uri = ResourceStore::tile_uri_for(session_id, layout_opt, level, x, y);
+    if is_json {
+        if let Some(tile_snap) = resources.tiles.get(&png_uri) {
+            let meta_text = serde_json::to_string_pretty(&tile_snap.metadata)
+                .unwrap_or_else(|_| tile_snap.metadata.to_string());
+            return Ok(json!({
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": meta_text
+                    }
+                ]
+            }));
+        }
+    }
+    if let Some(tile_snap) = resources.tiles.get(&png_uri) {
+        return Ok(json!({
+            "contents": [
+                {
+                    "uri": png_uri,
+                    "mimeType": "image/png",
+                    "blob": tile_snap.data_base64
+                }
+            ]
+        }));
+    }
+
+    let manifest = match layout_opt {
+        Some(lay) => Some(resources.get_layout_manifest(session_id, lay).ok_or_else(|| {
+            format!("No cached pyramid manifest for layout '{lay}'; capture layout '{lay}' first")
+        })?),
+        None => resources.pyramid_manifests.get(session_id),
+    };
+    let manifest_layout = layout_opt
+        .or_else(|| {
+            manifest
+                .and_then(|m| m.get("layout"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+    let manifest_renderer = manifest
+        .and_then(|m| m.get("renderer"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let base_bounds = match manifest {
+        Some(m) => m
+            .get("world_bounds")
+            .and_then(Value::as_array)
+            .and_then(|arr| bounds_from_array(arr, true))
+            .ok_or_else(|| "Cached pyramid manifest is missing valid world_bounds".to_string())?,
+        None => [-100.0, -100.0, 100.0, 100.0],
+    };
+
+    let tile_bounds = crate::app::control::vision::compute_tile_bounds(base_bounds, level, x, y)?;
+    let path = std::env::temp_dir().join(format!(
+        "ocs-tile-{session_id}-{}-{level}-{x}-{y}.png",
+        layout_opt
+            .map(encode_uri_segment)
+            .unwrap_or_else(|| "active".to_string())
+    ));
+    let mut req = json!({
+        "op": "capture",
+        "path": path.to_string_lossy(),
+        "scope": "viewport",
+        "view": "region",
+        "bounds": tile_bounds,
+        "max_dimension": 512,
+    });
+    if let Some(ref lay) = manifest_layout {
+        req["layout"] = json!(lay);
+        req["aspect_fit"] = json!(true);
+    }
+    if let Some(ref rend) = manifest_renderer {
+        req["renderer"] = json!(rend);
+    }
+
+    let result = client(clients, session_id)?.request(req, 20.0, pump, mcp_id)?;
+    if result["ok"].as_bool() != Some(true) || result["status"].as_str() != Some("completed") {
+        return Err(result.to_string());
+    }
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(path);
+    let b64 = BASE64.encode(&bytes);
+    let bytes_len = bytes.len();
+    let manifest_uri = ResourceStore::manifest_uri_for(session_id, layout_opt);
+    let mut meta = result.get("result").cloned().unwrap_or_else(|| json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.remove("path");
+        obj.insert("uri".into(), Value::String(png_uri.clone()));
+        obj.insert(
+            "pyramid".into(),
+            json!({
+                "level": level,
+                "x": x,
+                "y": y,
+                "tile_world_bounds": tile_bounds,
+                "tile_uri": png_uri,
+                "manifest_uri": manifest_uri,
+            }),
+        );
+    }
+    resources.insert_tile_for_layout(
+        session_id,
+        layout_opt,
+        level,
+        x,
+        y,
+        b64.clone(),
+        bytes_len,
+        meta.clone(),
+    );
+    if is_json {
+        let meta_text = serde_json::to_string_pretty(&meta).unwrap_or_else(|_| meta.to_string());
+        return Ok(json!({
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": meta_text
+                }
+            ]
+        }));
+    }
+    Ok(json!({
+        "contents": [
+            {
+                "uri": png_uri,
+                "mimeType": "image/png",
+                "blob": b64
+            }
+        ]
+    }))
 }
 
 fn read_resource(
@@ -1854,138 +2249,55 @@ fn read_resource(
                         }
                     ]
                 }));
-            } else if subpath.starts_with("tile/") {
-                let trimmed = subpath.strip_prefix("tile/").unwrap_or("");
-                let is_json = trimmed.ends_with(".json");
-                let core = trimmed.trim_end_matches(".png").trim_end_matches(".json");
-                let parts: Vec<&str> = core.split('/').collect();
-                if parts.len() == 3 {
-                    if let (Ok(level), Ok(x), Ok(y)) = (
-                        parts[0].parse::<u32>(),
-                        parts[1].parse::<u32>(),
-                        parts[2].parse::<u32>(),
-                    ) {
-                        let png_uri =
-                            format!("cad://session/{session_id}/tile/{level}/{x}/{y}.png");
-                        if is_json {
-                            if let Some(tile_snap) = resources.tiles.get(&png_uri) {
-                                let meta_text = serde_json::to_string_pretty(&tile_snap.metadata)
-                                    .unwrap_or_else(|_| tile_snap.metadata.to_string());
-                                return Ok(json!({
-                                    "contents": [
-                                        {
-                                            "uri": uri,
-                                            "mimeType": "application/json",
-                                            "text": meta_text
-                                        }
-                                    ]
-                                }));
-                            }
-                        }
-
-                        if let Some(tile_snap) = resources.tiles.get(&png_uri) {
-                            return Ok(json!({
-                                "contents": [
-                                    {
-                                        "uri": png_uri,
-                                        "mimeType": "image/png",
-                                        "blob": tile_snap.data_base64
-                                    }
-                                ]
-                            }));
-                        }
-
-                        let mut base_bounds = [-100.0, -100.0, 100.0, 100.0];
-                        if let Some(manifest) = resources.pyramid_manifests.get(session_id) {
-                            if let Some(arr) =
-                                manifest.get("world_bounds").and_then(Value::as_array)
+            } else if let Some(layout_rest) = subpath.strip_prefix("layout/") {
+                let Some((enc_layout, tail)) = layout_rest.split_once('/') else {
+                    return Err(format!("Unsupported layout resource URI: {uri}"));
+                };
+                let Some(layout) = decode_uri_segment(enc_layout).filter(|s| !s.trim().is_empty())
+                else {
+                    return Err(format!("Invalid layout encoding in URI: {uri}"));
+                };
+                if tail == "pyramid/manifest.json" {
+                    let manifest = resources
+                        .get_layout_manifest(session_id, &layout)
+                        .ok_or_else(|| {
+                            format!("No cached pyramid manifest for layout '{layout}'; capture layout '{layout}' first")
+                        })?;
+                    let text = serde_json::to_string_pretty(manifest)
+                        .unwrap_or_else(|_| manifest.to_string());
+                    return Ok(json!({
+                        "contents": [
                             {
-                                if arr.len() == 4 {
-                                    if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                                        arr[0].as_f64(),
-                                        arr[1].as_f64(),
-                                        arr[2].as_f64(),
-                                        arr[3].as_f64(),
-                                    ) {
-                                        base_bounds = [x0, y0, x1, y1];
-                                    }
-                                }
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": text
                             }
-                        }
-                        let tile_bounds = crate::app::control::vision::compute_tile_bounds(
-                            base_bounds,
-                            level,
-                            x,
-                            y,
-                        )?;
-                        let path = std::env::temp_dir()
-                            .join(format!("ocs-tile-{session_id}-{level}-{x}-{y}.png"));
-                        let req = json!({
-                            "op": "capture",
-                            "path": path.to_string_lossy(),
-                            "scope": "viewport",
-                            "view": "region",
-                            "bounds": tile_bounds,
-                            "max_dimension": 512,
-                        });
-                        let result =
-                            client(clients, session_id)?.request(req, 20.0, pump, mcp_id)?;
-                        if result["ok"].as_bool() != Some(true)
-                            || result["status"].as_str() != Some("completed")
-                        {
-                            return Err(result.to_string().into());
-                        }
-                        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-                        let _ = std::fs::remove_file(path);
-                        let b64 = BASE64.encode(&bytes);
-                        let bytes_len = bytes.len();
-                        let mut meta = result.get("result").cloned().unwrap_or_else(|| json!({}));
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.remove("path");
-                            obj.insert(
-                                "pyramid".into(),
-                                json!({
-                                    "level": level,
-                                    "x": x,
-                                    "y": y,
-                                    "tile_world_bounds": tile_bounds,
-                                    "tile_uri": png_uri,
-                                    "manifest_uri": format!("cad://session/{session_id}/pyramid/manifest.json")
-                                }),
-                            );
-                        }
-                        resources.insert_tile(
+                        ]
+                    }));
+                } else if let Some(trimmed) = tail.strip_prefix("tile/") {
+                    if let Some((level, x, y, is_json)) = parse_tile_subpath(trimmed) {
+                        return serve_tile_resource(
+                            uri,
                             session_id,
+                            Some(&layout),
                             level,
                             x,
                             y,
-                            b64.clone(),
-                            bytes_len,
-                            meta.clone(),
+                            is_json,
+                            clients,
+                            resources,
+                            pump,
+                            mcp_id,
                         );
-                        if is_json {
-                            let meta_text = serde_json::to_string_pretty(&meta)
-                                .unwrap_or_else(|_| meta.to_string());
-                            return Ok(json!({
-                                "contents": [
-                                    {
-                                        "uri": uri,
-                                        "mimeType": "application/json",
-                                        "text": meta_text
-                                    }
-                                ]
-                            }));
-                        }
-                        return Ok(json!({
-                            "contents": [
-                                {
-                                    "uri": png_uri,
-                                    "mimeType": "image/png",
-                                    "blob": b64
-                                }
-                            ]
-                        }));
                     }
+                }
+                return Err(format!("Unsupported layout resource URI: {uri}"));
+            } else if let Some(trimmed) = subpath.strip_prefix("tile/") {
+                if let Some((level, x, y, is_json)) = parse_tile_subpath(trimmed) {
+                    return serve_tile_resource(
+                        uri, session_id, None, level, x, y, is_json, clients, resources, pump,
+                        mcp_id,
+                    );
                 }
             } else if subpath == "viewport.png" {
                 let path = std::env::temp_dir().join(format!("ocs-resource-{}.png", random_id()?));
@@ -2006,7 +2318,7 @@ fn read_resource(
 
                 let mut hasher = Sha256::new();
                 hasher.update(&bytes);
-                let hash = format!("{:x}", hasher.finalize());
+                let hash = crate::io::recovery::hex_digest(hasher.finalize());
                 let b64 = BASE64.encode(&bytes);
                 let bytes_len = bytes.len();
                 let meta = result.get("result").cloned().unwrap_or_else(|| json!({}));
@@ -2053,7 +2365,9 @@ fn call_tool(
     match name {
         "ocs_sessions" => {
             let launch = arguments["launch_if_none"].as_bool().unwrap_or(true);
-            Ok(Value::Array(sessions(launch).map_err(CallError::Infra)?))
+            let listed = sessions(launch).map_err(CallError::Infra)?;
+            refresh_client_states(clients);
+            Ok(Value::Array(listed))
         }
         "ocs_read" => {
             let op = arguments["op"].as_str().unwrap_or("state");
@@ -2164,9 +2478,23 @@ fn call_tool(
             let scope = arguments["scope"].as_str().unwrap_or("viewport");
             let max_dimension = arguments["max_dimension"].as_u64().unwrap_or(1600);
             let delivery = arguments["delivery"].as_str().unwrap_or("inline");
-            refuse_retired_capture_parameters(&arguments).map_err(CallError::from)?;
+            refuse_retired_capture_parameters(arguments).map_err(CallError::from)?;
             let tile = arguments.get("tile");
             let want_manifest = arguments["pyramid_manifest"].as_bool().unwrap_or(false);
+            let requested_layout = arguments.get("layout").and_then(Value::as_str);
+            let requested_renderer = arguments.get("renderer").and_then(Value::as_str);
+            let requested_doc_id = arguments.get("document_id").and_then(Value::as_u64);
+
+            if tile.is_some()
+                && arguments
+                    .get("focus_handles")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            {
+                return Err(CallError::Tool(
+                    "tile cannot be combined with focus_handles; compute bounds from a capture or supply explicit 'bounds'".to_string(),
+                ));
+            }
 
             let mut tile_info: Option<(u32, u32, u32, [f64; 4])> = None;
             if let Some(tile_val) = tile {
@@ -2175,54 +2503,13 @@ fn call_tool(
                     tile_val.get("x").and_then(Value::as_u64),
                     tile_val.get("y").and_then(Value::as_u64),
                 ) {
-                    let mut base_bounds = [-100.0, -100.0, 100.0, 100.0];
-                    if let Some(bounds_arr) = arguments.get("bounds").and_then(Value::as_array) {
-                        if bounds_arr.len() >= 4 {
-                            if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                                bounds_arr[0].as_f64(),
-                                bounds_arr[1].as_f64(),
-                                bounds_arr[2].as_f64(),
-                                bounds_arr[3].as_f64(),
-                            ) {
-                                base_bounds = [x0, y0, x1, y1];
-                            }
-                        }
-                    } else if let Some(manifest) = resources.pyramid_manifests.get(session_id) {
-                        if let Some(arr) = manifest.get("world_bounds").and_then(Value::as_array) {
-                            if arr.len() == 4 {
-                                if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                                    arr[0].as_f64(),
-                                    arr[1].as_f64(),
-                                    arr[2].as_f64(),
-                                    arr[3].as_f64(),
-                                ) {
-                                    base_bounds = [x0, y0, x1, y1];
-                                }
-                            }
-                        }
-                    } else if let Some(latest_uri) = resources.latest.get(session_id) {
-                        if let Some(snap) = resources.snapshots.get(latest_uri) {
-                            if let Some(spatial) = snap.metadata.get("_spatial") {
-                                if let Some(wb) = spatial.get("world_bounds") {
-                                    if let (Some(min), Some(max)) = (
-                                        wb.get("min").and_then(Value::as_array),
-                                        wb.get("max").and_then(Value::as_array),
-                                    ) {
-                                        if min.len() >= 2 && max.len() >= 2 {
-                                            if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                                                min[0].as_f64(),
-                                                min[1].as_f64(),
-                                                max[0].as_f64(),
-                                                max[1].as_f64(),
-                                            ) {
-                                                base_bounds = [x0, y0, x1, y1];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let base_bounds = resolve_tile_base_bounds(
+                        arguments,
+                        resources,
+                        session_id,
+                        requested_layout,
+                    )
+                    .map_err(CallError::Tool)?;
                     let tb = crate::app::control::vision::compute_tile_bounds(
                         base_bounds,
                         level as u32,
@@ -2264,6 +2551,18 @@ fn call_tool(
             if let Some(annotate) = arguments.get("annotate").and_then(Value::as_bool) {
                 req["annotate"] = json!(annotate);
             }
+            if let Some(layout) = requested_layout {
+                req["layout"] = json!(layout);
+            }
+            if let Some(aspect_fit) = arguments.get("aspect_fit").and_then(Value::as_bool) {
+                req["aspect_fit"] = json!(aspect_fit);
+            }
+            if let Some(renderer) = requested_renderer {
+                req["renderer"] = json!(renderer);
+            }
+            if let Some(document_id) = requested_doc_id {
+                req["document_id"] = json!(document_id);
+            }
             let result = client(clients, session_id)?.request(req, 30.0, pump, mcp_id)?;
             if result["ok"].as_bool() != Some(true)
                 || result["status"].as_str() != Some("completed")
@@ -2271,6 +2570,12 @@ fn call_tool(
                 // Failed capture response from the GUI: retryable, stays Tool.
                 return Err(result.to_string().into());
             }
+            let targets_other_doc = requested_doc_id.is_some_and(|doc_id| {
+                clients
+                    .get(session_id)
+                    .and_then(|c| c.state["document_id"].as_u64())
+                    .is_some_and(|active_id| active_id != doc_id)
+            });
             let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
             let _ = std::fs::remove_file(path);
             let mut meta = result.get("result").cloned().unwrap_or_else(|| json!({}));
@@ -2283,32 +2588,41 @@ fn call_tool(
 
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
-            let hash = format!("{:x}", hasher.finalize());
+            let hash = crate::io::recovery::hex_digest(hasher.finalize());
             let b64 = BASE64.encode(&bytes);
             let bytes_len = bytes.len();
 
-            let uri = resources.insert(session_id, &hash, b64.clone(), bytes_len, meta.clone());
+            let uri = resources.insert_with_latest(
+                session_id,
+                &hash,
+                b64.clone(),
+                bytes_len,
+                meta.clone(),
+                !targets_other_doc,
+            );
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("uri".into(), Value::String(uri.clone()));
-                obj.insert(
-                    "latest_uri".into(),
-                    Value::String(format!("cad://session/{session_id}/snapshot/latest.png")),
-                );
+                if !targets_other_doc {
+                    obj.insert(
+                        "latest_uri".into(),
+                        Value::String(format!("cad://session/{session_id}/snapshot/latest.png")),
+                    );
+                }
                 obj.insert("hash".into(), Value::String(hash.clone()));
                 obj.insert("bytes".into(), Value::from(bytes_len));
             }
 
+            let effective_layout = meta
+                .get("layout")
+                .and_then(Value::as_str)
+                .or(requested_layout)
+                .map(str::to_string);
+            let tile_layout = requested_layout.and(effective_layout.as_deref());
+
             let mut final_uri = uri.clone();
             if let Some((level, x, y, tb)) = tile_info {
-                let tile_uri = resources.insert_tile(
-                    session_id,
-                    level,
-                    x,
-                    y,
-                    b64.clone(),
-                    bytes_len,
-                    meta.clone(),
-                );
+                let tile_uri = ResourceStore::tile_uri_for(session_id, tile_layout, level, x, y);
+                let manifest_uri = ResourceStore::manifest_uri_for(session_id, tile_layout);
                 final_uri = tile_uri.clone();
                 let pyr = json!({
                     "level": level,
@@ -2316,49 +2630,96 @@ fn call_tool(
                     "y": y,
                     "tile_world_bounds": tb,
                     "tile_uri": tile_uri,
-                    "manifest_uri": format!("cad://session/{session_id}/pyramid/manifest.json")
+                    "manifest_uri": manifest_uri,
                 });
                 if let Some(obj) = meta.as_object_mut() {
                     obj.insert("pyramid".into(), pyr);
                     obj.insert("uri".into(), Value::String(final_uri.clone()));
                 }
+                if !targets_other_doc {
+                    resources.insert_tile_for_layout(
+                        session_id,
+                        tile_layout,
+                        level,
+                        x,
+                        y,
+                        b64.clone(),
+                        bytes_len,
+                        meta.clone(),
+                    );
+                }
             }
 
-            if want_manifest
-                || (!resources.pyramid_manifests.contains_key(session_id) && tile_info.is_none())
-            {
-                let mut bounds = [-100.0, -100.0, 100.0, 100.0];
-                let mut unit = "Millimeters".to_string();
-                if let Some(spatial) = meta.get("_spatial") {
-                    if let Some(u) = spatial.get("unit").and_then(Value::as_str) {
-                        unit = u.to_string();
-                    }
-                    if let Some(wb) = spatial.get("world_bounds") {
-                        if let (Some(min), Some(max)) = (
-                            wb.get("min").and_then(Value::as_array),
-                            wb.get("max").and_then(Value::as_array),
-                        ) {
-                            if min.len() >= 2 && max.len() >= 2 {
-                                if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                                    min[0].as_f64(),
-                                    min[1].as_f64(),
-                                    max[0].as_f64(),
-                                    max[1].as_f64(),
-                                ) {
-                                    bounds = [x0, y0, x1, y1];
-                                }
-                            }
-                        }
-                    }
-                }
+            let needs_manifest = if let Some(eff_lay) = tile_layout {
+                want_manifest
+                    || (!targets_other_doc
+                        && tile_info.is_none()
+                        && resources.get_layout_manifest(session_id, eff_lay).is_none())
+            } else {
+                let manifest_stale = manifest_layout_differs(
+                    resources.pyramid_manifests.get(session_id),
+                    effective_layout.as_deref(),
+                );
+                want_manifest
+                    || (!targets_other_doc
+                        && tile_info.is_none()
+                        && (!resources.pyramid_manifests.contains_key(session_id)
+                            || manifest_stale))
+            };
+            if needs_manifest {
+                let bounds = spatial_world_bounds(&meta).unwrap_or([-100.0, -100.0, 100.0, 100.0]);
+                let unit = meta
+                    .get("_spatial")
+                    .and_then(|s| s.get("unit"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Millimeters")
+                    .to_string();
                 let manifest = crate::app::control::vision::compute_pyramid_manifest(
                     session_id, &unit, bounds, 4, 512,
                 );
-                if let Ok(manifest_val) = serde_json::to_value(&manifest) {
-                    resources.insert_pyramid_manifest(session_id, manifest_val.clone());
+                if let Ok(mut manifest_val) = serde_json::to_value(&manifest) {
+                    if let Some(renderer) = meta
+                        .get("renderer")
+                        .and_then(Value::as_str)
+                        .or(requested_renderer)
+                    {
+                        if let Some(obj) = manifest_val.as_object_mut() {
+                            obj.insert("renderer".into(), Value::String(renderer.to_string()));
+                        }
+                    }
+                    let manifest_for_meta = if let Some(eff_lay) = tile_layout {
+                        if !targets_other_doc {
+                            resources.insert_layout_manifest(session_id, eff_lay, manifest_val);
+                            resources.get_layout_manifest(session_id, eff_lay).cloned()
+                        } else {
+                            let enc = encode_uri_segment(eff_lay);
+                            if let Some(obj) = manifest_val.as_object_mut() {
+                                obj.insert("layout".into(), Value::String(eff_lay.to_string()));
+                                obj.insert(
+                                    "tile_uri_template".into(),
+                                    Value::String(format!(
+                                        "cad://session/{session_id}/layout/{enc}/tile/{{level}}/{{x}}/{{y}}.png"
+                                    )),
+                                );
+                            }
+                            Some(manifest_val)
+                        }
+                    } else {
+                        if let Some(layout) = effective_layout.as_deref() {
+                            if let Some(obj) = manifest_val.as_object_mut() {
+                                obj.insert("layout".into(), Value::String(layout.to_string()));
+                            }
+                        }
+                        if !targets_other_doc {
+                            resources.insert_pyramid_manifest(session_id, manifest_val.clone());
+                        }
+                        Some(manifest_val)
+                    };
                     if want_manifest {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("pyramid_manifest".into(), manifest_val);
+                        if let Some(mval) = manifest_for_meta {
+                            if let Some(obj) = meta.as_object_mut() {
+                                obj.insert("pyramid_manifest".into(), mval);
+                            }
                         }
                     }
                 }
@@ -2469,6 +2830,10 @@ pub(crate) fn capture_input_schema() -> Value {
             "focus_handles":{"type":"array","items":{"type":"string"},"description":"Hex handles of entities to zoom and fit in view before capturing."},
             "highlight_handles":{"type":"array","items":{"type":"string"},"description":"Hex handles of entities to select/highlight before capturing."},
             "annotate":{"type":"boolean","default":false,"description":"Overlay Set-of-Marks numbered tags on visible entities for visual grounding."},
+            "layout":{"type":"string","minLength":1,"description":"Capture a specific layout ('Model' or any paper-space layout name) headlessly off-screen without switching the active GUI tab, moving the live camera, or mutating selection. Defaults aspect_fit to true unless aspect_fit: false is explicitly passed."},
+            "aspect_fit":{"type":"boolean","default":false,"description":"Render off-screen with output pixel dimensions fitted to the aspect ratio of the framed bounds/extents (longest edge = max_dimension) instead of the live GUI viewport aspect ratio. On layout captures, defaults to true unless explicitly set false."},
+            "renderer":{"type":"string","enum":["auto","gpu","cpu"],"default":"auto","description":"Off-screen rendering backend: 'auto' uses headless wgpu (WYSIWYG canvas) when available and falls back to CPU SVG/resvg, 'gpu' requires headless wgpu, 'cpu' forces vector SVG/resvg rasterization."},
+            "document_id":{"type":"integer","minimum":0,"description":"Optional open document id (from ocs_sessions) to capture headlessly off-screen without activating its tab."},
             "tile":{"type":"object","properties":{"level":{"type":"integer","minimum":0,"maximum":6,"description":"Pyramid zoom level (0 = full overview, 1 = 2x2 grid, 2 = 4x4 grid, etc.)."},"x":{"type":"integer","minimum":0,"description":"Tile column index (0-indexed, left-to-right)."},"y":{"type":"integer","minimum":0,"description":"Tile row index (0-indexed, top-to-bottom)."}},"required":["level","x","y"],"description":"Fetch a specific DeepZoom pyramid tile. Automatically computes tile world bounds and frames the camera."},
             "pyramid_manifest":{"type":"boolean","default":false,"description":"If true, generates and returns the complete multiscale pyramid manifest (levels, grid dimensions, tile world spans and resource URIs) in the response metadata."}
         },
@@ -2488,8 +2853,8 @@ pub(crate) fn tool_definitions() -> Value {
         },
         {
             "name":"ocs_read",
-            "description":"Use entity_schema with parameters.type for creation fields/examples; omit type to list. Use validate with parameters.request to check an execute request without running it (no live document checks). Use guide with parameters.name to read workflow, architecture, capture or batch-bindings guidance (omit name to list). Discover capabilities and record schemas, or read state, complete database records, command manifests, entities, blocks (semantic block instances with attributes, definition tags and dynamic properties), properties, kernel measurements and spatial relationships, history, events or operation status from a live OCS session. Use batch_result with parameters.request_id to retrieve retained batch details without executing steps; available only in the originating MCP connection, for up to 64 retained batches per session.",
-            "inputSchema":{"type":"object","properties":{"ocs_session_id":{"type":"string","minLength":1,"description":"Value of session_id returned by ocs_sessions."},"op":{"type":"string","enum":READ_OPS,"default":"state"},"parameters":{"type":"object","description":"Operation-specific filters.","properties":{"request":{"type":"object","description":"Execute request to preflight without dispatch. request_id may be omitted. Batch bindings are checked structurally; result-dependent values require execution."},"name":{"type":"string","description":"Command name, block name/glob, or record name."},"names":{"type":"array","items":{"type":"string"},"description":"Block name or wildcard glob filters (e.g. ['*'], ['DOOR*']) for op: blocks."},"extract_attributes":{"type":"boolean","default":true,"description":"Extract ATTRIB values, ATTDEF defaults, and visible definition text tags (e.g. TAG, DIMS) for op: blocks."},"extract_dynamic_properties":{"type":"boolean","default":true,"description":"Extract dynamic block parameters, visibility states, and lookup values for op: blocks."},"include_anonymous":{"type":"boolean","default":false,"description":"Include unlinked internal anonymous blocks (*U..., *D..., *T...) in op: blocks."},"search":{"type":"string","description":"Case-insensitive command or record-type search."},"find":{"type":"string","description":"Text query string for text_search."},"match_case":{"type":"boolean","default":false,"description":"Case-sensitive text search."},"whole_word":{"type":"boolean","default":false,"description":"Match only whole words."},"ignore_accents":{"type":"boolean","description":"Ignore accents/diacritics in text (defaults to true when match_case is false)."},"scope":{"type":"string","enum":["all","active_space","blocks"],"default":"all","description":"Text search scope."},"system_spellcheck":{"type":"boolean","default":false,"description":"Use native OS spell-checker (Windows, macOS, Linux)."},"language":{"type":"string","description":"Language tag for spell-checker (e.g. 'fr-FR', 'en-US', 'de-DE', 'es-ES')."},"suggest":{"type":"boolean","default":true,"description":"Include suggested corrections for misspelled words."},"check_terms":{"type":"array","items":{"type":"string"},"description":"List of terms or suspect misspellings to flag in text_audit."},"dictionary":{"type":"array","items":{"type":"string"},"description":"Known valid words for text_audit dictionary check."},"pairs":{"type":"array","description":"Find/replace pairs for dry-run simulation in text_audit.","items":{"type":"object","properties":{"find":{"type":"string"},"replace":{"type":"string"}},"required":["find","replace"]}},"dry_run_pairs":{"type":"array","description":"Alias for pairs in text_audit.","items":{"type":"object","properties":{"find":{"type":"string"},"replace":{"type":"string"}},"required":["find","replace"]}},"document_id":{"type":"integer","minimum":0},"path":{"type":"string","description":"Optional intended output path for audit; extension determines target format."},"target_format":{"type":"string","enum":["dwg","dxf"],"description":"Intended output format for audit."},"target_version":{"type":"string","enum":["R14","2000","2004","2007","2010","2013","2018","AC1014","AC1015","AC1018","AC1021","AC1024","AC1027","AC1032"],"description":"Intended CAD output version for audit."},"collection":{"type":"string","description":"Record collection, all for records, or omit to discover collections and schema types."},"handle":{"type":"string"},"handles":{"type":"array","items":{"type":"string"},"description":"Exact entity or record handles."},"type":{"type":"string","description":"Entity or record type filter; for record_schema, returns its complete type graph and writable field paths."},"layer":{"type":"string","description":"Layer name filter for query; * and ? are wildcards."},"xdata_app":{"type":"string","description":"Only entities carrying XDATA of this application (query)."},"detail":{"type":"string","enum":["summary","geometry","full"],"default":"geometry","description":"Entity detail returned by query."},"fields":{"type":"array","items":{"type":"string"},"description":"Return only these entity fields plus handle."},"paths":{"type":"array","items":{"type":"string"},"description":"Project RFC 6901 JSON Pointer paths relative to record.properties."},"where":{"type":"array","description":"All property filters must match.","items":{"type":"object","properties":{"path":{"type":"string"},"op":{"type":"string","enum":["eq","ne","lt","lte","gt","gte","contains","starts_with","ends_with","in","exists","not_exists"],"default":"eq"},"value":{}},"required":["path"],"additionalProperties":false}},"near":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Rank planar curves by exact kernel distance to this world XY point."},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"World point whose object snap the snap op reports."},"from":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Base point for perpendicular and tangent snaps (snap op)."},"contains_point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Return closed planar curves containing this world XY point."},"bounds":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"Filter entities whose world XY bounds overlap [min_x,min_y,max_x,max_y]."},"intersections":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":2,"description":"Return exact kernel intersections between two planar curve handles."},"after":{"type":"integer","minimum":0,"description":"Event cursor."},"request_id":{"type":"string","description":"Operation id to query."},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":10000}},"additionalProperties":false}},"anyOf":[{"required":["ocs_session_id"]},{"required":["op"],"properties":{"op":{"enum":["guide","entity_schema","validate"]}}}],"additionalProperties":false},
+            "description":"Use entity_schema with parameters.type for creation fields/examples; omit type to list. Use validate with parameters.request to check an execute request without running it (no live document checks). Use guide with parameters.name to read workflow, architecture, capture, plugin-panels or batch-bindings guidance (omit name to list). Discover capabilities and record schemas, or read state, complete database records, command manifests, entities, blocks (semantic block instances with attributes, definition tags and dynamic properties), properties, kernel measurements and spatial relationships, history, events or operation status from a live OCS session. Use batch_result with parameters.request_id to retrieve retained batch details without executing steps; available only in the originating MCP connection, for up to 64 retained batches per session.",
+            "inputSchema":{"type":"object","properties":{"ocs_session_id":{"type":"string","minLength":1,"description":"Value of session_id returned by ocs_sessions."},"op":{"type":"string","enum":READ_OPS,"default":"state"},"parameters":{"type":"object","description":"Operation-specific filters.","properties":{"layout":{"type":"string","minLength":1,"description":"Layout name for op: page_setup_get."},"request":{"type":"object","description":"Execute request to preflight without dispatch. request_id may be omitted. Batch bindings are checked structurally; result-dependent values require execution."},"name":{"type":"string","description":"Command name, block name/glob, or record name."},"names":{"type":"array","items":{"type":"string"},"description":"Block name or wildcard glob filters (e.g. ['*'], ['DOOR*']) for op: blocks."},"extract_attributes":{"type":"boolean","default":true,"description":"Extract ATTRIB values, ATTDEF defaults, and visible definition text tags (e.g. TAG, DIMS) for op: blocks."},"extract_dynamic_properties":{"type":"boolean","default":true,"description":"Extract dynamic block parameters, visibility states, and lookup values for op: blocks."},"include_anonymous":{"type":"boolean","default":false,"description":"Include unlinked internal anonymous blocks (*U..., *D..., *T...) in op: blocks."},"search":{"type":"string","description":"Case-insensitive command or record-type search."},"find":{"type":"string","description":"Text query string for text_search."},"match_case":{"type":"boolean","default":false,"description":"Case-sensitive text search."},"whole_word":{"type":"boolean","default":false,"description":"Match only whole words."},"ignore_accents":{"type":"boolean","description":"Ignore accents/diacritics in text (defaults to true when match_case is false)."},"scope":{"type":"string","enum":["all","active_space","blocks"],"default":"all","description":"Text search scope."},"system_spellcheck":{"type":"boolean","default":false,"description":"Use native OS spell-checker (Windows, macOS, Linux)."},"language":{"type":"string","description":"Language tag for spell-checker (e.g. 'fr-FR', 'en-US', 'de-DE', 'es-ES')."},"suggest":{"type":"boolean","default":true,"description":"Include suggested corrections for misspelled words."},"check_terms":{"type":"array","items":{"type":"string"},"description":"List of terms or suspect misspellings to flag in text_audit."},"dictionary":{"type":"array","items":{"type":"string"},"description":"Known valid words for text_audit dictionary check."},"pairs":{"type":"array","description":"Find/replace pairs for dry-run simulation in text_audit.","items":{"type":"object","properties":{"find":{"type":"string"},"replace":{"type":"string"}},"required":["find","replace"]}},"dry_run_pairs":{"type":"array","description":"Alias for pairs in text_audit.","items":{"type":"object","properties":{"find":{"type":"string"},"replace":{"type":"string"}},"required":["find","replace"]}},"document_id":{"type":"integer","minimum":0},"path":{"type":"string","description":"Optional intended output path for audit; extension determines target format."},"target_format":{"type":"string","enum":["dwg","dxf"],"description":"Intended output format for audit."},"target_version":{"type":"string","enum":["R14","2000","2004","2007","2010","2013","2018","AC1014","AC1015","AC1018","AC1021","AC1024","AC1027","AC1032"],"description":"Intended CAD output version for audit."},"collection":{"type":"string","description":"Record collection, all for records, or omit to discover collections and schema types."},"handle":{"type":"string"},"handles":{"type":"array","items":{"type":"string"},"description":"Exact entity or record handles."},"type":{"type":"string","description":"Entity or record type filter; for record_schema, returns its complete type graph and writable field paths."},"layer":{"type":"string","description":"Layer name filter for query; * and ? are wildcards."},"xdata_app":{"type":"string","description":"Only entities carrying XDATA of this application (query)."},"detail":{"type":"string","enum":["summary","geometry","full"],"default":"geometry","description":"Entity detail returned by query."},"fields":{"type":"array","items":{"type":"string"},"description":"Return only these entity fields plus handle."},"paths":{"type":"array","items":{"type":"string"},"description":"Project RFC 6901 JSON Pointer paths relative to record.properties."},"where":{"type":"array","description":"All property filters must match.","items":{"type":"object","properties":{"path":{"type":"string"},"op":{"type":"string","enum":["eq","ne","lt","lte","gt","gte","contains","starts_with","ends_with","in","exists","not_exists"],"default":"eq"},"value":{}},"required":["path"],"additionalProperties":false}},"near":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Rank planar curves by exact kernel distance to this world XY point."},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"World point whose object snap the snap op reports."},"from":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Base point for perpendicular and tangent snaps (snap op)."},"contains_point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3,"description":"Return closed planar curves containing this world XY point."},"bounds":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"Filter entities whose world XY bounds overlap [min_x,min_y,max_x,max_y]."},"intersections":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":2,"description":"Return exact kernel intersections between two planar curve handles."},"after":{"type":"integer","minimum":0,"description":"Event cursor."},"request_id":{"type":"string","description":"Operation id to query."},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":10000},"station":{"type":"number","description":"Alignment station for op: civil_station_offset."},"offset_distance":{"type":"number","description":"Signed perpendicular distance from the alignment, positive right of travel, for op: civil_station_offset."},"handle":{"type":"string"},"handles":{"type":"array","items":{"type":"string"},"description":"Exact entity or record handles."}},"additionalProperties":false}},"anyOf":[{"required":["ocs_session_id"]},{"required":["op"],"properties":{"op":{"enum":["guide","entity_schema","validate"]}}}],"additionalProperties":false},
             "outputSchema":read_output_schema(),
             "title":"Read OCS state","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
         },
@@ -2528,6 +2893,143 @@ fn refuse_retired_capture_parameters(arguments: &Value) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+fn capture_layout_matches(entry: &Value, requested_layout: Option<&str>) -> bool {
+    match requested_layout {
+        None => true,
+        Some(req_lay) => entry
+            .get("layout")
+            .and_then(Value::as_str)
+            .is_some_and(|lay| lay.eq_ignore_ascii_case(req_lay)),
+    }
+}
+
+fn manifest_layout_differs(manifest: Option<&Value>, effective_layout: Option<&str>) -> bool {
+    match (effective_layout, manifest) {
+        (Some(eff_lay), Some(manifest)) => manifest
+            .get("layout")
+            .and_then(Value::as_str)
+            .is_none_or(|lay| !lay.eq_ignore_ascii_case(eff_lay)),
+        (None, Some(manifest)) => manifest.get("layout").is_some(),
+        _ => false,
+    }
+}
+
+fn bounds_from_array(arr: &[Value], exact_len: bool) -> Option<[f64; 4]> {
+    let valid_len = if exact_len {
+        arr.len() == 4
+    } else {
+        arr.len() >= 4
+    };
+    if !valid_len {
+        return None;
+    }
+    Some([
+        arr[0].as_f64()?,
+        arr[1].as_f64()?,
+        arr[2].as_f64()?,
+        arr[3].as_f64()?,
+    ])
+}
+
+fn spatial_world_bounds(meta: &Value) -> Option<[f64; 4]> {
+    let wb = meta.get("_spatial")?.get("world_bounds")?;
+    let min = wb.get("min")?.as_array()?;
+    let max = wb.get("max")?.as_array()?;
+    if min.len() < 2 || max.len() < 2 {
+        return None;
+    }
+    Some([
+        min[0].as_f64()?,
+        min[1].as_f64()?,
+        max[0].as_f64()?,
+        max[1].as_f64()?,
+    ])
+}
+
+fn resolve_tile_base_bounds(
+    arguments: &Value,
+    resources: &ResourceStore,
+    session_id: &str,
+    requested_layout: Option<&str>,
+) -> Result<[f64; 4], String> {
+    const DEFAULT_BOUNDS: [f64; 4] = [-100.0, -100.0, 100.0, 100.0];
+    if let Some(bounds_arr) = arguments.get("bounds").and_then(Value::as_array) {
+        return bounds_from_array(bounds_arr, false)
+            .filter(|b| b.iter().all(|v| v.is_finite()))
+            .ok_or_else(|| {
+                "bounds must be a 4-element finite numeric array [min_x, min_y, max_x, max_y]"
+                    .to_string()
+            });
+    }
+    if let Some(req_lay) = requested_layout {
+        if let Some(bounds) = resources
+            .get_layout_manifest(session_id, req_lay)
+            .and_then(|m| m.get("world_bounds").and_then(Value::as_array))
+            .and_then(|arr| bounds_from_array(arr, true))
+        {
+            return Ok(bounds);
+        }
+        if let Some(bounds) = resources
+            .pyramid_manifests
+            .get(session_id)
+            .filter(|m| capture_layout_matches(m, Some(req_lay)))
+            .and_then(|m| m.get("world_bounds").and_then(Value::as_array))
+            .and_then(|arr| bounds_from_array(arr, true))
+        {
+            return Ok(bounds);
+        }
+        if let Some(bounds) = resources
+            .latest
+            .get(session_id)
+            .and_then(|latest_uri| resources.snapshots.get(latest_uri))
+            .filter(|snap| capture_layout_matches(&snap.metadata, Some(req_lay)))
+            .and_then(|snap| spatial_world_bounds(&snap.metadata))
+        {
+            return Ok(bounds);
+        }
+        if let Some(bounds) = resources
+            .order
+            .iter()
+            .rev()
+            .filter_map(|uri| resources.snapshots.get(uri))
+            .find(|snap| {
+                snap.session_id == session_id
+                    && capture_layout_matches(&snap.metadata, Some(req_lay))
+            })
+            .and_then(|snap| spatial_world_bounds(&snap.metadata))
+        {
+            return Ok(bounds);
+        }
+        return Err(format!(
+            "No cached bounds or pyramid manifest for layout '{req_lay}'; capture layout '{req_lay}' first or supply explicit 'bounds'"
+        ));
+    }
+    if let Some(manifest) = resources
+        .pyramid_manifests
+        .get(session_id)
+        .filter(|m| capture_layout_matches(m, None))
+    {
+        if let Some(bounds) = manifest
+            .get("world_bounds")
+            .and_then(Value::as_array)
+            .and_then(|arr| bounds_from_array(arr, true))
+        {
+            return Ok(bounds);
+        }
+    }
+    if let Some(snap) = resources
+        .latest
+        .get(session_id)
+        .and_then(|latest_uri| resources.snapshots.get(latest_uri))
+        .filter(|snap| capture_layout_matches(&snap.metadata, None))
+    {
+        if let Some(bounds) = spatial_world_bounds(&snap.metadata) {
+            return Ok(bounds);
+        }
+    }
+    Ok(DEFAULT_BOUNDS)
 }
 
 fn tool_result(value: Value) -> Value {
@@ -2633,7 +3135,7 @@ fn tool_schema_digest() -> String {
     let canonical = serde_json::to_string(&tool_definitions()).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::io::recovery::hex_digest(hasher.finalize())
 }
 
 fn modern_request(params: &Value) -> bool {
@@ -2789,9 +3291,7 @@ fn handle_message(
     }
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str)?;
-    if id.is_none() {
-        return None;
-    }
+    id.as_ref()?;
     let id = id.unwrap();
     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
     if let Some(requested) = params["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str() {
@@ -2865,6 +3365,11 @@ fn handle_message(
                     session_ids.push(k.clone());
                 }
             }
+            for (k, _) in resources.layout_manifests.keys() {
+                if !session_ids.contains(k) {
+                    session_ids.push(k.clone());
+                }
+            }
             // Deterministic order: HashMap iteration is random, and stable
             // ordering keeps client caches and prompt caches hitting.
             session_ids.sort();
@@ -2896,6 +3401,12 @@ fn handle_message(
                         "uriTemplate": "cad://session/{session_id}/tile/{level}/{x}/{y}.png",
                         "name": "Pyramid tile",
                         "description": "DeepZoom viewport tile at zoom level, column x, row y.",
+                        "mimeType": "image/png"
+                    },
+                    {
+                        "uriTemplate": "cad://session/{session_id}/layout/{layout}/tile/{level}/{x}/{y}.png",
+                        "name": "Layout pyramid tile",
+                        "description": "DeepZoom off-screen tile for a specific layout at zoom level, column x, row y.",
                         "mimeType": "image/png"
                     },
                     {
@@ -3050,7 +3561,7 @@ pub fn sync_agent_tool_schemas() -> bool {
         return false;
     }
     let base_dir = mcp_root.join("opencadstudio");
-    if let Err(_) = std::fs::create_dir_all(&base_dir) {
+    if std::fs::create_dir_all(&base_dir).is_err() {
         return false;
     }
 
@@ -3179,6 +3690,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// A pump with no reader: waits behave exactly as before (quiet
     /// immediately), so tests that never cancel need no other changes.
@@ -3203,7 +3715,7 @@ mod tests {
             &names[..4],
             ["ocs_sessions", "ocs_read", "ocs_execute", "ocs_capture"]
         );
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 22);
         // The build announcement must live in the entry-point tool
         // description: global instructions don't reliably reach agents.
         assert!(
@@ -3215,15 +3727,19 @@ mod tests {
         );
         assert_eq!(tools[0]["annotations"]["readOnlyHint"], false);
         for tool in [&tools[1], &tools[2], &tools[3]] {
-            assert!(tool["inputSchema"]["properties"]
-                .get("session_id")
-                .is_none());
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .get("session_id")
+                    .is_none()
+            );
         }
         for tool in [&tools[2], &tools[3]] {
-            assert!(tool["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("ocs_session_id")));
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("ocs_session_id"))
+            );
         }
         let read_schema = &tools[1]["inputSchema"];
         for op in ["guide", "entity_schema", "validate"] {
@@ -3285,8 +3801,8 @@ mod tests {
         let save_var = find_variant("save_verified");
         assert_eq!(save_var["properties"]["target_version"]["enum"][0], "R14");
         assert_eq!(
-            tools[1]["inputSchema"]["properties"]["parameters"]["properties"]["where"]["items"]
-                ["properties"]["op"]["enum"],
+            tools[1]["inputSchema"]["properties"]["parameters"]["properties"]["where"]["items"]["properties"]
+                ["op"]["enum"],
             json!([
                 "eq",
                 "ne",
@@ -3328,10 +3844,12 @@ mod tests {
             initialized["result"]["capabilities"]["resources"]["subscribe"],
             false
         );
-        assert!(initialized["result"]["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("geometry kernel"));
+        assert!(
+            initialized["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("geometry kernel")
+        );
 
         let listed = handle_message(
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
@@ -3341,7 +3859,7 @@ mod tests {
             &mut detached_pump(),
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 20);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 22);
         // SEP-2549: freshness hints ship on every protocol version; only
         // the modern envelope stays negotiated (see
         // legacy_list_results_carry_sep2549_ttl).
@@ -3366,9 +3884,10 @@ mod tests {
         assert_eq!(discovered["result"]["cacheScope"], "public");
         assert_eq!(discovered["result"]["supportedVersions"][0], "2026-07-28");
         assert!(discovered["result"]["capabilities"]["resources"].is_object());
-        assert!(discovered["result"]["capabilities"]["extensions"]
-            ["io.modelcontextprotocol/tasks"]
-            .is_object());
+        assert!(
+            discovered["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                .is_object()
+        );
         assert_eq!(
             discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             "OpenCADStudio"
@@ -3821,12 +4340,16 @@ mod tests {
             )
             .unwrap();
             let templates = listed["result"]["resourceTemplates"].as_array().unwrap();
-            assert!(templates
-                .iter()
-                .any(|t| t["uriTemplate"].as_str().unwrap().contains("{level}")));
-            assert!(templates
-                .iter()
-                .any(|t| t["uriTemplate"].as_str().unwrap().contains("{hash}")));
+            assert!(
+                templates
+                    .iter()
+                    .any(|t| t["uriTemplate"].as_str().unwrap().contains("{level}"))
+            );
+            assert!(
+                templates
+                    .iter()
+                    .any(|t| t["uriTemplate"].as_str().unwrap().contains("{hash}"))
+            );
             assert_eq!(listed["result"]["ttlMs"], RESOURCE_TTL_MS);
             assert_eq!(listed["result"]["cacheScope"], "public");
         }
@@ -3948,6 +4471,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn schema_sync_respects_opt_out() {
         std::env::set_var("OCS_SKIP_SCHEMA_SYNC", "1");
         assert!(!schema_sync_enabled());
@@ -3981,10 +4505,12 @@ mod tests {
             .unwrap();
         let prop = &capture["inputSchema"]["properties"]["request_id"];
         assert_eq!(prop["type"], "string");
-        assert!(!capture["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("request_id")));
+        assert!(
+            !capture["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("request_id"))
+        );
     }
 
     #[test]
@@ -4081,10 +4607,12 @@ mod tests {
         .unwrap();
         assert_eq!(called["result"]["isError"], true);
         assert!(called["result"].get("structuredContent").is_none());
-        assert!(called["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("request_id"));
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("request_id")
+        );
     }
 
     #[test]
@@ -4133,9 +4661,11 @@ mod tests {
         .unwrap();
         let res_arr = listed["result"]["resources"].as_array().unwrap();
         assert!(res_arr.iter().any(|r| r["uri"] == uri));
-        assert!(res_arr
-            .iter()
-            .any(|r| r["uri"] == "cad://session/sess1/snapshot/latest.png"));
+        assert!(
+            res_arr
+                .iter()
+                .any(|r| r["uri"] == "cad://session/sess1/snapshot/latest.png")
+        );
 
         // Test resources/read with png
         let read_png = handle_message(
@@ -4220,10 +4750,12 @@ mod tests {
         );
         let content = res_res["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
-        assert!(content[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("cad://session/s1/snapshot/hash123.png"));
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cad://session/s1/snapshot/hash123.png")
+        );
         assert_eq!(content[1]["type"], "resource_link");
         assert_eq!(content[1]["name"], "Captured viewport");
         assert_eq!(content[1]["mimeType"], "image/png");
@@ -4281,6 +4813,140 @@ mod tests {
     }
 
     #[test]
+    fn capture_schema_exposes_layout_and_aspect_fit() {
+        let schema = capture_input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(props["layout"]["type"], "string");
+        assert_eq!(props["layout"]["minLength"], 1);
+        assert_eq!(props["aspect_fit"]["type"], "boolean");
+        assert_eq!(props["aspect_fit"]["default"], false);
+        assert_eq!(props["renderer"]["type"], "string");
+        assert_eq!(props["renderer"]["enum"], json!(["auto", "gpu", "cpu"]));
+        assert_eq!(props["renderer"]["default"], "auto");
+        assert_eq!(props["document_id"]["type"], "integer");
+        assert_eq!(props["document_id"]["minimum"], 0);
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("layout")));
+        assert!(!required.contains(&json!("aspect_fit")));
+        assert!(!required.contains(&json!("renderer")));
+        assert!(!required.contains(&json!("document_id")));
+    }
+
+    #[test]
+    fn capture_layout_cache_isolates_bounds_across_layouts() {
+        let mut resources = ResourceStore::default();
+        let m_uri = resources.insert_layout_manifest(
+            "s1",
+            "Model",
+            json!({"world_bounds":[0.0, 0.0, 1000.0, 500.0],"renderer":"gpu"}),
+        );
+        assert_eq!(m_uri, "cad://session/s1/layout/Model/pyramid/manifest.json");
+        let s_uri = resources.insert_layout_manifest(
+            "s1",
+            "Sheet 1",
+            json!({"world_bounds":[0.0, 0.0, 297.0, 210.0],"renderer":"cpu"}),
+        );
+        assert_eq!(
+            s_uri,
+            "cad://session/s1/layout/Sheet%201/pyramid/manifest.json"
+        );
+
+        assert_eq!(
+            resolve_tile_base_bounds(&json!({}), &resources, "s1", Some("model")).unwrap(),
+            [0.0, 0.0, 1000.0, 500.0]
+        );
+        assert_eq!(
+            resolve_tile_base_bounds(&json!({}), &resources, "s1", Some("sheet 1")).unwrap(),
+            [0.0, 0.0, 297.0, 210.0]
+        );
+        assert!(
+            resolve_tile_base_bounds(&json!({}), &resources, "s1", Some("Uncaptured")).is_err()
+        );
+        assert_eq!(
+            resolve_tile_base_bounds(
+                &json!({"bounds": [0.0, 0.0, 420.0, 297.0]}),
+                &resources,
+                "s1",
+                Some("Uncaptured"),
+            )
+            .unwrap(),
+            [0.0, 0.0, 420.0, 297.0]
+        );
+
+        let t_model = resources.insert_tile_for_layout(
+            "s1",
+            Some("Model"),
+            1,
+            0,
+            0,
+            "AAAA".into(),
+            3,
+            json!({"layout":"Model","tag":"model-tile"}),
+        );
+        let t_sheet = resources.insert_tile_for_layout(
+            "s1",
+            Some("Sheet 1"),
+            1,
+            0,
+            0,
+            "BBBB".into(),
+            3,
+            json!({"layout":"Sheet 1","tag":"sheet-tile"}),
+        );
+        assert_eq!(t_model, "cad://session/s1/layout/Model/tile/1/0/0.png");
+        assert_eq!(t_sheet, "cad://session/s1/layout/Sheet%201/tile/1/0/0.png");
+
+        let mut clients = HashMap::new();
+        let mut tasks = TaskStore::default();
+        let read_s_man = handle_message(
+            json!({"jsonrpc":"2.0","id":"r-sman","method":"resources/read","params":{"uri":s_uri}}),
+            &mut clients,
+            &mut tasks,
+            &mut resources,
+            &mut detached_pump(),
+        )
+        .unwrap();
+        let s_man_txt = read_s_man["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(s_man_txt.contains("cad://session/s1/layout/Sheet%201/tile/{level}/{x}/{y}.png"));
+
+        let read_m_tile = handle_message(
+            json!({"jsonrpc":"2.0","id":"r-mtile","method":"resources/read","params":{"uri":t_model}}),
+            &mut clients,
+            &mut tasks,
+            &mut resources,
+            &mut detached_pump(),
+        )
+        .unwrap();
+        assert_eq!(read_m_tile["result"]["contents"][0]["blob"], "AAAA");
+
+        let read_s_tile_json = handle_message(
+            json!({"jsonrpc":"2.0","id":"r-stile-json","method":"resources/read","params":{"uri":"cad://session/s1/layout/Sheet%201/tile/1/0/0.json"}}),
+            &mut clients,
+            &mut tasks,
+            &mut resources,
+            &mut detached_pump(),
+        )
+        .unwrap();
+        assert!(
+            read_s_tile_json["result"]["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("sheet-tile")
+        );
+
+        let untagged = json!({"world_bounds": [0.0, 0.0, 10.0, 10.0]});
+        let model = json!({"layout": "Model", "world_bounds": [0.0, 0.0, 10.0, 10.0]});
+        assert!(!manifest_layout_differs(Some(&untagged), None));
+        assert!(manifest_layout_differs(Some(&untagged), Some("Sheet1")));
+        assert!(!manifest_layout_differs(Some(&model), Some("model")));
+        assert!(manifest_layout_differs(Some(&model), Some("Sheet1")));
+        assert!(manifest_layout_differs(Some(&model), None));
+    }
+
+    #[test]
     fn every_capture_delivers_its_image() {
         for metadata in [
             json!({"hash":"hash-1","uri":"cad://session/s/snapshot/hash-1.png"}),
@@ -4292,17 +4958,18 @@ mod tests {
             }));
             assert_eq!(result["isError"], false);
             assert_eq!(result["structuredContent"], metadata);
-            assert!(result["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|block| block["type"] == "image"
-                    && block["data"] == "capture-png"));
+            assert!(
+                result["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|block| block["type"] == "image" && block["data"] == "capture-png")
+            );
         }
     }
 
     #[test]
-    fn test_pyramid_tiling_protocol_and_resources() {
+    fn pyramid_tiling_protocol_and_resources() {
         let mut clients = HashMap::new();
         let mut tasks = TaskStore::default();
         let mut resources = ResourceStore::default();
@@ -4378,10 +5045,12 @@ mod tests {
         .unwrap();
         let man_contents = read_man["result"]["contents"].as_array().unwrap();
         assert_eq!(man_contents[0]["mimeType"], "application/json");
-        assert!(man_contents[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("cad://session/sess1/tile/{level}/{x}/{y}.png"));
+        assert!(
+            man_contents[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cad://session/sess1/tile/{level}/{x}/{y}.png")
+        );
 
         // 5. Test resources/read with tile png
         let read_tile = handle_message(
@@ -4441,9 +5110,11 @@ mod tests {
             "request_id":"draw",
             "steps":[{"op":"run","request_id":"nested","cmd":"LINE 0,0 10,0"}]
         });
-        assert!(validate_execute_request(&invalid, "batch")
-            .unwrap_err()
-            .contains("omit request_id"));
+        assert!(
+            validate_execute_request(&invalid, "batch")
+                .unwrap_err()
+                .contains("omit request_id")
+        );
 
         let compact = compact_state(&json!({
             "session_id":"s","document_id":3,"revision":4,"geometry_revision":5,
@@ -4505,6 +5176,43 @@ mod tests {
     }
 
     #[test]
+    fn only_a_first_step_stale_state_is_retryable() {
+        let stale = json!({"ok":false,"code":"stale_state"});
+        let batch = |next| BatchExecution {
+            id: "b".into(),
+            request: json!({}),
+            steps: Vec::new(),
+            next,
+            active: None,
+            pending: None,
+            results: Vec::new(),
+            changes: Vec::new(),
+            state: None,
+            terminal: None,
+        };
+        assert!(stale_before_first_step(&batch(1), &stale));
+        assert!(!stale_before_first_step(&batch(2), &stale), "step 0 ran");
+        assert!(!stale_before_first_step(
+            &batch(1),
+            &json!({"ok":false,"code":"command_busy"})
+        ));
+    }
+
+    #[test]
+    fn a_refresh_never_retargets_another_document() {
+        let current = json!({"document_id":2,"revision":1});
+        assert!(adopt_refreshed_state(
+            &current,
+            &json!({"ok":true,"document_id":2,"revision":9})
+        ));
+        assert!(!adopt_refreshed_state(
+            &current,
+            &json!({"ok":true,"document_id":3,"revision":9})
+        ));
+        assert!(!adopt_refreshed_state(&current, &json!({"ok":false})));
+    }
+
+    #[test]
     fn gui_failures_are_mcp_errors() {
         let result = tool_result(json!({
             "ok":false,
@@ -4514,10 +5222,12 @@ mod tests {
         }));
         assert_eq!(result["isError"], true);
         assert!(result.get("structuredContent").is_none());
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("stale_state"));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("stale_state")
+        );
     }
 
     #[test]
@@ -4574,8 +5284,80 @@ mod tests {
         });
         let batch_res = validate_execute_request(&batch, "batch").expect("batch passes");
         assert_eq!(batch_res.warnings.len(), 1);
-        assert!(batch_res.warnings[0]
-            .contains("batch step 0: unknown parameter 'stray' ignored for op 'run'"));
+        assert!(
+            batch_res.warnings[0]
+                .contains("batch step 0: unknown parameter 'stray' ignored for op 'run'")
+        );
+    }
+
+    #[test]
+    fn entities_set_rejects_unknown_fields_without_changing_legacy_warnings() {
+        let request = json!({
+            "op":"entities_set",
+            "handles":["2A"],
+            "layer":"Walls",
+            "colour":"ByLayer"
+        });
+        let error = crate::mcp_ops::validate_request(&request, false).unwrap_err();
+        assert!(error.contains("unknown parameter 'colour'"), "{error}");
+
+        let bound_batch = json!({
+            "op":"batch",
+            "request_id":"entities-set-bound",
+            "steps":[
+                {"op":"entities_create","entities":[{"type":"Point","location":[0,0]}]},
+                {"op":"entities_set","color":"ByLayer","bindings":{
+                    "handles":{"step":0,"path":"/result/handles"}
+                }}
+            ]
+        });
+        validate_execute_request(&bound_batch, "batch").expect("bound entities_set batch");
+    }
+
+    #[test]
+    fn xref_operations_reject_unknown_fields_and_require_a_path_choice() {
+        for op in [
+            "xref_reload",
+            "xref_unload",
+            "xref_detach",
+            "xref_bind",
+            "xref_set_path",
+            "xref_set_type",
+        ] {
+            let mut request = json!({"op":op,"id":"2A","stray":true});
+            if op == "xref_set_path" {
+                request["path"] = json!("site.dwg");
+            } else if op == "xref_set_type" {
+                request["reference_type"] = json!("overlay");
+            }
+            let error = crate::mcp_ops::validate_request(&request, false).unwrap_err();
+            assert!(error.contains("unknown parameter 'stray'"), "{op}: {error}");
+        }
+        let error =
+            crate::mcp_ops::validate_request(&json!({"op":"xref_set_path","id":"2A"}), false)
+                .unwrap_err();
+        assert!(
+            error.contains("Supply exactly one of path, path_type for xref_set_path"),
+            "{error}"
+        );
+        let error = crate::mcp_ops::validate_request(
+            &json!({"op":"xref_set_path","id":"2A","path":"site.dwg","path_type":"full"}),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("Supply exactly one"), "{error}");
+        for request in [
+            json!({"op":"xref_set_path","id":"2A","path":null}),
+            json!({"op":"xref_set_path","id":"2A","path":null,"path_type":"full"}),
+            json!({"op":"xref_set_path","id":"2A","path":"site.dwg","path_type":null}),
+        ] {
+            let error = crate::mcp_ops::validate_request(&request, false).unwrap_err();
+            assert!(error.contains("Supply exactly one"), "{request}: {error}");
+        }
+        let schema = crate::mcp_ops::op_schema(
+            crate::mcp_ops::find_op("xref_set_path").expect("xref_set_path schema"),
+        );
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(2));
     }
 
     #[test]
@@ -4659,15 +5441,19 @@ mod tests {
         // Reconstruct the old duplicated layout using the same operation
         // definitions, so the size comparison stays meaningful as ops evolve.
         let mut old = standalone.clone();
-        old["anyOf"] = json!(crate::mcp_ops::OPS
-            .iter()
-            .map(|op| crate::mcp_ops::op_schema(op))
-            .collect::<Vec<_>>());
-        old["$defs"]["batch_step"]["anyOf"] = json!(crate::mcp_ops::OPS
-            .iter()
-            .filter(|op| op.batchable)
-            .map(|op| crate::mcp_ops::op_schema(op))
-            .collect::<Vec<_>>());
+        old["anyOf"] = json!(
+            crate::mcp_ops::OPS
+                .iter()
+                .map(|op| crate::mcp_ops::op_schema(op))
+                .collect::<Vec<_>>()
+        );
+        old["$defs"]["batch_step"]["anyOf"] = json!(
+            crate::mcp_ops::OPS
+                .iter()
+                .filter(|op| op.batchable)
+                .map(|op| crate::mcp_ops::op_schema(op))
+                .collect::<Vec<_>>()
+        );
         old["$defs"]
             .as_object_mut()
             .unwrap()
@@ -4694,7 +5480,7 @@ mod tests {
             .unwrap()
         };
         let catalog = call("entity_schema", json!({}));
-        assert_eq!(catalog["types"].as_array().unwrap().len(), 11);
+        assert_eq!(catalog["types"].as_array().unwrap().len(), 13);
         assert!(catalog.get("schema").is_none());
         let circle = call("entity_schema", json!({"type":"Circle"}));
         assert_eq!(
@@ -4712,10 +5498,12 @@ mod tests {
             json!({"request":{"op":"entities_create","entities":[{"type":"Circle","center":["bad",0],"radius":2}]}}),
         );
         assert_eq!(invalid["valid"], false);
-        assert!(invalid["error"]
-            .as_str()
-            .unwrap()
-            .contains("/entities/0/center/0"));
+        assert!(
+            invalid["error"]
+                .as_str()
+                .unwrap()
+                .contains("/entities/0/center/0")
+        );
         assert!(clients.is_empty());
         assert!(resources.latest.is_empty());
         let rejected = call_tool(
@@ -4756,7 +5544,7 @@ mod tests {
 
     #[test]
     fn guides_are_discoverable_without_a_gui_session() {
-        assert!(INSTRUCTIONS.len() < 1100);
+        assert!(INSTRUCTIONS.len() < 1200);
         assert!(INSTRUCTIONS.contains("state.command.accepts"));
         assert!(INSTRUCTIONS.contains("never replay a mutation"));
         let mut clients = HashMap::new();
@@ -4781,11 +5569,13 @@ mod tests {
         assert_eq!(tool_list["guides"].as_array().unwrap().len(), GUIDES.len());
         for (name, _, text) in GUIDES {
             let uri = format!("cad://guides/{name}");
-            assert!(listed["result"]["resources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["uri"] == uri));
+            assert!(
+                listed["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["uri"] == uri)
+            );
             let resource = read_resource(
                 &uri,
                 &mut clients,
@@ -4808,14 +5598,16 @@ mod tests {
             assert_eq!(tool["ok"], true);
             assert_eq!(tool_list["ok"], true);
         }
-        assert!(read_resource(
-            "cad://guides/missing",
-            &mut clients,
-            &mut resources,
-            &mut detached_pump(),
-            None
-        )
-        .is_err());
+        assert!(
+            read_resource(
+                "cad://guides/missing",
+                &mut clients,
+                &mut resources,
+                &mut detached_pump(),
+                None
+            )
+            .is_err()
+        );
         assert!(clients.is_empty());
     }
 
@@ -4823,20 +5615,24 @@ mod tests {
     fn batch_bindings_validate_and_preserve_types() {
         let step = json!({"op":"group_create","name":"walls","bindings":{"handles":{"step":0,"path":"/result/a~1b~0c"}}});
         let request = json!({"op":"batch","steps":[{"op":"run","cmd":"LINE 0,0 1,1"},step]});
-        assert!(validate_execute_request(&request, "batch")
-            .unwrap()
-            .warnings
-            .is_empty());
+        assert!(
+            validate_execute_request(&request, "batch")
+                .unwrap()
+                .warnings
+                .is_empty()
+        );
         let results = vec![json!({"ok":true,"status":"completed","result":{"a/b~c":["A","B"]}})];
         let resolved = resolve_batch_step(&step, 1, &results).unwrap();
         assert_eq!(resolved["handles"], json!(["A", "B"]));
         assert!(resolved.get("bindings").is_none());
-        assert!(resolve_batch_step(
-            &step,
-            1,
-            &[json!({"status":"completed","result":{"a/b~c":42}})]
-        )
-        .is_err());
+        assert!(
+            resolve_batch_step(
+                &step,
+                1,
+                &[json!({"status":"completed","result":{"a/b~c":42}})]
+            )
+            .is_err()
+        );
         assert!(resolve_batch_step(&step, 1, &[json!({"status":"running"})]).is_err());
         assert!(resolve_batch_step(&step, 1, &[json!({"status":"completed"})]).is_err());
         for binding in [
@@ -5101,9 +5897,11 @@ mod tests {
         assert!(schema["$defs"]["window"].is_object());
         assert!(schema["$defs"]["batch_step"].is_object());
         let json_str = schema.to_string();
-        // Generates cleanly without exponential blowup: compact ~15KB to 45KB
+        // Generates cleanly without exponential blowup: compact ~15KB to 48KB
+        // (the catalogue's 13th execute op, plugin_panel_action, sits inside
+        // the deliberate 2026-11 budget revisit)
         assert!(
-            json_str.len() < 45_000,
+            json_str.len() < 48_000,
             "schema size is {} bytes",
             json_str.len()
         );

@@ -21,16 +21,16 @@ use crate::t;
 
 /// Fixed row height used by the renderer, so `ContextMenu::default_row_y`
 /// (which anchors the default row under the cursor) agrees with the layout.
-pub const MENU_ROW_H: f32 = 22.0;
+pub const MENU_ROW_H: f32 = crate::ui::style::kit_metrics::MENU_ITEM_H;
 /// Height of a separator row (1 px line plus its vertical padding).
-pub const MENU_SEP_H: f32 = 7.0;
+pub const MENU_SEP_H: f32 = crate::ui::style::kit_metrics::MENU_SEPARATOR_H;
 /// Vertical padding inside the menu panel above the first row.
-pub const MENU_PAD_TOP: f32 = 4.0;
+pub const MENU_PAD_TOP: f32 = crate::ui::style::kit_metrics::MENU_PAD_Y;
 /// The row layout the renderer uses, for sizing the menu to its widest row:
 /// side padding, icon gutter, gap after it, indent of a submenu's items,
 /// least gap before a hint or check, and the check and caret.
-const ROW_PAD_LEFT: f32 = 6.0;
-const ROW_PAD_RIGHT: f32 = 12.0;
+const ROW_PAD_LEFT: f32 = crate::ui::style::kit_metrics::TOOL_GAP;
+const ROW_PAD_RIGHT: f32 = crate::ui::style::kit_metrics::MENU_PAD_X;
 const GUTTER_W: f32 = 18.0;
 const GUTTER_GAP: f32 = 4.0;
 const CHILD_INDENT: f32 = 14.0;
@@ -49,6 +49,7 @@ pub enum SubmenuId {
     DrawOrder,
     Isolate,
     SnapOverrides,
+    SavedFilters,
     /// A submenu of a menu-bar menu opened from the keyboard.
     MenuBar(u16),
 }
@@ -321,7 +322,9 @@ impl ContextMenu {
     /// Vertical offset from the panel's top edge to the top of the default
     /// row, using the renderer's fixed row metrics.
     pub fn default_row_y(&self) -> f32 {
-        let mut y = MENU_PAD_TOP;
+        // The rows start inside the panel's border.
+        let first = MENU_PAD_TOP + crate::ui::style::kit_metrics::LINE;
+        let mut y = first;
         for row in &self.rows {
             match row {
                 MenuRow::Item(item) => {
@@ -344,12 +347,13 @@ impl ContextMenu {
                 }
             }
         }
-        MENU_PAD_TOP
+        first
     }
 
-    /// Total panel height (rows plus the panel's vertical padding).
+    /// Total panel height (rows plus the panel's vertical padding and its
+    /// border, which the rows stay inside).
     pub fn height(&self) -> f32 {
-        let mut h = MENU_PAD_TOP * 2.0;
+        let mut h = MENU_PAD_TOP * 2.0 + 2.0 * crate::ui::style::kit_metrics::LINE;
         for row in &self.rows {
             match row {
                 MenuRow::Item(_) => h += MENU_ROW_H,
@@ -372,7 +376,7 @@ impl ContextMenu {
         let item_w = |item: &MenuItem, indent: f32| {
             let mut end = 0.0;
             if let Some(hint) = &item.hint {
-                end += GUTTER_GAP + width(hint, 11.0, false);
+                end += GUTTER_GAP + width(hint, crate::ui::style::text::UI, false);
             }
             if item.checked {
                 end += GUTTER_GAP + CHECK_W;
@@ -380,7 +384,7 @@ impl ContextMenu {
             if end > 0.0 {
                 end += END_GAP - GUTTER_GAP;
             }
-            indent + width(&item.label, 12.0, item.default) + end
+            indent + width(&item.label, crate::ui::style::text::UI, item.default) + end
         };
         let widest = self
             .rows
@@ -388,10 +392,12 @@ impl ContextMenu {
             .map(|row| match row {
                 MenuRow::Item(item) => item_w(item, 0.0),
                 MenuRow::Separator => 0.0,
-                MenuRow::Submenu { label, items, .. } => items
-                    .iter()
-                    .map(|item| item_w(item, CHILD_INDENT))
-                    .fold(width(label, 12.0, false) + END_GAP + CARET_W, f32::max),
+                MenuRow::Submenu { label, items, .. } => {
+                    items.iter().map(|item| item_w(item, CHILD_INDENT)).fold(
+                        width(label, crate::ui::style::text::UI, false) + END_GAP + CARET_W,
+                        f32::max,
+                    )
+                }
             })
             .fold(0.0, f32::max);
         // The panel's border on both sides.
@@ -426,6 +432,9 @@ pub enum MenuContext {
         single_hatch: bool,
         /// Exactly one multileader is selected: its leader rows are offered.
         single_mleader: bool,
+        /// Exactly one block reference is selected: its block rows are
+        /// offered; `Some(true)` when it is a dynamic block (Reset Block).
+        single_block: Option<bool>,
         selected_constraint: Option<ConstraintId>,
         isolation_active: bool,
         /// Recently run commands, newest first.
@@ -434,6 +443,8 @@ pub enum MenuContext {
         undo_label: Option<String>,
         redo_label: Option<String>,
         props_open: bool,
+        /// The drawing's saved selection filters, by name.
+        saved_filters: Vec<String>,
     },
     /// A grip is hot / being dragged.
     Grip(GripMenuContext),
@@ -451,6 +462,7 @@ pub fn build_context_menu(ctx: &MenuContext, open_submenu: Option<SubmenuId>) ->
             has_selection,
             single_hatch,
             single_mleader,
+            single_block,
             selected_constraint,
             isolation_active,
             recent_cmds,
@@ -458,10 +470,12 @@ pub fn build_context_menu(ctx: &MenuContext, open_submenu: Option<SubmenuId>) ->
             undo_label,
             redo_label,
             props_open,
+            saved_filters,
         } => idle_rows(
             *has_selection,
             *single_hatch,
             *single_mleader,
+            *single_block,
             *selected_constraint,
             *isolation_active,
             recent_cmds,
@@ -469,6 +483,7 @@ pub fn build_context_menu(ctx: &MenuContext, open_submenu: Option<SubmenuId>) ->
             undo_label.as_deref(),
             redo_label.as_deref(),
             *props_open,
+            saved_filters,
             open_submenu,
         ),
         MenuContext::Grip(grip) => grip_rows(grip),
@@ -520,8 +535,8 @@ pub fn menu_line_item(
     icon: Option<&'static [u8]>,
 ) -> MenuItem {
     let enabled = line.is_some();
-    let mut item = MenuItem::new(label, MenuAction::MenuLine(line.unwrap_or_default()))
-        .enabled(enabled);
+    let mut item =
+        MenuItem::new(label, MenuAction::MenuLine(line.unwrap_or_default())).enabled(enabled);
     if !hint.is_empty() {
         item = item.hint(hint);
     }
@@ -674,6 +689,7 @@ fn idle_rows(
     has_selection: bool,
     single_hatch: bool,
     single_mleader: bool,
+    single_block: Option<bool>,
     selected_constraint: Option<ConstraintId>,
     isolation_active: bool,
     recent_cmds: &[String],
@@ -681,6 +697,7 @@ fn idle_rows(
     undo_label: Option<&str>,
     redo_label: Option<&str>,
     props_open: bool,
+    saved_filters: &[String],
     open_submenu: Option<SubmenuId>,
 ) -> Vec<MenuRow> {
     let cmd = |label: String, name: &str| {
@@ -775,6 +792,22 @@ fn idle_rows(
                 "AIMLEADEREDITREMOVE",
             )));
         }
+        if let Some(dynamic) = single_block {
+            rows.push(MenuRow::Item(cmd(
+                t!("Block Editor").into_owned(),
+                "BEDIT",
+            )));
+            rows.push(MenuRow::Item(cmd(
+                t!("Edit Block In-place").into_owned(),
+                "REFEDIT",
+            )));
+            if dynamic {
+                rows.push(MenuRow::Item(cmd(
+                    t!("Reset Block").into_owned(),
+                    "RESETBLOCK",
+                )));
+            }
+        }
         rows.push(MenuRow::Item(
             MenuItem::new(t!("Erase").into_owned(), MenuAction::DeleteSelected)
                 .command_icon("ERASE"),
@@ -868,6 +901,21 @@ fn idle_rows(
         t!("Quick Select...").into_owned(),
         MenuAction::QuickSelect,
     )));
+    rows.push(MenuRow::Item(cmd(t!("Filter...").into_owned(), "FILTER")));
+    // The drawing's saved filters open below the row, in the menu (#2611):
+    // one click applies one, no dialog.
+    if !saved_filters.is_empty() {
+        rows.push(MenuRow::Submenu {
+            id: SubmenuId::SavedFilters,
+            label: t!("Apply saved filter").into_owned(),
+            icon: None,
+            items: saved_filters
+                .iter()
+                .map(|name| cmd(name.clone(), &format!("FILTER {name}")))
+                .collect(),
+            open: open_submenu == Some(SubmenuId::SavedFilters),
+        });
+    }
     // Count the selected objects, or start a count.
     rows.push(MenuRow::Item(if has_selection {
         cmd(t!("Count Selection").into_owned(), "COUNT _C")
@@ -1120,6 +1168,7 @@ mod tests {
             has_selection,
             single_hatch: false,
             single_mleader: false,
+            single_block: None,
             selected_constraint: None,
             isolation_active: false,
             recent_cmds: vec!["LINE".into(), "CIRCLE".into()],
@@ -1127,6 +1176,7 @@ mod tests {
             undo_label: Some("LINE".into()),
             redo_label: None,
             props_open: false,
+            saved_filters: Vec::new(),
         }
     }
 
@@ -1259,11 +1309,21 @@ mod tests {
     #[test]
     fn default_row_y_accounts_for_separators() {
         let menu = build_context_menu(&line_ctx(), None);
-        assert_eq!(menu.default_row_y(), MENU_PAD_TOP);
+        assert_eq!(
+            menu.default_row_y(),
+            MENU_PAD_TOP + crate::ui::style::kit_metrics::LINE
+        );
         let menu = build_context_menu(&idle_ctx(false), None);
-        assert_eq!(menu.default_row_y(), MENU_PAD_TOP);
-        // 11 items + 3 submenu headers + 6 separators, plus panel padding.
-        let expected = MENU_PAD_TOP * 2.0 + 14.0 * MENU_ROW_H + 6.0 * MENU_SEP_H;
+        assert_eq!(
+            menu.default_row_y(),
+            MENU_PAD_TOP + crate::ui::style::kit_metrics::LINE
+        );
+        // 12 items (Filter... among them) + 3 submenu headers + 6
+        // separators, plus panel padding. No saved filters: no submenu.
+        let expected = MENU_PAD_TOP * 2.0
+            + 2.0 * crate::ui::style::kit_metrics::LINE
+            + 15.0 * MENU_ROW_H
+            + 6.0 * MENU_SEP_H;
         assert_eq!(menu.height(), expected);
     }
 
@@ -1322,6 +1382,27 @@ fn item_key(item: &MenuItem) -> String {
 
 /// The idle menu as the user arranged it: hidden rows gone, their own
 /// commands after Recent Input, and Customize at the end.
+/// The command a user's entry carries when it is a separator line.
+pub const MENU_SEPARATOR: &str = "--";
+
+/// The commands the user added, as rows: shown in the idle menu and alone
+/// by POPMENU.
+pub fn user_rows(custom: &MenuCustomization) -> Vec<MenuRow> {
+    custom
+        .custom
+        .iter()
+        .map(|(label, command)| {
+            if command == MENU_SEPARATOR {
+                return MenuRow::Separator;
+            }
+            MenuRow::Item(
+                MenuItem::new(label.clone(), MenuAction::Command(command.clone()))
+                    .command_icon(command.split_whitespace().next().unwrap_or("")),
+            )
+        })
+        .collect()
+}
+
 pub fn customize_rows(rows: Vec<MenuRow>, custom: &MenuCustomization) -> Vec<MenuRow> {
     // The default row (Repeat) always stays.
     let hidden = |key: &str| custom.hidden.iter().any(|h| h == key);
@@ -1330,16 +1411,31 @@ pub fn customize_rows(rows: Vec<MenuRow>, custom: &MenuCustomization) -> Vec<Men
     for row in rows {
         let row = match row {
             MenuRow::Item(item) if !item.default && hidden(&item_key(&item)) => continue,
-            MenuRow::Submenu { id, label, icon, items, open } => {
+            MenuRow::Submenu {
+                id,
+                label,
+                icon,
+                items,
+                open,
+            } => {
                 if hidden(&format!("{id:?}")) {
                     continue;
                 }
                 let items: Vec<MenuItem> = if id == SubmenuId::RecentInput {
                     items
                 } else {
-                    items.into_iter().filter(|item| !hidden(&item_key(item))).collect()
+                    items
+                        .into_iter()
+                        .filter(|item| !hidden(&item_key(item)))
+                        .collect()
                 };
-                MenuRow::Submenu { id, label, icon, items, open }
+                MenuRow::Submenu {
+                    id,
+                    label,
+                    icon,
+                    items,
+                    open,
+                }
             }
             row => row,
         };
@@ -1347,25 +1443,27 @@ pub fn customize_rows(rows: Vec<MenuRow>, custom: &MenuCustomization) -> Vec<Men
         out.push(row);
         if separator && !inserted {
             inserted = true;
-            for (label, command) in &custom.custom {
-                out.push(MenuRow::Item(
-                    MenuItem::new(label.clone(), MenuAction::Command(command.clone()))
-                        .command_icon(command.split_whitespace().next().unwrap_or("")),
-                ));
-            }
+            out.extend(user_rows(custom));
             out.push(MenuRow::Separator);
         }
     }
     out.push(MenuRow::Separator);
     out.push(MenuRow::Item(
-        MenuItem::new(crate::tr!("context-menu", "customize"), MenuAction::Customize)
-            .icon(MenuIcon::Chrome(crate::ui::icons::GEAR)),
+        MenuItem::new(
+            crate::tr!("context-menu", "customize"),
+            MenuAction::Customize,
+        )
+        .icon(MenuIcon::Chrome(crate::ui::icons::GEAR)),
     ));
     // No separator leads, ends or doubles up once rows are gone.
     let mut tidy: Vec<MenuRow> = Vec::with_capacity(out.len());
     for row in out {
         let separator = matches!(row, MenuRow::Separator);
-        if separator && tidy.last().is_none_or(|last| matches!(last, MenuRow::Separator)) {
+        if separator
+            && tidy
+                .last()
+                .is_none_or(|last| matches!(last, MenuRow::Separator))
+        {
             continue;
         }
         tidy.push(row);
@@ -1382,6 +1480,7 @@ mod customization_tests {
             has_selection: true,
             single_hatch: false,
             single_mleader: false,
+            single_block: None,
             selected_constraint: None,
             isolation_active: false,
             recent_cmds: vec!["LINE".into()],
@@ -1389,6 +1488,7 @@ mod customization_tests {
             undo_label: None,
             redo_label: None,
             props_open: false,
+            saved_filters: Vec::new(),
         }
     }
 
@@ -1416,8 +1516,37 @@ mod customization_tests {
         assert!(!shown.contains(&"Undo".to_string()) && !shown.contains(&"COPYCLIP".to_string()));
         assert!(shown.contains(&"Redo".to_string()));
         // Repeat, Recent Input, separator, then the user's command.
-        assert!(matches!(&rows[3], MenuRow::Item(item) if item.action == MenuAction::Command("OFFSET".into())));
-        assert!(matches!(rows.last(), Some(MenuRow::Item(item)) if item.action == MenuAction::Customize));
-        assert!(!rows.windows(2).any(|pair| matches!(pair, [MenuRow::Separator, MenuRow::Separator])));
+        assert!(
+            matches!(&rows[3], MenuRow::Item(item) if item.action == MenuAction::Command("OFFSET".into()))
+        );
+        assert!(
+            matches!(rows.last(), Some(MenuRow::Item(item)) if item.action == MenuAction::Customize)
+        );
+        assert!(!rows
+            .windows(2)
+            .any(|pair| matches!(pair, [MenuRow::Separator, MenuRow::Separator])));
+    }
+
+    /// #2619: a "--" entry draws a separator between the user's commands.
+    #[test]
+    fn a_separator_entry_splits_the_users_commands() {
+        let rows = build_context_menu(&idle(), None).rows;
+        let custom = MenuCustomization {
+            hidden: Vec::new(),
+            custom: vec![
+                ("Offset".into(), "OFFSET".into()),
+                ("──────".into(), MENU_SEPARATOR.into()),
+                ("Trim".into(), "TRIM".into()),
+            ],
+        };
+        let rows = customize_rows(rows, &custom);
+        let at = rows
+            .iter()
+            .position(|row| matches!(row, MenuRow::Item(item) if item.action == MenuAction::Command("OFFSET".into())))
+            .unwrap();
+        assert!(matches!(rows[at + 1], MenuRow::Separator));
+        assert!(
+            matches!(&rows[at + 2], MenuRow::Item(item) if item.action == MenuAction::Command("TRIM".into()))
+        );
     }
 }

@@ -9,11 +9,11 @@
 
 use crate::modules::draw::modify::spline_ops::{spline_cut, spline_to_nurbs};
 use crate::t;
-use codec::entities::Spline as SplineEnt;
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::entities::Spline as SplineEnt;
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::{DVec3, Vec3};
-use kernel::geom2d::Curve;
+use ocs_geom::geom2d::Curve;
 
 use crate::command::{CadCommand, CmdResult};
 
@@ -64,6 +64,12 @@ enum LenState {
     },
 }
 
+impl Default for LengthenCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LengthenCommand {
     pub fn new() -> Self {
         Self {
@@ -92,26 +98,43 @@ impl CadCommand for LengthenCommand {
             }
             LenState::Value(ValueMode::Delta) => format!(
                 "LENGTHEN  Enter delta length <{}>:",
-                LENGTHEN_DEFAULTS.lock().unwrap().delta
+                LENGTHEN_DEFAULTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .delta
             ),
             LenState::Value(ValueMode::Total) => format!(
                 "LENGTHEN  Enter total length <{}>:",
-                LENGTHEN_DEFAULTS.lock().unwrap().total
+                LENGTHEN_DEFAULTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .total
             ),
             LenState::Value(ValueMode::Percent) => format!(
                 "LENGTHEN  Enter percentage length <{}>:",
-                LENGTHEN_DEFAULTS.lock().unwrap().percent
+                LENGTHEN_DEFAULTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .percent
             ),
             LenState::Value(ValueMode::DeltaAngle) => format!(
                 "LENGTHEN  Enter delta angle <{}>:",
                 crate::entities::common::format_angle(
-                    LENGTHEN_DEFAULTS.lock().unwrap().delta_angle.to_radians(),
+                    LENGTHEN_DEFAULTS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .delta_angle
+                        .to_radians(),
                 )
             ),
             LenState::Value(ValueMode::TotalAngle) => format!(
                 "LENGTHEN  Enter total angle <{}>:",
                 crate::entities::common::format_angle(
-                    LENGTHEN_DEFAULTS.lock().unwrap().total_angle.to_radians(),
+                    LENGTHEN_DEFAULTS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .total_angle
+                        .to_radians(),
                 )
             ),
             LenState::DynamicPoint { .. } => "LENGTHEN  Specify new end point:".into(),
@@ -240,7 +263,10 @@ impl CadCommand for LengthenCommand {
                 "DY" | "DYNAMIC" => ValueMode::Dynamic,
                 _ => return Some(CmdResult::NeedPoint),
             };
-            LENGTHEN_DEFAULTS.lock().unwrap().mode = mode;
+            LENGTHEN_DEFAULTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mode = mode;
             self.state = if matches!(mode, ValueMode::Dynamic) {
                 LenState::DynamicPick
             } else {
@@ -278,7 +304,7 @@ impl CadCommand for LengthenCommand {
             return Some(CmdResult::NeedPoint);
         }
         {
-            let mut defaults = LENGTHEN_DEFAULTS.lock().unwrap();
+            let mut defaults = LENGTHEN_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
             match mode {
                 ValueMode::Delta => defaults.delta = value,
                 ValueMode::Total => defaults.total = value,
@@ -335,7 +361,10 @@ impl CadCommand for LengthenCommand {
     fn on_enter(&mut self) -> CmdResult {
         match self.state {
             LenState::ChooseMode => {
-                let mode = LENGTHEN_DEFAULTS.lock().unwrap().mode;
+                let mode = LENGTHEN_DEFAULTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .mode;
                 self.state = if matches!(mode, ValueMode::Dynamic) {
                     LenState::DynamicPick
                 } else {
@@ -345,7 +374,7 @@ impl CadCommand for LengthenCommand {
             }
             LenState::Value(mode) => {
                 let value = {
-                    let defaults = LENGTHEN_DEFAULTS.lock().unwrap();
+                    let defaults = LENGTHEN_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
                     match mode {
                         ValueMode::Delta => defaults.delta,
                         ValueMode::Total => defaults.total,
@@ -387,7 +416,7 @@ pub fn lengthen_entity(entity: &EntityType, pick_pt: Vec3, mode: &LenMode) -> Op
 }
 
 fn lengthen_entity_precise(entity: &EntityType, pick: DVec3, mode: &LenMode) -> Option<EntityType> {
-    use kernel::space::lengthen::{lengthen_arc, lengthen_line, LengthChange};
+    use ocs_geom::space::lengthen::{lengthen_arc, lengthen_line, LengthChange};
     let change = match mode {
         LenMode::Delta(value) => LengthChange::Delta(*value),
         LenMode::Total(value) => LengthChange::Total(*value),
@@ -425,7 +454,7 @@ fn lengthen_entity_precise(entity: &EntityType, pick: DVec3, mode: &LenMode) -> 
         EntityType::Ellipse(ellipse) => {
             let curve = crate::entities::curve::ellipse_curve(ellipse)?;
             let (start, end) =
-                kernel::space::lengthen::lengthen_ellipse(&curve, pick.to_array(), change)?;
+                ocs_geom::space::lengthen::lengthen_ellipse(&curve, pick.to_array(), change)?;
             let mut result = ellipse.clone();
             result.start_parameter = start;
             result.end_parameter = end;
@@ -435,12 +464,12 @@ fn lengthen_entity_precise(entity: &EntityType, pick: DVec3, mode: &LenMode) -> 
         EntityType::LwPolyline(polyline) => {
             let curve = crate::entities::curve::lwpolyline_curve(polyline)?;
             let vertices =
-                kernel::space::lengthen::lengthen_polyline(&curve, pick.to_array(), change)?;
+                ocs_geom::space::lengthen::lengthen_polyline(&curve, pick.to_array(), change)?;
             let mut result = polyline.clone();
             result.vertices = vertices
                 .into_iter()
                 .map(|vertex| {
-                    let mut value = polyline.vertices[vertex.source].clone();
+                    let mut value = polyline.vertices[vertex.source];
                     value.location.x = vertex.position[0];
                     value.location.y = vertex.position[1];
                     value.bulge = vertex.bulge;
@@ -485,12 +514,13 @@ fn lengthen_spline(spl: &SplineEnt, pick_pt: Vec3, mode: &LenMode) -> Option<Ent
         return None;
     }
     let new_len = apply_mode(arc_len, mode)?;
-    if new_len < 1e-10 || new_len >= arc_len {
-        // A spline is shortened by splitting it, so there is nothing to keep
-        // if the new length is the whole of it or more. Extending would mean
-        // continuing the curve past its own control polygon, which is a
-        // different operation from cutting one.
+    if new_len < 1e-10 || (new_len - arc_len).abs() <= 1e-10 * arc_len.max(1.0) {
         return None;
+    }
+    if new_len > arc_len {
+        // Longer: the curve continued past the picked end, curvature
+        // continuous, the original part unchanged.
+        return extend_spline(spl, pick_pt, new_len - arc_len);
     }
 
     let p_start = nurbs.point_at_knot(t0);
@@ -513,6 +543,42 @@ fn lengthen_spline(spl: &SplineEnt, pick_pt: Vec3, mode: &LenMode) -> Option<Ent
     Some(EntityType::Spline(if extend_end { left } else { right }))
 }
 
+fn extend_spline(spl: &SplineEnt, pick_pt: Vec3, distance: f64) -> Option<EntityType> {
+    if spl.flags.closed || spl.flags.periodic {
+        return None;
+    }
+    let curve = crate::entities::spline::nurbs3(spl)?.with_periodicity(false);
+    let (t0, t1) = curve.domain();
+    let (p_start, p_end) = (curve.point_at_knot(t0), curve.point_at_knot(t1));
+    let (px, py) = (pick_pt.x as f64, pick_pt.y as f64);
+    let at_end =
+        (p_end[0] - px).hypot(p_end[1] - py) <= (p_start[0] - px).hypot(p_start[1] - py);
+    let longer = curve.extended(at_end, distance)?;
+    let mut result = spl.clone();
+    result.common.handle = Handle::NULL;
+    result.degree = longer.degree() as i32;
+    result.control_points = longer
+        .control_points()
+        .iter()
+        .map(|p| Vector3::new(p[0], p[1], p[2]))
+        .collect();
+    result.knots = longer.knots().to_vec();
+    result.flags.rational = longer.is_rational();
+    result.weights = if result.flags.rational {
+        longer.weights().to_vec()
+    } else {
+        Vec::new()
+    };
+    // The fit data described the shorter curve; what comes back is a
+    // control-point spline.
+    result.fit_points.clear();
+    result.begin_tangent = Vector3::ZERO;
+    result.end_tangent = Vector3::ZERO;
+    result.dwg_flags1 &= !1;
+    result.dxf_flags &= !(32 | 1024);
+    Some(EntityType::Spline(result))
+}
+
 // ── Autocomplete registry ─────────────────────────────────
 inventory::submit!(crate::command::CommandRegistration {
     names: &["LENGTHEN"]
@@ -523,7 +589,7 @@ mod tests {
     use super::*;
 
     fn spatial_line() -> EntityType {
-        EntityType::Line(codec::entities::Line::from_points(
+        EntityType::Line(document::entities::Line::from_points(
             Vector3::new(0.0, 0.0, 0.0),
             Vector3::new(0.0, 0.0, 4.0),
         ))
@@ -595,7 +661,7 @@ mod tests {
 
     #[test]
     fn circular_arc_accepts_total_angle_in_radians() {
-        let arc = codec::entities::Arc::from_center_radius_angles(
+        let arc = document::entities::Arc::from_center_radius_angles(
             Vector3::ZERO,
             2.0,
             0.0,
@@ -613,19 +679,59 @@ mod tests {
     }
 
     #[test]
+    fn lengthen_continues_when_the_lock_of_its_defaults_is_poisoned() {
+        let _ = std::thread::spawn(|| {
+            let _guard = LENGTHEN_DEFAULTS.lock();
+            panic!("poison the LENGTHEN defaults");
+        })
+        .join();
+        assert!(LENGTHEN_DEFAULTS.is_poisoned());
+
+        // Each step below takes the lock; none depends on the mode that
+        // other tests leave in the shared defaults.
+        let mut command = LengthenCommand::new();
+        assert!(command.on_text_input("T").is_some());
+        assert!(command.prompt().contains("total length"));
+        assert!(command.on_text_input("1").is_some());
+        for (mode, text) in [
+            (ValueMode::Delta, "delta length"),
+            (ValueMode::Percent, "percentage"),
+            (ValueMode::DeltaAngle, "delta angle"),
+            (ValueMode::TotalAngle, "total angle"),
+        ] {
+            command.state = LenState::Value(mode);
+            assert!(command.prompt().contains(text));
+        }
+        let mut command = LengthenCommand::new();
+        command.on_enter();
+        assert!(!matches!(command.state, LenState::ChooseMode));
+        command.state = LenState::Value(ValueMode::Total);
+        command.on_enter();
+        assert!(matches!(command.state, LenState::Apply(_)));
+
+        LENGTHEN_DEFAULTS.clear_poison();
+    }
+
+    #[test]
     fn default_total_angle_is_a_half_turn_in_degrees() {
-        assert_eq!(LENGTHEN_DEFAULTS.lock().unwrap().total_angle, 180.0);
+        assert_eq!(
+            LENGTHEN_DEFAULTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .total_angle,
+            180.0
+        );
     }
 
     #[test]
     fn polyline_lengthening_preserves_plane_and_interpolates_widths() {
-        let mut polyline = codec::entities::LwPolyline::new();
+        let mut polyline = document::entities::LwPolyline::new();
         polyline.normal = Vector3::new(0.0, 1.0, 0.0);
         polyline.elevation = 5.0;
-        let mut start = codec::entities::LwVertex::from_coords(0.0, 0.0);
+        let mut start = document::entities::LwVertex::from_coords(0.0, 0.0);
         start.start_width = 2.0;
         start.end_width = 4.0;
-        polyline.vertices = vec![start, codec::entities::LwVertex::from_coords(10.0, 0.0)];
+        polyline.vertices = vec![start, document::entities::LwVertex::from_coords(10.0, 0.0)];
         let entity = EntityType::LwPolyline(polyline.clone());
         let pick = DVec3::from_array(
             crate::entities::curve::lwpolyline_curve(&polyline)

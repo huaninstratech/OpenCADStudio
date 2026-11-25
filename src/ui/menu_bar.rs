@@ -3,7 +3,7 @@
 //! implementation of it.
 
 use crate::app::Message;
-use crate::ui::style::chrome;
+use crate::ui::style::{chrome, kit_metrics as km, text as ui_text};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{mouse, overlay, renderer, Shell};
@@ -31,6 +31,28 @@ enum Entry {
 
 use Entry::{Cmd, Sep, Sub};
 
+/// The Toolbars submenu: each entry shows that ribbon panel as a toolbar
+/// over the drawing, or puts it back. `TOOLBAR` alone lists them all.
+const TOOLBARS: &[Entry] = &[
+    Cmd("Draw", "TOOLBAR draw/Draw", ""),
+    Cmd("Modify", "TOOLBAR draw/Modify", ""),
+    Cmd("Layers", "TOOLBAR draw/Layers", ""),
+    Cmd("Properties", "TOOLBAR draw/Properties", ""),
+    Cmd("Annotation", "TOOLBAR draw/Annotation", ""),
+    Cmd("Block", "TOOLBAR draw/Block", ""),
+    Cmd("Groups", "TOOLBAR draw/Groups", ""),
+    Cmd("Clipboard", "TOOLBAR draw/Clipboard", ""),
+    Cmd("Measure", "TOOLBAR draw/Measure", ""),
+    Sep,
+    Cmd("Text", "TOOLBAR annotate/Text", ""),
+    Cmd("Dimensions", "TOOLBAR annotate/Dimensions", ""),
+    Cmd("Leaders", "TOOLBAR annotate/Leaders", ""),
+    Cmd("Tables", "TOOLBAR annotate/Tables", ""),
+    Sep,
+    Cmd("Navigate", "TOOLBAR view/Navigate", ""),
+    Cmd("Visual Style", "TOOLBAR view/Visual Style", ""),
+];
+
 /// The menus in menu-bar order. The Window menu also lists the open
 /// drawings (see `view`).
 const MENUS: &[(&str, &[Entry])] = &[
@@ -50,6 +72,8 @@ const MENUS: &[(&str, &[Entry])] = &[
             Cmd("Save", "QSAVE", "Ctrl+S"),
             Cmd("Save As...", "SAVEAS", "Ctrl+Shift+S"),
             Cmd("Export...", "EXPORT", ""),
+            Cmd("Export STL", "STLOUT", ""),
+            Cmd("Export STEP AP214", "STEPOUT", ""),
             Cmd("eTransmit...", "ETRANSMIT", ""),
             Sep,
             Cmd("Page Setup Manager...", "PAGESETUP", ""),
@@ -131,10 +155,10 @@ const MENUS: &[(&str, &[Entry])] = &[
                     Cmd("Realtime", "PAN", ""),
                     Cmd("Point", "-PAN", ""),
                     Sep,
-                    Cmd("Left", "PAN LEFT", ""),
-                    Cmd("Right", "PAN RIGHT", ""),
-                    Cmd("Up", "PAN UP", ""),
-                    Cmd("Down", "PAN DOWN", ""),
+                    Cmd("Left", "PANLEFT", ""),
+                    Cmd("Right", "PANRIGHT", ""),
+                    Cmd("Up", "PANUP", ""),
+                    Cmd("Down", "PANDOWN", ""),
                 ],
             ),
             Sep,
@@ -151,7 +175,7 @@ const MENUS: &[(&str, &[Entry])] = &[
                     Cmd("3 Viewports", "-VPORTS 3", ""),
                     Cmd("4 Viewports", "-VPORTS 4", ""),
                     Sep,
-                    Cmd("Join", "-VPORTS J", ""),
+                    Cmd("Join", "VPJOIN", ""),
                 ],
             ),
             Cmd("Named Views...", "VIEW", ""),
@@ -197,7 +221,7 @@ const MENUS: &[(&str, &[Entry])] = &[
                     Cmd("Text Window", "TEXTSCR", "F2"),
                 ],
             ),
-            Cmd("Toolbars...", "TOOLBAR", ""),
+            Sub("Toolbars", TOOLBARS),
         ],
     ),
     (
@@ -230,7 +254,7 @@ const MENUS: &[(&str, &[Entry])] = &[
     (
         "Format",
         &[
-            Cmd("Layer...", "LAYER", ""),
+            Cmd("Layer...", "LAYERS", ""),
             Cmd("Layer States Manager...", "LAYERSTATE", ""),
             Cmd("Layer Walk...", "LAYWALK", ""),
             Sub(
@@ -283,11 +307,9 @@ const MENUS: &[(&str, &[Entry])] = &[
             Sub(
                 "Workspaces",
                 &[
-                    Cmd("2D Drafting", "WSCURRENT 2D", ""),
-                    Cmd("3D Modeling", "WSCURRENT 3D", ""),
+                    Cmd("Ribbon", "WSCURRENT RIBBON", ""),
+                    Cmd("Classic", "WSCURRENT CLASSIC", ""),
                     Sep,
-                    Cmd("Save Current As...", "WSSAVE", ""),
-                    Cmd("Workspace Settings...", "WSSETTINGS", ""),
                     Cmd("Customize...", "CUI", ""),
                 ],
             ),
@@ -295,7 +317,7 @@ const MENUS: &[(&str, &[Entry])] = &[
                 "Palettes",
                 &[
                     Cmd("Properties", "PROPERTIES", "Ctrl+1"),
-                    Cmd("Layers", "LAYER", ""),
+                    Cmd("Layers", "LAYERS", ""),
                     Cmd("Design Center", "ADCENTER", "Ctrl+2"),
                     Cmd("Tool Palettes", "TOOLPALETTES", "Ctrl+3"),
                     Cmd("Sheet Set Manager", "SHEETSET", "Ctrl+4"),
@@ -304,12 +326,19 @@ const MENUS: &[(&str, &[Entry])] = &[
                     Cmd("External References", "EXTERNALREFERENCES", ""),
                 ],
             ),
-            Cmd("Toolbars...", "TOOLBAR", ""),
+            Sub("Toolbars", TOOLBARS),
             Cmd("Command Line", "COMMANDLINE", "Ctrl+9"),
             Cmd("Clean Screen", "CLEANSCREEN", "Ctrl+0"),
             Sep,
             Cmd("Spelling", "SPELL", ""),
+            Sep,
+            // Selection (#2611 mockup, Menus): saved filters are in FILTER's
+            // list and the drawing's right-click menu.
             Cmd("Quick Select...", "QSELECT", ""),
+            Cmd("Filter...", "FILTER", ""),
+            Cmd("Select Similar", "SELECTSIMILAR", ""),
+            Cmd("Select All", "SELECTALL", "Ctrl+A"),
+            Sep,
             Sub(
                 "Draw Order",
                 &[
@@ -657,22 +686,23 @@ const MENUS: &[(&str, &[Entry])] = &[
             Cmd("Keyboard Shortcuts", "SHORTCUTS", ""),
             Cmd("Send Feedback", "FEEDBACK", ""),
             Sep,
+            Cmd("Check for Updates...", "CHECKFORUPDATES", ""),
             Cmd("About Open CAD Studio", "ABOUT", ""),
         ],
     ),
 ];
 
-const ENTRY_H: f32 = 22.0;
+const ENTRY_H: f32 = km::MENU_ITEM_H;
 const ICON: f32 = crate::ui::style::ribbon_metrics::SMALL_ICON;
 /// A row's label and the shortcut and aliases at its end.
-const LABEL_SIZE: f32 = 12.0;
-const TAIL_SIZE: f32 = 11.0;
+const LABEL_SIZE: f32 = ui_text::UI;
+const TAIL_SIZE: f32 = ui_text::UI;
 /// Gap between a row's parts, its side padding, the least gap before the
 /// shortcut, and the submenu arrow.
 const ROW_SPACING: f32 = 8.0;
-const ROW_PAD: f32 = 8.0;
+const ROW_PAD: f32 = km::MENU_PAD_X;
 const TAIL_GAP: f32 = 8.0;
-const ARROW: f32 = 8.0;
+const ARROW: f32 = km::CARET;
 /// The menus the Start tab keeps: it has no drawing for the others.
 const START_MENUS: [&str; 3] = ["File", "Window", "Help"];
 
@@ -780,7 +810,13 @@ pub fn keyboard_menu(
     let menus = menu_rows(aliases);
     let rows = menus.get(index)?;
     fn item(row: &Row) -> Option<crate::ui::popup::context_menu::MenuItem> {
-        let Row::Cmd { icon, label, tail, on_press } = row else {
+        let Row::Cmd {
+            icon,
+            label,
+            tail,
+            on_press,
+        } = row
+        else {
             return None;
         };
         let line = match on_press.as_deref() {
@@ -1120,24 +1156,9 @@ fn entry_style(theme: &Theme, status: button::Status, submenu: bool) -> button::
     }
 }
 
-/// A line one physical pixel high, with 2 px above and below and 4 px at
-/// the sides: a logical pixel would draw one or two pixels high at a
-/// fractional scale.
+/// The kit menu's separator line.
 fn separator<'a>() -> Element<'a, Message> {
-    container(
-        container(
-            Space::new()
-                .width(Fill)
-                .height(crate::ui::icons::hairline()),
-        )
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(chrome::border(theme))),
-            ..Default::default()
-        }),
-    )
-    .padding([2, 4])
-    .width(Fill)
-    .into()
+    crate::ui::kit::menu::entry(crate::ui::kit::menu::Item::Separator)
 }
 
 /// A menu title on the bar: `tab_text`, and `strong` on a `hover` fill
@@ -1297,39 +1318,7 @@ impl<'a> From<Title<'a>> for Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, MENUS};
-
-    fn commands(entries: &'static [Entry], out: &mut Vec<&'static str>) {
-        for entry in entries {
-            match *entry {
-                Entry::Cmd(_, line, _) => out.push(line.split_whitespace().next().unwrap()),
-                Entry::Sep => {}
-                Entry::Sub(_, entries) => commands(entries, out),
-            }
-        }
-    }
-
-    /// Lists the menu commands OCS's command table does not know: a to-do
-    /// list, not a failure. Running one reports it on the command line.
-    #[test]
-    fn menu_commands_ocs_does_not_have_yet() {
-        let known = crate::command::all_registered_command_names();
-        let mut all = Vec::new();
-        for (_, entries) in MENUS {
-            commands(entries, &mut all);
-        }
-        let mut missing: Vec<_> = all
-            .into_iter()
-            .filter(|command| !known.iter().any(|k| k.eq_ignore_ascii_case(command)))
-            .collect();
-        missing.sort_unstable();
-        missing.dedup();
-        println!(
-            "Menu commands OCS does not have yet ({}):\n{}",
-            missing.len(),
-            missing.join("\n")
-        );
-    }
+    use super::MENUS;
 
     #[test]
     fn the_menu_tree_has_every_menu_of_the_design() {

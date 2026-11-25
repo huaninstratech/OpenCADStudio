@@ -1,8 +1,14 @@
 //! Colour tokens of the window chrome (ribbon, menu bar and their popups).
-//! Every token mixes the theme's background and text colours, so the chrome
-//! follows any iced or Fusion theme: `mix(bg, fg, t)` per channel, clamped.
-//! A negative `t` goes past the background, darker on a dark theme and
-//! lighter on a light one.
+//!
+//! The surfaces (bars, panels, hover, borders) come from the theme's
+//! background alone: its OKLCH lightness moved a fixed step, lighter on a
+//! dark theme and darker on a light one, with its hue kept (see
+//! [`super::readable::surface`]). The text colour has no part in them, so a
+//! theme's text can change without the ribbon changing shade. The steps are
+//! those of the prototype design, the Studio Dark theme.
+//!
+//! The text tokens mix the theme's background and text colours:
+//! `mix(bg, fg, t)` per channel, clamped, and are kept readable.
 
 use iced::{Color, Theme};
 
@@ -17,64 +23,70 @@ pub fn mix(bg: Color, fg: Color, t: f32) -> Color {
     }
 }
 
+/// A text colour: the background mixed towards the text by `t`.
 fn token(theme: &Theme, t: f32) -> Color {
     let background = theme.palette().background.base;
     mix(background.color, background.text, t)
 }
 
-/// Lines between bars; the darkest recess.
+/// A surface `step` of OKLCH lightness away from the background.
+fn step(theme: &Theme, by: f32) -> Color {
+    super::readable::surface(theme, by)
+}
+
+/// Lines between bars; the darkest recess (a step back from the bars).
 pub fn page(theme: &Theme) -> Color {
-    token(theme, -0.10)
+    step(theme, -0.070)
 }
 
 /// Menu-bar and tab-row background.
 pub fn bar(theme: &Theme) -> Color {
-    token(theme, 0.0)
+    theme.palette().background.base.color
 }
 
 /// Panel title strip.
 pub fn title_bar(theme: &Theme) -> Color {
-    token(theme, 0.056)
+    step(theme, 0.039)
 }
 
 /// Ribbon tool area, active tab, popups.
 pub fn panel(theme: &Theme) -> Color {
-    token(theme, 0.111)
+    step(theme, 0.073)
 }
 
 /// Panel body while its slide-out is open and unpinned.
 pub fn open_panel(theme: &Theme) -> Color {
-    token(theme, 0.162)
+    step(theme, 0.107)
 }
 
 /// Hover and pressed background.
 pub fn hover(theme: &Theme) -> Color {
-    token(theme, 0.207)
+    step(theme, 0.135)
 }
 
 /// Popup and control borders.
 pub fn border(theme: &Theme) -> Color {
-    token(theme, 0.267)
+    step(theme, 0.175)
 }
 
 /// Hover outline of buttons.
 pub fn hover_border(theme: &Theme) -> Color {
-    token(theme, 0.308)
+    step(theme, 0.199)
 }
 
 /// Section labels, shortcut text.
 pub fn muted(theme: &Theme) -> Color {
-    token(theme, 0.652)
+    super::readable::at_least_muted(token(theme, 0.652), theme)
 }
 
 /// Panel title text.
 pub fn title_text(theme: &Theme) -> Color {
-    token(theme, 0.714)
+    super::readable::at_least_muted(token(theme, 0.714), theme)
 }
 
 /// Inactive tab and menu-bar text.
 pub fn tab_text(theme: &Theme) -> Color {
-    token(theme, 0.859)
+    super::readable::at_least_muted(token(theme, 0.859), theme)
 }
 
 /// Button labels.
@@ -91,8 +103,18 @@ pub fn accent(theme: &Theme) -> Color {
     theme.palette().primary.base.color
 }
 
+/// Text and icons on an accent fill (a primary button).
+pub fn on_accent(theme: &Theme) -> Color {
+    theme.palette().primary.base.text
+}
+
 pub fn danger(theme: &Theme) -> Color {
     theme.palette().danger.base.color
+}
+
+/// A good outcome: a live connection, a step that worked.
+pub fn success(theme: &Theme) -> Color {
+    theme.palette().success.base.color
 }
 
 /// Background of a lit button: the command it runs is running, or the
@@ -104,6 +126,51 @@ pub fn lit(theme: &Theme) -> Color {
 /// Outline of a lit button.
 pub fn lit_border(theme: &Theme) -> Color {
     mix(panel(theme), accent(theme), 0.7)
+}
+
+// ── Palette area (strip, docked palettes, Properties, drawing tabs) ──────
+//
+// The prototype "palettes up to the ribbon" names its own surfaces. Where
+// one is within a step of a chrome surface it is that surface, so the
+// palettes and the ribbon stay one family; the others are steps of their
+// own, by the same OKLCH rule, so every theme follows.
+
+/// Palette background, its title bar, the open strip group and the active
+/// drawing tab.
+pub fn surface(theme: &Theme) -> Color {
+    panel(theme)
+}
+
+/// Category bars, property grid lines, the combo field, the splitter.
+pub fn surface_raised(theme: &Theme) -> Color {
+    step(theme, 0.013)
+}
+
+/// Palette strip and drawing-tab bar background.
+pub fn strip(theme: &Theme) -> Color {
+    bar(theme)
+}
+
+/// The dark 1 px edge: strip and palette border, the lines around the open
+/// strip group, the line under the ribbon.
+pub fn edge(theme: &Theme) -> Color {
+    step(theme, -0.041)
+}
+
+/// Line between strip groups.
+pub fn strip_divider(theme: &Theme) -> Color {
+    step(theme, 0.132)
+}
+
+/// Name cell of the selected property row: the accent at 38 % over the
+/// surface.
+pub fn row_selected(theme: &Theme) -> Color {
+    mix(surface(theme), accent(theme), 0.38)
+}
+
+/// Inactive drawing tab.
+pub fn tab_inactive(theme: &Theme) -> Color {
+    title_bar(theme)
 }
 
 #[cfg(test)]

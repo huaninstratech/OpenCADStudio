@@ -1,7 +1,7 @@
 //! CPU-side complex linetype tessellation.
 //!
 //! Walks the entity path and applies LT elements (dashes, gaps, dots, shapes),
-//! returning one `WireModel` per continuous stroke.
+//! batching compatible strokes into `WireModel`s with explicit breaks.
 //!
 //! Coordinate convention: 2D entities live in the **XZ** plane (Y = elevation).
 //! Shape X → along the linetype direction; Shape Y → perpendicular in XZ.
@@ -15,7 +15,7 @@ use crate::scene::text::lff;
 
 /// Apply `lt` along `path_pts` (the entity's tessellated world-space strip).
 ///
-/// Returns one `WireModel` per continuous stroke. Pass the entity's `name`,
+/// Returns batched `WireModel`s. Pass the entity's `name`,
 /// `color`, `selected` flag, and `line_weight_px` so the WireModels inherit
 /// the entity's visual properties.
 /// Build the "A"-type segment list for one path: a solid begin/end dash of
@@ -67,6 +67,30 @@ fn atype_segments(scaled: &[LtSeg], align_end: f32, total: f32) -> Option<Vec<Lt
     Some(segs)
 }
 
+/// The most pattern repeats one complex-linetype run, or one entity's whole
+/// path, may have. Every repeat becomes real wire geometry on the CPU, and a
+/// model-space annotation factor of 0.001 shrinks the pattern by the same
+/// amount, so millions of repeats (millions of wires) came from a handful of
+/// curves and slowed every pan frame. 20 000 still draws a 10 km fence at a
+/// 0.5 unit pattern; anything denser is below a pixel at any practical zoom and
+/// is drawn as the plain solid stroke instead.
+pub(crate) const MAX_PATTERN_REPEATS: f32 = 20_000.0;
+
+/// Whether `length` of path under `lt` at `scale` would pass
+/// `MAX_PATTERN_REPEATS`. A polyline walks one run per segment, each of which
+/// may be under the cap alone, so the walk checks the entity's total too.
+pub(crate) fn exceeds_repeat_budget(lt: &ComplexLt, scale: f32, length: f64) -> bool {
+    let period: f32 = lt
+        .segments
+        .iter()
+        .map(|s| match s {
+            LtSegment::Dash(l) | LtSegment::Space(l) => (l * scale).abs(),
+            _ => 0.0,
+        })
+        .sum();
+    period > 1e-10 && length / period as f64 > MAX_PATTERN_REPEATS as f64
+}
+
 pub fn apply_along(
     name: &str,
     path_pts: &[[f32; 3]],
@@ -82,14 +106,104 @@ pub fn apply_along(
     // element still ends on a dash at its own endpoint. `None` tiles the pattern
     // from the start vertex.
     ref_total: Option<f32>,
+    // A wide polyline's band width at each point of the path.
+    band: Option<&[f32]>,
+) -> Vec<WireModel> {
+    apply_stretched(
+        name,
+        path_pts,
+        lt,
+        scale,
+        1.0,
+        color,
+        selected,
+        line_weight_px,
+        ref_total,
+        band,
+    )
+}
+
+/// Walk a closed path from its first point: a whole number of periods, their
+/// dashes and gaps stretched to fit, and the glyphs at their own size. A path
+/// shorter than one period is drawn solid.
+pub fn apply_closed(
+    name: &str,
+    path_pts: &[[f32; 3]],
+    lt: &ComplexLt,
+    scale: f32,
+    color: [f32; 4],
+    selected: bool,
+    line_weight_px: f32,
+    band: Option<&[f32]>,
+) -> Vec<WireModel> {
+    let period: f32 = scale_segments(&lt.segments, scale)
+        .iter()
+        .map(|s| match s {
+            LtSeg::Dash(l) | LtSeg::Space(l) => *l,
+            LtSeg::Dot | LtSeg::Shape { .. } | LtSeg::Text { .. } => 0.0,
+        })
+        .sum();
+    let length: f32 = path_pts
+        .windows(2)
+        .map(|w| {
+            let d = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        })
+        .sum();
+    if period < 1e-10 || crate::scene::pipeline::wire_gpu::closed_dash_solid(length, period) {
+        return apply_along(
+            name,
+            path_pts,
+            lt,
+            scale,
+            color,
+            selected,
+            line_weight_px,
+            Some(length),
+            band,
+        );
+    }
+    let periods = crate::scene::pipeline::wire_gpu::closed_dash_periods(length, period);
+    apply_stretched(
+        name,
+        path_pts,
+        lt,
+        scale,
+        length / (periods * period),
+        color,
+        selected,
+        line_weight_px,
+        None,
+        band,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_stretched(
+    name: &str,
+    path_pts: &[[f32; 3]],
+    lt: &ComplexLt,
+    scale: f32,
+    stretch: f32,
+    color: [f32; 4],
+    selected: bool,
+    line_weight_px: f32,
+    ref_total: Option<f32>,
+    band: Option<&[f32]>,
 ) -> Vec<WireModel> {
     if path_pts.len() < 2 || lt.segments.is_empty() {
         return vec![];
     }
+    let band = band.filter(|band| band.len() == path_pts.len());
 
-    let scaled: Vec<LtSeg> = scale_segments(&lt.segments, scale);
+    let mut scaled: Vec<LtSeg> = scale_segments(&lt.segments, scale);
     if scaled.is_empty() {
         return vec![];
+    }
+    for segment in &mut scaled {
+        if let LtSeg::Dash(length) | LtSeg::Space(length) = segment {
+            *length *= stretch;
+        }
     }
 
     let pattern_len: f32 = scaled
@@ -111,7 +225,6 @@ pub fn apply_along(
     // single-threaded, before the drawing ever finishes loading. Past a sane
     // repeat count the dashes are sub-pixel anyway, so render the base wire
     // solid: returning empty here makes the caller fall back to the solid base.
-    const MAX_PATTERN_REPEATS: f32 = 1_000_000.0;
     let path_len: f32 = path_pts
         .windows(2)
         .map(|w| {
@@ -150,8 +263,11 @@ pub fn apply_along(
     let atype_on = atype_segs.is_some();
     let walk_segs: &[LtSeg] = atype_segs.as_deref().unwrap_or(&scaled);
 
-    let mut strokes: Vec<Vec<[f32; 3]>> = Vec::new();
+    // Each stroke with its band width per point, empty for a hairline: only a
+    // dash takes the band, a dot or a shape stays as thin as a glyph.
+    let mut strokes = StrokeBatches::default();
     let mut cur_stroke: Vec<[f32; 3]> = Vec::new();
+    let mut cur_widths: Vec<f32> = Vec::new();
     // Embedded linetype text (LtSeg::Text) renders as SDF glyph quads collected
     // here; emitted as one extra text-carrying WireModel at the end.
     let mut text_verts: Vec<crate::scene::pipeline::text_gpu::TextVertex> = Vec::new();
@@ -198,6 +314,13 @@ pub fn apply_along(
                     let p_start = lerp(ps, pe, pos / seg_len);
                     let p_end = lerp(ps, pe, (pos + advance) / seg_len);
 
+                    if let Some(band) = band {
+                        let width_at = |at: f32| band[i] + (band[i + 1] - band[i]) * (at / seg_len);
+                        if cur_stroke.is_empty() {
+                            cur_widths.push(width_at(pos));
+                        }
+                        cur_widths.push(width_at(pos + advance));
+                    }
                     if cur_stroke.is_empty() {
                         cur_stroke.push(p_start);
                     }
@@ -215,7 +338,7 @@ pub fn apply_along(
                     let remaining = space_len - elem_consumed;
                     let advance = remaining.min(seg_len - pos);
 
-                    flush(&mut cur_stroke, &mut strokes);
+                    flush(&mut cur_stroke, &mut cur_widths, &mut strokes);
 
                     pos += advance;
                     elem_consumed += advance;
@@ -226,14 +349,11 @@ pub fn apply_along(
                 }
 
                 LtSeg::Dot => {
-                    flush(&mut cur_stroke, &mut strokes);
+                    flush(&mut cur_stroke, &mut cur_widths, &mut strokes);
                     let p = lerp(ps, pe, pos / seg_len);
-                    strokes.push(vec![p, p]);
+                    strokes.push(vec![p, p], Vec::new());
                     elem_idx += 1;
                     elem_consumed = 0.0;
-                    if pos < 1e-6 {
-                        break;
-                    }
                 }
 
                 LtSeg::Shape {
@@ -246,7 +366,7 @@ pub fn apply_along(
                     rot_deg,
                     rot_mode,
                 } => {
-                    flush(&mut cur_stroke, &mut strokes);
+                    flush(&mut cur_stroke, &mut cur_widths, &mut strokes);
 
                     let insert = lerp(ps, pe, pos / seg_len);
                     let insert = offset_pt(insert, fwd, perp, *x, *y);
@@ -264,13 +384,12 @@ pub fn apply_along(
                     let shape_strokes = emit_shape(
                         sh_name, shx_file, *number, insert, frame_fwd, frame_perp, *sh_scale, rot,
                     );
-                    strokes.extend(shape_strokes);
+                    for stroke in shape_strokes {
+                        strokes.push(stroke, Vec::new());
+                    }
 
                     elem_idx += 1;
                     elem_consumed = 0.0;
-                    if pos < 1e-6 {
-                        break;
-                    }
                 }
                 LtSeg::Text {
                     text,
@@ -281,7 +400,7 @@ pub fn apply_along(
                     rot_deg,
                     rot_mode,
                 } => {
-                    flush(&mut cur_stroke, &mut strokes);
+                    flush(&mut cur_stroke, &mut cur_widths, &mut strokes);
 
                     let insert = lerp(ps, pe, pos / seg_len);
                     let mut insert = offset_pt(insert, fwd, perp, *x, *y);
@@ -356,55 +475,53 @@ pub fn apply_along(
 
                     elem_idx += 1;
                     elem_consumed = 0.0;
-                    if pos < 1e-6 {
-                        break;
-                    }
                 }
             }
         }
     }
 
-    flush(&mut cur_stroke, &mut strokes);
+    flush(&mut cur_stroke, &mut cur_widths, &mut strokes);
 
-    let mut out: Vec<WireModel> = strokes
+    let mut out: Vec<WireModel> = strokes.finish()
         .into_iter()
-        .filter(|s| s.len() >= 2)
-        .map(|pts| WireModel {
-            bg_adapt: None,
-            point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
-            world_width: 0.0,
-            depth_override: None,
-            display_visible: true,
-            snap_only: false,
-            plot_visible: true,
-            fill_is_3d: false,
-            fill_is_2d_solid: false,
-            render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
-            name: name.to_string(),
-            points: pts,
-            points_low: Vec::new(),
-            color,
-            selected,
-            pattern_length: 0.0,
-            pattern: [0.0; 8],
-            line_weight_px,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
-            aci: 0,
-            key_vertices: vec![],
-            aabb: WireModel::UNBOUNDED_AABB,
-            plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
-
-            ..Default::default()
+        .filter(|(pts, _)| pts.len() >= 2)
+        .map(|(pts, widths)| {
+            let (world_width, taper_widths) = band_widths(&widths);
+            WireModel {
+                bg_adapt: None,
+                point_marker: None,
+                world_width,
+                depth_override: None,
+                display_visible: true,
+                snap_only: false,
+                plot_visible: true,
+                fill_is_3d: false,
+                fill_is_2d_solid: false,
+                solid_normal: None,
+                render_instance: None,
+                dash_from_start: false,
+                name: name.to_string(),
+                color,
+                selected,
+                pattern_length: 0.0,
+                pattern: [0.0; 8],
+                line_weight_px,
+                aci: 0,
+                aabb: WireModel::UNBOUNDED_AABB,
+                plinegen: true,
+                geom: std::sync::Arc::new(crate::scene::WireGeom {
+                    taper_widths,
+                    pattern_stations: Vec::new(),
+                    text_verts: Vec::new(),
+                    points: pts,
+                    points_low: Default::default(),
+                    snap_pts: vec![],
+                    tangent_geoms: vec![],
+                    key_vertices: vec![],
+                    ..crate::scene::WireGeom::default()
+                }),
+                ..Default::default()
+            }
         })
         .collect();
 
@@ -424,8 +541,6 @@ pub fn apply_along(
         out.push(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -435,30 +550,36 @@ pub fn apply_along(
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
             stub: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts,
-            searchable_text: searchable,
+            element_linetype: None,
+            element_color: None,
+            dash_closure: Default::default(),
             name: name.to_string(),
-            points: Vec::new(),
-            points_low: Vec::new(),
+            effective_layer: None,
+            block_member: None,
             color,
             selected,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
             aci: 0,
-            key_vertices: vec![],
             aabb: [nx as f32, ny as f32, xx as f32, xy as f32],
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                text_verts,
+                searchable_text: searchable,
+                points: Vec::new(),
+                points_low: Default::default(),
+                snap_pts: vec![],
+                tangent_geoms: vec![],
+                key_vertices: vec![],
+                ..crate::scene::WireGeom::default()
+            }),
         });
     }
     out
@@ -538,9 +659,67 @@ fn scale_segments(segs: &[LtSegment], scale: f32) -> Vec<LtSeg> {
         .collect()
 }
 
-fn flush(cur: &mut Vec<[f32; 3]>, strokes: &mut Vec<Vec<[f32; 3]>>) {
+#[derive(Default)]
+struct StrokeBatches {
+    batches: Vec<(Vec<[f32; 3]>, Vec<f32>)>,
+    pending: Vec<[f32; 3]>,
+}
+
+impl StrokeBatches {
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.batches.push((std::mem::take(&mut self.pending), Vec::new()));
+        }
+    }
+
+    fn push(&mut self, points: Vec<[f32; 3]>, widths: Vec<f32>) {
+        if points.len() < 2 {
+            return;
+        }
+        if !widths.is_empty() {
+            self.flush_pending();
+            self.batches.push((points, widths));
+            return;
+        }
+        // NaN keeps individual strokes disconnected in the shared buffer.
+        // Keep bounds reasonably local so box-edge tests can skip distant
+        // pattern chunks without expanding every individual stroke.
+        const MAX_BATCH_POINTS: usize = 2_048;
+        if !self.pending.is_empty() && self.pending.len() + points.len() + 1 > MAX_BATCH_POINTS {
+            self.flush_pending();
+        }
+        if !self.pending.is_empty() {
+            self.pending.push([f32::NAN; 3]);
+        }
+        self.pending.extend(points);
+    }
+
+    fn finish(mut self) -> Vec<(Vec<[f32; 3]>, Vec<f32>)> {
+        self.flush_pending();
+        self.batches
+    }
+}
+
+fn flush(
+    cur: &mut Vec<[f32; 3]>,
+    widths: &mut Vec<f32>,
+    strokes: &mut StrokeBatches,
+) {
     if !cur.is_empty() {
-        strokes.push(std::mem::take(cur));
+        strokes.push(std::mem::take(cur), std::mem::take(widths));
+    }
+}
+
+/// A wire's `world_width` and `taper_widths` for these per-point widths: one
+/// width when they all agree, a taper with its widest edge when they vary.
+pub(crate) fn band_widths(widths: &[f32]) -> (f32, Vec<f32>) {
+    let widest = widths.iter().copied().fold(0.0f32, f32::max);
+    if widest <= 0.0 {
+        (0.0, Vec::new())
+    } else if widths.iter().all(|width| (widest - width).abs() < 1e-6) {
+        (widest, Vec::new())
+    } else {
+        (widest, widths.to_vec())
     }
 }
 
@@ -648,6 +827,27 @@ mod upright_tests {
     use super::apply_along;
     use crate::io::linetypes::{ComplexLt, LtRotation, LtSegment};
 
+    #[test]
+    fn batched_strokes_preserve_breaks_across_chunks() {
+        let mut batches = super::StrokeBatches::default();
+        for i in 0..1000 {
+            batches.push(vec![[i as f32, 0.0, 0.0], [i as f32 + 0.5, 0.0, 0.0]], vec![]);
+        }
+        let batches = batches.finish();
+        assert!(batches.len() > 1);
+        let mut strokes = 0;
+        for (points, widths) in batches {
+            assert!(points.len() <= 2048);
+            assert!(widths.is_empty());
+            for stroke in points.split(|point| point[0].is_nan()) {
+                assert_eq!(stroke.len(), 2);
+                assert_eq!(stroke[1][0] - stroke[0][0], 0.5);
+                strokes += 1;
+            }
+        }
+        assert_eq!(strokes, 1000);
+    }
+
     /// Text vertices of one `GAS`-style repeat along `path`.
     fn text_xs(path: [[f32; 3]; 2], rot_mode: LtRotation) -> Vec<[f32; 2]> {
         let lt = ComplexLt {
@@ -665,7 +865,7 @@ mod upright_tests {
                 LtSegment::Space(0.3),
             ],
         };
-        apply_along("GAS", &path, &lt, 1.0, [1.0; 4], false, 1.0, None)
+        apply_along("GAS", &path, &lt, 1.0, [1.0; 4], false, 1.0, None, None)
             .iter()
             .flat_map(|wire| wire.text_verts.iter())
             .map(|v| [v.pos[0] + v.pos_low[0], v.pos[1] + v.pos_low[1]])
@@ -704,5 +904,50 @@ mod upright_tests {
             text_xs(rightward, LtRotation::Upright),
             text_xs(rightward, LtRotation::Relative)
         );
+    }
+
+    #[test]
+    fn a_shape_at_a_segment_start_does_not_skip_the_rest_of_that_segment() {
+        // Issue #2804's XX-WERKGRENS is a zero-length shape followed by a gap.
+        // Both polyline segments must carry that pattern, not just the first
+        // shape at the start followed by the gap on the next segment.
+        let lt = ComplexLt {
+            segments: vec![
+                LtSegment::Shape {
+                    name: "TRACK1".into(),
+                    shx_file: String::new(),
+                    number: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    scale: 1.0,
+                    rot_deg: 0.0,
+                    rot_mode: LtRotation::Relative,
+                },
+                LtSegment::Space(1.0),
+            ],
+        };
+        let path = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let wires = apply_along(
+            "shape-first",
+            &path,
+            &lt,
+            1.0,
+            [1.0; 4],
+            false,
+            1.0,
+            Some(2.0),
+            None,
+        );
+        // The shape strokes share one wire, a NaN point between them.
+        let strokes: Vec<&[[f32; 3]]> = wires
+            .iter()
+            .flat_map(|wire| wire.points.split(|p| p[0].is_nan()))
+            .collect();
+        assert_eq!(strokes.len(), 2, "{wires:?}");
+        for (stroke, x) in strokes.iter().zip([0.0, 1.0]) {
+            assert_eq!(stroke.len(), 2);
+            assert!((stroke[0][0] - x).abs() < 1.0e-6, "{wires:?}");
+            assert!((stroke[1][0] - x).abs() < 1.0e-6, "{wires:?}");
+        }
     }
 }

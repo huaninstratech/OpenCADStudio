@@ -28,9 +28,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::entities::{EntityType, Line};
-use codec::objects::{ObjectType, XRecord};
-use codec::types::{Handle, Vector3};
+use document::entities::{EntityType, Line};
+use document::objects::{ObjectType, XRecord};
+use document::types::{Handle, Vector3};
 use OpenCADStudio::scene::{ChangeKind, Scene};
 
 const OBJECTS: usize = 20_000;
@@ -39,7 +39,7 @@ const RUNS: usize = 3;
 const WARMUP: usize = 1;
 
 fn build_scene() -> (Scene, Handle) {
-    let mut document = codec::Document::new();
+    let mut document = document::Document::new();
     for index in 0..OBJECTS {
         let handle = document.allocate_handle();
         let mut record = XRecord::named(format!("object{index:05}"));
@@ -62,7 +62,13 @@ fn main() {
     let changes = [(line, ChangeKind::Modified)];
     let refresh = |scene: &mut Scene| {
         let refreshed = scene.refresh_associative_dimensions(black_box(&changes));
-        (refreshed.len(), refreshed.iter().map(|(handle, _)| handle.value()).sum::<u64>())
+        (
+            refreshed.len(),
+            refreshed
+                .iter()
+                .map(|(handle, _)| handle.value())
+                .sum::<u64>(),
+        )
     };
 
     for _ in 0..WARMUP {
@@ -83,7 +89,11 @@ fn main() {
             "dimension_association_refresh: run {run} {ITERATIONS} edits: {per_edit_us:.3} us/edit"
         );
     }
-    assert_eq!(scene.document.objects.len(), objects, "the scan must not mutate the drawing");
+    assert_eq!(
+        scene.document.objects.len(),
+        objects,
+        "the scan must not mutate the drawing"
+    );
 
     println!(
         "dimension_association_refresh: {OBJECTS} XRecords, {objects} objects, no DIMASSOC; \

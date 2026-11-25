@@ -21,7 +21,7 @@ pub struct MeshModel {
     /// Optional AcDbMaterial handle per triangle. Empty means the whole mesh
     /// uses `MeshLodSet::material`; otherwise each entry aligns with one
     /// `indices` triplet and overrides the entity material for that face.
-    pub triangle_material_handles: Vec<Option<codec::Handle>>,
+    pub triangle_material_handles: Vec<Option<document::Handle>>,
     /// Optional ACIS face colour per triangle, aligned with `indices` triplets.
     pub triangle_colors: Vec<Option<[f32; 4]>>,
     /// RGBA colour in [0, 1].
@@ -40,12 +40,15 @@ pub struct MeshModel {
 /// | 1   | MID (½)    | 50–200 px                    |
 /// | 2   | LOW (¼)    | < 50 px                      |
 ///
-/// `lods` holds up to one MeshModel per LOD level (high → low). Empty
-/// slots fall back to the nearest available LOD at render time.
-/// Kernel-owned source for a view-dependent silhouette.
+/// `lods[0]` is the full mesh every pick, snap, edit and measurement uses.
+/// Levels 1 and 2 are display-only index buffers over its vertices
+/// ([`MeshLodSet::display_lods`]); a missing level draws level 0.
+pub use super::mass::MassProperties;
+
+/// The source of a mesh's view-dependent silhouette.
 #[derive(Clone, Debug)]
 pub struct CurvedGen {
-    pub source: kernel::brep::mesh::SilhouetteSource,
+    pub source: super::silhouette::SilhouetteSource,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -63,7 +66,7 @@ pub struct MeshMetrics {
 }
 
 impl MeshMetrics {
-    fn apply_mass_properties(&mut self, properties: kernel::brep::MassProperties) {
+    fn apply_mass_properties(&mut self, properties: MassProperties) {
         self.volume = properties.volume;
         self.centroid = properties.centroid;
         self.moment_of_inertia = properties.moment_of_inertia;
@@ -76,7 +79,7 @@ impl MeshMetrics {
     pub fn translate(&mut self, delta: [f64; 3]) {
         if self.volume > 1e-18 {
             self.apply_mass_properties(
-                kernel::brep::MassProperties {
+                MassProperties {
                     volume: self.volume,
                     centroid: self.centroid,
                     moment_of_inertia: self.moment_of_inertia,
@@ -98,6 +101,9 @@ impl MeshMetrics {
 #[derive(Clone, Debug)]
 pub struct MeshLodSet {
     pub lods: Vec<MeshModel>,
+    /// Fully resolved display/export layer for this placement. Geometry and
+    /// instance sources remain shared and placement-independent.
+    pub effective_layer: Option<std::sync::Arc<str>>,
     /// Effective AcDbMaterial resolved from entity/layer/INSERT inheritance.
     /// Geometry remains usable when it is absent; the renderer then keeps the
     /// per-mesh entity colour.
@@ -105,7 +111,8 @@ pub struct MeshLodSet {
     /// Face-level ACIS material overrides, resolved from each LOD's
     /// `triangle_material_handles`. Only handles actually referenced by the
     /// tessellation are retained.
-    pub face_materials: rustc_hash::FxHashMap<codec::Handle, super::material_model::MeshMaterial>,
+    pub face_materials:
+        rustc_hash::FxHashMap<document::Handle, super::material_model::MeshMaterial>,
     /// Effective AcDbVisualStyle override resolved from the entity's full,
     /// face and edge style handles.
     pub visual_style: Option<super::visual_style_model::MeshVisualStyle>,
@@ -120,6 +127,9 @@ pub struct MeshLodSet {
     pub edge_verts: Vec<[f32; 3]>,
     /// Low residual paired with `edge_verts`.
     pub edge_verts_low: Vec<[f32; 3]>,
+    /// A colour of its own for each of `edge_verts`, where the B-rep edge
+    /// carries one; shorter or empty when none do.
+    pub edge_vert_colors: Vec<Option<[f32; 4]>>,
     /// Kernel sources for per-frame silhouettes.
     pub curved_gens: Vec<CurvedGen>,
     /// Geometry measurements calculated once from the highest available LOD.
@@ -140,9 +150,9 @@ pub struct MeshLodSet {
     /// block entity. Top-level meshes leave this empty.
     pub instance_source: Option<std::sync::Arc<MeshInstanceSource>>,
     /// Accumulated block-local → world transform for this rendered instance.
-    pub instance_transform: Option<codec::types::Transform>,
+    pub instance_transform: Option<document::types::Transform>,
     /// Parent INSERT selected for this rendered block instance.
-    pub instance_handle: Option<codec::Handle>,
+    pub instance_handle: Option<document::Handle>,
     /// Effective colour after INSERT inheritance, without copying the mesh.
     pub instance_color: Option<[f32; 4]>,
     /// Colour of the edge and silhouette lines when it differs from the
@@ -150,15 +160,34 @@ pub struct MeshLodSet {
     pub edge_color: Option<[f32; 4]>,
     /// Precise world bounds used by the interaction index.
     pub instance_aabb: Option<[f64; 6]>,
+    /// Display LODs 1 and 2 over `lods[0]`'s vertices ([`simplified_lods`]).
+    /// Shared, so cloning a set does not copy them.
+    pub display_lods: std::sync::Arc<[DisplayLod]>,
+}
+
+/// A coarser triangle list over a mesh's own vertex buffer: drawn in place
+/// of the full triangles when the mesh is small on screen, never picked.
+#[derive(Clone, Debug, Default)]
+pub struct DisplayLod {
+    pub indices: Vec<u32>,
+    /// Aligned with `indices` triplets when the source mesh has them.
+    pub triangle_material_handles: Vec<Option<document::Handle>>,
+    pub triangle_colors: Vec<Option<[f32; 4]>>,
+    /// Vertex and triangle counts of the mesh it was made from: a level whose
+    /// source has since been re-tessellated no longer applies.
+    pub source: (usize, usize),
 }
 
 #[derive(Clone, Debug)]
 pub struct MeshInstanceSource {
-    pub handle: codec::Handle,
+    pub handle: document::Handle,
     pub lods: Vec<MeshModel>,
     pub edge_verts: Vec<[f32; 3]>,
     pub edge_verts_low: Vec<[f32; 3]>,
     pub curved_gens: Vec<CurvedGen>,
+    /// The display LODs of `lods[0]`, shared by every placement of this
+    /// geometry (see [`MeshLodSet::display_lods`]).
+    pub display_lods: std::sync::Arc<[DisplayLod]>,
 }
 
 /// 3D bounds of every LOD's vertices: `([min_x, min_y, max_x, max_y], [min_z, max_z])`.
@@ -186,34 +215,21 @@ fn compute_mesh_metrics(lods: &[MeshModel]) -> MeshMetrics {
     let Some(mesh) = lods.iter().find(|mesh| !mesh.indices.is_empty()) else {
         return MeshMetrics::default();
     };
-    let kernel_mesh = kernel::brep::Mesh {
-        positions: mesh
-            .verts
-            .iter()
-            .enumerate()
-            .map(|(index, high)| {
-                let low = mesh.verts_low.get(index).copied().unwrap_or([0.0; 3]);
-                [
-                    high[0] as f64 + low[0] as f64,
-                    high[1] as f64 + low[1] as f64,
-                    high[2] as f64 + low[2] as f64,
-                ]
-            })
-            .collect(),
-        normals: Vec::new(),
-        triangles: mesh
-            .indices
-            .chunks_exact(3)
-            .map(|triangle| {
-                [
-                    triangle[0] as usize,
-                    triangle[1] as usize,
-                    triangle[2] as usize,
-                ]
-            })
-            .collect(),
-    };
-    let surface = kernel_mesh.surface_properties();
+    let positions: Vec<[f64; 3]> = mesh
+        .verts
+        .iter()
+        .enumerate()
+        .map(|(index, high)| {
+            let low = mesh.verts_low.get(index).copied().unwrap_or([0.0; 3]);
+            [0, 1, 2].map(|k| high[k] as f64 + low[k] as f64)
+        })
+        .collect();
+    let triangles: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+        .collect();
+    let surface = super::mass::surface_properties(&positions, &triangles);
     let mut metrics = MeshMetrics {
         vertices: mesh.verts.len(),
         triangles: mesh.indices.len() / 3,
@@ -221,14 +237,14 @@ fn compute_mesh_metrics(lods: &[MeshModel]) -> MeshMetrics {
         centroid: surface.map_or([0.0; 3], |value| value.1),
         ..MeshMetrics::default()
     };
-    if let Some(properties) = kernel_mesh.inertial_properties() {
+    if let Some(properties) = MassProperties::of_mesh(&positions, &triangles) {
         metrics.apply_mass_properties(properties);
     }
     metrics
 }
 
 impl MeshLodSet {
-    pub fn apply_mass_properties(&mut self, properties: kernel::brep::MassProperties) {
+    pub fn apply_mass_properties(&mut self, properties: MassProperties) {
         self.metrics.apply_mass_properties(properties);
     }
 
@@ -238,12 +254,14 @@ impl MeshLodSet {
         let metrics = compute_mesh_metrics(&lods);
         Self {
             lods,
+            effective_layer: None,
             material: None,
             face_materials: rustc_hash::FxHashMap::default(),
             visual_style: None,
             complete: true,
             edge_verts: Vec::new(),
             edge_verts_low: Vec::new(),
+            edge_vert_colors: Vec::new(),
             curved_gens: Vec::new(),
             metrics,
             world_aabb,
@@ -254,7 +272,32 @@ impl MeshLodSet {
             instance_color: None,
             edge_color: None,
             instance_aabb: None,
+            display_lods: Default::default(),
         }
+    }
+
+    /// Builds display LODs 1 and 2 from `lods[0]` (desktop only; the web
+    /// build draws every mesh at full detail).
+    pub fn build_display_lods(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(mesh) = self.lods.first() {
+            self.display_lods = simplified_lods(mesh).into();
+        }
+    }
+
+    /// Display LOD `level` (1 or 2) when it still matches the mesh it was
+    /// built from.
+    ///
+    /// A placement of shared geometry holds no mesh of its own: its levels
+    /// are the ones of the geometry it places.
+    pub fn display_lod(&self, level: usize) -> Option<&DisplayLod> {
+        let (lods, mesh) = match (&self.instance_source, self.lods.first()) {
+            (_, Some(mesh)) => (&self.display_lods, mesh),
+            (Some(source), None) => (&source.display_lods, source.lods.first()?),
+            (None, None) => return None,
+        };
+        let lod = lods.get(level.checked_sub(1)?)?;
+        (lod.source == (mesh.verts.len(), mesh.indices.len() / 3)).then_some(lod)
     }
 
     /// Wrap a single MeshModel as a one-LOD set. Used by interactive
@@ -273,13 +316,14 @@ impl MeshLodSet {
         self.z_aabb = z;
     }
 
-    pub fn prepare_instance_source(&mut self, handle: codec::Handle) {
+    pub fn prepare_instance_source(&mut self, handle: document::Handle) {
         self.instance_source = Some(std::sync::Arc::new(MeshInstanceSource {
             handle,
             lods: self.lods.clone(),
             edge_verts: self.edge_verts.clone(),
             edge_verts_low: self.edge_verts_low.clone(),
             curved_gens: self.curved_gens.clone(),
+            display_lods: self.display_lods.clone(),
         }));
         self.instance_transform = None;
         self.instance_handle = None;
@@ -305,12 +349,12 @@ impl MeshLodSet {
         )
     }
 
-    pub fn entity_handle(&self) -> Option<codec::Handle> {
+    pub fn entity_handle(&self) -> Option<document::Handle> {
         self.instance_handle.or_else(|| {
             self.lods
                 .first()
                 .and_then(|mesh| mesh.name.parse::<u64>().ok())
-                .map(codec::Handle::new)
+                .map(document::Handle::new)
         })
     }
 
@@ -322,6 +366,139 @@ impl MeshLodSet {
                 .map(|mesh| mesh.color)
         })
     }
+}
+
+/// Meshes below this many triangles keep a single LOD: simplifying them
+/// saves less than the extra index buffers cost.
+pub const MIN_LOD_TRIANGLES: usize = 2048;
+
+/// Display LODs 1 and 2 of `mesh`: about ½ and ¼ of its triangles over the
+/// same vertex buffer (same vertices and normals, fewer triangles).
+///
+/// Solid tessellations split vertices per triangle, so corners are first
+/// welded by position for the simplifier to see one surface; each kept
+/// corner then goes back to the copy whose normal best fits its triangle,
+/// so creases keep their own shading. Triangles are simplified per
+/// (material, colour) group with each group's border locked, so faces of
+/// different appearance keep their shared boundary and the per-triangle
+/// attributes stay aligned. A level that would not drop at least a tenth of
+/// the triangles is left out.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn simplified_lods(mesh: &MeshModel) -> Vec<DisplayLod> {
+    let triangles = mesh.indices.len() / 3;
+    if triangles < MIN_LOD_TRIANGLES
+        || mesh.verts.is_empty()
+        || mesh.indices.iter().any(|&i| i as usize >= mesh.verts.len())
+    {
+        return Vec::new();
+    }
+    // `weld[i]` is the first vertex at vertex i's position; `copies` lists
+    // every vertex grouped by that welded one. The simplifier gets only the
+    // welded positions (`dense`): copies left in its buffer at the same
+    // place would read as seams it may not collapse.
+    let mut first_at = rustc_hash::FxHashMap::default();
+    let weld: Vec<u32> = mesh
+        .verts
+        .iter()
+        .enumerate()
+        .map(|(i, v)| *first_at.entry(v.map(f32::to_bits)).or_insert(i as u32))
+        .collect();
+    drop(first_at);
+    let mut dense_of = vec![u32::MAX; mesh.verts.len()];
+    let mut dense: Vec<u32> = Vec::new();
+    for (i, &w) in weld.iter().enumerate() {
+        if w as usize == i {
+            dense_of[i] = dense.len() as u32;
+            dense.push(w);
+        }
+    }
+    let positions: Vec<[f32; 3]> = dense.iter().map(|&i| mesh.verts[i as usize]).collect();
+    let mut copies: Vec<u32> = (0..mesh.verts.len() as u32).collect();
+    copies.sort_unstable_by_key(|&i| weld[i as usize]);
+    let copies_of = |welded: u32| {
+        let low = copies.partition_point(|&i| weld[i as usize] < welded);
+        let high = copies.partition_point(|&i| weld[i as usize] <= welded);
+        &copies[low..high]
+    };
+    let has_normals = mesh.normals.len() == mesh.verts.len();
+    let unweld = |triangle: &[u32]| -> [u32; 3] {
+        let p = |i: u32| glam::Vec3::from(mesh.verts[i as usize]);
+        let facing = (p(triangle[1]) - p(triangle[0])).cross(p(triangle[2]) - p(triangle[0]));
+        [0, 1, 2].map(|corner| {
+            let welded = triangle[corner];
+            if !has_normals {
+                return welded;
+            }
+            copies_of(welded)
+                .iter()
+                .copied()
+                .max_by(|a, b| {
+                    let fit = |i: u32| glam::Vec3::from(mesh.normals[i as usize]).dot(facing);
+                    fit(*a).total_cmp(&fit(*b))
+                })
+                .unwrap_or(welded)
+        })
+    };
+    let materials = mesh.triangle_material_handles.len() == triangles;
+    let colors = mesh.triangle_colors.len() == triangles;
+    let key = |t: usize| {
+        (
+            materials.then(|| mesh.triangle_material_handles[t]).flatten(),
+            colors
+                .then(|| mesh.triangle_colors[t].map(|c| c.map(f32::to_bits)))
+                .flatten(),
+        )
+    };
+    let mut groups: Vec<(usize, Vec<u32>)> = Vec::new();
+    let mut slot = rustc_hash::FxHashMap::default();
+    for (t, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+        let at = *slot.entry(key(t)).or_insert_with(|| {
+            groups.push((t, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at]
+            .1
+            .extend(triangle.iter().map(|&i| dense_of[weld[i as usize] as usize]));
+    }
+    let mut lods = Vec::new();
+    let mut previous = triangles;
+    for (fraction, target_error) in [(0.5_f64, 0.005_f32), (0.25, 0.02)] {
+        let mut lod = DisplayLod {
+            source: (mesh.verts.len(), triangles),
+            ..DisplayLod::default()
+        };
+        for (first, indices) in &groups {
+            let target = ((indices.len() as f64 * fraction) as usize / 3 * 3).max(3);
+            let kept = meshopt::simplify::simplify_decoder(
+                indices,
+                &positions,
+                target,
+                target_error,
+                meshopt::SimplifyOptions::LockBorder,
+                None,
+            );
+            let count = kept.len() / 3;
+            lod.indices
+                .extend(kept.chunks_exact(3).flat_map(|triangle| {
+                    unweld(&[triangle[0], triangle[1], triangle[2]].map(|d| dense[d as usize]))
+                }));
+            if materials {
+                lod.triangle_material_handles
+                    .extend(std::iter::repeat_n(mesh.triangle_material_handles[*first], count));
+            }
+            if colors {
+                lod.triangle_colors
+                    .extend(std::iter::repeat_n(mesh.triangle_colors[*first], count));
+            }
+        }
+        let count = lod.indices.len() / 3;
+        if count * 10 > previous * 9 {
+            break;
+        }
+        previous = count;
+        lods.push(lod);
+    }
+    lods
 }
 
 /// Max B-rep edge pairs read from one solid for snapping. Curved-edge
@@ -446,5 +623,136 @@ mod solid_snap_tests {
         );
         // The first pair survives sampling (index 0 is kept).
         assert_eq!(segs[0].0, glam::DVec3::new(100.0, 0.0, 0.0));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lod_tests {
+    use super::{simplified_lods, MeshLodSet, MeshModel};
+
+    fn mesh_of(body: &ocs_solid::model::Brep) -> MeshModel {
+        let mesh = crate::scene::model::solid_model::tessellate(
+            body,
+            crate::scene::model::solid_model::DisplayTolerance::new(0.05),
+        )
+        .unwrap();
+        MeshModel {
+            name: "1".into(),
+            verts: mesh
+                .positions
+                .iter()
+                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                .collect(),
+            verts_low: Vec::new(),
+            normals: mesh
+                .normals
+                .iter()
+                .map(|n| [n[0] as f32, n[1] as f32, n[2] as f32])
+                .collect(),
+            indices: mesh
+                .triangles
+                .iter()
+                .flat_map(|t| t.map(|i| i as u32))
+                .collect(),
+            triangle_material_handles: Vec::new(),
+            triangle_colors: Vec::new(),
+            color: [1.0; 4],
+            selected: false,
+        }
+    }
+
+    /// Worst distance of a triangle's centroid off the exact surface, where
+    /// `off` measures a point's distance from it.
+    fn worst(mesh: &MeshModel, indices: &[u32], off: impl Fn(glam::DVec3) -> f64) -> f64 {
+        indices
+            .chunks_exact(3)
+            .map(|t| {
+                let p = |i: u32| glam::DVec3::from(mesh.verts[i as usize].map(f64::from));
+                off((p(t[0]) + p(t[1]) + p(t[2])) / 3.0)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn a_sphere_simplifies_to_half_and_quarter_within_a_small_error() {
+        let body = ocs_solid::model::make_sphere([0.0; 3], 10.0).unwrap();
+        let mesh = mesh_of(&body);
+        let lods = simplified_lods(&mesh);
+        assert_eq!(lods.len(), 2);
+        let full = mesh.indices.len() / 3;
+        let off = |p: glam::DVec3| (p.length() - 10.0).abs();
+        let base = worst(&mesh, &mesh.indices, off);
+        for (lod, fraction) in lods.iter().zip([0.5, 0.25]) {
+            let count = lod.indices.len() / 3;
+            assert!(
+                (count as f64) < full as f64 * (fraction + 0.15),
+                "{count} of {full} triangles"
+            );
+            assert_eq!(lod.source, (mesh.verts.len(), full));
+            let error = worst(&mesh, &lod.indices, off);
+            assert!(error < base + 0.05, "{error} vs {base}");
+        }
+    }
+
+    /// A block reference places shared geometry and holds no mesh of its
+    /// own: the levels it draws are the ones of the geometry it places.
+    #[test]
+    fn a_placement_draws_the_levels_of_the_geometry_it_places() {
+        let body = ocs_solid::model::make_sphere([0.0; 3], 10.0).unwrap();
+        let mut solid = MeshLodSet::from_single(mesh_of(&body));
+        solid.build_display_lods();
+        solid.prepare_instance_source(document::Handle::new(7));
+        let mut placed = solid.clone();
+        placed.lods.clear();
+        placed.display_lods = Default::default();
+        placed.instance_transform = Some(document::types::Transform::identity());
+        for level in [1, 2] {
+            let own = solid.display_lod(level).expect("the solid has the level");
+            let drawn = placed
+                .display_lod(level)
+                .unwrap_or_else(|| panic!("the placement has no level {level}"));
+            assert_eq!(drawn.indices, own.indices, "level {level}");
+        }
+        assert!(placed.display_lod(0).is_none());
+        assert!(placed.display_lod(3).is_none());
+    }
+
+    #[test]
+    fn a_torus_keeps_each_colour_group_and_its_attributes_aligned() {
+        let body = ocs_solid::model::make_torus([0.0; 3], 20.0, 5.0).unwrap();
+        let mut mesh = mesh_of(&body);
+        // Colour by side of the YZ plane: two groups sharing a boundary.
+        let red = Some([1.0, 0.0, 0.0, 1.0]);
+        mesh.triangle_colors = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|t| (mesh.verts[t[0] as usize][0] > 0.0).then_some(red).flatten())
+            .collect();
+        let lods = simplified_lods(&mesh);
+        assert!(!lods.is_empty());
+        let full = mesh.indices.len() / 3;
+        let off = |p: glam::DVec3| {
+            let ring = glam::DVec2::new(p.x, p.y).length() - 20.0;
+            (glam::DVec2::new(ring, p.z).length() - 5.0).abs()
+        };
+        let base = worst(&mesh, &mesh.indices, off);
+        for lod in &lods {
+            let count = lod.indices.len() / 3;
+            assert!(count * 10 <= full * 9, "{count} of {full}");
+            assert_eq!(lod.triangle_colors.len(), count);
+            assert!(lod.triangle_material_handles.is_empty());
+            let error = worst(&mesh, &lod.indices, off);
+            assert!(error < base + 0.06, "{error} vs {base}");
+            // Every triangle keeps its group's colour: no red triangle
+            // wholly on the uncoloured side, nor the other way round.
+            for (t, colour) in lod.indices.chunks_exact(3).zip(&lod.triangle_colors) {
+                let xs = [t[0], t[1], t[2]].map(|i| mesh.verts[i as usize][0]);
+                if colour.is_some() {
+                    assert!(xs.iter().any(|x| *x > 0.0), "{xs:?}");
+                } else {
+                    assert!(xs.iter().any(|x| *x <= 0.0), "{xs:?}");
+                }
+            }
+        }
     }
 }

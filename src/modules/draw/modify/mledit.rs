@@ -1,9 +1,9 @@
-use codec::entities::MLine;
-use codec::objects::MLineStyle;
-use codec::{EntityType, Handle};
+use document::entities::MLine;
+use document::objects::MLineStyle;
+use document::{EntityType, Handle};
 use glam::DVec3;
-use kernel::geom2d::{Curve, Line};
-use kernel::space::{PlanarCurve, Plane, Vec3 as KernelVec3};
+use ocs_geom::geom2d::{Curve, Line};
+use ocs_geom::space::{PlanarCurve, Plane, Vec3 as KernelVec3};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
@@ -92,7 +92,8 @@ impl MlineEditCommand {
                 }
                 let insert = segment + 1;
                 let mut vertex = mline.vertices[segment].clone();
-                vertex.position = codec::types::Vector3::new(projected.x, projected.y, projected.z);
+                vertex.position =
+                    document::types::Vector3::new(projected.x, projected.y, projected.z);
                 mline.vertices.insert(insert, vertex);
                 crate::entities::mline::rebuild_mline_geometry(&mut mline);
                 crate::modules::draw::draw::mline::sync_mline_element_parameters(
@@ -604,8 +605,18 @@ pub(crate) fn trim_mline_at(
             continue;
         }
         let at = at.clamp(0.0, 1.0);
-        let low = edges.iter().copied().filter(|t| *t < at).fold(0.0, f64::max) * length;
-        let high = edges.iter().copied().filter(|t| *t > at).fold(1.0, f64::min) * length;
+        let low = edges
+            .iter()
+            .copied()
+            .filter(|t| *t < at)
+            .fold(0.0, f64::max)
+            * length;
+        let high = edges
+            .iter()
+            .copied()
+            .filter(|t| *t > at)
+            .fold(1.0, f64::min)
+            * length;
         let data = &mut mline.vertices[segment].segments[element];
         remove_drawn_range(&mut data.parameters, length, low, high);
         add_cut_range(&mut data.area_fill_parameters, length, low, high);
@@ -689,7 +700,7 @@ fn snapshot_segment_data(
     mline: &MLine,
     segment: usize,
     normal: DVec3,
-) -> Option<Vec<(codec::entities::MLineSegment, f64)>> {
+) -> Option<Vec<(document::entities::MLineSegment, f64)>> {
     (0..mline.style_element_count)
         .map(|element| {
             let endpoints = element_segment(mline, segment, element)?;
@@ -705,7 +716,7 @@ fn restore_shifted_segment_data(
     mline: &mut MLine,
     segment: usize,
     normal: DVec3,
-    source: Vec<(codec::entities::MLineSegment, f64)>,
+    source: Vec<(document::entities::MLineSegment, f64)>,
     moved_start: bool,
 ) {
     for (element, (source, source_length)) in source.into_iter().enumerate() {
@@ -1033,7 +1044,7 @@ fn move_closest_end(mline: &mut MLine, style: &MLineStyle, index: usize, interse
         snapshot_segment_data(mline, segment, normal).map(|data| (segment, data))
     });
     mline.vertices[index].position =
-        codec::types::Vector3::new(intersection.x, intersection.y, intersection.z);
+        document::types::Vector3::new(intersection.x, intersection.y, intersection.z);
     crate::entities::mline::rebuild_mline_geometry(mline);
     crate::modules::draw::draw::mline::sync_mline_element_parameters(mline, style);
     restore_shifted_segment_data(mline, segment, normal, source, index == 0);
@@ -1072,26 +1083,26 @@ fn segment_intersection(
     second: (DVec3, DVec3),
     normal: DVec3,
 ) -> Option<(DVec3, f64, f64, f64)> {
-    let axis = (kernel::space::Vec3::from(first.1.to_array())
-        - kernel::space::Vec3::from(first.0.to_array()))
+    let axis = (ocs_geom::space::Vec3::from(first.1.to_array())
+        - ocs_geom::space::Vec3::from(first.0.to_array()))
     .normalize()?
     .to_array();
-    let plane = kernel::space::Plane::orthonormal(first.0.to_array(), axis, normal.to_array())?;
+    let plane = ocs_geom::space::Plane::orthonormal(first.0.to_array(), axis, normal.to_array())?;
     let points = [
         first.0.to_array(),
         first.1.to_array(),
         second.0.to_array(),
         second.1.to_array(),
     ];
-    let tolerance = kernel::space::coplanarity_tolerance(&points);
+    let tolerance = ocs_geom::space::coplanarity_tolerance(&points);
     if !plane.contains(points[2], tolerance) || !plane.contains(points[3], tolerance) {
         return None;
     }
-    let p = kernel::geom2d::Vec2::from(plane.project(points[0])?);
-    let q = kernel::geom2d::Vec2::from(plane.project(points[2])?);
-    let r = kernel::geom2d::Vec2::from(plane.project(points[1])?) - p;
-    let s = kernel::geom2d::Vec2::from(plane.project(points[3])?) - q;
-    let (t, u) = kernel::geom2d::intersect::line_line(
+    let p = ocs_geom::geom2d::Vec2::from(plane.project(points[0])?);
+    let q = ocs_geom::geom2d::Vec2::from(plane.project(points[2])?);
+    let r = ocs_geom::geom2d::Vec2::from(plane.project(points[1])?) - p;
+    let s = ocs_geom::geom2d::Vec2::from(plane.project(points[3])?) - q;
+    let (t, u) = ocs_geom::geom2d::intersect::line_line(
         p.to_array(),
         r.to_array(),
         q.to_array(),
@@ -1112,8 +1123,8 @@ mod trim_tests {
     fn trim_cuts_every_element_between_its_edges() {
         let mut mline = MLine::new();
         mline.style_element_count = 2;
-        mline.add_vertex(codec::types::Vector3::new(0.0, 0.0, 0.0));
-        mline.add_vertex(codec::types::Vector3::new(10.0, 0.0, 0.0));
+        mline.add_vertex(document::types::Vector3::new(0.0, 0.0, 0.0));
+        mline.add_vertex(document::types::Vector3::new(10.0, 0.0, 0.0));
         for vertex in &mut mline.vertices {
             for (element, offset) in [1.0, -1.0].into_iter().enumerate() {
                 vertex.segments[element].parameters = vec![offset, 0.0];
@@ -1124,17 +1135,24 @@ mod trim_tests {
         let trimmed = trim_mline_at(&mline, DVec3::new(5.0, 0.2, 0.0), cuts).unwrap();
         for element in 0..2 {
             let data = &trimmed.vertices[0].segments[element];
-            assert_eq!(drawn_ranges(&data.parameters, 10.0), vec![(0.0, 3.0), (7.0, 10.0)]);
+            assert_eq!(
+                drawn_ranges(&data.parameters, 10.0),
+                vec![(0.0, 3.0), (7.0, 10.0)]
+            );
         }
         // The fill between the outer lines leaves the same gap.
-        let mut style = codec::objects::MLineStyle::new("FILLED");
+        let mut style = document::objects::MLineStyle::new("FILLED");
         style.elements = vec![
-            codec::objects::MLineStyleElement::new(1.0),
-            codec::objects::MLineStyleElement::new(-1.0),
+            document::objects::MLineStyleElement::new(1.0),
+            document::objects::MLineStyleElement::new(-1.0),
         ];
         style.flags.fill_on = true;
         let fill = crate::entities::mline::mline_fill_triangles_with_style(&trimmed, &style);
         assert!(!fill.is_empty());
-        assert!(fill.iter().all(|p| p[0] <= 3.0 + 1e-6 || p[0] >= 7.0 - 1e-6), "{fill:?}");
+        assert!(
+            fill.iter()
+                .all(|p| p[0] <= 3.0 + 1e-6 || p[0] >= 7.0 - 1e-6),
+            "{fill:?}"
+        );
     }
 }

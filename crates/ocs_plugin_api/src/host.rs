@@ -1,6 +1,6 @@
 //! Runtime host surface (`host` feature).
 //!
-//! [`HostApi`] is the `opencadcodec`-typed adapter a plugin uses at *dispatch* time
+//! [`HostApi`] is the `document`-typed adapter a plugin uses at *dispatch* time
 //! — document access, entity creation, XDATA, undo, and the command line. It is
 //! the stable counterpart to the dependency-free manifest/ribbon contract: a
 //! plugin's `dispatch` receives `&mut dyn HostApi` rather than the host's
@@ -19,19 +19,22 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::manifest::{EntityClasses, PluginManifest};
 use crate::ribbon::CadModule;
 
-// Re-export the opencadcodec crate and the types that appear in the HostApi trait
-// so out-of-tree plugins can use them without adding their own opencadcodec
+// Re-export the document crate and the types that appear in the HostApi trait
+// so out-of-tree plugins can use them without adding their own document
 // dependency (which would risk an ABI-mismatching version).
-pub use codec;
-pub use codec as acadrust;
-pub use codec::objects::{
+pub use document;
+pub use document as acadrust;
+// The name plugins used before the crate was renamed to document.
+pub use document as codec;
+pub use document::objects::{
     DictionaryCloningFlags, KnownXRecordKind, ProxyObjectReference, ProxyReferenceKind, XRecord,
     XRecordEntry, XRecordSection, XRecordValue, XRecordValueType,
 };
-pub use codec::xdata::{ExtendedDataRecord, XDataValue};
-pub use codec::{Document, EntityType, Handle};
+pub use document::xdata::{ExtendedDataRecord, XDataValue};
+pub use document::{Document, EntityType, Handle};
 
 use crate::ipc::protocol::{PluginRequest, PluginResponse};
+use crate::scene::{PanelScene, PanelSurface, SceneRevision, SurfaceReject, SurfaceRejectCode};
 
 /// Thread-safe handle that can issue host requests from plugin worker threads.
 /// Out-of-process V4 plugins implement this; in-process hosts may return `None`.
@@ -314,6 +317,16 @@ pub enum TableOperation {
         rotation: Option<u16>,
         scale: Option<[f64; 2]>,
     },
+    /// Put the paper-space layout tabs in this order (API v23). `names` lists
+    /// every paper-space layout once, in the new order; `Model` stays first
+    /// and is not listed. One undo step.
+    LayoutSetTabOrder { names: Vec<String> },
+    /// Set the drawing's custom properties (the Custom tab of DWGPROPS) (API
+    /// v26). Each `(name, value)` pair replaces the value of the property with
+    /// that name (matched trimmed, ignoring case) or is appended; properties
+    /// not listed are kept. Names must be non-empty and distinct. One undo
+    /// step; nothing is recorded when every value is already there.
+    CustomPropertiesSet { properties: Vec<(String, String)> },
 }
 
 /// The style tables `TableOperation` can rename, delete or make current.
@@ -491,10 +504,115 @@ pub enum HostNotification {
         type_keys: Vec<String>,
         pick_point: [f64; 3],
     },
+    /// V22 digest of a tab's active selection, sent INSTEAD OF the legacy
+    /// handle-list selection notifications (`SelectionChangedV4` /
+    /// `SelectionChanged`) to plugins whose exported
+    /// `ocs_plugin_api_version` reports 22 or newer (the host routes
+    /// per plugin, so no variant is duplicated). `revision` increases
+    /// monotonically per tab whenever the selection fingerprint actually
+    /// changes — the same dedup gate the legacy variants use — and `count`
+    /// is the exact selection size, so the notification is O(1) even for
+    /// selections of tens of thousands of entities. A plugin fetches
+    /// handles lazily via [`HostApi::selection`] only when it needs them.
+    /// Discriminant 14.
+    SelectionChangedDigest {
+        tab_id: u64,
+        revision: u64,
+        count: u64,
+    },
+    /// V27 exact, categorized document-change delta — the incremental
+    /// successor of [`HostNotification::DocumentChangedRegions`]. Sent INSTEAD
+    /// OF the v13 Regions notification, at the same boundaries, to plugins
+    /// whose exported `ocs_plugin_api_version` reports 27 or newer (the host
+    /// routes per plugin, so no endpoint receives a duplicate Regions+delta
+    /// stream); older plugins keep the exact legacy Regions streams.
+    ///
+    /// `added` / `modified` / `deleted` classify the entity handles of the
+    /// change boundary by net effect against the previous published boundary:
+    ///
+    /// * `added`: absent before the boundary, present after it.
+    /// * `modified`: present on both sides whose relevant data changed.
+    /// * `deleted`: present before, absent after. A deleted handle STAYS in
+    ///   the list even though lookup now fails — the deletion itself is the
+    ///   information.
+    /// * A same-handle replacement (erase + recreate reusing the handle) is
+    ///   `modified`; a replacement through a new handle is
+    ///   `deleted(old) + added(new)`.
+    /// * Repeated changes to one handle within ONE boundary fold into the net
+    ///   classification above (first-event start presence vs last-event end
+    ///   presence); e.g. created-then-erased within one boundary nets to
+    ///   nothing, erased-then-recreated nets to `modified`.
+    ///
+    /// The lists are deterministic (ascending handle order) and deduplicated.
+    ///
+    /// `records` carries the same (entity, app-name) XDATA/XRecord touch pairs
+    /// the v13 Regions notification would have carried.
+    ///
+    /// `snapshot` correlates the boundary with the V4 snapshot store:
+    /// `Some` when a snapshot was actually published for this boundary (the
+    /// plugin can match the pair against the mapping it holds), `None` when
+    /// no V4 store was open for the tab (the legitimate no-consumer case —
+    /// NOT a failure). See [`DocumentDeltaSnapshot`] for the
+    /// generation/version matching rule.
+    ///
+    /// `full_refresh_required` is the honesty flag: `true` means the host
+    /// cannot prove the incremental sets are complete (journal gap, overflow,
+    /// or a whole-document mutation it cannot attribute) and the consumer
+    /// MUST resynchronize the whole document instead of applying the lists.
+    /// `false` with all lists empty is an EXACT statement — nothing relevant
+    /// changed — and must not be confused with the legacy empty-set
+    /// "unknown, walk everything" behavior of `DocumentChangedRegions`.
+    /// Discriminant 15.
+    DocumentChangedDelta {
+        tab_id: u64,
+        version: u64,
+        added: Vec<Handle>,
+        modified: Vec<Handle>,
+        deleted: Vec<Handle>,
+        records: Vec<(Handle, String)>,
+        snapshot: Option<DocumentDeltaSnapshot>,
+        full_refresh_required: bool,
+    },
+    /// A semantic panel-surface event (api v29): what the user did to
+    /// which element of `panel_id`, with the surface's monotonic event
+    /// `sequence` as the explicit event identity — identical-looking
+    /// activations are DISTINCT events, and equality is not identity.
+    /// Best-effort by contract: never acknowledged by re-publishing
+    /// values; drag moves may be coalesced (positions are absolute), but
+    /// `DragSettled` and `DragCancelled` are authoritative and never
+    /// dropped. Only routed to plugins whose manifest declares v29 — a
+    /// v28 runner cannot decode tag 16
+    /// (`notification_api_version` gate). Discriminant 16.
+    PanelSurfaceEvent {
+        panel_id: String,
+        sequence: u64,
+        event: crate::scene::SurfaceEvent,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
     Unknown(Vec<u8>),
+}
+
+/// Snapshot correlation payload of
+/// [`HostNotification::DocumentChangedDelta`]: identifies the exact V4
+/// snapshot-store publication that reflects the same document state the
+/// delta was computed from.
+///
+/// `version` is the store's per-publication counter (the same value the
+/// `DocumentChangedV4` notification carries for the boundary) and
+/// `generation` increments every time the store mapping itself is replaced
+/// (a resize retires the old file and opens a new one). Versions are only
+/// comparable within one generation: a plugin whose loaded mapping reports a
+/// different generation must re-fetch the store path and re-open — never
+/// compare versions across mappings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentDeltaSnapshot {
+    /// V4 snapshot-store version published for this boundary.
+    pub version: u64,
+    /// Store-mapping generation; increments when the backing file is
+    /// replaced (resize/reopen).
+    pub generation: u64,
 }
 
 impl Serialize for HostNotification {
@@ -565,14 +683,11 @@ impl Serialize for HostNotification {
                 value,
             } => {
                 bytes.push(12);
-                bincode::serialize_into(&mut bytes, panel_id)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, panel_id).map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, control_id)
                     .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, action)
-                    .map_err(serde::ser::Error::custom)?;
-                bincode::serialize_into(&mut bytes, value)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, action).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, value).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::QuadAction {
                 panel_id,
@@ -582,8 +697,7 @@ impl Serialize for HostNotification {
                 pick_point,
             } => {
                 bytes.push(13);
-                bincode::serialize_into(&mut bytes, panel_id)
-                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, panel_id).map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, control_id)
                     .map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, handles).map_err(serde::ser::Error::custom)?;
@@ -591,6 +705,47 @@ impl Serialize for HostNotification {
                     .map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, pick_point)
                     .map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::SelectionChangedDigest {
+                tab_id,
+                revision,
+                count,
+            } => {
+                bytes.push(14);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, revision).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, count).map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::DocumentChangedDelta {
+                tab_id,
+                version,
+                added,
+                modified,
+                deleted,
+                records,
+                snapshot,
+                full_refresh_required,
+            } => {
+                bytes.push(15);
+                bincode::serialize_into(&mut bytes, tab_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, version).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, added).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, modified).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, deleted).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, records).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, snapshot).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, full_refresh_required)
+                    .map_err(serde::ser::Error::custom)?;
+            }
+            HostNotification::PanelSurfaceEvent {
+                panel_id,
+                sequence,
+                event,
+            } => {
+                bytes.push(16);
+                bincode::serialize_into(&mut bytes, panel_id).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, sequence).map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, event).map_err(serde::ser::Error::custom)?;
             }
             HostNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
@@ -654,14 +809,14 @@ impl<'de> Deserialize<'de> for HostNotification {
             }
             12 => {
                 let mut cursor = std::io::Cursor::new(rest);
-                let panel_id: String = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let control_id: String = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let action: String = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let value: Option<crate::dialog::DialogValue> = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
+                let panel_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let control_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let action: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let value: Option<crate::dialog::DialogValue> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
                 Ok(HostNotification::PanelAction {
                     panel_id,
                     control_id,
@@ -671,16 +826,16 @@ impl<'de> Deserialize<'de> for HostNotification {
             }
             13 => {
                 let mut cursor = std::io::Cursor::new(rest);
-                let panel_id: String = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let control_id: String = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let handles: Vec<Handle> = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let type_keys: Vec<String> = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
-                let pick_point: [f64; 3] = bincode::deserialize_from(&mut cursor)
-                    .map_err(serde::de::Error::custom)?;
+                let panel_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let control_id: String =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let handles: Vec<Handle> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let type_keys: Vec<String> =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
+                let pick_point: [f64; 3] =
+                    bincode::deserialize_from(&mut cursor).map_err(serde::de::Error::custom)?;
                 Ok(HostNotification::QuadAction {
                     panel_id,
                     control_id,
@@ -689,6 +844,49 @@ impl<'de> Deserialize<'de> for HostNotification {
                     pick_point,
                 })
             }
+            14 => bincode::deserialize(rest)
+                .map(
+                    |(tab_id, revision, count)| HostNotification::SelectionChangedDigest {
+                        tab_id,
+                        revision,
+                        count,
+                    },
+                )
+                .map_err(serde::de::Error::custom),
+            15 => bincode::deserialize(rest)
+                .map(
+                    |(
+                        tab_id,
+                        version,
+                        added,
+                        modified,
+                        deleted,
+                        records,
+                        snapshot,
+                        full_refresh_required,
+                    )| {
+                        HostNotification::DocumentChangedDelta {
+                            tab_id,
+                            version,
+                            added,
+                            modified,
+                            deleted,
+                            records,
+                            snapshot,
+                            full_refresh_required,
+                        }
+                    },
+                )
+                .map_err(serde::de::Error::custom),
+            16 => bincode::deserialize(rest)
+                .map(
+                    |(panel_id, sequence, event)| HostNotification::PanelSurfaceEvent {
+                        panel_id,
+                        sequence,
+                        event,
+                    },
+                )
+                .map_err(serde::de::Error::custom),
             _ => Ok(HostNotification::Unknown(bytes)),
         }
     }
@@ -923,6 +1121,60 @@ pub trait BuiltinPlugin: Send + Sync {
         _pick_point: [f64; 3],
     ) {
     }
+
+    /// The typed operations this plugin offers to AI clients over the
+    /// automation bridge (API v25). The host lists them with the plugin and
+    /// calls one through [`Self::call_tool`]. The default offers none.
+    ///
+    /// The runner only calls this for plugins whose exported
+    /// `ocs_plugin_api_version` symbol reports API major 25 or newer.
+    fn tools(&self) -> Vec<PluginTool> {
+        Vec::new()
+    }
+
+    /// Run one of [`Self::tools`] (API v25). `arguments` is the JSON object
+    /// the client sent, already checked against the tool's `input_schema`;
+    /// the result is a JSON value as text, an `Err` a message for the client.
+    ///
+    /// `host` is the active tab's full [`HostApi`]: the host wraps the whole
+    /// call in one undo step named after the tool, so every write the call
+    /// makes undoes together. The host guards this call: a panic is contained
+    /// and reported as an error.
+    fn call_tool(
+        &mut self,
+        _host: &mut dyn HostApi,
+        name: &str,
+        _arguments: &str,
+    ) -> Result<String, String> {
+        Err(format!("unknown tool '{name}'"))
+    }
+}
+
+/// One operation a plugin offers to AI clients (API v25): see
+/// [`BuiltinPlugin::tools`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTool {
+    /// Unique within the plugin; `[a-z0-9_]`, as clients address it.
+    pub name: String,
+    /// What the tool does and when to use it, written for the AI client.
+    pub description: String,
+    /// JSON Schema of the `arguments` object, as JSON text.
+    pub input_schema: String,
+}
+
+/// What kind of command-line input the active [`InteractiveCommand`] step awaits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "host", derive(serde::Serialize, serde::Deserialize))]
+pub enum InteractiveInputKind {
+    /// Normal viewport point, object pick, or selection step.
+    #[default]
+    Point,
+    /// Single-token command-line input (numbers, keywords): hides coordinate
+    /// dynamic-input boxes and submits on Space or Enter.
+    SingleToken,
+    /// Free-form command-line text: preserves letter case, bypasses math
+    /// evaluation, and keeps Space literal until Enter submits.
+    FreeText,
 }
 
 /// A point-driven interactive command a plugin starts via
@@ -996,8 +1248,48 @@ pub trait InteractiveCommand: Send {
     }
 
     /// Pending panel updates buffered during interactive command execution (API v7, additive).
-    fn take_pending_panel_updates(&mut self) -> Vec<(String, std::collections::HashMap<String, crate::dialog::DialogValue>)> {
+    fn take_pending_panel_updates(
+        &mut self,
+    ) -> Vec<(
+        String,
+        std::collections::HashMap<String, crate::dialog::DialogValue>,
+    )> {
         Vec::new()
+    }
+
+    /// An interaction event (button click, choice select, file picked, etc.)
+    /// occurred inside an open modal dialog.
+    fn on_dialog_action(
+        &mut self,
+        _event: crate::dialog::DialogEvent,
+    ) -> crate::dialog::DialogActionResponse {
+        crate::dialog::DialogActionResponse::None
+    }
+
+    /// Mid-command Ctrl+Z (API v24). A command that collects several inputs
+    /// can take the undo itself — drop its last point and return the next
+    /// step, usually [`CommandStep::NeedPoint`], with `prompt` and
+    /// `on_cursor_move` following the shortened state — the way the host's
+    /// own multi-point commands pop their last vertex. `None` (the default)
+    /// leaves Ctrl+Z to the document undo.
+    ///
+    /// Only plugins whose manifest declares API v24 or newer are asked, and
+    /// the runner calls this slot only for plugins built against v24 or
+    /// newer, so older plugins keep the document undo. Out of process the
+    /// call carries no `HostApi`: it changes the command's own state and
+    /// answers with a step.
+    fn on_undo_step(&mut self) -> Option<CommandStep> {
+        None
+    }
+
+    /// What kind of command-line input the current step expects (API v27).
+    fn input_kind(&self) -> InteractiveInputKind {
+        InteractiveInputKind::Point
+    }
+
+    /// Command-line text submitted while [`Self::input_kind`] awaits text (API v27).
+    fn on_text_input(&mut self, _text: &str) -> CommandStep {
+        CommandStep::NeedPoint
     }
 }
 
@@ -1156,6 +1448,10 @@ pub struct PluginGrip {
     pub point: [f64; 3],
     #[serde(default)]
     pub axis: Option<[f64; 3]>,
+    /// API v21: constrain every custom-grip event to the original world-XY
+    /// plane. `false` preserves the legacy camera-target-plane behavior.
+    #[serde(default)]
+    pub xy_plane: bool,
     #[serde(default)]
     pub shape: PluginGripShape,
 }
@@ -1315,8 +1611,8 @@ macro_rules! export_plugin {
         }
 
         #[no_mangle]
-        pub extern "C" fn ocs_plugin_register(
-        ) -> *mut ::std::boxed::Box<dyn $crate::host::BuiltinPlugin> {
+        pub extern "C" fn ocs_plugin_register()
+        -> *mut ::std::boxed::Box<dyn $crate::host::BuiltinPlugin> {
             // The constructor runs across a C ABI boundary; a panic unwinding
             // past it is undefined behavior. Contain it and report failure as a
             // null pointer, which the host loader treats as "registration
@@ -1404,7 +1700,7 @@ pub trait HostApi {
     /// `{"layer":"*-OPENBARE_RUIMTE_*","type":"Mesh","xdata_app":"OPENINFRA",
     /// "bounds":[x0,y0,x1,y1],"offset":0,"limit":500}`: `layer` takes `*` and
     /// `?`, `where` filters properties by JSON Pointer, and `limit` is at
-    /// most 10000. One message carries at most 64 MiB either way, so batch
+    /// most 10000. One message carries at most 1 GiB either way, so batch
     /// writes and size pages to stay under it.
     fn query_entities(&mut self, query: &str) -> Result<EntityPage, String> {
         let _ = query;
@@ -1981,7 +2277,8 @@ pub trait HostApi {
         false
     }
 
-    /// Update control values in a persistent dockable side panel (API v7, additive).
+    /// Update control values in a persistent dockable side panel or an active
+    /// modal dialog (API v7, additive).
     fn update_panel(
         &mut self,
         _panel_id: &str,
@@ -2025,6 +2322,286 @@ pub trait HostApi {
     /// shape).
     fn unregister_quad_panels(&mut self, _plugin_id: &str, panel_ids: &[&str]) -> Vec<bool> {
         vec![false; panel_ids.len()]
+    }
+
+    /// Validate a declared parametric chain without staging it (additive).
+    ///
+    /// Capable hosts run the same structural, seam, cap and chord-refinement
+    /// audit as staging, discarding the resulting display entities. This is a
+    /// pure read: no document, undo, publish, dirty or cache state changes.
+    fn validate_parametric_chain(
+        &self,
+        _chain: &ParametricChain,
+        _tolerance: f64,
+    ) -> Result<(), String> {
+        Err("Parametric chain validation is not supported by this host".to_owned())
+    }
+
+    /// Display a declarative modal form dialog associated with a specific
+    /// owning plugin ID. Defaults to [`HostApi::show_dialog`].
+    fn show_dialog_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        dialog: crate::dialog::DialogDef,
+    ) -> crate::dialog::DialogResponse {
+        self.show_dialog(dialog)
+    }
+
+    /// Read the current form contents of a registered persistent panel (API v18,
+    /// additive).
+    ///
+    /// This is only a read snapshot during ordinary document-bound command dispatch:
+    /// it submits nothing, writes neither UI nor document state, and records no undo
+    /// step. The returned [`crate::dialog::PanelSnapshot`] is UI input, not document
+    /// authority or a document revision. An asynchronous
+    /// [`HostNotification::PanelAction`] is not a write window and carries no write
+    /// authority; it may only ask the plugin to enter ordinary command dispatch.
+    ///
+    /// Before any write based on a snapshot, the plugin must reject every snapshot
+    /// whose `errors` is non-empty, re-read the authoritative document records, and
+    /// validate that the intended target still exists and is suitable. Only then may
+    /// it perform the write under the ordinary undo contract. The default refuses the
+    /// read so hosts without panel read-back support fail closed.
+    fn panel_snapshot(&self, _panel_id: &str) -> Result<crate::dialog::PanelSnapshot, String> {
+        Err("Panel snapshots are not supported by this host".to_owned())
+    }
+
+    // ---- Panel identity (api 18, additive defaults; appended at the ABI tail). ----
+    //
+    // These methods receive identity from the host's authenticated transport,
+    // not from a PanelDef or a caller-chosen command argument. Direct HostApi
+    // implementers retain their legacy registration/update behavior. An IPC
+    // server must call the `_for_plugin` variants with its transport identity.
+    // No asynchronous notification acquires HostApi through these methods.
+
+    /// Register a panel with host-authenticated ownership. The default keeps
+    /// the legacy direct-host behavior; identity-aware hosts override it.
+    fn register_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel: crate::dialog::PanelDef,
+    ) -> bool {
+        self.register_panel(panel)
+    }
+
+    /// Update only a panel owned by the authenticated caller.
+    fn update_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        values: std::collections::HashMap<String, crate::dialog::DialogValue>,
+    ) -> bool {
+        self.update_panel(panel_id, values)
+    }
+
+    /// Toggle only a panel owned by the authenticated caller.
+    fn toggle_panel_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        show: Option<bool>,
+    ) -> bool {
+        self.toggle_panel(panel_id, show)
+    }
+
+    /// Read a panel after the host has authenticated its transport owner.
+    /// The returned tab is the current document-bound session's tab, not a
+    /// caller-provided target. Old hosts fail closed instead of returning an
+    /// unowned or fabricated snapshot.
+    fn panel_snapshot_for_plugin(
+        &self,
+        _plugin_id: &str,
+        _panel_id: &str,
+    ) -> Result<crate::dialog::PanelSnapshot, String> {
+        Err("Authenticated panel snapshots are not supported by this host".to_owned())
+    }
+
+    /// Create or update the drawing's geographic location (API v22,
+    /// additive): the model-space GEODATA object and its
+    /// `ACAD_GEOGRAPHICDATA` extension-dictionary entry, so other CAD
+    /// programs open the drawing georeferenced. Returns the object's handle.
+    /// A refusal (unknown CRS, non-finite point, zero north) changes nothing.
+    /// Undo composition follows [`HostApi::delete_xrecord`].
+    fn set_geo_location(&mut self, _location: &GeoLocation) -> Result<Handle, String> {
+        Err("Geographic location writes are not supported by this host".to_owned())
+    }
+
+    /// Remove the drawing's geographic location (API v22, additive). Returns
+    /// `false` when the drawing had none (no undo step is recorded then).
+    fn remove_geo_location(&mut self) -> Result<bool, String> {
+        Err("Geographic location writes are not supported by this host".to_owned())
+    }
+
+    /// Publish or replace a panel's scene (API v29). A host without surface
+    /// support refuses: `InvalidSurface` for an invalid scene, otherwise
+    /// `Unattached`.
+    fn panel_surface_publish(
+        &mut self,
+        _panel_id: &str,
+        scene: PanelScene,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        Err(surface_reject_default_scene(&scene))
+    }
+
+    /// [`Self::panel_surface_publish`] for the transport's authenticated
+    /// `plugin_id`.
+    fn panel_surface_publish_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        scene: PanelScene,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        self.panel_surface_publish(panel_id, scene)
+    }
+
+    /// Publish (or replace) a panel's WIDGET surface (API v29, additive):
+    /// the semantic tree/list the host renders with native widgets.
+    /// Independent revision space (finding F1). The default is the
+    /// transport-era stub (Unattached; nothing stored); surface-aware
+    /// hosts override [`HostApi::panel_widget_publish_for_plugin`].
+    fn panel_widget_publish(
+        &mut self,
+        _panel_id: &str,
+        _surface: crate::widget::WidgetSurface,
+    ) -> Result<crate::widget::WidgetRevision, crate::widget::WidgetReject> {
+        Err(crate::widget::WidgetReject {
+            code: crate::widget::WidgetRejectCode::Unattached,
+            current_revision: None,
+        })
+    }
+
+    /// [`Self::panel_widget_publish`] for the transport's authenticated
+    /// `plugin_id`.
+    fn panel_widget_publish_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        surface: crate::widget::WidgetSurface,
+    ) -> Result<crate::widget::WidgetRevision, crate::widget::WidgetReject> {
+        self.panel_widget_publish(panel_id, surface)
+    }
+
+    /// Patch a panel's stored scene atomically (API v29, additive): the
+    /// bounded, revision-checked op list applies all-or-nothing against
+    /// the stored head; a stale base or any op failure refuses with the
+    /// typed rejection and zero mutation. The default is the
+    /// transport-era stub (same as publishing): `Unattached` for
+    /// structurally sound frames, nothing stored. Surface-aware hosts
+    /// override [`HostApi::panel_surface_patch_for_plugin`].
+    fn panel_surface_patch(
+        &mut self,
+        _panel_id: &str,
+        _patch: crate::scene::ScenePatch,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        Err(SurfaceReject {
+            code: SurfaceRejectCode::Unattached,
+            current_revision: None,
+        })
+    }
+
+    /// Patch from the host's authenticated transport identity. The
+    /// default keeps the direct-host behavior; surface-aware hosts
+    /// override it.
+    fn panel_surface_patch_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        patch: crate::scene::ScenePatch,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        self.panel_surface_patch(panel_id, patch)
+    }
+
+    /// Install a bounded widget page into the panel's widget surface
+    /// (API v29, additive): the lazy-expansion/paging primitive. The
+    /// default is the transport-era stub (Unattached; nothing stored).
+    /// Surface-aware hosts override
+    /// [`HostApi::panel_surface_page_for_plugin`].
+    fn panel_surface_page(
+        &mut self,
+        _panel_id: &str,
+        _page: crate::widget::WidgetPage,
+    ) -> Result<crate::widget::WidgetRevision, crate::widget::WidgetReject> {
+        Err(crate::widget::WidgetReject {
+            code: crate::widget::WidgetRejectCode::Unattached,
+            current_revision: None,
+        })
+    }
+
+    /// Install from the host's authenticated transport identity. The
+    /// default keeps the direct-host behavior; surface-aware hosts
+    /// override it.
+    fn panel_surface_page_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        page: crate::widget::WidgetPage,
+    ) -> Result<crate::widget::WidgetRevision, crate::widget::WidgetReject> {
+        self.panel_surface_page(panel_id, page)
+    }
+
+    /// Publish (or replace) a panel's TABLE surface (API v29, additive):
+    /// stable row keys, typed scalar cells. The default is the
+    /// transport-era stub (Unattached; nothing stored); surface-aware
+    /// hosts override [`HostApi::panel_table_publish_for_plugin`].
+    fn panel_table_publish(
+        &mut self,
+        _panel_id: &str,
+        _surface: crate::tables::TableSurface,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        Err(crate::tables::TableReject {
+            code: crate::tables::TableRejectCode::Unattached,
+            current_revision: None,
+        })
+    }
+
+    /// [`Self::panel_table_publish`] for the transport's authenticated
+    /// `plugin_id`.
+    fn panel_table_publish_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        surface: crate::tables::TableSurface,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        self.panel_table_publish(panel_id, surface)
+    }
+
+    /// Patch a panel's stored TABLE atomically (API v29, additive):
+    /// cell/row ops apply all-or-nothing against the stored head. The
+    /// default is the transport-era stub (Unattached; nothing stored).
+    fn panel_surface_table_patch(
+        &mut self,
+        _panel_id: &str,
+        _patch: crate::tables::TablePatch,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        Err(crate::tables::TableReject {
+            code: crate::tables::TableRejectCode::Unattached,
+            current_revision: None,
+        })
+    }
+
+    /// [`Self::panel_surface_table_patch`] for the transport's
+    /// authenticated `plugin_id`.
+    fn panel_surface_table_patch_for_plugin(
+        &mut self,
+        _plugin_id: &str,
+        panel_id: &str,
+        patch: crate::tables::TablePatch,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        self.panel_surface_table_patch(panel_id, patch)
+    }
+}
+
+/// The answer of a host without surface support: `InvalidSurface` for an
+/// invalid scene, otherwise `Unattached`.
+pub(crate) fn surface_reject_default_scene(scene: &PanelScene) -> SurfaceReject {
+    let structural = scene.validate().is_ok();
+    SurfaceReject {
+        code: if structural {
+            SurfaceRejectCode::Unattached
+        } else {
+            SurfaceRejectCode::InvalidSurface
+        },
+        current_revision: None,
     }
 }
 
@@ -2342,6 +2919,15 @@ pub struct PluginClassParameterRow {
     pub value: Option<String>,
 }
 
+fn deserialize_selectable_custom<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // bincode 1 reports UnexpectedEof instead of a missing sequence element
+    // for a v17 payload ending immediately before this trailing field.
+    bool::deserialize(deserializer).or(Ok(false))
+}
+
 /// One staged instance of a registered plugin class (API v14): identity plus
 /// a host-evaluated design descriptor. Records carry the truth; the host
 /// never re-interprets anything the plugin does not declare here.
@@ -2369,6 +2955,13 @@ pub struct PluginClassInstance {
     /// handles-to-records linkage the plugin maintains).
     #[serde(default)]
     pub design_record: String,
+    /// Keep this staged display set selectable for plugin custom grips/panels,
+    /// while suppressing native vertex editing and native property updates.
+    ///
+    /// API v18 additive. Absent v17 payloads decode as `false`, preserving the
+    /// legacy reference-only staging behavior byte-for-byte.
+    #[serde(default, deserialize_with = "deserialize_selectable_custom")]
+    pub selectable_custom: bool,
 }
 
 /// Host-evaluated display descriptor kinds (API v14, additive).
@@ -2398,6 +2991,24 @@ impl PluginDisplayDescriptor {
     }
 }
 
+/// The drawing's geographic location (API v22, additive): what
+/// [`HostApi::set_geo_location`] writes into the model-space GEODATA object.
+///
+/// Drawing units, the up direction and the scale method follow the drawing
+/// (INSUNITS) when the object is first created; an existing object keeps them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    /// `EPSG:<code>`, a WKT definition, or a MapGuide XML definition with an
+    /// EPSG alias. Geographic CRSs make the object geographic (type 3),
+    /// projected ones a projected grid (type 2).
+    pub coordinate_system: String,
+    /// The point in drawing coordinates that is placed at `reference_point`.
+    pub design_point: [f64; 3],
+    /// The same point in CRS coordinates (easting/northing, or lon/lat).
+    pub reference_point: [f64; 3],
+    /// North in drawing XY; `[0.0, 1.0]` is drawing +Y.
+    pub north_direction: [f64; 2],
+}
 
 /// One XRecord addressed by dictionary path + name (API v13, additive).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2418,14 +3029,14 @@ pub struct XRecordUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LayerConfig {
     pub name: String,
-    pub color: Option<codec::types::Color>,
+    pub color: Option<document::types::Color>,
     pub linetype: Option<String>,
-    pub lineweight: Option<codec::types::LineWeight>,
+    pub lineweight: Option<document::types::LineWeight>,
     pub off: Option<bool>,
     pub frozen: Option<bool>,
     pub locked: Option<bool>,
     pub plottable: Option<bool>,
-    pub transparency: Option<codec::types::Transparency>,
+    pub transparency: Option<document::types::Transparency>,
     pub description: Option<String>,
 }
 
@@ -2670,4 +3281,292 @@ mod repl {
 }
 
 #[cfg(feature = "host")]
-pub use repl::{execute_code_guard, CommandSource, ExecutionResult};
+pub use repl::{CommandSource, ExecutionResult, execute_code_guard};
+
+#[cfg(all(test, feature = "host"))]
+mod tests {
+    use super::*;
+
+    /// Wire round-trip helper (host.rs test convention): bincode-serialize a
+    /// notification, deserialize it back, and assert the decoded value equals
+    /// the original. Returns the decoded value for field-level assertions.
+    fn assert_serde_roundtrip(notification: HostNotification) -> HostNotification {
+        let bytes = bincode::serialize(&notification).expect("serialize HostNotification");
+        let got: HostNotification =
+            bincode::deserialize(&bytes).expect("deserialize HostNotification");
+        assert_eq!(
+            got, notification,
+            "the serialized notification must decode back to itself"
+        );
+        got
+    }
+
+    /// A populated [`HostNotification::DocumentChangedDelta`] (API v27),
+    /// matching what a boundary publishes: categorized handle lists, the
+    /// v13 record pairs, the snapshot correlation and the honesty flag.
+    #[test]
+    fn document_changed_delta_roundtrips_all_field_shapes() {
+        // Snapshot published, incremental bound proven.
+        let notified = assert_serde_roundtrip(HostNotification::DocumentChangedDelta {
+            tab_id: 5,
+            version: 41,
+            added: vec![Handle::from(0x2A)],
+            modified: vec![Handle::from(0x8A)],
+            deleted: vec![Handle::from(0x15)],
+            records: vec![(Handle::from(0x8A), "CVIFC".to_owned())],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 41,
+                generation: 2,
+            }),
+            full_refresh_required: false,
+        });
+        match notified {
+            HostNotification::DocumentChangedDelta {
+                added,
+                modified,
+                deleted,
+                ..
+            } => {
+                assert_eq!(added.len() + modified.len() + deleted.len(), 3);
+            }
+            other => panic!("expected DocumentChangedDelta, got {other:?}"),
+        }
+        // Snapshot published, later in the store, still no refresh needed.
+        assert_serde_roundtrip(HostNotification::DocumentChangedDelta {
+            tab_id: 5,
+            version: 41,
+            added: vec![Handle::from(0x2A)],
+            modified: vec![],
+            deleted: vec![],
+            records: vec![],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 42,
+                generation: 3,
+            }),
+            full_refresh_required: true,
+        });
+        // No V4 store open for the tab (the legitimate no-consumer case).
+        assert_serde_roundtrip(HostNotification::DocumentChangedDelta {
+            tab_id: 5,
+            version: 41,
+            added: vec![Handle::from(0x2A)],
+            modified: vec![],
+            deleted: vec![],
+            records: vec![],
+            snapshot: None,
+            full_refresh_required: false,
+        });
+        // Provably-incomplete boundary (journal gap): lists full of real
+        // handles AND the full-refresh flag set.
+        assert_serde_roundtrip(HostNotification::DocumentChangedDelta {
+            tab_id: 5,
+            version: 41,
+            added: vec![Handle::from(0x2A)],
+            modified: vec![Handle::from(0x8A)],
+            deleted: vec![Handle::from(0x15)],
+            records: vec![],
+            snapshot: None,
+            full_refresh_required: true,
+        });
+    }
+
+    /// A deleted handle STAYS in the delta even though it references no live
+    /// entity anymore (the deletion itself is the information — API v27):
+    /// deserialization must not drop, zero-fix or re-resolve it.
+    #[test]
+    fn document_changed_delta_deleted_handles_survive_the_wire() {
+        let notification = HostNotification::DocumentChangedDelta {
+            tab_id: 2,
+            version: 9,
+            added: vec![Handle::from(0x2A)],
+            modified: vec![Handle::from(0x8A)],
+            deleted: vec![Handle::from(0xDEAD), Handle::from(0xBEEF)],
+            records: vec![],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 9,
+                generation: 1,
+            }),
+            full_refresh_required: false,
+        };
+        let decoded = assert_serde_roundtrip(notification);
+        match decoded {
+            HostNotification::DocumentChangedDelta { deleted, .. } => {
+                // Handles no live entity answers for still arrive verbatim.
+                assert_eq!(
+                    deleted,
+                    vec![Handle::from(0xDEAD), Handle::from(0xBEEF)],
+                    "deleted handles must survive serialization untouched"
+                );
+                // The transparent u64 encoding pins the exact wire value.
+                let bytes = bincode::serialize(&Handle::from(0xDEAD)).expect("handle bytes");
+                assert_eq!(bytes, 0xDEAD_u64.to_le_bytes());
+            }
+            other => panic!("expected DocumentChangedDelta, got {other:?}"),
+        }
+    }
+
+    /// API v27 pins the delta at discriminant 15 — the first tagged byte of a
+    /// serialized `DocumentChangedDelta` is 15 (the notification serializes as
+    /// a bincode `Vec<u8>` wrapper: a u64 LE length prefix, then the tag byte,
+    /// then the field-wise bincode payload).
+    #[test]
+    fn document_changed_delta_tag_byte_is_fifteen() {
+        let delta = HostNotification::DocumentChangedDelta {
+            tab_id: 1,
+            version: 2,
+            added: vec![Handle::from(5)],
+            modified: vec![],
+            deleted: vec![],
+            records: vec![],
+            snapshot: None,
+            full_refresh_required: false,
+        };
+        let bytes = bincode::serialize(&delta).expect("serialize delta");
+        assert!(
+            bytes.len() > 8,
+            "the tagged payload is wrapped in a u64 length prefix"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[..8].try_into().expect("length prefix")) as usize,
+            bytes.len() - 8,
+            "the wrapper length covers exactly the tagged payload"
+        );
+        assert_eq!(bytes[8], 15, "DocumentChangedDelta is discriminant 15");
+    }
+
+    /// API v27 may not disturb the legacy `DocumentChangedRegions` (v13)
+    /// payload: pin its EXACT serialized byte sequence — a future serializer
+    /// change shifts one of these bytes and fails here.
+    #[test]
+    fn document_changed_regions_bytes_stay_stable() {
+        #[rustfmt::skip]
+        const DOCUMENT_CHANGED_REGIONS_V13_BYTES: [u8; 70] = [
+            // bincode wrapper: u64 LE length (62) of the tagged payload below.
+            0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Tag 11 = DocumentChangedRegions.
+            0x0b,
+            // tab_id (u64 LE) = 3
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // version (u64 LE) = 9
+            0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // entities: len 1, handle 0x2A.
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // records: len 1, (handle 0x8A, app name len 5, "CVIFC").
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x8a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x43, 0x56, 0x49, 0x46, 0x43,
+        ];
+        let regions = HostNotification::DocumentChangedRegions {
+            tab_id: 3,
+            version: 9,
+            entities: vec![Handle::from(0x2A)],
+            records: vec![(Handle::from(0x8A), "CVIFC".to_owned())],
+        };
+        let bytes = bincode::serialize(&regions).expect("serialize regions");
+        assert_eq!(
+            bytes, DOCUMENT_CHANGED_REGIONS_V13_BYTES,
+            "the legacy v13 Regions payload must stay byte-compatible"
+        );
+        // And the pinned bytes decode back to the exact same value.
+        let decoded: HostNotification = bincode::deserialize(&bytes).expect("pinned bytes decode");
+        assert_eq!(decoded, regions);
+    }
+
+    /// Exact-empty ("nothing relevant changed" — API v27) and
+    /// full-refresh-required ("the lists cannot be trusted — resync") are
+    /// DIFFERENT statements on the same wire shape: each round-trips to
+    /// itself and never to the other.
+    #[test]
+    fn document_changed_delta_empty_exact_differs_from_full_refresh() {
+        let exact_empty = HostNotification::DocumentChangedDelta {
+            tab_id: 7,
+            version: 12,
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+            records: vec![],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 12,
+                generation: 1,
+            }),
+            full_refresh_required: false,
+        };
+        let full_refresh = HostNotification::DocumentChangedDelta {
+            tab_id: 7,
+            version: 12,
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+            records: vec![],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 12,
+                generation: 1,
+            }),
+            full_refresh_required: true,
+        };
+        assert_ne!(exact_empty, full_refresh);
+
+        let empty_bytes = bincode::serialize(&exact_empty).expect("serialize exact-empty");
+        let refresh_bytes = bincode::serialize(&full_refresh).expect("serialize full-refresh");
+        assert_ne!(empty_bytes, refresh_bytes, "the flag must change the wire");
+
+        let decoded_empty: HostNotification =
+            bincode::deserialize(&empty_bytes).expect("decode exact-empty");
+        let decoded_refresh: HostNotification =
+            bincode::deserialize(&refresh_bytes).expect("decode full-refresh");
+        match (decoded_empty, decoded_refresh) {
+            (
+                HostNotification::DocumentChangedDelta {
+                    full_refresh_required: empty_flag,
+                    ..
+                },
+                HostNotification::DocumentChangedDelta {
+                    full_refresh_required: refresh_flag,
+                    ..
+                },
+            ) => {
+                assert!(!empty_flag, "the exact-empty delta decodes with flag unset");
+                assert!(refresh_flag, "the full-refresh delta decodes with flag set");
+            }
+            other => panic!("expected a delta pair, got {other:?}"),
+        }
+        // Each also survives a plain assertion-backed round-trip.
+        assert_serde_roundtrip(exact_empty);
+        assert_serde_roundtrip(full_refresh);
+    }
+
+    /// Decoder policy for truncated delta payloads: every proper byte-prefix
+    /// of a serialized `DocumentChangedDelta` fails to deserialize — never a
+    /// panic, never a cargo-culted wrong variant. (Unknown passthrough is for
+    /// FORWARD tags only: tag 15 truncates, it does not degrade.)
+    #[test]
+    fn document_changed_delta_truncated_payloads_are_decode_errors() {
+        let delta = HostNotification::DocumentChangedDelta {
+            tab_id: 4,
+            version: 33,
+            added: vec![Handle::from(5), Handle::from(6)],
+            modified: vec![Handle::from(7)],
+            deleted: vec![Handle::from(0xDEAD)],
+            records: vec![(Handle::from(7), "CVIFC".to_owned())],
+            snapshot: Some(DocumentDeltaSnapshot {
+                version: 33,
+                generation: 2,
+            }),
+            full_refresh_required: false,
+        };
+        let bytes = bincode::serialize(&delta).expect("serialize delta");
+        assert!(
+            bincode::deserialize::<HostNotification>(&bytes).is_ok(),
+            "the untruncated payload decodes"
+        );
+        for cut in 0..bytes.len() {
+            assert!(
+                bincode::deserialize::<HostNotification>(&bytes[..cut]).is_err(),
+                "a payload truncated to {cut} of {} bytes must be a decode error",
+                bytes.len()
+            );
+        }
+    }
+}

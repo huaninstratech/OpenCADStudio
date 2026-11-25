@@ -1,3 +1,4 @@
+mod gpu_memory;
 // WGSL has no includes. Compose one shared draw-order function into each 2D
 // shader at compile time, including the sources used by shader validation tests.
 macro_rules! draw_order_shader {
@@ -8,6 +9,11 @@ macro_rules! draw_order_shader {
                 "/src/shaders/draw_order.wgsl"
             )),
             "\n",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/shaders/dash_layout.wgsl"
+            )),
+            "\n",
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shaders/", $file))
         )
     };
@@ -15,6 +21,8 @@ macro_rules! draw_order_shader {
 
 mod analytic_slots;
 pub mod circle_gpu;
+#[cfg(test)]
+mod dash_gpu_tests;
 #[cfg(test)]
 mod depth_tests;
 mod device_capabilities;
@@ -25,8 +33,12 @@ pub mod gpu_budget;
 mod gpu_tests;
 pub mod gpu_upload;
 pub mod hatch_gpu;
+#[cfg(test)]
+mod hatch_tone_tests;
 pub mod image_gpu;
 pub mod mesh_gpu;
+#[cfg(test)]
+mod paper_lineweight_tests;
 pub mod point_cloud_gpu;
 pub mod text_gpu;
 pub mod uniforms;
@@ -71,13 +83,37 @@ struct SilhouetteChunk {
 
 struct SilhouetteSourceGroup {
     color: [f32; 4],
-    sources: Vec<kernel::brep::mesh::SilhouetteSource>,
+    sources: Vec<crate::scene::model::silhouette::SilhouetteSource>,
     instance_buffers: Vec<(wgpu::Buffer, u32)>,
 }
 use device_capabilities::DeviceCapabilities;
 
 /// MSAA sample count for the main drawing pipelines.
-const MSAA_SAMPLES: u32 = 4;
+///
+/// Defaults to 4. `OCS_MSAA=1` (or `4`) overrides it at startup so low-end
+/// integrated GPUs, which are fill-rate and bandwidth bound, can trade edge
+/// smoothing for frame time and GPU memory. With 1 the scene renders straight
+/// into the resolve texture and the resolve pass is skipped. Only 1 and 4 are
+/// accepted: WebGPU guarantees just those counts for `Bgra8Unorm` and
+/// `Depth24PlusStencil8`; 2 and 8 need `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`,
+/// which the device is not requested with.
+pub(crate) fn msaa_samples() -> u32 {
+    static SAMPLES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SAMPLES.get_or_init(|| {
+        let n = msaa_samples_from(std::env::var("OCS_MSAA").ok().as_deref());
+        crate::perf_record!("[perf] msaa samples={n}");
+        n
+    })
+}
+
+/// The sample count an `OCS_MSAA` value asks for: 1 or 4, and 4 for any
+/// other value or none.
+fn msaa_samples_from(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| matches!(n, 1 | 4))
+        .unwrap_or(4)
+}
 const SHADOW_MAP_SIZE: u32 = 2048;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,6 +137,40 @@ struct MeshResidentRange {
 struct MeshHighlightDraw {
     range: MeshResidentRange,
     kind: MeshHighlightKind,
+}
+
+/// GPU data for a stable bucket of regular highlight wires. Membership is
+/// compared exactly, rather than by hash, before buffers can be reused.
+struct HighlightWireChunk {
+    members: Vec<usize>,
+    gpu: Vec<WireGpu>,
+    bytes: usize,
+}
+
+// GPU buffers for committed selection survive transient box-preview changes.
+struct SelectedHighlightGpuCache {
+    wire_id: u64,
+    depth_generation: u64,
+    tint: Option<[u32; 4]>,
+    selected: rustc_hash::FxHashSet<document::Handle>,
+    annotation: std::sync::Arc<Vec<WireModel>>,
+    wires: Vec<WireGpu>,
+    blocks: Vec<BlockWireGpu>,
+    circles: Vec<CircleGpu>,
+    ellipses: Vec<EllipseGpu>,
+    text: Vec<text_gpu::TextGpu>,
+    block_text: Vec<text_gpu::BlockTextGpu>,
+}
+
+// Cached hover-half text highlight uploads, keyed by the render-side hover
+// identity (generations + wire content + depth generation, annotation source
+// pointer). The hover half of the xray overlay re-emits on every rollover /
+// marquee tick; without this cache every tick re-copied every glyph vertex of
+// the hovered set and re-uploaded it, scaling with hovered text size.
+struct HoverTextGpuCache {
+    key: (u64, u64),
+    text: Vec<text_gpu::TextGpu>,
+    block_text: Vec<text_gpu::BlockTextGpu>,
 }
 
 pub struct Pipeline {
@@ -168,6 +238,9 @@ pub struct Pipeline {
     mesh_wireframe_pipeline: wgpu::RenderPipeline,
     /// Edge pipeline that forces black, for the edge overlay in filled modes.
     mesh_edge_black_pipeline: wgpu::RenderPipeline,
+    /// HiddenLine's occluded edges: only where something nearer is drawn
+    /// (`Greater`, no depth write), dashed in screen space.
+    mesh_occluded_pipeline: wgpu::RenderPipeline,
     silhouette_pipeline: wgpu::RenderPipeline,
     silhouette_black_pipeline: wgpu::RenderPipeline,
     /// Depth-only variant of the mesh pipeline (TriangleList, no color
@@ -177,6 +250,7 @@ pub struct Pipeline {
     mesh_plain_depth_pipeline: wgpu::RenderPipeline,
     mesh_material_bgl: wgpu::BindGroupLayout,
     mesh_default_material_bind_group: wgpu::BindGroup,
+    mesh_default_material_memory: mesh_gpu::MaterialMemory,
     face3d_pipeline: wgpu::RenderPipeline,
     block_face3d_pipeline: wgpu::RenderPipeline,
     /// Depth-only variant of the face3d pipeline (no color writes,
@@ -250,6 +324,9 @@ pub struct Pipeline {
     msaa_view: wgpu::TextureView,
     /// Single-sample texture that receives the MSAA resolve result.
     resolve_view: wgpu::TextureView,
+    /// The final wire/text highlight pass can be composited over the cached 2D drawing.
+    wire_highlight_target: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    wire_highlight_dirty: bool,
     /// Pipeline + resources for blitting the resolve texture to the surface target.
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
@@ -286,13 +363,18 @@ pub struct Pipeline {
     /// GPU buffer. `Some(false)` = regular wires, `Some(true)` = mesh edges.
     pub(crate) wire_arena_fallback: std::sync::Arc<Vec<WireGpu>>,
     pub(crate) wire_arena_fallback_kind: Option<bool>,
-    pub(crate) wire_arena_fallback_handles: rustc_hash::FxHashSet<codec::Handle>,
+    pub(crate) wire_arena_fallback_handles: rustc_hash::FxHashSet<document::Handle>,
     /// The Model content id both arenas currently mirror (`u64::MAX` = none).
     pub(crate) wire_arena_id: u64,
     /// The draw-depth generation the arenas' slabs baked. A patch rewrites
     /// only the changed entities, so after a full depth rebuild the arenas
     /// have to be rebuilt instead of patched.
     pub(crate) wire_arena_depth_generation: u64,
+    /// Persistent overlay const buffers for dense-entity highlights, one per
+    /// (arena, tint). See [`wire_arena::DenseHighlightConst`] — these replace
+    /// the full `consts_cpu` clone + upload `highlight_dense` used to do on
+    /// every selection change when a dense entity was highlighted.
+    pub(crate) dense_highlight_consts: Vec<wire_arena::DenseHighlightConst>,
     /// Handles that contributed to this slot's retained analytical uploads.
     pub(crate) partition_contributors: wire_arena::ContributorSet,
     /// Where each reference's analytical instances sit in the uploads above, so
@@ -304,6 +386,7 @@ pub struct Pipeline {
     /// Last content/camera/viewport tuple used to derive visible instance
     /// ranges from the resident arena.
     pub(crate) wire_cull_key: (u64, u64, u32, u32),
+    pub(crate) wire_cull_view: Option<wire_arena::WireCullView>,
     /// View/source keys for CPU visibility passes.
     pub(crate) hatch_lod_key: (usize, u64, u32, u32, bool),
     pub(crate) wipeout_lod_key: (usize, u64, u32, u32, bool),
@@ -316,6 +399,13 @@ pub struct Pipeline {
     clip_boundary: Option<(wgpu::Buffer, u32)>,
     /// Ghost copies (25% alpha) of selected wires for the X-ray depth pass.
     gpu_selected_wires: Vec<WireGpu>,
+    selected_highlight_gpu_cache: Option<SelectedHighlightGpuCache>,
+    /// Reusable GPU overlays for dense entities during changing box previews.
+    highlight_wire_cache: rustc_hash::FxHashMap<(u64, [u32; 4]), Vec<WireGpu>>,
+    highlight_wire_cache_key: Option<(u64, u64)>,
+    highlight_wire_cache_bytes: usize,
+    highlight_wire_chunks: rustc_hash::FxHashMap<(u8, [u32; 4]), HighlightWireChunk>,
+    highlight_wire_chunk_bytes: usize,
     gpu_selected_circles: Vec<CircleGpu>,
     gpu_selected_ellipses: Vec<EllipseGpu>,
     gpu_selected_block_wires: Vec<BlockWireGpu>,
@@ -346,16 +436,29 @@ pub struct Pipeline {
     /// repacked here, keeping the rest of a multi-million-triangle scene resident.
     gpu_mesh_dynamic: Vec<mesh_gpu::MeshBatchChunk>,
     mesh_disabled_chunks: rustc_hash::FxHashSet<usize>,
-    mesh_dynamic_handles: rustc_hash::FxHashSet<codec::Handle>,
+    mesh_dynamic_handles: rustc_hash::FxHashSet<document::Handle>,
     /// Wire content generation whose geometry the static+dynamic mesh state
     /// mirrors. It gates replay of the same per-entity journal handoff.
     pub cached_mesh_content_id: u64,
     /// Draw ranges for each entity inside the resident mesh chunks. Highlight
     /// overlays reuse these buffers instead of uploading duplicate geometry.
-    mesh_ranges_by_handle: rustc_hash::FxHashMap<codec::Handle, Vec<MeshResidentRange>>,
+    mesh_ranges_by_handle: rustc_hash::FxHashMap<document::Handle, Vec<MeshResidentRange>>,
+    /// Eye-relative view-projection, eye and viewport size of the last
+    /// uniform upload: what display LODs are chosen by.
+    mesh_lod_view: Option<(glam::Mat4, glam::DVec3, [f32; 2])>,
+    /// Each LOD chunk's current level per entry (by active chunk index), kept
+    /// across frames for hysteresis.
+    mesh_lod_levels: rustc_hash::FxHashMap<usize, Vec<u8>>,
+    /// This frame's opaque draws of each LOD chunk: `(level, start, count)`.
+    /// A chunk without an entry draws `index_buffer` whole.
+    mesh_lod_draws: rustc_hash::FxHashMap<usize, Vec<(u8, u32, u32)>>,
     mesh_highlight_draws: Vec<MeshHighlightDraw>,
     /// `(geometry_epoch, selection_generation)` the highlight overlay was built for.
     pub cached_highlight_key: (u64, u64),
+    /// `hover_generation` the mesh highlight ranges were last built for. A
+    /// rollover / marquee tick rebuilds the (cheap) index ranges without
+    /// invalidating the committed-selection draw ranges.
+    pub cached_mesh_hover_generation: Option<u64>,
     /// Batched 3DFACE fill (all faces in one buffer) and edges (merged wire).
     gpu_face3d_fill: Option<Face3DGpu>,
     gpu_face3d_edges: Vec<WireGpu>,
@@ -371,6 +474,7 @@ pub struct Pipeline {
         Option<std::sync::Arc<crate::scene::model::point_cloud::PointCloudSet>>,
     pub cached_text_source: Option<std::sync::Arc<Vec<text_gpu::TextVertex>>>,
     pub cached_annotation_highlight_source: Option<std::sync::Arc<Vec<WireModel>>>,
+    pub cached_selected_annotation_source: Option<std::sync::Arc<Vec<WireModel>>>,
     pub cached_mesh_source: Option<std::sync::Arc<Vec<MeshLodSet>>>,
     pub cached_face3d_source: Option<std::sync::Arc<Vec<WireModel>>>,
     pub cached_face3d_depth_source: Option<std::sync::Weak<rustc_hash::FxHashMap<u64, [f32; 2]>>>,
@@ -393,6 +497,13 @@ pub struct Pipeline {
     /// a pick bumps only `selection_generation`, refreshing the overlay without
     /// touching the main wire buffers.
     pub cached_selection: (u64, u64),
+    /// `hover_generation` the hover half of the xray overlay was last built
+    /// for. `None` until the first build. Rollover / marquee ticks bump only
+    /// the hover generation, so the committed selection's cached GPU buffers
+    /// (sized by the whole selection) are reused untouched.
+    pub cached_hover_generation: Option<u64>,
+    /// Cached hover-half text highlight uploads — see [`HoverTextGpuCache`].
+    hover_text_gpu_cache: Option<HoverTextGpuCache>,
     /// Face upload key; keeps the resident wire Arc uniquely owned by Scene.
     pub cached_face3d_key: (u64, bool, bool, u64),
     /// Cached planar-solid visibility for `(wire_content_id, view direction)`.
@@ -424,12 +535,16 @@ pub struct Pipeline {
     /// Skip the canvas entirely — no clear colour, no background pass — so
     /// whatever was drawn underneath this viewport shows through it.
     pub skip_background: bool,
+    /// HiddenLine with occluded edges on (VSOCCLUDEDEDGES, or the visual
+    /// style's obscured edge flag): solid edges behind faces draw dashed.
+    pub occluded_edges: bool,
     /// Stable identity of the viewport that last used this (index-addressed)
     /// pipeline slot. The renderer's viewport list drops off-canvas viewports,
     /// so a slot can be reused by a *different* viewport across frames; when the
     /// occupant changes, all cache keys above belong to the previous one and are
     /// reset so every buffer re-uploads. `u64::MAX` = never used.
     pub slot_id: u64,
+    pub(in crate::scene) slot_owner: std::sync::Weak<()>,
 }
 
 /// The views and samplers the frame bind group carries beside its uniforms.
@@ -463,2323 +578,9 @@ fn frame_bind_group(
     })
 }
 
+mod builder;
+
 impl Pipeline {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        // ── Shared frame uniform buffer (view_proj etc.) ───────────────────
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("viewer.uniform_buffer"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let selection_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("viewer.selection_uniform_buffer"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Bind group layout 0 — shared by wire and hatch pipelines.
-        let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("viewer.frame_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-            ],
-        });
-        let shadow_frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadow.frame_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let placeholder_texture = |label: &'static str, rgba: [u8; 4]| {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            queue.write_texture(
-                texture.as_image_copy(),
-                &rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4),
-                    rows_per_image: Some(1),
-                },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            texture
-        };
-        let background_texture = placeholder_texture("background.placeholder", [0, 0, 0, 255]);
-        let environment_texture =
-            placeholder_texture("environment.placeholder", [128, 128, 128, 255]);
-        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("background.sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        let shadow_fallback_texture = create_shadow_texture(device, 1);
-        let shadow_fallback_view =
-            shadow_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("shadow.sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let background_view =
-            background_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let environment_view =
-            environment_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let frame_views = FrameViews {
-            background: &background_view,
-            environment: &environment_view,
-            background_sampler: &background_sampler,
-            shadow: &shadow_fallback_view,
-            shadow_sampler: &shadow_sampler,
-        };
-        let uniform_bind_group =
-            frame_bind_group(device, &frame_bgl, &uniform_buffer, &frame_views);
-        let selection_uniform_bind_group =
-            frame_bind_group(device, &frame_bgl, &selection_uniform_buffer, &frame_views);
-        let shadow_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow.frame_bind_group"),
-            layout: &shadow_frame_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        // ── Wire pipeline ──────────────────────────────────────────────────
-        // Select the renderer tier from device limits.
-        let device_caps = DeviceCapabilities::detect(device);
-        #[cfg(not(target_arch = "wasm32"))]
-        let force_compat_renderer = crate::cli::gui_config().compat_renderer;
-        #[cfg(target_arch = "wasm32")]
-        let force_compat_renderer = false;
-        let wire_mode = wire_gpu::WirePipelineMode::select(device_caps, force_compat_renderer);
-        let wire_const_bgl = wire_mode
-            .uses_storage()
-            .then(|| wire_gpu::WireConst::bind_group_layout(device));
-        let mut wire_bgls: Vec<Option<&wgpu::BindGroupLayout>> = vec![Some(&frame_bgl)];
-        if let Some(bgl) = &wire_const_bgl {
-            wire_bgls.push(Some(bgl));
-        }
-        let wire_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wire.pipeline_layout"),
-            bind_group_layouts: &wire_bgls,
-            immediate_size: 0,
-        });
-        let block_wire_const_bgl =
-            wire_gpu::block_const_bind_group_layout(device, wire_mode.uses_storage());
-        let block_wire_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("block_wire.pipeline_layout"),
-            bind_group_layouts: &[Some(&frame_bgl), Some(&block_wire_const_bgl)],
-            immediate_size: 0,
-        });
-
-        let depth_tex = create_depth_texture(device, Size::new(1, 1));
-        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let wire_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wire.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(match wire_mode {
-                wire_gpu::WirePipelineMode::IndexedStorage => {
-                    draw_order_shader!("wire_indexed.wgsl")
-                }
-                wire_gpu::WirePipelineMode::Packed => draw_order_shader!("wire.wgsl"),
-            })),
-        });
-        let block_wire_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("block_wire.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                if wire_mode.uses_storage() {
-                    draw_order_shader!("block_wire_storage.wgsl")
-                } else {
-                    draw_order_shader!("block_wire.wgsl")
-                },
-            )),
-        });
-
-        // Stencil test shared by every paper content pipeline: draw only where
-        // the stencil equals the bound reference. Non-clipped content binds
-        // reference 0 (matching the frame's stencil, cleared to 0); a clip
-        // region's content binds reference 1 after its boundary has been stamped
-        // into the stencil by the clip-mask pipeline. In Model space nothing
-        // masks the stencil, so it stays 0 and reference 0 always passes.
-        let content_stencil_face = wgpu::StencilFaceState {
-            compare: wgpu::CompareFunction::Equal,
-            fail_op: wgpu::StencilOperation::Keep,
-            depth_fail_op: wgpu::StencilOperation::Keep,
-            pass_op: wgpu::StencilOperation::Keep,
-        };
-        let content_stencil = wgpu::StencilState {
-            front: content_stencil_face,
-            back: content_stencil_face,
-            read_mask: 0xff,
-            write_mask: 0x00,
-        };
-
-        let background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("background.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/background.wgsl"
-            ))),
-        });
-        let background_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("background.pipeline_layout"),
-            bind_group_layouts: &[Some(&frame_bgl)],
-            immediate_size: 0,
-        });
-        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("background.pipeline"),
-            layout: Some(&background_layout),
-            vertex: wgpu::VertexState {
-                module: &background_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &background_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wire.pipeline"),
-            layout: Some(&wire_layout),
-            vertex: wgpu::VertexState {
-                module: &wire_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wire_mode.layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &wire_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // ── Clip-mask pipeline ─────────────────────────────────────────────
-        // Stamps a viewport / XCLIP boundary polygon into the stencil buffer:
-        // no colour, no depth, stencil `Invert` (even-odd fill → interior marked
-        // for any polygon, convex or not). The boundary is drawn as a triangle
-        // fan in paper coordinates and transformed exactly like wires.
-        let clip_mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("clip_mask.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/clip_mask.wgsl"
-            ))),
-        });
-        let clip_mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("clip_mask.pipeline_layout"),
-            bind_group_layouts: &[],
-            immediate_size: 0,
-        });
-        let clip_mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("clip_mask.pipeline"),
-            layout: Some(&clip_mask_layout),
-            vertex: wgpu::VertexState {
-                module: &clip_mask_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState {
-                    front: wgpu::StencilFaceState {
-                        compare: wgpu::CompareFunction::Always,
-                        fail_op: wgpu::StencilOperation::Keep,
-                        depth_fail_op: wgpu::StencilOperation::Keep,
-                        pass_op: wgpu::StencilOperation::Invert,
-                    },
-                    back: wgpu::StencilFaceState {
-                        compare: wgpu::CompareFunction::Always,
-                        fail_op: wgpu::StencilOperation::Keep,
-                        depth_fail_op: wgpu::StencilOperation::Keep,
-                        pass_op: wgpu::StencilOperation::Invert,
-                    },
-                    read_mask: 0xff,
-                    write_mask: 0xff,
-                },
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &clip_mask_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Black variant of `wire_pipeline` — same geometry/depth, black fragment
-        // — for 3D mesh outline edges in filled modes (see the wire draw loop).
-        let wire_black_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wire.black.pipeline"),
-            layout: Some(&wire_layout),
-            vertex: wgpu::VertexState {
-                module: &wire_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wire_mode.layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &wire_shader,
-                entry_point: Some("fs_black"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Selection overlay variant: renders selected wires on top of everything
-        // (depth_compare=Always), without writing depth. Ensures selected entities
-        // are always fully visible regardless of occluding geometry.
-        let wire_xray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wire_xray.pipeline"),
-            layout: Some(&wire_layout),
-            vertex: wgpu::VertexState {
-                module: &wire_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wire_mode.layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &wire_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let wire_preview_overlay_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("wire_preview_overlay.pipeline"),
-                layout: Some(&wire_layout),
-                vertex: wgpu::VertexState {
-                    module: &wire_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[wire_mode.layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &wire_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-        let block_wire_buffers: &[wgpu::VertexBufferLayout<'_>] = if wire_mode.uses_storage() {
-            &[wire_gpu::BlockWireInstance::layout()]
-        } else {
-            &[
-                wire_gpu::BlockWireVertex::layout(),
-                wire_gpu::BlockWireInstance::layout(),
-            ]
-        };
-        let make_block_wire_pipeline =
-            |label: &'static str,
-             fragment: &'static str,
-             depth_write_enabled: bool,
-             depth_compare: wgpu::CompareFunction| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&block_wire_layout),
-                    vertex: wgpu::VertexState {
-                        module: &block_wire_shader,
-                        entry_point: Some("vs_main"),
-                        // Storage mode has no geometry vertex buffer: the
-                        // instances become slot 0 and the segments arrive through
-                        // the bind group.
-                        buffers: block_wire_buffers,
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth24PlusStencil8,
-                        depth_write_enabled: Some(depth_write_enabled),
-                        depth_compare: Some(depth_compare),
-                        stencil: content_stencil.clone(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLES,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &block_wire_shader,
-                        entry_point: Some(fragment),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let block_wire_pipeline = make_block_wire_pipeline(
-            "block_wire.pipeline",
-            "fs_main",
-            true,
-            wgpu::CompareFunction::LessEqual,
-        );
-        let block_wire_black_pipeline = make_block_wire_pipeline(
-            "block_wire.black.pipeline",
-            "fs_black",
-            true,
-            wgpu::CompareFunction::LessEqual,
-        );
-        let block_wire_xray_pipeline = make_block_wire_pipeline(
-            "block_wire.xray.pipeline",
-            "fs_main",
-            false,
-            wgpu::CompareFunction::Always,
-        );
-
-        // ── Hatch pipeline ─────────────────────────────────────────────────
-        // Binding 0 carries the fill plane; boundary and family data are
-        // fragment-only.
-        let hatch_entry = |binding: u32, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: vis,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: binding < 2,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let frag = wgpu::ShaderStages::FRAGMENT;
-        let vert_frag = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
-        let wipeout_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("wipeout.bgl1"),
-            entries: &[
-                hatch_entry(0, vert_frag),
-                hatch_entry(1, frag),
-                hatch_entry(2, frag),
-            ],
-        });
-
-        let wipeout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wipeout.pipeline_layout"),
-            bind_group_layouts: &[&frame_bgl, &wipeout_bgl1].map(Some),
-            immediate_size: 0,
-        });
-
-        let wipeout_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wipeout.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
-                "wipeout.wgsl"
-            ))),
-        });
-
-        let wipeout_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wipeout.pipeline"),
-            layout: Some(&wipeout_layout),
-            vertex: wgpu::VertexState {
-                module: &wipeout_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    wipeout_gpu::HatchVertex::layout(),
-                    wipeout_gpu::WipeoutPlacement::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                // The shader already applies draw order, and #1304 showed a
-                // raster bias can jump across a block's narrow depth band and
-                // erase its foreground — so the bias stays at zero. Coincident
-                // ties still resolve toward the mask because it draws later
-                // under LessEqual. Block text keeps 9-16 depth quanta of
-                // margin over the wipes it is drawn after; if a raster bias
-                // ever returns here, WIPEOUT_DEPTH_BIAS_QUANTA is the budget
-                // the block-text regression asserts against.
-                // The shader already applies draw order, and #1304 showed a
-                // raster bias can jump across a block's narrow depth band and
-                // erase its foreground — so the bias stays at zero. Coincident
-                // ties still resolve toward the mask because it draws later
-                // under LessEqual. Block text keeps 9-16 depth quanta of
-                // margin over the wipes it is drawn after; if a raster bias
-                // ever returns here, WIPEOUT_DEPTH_BIAS_QUANTA is the budget
-                // the block-text regression asserts against.
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &wipeout_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // ── Hatch renderer ─────────────────────────────────────────────────
-        // The façade owns capability selection plus both backend lifecycles.
-        let hatch_gpu = hatch_gpu::HatchGpu::new(
-            device,
-            format,
-            &frame_bgl,
-            &content_stencil,
-            device_caps,
-            force_compat_renderer,
-        );
-        let hatch_translucent_gpu = hatch_gpu::HatchGpu::new(
-            device,
-            format,
-            &frame_bgl,
-            &content_stencil,
-            device_caps,
-            force_compat_renderer,
-        );
-        #[cfg(not(target_arch = "wasm32"))]
-        if std::env::var_os("RUST_LOG").is_some() {
-            eprintln!(
-                "renderer pipelines: wire={} hatch={} mesh={} (storage buffers/stage: {})",
-                if wire_mode.uses_storage() {
-                    "storage"
-                } else {
-                    "packed"
-                },
-                hatch_gpu.backend_name(),
-                "vertex",
-                device.limits().max_storage_buffers_per_shader_stage
-            );
-        }
-        #[cfg(target_arch = "wasm32")]
-        log::info!(
-            "renderer pipelines: wire={} hatch={} mesh={} (storage buffers/stage: {})",
-            if wire_mode.uses_storage() {
-                "storage"
-            } else {
-                "packed"
-            },
-            hatch_gpu.backend_name(),
-            "vertex",
-            device.limits().max_storage_buffers_per_shader_stage
-        );
-
-        // ── Mesh pipeline ──────────────────────────────────────────────────
-        let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mesh.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/mesh.wgsl"
-            ))),
-        });
-        let mesh_material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mesh.material.bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 11,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let mesh_default_material_bind_group =
-            mesh_gpu::create_material_bind_group(device, queue, &mesh_material_bgl, None);
-
-        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mesh.pipeline_layout"),
-            bind_group_layouts: &[&frame_bgl, &mesh_material_bgl].map(Some),
-            immediate_size: 0,
-        });
-
-        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shadow.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/shadow.wgsl"
-            ))),
-        });
-        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadow.pipeline_layout"),
-            bind_group_layouts: &[&shadow_frame_bgl, &mesh_material_bgl].map(Some),
-            immediate_size: 0,
-        });
-        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow.pipeline"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shadow_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    mesh_gpu::MeshVertex::layout(),
-                    mesh_gpu::MeshInstanceGpu::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
-                    clamp: 0.0,
-                },
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        let shadow_plain_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("shadow.plain.pipeline"),
-                layout: Some(&shadow_layout),
-                vertex: wgpu::VertexState {
-                    module: &shadow_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        mesh_gpu::MeshPlainVertex::layout(),
-                        mesh_gpu::MeshInstanceGpu::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 2,
-                        slope_scale: 2.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: None,
-                multiview_mask: None,
-                cache: None,
-            });
-
-        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh.pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &mesh_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    mesh_gpu::MeshVertex::layout(),
-                    mesh_gpu::MeshInstanceGpu::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // two-sided: ACIS import winding is unreliable
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState {
-                    constant: 1,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mesh_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let mesh_plain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh.plain.pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &mesh_shader,
-                entry_point: Some("vs_main_plain"),
-                buffers: &[
-                    mesh_gpu::MeshPlainVertex::layout(),
-                    mesh_gpu::MeshInstanceGpu::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState {
-                    constant: 1,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mesh_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Transparent variant — identical to `mesh_pipeline` but with depth
-        // writes disabled. Non-opaque solids are drawn after the opaque fills
-        // with this pipeline so they blend over the geometry behind them (which
-        // has already written depth) instead of erasing it.
-        let mesh_transparent_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mesh.transparent.pipeline"),
-                layout: Some(&mesh_layout),
-                vertex: wgpu::VertexState {
-                    module: &mesh_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        mesh_gpu::MeshVertex::layout(),
-                        mesh_gpu::MeshInstanceGpu::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &mesh_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-        let mesh_plain_transparent_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mesh.plain.transparent.pipeline"),
-                layout: Some(&mesh_layout),
-                vertex: wgpu::VertexState {
-                    module: &mesh_shader,
-                    entry_point: Some("vs_main_plain"),
-                    buffers: &[
-                        mesh_gpu::MeshPlainVertex::layout(),
-                        mesh_gpu::MeshInstanceGpu::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &mesh_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-
-        // Highlight variants reuse the resident mesh buffers and differ only in
-        // their fixed fragment tint. No selected mesh geometry is re-uploaded.
-        let make_mesh_highlight_pipeline =
-            |label: &'static str,
-             vertex_entry: &'static str,
-             vertex_layout: wgpu::VertexBufferLayout<'static>,
-             fragment_entry: &'static str| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&mesh_layout),
-                    vertex: wgpu::VertexState {
-                        module: &mesh_shader,
-                        entry_point: Some(vertex_entry),
-                        buffers: &[vertex_layout, mesh_gpu::MeshInstanceGpu::layout()],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth24PlusStencil8,
-                        depth_write_enabled: Some(false),
-                        depth_compare: Some(wgpu::CompareFunction::Always),
-                        stencil: content_stencil.clone(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLES,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &mesh_shader,
-                        entry_point: Some(fragment_entry),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let mesh_selected_pipeline = make_mesh_highlight_pipeline(
-            "mesh.highlight.selected.pipeline",
-            "vs_main",
-            mesh_gpu::MeshVertex::layout(),
-            "fs_highlight_selected",
-        );
-        let mesh_plain_selected_pipeline = make_mesh_highlight_pipeline(
-            "mesh.plain.highlight.selected.pipeline",
-            "vs_main_plain",
-            mesh_gpu::MeshPlainVertex::layout(),
-            "fs_highlight_selected",
-        );
-        let mesh_hover_pipeline = make_mesh_highlight_pipeline(
-            "mesh.highlight.hover.pipeline",
-            "vs_main",
-            mesh_gpu::MeshVertex::layout(),
-            "fs_highlight_hover",
-        );
-        let mesh_plain_hover_pipeline = make_mesh_highlight_pipeline(
-            "mesh.plain.highlight.hover.pipeline",
-            "vs_main_plain",
-            mesh_gpu::MeshPlainVertex::layout(),
-            "fs_highlight_hover",
-        );
-
-        // Wireframe variant — same shader / vertex layout / depth state,
-        // only the input topology changes (LineList) and back-face
-        // culling drops out (each triangle edge is shared between two
-        // faces, one of which would otherwise hide the edge).
-        // Edge/wireframe pipeline (LineList). `fs_edge` outputs the flat entity
-        // colour — no lighting — for the lines-only modes. A `fs_edge_black`
-        // twin (below) forces black for the edge overlay in filled modes.
-        let make_edge_pipeline =
-            |label: &'static str,
-             fs: &'static str,
-             vertex_layout: wgpu::VertexBufferLayout<'static>| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&mesh_layout),
-                    vertex: wgpu::VertexState {
-                        module: &mesh_shader,
-                        entry_point: Some("vs_edge"),
-                        buffers: &[vertex_layout, mesh_gpu::MeshInstanceGpu::layout()],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::LineList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth24PlusStencil8,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                        stencil: content_stencil.clone(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLES,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &mesh_shader,
-                        entry_point: Some(fs),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let mesh_wireframe_pipeline = make_edge_pipeline(
-            "mesh.wireframe.pipeline",
-            "fs_edge",
-            mesh_gpu::MeshVertex::edge_layout(),
-        );
-        let mesh_edge_black_pipeline = make_edge_pipeline(
-            "mesh.edge_black.pipeline",
-            "fs_edge_black",
-            mesh_gpu::MeshVertex::edge_layout(),
-        );
-        let silhouette_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mesh.silhouette.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/silhouette.wgsl"
-            ))),
-        });
-        let silhouette_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mesh.silhouette.layout"),
-            bind_group_layouts: &[Some(&frame_bgl)],
-            immediate_size: 0,
-        });
-        let make_silhouette_pipeline = |label: &'static str, fragment: &'static str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&silhouette_layout),
-                vertex: wgpu::VertexState {
-                    module: &silhouette_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        mesh_gpu::SilhouetteVertex::layout(),
-                        mesh_gpu::SilhouetteInstance::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &silhouette_shader,
-                    entry_point: Some(fragment),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let silhouette_pipeline = make_silhouette_pipeline("mesh.silhouette.pipeline", "fs_main");
-        let silhouette_black_pipeline =
-            make_silhouette_pipeline("mesh.silhouette_black.pipeline", "fs_black");
-
-        // Depth-only variant — TriangleList, back-face culling stays on
-        // (we only want front-facing fragments to write depth so wires
-        // on the far side of the mesh stay hidden), `write_mask` zero
-        // so no fragment ever reaches the colour buffer.
-        let mesh_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh.depth.pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &mesh_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    mesh_gpu::MeshVertex::layout(),
-                    mesh_gpu::MeshInstanceGpu::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // two-sided: ACIS import winding is unreliable
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState {
-                    constant: 1,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mesh_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let mesh_plain_depth_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mesh.plain.depth.pipeline"),
-                layout: Some(&mesh_layout),
-                vertex: wgpu::VertexState {
-                    module: &mesh_shader,
-                    entry_point: Some("vs_main_plain"),
-                    buffers: &[
-                        mesh_gpu::MeshPlainVertex::layout(),
-                        mesh_gpu::MeshInstanceGpu::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &mesh_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::empty(),
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-
-        // ── Face3D pipeline ────────────────────────────────────────────────
-        let face3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("face3d.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
-                "face3d.wgsl"
-            ))),
-        });
-        let block_face3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("block_face3d.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
-                "block_face3d.wgsl"
-            ))),
-        });
-
-        let face3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("face3d.pipeline_layout"),
-            bind_group_layouts: &[&frame_bgl].map(Some),
-            immediate_size: 0,
-        });
-
-        let face3d_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("face3d.pipeline"),
-            layout: Some(&face3d_layout),
-            vertex: wgpu::VertexState {
-                module: &face3d_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[face3d_gpu::Face3DVertex::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState {
-                    constant: 1,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &face3d_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Depth-only variant — write_mask zero, no blend. The face3d
-        // shader still runs but its colour output is discarded, so we
-        // get a pure depth prepass for HiddenLine.
-        let face3d_depth_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("face3d.depth.pipeline"),
-                layout: Some(&face3d_layout),
-                vertex: wgpu::VertexState {
-                    module: &face3d_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[face3d_gpu::Face3DVertex::layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &face3d_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::empty(),
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-        let make_block_face3d_pipeline = |label: &'static str, depth_only: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&face3d_layout),
-                vertex: wgpu::VertexState {
-                    module: &block_face3d_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        face3d_gpu::Face3DVertex::layout(),
-                        face3d_gpu::Face3DInstance::layout(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: content_stencil.clone(),
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &block_face3d_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: (!depth_only).then_some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: if depth_only {
-                            wgpu::ColorWrites::empty()
-                        } else {
-                            wgpu::ColorWrites::ALL
-                        },
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let block_face3d_pipeline = make_block_face3d_pipeline("block_face3d.pipeline", false);
-        let block_face3d_depth_pipeline =
-            make_block_face3d_pipeline("block_face3d.depth.pipeline", true);
-
-        // ── Image pipeline ─────────────────────────────────────────────────
-        let image_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("image.bgl1"),
-            entries: &[
-                // binding 0: texture
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // binding 1: sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // binding 2: ImageParams uniform (read in vertex for the
-                // draw-order z bias and in fragment for opacity).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("image.pipeline_layout"),
-            bind_group_layouts: &[&frame_bgl, &image_bgl1].map(Some),
-            immediate_size: 0,
-        });
-
-        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("image.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(draw_order_shader!(
-                "image.wgsl"
-            ))),
-        });
-
-        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("image.pipeline"),
-            layout: Some(&image_layout),
-            vertex: wgpu::VertexState {
-                module: &image_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    image_gpu::ImageVertex::layout(),
-                    image_gpu::ImageInstance::layout(),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &image_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // ── Point cloud sprites ────────────────────────────────────────────
-        let point_cloud_bgl1 = point_cloud_gpu::params_layout(device);
-        let point_cloud_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("point_cloud.pipeline_layout"),
-            bind_group_layouts: &[&frame_bgl, &point_cloud_bgl1].map(Some),
-            immediate_size: 0,
-        });
-        let point_cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("point_cloud.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/point_cloud.wgsl"
-            )))),
-        });
-        let point_cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("point_cloud.pipeline"),
-            layout: Some(&point_cloud_layout),
-            vertex: wgpu::VertexState {
-                module: &point_cloud_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[point_cloud_gpu::instance_layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: content_stencil.clone(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &point_cloud_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let gpu_point_clouds = point_cloud_gpu::PointCloudGpu::new(device, &point_cloud_bgl1);
-
-        // ── Text (SDF glyph quads) ─────────────────────────────────────────
-        let text_atlas_bgl = text_gpu::TextAtlasGpu::bind_group_layout(device);
-        let (
-            text_pipeline,
-            text_highlight_pipeline,
-            block_text_pipeline,
-            block_text_highlight_pipeline,
-        ) = text_gpu::create_pipelines(
-            device,
-            &frame_bgl,
-            &text_atlas_bgl,
-            format,
-            MSAA_SAMPLES,
-            &content_stencil,
-        );
-
-        let (circle_pipeline, circle_xray_pipeline) = circle_gpu::create_pipelines(
-            device,
-            &frame_bgl,
-            format,
-            MSAA_SAMPLES,
-            &content_stencil,
-        );
-
-        let (ellipse_pipeline, ellipse_xray_pipeline) = ellipse_gpu::create_pipelines(
-            device,
-            &frame_bgl,
-            format,
-            MSAA_SAMPLES,
-            &content_stencil,
-        );
-
-        let viewcube = ViewCubePipeline::new(device, queue, format);
-
-        let init_size = Size::new(1, 1);
-        let msaa_view = create_msaa_texture(device, init_size, format)
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let resolve_tex = create_resolve_texture(device, init_size, format);
-        let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // ── Blit pipeline (resolve texture → surface target) ──────────────
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit.shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../../shaders/blit.wgsl"
-            ))),
-        });
-
-        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blit.bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        // UV crop uniform: [uv_offset_x, uv_offset_y, uv_scale_x, uv_scale_y]
-        // padded to 16 bytes (std140 vec2 alignment). Defaulted to the
-        // identity crop (offset 0, scale 1) for the common on-canvas case.
-        let blit_uniform_buffer = gpu_upload::upload_buffer(
-            device,
-            queue,
-            "blit.uniform_buffer",
-            &[0.0f32, 0.0, 1.0, 1.0],
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-
-        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("blit.pipeline_layout"),
-            bind_group_layouts: &[&blit_bgl].map(Some),
-            immediate_size: 0,
-        });
-
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit.pipeline"),
-            layout: Some(&blit_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    // Premultiplied-alpha blend: the geometry passes already
-                    // wrote into a transparent MSAA target with standard
-                    // `SrcAlpha / 1-SrcAlpha` blending, so AA-edge fragments
-                    // sit as `(rgb * a, a)` in the resolve texture. Treating
-                    // that as straight alpha during the surface blit would
-                    // multiply by alpha a second time and darken thin lines
-                    // / curves. `PREMULTIPLIED_ALPHA_BLENDING` uses `One` as
-                    // the source colour factor and leaves the dst weighted
-                    // by `1-SrcAlpha`, which is the correct compositing
-                    // operator for already-premultiplied content.
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit.sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit.bind_group"),
-            layout: &blit_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&resolve_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&blit_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: blit_uniform_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        Self {
-            background_pipeline,
-            shadow_pipeline,
-            shadow_plain_pipeline,
-            wire_pipeline,
-            block_wire_pipeline,
-            clip_mask_pipeline,
-            wire_black_pipeline,
-            block_wire_black_pipeline,
-            wire_xray_pipeline,
-            wire_preview_overlay_pipeline,
-            preview_overlay_direct: false,
-            circle_pipeline,
-            circle_xray_pipeline,
-            ellipse_pipeline,
-            ellipse_xray_pipeline,
-            block_wire_xray_pipeline,
-            wire_const_bgl,
-            block_wire_const_bgl,
-            block_wire_mode: wire_mode,
-            gpu_error_epoch: gpu_errors_seen(),
-            wipeout_pipeline,
-            hatch_gpu,
-            hatch_translucent_gpu,
-            image_pipeline,
-            point_cloud_pipeline,
-            text_pipeline,
-            block_text_pipeline,
-            text_highlight_pipeline,
-            block_text_highlight_pipeline,
-            text_atlas_bgl,
-            text_atlas_gpu: None,
-            text_gpu: Vec::new(),
-            block_text_gpu: Vec::new(),
-            block_text_highlight_gpu: Vec::new(),
-            text_highlight_gpu: Vec::new(),
-            text_preview_gpu: Vec::new(),
-            silhouette_chunks: Vec::new(),
-            silhouette_source_key: (usize::MAX, usize::MAX, u64::MAX),
-            silhouette_source_groups: Vec::new(),
-            mesh_pipeline,
-            mesh_plain_pipeline,
-            mesh_transparent_pipeline,
-            mesh_plain_transparent_pipeline,
-            mesh_selected_pipeline,
-            mesh_plain_selected_pipeline,
-            mesh_hover_pipeline,
-            mesh_plain_hover_pipeline,
-            mesh_wireframe_pipeline,
-            mesh_edge_black_pipeline,
-            silhouette_pipeline,
-            silhouette_black_pipeline,
-            mesh_depth_pipeline,
-            mesh_plain_depth_pipeline,
-            mesh_material_bgl,
-            mesh_default_material_bind_group,
-            face3d_pipeline,
-            block_face3d_pipeline,
-            face3d_depth_pipeline,
-            block_face3d_depth_pipeline,
-            uniform_buffer,
-            frame_bgl,
-            uniform_bind_group,
-            selection_uniform_buffer,
-            selection_uniform_bind_group,
-            shadow_uniform_bind_group,
-            background_texture,
-            environment_texture,
-            background_sampler,
-            background_source_id: 0,
-            environment_source_id: 0,
-            shadow_full: None,
-            _shadow_fallback_texture: shadow_fallback_texture,
-            shadow_fallback_view,
-            shadow_sampler,
-            shadow_enabled: false,
-            wipeout_bgl1,
-            image_bgl1,
-            depth_texture_size: Size::new(1, 1),
-            viewport: None,
-            // (0, 0) forces the first `ensure_depth_texture` to allocate at the
-            // real rounded size — the constructor textures above are placeholders.
-            alloc_size: Size::new(0, 0),
-            depth_view,
-            msaa_view,
-            resolve_view,
-            blit_pipeline,
-            blit_bind_group_layout: blit_bgl,
-            blit_sampler,
-            blit_bind_group,
-            blit_uniform_buffer,
-            surface_format: format,
-            gpu_wires: std::sync::Arc::new(vec![]),
-            gpu_circles: std::sync::Arc::new(vec![]),
-            gpu_ellipses: std::sync::Arc::new(vec![]),
-            gpu_block_wires: std::sync::Arc::new(vec![]),
-            wire_arena: None,
-            wire_arena_mesh: None,
-            wire_arena_fallback: std::sync::Arc::new(Vec::new()),
-            wire_arena_fallback_kind: None,
-            wire_arena_fallback_handles: rustc_hash::FxHashSet::default(),
-            wire_arena_id: u64::MAX,
-            wire_arena_depth_generation: u64::MAX,
-            partition_contributors: wire_arena::ContributorSet::default(),
-            analytic_slots: None,
-            partition_depth_generation: u64::MAX,
-            wire_cull_key: (u64::MAX, u64::MAX, 0, 0),
-            hatch_lod_key: (usize::MAX, u64::MAX, 0, 0, false),
-            wipeout_lod_key: (usize::MAX, u64::MAX, 0, 0, false),
-            silhouette_key: (usize::MAX, u64::MAX, [u32::MAX; 3], false),
-            clip_boundary: None,
-            gpu_selected_wires: vec![],
-            gpu_selected_circles: vec![],
-            gpu_selected_ellipses: vec![],
-            gpu_selected_block_wires: vec![],
-            gpu_preview_wires: vec![],
-            gpu_preview_block_wires: vec![],
-            gpu_preview_circles: vec![],
-            gpu_preview_ellipses: vec![],
-            gpu_wipeouts: vec![],
-            wipeout_skip_flags: vec![],
-            gpu_images: vec![],
-            gpu_point_clouds,
-            gpu_mesh_batch: Default::default(),
-            gpu_mesh_dynamic: vec![],
-            mesh_disabled_chunks: rustc_hash::FxHashSet::default(),
-            mesh_dynamic_handles: rustc_hash::FxHashSet::default(),
-            cached_mesh_content_id: u64::MAX,
-            mesh_ranges_by_handle: rustc_hash::FxHashMap::default(),
-            mesh_highlight_draws: vec![],
-            cached_highlight_key: (u64::MAX, u64::MAX),
-            gpu_face3d_fill: None,
-            gpu_face3d_edges: vec![],
-            viewcube,
-            cached_hatch_source: None,
-            cached_preview_hatch_source: None,
-            cached_wipeout_source: None,
-            cached_image_source: None,
-            cached_point_cloud_source: None,
-            cached_text_source: None,
-            cached_annotation_highlight_source: None,
-            cached_mesh_source: None,
-            cached_face3d_source: None,
-            cached_face3d_depth_source: None,
-            cached_fill_mode: false,
-            cached_epoch: (u64::MAX, u64::MAX, u64::MAX),
-            cached_wire_id: u64::MAX,
-            cached_selection: (u64::MAX, u64::MAX),
-            cached_face3d_key: (u64::MAX, false, false, u64::MAX),
-            cached_solid_visibility: (u64::MAX, [u32::MAX; 3], u64::MAX),
-            wire_handle_index: std::sync::Arc::new(rustc_hash::FxHashMap::default()),
-            render_sig: u64::MAX,
-            skip_geometry: false,
-            skip_hatch_frame: false,
-            skip_background: false,
-            slot_id: u64::MAX,
-        }
-    }
-
-    /// Upload block placements while reusing unchanged geometry.
-    pub fn upload_block_wires(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        wires: &[wire_gpu::BlockRef<'_>],
-        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
-        block_geometry: &mut wire_gpu::BlockGeometryCache,
-    ) -> Vec<BlockWireGpu> {
-        BlockWireGpu::from_wires(
-            device,
-            queue,
-            wires,
-            depth_map,
-            None,
-            wire_gpu::BlockWireTarget {
-                const_bgl: &self.block_wire_const_bgl,
-                mode: self.block_wire_mode,
-            },
-            Some(block_geometry),
-        )
-    }
-
-    /// Upload GPU-instanced analytical circles from a wire slice.
-    pub fn upload_circles(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        wires: &[WireModel],
-        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
-    ) -> Vec<CircleGpu> {
-        let mut instances: Vec<CircleInstance> = Vec::new();
-        for wire in wires {
-            if !wire.display_visible {
-                continue;
-            }
-            let depth = wire_gpu::wire_draw_depth(wire, depth_map);
-            if let Some(insts) = circle_gpu::extract_circle_instances(wire, depth) {
-                instances.extend(insts);
-            }
-        }
-        self.upload_circles_from_instances(device, queue, &instances)
-    }
-
-    /// Upload GPU-instanced analytical circles from pre-extracted instances.
-    pub fn upload_circles_from_instances(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[CircleInstance],
-    ) -> Vec<CircleGpu> {
-        if instances.is_empty() {
-            vec![]
-        } else {
-            let mut sorted = instances.to_vec();
-            {
-                // A stable parallel sort: the same order, a quarter-million
-                // instances sorted across the cores.
-                #[cfg(not(target_arch = "wasm32"))]
-                use rayon::prelude::*;
-                #[cfg(not(target_arch = "wasm32"))]
-                sorted.par_sort_by(|a, b| {
-                    a.params[2]
-                        .partial_cmp(&b.params[2])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                #[cfg(target_arch = "wasm32")]
-                sorted.sort_by(|a, b| {
-                    a.params[2]
-                        .partial_cmp(&b.params[2])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            vec![CircleGpu::from_instances(
-                device,
-                queue,
-                "viewer.circles",
-                &sorted,
-            )]
-        }
-    }
-
-    /// Upload GPU-instanced analytical ellipses from a wire slice.
-    pub fn upload_ellipses(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        wires: &[WireModel],
-        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
-    ) -> Vec<EllipseGpu> {
-        let mut instances: Vec<EllipseInstance> = Vec::new();
-        for wire in wires {
-            if !wire.display_visible {
-                continue;
-            }
-            let depth = wire_gpu::wire_draw_depth(wire, depth_map);
-            if let Some(insts) = ellipse_gpu::extract_ellipse_instances(wire, depth) {
-                instances.extend(insts);
-            }
-        }
-        self.upload_ellipses_from_instances(device, queue, &instances)
-    }
-
-    /// Upload GPU-instanced analytical ellipses from pre-extracted instances.
-    pub fn upload_ellipses_from_instances(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[EllipseInstance],
-    ) -> Vec<EllipseGpu> {
-        if instances.is_empty() {
-            vec![]
-        } else {
-            let mut sorted = instances.to_vec();
-            {
-                #[cfg(not(target_arch = "wasm32"))]
-                use rayon::prelude::*;
-                #[cfg(not(target_arch = "wasm32"))]
-                sorted.par_sort_by(|a, b| {
-                    a.params[2]
-                        .partial_cmp(&b.params[2])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                #[cfg(target_arch = "wasm32")]
-                sorted.sort_by(|a, b| {
-                    a.params[2]
-                        .partial_cmp(&b.params[2])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            vec![EllipseGpu::from_instances(
-                device,
-                queue,
-                "viewer.ellipses",
-                &sorted,
-            )]
-        }
-    }
-
-    /// `upload_block_wires`, also reporting where every placement landed.
-    pub fn upload_block_wires_tracked(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        wires: &[wire_gpu::BlockRef<'_>],
-        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
-        block_geometry: &mut wire_gpu::BlockGeometryCache,
-    ) -> (Vec<BlockWireGpu>, Option<wire_gpu::BlockTracking>) {
-        BlockWireGpu::from_wires_tracked(
-            device,
-            queue,
-            wires,
-            depth_map,
-            wire_gpu::BlockWireTarget {
-                const_bgl: &self.block_wire_const_bgl,
-                mode: self.block_wire_mode,
-            },
-            Some(block_geometry),
-        )
-    }
-
-    /// `upload_circles_from_instances`, also reporting where each instance
-    /// landed in the depth-sorted buffer, paired with the reference that owns it.
-    pub fn upload_circles_tracked(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[CircleInstance],
-        owners: &[codec::Handle],
-    ) -> (Vec<CircleGpu>, Vec<(codec::Handle, analytic_slots::CurveSlot)>) {
-        if instances.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let (sorted, position) = analytic_slots::sort_by_depth(instances, |c| c.params[2]);
-        let gpu = CircleGpu::from_instances(device, queue, "viewer.circles", &sorted);
-        let slots = owners
-            .iter()
-            .zip(position)
-            .enumerate()
-            .map(|(original, (owner, index))| {
-                (
-                    *owner,
-                    analytic_slots::CurveSlot {
-                        index,
-                        depth_bits: instances[original].params[2].to_bits(),
-                    },
-                )
-            })
-            .collect();
-        (vec![gpu], slots)
-    }
-
-    /// The ellipse counterpart of `upload_circles_tracked`.
-    pub fn upload_ellipses_tracked(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[EllipseInstance],
-        owners: &[codec::Handle],
-    ) -> (Vec<EllipseGpu>, Vec<(codec::Handle, analytic_slots::CurveSlot)>) {
-        if instances.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let (sorted, position) = analytic_slots::sort_by_depth(instances, |e| e.params[2]);
-        let gpu = EllipseGpu::from_instances(device, queue, "viewer.ellipses", &sorted);
-        let slots = owners
-            .iter()
-            .zip(position)
-            .enumerate()
-            .map(|(original, (owner, index))| {
-                (
-                    *owner,
-                    analytic_slots::CurveSlot {
-                        index,
-                        depth_bits: instances[original].params[2].to_bits(),
-                    },
-                )
-            })
-            .collect();
-        (vec![gpu], slots)
-    }
-
     /// Remember where every reference's analytical instances landed in the
     /// uploads this slot now holds. Without a complete record (or with the
     /// feature off) in-place patching stays disabled until the next full
@@ -2787,8 +588,8 @@ impl Pipeline {
     pub(crate) fn record_analytic_slots(
         &mut self,
         blocks: Option<wire_gpu::BlockTracking>,
-        circles: Vec<(codec::Handle, analytic_slots::CurveSlot)>,
-        ellipses: Vec<(codec::Handle, analytic_slots::CurveSlot)>,
+        circles: Vec<(document::Handle, analytic_slots::CurveSlot)>,
+        ellipses: Vec<(document::Handle, analytic_slots::CurveSlot)>,
         depth_generation: u64,
     ) {
         self.analytic_slots = None;
@@ -2798,7 +599,7 @@ impl Pipeline {
         if self.gpu_circles.len() > 1 || self.gpu_ellipses.len() > 1 {
             return;
         }
-        let mut by_handle: rustc_hash::FxHashMap<codec::Handle, analytic_slots::HandleSlots> =
+        let mut by_handle: rustc_hash::FxHashMap<document::Handle, analytic_slots::HandleSlots> =
             rustc_hash::FxHashMap::default();
         for (handle, slot) in blocks.slots {
             by_handle.entry(handle).or_default().blocks.push(slot);
@@ -2813,8 +614,14 @@ impl Pipeline {
             by_handle,
             block_buffers: blocks.buffers,
             shapes: blocks.shapes,
-            circle_buffer: self.gpu_circles.first().map(|gpu| gpu.instance_buffer.clone()),
-            ellipse_buffer: self.gpu_ellipses.first().map(|gpu| gpu.instance_buffer.clone()),
+            circle_buffer: self
+                .gpu_circles
+                .first()
+                .map(|gpu| gpu.instance_buffer.clone()),
+            ellipse_buffer: self
+                .gpu_ellipses
+                .first()
+                .map(|gpu| gpu.instance_buffer.clone()),
             blocks_id: std::sync::Arc::as_ptr(&self.gpu_block_wires) as usize,
             circles_id: std::sync::Arc::as_ptr(&self.gpu_circles) as usize,
             ellipses_id: std::sync::Arc::as_ptr(&self.gpu_ellipses) as usize,
@@ -2868,7 +675,7 @@ impl Pipeline {
                 analytic_slots::Outcome::Rebuild(reason) => return Err(reason),
             }
         }
-        slots.apply(queue, &edits);
+        slots.apply(queue, &edits)?;
         Ok(edits.len())
     }
 
@@ -3059,13 +866,355 @@ impl Pipeline {
         (circles, ellipses, regular, blocks)
     }
 
+    pub(crate) fn prepare_highlight_wire_cache(&mut self, wire_id: u64, depth_generation: u64) {
+        let key = (wire_id, depth_generation);
+        if self.highlight_wire_cache_key != Some(key) {
+            self.highlight_wire_cache.clear();
+            self.highlight_wire_cache_bytes = 0;
+            self.highlight_wire_chunks.clear();
+            self.highlight_wire_chunk_bytes = 0;
+            self.highlight_wire_cache_key = Some(key);
+        }
+    }
+
+    /// Keep the unchanged portions of a large regular-wire highlight on the
+    /// GPU while a selection marquee changes. Buckets are stable for a handle
+    /// and cached only while wire geometry and draw depths are unchanged.
+    fn highlight_small_wire_chunks(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        wires: &[&WireModel],
+        color: [f32; 4],
+        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
+        transient: &rustc_hash::FxHashSet<usize>,
+    ) -> Vec<WireGpu> {
+        const BUCKETS: usize = 32;
+        const MIN_WIRES: usize = 512;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+        if wires.len() < MIN_WIRES {
+            return WireGpu::from_highlight_refs(
+                device, queue, wires, color, depth_map, self.wire_const_bgl.as_ref(),
+            );
+        }
+        let mut buckets: [Vec<&WireModel>; BUCKETS] = std::array::from_fn(|_| Vec::new());
+        let mut uncached = Vec::new();
+        for &wire in wires {
+            let ptr = wire as *const WireModel as usize;
+            if transient.contains(&ptr) {
+                uncached.push(wire);
+            } else if let Some(handle) = wire_gpu::fast_parse_u64(&wire.name) {
+                buckets[((handle >> 8) as usize) % BUCKETS].push(wire);
+            } else {
+                uncached.push(wire);
+            }
+        }
+        let mut output = WireGpu::from_highlight_refs(
+            device, queue, &uncached, color, depth_map, self.wire_const_bgl.as_ref(),
+        );
+        let mut reused = 0;
+        let mut rebuilt = 0;
+        for (bucket, group) in buckets.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let mut members: Vec<usize> = group
+                .iter()
+                .map(|wire| *wire as *const WireModel as usize)
+                .collect();
+            members.sort_unstable();
+            let key = (bucket as u8, color.map(f32::to_bits));
+            if let Some(cached) = self.highlight_wire_chunks.get(&key) {
+                if cached.members == members {
+                    output.extend(cached.gpu.iter().cloned());
+                    reused += 1;
+                    continue;
+                }
+            }
+            if let Some(old) = self.highlight_wire_chunks.remove(&key) {
+                self.highlight_wire_chunk_bytes = self.highlight_wire_chunk_bytes.saturating_sub(old.bytes);
+            }
+            let gpu = WireGpu::from_highlight_refs(
+                device, queue, group, color, depth_map, self.wire_const_bgl.as_ref(),
+            );
+            let bytes = gpu
+                .iter()
+                .fold(0usize, |sum, wire| {
+                    sum.saturating_add(
+                        usize::try_from(wire.instance_buffer.size()).unwrap_or(usize::MAX),
+                    )
+                })
+                .saturating_add(
+                    group
+                        .len()
+                        .saturating_mul(std::mem::size_of::<wire_gpu::WireConst>()),
+                );
+            if bytes <= MAX_BYTES.saturating_sub(self.highlight_wire_chunk_bytes) {
+                self.highlight_wire_chunk_bytes += bytes;
+                self.highlight_wire_chunks.insert(
+                    key,
+                    HighlightWireChunk {
+                        members,
+                        gpu: gpu.clone(),
+                        bytes,
+                    },
+                );
+            }
+            output.extend(gpu);
+            rebuilt += 1;
+        }
+        if crate::perf::enabled() {
+            crate::perf_record!("[perf] highlight-chunks reused={reused} rebuilt={rebuilt}");
+        }
+        output
+    }
+
+    fn highlight_regular_wires(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        wires: &[&WireModel],
+        color: [f32; 4],
+        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
+        annotation_context_wires: &[WireModel],
+    ) -> Vec<WireGpu> {
+        const MIN_POINTS: usize = 8192;
+        const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+        if self.highlight_wire_cache_key.is_none() {
+            return WireGpu::from_highlight_refs(
+                device,
+                queue,
+                wires,
+                color,
+                depth_map,
+                self.wire_const_bgl.as_ref(),
+            );
+        }
+
+        // Annotation outlines are transient and can share an entity handle
+        // with resident wires. Never include them in a resident cache entry.
+        let transient: rustc_hash::FxHashSet<usize> = annotation_context_wires
+            .iter().map(|wire| wire as *const WireModel as usize).collect();
+        let mut counts = rustc_hash::FxHashMap::<u64, usize>::default();
+        let mut wire_counts = rustc_hash::FxHashMap::<document::Handle, usize>::default();
+        let mut ineligible = rustc_hash::FxHashSet::default();
+        for wire in wires {
+            if transient.contains(&(*wire as *const WireModel as usize)) { continue; }
+            if let Some(handle) = wire_gpu::fast_parse_u64(&wire.name) {
+                *counts.entry(handle).or_default() += wire.points.len();
+                let handle = document::Handle::new(handle);
+                *wire_counts.entry(handle).or_default() += 1;
+                if wire_arena::classify_wire(wire) != wire_arena::WireKind::Regular {
+                    ineligible.insert(handle);
+                }
+            }
+        }
+        wire_counts.retain(|handle, _| {
+            !ineligible.contains(handle)
+                && counts.get(&handle.value()).copied().unwrap_or(0) >= MIN_POINTS
+        });
+        let (mut output, reused) = match (
+            &self.wire_arena,
+            &self.wire_const_bgl,
+            self.highlight_wire_cache_key,
+        ) {
+            (Some(arena), Some(bgl), Some((wire_id, depth_generation)))
+                if self.wire_arena_id == wire_id
+                    && self.wire_arena_depth_generation == depth_generation =>
+            {
+                arena.highlight_dense(
+                    device,
+                    queue,
+                    bgl,
+                    &wire_counts,
+                    color,
+                    &mut self.dense_highlight_consts,
+                )
+            }
+            _ => (Vec::new(), rustc_hash::FxHashSet::default()),
+        };
+        let mut groups = rustc_hash::FxHashMap::<u64, Vec<&WireModel>>::default();
+        let mut small = Vec::new();
+        for &wire in wires {
+            if transient.contains(&(wire as *const WireModel as usize)) {
+                small.push(wire);
+                continue;
+            }
+            match wire_gpu::fast_parse_u64(&wire.name) {
+                Some(handle) if reused.contains(&document::Handle::new(handle)) => {}
+                Some(handle) if counts.get(&handle).copied().unwrap_or(0) >= MIN_POINTS => {
+                    groups.entry(handle).or_default().push(wire);
+                }
+                _ => small.push(wire),
+            }
+        }
+        output.extend(
+            self.highlight_small_wire_chunks(device, queue, &small, color, depth_map, &transient),
+        );
+        for (handle, group) in groups {
+            let key = (handle, color.map(f32::to_bits));
+            if let Some(cached) = self.highlight_wire_cache.get(&key) {
+                output.extend(cached.iter().cloned());
+                continue;
+            }
+            let gpu = WireGpu::from_highlight_refs(
+                device, queue, &group, color, depth_map, self.wire_const_bgl.as_ref(),
+            );
+            let bytes = gpu
+                .iter()
+                .fold(0usize, |total, wire| {
+                    total.saturating_add(
+                        usize::try_from(wire.instance_buffer.size()).unwrap_or(usize::MAX),
+                    )
+                })
+                .saturating_add(
+                    group
+                        .len()
+                        .saturating_mul(std::mem::size_of::<wire_gpu::WireConst>()),
+                );
+            if bytes <= MAX_CACHE_BYTES.saturating_sub(self.highlight_wire_cache_bytes) {
+                self.highlight_wire_cache_bytes += bytes;
+                self.highlight_wire_cache.insert(key, gpu.clone());
+            }
+            output.extend(gpu);
+        }
+        output
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_split_highlights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        wires: &[WireModel],
+        selected: &rustc_hash::FxHashSet<document::Handle>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
+        selected_annotation: &std::sync::Arc<Vec<WireModel>>,
+        hover_annotation: &[WireModel],
+        depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
+        selected_tint: Option<[f32; 4]>,
+        wire_id: u64,
+        depth_generation: u64,
+        refresh_selected: bool,
+        refresh_hover: bool,
+        hover_key: (u64, u64),
+    ) {
+        let tint_key = selected_tint.map(|color| color.map(f32::to_bits));
+        let selected_cache_ready = self.selected_highlight_gpu_cache.as_ref().is_some_and(|cache| {
+            cache.wire_id == wire_id
+                && cache.depth_generation == depth_generation
+                && cache.tint == tint_key
+                && cache.selected == *selected
+                && (std::sync::Arc::ptr_eq(&cache.annotation, selected_annotation)
+                    || (cache.annotation.is_empty() && selected_annotation.is_empty()))
+        });
+        let empty = rustc_hash::FxHashSet::default();
+        // The committed-selection half only re-emits when the caller says the
+        // selection (or the wires under it) changed. Hover-only bumps — every
+        // rollover and marquee tick — skip the O(selected) gather, re-emit and
+        // re-upload entirely, reusing the cached GPU buffers untouched.
+        if refresh_selected || !selected_cache_ready {
+            self.upload_selected_wires(
+                device,
+                queue,
+                wires,
+                selected,
+                &empty,
+                selected_annotation,
+                depth_map,
+                selected_tint,
+            );
+            self.upload_text_highlight(
+                device,
+                queue,
+                wires,
+                selected,
+                &empty,
+                selected_annotation,
+                depth_map,
+                selected_tint,
+            );
+            self.selected_highlight_gpu_cache = Some(SelectedHighlightGpuCache {
+                wire_id,
+                depth_generation,
+                tint: tint_key,
+                selected: selected.clone(),
+                annotation: std::sync::Arc::clone(selected_annotation),
+                wires: self.gpu_selected_wires.clone(),
+                blocks: self.gpu_selected_block_wires.clone(),
+                circles: self.gpu_selected_circles.clone(),
+                ellipses: self.gpu_selected_ellipses.clone(),
+                text: self.text_highlight_gpu.clone(),
+                block_text: self.block_text_highlight_gpu.clone(),
+            });
+        }
+        // The hover half re-emits only when it changed. The hover set is
+        // `hovered − selected`, so a selection change also changes it. The
+        // text uploads are additionally cached on the render-side hover key:
+        // a marquee over text-heavy content re-emits the wire instances (the
+        // small-chunk cache covers those) but must not re-copy every hovered
+        // glyph vertex per tick.
+        if refresh_hover {
+            let hover_only = hovered.difference(selected).copied().collect();
+            self.upload_selected_wires(
+                device,
+                queue,
+                wires,
+                &empty,
+                &hover_only,
+                hover_annotation,
+                depth_map,
+                selected_tint,
+            );
+            if self
+                .hover_text_gpu_cache
+                .as_ref()
+                .is_some_and(|cache| cache.key == hover_key)
+            {
+                let cache = self.hover_text_gpu_cache.as_ref().unwrap();
+                self.text_highlight_gpu = cache.text.clone();
+                self.block_text_highlight_gpu = cache.block_text.clone();
+            } else {
+                self.upload_text_highlight(
+                    device,
+                    queue,
+                    wires,
+                    &empty,
+                    &hover_only,
+                    hover_annotation,
+                    depth_map,
+                    selected_tint,
+                );
+                self.hover_text_gpu_cache = Some(HoverTextGpuCache {
+                    key: hover_key,
+                    text: self.text_highlight_gpu.clone(),
+                    block_text: self.block_text_highlight_gpu.clone(),
+                });
+            }
+            // Draw committed selection before the current hover, as in the
+            // combined overlay.
+            let cache = self.selected_highlight_gpu_cache.as_ref();
+            fn prepend<T: Clone>(cached: &[T], live: &mut Vec<T>) {
+                live.splice(0..0, cached.iter().cloned());
+            }
+            if let Some(cache) = cache {
+                prepend(&cache.wires, &mut self.gpu_selected_wires);
+                prepend(&cache.blocks, &mut self.gpu_selected_block_wires);
+                prepend(&cache.circles, &mut self.gpu_selected_circles);
+                prepend(&cache.ellipses, &mut self.gpu_selected_ellipses);
+                prepend(&cache.text, &mut self.text_highlight_gpu);
+                prepend(&cache.block_text, &mut self.block_text_highlight_gpu);
+            }
+        }
+    }
+
     pub fn upload_selected_wires(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         wires: &[WireModel],
-        selected: &rustc_hash::FxHashSet<codec::Handle>,
-        hovered: &rustc_hash::FxHashSet<codec::Handle>,
+        selected: &rustc_hash::FxHashSet<document::Handle>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
         annotation_context_wires: &[WireModel],
         depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
         selected_tint: Option<[f32; 4]>,
@@ -3159,24 +1308,19 @@ impl Pipeline {
         };
         let t_split = perf_started.map(|t| t.elapsed().as_secs_f64() * 1000.0);
         let mut gpu = if let Some(tint) = selected_tint {
-            WireGpu::from_highlight_refs(
+            self.highlight_regular_wires(
                 device,
                 queue,
                 &selected_regular,
                 tint,
                 depth_map,
-                self.wire_const_bgl.as_ref(),
+                annotation_context_wires,
             )
         } else {
             Vec::new()
         };
-        gpu.extend(WireGpu::from_highlight_refs(
-            device,
-            queue,
-            &hover_regular,
-            WireModel::HOVER,
-            depth_map,
-            self.wire_const_bgl.as_ref(),
+        gpu.extend(self.highlight_regular_wires(
+            device, queue, &hover_regular, WireModel::HOVER, depth_map, annotation_context_wires,
         ));
         let t_regular = perf_started.map(|t| t.elapsed().as_secs_f64() * 1000.0);
         self.gpu_selected_wires = gpu;
@@ -3247,8 +1391,8 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         wires: &[WireModel],
-        selected: &rustc_hash::FxHashSet<codec::Handle>,
-        hovered: &rustc_hash::FxHashSet<codec::Handle>,
+        selected: &rustc_hash::FxHashSet<document::Handle>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
         annotation_context_wires: &[WireModel],
         depth_map: &rustc_hash::FxHashMap<u64, [f32; 2]>,
         selected_tint: Option<[f32; 4]>,
@@ -3570,14 +1714,13 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 let mut sources = Vec::with_capacity(generators.len());
                 for generator in generators {
                     if let Some(transform) = source.instance_transform {
-                        let origin = transform.apply(codec::types::Vector3::ZERO);
+                        let origin = transform.apply(document::types::Vector3::ZERO);
                         let vectors = [
-                            transform.apply_rotation(codec::types::Vector3::UNIT_X),
-                            transform.apply_rotation(codec::types::Vector3::UNIT_Y),
-                            transform.apply_rotation(codec::types::Vector3::UNIT_Z),
+                            transform.apply_rotation(document::types::Vector3::UNIT_X),
+                            transform.apply_rotation(document::types::Vector3::UNIT_Y),
+                            transform.apply_rotation(document::types::Vector3::UNIT_Z),
                         ];
-                        if let Some(transformed) = kernel::brep::mesh::transform_silhouette_affine(
-                            &generator.source,
+                        if let Some(transformed) = generator.source.transformed(
                             vectors.map(|vector| [vector.x, vector.y, vector.z]),
                             [origin.x, origin.y, origin.z],
                         ) {
@@ -3601,10 +1744,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         let compute_group = |group: &SilhouetteSourceGroup| {
             let mut points = Vec::new();
             for source in &group.sources {
-                points.extend(kernel::brep::mesh::silhouette(
-                    source,
-                    [view.x, view.y, view.z],
-                ));
+                points.extend(source.outline([view.x, view.y, view.z]));
             }
             points
         };
@@ -3638,7 +1778,11 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                     ],
                 }
             };
-            let mut verts: Vec<SilhouetteVertex> = Vec::with_capacity(max_vertices);
+            // Sized to this group's points, not to a whole GPU chunk: a full
+            // chunk (32 MB) per group per frame made a drawing with hundreds
+            // of 3-D bodies allocate gigabytes per second.
+            let mut verts: Vec<SilhouetteVertex> =
+                Vec::with_capacity(points.len().min(max_vertices));
             let push_chunk = |verts: &[SilhouetteVertex], chunks: &mut Vec<SilhouetteChunk>| {
                 let vertex_count = verts.len() / 2 * 2;
                 if vertex_count == 0 {
@@ -3770,9 +1914,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.wipeout_skip_flags = self
             .gpu_wipeouts
             .iter()
-            .map(|h| {
-                aabb_offscreen(h.world_aabb.map(f64::from), view_rot, eye, clip_w, clip_h)
-            })
+            .map(|h| aabb_offscreen(h.world_aabb.map(f64::from), view_rot, eye, clip_w, clip_h))
             .collect();
     }
 
@@ -3885,7 +2027,10 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 if gpu_errors_seen() == errors_before {
                     cache.insert(
                         key,
-                        (std::sync::Arc::downgrade(meshes), std::sync::Arc::clone(&chunks)),
+                        (
+                            std::sync::Arc::downgrade(meshes),
+                            std::sync::Arc::clone(&chunks),
+                        ),
                     );
                 }
                 (chunks, triangles)
@@ -3915,6 +2060,8 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.mesh_disabled_chunks.clear();
         self.mesh_dynamic_handles.clear();
         self.gpu_mesh_batch = chunks;
+        self.mesh_lod_levels.clear();
+        self.mesh_lod_draws.clear();
         let indexed_at = iced::time::Instant::now();
         if crate::perf::enabled() {
             let instances: u64 = self
@@ -3992,7 +2139,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         meshes: &[MeshLodSet],
-        changes: &[(codec::Handle, crate::scene::ChangeKind)],
+        changes: &[(document::Handle, crate::scene::ChangeKind)],
     ) -> bool {
         let started = iced::time::Instant::now();
         if self.gpu_mesh_batch.is_empty() || changes.is_empty() {
@@ -4044,6 +2191,8 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             &mut chunks,
         );
         self.gpu_mesh_dynamic = chunks;
+        self.mesh_lod_levels.clear();
+        self.mesh_lod_draws.clear();
         self.rebuild_mesh_range_map();
         if crate::perf::enabled() {
             crate::perf_record!(
@@ -4062,22 +2211,63 @@ analytic={:.1} regular={:.1} blocks={:.1}",
     /// chunk buffers; changing hover never allocates or uploads mesh geometry.
     pub fn update_mesh_highlight(
         &mut self,
-        selected: &rustc_hash::FxHashSet<codec::Handle>,
-        hovered: &rustc_hash::FxHashSet<codec::Handle>,
+        selected: &rustc_hash::FxHashSet<document::Handle>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
         edge_wires: &[WireModel],
+        selected_edge_wires: &[WireModel],
     ) {
-        let edge_handles: rustc_hash::FxHashSet<codec::Handle> = edge_wires
+        let edge_handles: rustc_hash::FxHashSet<document::Handle> = edge_wires
             .iter()
+            .chain(selected_edge_wires)
             .filter_map(|wire| wire.name.strip_prefix("mesh-edge:"))
             .filter_map(|value| value.parse::<u64>().ok())
-            .map(codec::Handle::new)
+            .map(document::Handle::new)
             .collect();
+        self.mesh_highlight_draws = Self::mesh_highlight_draws(
+            &self.mesh_ranges_by_handle,
+            selected,
+            hovered,
+            &edge_handles,
+        );
+    }
+
+    pub(in crate::scene) fn has_hovered_mesh(
+        &self,
+        meshes: &std::sync::Arc<Vec<MeshLodSet>>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
+    ) -> bool {
+        if hovered.is_empty() {
+            return false;
+        }
+        if self
+            .cached_mesh_source
+            .as_ref()
+            .is_some_and(|source| std::sync::Arc::ptr_eq(source, meshes))
+        {
+            return hovered
+                .iter()
+                .any(|handle| self.mesh_ranges_by_handle.contains_key(handle));
+        }
+        meshes
+            .iter()
+            .filter_map(MeshLodSet::entity_handle)
+            .any(|handle| hovered.contains(&handle))
+    }
+
+    /// The highlight draws for the picked and the hovered solids: the resident
+    /// ranges of each, leaving out the ones highlighted by their edges.
+    fn mesh_highlight_draws(
+        ranges_by_handle: &rustc_hash::FxHashMap<document::Handle, Vec<MeshResidentRange>>,
+        selected: &rustc_hash::FxHashSet<document::Handle>,
+        hovered: &rustc_hash::FxHashSet<document::Handle>,
+        edge_handles: &rustc_hash::FxHashSet<document::Handle>,
+    ) -> Vec<MeshHighlightDraw> {
         let mut out = Vec::new();
         for handle in selected
             .iter()
             .filter(|handle| !edge_handles.contains(handle))
         {
-            if let Some(ranges) = self.mesh_ranges_by_handle.get(handle) {
+            if let Some(ranges) = ranges_by_handle.get(handle) {
                 out.extend(ranges.iter().copied().map(|range| MeshHighlightDraw {
                     range,
                     kind: MeshHighlightKind::Selected,
@@ -4088,14 +2278,171 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             .iter()
             .filter(|handle| !selected.contains(handle) && !edge_handles.contains(handle))
         {
-            if let Some(ranges) = self.mesh_ranges_by_handle.get(&handle) {
+            if let Some(ranges) = ranges_by_handle.get(handle) {
                 out.extend(ranges.iter().copied().map(|range| MeshHighlightDraw {
                     range,
                     kind: MeshHighlightKind::Hover,
                 }));
             }
         }
-        self.mesh_highlight_draws = out;
+        Self::joined_highlight_draws(out)
+    }
+
+    /// Highlight draws that read the same buffers and follow one another, as
+    /// one draw.
+    ///
+    /// Each reference of a block is a range of one instance and each solid a
+    /// range of its own triangles, so with thousands of them picked the
+    /// highlight was a draw call apiece on every frame, over solids that are
+    /// drawn in a handful. What is drawn stays the same: the same triangles
+    /// for the same instances, as often as they were listed.
+    fn joined_highlight_draws(mut draws: Vec<MeshHighlightDraw>) -> Vec<MeshHighlightDraw> {
+        draws.sort_unstable_by_key(|draw| {
+            let range = &draw.range;
+            (
+                draw.kind == MeshHighlightKind::Hover,
+                range.dynamic,
+                range.chunk,
+                range.transparent,
+                range.index_start,
+                range.index_count,
+                range.instance_start,
+                range.instance_count,
+            )
+        });
+        let mut joined: Vec<MeshHighlightDraw> = Vec::with_capacity(draws.len());
+        for draw in draws {
+            let next = draw.range;
+            let last = joined.last_mut().filter(|last| {
+                last.kind == draw.kind
+                    && last.range.dynamic == next.dynamic
+                    && last.range.chunk == next.chunk
+                    && last.range.transparent == next.transparent
+            });
+            if let Some(last) = last {
+                let range = &mut last.range;
+                // The same triangles, for the instances that follow.
+                if range.index_start == next.index_start
+                    && range.index_count == next.index_count
+                    && range.instance_start.checked_add(range.instance_count)
+                        == Some(next.instance_start)
+                {
+                    if let Some(count) = range.instance_count.checked_add(next.instance_count) {
+                        range.instance_count = count;
+                        continue;
+                    }
+                }
+                // The triangles that follow, for the same instances.
+                if range.instance_start == next.instance_start
+                    && range.instance_count == next.instance_count
+                    && range.index_count % 3 == 0
+                    && range.index_start.checked_add(range.index_count) == Some(next.index_start)
+                {
+                    if let Some(count) = range.index_count.checked_add(next.index_count) {
+                        range.index_count = count;
+                        continue;
+                    }
+                }
+            }
+            joined.push(draw);
+        }
+        joined
+    }
+
+    /// Chooses each LOD chunk's opaque draws for this frame from the view of
+    /// the last uniform upload. Call after the mesh batch is current; the
+    /// GPU buffers are not touched.
+    pub fn select_mesh_lods(&mut self) {
+        let Some((view_rot, eye, viewport)) = self.mesh_lod_view else {
+            self.mesh_lod_draws.clear();
+            return;
+        };
+        let mut levels = std::mem::take(&mut self.mesh_lod_levels);
+        let mut draws = std::mem::take(&mut self.mesh_lod_draws);
+        draws.clear();
+        for (index, chunk) in self.active_mesh_chunks_indexed() {
+            if chunk.lod_entries.is_empty() || chunk.lod_index_buffers.len() != 2 {
+                continue;
+            }
+            let current = levels.entry(index).or_default();
+            if current.len() != chunk.lod_entries.len() {
+                current.clear();
+            }
+            // Ranges per level; opaque draw order does not matter (depth
+            // test), so each level's touching ranges merge into one draw.
+            let mut per_level: [Vec<(u32, u32)>; 3] = Default::default();
+            for (at, entry) in chunk.lod_entries.iter().enumerate() {
+                let pixels = match chunk.instance_lod_bounds {
+                    // Every instance draws one level: the one the largest
+                    // of them needs where the chunk comes closest.
+                    Some(bounds) => mesh_gpu::instance_lod_boxes(entry.aabb, bounds, eye)
+                        .into_iter()
+                        .map(|aabb| mesh_gpu::projected_diagonal(aabb, &view_rot, eye, viewport))
+                        .fold(0.0, f32::max),
+                    None => mesh_gpu::projected_diagonal(entry.aabb, &view_rot, eye, viewport),
+                };
+                let level = mesh_gpu::lod_level(pixels, current.get(at).copied());
+                if at < current.len() {
+                    current[at] = level;
+                } else {
+                    current.push(level);
+                }
+                let level = if entry.ranges[level as usize].1 == 0 {
+                    0
+                } else {
+                    level as usize
+                };
+                let (start, count) = entry.ranges[level];
+                match per_level[level].last_mut() {
+                    Some(last) if last.0 + last.1 == start => last.1 += count,
+                    _ => per_level[level].push((start, count)),
+                }
+            }
+            draws.insert(
+                index,
+                per_level
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(level, ranges)| {
+                        ranges
+                            .iter()
+                            .map(move |&(start, count)| (level as u8, start, count))
+                    })
+                    .collect(),
+            );
+        }
+        levels.retain(|index, _| draws.contains_key(index));
+        if crate::perf::enabled() {
+            // What the opaque fills draw this frame: the parts at each level
+            // and the triangles they come to, of those of every part in full.
+            let mut parts = [0usize; 3];
+            let (mut drawn, mut full) = (0u64, 0u64);
+            for (index, chunk) in self.active_mesh_chunks_indexed() {
+                let instances = u64::from(chunk.instance_count.max(1));
+                full += u64::from(chunk.index_count / 3) * instances;
+                match draws.get(&index) {
+                    Some(ranges) => {
+                        for &(_, _, count) in ranges {
+                            drawn += u64::from(count / 3) * instances;
+                        }
+                        for level in levels.get(&index).into_iter().flatten() {
+                            parts[usize::from(*level).min(2)] += 1;
+                        }
+                    }
+                    None => drawn += u64::from(chunk.index_count / 3) * instances,
+                }
+            }
+            crate::perf_record!(
+                "[perf] mesh-lod parts={}/{}/{} triangles={} of {}",
+                parts[0],
+                parts[1],
+                parts[2],
+                drawn,
+                full,
+            );
+        }
+        self.mesh_lod_levels = levels;
+        self.mesh_lod_draws = draws;
     }
 
     fn active_mesh_chunks_indexed(
@@ -4317,6 +2664,14 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         if self.shadow_full.is_none() {
             uniforms.shadow_params[0] = 0.0;
         }
+        let eye = |high: [f32; 3], low: [f32; 3]| {
+            glam::DVec3::from(high.map(f64::from)) + glam::DVec3::from(low.map(f64::from))
+        };
+        self.mesh_lod_view = Some((
+            uniforms.view_rot,
+            eye(uniforms.eye_high, uniforms.eye_low),
+            uniforms.viewport_size,
+        ));
         let mut selection = uniforms;
         selection.transparency_enable = 1.0;
         uniforms.highlight_widen = 0.0;
@@ -4423,6 +2778,146 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 uv_scale[1] * fy,
             ]),
         );
+    }
+
+    fn has_wire_highlights(&self) -> bool {
+        !self.gpu_selected_wires.is_empty()
+            || !self.gpu_selected_block_wires.is_empty()
+            || !self.gpu_selected_circles.is_empty()
+            || !self.gpu_selected_ellipses.is_empty()
+            || !self.text_highlight_gpu.is_empty()
+            || !self.block_text_highlight_gpu.is_empty()
+    }
+
+    fn render_wire_highlights(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        raster: Rectangle,
+        stencil_ref: u32,
+        occluded: bool,
+        overlay: Option<&wgpu::TextureView>,
+    ) {
+        let multisampled = msaa_samples() > 1;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("selection_xray.render_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: if multisampled {
+                    &self.msaa_view
+                } else {
+                    overlay.unwrap_or(&self.msaa_view)
+                },
+                depth_slice: None,
+                resolve_target: overlay.filter(|_| multisampled),
+                ops: wgpu::Operations {
+                    load: if overlay.is_some() {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: if multisampled && overlay.is_some() {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
+                    },
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(raster.x, raster.y, raster.width, raster.height, 0.0, 1.0);
+        pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
+        pass.set_stencil_reference(stencil_ref);
+        if !self.gpu_selected_wires.is_empty() {
+            pass.set_pipeline(if occluded {
+                &self.wire_pipeline
+            } else {
+                &self.wire_xray_pipeline
+            });
+            for wire in &self.gpu_selected_wires {
+                if wire.instance_count > 0 {
+                    if let Some(bg) = &wire.const_bind_group {
+                        pass.set_bind_group(1, bg.as_ref(), &[]);
+                    }
+                    pass.set_vertex_buffer(0, wire.instance_buffer.slice(..));
+                    pass.draw(
+                        0..6,
+                        wire.first_instance..wire.first_instance + wire.instance_count,
+                    );
+                }
+            }
+        }
+        if !self.gpu_selected_block_wires.is_empty() {
+            pass.set_pipeline(if occluded {
+                &self.block_wire_pipeline
+            } else {
+                &self.block_wire_xray_pipeline
+            });
+            for wire in &self.gpu_selected_block_wires {
+                if wire.instance_count == 0 {
+                    continue;
+                }
+                bind_and_draw_block_wire(&mut pass, wire);
+            }
+        }
+        if !self.gpu_selected_circles.is_empty() {
+            pass.set_pipeline(if occluded {
+                &self.circle_pipeline
+            } else {
+                &self.circle_xray_pipeline
+            });
+            pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
+            for cg in &self.gpu_selected_circles {
+                if cg.instance_count > 0 {
+                    pass.set_vertex_buffer(0, cg.instance_buffer.slice(..));
+                    pass.draw(0..6, 0..cg.instance_count);
+                }
+            }
+        }
+        if !self.gpu_selected_ellipses.is_empty() {
+            pass.set_pipeline(if occluded {
+                &self.ellipse_pipeline
+            } else {
+                &self.ellipse_xray_pipeline
+            });
+            pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
+            for eg in &self.gpu_selected_ellipses {
+                if eg.instance_count > 0 {
+                    pass.set_vertex_buffer(0, eg.instance_buffer.slice(..));
+                    pass.draw(0..6, 0..eg.instance_count);
+                }
+            }
+        }
+        if let Some(atlas) = &self.text_atlas_gpu {
+            if !self.text_highlight_gpu.is_empty() {
+                pass.set_pipeline(&self.text_highlight_pipeline);
+                pass.set_bind_group(1, &atlas.bind_group, &[]);
+                for text in &self.text_highlight_gpu {
+                    pass.set_vertex_buffer(0, text.vertex_buffer.slice(..));
+                    pass.draw(0..text.vertex_count, 0..1);
+                }
+            }
+        }
+        if let Some(atlas) = &self.text_atlas_gpu {
+            if !self.block_text_highlight_gpu.is_empty() {
+                pass.set_pipeline(&self.block_text_highlight_pipeline);
+                pass.set_bind_group(1, &atlas.bind_group, &[]);
+                for text in &self.block_text_highlight_gpu {
+                    text.draw(&mut pass);
+                }
+            }
+        }
     }
 
     /// Render geometry at its fractional pixel rectangle and blit the resolve
@@ -4765,6 +3260,29 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                         pass.set_vertex_buffer(1, chunk.instance_buffer.slice(..));
                         pass.draw(0..chunk.vertex_count, 0..chunk.instance_count);
                     }
+                    // Occluded edges: the same edges again, dashed, where
+                    // a face or a visible edge is nearer.
+                    if self.occluded_edges {
+                        pass.set_pipeline(&self.mesh_occluded_pipeline);
+                        for (_, c) in self.active_mesh_chunks_indexed() {
+                            pass.set_bind_group(
+                                1,
+                                c.material_bind_group
+                                    .as_ref()
+                                    .unwrap_or(&self.mesh_default_material_bind_group),
+                                &[],
+                            );
+                            pass.set_vertex_buffer(1, c.instance_buffer.slice(..));
+                            if c.wire_vertex_count != 0 {
+                                pass.set_vertex_buffer(0, c.wire_vertex_buffer.slice(..));
+                                pass.draw(0..c.wire_vertex_count, 0..c.instance_count);
+                            }
+                            if c.edge_vertex_count != 0 {
+                                pass.set_vertex_buffer(0, c.edge_vertex_buffer.slice(..));
+                                pass.draw(0..c.edge_vertex_count, 0..c.instance_count);
+                            }
+                        }
+                    }
                 } else {
                     if mesh_wireframe {
                         pass.set_pipeline(&self.mesh_wireframe_pipeline);
@@ -4794,8 +3312,9 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                             pass.draw(0..chunk.vertex_count, 0..chunk.instance_count);
                         }
                     } else {
-                        // Opaque fills first (they write depth).
-                        for (_, c) in self.active_mesh_chunks_indexed() {
+                        // Opaque fills first (they write depth), each LOD
+                        // chunk at the levels `select_mesh_lods` chose.
+                        for (index, c) in self.active_mesh_chunks_indexed() {
                             pass.set_pipeline(if c.compact_vertices {
                                 &self.mesh_plain_pipeline
                             } else {
@@ -4813,11 +3332,33 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                             }
                             pass.set_vertex_buffer(0, c.vertex_buffer.slice(..));
                             pass.set_vertex_buffer(1, c.instance_buffer.slice(..));
-                            pass.set_index_buffer(
-                                c.index_buffer.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            pass.draw_indexed(0..c.index_count, 0, 0..c.instance_count);
+                            let Some(draws) = self.mesh_lod_draws.get(&index) else {
+                                pass.set_index_buffer(
+                                    c.index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                pass.draw_indexed(0..c.index_count, 0, 0..c.instance_count);
+                                continue;
+                            };
+                            let mut bound = None;
+                            for &(level, start, count) in draws {
+                                if bound != Some(level) {
+                                    let buffer = match level {
+                                        0 => &c.index_buffer,
+                                        level => &c.lod_index_buffers[level as usize - 1],
+                                    };
+                                    pass.set_index_buffer(
+                                        buffer.slice(..),
+                                        wgpu::IndexFormat::Uint32,
+                                    );
+                                    bound = Some(level);
+                                }
+                                pass.draw_indexed(
+                                    start..start + count,
+                                    0,
+                                    0..c.instance_count,
+                                );
+                            }
                         }
                         // Transparent fills last, with depth writes disabled, so they
                         // blend over the opaque geometry behind them instead of
@@ -5424,128 +3965,14 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 }
             }
 
-            // ── Pass 7: selection overlay pass ───────────────────────────────
-            // Redraws selected wires and text with depth_compare=Always so both
-            // appear on top of all other geometry at full brightness — unless
-            // faces are drawn: then edges behind a surface stay hidden while
-            // selected, as they are when not (#1031).
-            let occluded = hidden_line || !mesh_wireframe;
-            let have_text_highlight =
-                (!self.text_highlight_gpu.is_empty()) || !self.block_text_highlight_gpu.is_empty();
-            if !self.gpu_selected_wires.is_empty()
-                || !self.gpu_selected_block_wires.is_empty()
-                || !self.gpu_selected_circles.is_empty()
-                || !self.gpu_selected_ellipses.is_empty()
-                || have_text_highlight
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("selection_xray.render_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: msaa,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_viewport(raster.x, raster.y, raster.width, raster.height, 0.0, 1.0);
-                pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
-                pass.set_stencil_reference(stencil_ref);
-                if !self.gpu_selected_wires.is_empty() {
-                    pass.set_pipeline(if occluded {
-                        &self.wire_pipeline
-                    } else {
-                        &self.wire_xray_pipeline
-                    });
-                    for wire in &self.gpu_selected_wires {
-                        if wire.instance_count > 0 {
-                            if let Some(bg) = &wire.const_bind_group {
-                                pass.set_bind_group(1, bg.as_ref(), &[]);
-                            }
-                            pass.set_vertex_buffer(0, wire.instance_buffer.slice(..));
-                            pass.draw(
-                                0..6,
-                                wire.first_instance..wire.first_instance + wire.instance_count,
-                            );
-                        }
-                    }
-                }
-                if !self.gpu_selected_block_wires.is_empty() {
-                    pass.set_pipeline(if occluded {
-                        &self.block_wire_pipeline
-                    } else {
-                        &self.block_wire_xray_pipeline
-                    });
-                    for wire in &self.gpu_selected_block_wires {
-                        if wire.instance_count == 0 {
-                            continue;
-                        }
-                        bind_and_draw_block_wire(&mut pass, wire);
-                    }
-                }
-                if !self.gpu_selected_circles.is_empty() {
-                    pass.set_pipeline(if occluded {
-                        &self.circle_pipeline
-                    } else {
-                        &self.circle_xray_pipeline
-                    });
-                    pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
-                    for cg in &self.gpu_selected_circles {
-                        if cg.instance_count > 0 {
-                            pass.set_vertex_buffer(0, cg.instance_buffer.slice(..));
-                            pass.draw(0..6, 0..cg.instance_count);
-                        }
-                    }
-                }
-                if !self.gpu_selected_ellipses.is_empty() {
-                    pass.set_pipeline(if occluded {
-                        &self.ellipse_pipeline
-                    } else {
-                        &self.ellipse_xray_pipeline
-                    });
-                    pass.set_bind_group(0, &self.selection_uniform_bind_group, &[]);
-                    for eg in &self.gpu_selected_ellipses {
-                        if eg.instance_count > 0 {
-                            pass.set_vertex_buffer(0, eg.instance_buffer.slice(..));
-                            pass.draw(0..6, 0..eg.instance_count);
-                        }
-                    }
-                }
-                if let Some(atlas) = &self.text_atlas_gpu {
-                    if !self.text_highlight_gpu.is_empty() {
-                        pass.set_pipeline(&self.text_highlight_pipeline);
-                        pass.set_bind_group(1, &atlas.bind_group, &[]);
-                        for text in &self.text_highlight_gpu {
-                            pass.set_vertex_buffer(0, text.vertex_buffer.slice(..));
-                            pass.draw(0..text.vertex_count, 0..1);
-                        }
-                    }
-                }
-                if let Some(atlas) = &self.text_atlas_gpu {
-                    if !self.block_text_highlight_gpu.is_empty() {
-                        pass.set_pipeline(&self.block_text_highlight_pipeline);
-                        pass.set_bind_group(1, &atlas.bind_group, &[]);
-                        for text in &self.block_text_highlight_gpu {
-                            text.draw(&mut pass);
-                        }
-                    }
-                }
+            if self.wire_highlight_target.is_none() && self.has_wire_highlights() {
+                self.render_wire_highlights(
+                    encoder,
+                    raster,
+                    stencil_ref,
+                    hidden_line || !mesh_wireframe,
+                    None,
+                );
             }
 
             // ── Resolve MSAA → resolve texture ────────────────────────────────
@@ -5553,7 +3980,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             // resolve never touches the surface. Only the drawn [0, render_size]
             // corner holds content; the rounded border stays the cleared bg color
             // and is never sampled (the blit UV is scaled to render/alloc).
-            {
+            if msaa_samples() > 1 {
                 let _resolve = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("msaa.resolve_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5573,6 +4000,16 @@ analytic={:.1} regular={:.1} blocks={:.1}",
                 // No draw calls — the pass itself triggers the MSAA resolve.
             }
         } // end `if !self.skip_geometry`
+
+        let wire_highlight = self
+            .wire_highlight_target
+            .as_ref()
+            .filter(|_| self.has_wire_highlights());
+        // After the base resolve, the MSAA color target is available as scratch.
+        // Keep the existing depth/stencil and resolve the highlight separately.
+        if let Some((view, _)) = wire_highlight.filter(|_| self.wire_highlight_dirty) {
+            self.render_wire_highlights(encoder, raster, stencil_ref, false, Some(view));
+        }
 
         // ── Blit resolve texture → surface target at surface_dest position ──
         // The viewport maps the NDC quad to exactly `surface_dest` in the
@@ -5613,6 +4050,10 @@ analytic={:.1} regular={:.1} blocks={:.1}",
             );
             pass.set_bind_group(0, &self.blit_bind_group, &[]);
             pass.draw(0..6, 0..1);
+            if let Some((_, blit)) = wire_highlight {
+                pass.set_bind_group(0, blit, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
 
         // Simple line-command previews live above the cached base scene. The
@@ -5669,9 +4110,23 @@ analytic={:.1} regular={:.1} blocks={:.1}",
 
     /// Reset every cache key that describes this slot's uploaded content.
     pub(crate) fn forget_cached_keys(&mut self) {
+        self.wire_highlight_target = None;
+        self.wire_highlight_dirty = false;
+        self.selected_highlight_gpu_cache = None;
+        self.highlight_wire_cache.clear();
+        self.highlight_wire_cache_bytes = 0;
+        self.highlight_wire_chunks.clear();
+        self.highlight_wire_chunk_bytes = 0;
+        self.highlight_wire_cache_key = None;
+        // The dense-highlight overlay const buffers mirror the arenas' consts;
+        // an arena rebuild invalidates them (the length guards in
+        // highlight_dense double-check).
+        self.dense_highlight_consts.clear();
         self.cached_epoch = (u64::MAX, u64::MAX, u64::MAX);
         self.cached_wire_id = u64::MAX;
         self.cached_selection = (u64::MAX, u64::MAX);
+        self.cached_hover_generation = None;
+        self.hover_text_gpu_cache = None;
         self.cached_highlight_key = (u64::MAX, u64::MAX);
         self.cached_mesh_content_id = u64::MAX;
         self.cached_face3d_key = (u64::MAX, false, false, u64::MAX);
@@ -5682,10 +4137,12 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.cached_image_source = None;
         self.cached_point_cloud_source = None;
         self.cached_text_source = None;
+        self.cached_selected_annotation_source = None;
         self.cached_mesh_source = None;
         self.cached_face3d_source = None;
         self.cached_face3d_depth_source = None;
         self.wire_cull_key = (u64::MAX, u64::MAX, 0, 0);
+        self.wire_cull_view = None;
         self.hatch_lod_key = (usize::MAX, u64::MAX, 0, 0, false);
         self.wipeout_lod_key = (usize::MAX, u64::MAX, 0, 0, false);
         self.silhouette_key = (usize::MAX, u64::MAX, [u32::MAX; 3], false);
@@ -5695,6 +4152,11 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.partition_contributors = wire_arena::ContributorSet::default();
         self.analytic_slots = None;
         self.partition_depth_generation = u64::MAX;
+    }
+
+    /// Accept the errors seen so far without dropping this slot's caches.
+    pub(crate) fn absorb_gpu_errors(&mut self, errors: usize) {
+        self.gpu_error_epoch = errors;
     }
 
     /// Catch errors delivered after the previous upload/submit completed.
@@ -5764,6 +4226,8 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         self.mesh_disabled_chunks.clear();
         self.mesh_dynamic_handles.clear();
         self.mesh_ranges_by_handle.clear();
+        self.mesh_lod_levels.clear();
+        self.mesh_lod_draws.clear();
         self.mesh_highlight_draws.clear();
         self.silhouette_chunks.clear();
         self.silhouette_source_groups.clear();
@@ -5799,33 +4263,64 @@ analytic={:.1} regular={:.1} blocks={:.1}",
         let alloc = Size::new(round_up_tex(size.width), round_up_tex(size.height));
         if self.alloc_size != alloc {
             let size = alloc;
+            self.wire_highlight_target = None;
             let depth_tex = create_depth_texture(device, size);
             self.depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let msaa_tex = create_msaa_texture(device, size, self.surface_format);
-            self.msaa_view = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let resolve_tex = create_resolve_texture(device, size, self.surface_format);
             let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            self.blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit.bind_group"),
-                layout: &self.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&resolve_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.blit_uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            self.msaa_view = if msaa_samples() > 1 {
+                create_msaa_texture(device, size, self.surface_format)
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            } else {
+                resolve_tex.create_view(&wgpu::TextureViewDescriptor::default())
+            };
+            self.blit_bind_group = self.resolve_blit_bind_group(device, &resolve_view);
             self.resolve_view = resolve_view;
             self.alloc_size = alloc;
         }
+    }
+
+    pub(in crate::scene) fn prepare_wire_highlight_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        separate: bool,
+        dirty: bool,
+    ) {
+        self.wire_highlight_dirty = separate && dirty;
+        if !separate {
+            self.wire_highlight_target = None;
+        } else if self.wire_highlight_target.is_none() && self.has_wire_highlights() {
+            let view = create_resolve_texture(device, self.alloc_size, self.surface_format)
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let blit = self.resolve_blit_bind_group(device, &view);
+            self.wire_highlight_target = Some((view, blit));
+            self.wire_highlight_dirty = true;
+        }
+    }
+
+    fn resolve_blit_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit.bind_group"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })
     }
 }
 
@@ -5834,15 +4329,16 @@ analytic={:.1} regular={:.1} blocks={:.1}",
 /// `alloc_size` — this is the mitigation for the Windows-Firefox freeze (#191).
 fn round_up_tex(n: u32) -> u32 {
     const GRID: u32 = 128;
-    ((n.max(1) + GRID - 1) / GRID) * GRID
+    n.max(1).div_ceil(GRID) * GRID
 }
 
 /// `true` when the world-XY AABB projects entirely outside the
-/// viewport rect (extended by `MARGIN_FRAC` to absorb pan inertia and
-/// avoid edge pop-in). Phase 2.2 mesh-frustum / Phase 2.3 hatch +
+/// viewport rect (extended by [`OFFSCREEN_MARGIN_FRAC`] to absorb pan inertia
+/// and avoid edge pop-in). Phase 2.2 mesh-frustum / Phase 2.3 hatch +
 /// wipeout cull. Equivalent to a 2D bounding-box rejection test in
 /// NDC; uses the same 4-corner projection that LOD picking already
-/// does, so the extra cost is negligible.
+/// does, so the extra cost is negligible. Geometry with a known depth
+/// extent calls [`box_offscreen`] instead.
 ///
 /// IMPORTANT: the AABB must be in the same local space (world_offset
 /// subtracted) that `view_proj` expects. `WipeoutGpu.world_aabb` rebuilds
@@ -5862,19 +4358,11 @@ fn aabb_offscreen(
     let w = clip_w as f32;
     let h = clip_h as f32;
     // A corner behind the perspective eye mirrors across the screen, so the
-    // projected union bounds nothing: never cull in that case (#64).
-    let corners = [
-        (x0, y0),
-        (x1, y0),
-        (x0, y1),
-        (x1, y1),
-    ]
-    .map(|(x, y)| {
-        crate::scene::view::projection::project_ndc(
-            view_rot,
-            eye,
-            glam::DVec3::new(x, y, 0.0),
-        )
+    // projected union bounds nothing: never cull in that case (#64). Without a
+    // depth extent there is no telling where this geometry really sits, so a
+    // box entirely behind the eye is kept too.
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| {
+        crate::scene::view::projection::project_ndc(view_rot, eye, glam::DVec3::new(x, y, 0.0))
     });
     let mut min_px = f32::INFINITY;
     let mut max_px = f32::NEG_INFINITY;
@@ -5897,13 +4385,129 @@ fn aabb_offscreen(
             max_py = py;
         }
     }
-    // 25% pad on each side — matches `view_world_aabb` (wire path),
-    // keeps edge geometry rendered while panning before the next
-    // upload reaches the GPU.
-    const MARGIN_FRAC: f32 = 0.25;
-    let mx = w * MARGIN_FRAC;
-    let my = h * MARGIN_FRAC;
+    let mx = w * OFFSCREEN_MARGIN_FRAC;
+    let my = h * OFFSCREEN_MARGIN_FRAC;
     max_px < -mx || min_px > w + mx || max_py < -my || min_py > h + my
+}
+
+/// 25% pad on each side — matches `view_world_aabb` (wire path), keeps edge
+/// geometry rendered while panning before the next upload reaches the GPU.
+const OFFSCREEN_MARGIN_FRAC: f32 = 0.25;
+
+/// [`aabb_offscreen`] for a box that has a real depth extent. A tilted or
+/// perspective view maps the far face to a different screen rect than the near
+/// one, so the test needs all eight corners: projecting the footprint alone
+/// would cull geometry that the camera can still see. `depth_ignored` is the
+/// caller's [`parallel_view_ignores_depth`] answer, passed in so it is decided
+/// once per view rather than once per box.
+fn box_offscreen(
+    bounds: [f64; 6],
+    depth_ignored: bool,
+    view_rot: glam::Mat4,
+    eye: glam::DVec3,
+    clip_w: u32,
+    clip_h: u32,
+) -> bool {
+    let [x0, y0, z0, x1, y1, z1] = bounds;
+    if ![x0, y0, z0, x1, y1, z1].into_iter().all(f64::is_finite) {
+        return false;
+    }
+    let (z0, z1) = if z0 <= z1 { (z0, z1) } else { (z1, z0) };
+    let w = clip_w as f32;
+    let h = clip_h as f32;
+    let corners = [
+        (x0, y0, z0),
+        (x1, y0, z0),
+        (x0, y1, z0),
+        (x1, y1, z0),
+        (x0, y0, z1),
+        (x1, y0, z1),
+        (x0, y1, z1),
+        (x1, y1, z1),
+    ];
+    // The footprint alone bounds the box when the far face lands on the near
+    // one: flat geometry, or a view that depth cannot move on screen.
+    let corners = if z0 == z1 || depth_ignored {
+        &corners[..4]
+    } else {
+        &corners[..]
+    };
+    let mut min_px = f32::INFINITY;
+    let mut max_px = f32::NEG_INFINITY;
+    let mut min_py = f32::INFINITY;
+    let mut max_py = f32::NEG_INFINITY;
+    let mut behind = 0usize;
+    for &(x, y, z) in corners {
+        // A corner behind the perspective eye mirrors across the screen, so the
+        // projected union bounds nothing: never cull a box that straddles the
+        // eye plane (#64). One whose every corner is behind it is out of sight.
+        let Some(clip) =
+            crate::scene::view::projection::project_clip(view_rot, eye, glam::DVec3::new(x, y, z))
+        else {
+            return false;
+        };
+        if crate::scene::view::projection::behind_eye(clip) {
+            behind += 1;
+            continue;
+        }
+        let c = clip.truncate() / clip.w;
+        if !c.is_finite() {
+            return false;
+        }
+        let px = (c.x + 1.0) * 0.5 * w;
+        let py = (1.0 - c.y) * 0.5 * h;
+        if px < min_px {
+            min_px = px;
+        }
+        if px > max_px {
+            max_px = px;
+        }
+        if py < min_py {
+            min_py = py;
+        }
+        if py > max_py {
+            max_py = py;
+        }
+    }
+    if behind == corners.len() {
+        return true;
+    }
+    if behind > 0 {
+        return false;
+    }
+    let mx = w * OFFSCREEN_MARGIN_FRAC;
+    let my = h * OFFSCREEN_MARGIN_FRAC;
+    max_px < -mx || min_px > w + mx || max_py < -my || min_py > h + my
+}
+
+/// Whether a point's Z cannot move it on screen: a parallel projection looking
+/// straight down the world Z axis at the drawing plane, i.e. the usual plan view.
+///
+/// `view_proj_rte` zeroes the bottom row for a parallel projection, and a
+/// translated view keeps it zero, so `(0, 0, 0, 1)` proves one. Perspective
+/// never qualifies — there depth also changes the scale. The tolerance is
+/// relative and sits far above the f32 cosine noise of an exact plan rotation
+/// (~4e-8), while keeping a view tilted by up to 1e-6 rad on the fast path.
+fn parallel_view_ignores_depth(view_rot: glam::Mat4) -> bool {
+    if view_rot.row(3) != glam::Vec4::W {
+        return false;
+    }
+    let along = view_rot
+        .transform_vector3(glam::Vec3::Z)
+        .truncate()
+        .length();
+    let across = view_rot
+        .transform_vector3(glam::Vec3::X)
+        .truncate()
+        .length()
+        .max(
+            view_rot
+                .transform_vector3(glam::Vec3::Y)
+                .truncate()
+                .length(),
+        )
+        .max(f32::MIN_POSITIVE);
+    along <= across * 1e-6
 }
 
 /// Return `true` when the world-XY AABB's screen-space size is below the
@@ -5925,18 +4529,8 @@ fn aabb_below_pixel(
     let h = clip_h as f32;
     // Mirrored corners from behind the eye would fake a tiny or shifted box:
     // keep the draw call when any corner has no real projection (#64).
-    let corners = [
-        (x0, y0),
-        (x1, y0),
-        (x0, y1),
-        (x1, y1),
-    ]
-    .map(|(x, y)| {
-        crate::scene::view::projection::project_ndc(
-            view_rot,
-            eye,
-            glam::DVec3::new(x, y, 0.0),
-        )
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| {
+        crate::scene::view::projection::project_ndc(view_rot, eye, glam::DVec3::new(x, y, 0.0))
     });
     let mut min_px = f32::INFINITY;
     let mut max_px = f32::NEG_INFINITY;
@@ -5962,13 +4556,10 @@ fn aabb_below_pixel(
     (max_px - min_px).max(max_py - min_py) < threshold_px
 }
 
-/// Device bytes a renderer is holding, counted from the sizes it allocated
-/// rather than from process RSS — the allocator and the driver both keep
-/// high-water memory that RSS cannot distinguish from live resources.
-///
-/// Partial by construction: it covers the categories large enough to decide
-/// where the next fix goes, and says so rather than pretending to be a total.
-#[derive(Default, Clone, Copy, PartialEq)]
+/// Logical sizes of live resources held by viewport slots and shared caches.
+/// Shared handles count once. Excludes driver heaps/alignment, staging, iced
+/// and ViewCube resources; Depth24Plus storage is estimated at 4 bytes/texel.
+#[derive(Default, Clone, Copy, PartialEq, serde::Serialize)]
 pub(crate) struct GpuLiveBytes {
     pub slots: usize,
     pub shadow: u64,
@@ -5976,52 +4567,224 @@ pub(crate) struct GpuLiveBytes {
     pub text_atlas: u64,
     pub wire_arena: u64,
     pub block_geometry: u64,
+    pub wires: u64,
+    pub meshes: u64,
+    pub images: u64,
+    pub materials: u64,
+    pub text: u64,
+    pub overlays: u64,
+    pub hatches: u64,
+    pub point_clouds: u64,
+    pub other: u64,
 }
 
 impl GpuLiveBytes {
     pub(crate) fn total(&self) -> u64 {
-        self.shadow + self.render_targets + self.text_atlas + self.wire_arena + self.block_geometry
+        self.shadow
+            + self.render_targets
+            + self.text_atlas
+            + self.wire_arena
+            + self.block_geometry
+            + self.wires
+            + self.meshes
+            + self.images
+            + self.materials
+            + self.text
+            + self.overlays
+            + self.hatches
+            + self.point_clouds
+            + self.other
+    }
+    fn accumulate(&mut self, other: Self) {
+        self.slots += other.slots;
+        self.shadow += other.shadow;
+        self.render_targets += other.render_targets;
+        self.text_atlas += other.text_atlas;
+        self.wire_arena += other.wire_arena;
+        self.block_geometry += other.block_geometry;
+        self.wires += other.wires;
+        self.meshes += other.meshes;
+        self.images += other.images;
+        self.materials += other.materials;
+        self.text += other.text;
+        self.overlays += other.overlays;
+        self.hatches += other.hatches;
+        self.point_clouds += other.point_clouds;
+        self.other += other.other;
     }
 }
 
 impl Pipeline {
-    /// This slot's share. `alloc_size` is the real allocation, which is rounded
-    /// up from the requested size and grows only.
-    fn gpu_live_bytes(&self) -> GpuLiveBytes {
-        // 4x MSAA colour (4 B/sample) + 4x MSAA depth-stencil (4 B/sample) +
-        // one single-sample resolve target.
-        const BYTES_PER_PIXEL: u64 = (MSAA_SAMPLES as u64) * 4 + (MSAA_SAMPLES as u64) * 4 + 4;
-        let pixels = u64::from(self.alloc_size.width) * u64::from(self.alloc_size.height);
-        GpuLiveBytes {
+    fn collect_gpu_live<'a>(&'a self, counter: &mut gpu_memory::ResourceCounter<'a>) -> GpuLiveBytes {
+        let mut bytes = GpuLiveBytes {
             slots: 1,
-            // Only while this viewport casts shadows; the placeholder that
-            // stands in otherwise is 4 bytes.
-            shadow: match &self.shadow_full {
-                Some(_) => u64::from(SHADOW_MAP_SIZE) * u64::from(SHADOW_MAP_SIZE) * 4,
-                None => 4,
-            },
-            render_targets: pixels * BYTES_PER_PIXEL,
-            text_atlas: self
-                .text_atlas_gpu
+            ..Default::default()
+        };
+        bytes.shadow = counter.texture(&self._shadow_fallback_texture)
+            + self
+                .shadow_full
                 .as_ref()
-                .map(text_gpu::TextAtlasGpu::gpu_bytes)
-                .unwrap_or(0),
-            wire_arena: self
-                .wire_arena
+                .map_or(0, |(texture, _)| counter.texture(texture));
+        bytes.render_targets = counter.texture(self.depth_view.texture())
+            + counter.texture(self.msaa_view.texture())
+            + counter.texture(self.resolve_view.texture())
+            + self
+                .wire_highlight_target
                 .as_ref()
-                .map(wire_arena::PersistentWireArena::gpu_bytes)
-                .unwrap_or(0)
-                + self
-                    .wire_arena_mesh
-                    .as_ref()
-                    .map(wire_arena::PersistentWireArena::gpu_bytes)
-                    .unwrap_or(0),
-            block_geometry: 0,
+                .map_or(0, |(view, _)| counter.texture(view.texture()));
+        bytes.text_atlas = self
+            .text_atlas_gpu
+            .as_ref()
+            .map_or(0, |atlas| atlas.counted_gpu_bytes(counter));
+        // Arenas first: draw-range WireGpu clones below must not charge them again.
+        for arena in [&self.wire_arena, &self.wire_arena_mesh]
+            .into_iter()
+            .flatten()
+        {
+            bytes.wire_arena += arena.gpu_bytes(counter);
         }
+        bytes.wires += counter.wires(&self.gpu_wires)
+            + counter.wires(&self.wire_arena_fallback)
+            + counter.wires(&self.gpu_face3d_edges);
+        for circle in self.gpu_circles.iter() {
+            bytes.wires += counter.buffer(&circle.instance_buffer);
+        }
+        for ellipse in self.gpu_ellipses.iter() {
+            bytes.wires += counter.buffer(&ellipse.instance_buffer);
+        }
+        bytes.block_geometry += counter.blocks(&self.gpu_block_wires);
+        bytes.text += counter.text(&self.text_gpu) + counter.block_text(&self.block_text_gpu);
+        for chunks in [
+            self.gpu_mesh_batch.as_slice(),
+            self.gpu_mesh_dynamic.as_slice(),
+        ] {
+            let (meshes, materials) = counter.meshes(chunks);
+            bytes.meshes += meshes;
+            bytes.materials += materials;
+        }
+        bytes.materials += self.mesh_default_material_memory.gpu_bytes(counter);
+        for image in &self.gpu_images {
+            bytes.images += image.gpu_bytes(counter);
+        }
+        bytes.point_clouds += self.gpu_point_clouds.gpu_bytes(counter);
+        bytes.hatches +=
+            self.hatch_gpu.gpu_bytes(counter) + self.hatch_translucent_gpu.gpu_bytes(counter);
+        for wipeout in &self.gpu_wipeouts {
+            bytes.hatches +=
+                counter.buffer(&wipeout.vertex_buffer) + counter.buffer(&wipeout.instance_buffer)
+                + counter.buffer(&wipeout.uniform_buffers[0])
+                + counter.buffer(&wipeout.uniform_buffers[1]);
+        }
+        if let Some(fill) = &self.gpu_face3d_fill {
+            for chunk in fill.chunks_3d.iter().chain(&fill.chunks_2d) {
+                bytes.meshes += counter.buffer(&chunk.vertex_buffer);
+            }
+            for chunk in fill.block_chunks_3d.iter().chain(&fill.block_chunks_2d) {
+                bytes.meshes +=
+                    counter.buffer(&chunk.vertex_buffer) + counter.buffer(&chunk.instance_buffer);
+            }
+        }
+        bytes.overlays += counter.wires(&self.gpu_selected_wires)
+            + counter.wires(&self.gpu_preview_wires)
+            + counter.text(&self.text_highlight_gpu)
+            + counter.text(&self.text_preview_gpu)
+            + counter.block_text(&self.block_text_highlight_gpu);
+        bytes.block_geometry += counter.blocks(&self.gpu_selected_block_wires)
+            + counter.blocks(&self.gpu_preview_block_wires);
+        for circle in self
+            .gpu_selected_circles
+            .iter()
+            .chain(&self.gpu_preview_circles)
+        {
+            bytes.overlays += counter.buffer(&circle.instance_buffer);
+        }
+        for ellipse in self
+            .gpu_selected_ellipses
+            .iter()
+            .chain(&self.gpu_preview_ellipses)
+        {
+            bytes.overlays += counter.buffer(&ellipse.instance_buffer);
+        }
+        for wires in self.highlight_wire_cache.values() {
+            bytes.overlays += counter.wires(wires);
+        }
+        for chunk in self.highlight_wire_chunks.values() {
+            bytes.overlays += counter.wires(&chunk.gpu);
+        }
+        if let Some(cache) = &self.selected_highlight_gpu_cache {
+            bytes.overlays += counter.wires(&cache.wires)
+                + counter.text(&cache.text)
+                + counter.block_text(&cache.block_text);
+            bytes.block_geometry += counter.blocks(&cache.blocks);
+            for circle in &cache.circles {
+                bytes.overlays += counter.buffer(&circle.instance_buffer);
+            }
+            for ellipse in &cache.ellipses {
+                bytes.overlays += counter.buffer(&ellipse.instance_buffer);
+            }
+        }
+        for chunk in &self.silhouette_chunks {
+            bytes.overlays +=
+                counter.buffer(&chunk.vertex_buffer) + counter.buffer(&chunk.instance_buffer);
+        }
+        for group in &self.silhouette_source_groups {
+            for (buffer, _) in &group.instance_buffers {
+                bytes.overlays += counter.buffer(buffer);
+            }
+        }
+        if let Some((buffer, _)) = &self.clip_boundary {
+            bytes.other += counter.buffer(buffer);
+        }
+        bytes.other += counter.buffer(&self.uniform_buffer)
+            + counter.buffer(&self.selection_uniform_buffer)
+            + counter.buffer(&self.blit_uniform_buffer)
+            + counter.texture(&self.background_texture)
+            + counter.texture(&self.environment_texture);
+        bytes
     }
 }
 
 impl MultiPipeline {
+    /// After a panic in `prepare` the caches can be half written: forget
+    /// them, so that the next draw builds them again.
+    pub(in crate::scene) fn forget_after_draw_panic(&mut self) {
+        self.wire_buffer_cache.clear();
+        self.mesh_batch_cache.clear();
+        self.block_geometry.clear();
+        for inner in &mut self.inners {
+            inner.forget_cached_keys();
+        }
+    }
+
+    /// A closed scene no longer owns any GPU slot, even on the Start tab.
+    pub(in crate::scene) fn release_closed_slots(&mut self, device: &wgpu::Device) -> usize {
+        let mut released = 0;
+        for inner in &mut self.inners {
+            if inner.slot_id != u64::MAX && inner.slot_owner.strong_count() == 0 {
+                self.slot_by_instance.remove(&inner.slot_id);
+                inner.release_heavy_resources(device);
+                inner.slot_id = u64::MAX;
+                released += 1;
+            }
+        }
+        if released > 0 {
+            self.prune_shared_resources();
+        }
+        released
+    }
+
+    fn prune_shared_resources(&mut self) {
+        self.wire_buffer_cache.retain(|_, entry| {
+            std::sync::Arc::strong_count(&entry.0) > 1
+                || std::sync::Arc::strong_count(&entry.1) > 1
+                || std::sync::Arc::strong_count(&entry.3) > 1
+                || std::sync::Arc::strong_count(&entry.4) > 1
+        });
+        self.mesh_batch_cache
+            .retain(|_, entry| std::sync::Arc::strong_count(&entry.1) > 1);
+        self.block_geometry.clear();
+    }
+
     /// Release cold slots after 64 frames, or two frames under memory pressure.
     /// Current and previous frame slots remain reserved for sibling widgets.
     pub(crate) fn release_idle_slots(
@@ -6045,9 +4808,9 @@ impl MultiPipeline {
             }
             // Nothing to give back — releasing again would only churn the
             // render targets it just rebuilt at their smallest size.
-            let held = self.inners[index].gpu_live_bytes();
-            if held.wire_arena == 0
-                && held.shadow <= 4
+            if self.inners[index].wire_arena.is_none()
+                && self.inners[index].wire_arena_mesh.is_none()
+                && self.inners[index].shadow_full.is_none()
                 && self.inners[index].alloc_size == Size::new(0, 0)
             {
                 continue;
@@ -6056,16 +4819,7 @@ impl MultiPipeline {
             released += 1;
         }
         if released > 0 {
-            self.wire_buffer_cache.retain(|_, entry| {
-                std::sync::Arc::strong_count(&entry.0) > 1
-                    || std::sync::Arc::strong_count(&entry.1) > 1
-                    || std::sync::Arc::strong_count(&entry.3) > 1
-            });
-            self.mesh_batch_cache
-                .retain(|_, entry| std::sync::Arc::strong_count(&entry.1) > 1);
-            // Block records are host memory a released slot no longer needs;
-            // the next build re-emits what it still draws.
-            self.block_geometry.clear();
+            self.prune_shared_resources();
         }
         released
     }
@@ -6073,22 +4827,25 @@ impl MultiPipeline {
     /// Sum across slots, plus the caches held once for all of them.
     pub(crate) fn gpu_live_bytes(&self) -> GpuLiveBytes {
         let mut total = GpuLiveBytes::default();
-        // Block arenas belong to the batches, and a cached build hands the same
-        // arenas to several slots, so each one is counted once.
-        let mut counted = rustc_hash::FxHashSet::default();
+        let mut counter = gpu_memory::ResourceCounter::default();
         for inner in &self.inners {
-            let slot = inner.gpu_live_bytes();
-            total.slots += slot.slots;
-            total.shadow += slot.shadow;
-            total.render_targets += slot.render_targets;
-            total.text_atlas += slot.text_atlas;
-            total.wire_arena += slot.wire_arena;
-            total.block_geometry +=
-                wire_gpu::block_arena_bytes(&inner.gpu_block_wires, &mut counted)
-                    + wire_gpu::block_arena_bytes(&inner.gpu_selected_block_wires, &mut counted);
+            total.accumulate(inner.collect_gpu_live(&mut counter));
         }
+        // Cold cached resources are still live even without an active slot.
         for entry in self.wire_buffer_cache.values() {
-            total.block_geometry += wire_gpu::block_arena_bytes(&entry.1, &mut counted);
+            total.wires += counter.wires(&entry.0);
+            total.block_geometry += counter.blocks(&entry.1);
+            for circle in entry.3.iter() {
+                total.wires += counter.buffer(&circle.instance_buffer);
+            }
+            for ellipse in entry.4.iter() {
+                total.wires += counter.buffer(&ellipse.instance_buffer);
+            }
+        }
+        for entry in self.mesh_batch_cache.values() {
+            let (meshes, materials) = counter.meshes(&entry.1);
+            total.meshes += meshes;
+            total.materials += materials;
         }
         total
     }
@@ -6148,7 +4905,7 @@ fn create_depth_texture(device: &wgpu::Device, size: Size<u32>) -> wgpu::Texture
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count: msaa_samples(),
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth24PlusStencil8,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -6190,7 +4947,7 @@ fn create_msaa_texture(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count: msaa_samples(),
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -6225,7 +4982,13 @@ pub struct MultiPipeline {
     slot_last_used: Vec<u64>,
     slot_clock: u64,
     pub(crate) frame_rendered: std::sync::atomic::AtomicBool,
+    /// The frames whose draw panicked, so that their data is not drawn again.
+    pub(crate) draw_faults: crate::scene::view::draw_guard::DrawFaults,
     pub(crate) gpu_error_epoch: usize,
+    /// Consecutive frames that each reported new device errors.
+    pub(crate) gpu_error_streak: u32,
+    /// Consecutive frames without new device errors.
+    pub(crate) gpu_clean_frames: u32,
     /// Definition geometry shared across viewport slots.
     pub(crate) block_geometry: wire_gpu::BlockGeometryCache,
     /// Solid-mesh batches shared across slots, keyed by mesh-set identity.
@@ -6456,6 +5219,11 @@ impl GpuStatus {
 /// The adapter of the most recently created device.
 static GPU_ADAPTER: std::sync::Mutex<Option<GpuAdapter>> = std::sync::Mutex::new(None);
 
+/// Check without constructing the drawing pipeline on an empty Start tab.
+pub(crate) fn viewport_pipeline_initialized() -> bool {
+    GPU_ADAPTER.lock().is_ok_and(|slot| slot.is_some())
+}
+
 /// How many times the viewport has asked the scene for a primitive. Counted
 /// in `ViewportPane::draw`, which every renderer calls; only wgpu goes on to
 /// `prepare` and build a device. Draws without a device are therefore the
@@ -6540,70 +5308,32 @@ pub(crate) fn gpu_status_if_changed(seen: &mut u64) -> Option<GpuStatus> {
 }
 
 #[cfg(test)]
-mod gpu_status_tests {
-    use super::*;
+mod gpu_status_tests;
 
-    fn adapter(name: &str, device_type: wgpu::DeviceType) -> GpuAdapter {
-        GpuAdapter {
-            name: name.to_string(),
-            backend: wgpu::Backend::Vulkan,
-            device_type,
+impl MultiPipeline {
+    /// Construct a headless off-screen pipeline without mutating global GUI
+    /// adapter status or installing a process-wide GPU error counter handler.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new_headless(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            block_geometry: Default::default(),
+            inners: vec![Pipeline::new(device, queue, format)],
+            format,
+            slot_by_instance: rustc_hash::FxHashMap::default(),
+            slot_last_used: vec![0],
+            slot_clock: 0,
+            frame_rendered: std::sync::atomic::AtomicBool::new(false),
+            draw_faults: Default::default(),
+            gpu_error_epoch: 0,
+            gpu_error_streak: 0,
+            gpu_clean_frames: 0,
+            mesh_batch_cache: Default::default(),
+            wire_buffer_cache: rustc_hash::FxHashMap::default(),
         }
-    }
-
-    #[test]
-    fn software_is_the_device_type_or_a_known_fallback_name() {
-        assert!(adapter("llvmpipe (LLVM 21.1.8, 256 bits)", wgpu::DeviceType::Cpu).is_software());
-        // WebGPU reports every adapter as Other, so the name has to carry it.
-        assert!(adapter(
-            "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)",
-            wgpu::DeviceType::Other
-        )
-        .is_software());
-        assert!(adapter("Microsoft Basic Render Driver", wgpu::DeviceType::Other).is_software());
-        assert!(!adapter("NVIDIA GeForce GT 1030", wgpu::DeviceType::DiscreteGpu).is_software());
-        assert!(!adapter("Apple M2", wgpu::DeviceType::IntegratedGpu).is_software());
-        assert!(!adapter("", wgpu::DeviceType::Other).is_software());
-    }
-
-    #[test]
-    fn the_verdict_needs_either_a_device_or_enough_dropped_draws() {
-        assert_eq!(gpu_status_from(None, 0), GpuStatus::Unknown);
-        assert_eq!(
-            gpu_status_from(None, SCENE_DRAWS_BEFORE_NO_RENDERER - 1),
-            GpuStatus::Unknown
-        );
-        assert_eq!(
-            gpu_status_from(None, SCENE_DRAWS_BEFORE_NO_RENDERER),
-            GpuStatus::NoRenderer
-        );
-        let gpu = adapter("NVIDIA GeForce GT 1030", wgpu::DeviceType::DiscreteGpu);
-        assert_eq!(
-            gpu_status_from(Some(gpu.clone()), 100),
-            GpuStatus::Hardware(gpu)
-        );
-        let cpu = adapter("llvmpipe", wgpu::DeviceType::Cpu);
-        assert_eq!(
-            gpu_status_from(Some(cpu.clone()), 0),
-            GpuStatus::Software(cpu)
-        );
-    }
-
-    #[test]
-    fn only_degraded_verdicts_carry_an_identity() {
-        assert!(GpuStatus::Unknown.identity().is_none());
-        assert!(
-            GpuStatus::Hardware(adapter("x", wgpu::DeviceType::DiscreteGpu))
-                .identity()
-                .is_none()
-        );
-        assert_eq!(
-            GpuStatus::NoRenderer.identity().as_deref(),
-            Some("no-renderer")
-        );
-        let software = GpuStatus::Software(adapter("llvmpipe", wgpu::DeviceType::Cpu));
-        assert!(software.is_degraded());
-        assert_eq!(software.identity().as_deref(), Some("software:llvmpipe"));
     }
 }
 
@@ -6619,7 +5349,10 @@ impl iced::widget::shader::Pipeline for MultiPipeline {
             slot_last_used: vec![0],
             slot_clock: 0,
             frame_rendered: std::sync::atomic::AtomicBool::new(false),
+            draw_faults: Default::default(),
             gpu_error_epoch: gpu_errors_seen(),
+            gpu_error_streak: 0,
+            gpu_clean_frames: 0,
             mesh_batch_cache: Default::default(),
             wire_buffer_cache: rustc_hash::FxHashMap::default(),
         }
@@ -6627,95 +5360,16 @@ impl iced::widget::shader::Pipeline for MultiPipeline {
 }
 
 #[cfg(test)]
-mod highlight_classification_tests {
-    use super::*;
-    use crate::scene::model::wire_model::TangentGeom;
+mod mesh_highlight_draw_tests;
 
-    fn plain(name: &str) -> WireModel {
-        WireModel::solid(
-            name.to_string(),
-            vec![[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
-            [1.0; 4],
-            false,
-        )
-    }
-
-    fn circle(name: &str) -> WireModel {
-        let mut wire = plain(name);
-        wire.tangent_geoms.push(TangentGeom::PlanarCircle {
-            center: [0.0, 0.0, 0.0],
-            axis_x: [1.0, 0.0, 0.0],
-            axis_y: [0.0, 1.0, 0.0],
-            radius: 2.0,
-        });
-        wire
-    }
-
-    fn ellipse(name: &str) -> WireModel {
-        let mut wire = plain(name);
-        wire.tangent_geoms.push(TangentGeom::PlanarEllipse {
-            center: [0.0, 0.0, 0.0],
-            major_axis: [2.0, 0.0, 0.0],
-            normal: [0.0, 0.0, 1.0],
-            minor_axis_ratio: 0.5,
-            start_param: 0.0,
-            end_param: std::f64::consts::TAU,
-        });
-        wire
-    }
-
-    #[test]
-    fn each_wire_lands_in_the_bucket_the_old_predicate_chose() {
-        let wires = [plain("1"), circle("2"), ellipse("3"), plain("4")];
-        let refs: Vec<&WireModel> = wires.iter().collect();
-        let depth_map = rustc_hash::FxHashMap::default();
-
-        let (circles, ellipses, regular, blocks) =
-            Pipeline::classify_highlight_wires(&refs, None, &depth_map);
-
-        for wire in &refs {
-            let was_regular = wire.render_instance.is_none()
-                && circle_gpu::extract_circle_instances(wire, 0.0).is_none()
-                && ellipse_gpu::extract_ellipse_instances(wire, 0.0).is_none();
-            assert_eq!(
-                was_regular,
-                regular.iter().any(|kept| std::ptr::eq(*kept, *wire)),
-                "wire {} disagrees with the old predicate",
-                wire.name,
-            );
-        }
-
-        assert_eq!(regular.len(), 2, "two plain lines");
-        assert_eq!(circles.len(), 1, "one circle instance");
-        assert_eq!(ellipses.len(), 1, "one ellipse instance");
-        assert!(blocks.is_empty(), "no block wires in this sample");
-    }
-
-    // Hover recolours every instance; a selection only recolours when a tint is
-    // configured. Both go through the same argument, so it has to actually
-    // reach the instances.
-    #[test]
-    fn the_colour_override_reaches_the_instances() {
-        let wires = [circle("2"), ellipse("3")];
-        let refs: Vec<&WireModel> = wires.iter().collect();
-        let depth_map = rustc_hash::FxHashMap::default();
-
-        let (tinted_circles, tinted_ellipses, _, _) =
-            Pipeline::classify_highlight_wires(&refs, Some(WireModel::HOVER), &depth_map);
-        assert_eq!(tinted_circles[0].color, WireModel::HOVER);
-        assert_eq!(tinted_ellipses[0].color, WireModel::HOVER);
-
-        let (plain_circles, _, _, _) = Pipeline::classify_highlight_wires(&refs, None, &depth_map);
-        assert_ne!(
-            plain_circles[0].color,
-            WireModel::HOVER,
-            "without a tint the extractor's own colour stands",
-        );
-    }
-}
+#[cfg(test)]
+mod highlight_classification_tests;
 
 /// Whether analytical blocks, circles and ellipses are patched in place on an
 /// edit (`OCS_ANALYTIC_PATCH=0` turns it off).
 pub(crate) fn analytic_patch_enabled() -> bool {
     analytic_slots::enabled()
 }
+
+#[cfg(test)]
+mod msaa_sample_tests;

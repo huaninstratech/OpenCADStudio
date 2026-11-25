@@ -9,12 +9,16 @@
 // completed selection action fires straight away, no Enter required.
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
 use crate::modules::draw::fence::FencePick;
 use crate::scene::model::wire_model::WireModel;
+
+/// The step a path picked from a box clicked at the empty command prompt
+/// relaunches into: it only records the set as the Previous selection.
+pub const IMPLIED_PATH_DONE: &str = "_SELECT_PATH_DONE";
 
 pub struct SelectObjectsCommand {
     prompt_cmd: String,
@@ -43,7 +47,7 @@ pub struct SelectObjectsCommand {
     associative_dimensions_only: bool,
     /// The kinds of object the command takes; the host drops the rest of
     /// each completed selection silently, and Enter on nothing ends quietly.
-    keep: Option<fn(&codec::EntityType) -> bool>,
+    keep: Option<fn(&document::EntityType) -> bool>,
     /// A SEttings keyword at the prompt, and what it does.
     settings: Option<fn() -> CmdResult>,
     /// A command's own keyword at the prompt (its label, the keyword and
@@ -156,7 +160,7 @@ impl SelectObjectsCommand {
         prompt_cmd: &str,
         pending_cmd: &str,
         prompt_text: &'static str,
-        keep: fn(&codec::EntityType) -> bool,
+        keep: fn(&document::EntityType) -> bool,
     ) -> Self {
         let mut command = Self::with_prompt(prompt_cmd, pending_cmd, prompt_text);
         command.keep = Some(keep);
@@ -244,7 +248,11 @@ impl CadCommand for SelectObjectsCommand {
         // The reference asks the same "Select objects:" however many are
         // picked; each pick's count is its own "N found" line.
         if self.auto_constrain_settings {
-            return t!("%{cmd}  Select objects or [Settings]:", cmd = self.prompt_cmd).into_owned();
+            return t!(
+                "%{cmd}  Select objects or [Settings]:",
+                cmd = self.prompt_cmd
+            )
+            .into_owned();
         }
         t!("%{cmd}  Select objects:", cmd = self.prompt_cmd).into_owned()
     }
@@ -257,6 +265,23 @@ impl CadCommand for SelectObjectsCommand {
         self.pick.is_none()
     }
 
+    /// Fence and polygon points are the bare cursor: object snap would pull
+    /// them onto the objects being selected.
+    fn wants_raw_point(&self) -> bool {
+        self.pick.is_some()
+    }
+
+    fn selection_path(&self) -> Option<crate::command::SelectionPath> {
+        self.pick
+            .as_ref()
+            .map(|pick| crate::command::SelectionPath {
+                points: pick.points.clone(),
+                closed: pick.closed,
+                crossing: self.pick_crossing,
+                implied: self.pending_cmd == IMPLIED_PATH_DONE,
+            })
+    }
+
     fn entity_pick_highlights_hover(&self) -> bool {
         self.pick.is_none()
     }
@@ -265,7 +290,7 @@ impl CadCommand for SelectObjectsCommand {
         self.associative_dimensions_only
     }
 
-    fn selection_entity_filter(&self) -> Option<fn(&codec::EntityType) -> bool> {
+    fn selection_entity_filter(&self) -> Option<fn(&document::EntityType) -> bool> {
         self.keep
     }
 
@@ -314,6 +339,15 @@ impl CadCommand for SelectObjectsCommand {
     }
 
     fn on_selection_complete(&mut self, handles: Vec<Handle>) -> CmdResult {
+        // A path started from a box clicked with no command running is the
+        // whole selection: it ends with the path, leaving the objects
+        // selected, as a box picked there would.
+        if self.pending_cmd == IMPLIED_PATH_DONE {
+            if handles.is_empty() {
+                return CmdResult::Cancel;
+            }
+            return CmdResult::Relaunch(std::mem::take(&mut self.pending_cmd), handles);
+        }
         if self.commit_on_enter {
             // Keep gathering: remember the running set and update the prompt.
             // The command is applied when the user presses Enter / right-clicks.
@@ -402,7 +436,8 @@ impl CadCommand for SelectObjectsCommand {
     fn on_preview_wires(&mut self, pt: DVec3) -> Vec<WireModel> {
         match &self.pick {
             Some(pick) if !pick.is_empty() => {
-                vec![pick.preview([pt.x, pt.y], "select_fence")]
+                let window_polygon = pick.closed && !self.pick_crossing;
+                vec![pick.preview_styled([pt.x, pt.y], "select_fence", !window_polygon)]
             }
             _ => vec![],
         }
@@ -480,7 +515,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_select_objects_command_entity_pick_and_relaunch() {
+    fn select_objects_command_entity_pick_and_relaunch() {
         let mut cmd = SelectObjectsCommand::new("MOVE");
         assert!(cmd.is_selection_gathering());
         assert_eq!(cmd.prompt(), "MOVE  Select objects:");
@@ -515,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_objects_command_single_pick_variant() {
+    fn select_objects_command_single_pick_variant() {
         let mut cmd = SelectObjectsCommand::instant("CHAMFER");
         let h = Handle::new(99);
 

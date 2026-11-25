@@ -9,7 +9,7 @@
 //      Press Enter to apply changes.
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, HatchEditOperation};
@@ -30,24 +30,39 @@ pub struct HatcheditCommand {
     disassociate: bool,
     store_origin: bool,
     current_origin: [f64; 2],
-    origin_plane: kernel::space::Plane,
+    origin_plane: ocs_geom::space::Plane,
     origin_bounds: Option<([f64; 2], [f64; 2])>,
     origin_bounds_unavailable: bool,
-    style: Option<codec::entities::HatchStyleType>,
+    style: Option<document::entities::HatchStyleType>,
     annotative: Option<bool>,
     annotative_current: bool,
-    style_current: codec::entities::HatchStyleType,
+    style_current: document::entities::HatchStyleType,
     input: Option<&'static str>,
-    source_appearance: Option<(codec::types::Color, String, codec::types::Transparency)>,
-    current_color: codec::types::Color,
-    current_transparency: codec::types::Transparency,
+    source_appearance: Option<(
+        document::types::Color,
+        String,
+        document::types::Transparency,
+    )>,
+    current_color: document::types::Color,
+    current_transparency: document::types::Transparency,
     boundary_region: bool,
     association_sources: Option<(
         crate::command::WorkingPlane,
         rustc_hash::FxHashMap<Handle, crate::scene::BoundarySource>,
     )>,
-    association_paths: Vec<codec::entities::BoundaryPath>,
+    association_paths: Vec<document::entities::BoundaryPath>,
     association_missed: bool,
+    /// The Hatch panel's settings as it opened on the hatch, and as edited.
+    panel: Option<(
+        crate::modules::draw::draw::hatch::HatchSettings,
+        crate::modules::draw::draw::hatch::HatchSettings,
+    )>,
+}
+
+impl Default for HatcheditCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HatcheditCommand {
@@ -60,7 +75,7 @@ impl HatcheditCommand {
             origin_bounds: None,
             origin_bounds_unavailable: false,
             current_origin: [0.0, 0.0],
-            origin_plane: kernel::space::Plane::from_axes(
+            origin_plane: ocs_geom::space::Plane::from_axes(
                 [0.0; 3],
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
@@ -68,15 +83,16 @@ impl HatcheditCommand {
             style: None,
             annotative: None,
             annotative_current: false,
-            style_current: codec::entities::HatchStyleType::Normal,
+            style_current: document::entities::HatchStyleType::Normal,
             input: None,
             source_appearance: None,
-            current_color: codec::types::Color::ByLayer,
-            current_transparency: codec::types::Transparency::ByLayer,
+            current_color: document::types::Color::ByLayer,
+            current_transparency: document::types::Transparency::ByLayer,
             boundary_region: false,
             association_sources: None,
             association_paths: Vec::new(),
             association_missed: false,
+            panel: None,
         }
     }
 
@@ -100,7 +116,7 @@ impl HatcheditCommand {
             origin_bounds: None,
             origin_bounds_unavailable: false,
             current_origin: [0.0, 0.0],
-            origin_plane: kernel::space::Plane::from_axes(
+            origin_plane: ocs_geom::space::Plane::from_axes(
                 [0.0; 3],
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
@@ -108,15 +124,16 @@ impl HatcheditCommand {
             style: None,
             annotative: None,
             annotative_current: annotative,
-            style_current: codec::entities::HatchStyleType::Normal,
+            style_current: document::entities::HatchStyleType::Normal,
             input: None,
             source_appearance: None,
-            current_color: codec::types::Color::ByLayer,
-            current_transparency: codec::types::Transparency::ByLayer,
+            current_color: document::types::Color::ByLayer,
+            current_transparency: document::types::Transparency::ByLayer,
             boundary_region: false,
             association_sources: None,
             association_paths: Vec::new(),
             association_missed: false,
+            panel: None,
         }
     }
 
@@ -157,7 +174,7 @@ impl HatcheditCommand {
         rings: Vec<Vec<[f64; 2]>>,
         sources: &rustc_hash::FxHashMap<Handle, crate::scene::BoundarySource>,
     ) {
-        let exterior = kernel::geom2d::ring_nesting_depths(&rings)
+        let exterior = ocs_geom::geom2d::ring_nesting_depths(&rings)
             .into_iter()
             .map(|depth| depth == 0)
             .collect::<Vec<_>>();
@@ -175,11 +192,13 @@ impl HatcheditCommand {
     }
     pub fn with_appearance(
         mut self,
-        entity: Option<&codec::EntityType>,
-        current_color: codec::types::Color,
-        current_transparency: codec::types::Transparency,
+        entity: Option<&document::EntityType>,
+        current_color: document::types::Color,
+        current_transparency: document::types::Transparency,
     ) -> Self {
-        if let Some(codec::EntityType::Hatch(hatch)) = entity {
+        if let Some(document::EntityType::Hatch(hatch)) = entity {
+            let settings = crate::entities::hatch::panel_settings(hatch, self.annotative_current);
+            self.panel = Some((settings.clone(), settings));
             self.style_current = hatch.style;
             self.origin_plane = crate::entities::curve::ocs_plane(hatch.normal, hatch.elevation);
             self.origin_bounds = hatch
@@ -195,26 +214,26 @@ impl HatcheditCommand {
                     let mut anchors = Vec::new();
                     for curve in curves {
                         match curve {
-                            kernel::geom2d::Curve::Ellipse(arc) => {
+                            ocs_geom::geom2d::Curve::Ellipse(arc) => {
                                 if (arc.end_parameter - arc.start_parameter).abs()
                                     < std::f64::consts::TAU
                                 {
                                     return None;
                                 }
                                 for angle in [0.0, std::f64::consts::FRAC_PI_2] {
-                                    anchors.push(kernel::geom2d::Curve::Line(
-                                        kernel::geom2d::Line {
+                                    anchors.push(ocs_geom::geom2d::Curve::Line(
+                                        ocs_geom::geom2d::Line {
                                             start: arc.ellipse.point_at(angle),
                                             end: arc.ellipse.point_at(angle + std::f64::consts::PI),
                                         },
                                     ));
                                 }
                             }
-                            kernel::geom2d::Curve::Nurbs(_) => return None,
+                            ocs_geom::geom2d::Curve::Nurbs(_) => return None,
                             other => anchors.push(other),
                         }
                     }
-                    kernel::geom2d::analytic_curve_bounds(&anchors)
+                    ocs_geom::geom2d::analytic_curve_bounds(&anchors)
                 });
         }
         self.source_appearance = entity.map(|e| {
@@ -247,13 +266,42 @@ impl CadCommand for HatcheditCommand {
         "HATCHEDIT"
     }
 
+    /// The Hatch panel shows on the picked hatch while no option is being
+    /// answered at the prompt.
+    fn hatch_settings(&self) -> Option<crate::modules::draw::draw::hatch::HatchSettings> {
+        if !matches!(self.step, HatcheditStep::EditOptions { .. }) || self.input.is_some() {
+            return None;
+        }
+        self.panel.as_ref().map(|(_, now)| now.clone())
+    }
+
+    fn set_hatch_settings(&mut self, settings: crate::modules::draw::draw::hatch::HatchSettings) {
+        if let Some((_, now)) = self.panel.as_mut() {
+            *now = settings;
+        }
+    }
+
+    fn hatch_panel_edit(
+        &self,
+    ) -> Option<(
+        Handle,
+        crate::modules::draw::draw::hatch::HatchSettings,
+        crate::modules::draw::draw::hatch::HatchSettings,
+    )> {
+        let HatcheditStep::EditOptions { handle, .. } = &self.step else {
+            return None;
+        };
+        let (before, after) = self.panel.as_ref()?;
+        Some((*handle, before.clone(), after.clone()))
+    }
+
     fn prompt(&self) -> String {
         if let Some(input) = self.input {
             if input == "style" {
                 let current = match self.style_current {
-                    codec::entities::HatchStyleType::Normal => "Normal",
-                    codec::entities::HatchStyleType::Outer => "Outer",
-                    codec::entities::HatchStyleType::Ignore => "Ignore",
+                    document::entities::HatchStyleType::Normal => "Normal",
+                    document::entities::HatchStyleType::Outer => "Outer",
+                    document::entities::HatchStyleType::Ignore => "Ignore",
                 };
                 return format!("Enter hatching style [Ignore/Outer/Normal] <{current}>:");
             }
@@ -267,8 +315,8 @@ impl CadCommand for HatcheditCommand {
                         return format!(
                             "Specify transparency (0-90) or ByLayer/ByBlock <{}>:",
                             match transparency {
-                                codec::types::Transparency::ByLayer => "ByLayer".into(),
-                                codec::types::Transparency::ByBlock => "ByBlock".into(),
+                                document::types::Transparency::ByLayer => "ByLayer".into(),
+                                document::types::Transparency::ByBlock => "ByBlock".into(),
                                 value => format!("{:.0}", value.as_percent() * 100.0),
                             }
                         )
@@ -441,7 +489,7 @@ impl CadCommand for HatcheditCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let keyword = text.trim().to_ascii_uppercase();
         if let Some(input) = self.input {
-            use codec::types::{Color, Transparency};
+            use document::types::{Color, Transparency};
             let appearance = |color, layer, transparency| HatchEditOperation::Appearance {
                 color,
                 layer,
@@ -503,9 +551,9 @@ impl CadCommand for HatcheditCommand {
                 }
                 "style" => {
                     self.style = match keyword.as_str() {
-                        "I" | "IGNORE" => Some(codec::entities::HatchStyleType::Ignore),
-                        "O" | "OUTER" => Some(codec::entities::HatchStyleType::Outer),
-                        "N" | "NORMAL" => Some(codec::entities::HatchStyleType::Normal),
+                        "I" | "IGNORE" => Some(document::entities::HatchStyleType::Ignore),
+                        "O" | "OUTER" => Some(document::entities::HatchStyleType::Outer),
+                        "N" | "NORMAL" => Some(document::entities::HatchStyleType::Normal),
                         _ => return Some(CmdResult::NeedPoint),
                     };
                     return self.apply_result(self.update_operation());
@@ -750,9 +798,9 @@ impl CadCommand for HatcheditCommand {
         }
         if let Some(rest) = text.strip_prefix('Y') {
             self.style = match rest.trim() {
-                "NORMAL" | "N" => Some(codec::entities::HatchStyleType::Normal),
-                "OUTER" | "O" => Some(codec::entities::HatchStyleType::Outer),
-                "IGNORE" | "I" => Some(codec::entities::HatchStyleType::Ignore),
+                "NORMAL" | "N" => Some(document::entities::HatchStyleType::Normal),
+                "OUTER" | "O" => Some(document::entities::HatchStyleType::Outer),
+                "IGNORE" | "I" => Some(document::entities::HatchStyleType::Ignore),
                 _ => self.style,
             };
             return Some(CmdResult::NeedPoint);
@@ -907,10 +955,10 @@ impl CadCommand for HatcheditCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::hatch::{BoundaryEdge, BoundaryPath, EllipticArcEdge, LineEdge};
-    use codec::entities::{Hatch, HatchStyleType};
-    use codec::types::{Color, Transparency, Vector2};
-    use codec::EntityType;
+    use document::entities::hatch::{BoundaryEdge, BoundaryPath, EllipticArcEdge, LineEdge};
+    use document::entities::{Hatch, HatchStyleType};
+    use document::types::{Color, Transparency, Vector2};
+    use document::EntityType;
 
     fn hatch_command() -> HatcheditCommand {
         let mut hatch = Hatch::new();

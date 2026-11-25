@@ -1,10 +1,10 @@
 use super::*;
-use crate::command::WorkingPlane;
-use codec::entities::{CenterLineAssociation, CenterLineSource, CenterLineSourceKind};
-use codec::objects::XRecordValue;
-use codec::types::Vector3;
+use crate::entities::transform::WorkingPlane;
+use document::entities::{CenterLineAssociation, CenterLineSource, CenterLineSourceKind};
+use document::objects::XRecordValue;
+use document::types::Vector3;
 use glam::DVec3;
-use kernel::geom2d::{centerline_between, closest_point, Curve, Line as KernelLine};
+use ocs_geom::geom2d::{centerline_between, closest_point, Curve, Line as KernelLine};
 
 const SETTINGS_RECORD: &str = "OPEN_CAD_CENTERLINE_SETTINGS";
 
@@ -155,14 +155,14 @@ pub(crate) fn picked_source(
 
 /// The current endpoints of a centre-line source edge.
 pub(crate) fn source_segment(
-    document: &codec::Document,
+    document: &document::Document,
     source: &CenterLineSource,
 ) -> Option<(DVec3, DVec3)> {
     resolve_source(document, source)
 }
 
 fn resolve_source(
-    document: &codec::Document,
+    document: &document::Document,
     source: &CenterLineSource,
 ) -> Option<(DVec3, DVec3)> {
     let entity = document.get_entity(source.handle)?;
@@ -217,9 +217,9 @@ fn resolve_source(
 }
 
 fn rebuild_line(
-    document: &codec::Document,
+    document: &document::Document,
     association: &CenterLineAssociation,
-) -> Option<codec::Line> {
+) -> Option<document::Line> {
     let first = resolve_source(document, &association.first)?;
     let second = resolve_source(document, &association.second)?;
     construct_line(first, second, association)
@@ -229,7 +229,7 @@ pub(crate) fn construct_line(
     first: (DVec3, DVec3),
     second: (DVec3, DVec3),
     association: &CenterLineAssociation,
-) -> Option<codec::Line> {
+) -> Option<document::Line> {
     let plane = WorkingPlane::new(
         dvec(association.plane_origin),
         dvec(association.plane_x),
@@ -258,7 +258,7 @@ pub(crate) fn construct_line(
     let elevation = (first_start.z + first_end.z + second_start.z + second_end.z) * 0.25;
     let start = plane.to_world(DVec3::new(geometry.start[0], geometry.start[1], elevation));
     let end = plane.to_world(DVec3::new(geometry.end[0], geometry.end[1], elevation));
-    Some(codec::Line::from_points(vector(start), vector(end)))
+    Some(document::Line::from_points(vector(start), vector(end)))
 }
 
 /// Reverse index from a centre-line source handle to the carrier lines
@@ -376,11 +376,7 @@ impl Scene {
         &self,
         changed: &rustc_hash::FxHashSet<Handle>,
     ) -> Vec<Handle> {
-        if self
-            .associative_centerline_source_cache
-            .borrow()
-            .is_none()
-        {
+        if self.associative_centerline_source_cache.borrow().is_none() {
             let mut by_source: HashMap<Handle, Vec<Handle>> = HashMap::default();
             let mut order: HashMap<Handle, usize> = HashMap::default();
             for (position, entity) in self.document.entities().enumerate() {
@@ -418,9 +414,8 @@ impl Scene {
                 }
             }
         }
-        handles.sort_unstable_by_key(|handle| {
-            index.order.get(handle).copied().unwrap_or(usize::MAX)
-        });
+        handles
+            .sort_unstable_by_key(|handle| index.order.get(handle).copied().unwrap_or(usize::MAX));
         handles
     }
 
@@ -480,10 +475,11 @@ impl Scene {
         first: (Handle, DVec3),
         second: (Handle, DVec3),
     ) -> bool {
-        let pick = |document: &codec::Document, (handle, point): (Handle, DVec3)| {
+        let pick = |document: &document::Document, (handle, point): (Handle, DVec3)| {
             picked_source(document.get_entity(handle)?, handle, point)
         };
-        let (Some(first), Some(second)) = (pick(&self.document, first), pick(&self.document, second))
+        let (Some(first), Some(second)) =
+            (pick(&self.document, first), pick(&self.document, second))
         else {
             return false;
         };
@@ -517,29 +513,38 @@ impl Scene {
         true
     }
 
-    /// MATCHPROP's Center object: the destination centre line takes the
-    /// source's end extensions and is rebuilt on its own source lines.
-    pub(crate) fn match_centerline_extensions(&mut self, src: Handle, dst: Handle) {
-        let Some(EntityType::Line(source)) = self.document.get_entity(src) else {
-            return;
+    /// MATCHPROP's Center object: centre line `line` with the end
+    /// extensions of centre line `source`, rebuilt on its own source lines.
+    /// `None` when either is not a centre line or its sources are gone.
+    pub(crate) fn centerline_with_extensions_of(
+        &self,
+        source: &EntityType,
+        line: &document::Line,
+    ) -> Option<document::Line> {
+        let EntityType::Line(source) = source else {
+            return None;
         };
-        let Some(from) = CenterLineAssociation::read(&source.common.extended_data) else {
-            return;
-        };
-        let Some(EntityType::Line(line)) = self.document.get_entity(dst) else {
-            return;
-        };
-        let Some(mut association) = CenterLineAssociation::read(&line.common.extended_data) else {
-            return;
-        };
+        let from = CenterLineAssociation::read(&source.common.extended_data)?;
+        let mut association = CenterLineAssociation::read(&line.common.extended_data)?;
         association.start_extension = from.start_extension;
         association.end_extension = from.end_extension;
-        let Some(mut rebuilt) = rebuild_line(&self.document, &association) else {
-            return;
+        let mut rebuilt = rebuild_line(&self.document, &association)?;
+        rebuilt.common = line.common.clone();
+        association.write(&mut rebuilt.common.extended_data);
+        Some(rebuilt)
+    }
+
+    /// [`Self::centerline_with_extensions_of`] written to `dst`.
+    pub(crate) fn match_centerline_extensions(&mut self, src: Handle, dst: Handle) {
+        let rebuilt = match (self.document.get_entity(src), self.document.get_entity(dst)) {
+            (Some(source), Some(EntityType::Line(line))) => {
+                self.centerline_with_extensions_of(source, line)
+            }
+            _ => None,
         };
-        if let Some(EntityType::Line(line)) = self.document.get_entity_mut(dst) {
-            rebuilt.common = line.common.clone();
-            association.write(&mut rebuilt.common.extended_data);
+        if let (Some(rebuilt), Some(EntityType::Line(line))) =
+            (rebuilt, self.document.get_entity_mut(dst))
+        {
             *line = rebuilt;
         }
     }
@@ -620,9 +625,7 @@ impl Scene {
             // The association flags just changed. Drop the index; the bump
             // below re-indexes from the new xdata (an all-disassociated bump
             // rebuilds an empty index and refreshes nothing).
-            self.associative_centerline_source_cache
-                .borrow_mut()
-                .take();
+            self.associative_centerline_source_cache.borrow_mut().take();
             let changes: Vec<_> = candidates
                 .iter()
                 .map(|(handle, _, _)| (*handle, ChangeKind::Modified))
@@ -664,7 +667,7 @@ pub(crate) fn is_center_carrier(entity: &EntityType) -> bool {
         return false;
     };
     CenterLineAssociation::read(&line.common.extended_data).is_some()
-        || codec::entities::CenterMarkAssociation::read(&line.common.extended_data).is_some()
+        || document::entities::CenterMarkAssociation::read(&line.common.extended_data).is_some()
 }
 
 impl Scene {
@@ -680,7 +683,8 @@ impl Scene {
         let EntityType::Line(line) = self.document.get_entity(handle)? else {
             return None;
         };
-        if let Some(mark) = codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
+        if let Some(mark) =
+            document::entities::CenterMarkAssociation::read(&line.common.extended_data)
         {
             return Some((true, mark.associated));
         }
@@ -712,10 +716,13 @@ impl Scene {
             let Some((mark, false)) = self.center_object_state(*handle) else {
                 continue;
             };
-            let before = recording.before.get(handle).and_then(|before| before.as_deref());
+            let before = recording
+                .before
+                .get(handle)
+                .and_then(|before| before.as_deref());
             let was_associated = match before {
                 Some(EntityType::Line(line)) => {
-                    codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
+                    document::entities::CenterMarkAssociation::read(&line.common.extended_data)
                         .map(|association| association.associated)
                         .or_else(|| {
                             CenterLineAssociation::read(&line.common.extended_data)
@@ -752,7 +759,7 @@ pub(crate) fn entity_has_center_association(entity: &EntityType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::Line;
+    use document::entities::Line;
 
     fn line(y: f64) -> EntityType {
         EntityType::Line(Line::from_points(
@@ -798,7 +805,10 @@ mod tests {
         let Some(EntityType::Line(line)) = scene.document.get_entity(handle) else {
             panic!("carrier is not a line");
         };
-        assert!((line.start.y - line.end.y).abs() < 1e-9, "carrier not horizontal");
+        assert!(
+            (line.start.y - line.end.y).abs() < 1e-9,
+            "carrier not horizontal"
+        );
         line.start.y
     }
 
@@ -846,7 +856,10 @@ mod tests {
         let early = scene.add_entity(carrier(first, second));
         move_line(&mut scene, first, 2.0);
         scene.bump_entities(&[(first, ChangeKind::Modified)]);
-        assert!((carrier_y(&scene, early) - 6.0).abs() < 1e-9, "index is warm");
+        assert!(
+            (carrier_y(&scene, early) - 6.0).abs() < 1e-9,
+            "index is warm"
+        );
 
         let pasted = scene
             .document
@@ -880,10 +893,7 @@ mod tests {
 
         // One bump naming both the source and the inner carrier.
         move_line(&mut scene, a, 4.0);
-        scene.bump_entities(&[
-            (a, ChangeKind::Modified),
-            (inner, ChangeKind::Modified),
-        ]);
+        scene.bump_entities(&[(a, ChangeKind::Modified), (inner, ChangeKind::Modified)]);
         assert!((carrier_y(&scene, inner) - 7.0).abs() < 1e-9);
         assert!((carrier_y(&scene, outer) - 13.5).abs() < 1e-9);
     }

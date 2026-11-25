@@ -291,6 +291,8 @@ tool fires `ModuleEvent::Command("EX_FOO")`, which round-trips to
 `ModuleEvent::PluginFileDialog { command, title, filter_name, extensions }` lets a
 tool request a native file picker; on selection the host dispatches
 `"<command> <path>"` back with the path's original case preserved.
+`ModuleEvent::PluginFolderDialog { command, title }` (API v30) does the same with
+a folder picker.
 
 A leading `>` or the persistent literal-input toggle preserves both spaces
 and case. Automation and `ModuleEvent::PluginFileDialog` already preserve
@@ -319,6 +321,32 @@ set `needs_object_pick() -> true`; the host then calls
 `on_object_pick(handle, pt)` with the clicked entity's handle (read its
 XDATA/geometry via `HostApi`). Over `--serve` the pick is supplied as a hex
 handle: `run "MY_CMD 2F 30"`.
+
+A command that collects several points can take a mid-command Ctrl+Z itself
+(API v24): implement `on_undo_step` to drop the last point and return the next
+step (usually `NeedPoint`); the prompt and preview then follow the shortened
+state, as when PLINE pops its last vertex. Returning `None` (the default)
+leaves Ctrl+Z to the document undo. Plugins whose manifest declares an older
+API are never asked.
+
+### AI tools (API v25)
+
+A plugin can offer typed operations to AI clients that drive OCS over its
+MCP / automation bridge. `tools()` returns `PluginTool { name, description,
+input_schema }`, the schema being a JSON Schema of the arguments object as
+JSON text; `call_tool(host, name, arguments)` runs one and returns its result
+as JSON text, or an `Err` message. See `docs/plugin-template/src/lib.rs`
+(`add_point`).
+
+- Clients find the tools with `ocs_read` op `plugins` (each installed plugin
+  lists its `tools`) and call one with `ocs_execute` op
+  `plugin_call {plugin, tool, arguments}`. A disabled plugin's tools are not
+  callable; the Plugin Manager lists each plugin's tools on its card.
+- The host checks `arguments` against `input_schema` before the call and
+  wraps the whole call in one undo step named `<plugin id> <tool>`; the
+  plugin's own `push_undo` calls join it.
+- Only plugins whose manifest declares v25 or newer are asked; older ones
+  simply offer no tools.
 
 ### XDATA — domain persistence
 
@@ -456,16 +484,16 @@ hard-constrained drag direction), and `shape`. The declaration lifecycle:
   and a cancel discards the phase untouched. The payload is capped at 256
   entities per response (a larger set is refused with an error line); a
   response carrying only `preview` behaves exactly as before.
-- **A plugin can never freeze the host (v11.1).** Every delivery — begin,
-  move, settle, cancel — is issued WITHOUT waiting and collected at pump
-  ticks (coalescing unchanged: at most one move in flight, newest point
-  delivered next). Nested COMMAND frames (`run_command` /
-  `execute_command`) are REFUSED inside grip deliveries with an honest
-  `Err`: their execution would need the host's message loop, which a
-  delivery on the UI thread cannot pump — the freeze the consumer's
-  settle-replay wedge exhibited. Every other nested request (reads,
-  `push_undo`, direct writes, `entities_batch`) keeps its full inline
-  serving, so the settle callback stays the plugin's complete write
+- **Grip deliveries cannot freeze the host silently (v11.1).** Every
+  delivery — begin, move, settle, cancel — is issued WITHOUT waiting and
+  collected at pump ticks (coalescing unchanged: at most one move in
+  flight, newest point delivered next). Nested COMMAND frames
+  (`run_command` / `execute_command`) are REFUSED inside grip deliveries
+  with an honest `Err`: their execution would need the host's message
+  loop, which a delivery on the UI thread cannot pump — the freeze the
+  consumer's settle-replay wedge exhibited. Every other nested request
+  (reads, `push_undo`, direct writes, `entities_batch`) keeps its full
+  inline serving, so the settle callback stays the plugin's complete write
   window. A delivery that outlives its settle deadline is abandoned: the
   plugin's connection is torn down, any partially-open scope is closed
   (no dangling history), the drag ends as a cancel, and an error line
@@ -508,6 +536,50 @@ hard-constrained drag direction), and `shape`. The declaration lifecycle:
   store walk into one frame per pass — the record-carrier twin of
   `entities_batch`. With dirty regions, a boundary pass is 2–3 frames
   instead of dozens.
+- **Categorized document delta (v27).** `DocumentChangedDelta`
+  (discriminant 15) is the exact categorized successor of
+  `DocumentChangedRegions`: the host routes it INSTEAD OF the Regions
+  notification, per plugin, to every endpoint whose manifest API is 27 or
+  newer — no endpoint receives a duplicate Regions + delta stream, and
+  legacy APIs keep the byte-identical Regions stream:
+  - `added` handles are absent before the boundary and present after;
+    `modified` handles are present on both sides whose relevant data
+    changed; `deleted` handles are present before, absent after — a deleted
+    handle STAYS in the list even though lookup now fails (the deletion
+    itself is the information).
+  - A same-handle replacement (erase + recreate reusing the handle) is
+    `modified`; a replacement through a new handle is
+    `deleted(old) + added(new)`.
+  - Repeated changes to one handle within ONE boundary fold into the net
+    classification via first-event start presence vs last-event end
+    presence: created-then-erased nets to nothing, erased-then-recreated
+    nets to `modified`. The lists are ascending and deduplicated.
+  - `records` preserves the v13 behavior: the same (entity, app-name)
+    XDATA/XRecord touch pairs the Regions notification carried.
+  - `full_refresh_required` is the honesty flag: `true` means the host
+    cannot prove the incremental sets are complete (journal gap, overflow,
+    or an unattributable whole-document mutation) and the plugin MUST
+    resynchronize the whole document; `false` with all lists empty is an
+    EXACT "nothing relevant changed" — distinct from the legacy
+    empty-set-unknown of `DocumentChangedRegions`.
+  - `snapshot` (`DocumentDeltaSnapshot { version, generation }`) correlates
+    the boundary with the tab's V4 snapshot store: `version` matches the
+    `DocumentChangedV4` notification's version for the same boundary;
+    `generation` increments when the backing file mapping is replaced
+    (resize/reopen) — versions from different generations are never
+    comparable, so a plugin seeing a foreign generation re-fetches the
+    store path and re-opens. `snapshot: None` = no V4 store open for the
+    tab (legitimate, not a failure).
+  - Coverage is central-journal based, so every boundary is captured the
+    same way: built-in commands, direct editing and grips, multi-entity
+    operations, undo/redo (resulting-state semantics — the folded lists
+    reflect the state after the whole boundary), and plugin HostApi
+    operations.
+  - Multi-document: per-tab state is keyed by stable tab ids (never UI
+    array indices). Every delta carries the `tab_id`; a wholesale document
+    replacement rides `DocumentOpened` plus a full-refresh delta
+    (`full_refresh_required=true`); `DocumentTabClosed` is the final
+    notification for a tab — deltas queued for a closing tab die with it.
 
 **MCP parity.** Plugin-declared grips appear in the automation `grips` read
 (each entry marked with its owning `plugin`), and `grip_drag` takes a `plugin`
@@ -752,9 +824,9 @@ Rules and budgets:
   ids), exactly like `register_quad_panels`.
 - **Icons**: `QuadItemDef.icon` reuses the ribbon `IconKind`, so custom
   SVG bytes ride the same `OwnedIconKind` wire encoding as ribbon tools.
-  Recommended artwork is a 24×24 viewBox with `currentColor` strokes/fills
-  (multicolour is allowed but fixed colours do not re-theme); icons are
-  parsed once at registration and cached, never per frame. An icon over the
+  Quad items draw that SVG at 24 px as it is (see "Plugin icons" below for
+  what that means for the artwork); icons are parsed once at registration
+  and cached, never per frame. An icon over the
   **8 KiB** budget or failing to parse does not abort registration — the item
   renders the glyph fallback (label-derived abbreviation) instead.
 - **v14 compat**: plugins compiled against v14 or older keep working
@@ -764,6 +836,30 @@ Rules and budgets:
 - Runnable reference: [`docs/plugin-template-v2/`](plugin-template-v2) —
   panel bound to `Insert`, one `Command` item and one `Callback` item with a
   custom SVG icon.
+
+## Plugin icons
+
+A plugin sends one SVG per tool (`IconKind::Svg`). Where it ends up decides
+how it is drawn:
+
+- **Ribbon, command search, QAT, menus**: drawn like the built-in icons.
+  - *Size*: draw on the OCS pixel grid, `width="16" height="16"
+    viewBox="0 0 16 16"`, with 1 px strokes on half-pixel coordinates
+    (`M3.5 2.5H12.5`) and fills on whole pixels. The host recognises that
+    art by its viewBox and fits it to the screen's pixels at every size and
+    scale, so lines stay one or two pixels wide and sharp. Any other viewBox
+    (24×24, say) is scaled as it is and looks soft.
+  - *32 px slots*: the built-in icons have a separate 32 px drawing; a
+    plugin cannot send one, so its 16 px art is fitted to the large slot.
+  - *Colour*: use the OCS palette, which the host maps to the active theme:
+    `#ffffff` for lines and text-coloured parts, `#888888` for secondary
+    parts, `#4a9eff` for the accent, `#4ccf6f` (success), `#f0c040`
+    (warning) and `#e05050` (danger). The full list is `semantic_color` in
+    `src/ui/icons.rs`. Other colours are drawn as they are. `currentColor`
+    is not filled in and renders black.
+- **Quad menu items**: drawn at 24 px as they are, without fitting or
+  recolouring (see [quad-menu.md](quad-menu.md)). Draw them on a 24×24
+  viewBox in their final colours.
 
 ## HostApi vs MCP — the two surfaces
 
@@ -790,7 +886,7 @@ Which surface carries what:
 | Entity XDATA | `xdata_get` / `xdata_set` | `read_record` / `write_record` / `remove_record` |
 | NOD XRecords | — | `create/read/update/delete/list_xrecord` + the v13 batches |
 | Bulk data | `batch` (batched **ops**) | `entities_batch`, record batches (batched **data**) |
-| Notifications | `events` (the session journal) | `on_notification` (`DocumentChanged`, `DocumentChangedRegions`, …) |
+| Notifications | `events` (the session journal) | `on_notification` (`DocumentChanged`, `DocumentChangedRegions`, v27 upgrades it to `DocumentChangedDelta`, …) |
 | Viewport automation | `click`, `pointer`, `getpoint`, `user_select`, `view_focus`, `capture` | — (a plugin's grip events are its gestures) |
 | Reference-only designation | — | `set_reference_only` |
 | Parametric chain staging / sampling (v14) | — (`query` reads the staged entities) | `stage_parametric_chain` / `sample_parametric` |
@@ -878,14 +974,28 @@ corruption cannot affect the host or other plugins. Plugin processes stay
 
 Two timeouts protect the host from a stuck runner:
 
-| Timeout | Env var | Default | Floor |
-|---|---|---|---|
-| Spawn (connection) | `OCS_PLUGIN_SPAWN_TIMEOUT_SECS` | 30 s | — |
-| Per-call | `OCS_PLUGIN_CALL_TIMEOUT_SECS` | 30 s | `GetManifest`/`GetRibbon` ≥ 5 s, `Dispatch` ≥ 10 s, interactive events/prompt/pick ≥ 2 s |
+| Timeout | Env var | Default | Floor | Cap |
+|---|---|---|---|---|
+| Spawn (connection) | `OCS_PLUGIN_SPAWN_TIMEOUT_SECS` | 90 s (a cold-start AV scan on Windows can legitimately take that long) | — | — |
+| Per-call | `OCS_PLUGIN_CALL_TIMEOUT_SECS` | 30 s | `GetManifest`/`GetRibbon` ≥ 5 s, `Dispatch` ≥ 10 s, interactive events/prompt/pick ≥ 2 s | UI-blocking preview ticks (`CursorMove`/`CustomGripMove`) ≤ 2 s, one-step interactive probes ≤ 10 s |
+| Proxy read/write (per direction) | `OCS_PLUGIN_PROXY_TIMEOUT_SECS` | 30 s | — | — |
+
+A request routed through the TCP request proxy (the external Python REPL is
+the documented consumer) is additionally bounded in TOTAL wall time: four
+times the proxy timeout (2 minutes at the default), after which it answers
+`TimedOut` ("proxy request exceeded its total deadline") instead of retrying
+forever.
 
 A call timeout covers the full round-trip, including any nested plugin→host
-requests handled inline. When it fires the host kills the runner, marks the
-plugin dead, and reports a `CallTimeout` error via the normal plugin error path.
+requests handled inline. When it fires the host kills the runner's whole
+process tree, marks the plugin dead, and reports a `CallTimeout` error via the
+normal plugin error path. Nested traffic renews the per-call deadline (a
+debugger-paused plugin answers keep-alives), so an ABSOLUTE call budget also
+applies to one request: 10× the per-call timeout by default, overridable with
+`OCS_PLUGIN_CALL_MAX_SECONDS` (`0` disables the cap). Preview ticks are
+capped at 2 s and per-step interactive probes at 10 s regardless of the
+global setting, so a slow plugin degrades a command with an honest timeout
+instead of freezing the UI for the global budget.
 
 `<config>` is `%APPDATA%` (Windows), `~/Library/Application Support` (macOS), or
 `$XDG_CONFIG_HOME` / `~/.config` (Linux).

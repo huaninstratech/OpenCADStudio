@@ -107,6 +107,9 @@ pub(super) const XREF_LAUNCHER: &str = "XREF_LAUNCHER";
 pub(super) const XREF_FADE: &str = "XREF_FADE";
 /// The Text panel's corner arrow (Text Style).
 pub(super) const TEXT_LAUNCHER: &str = "TEXT_LAUNCHER";
+/// The Text Editor's Paragraph and Spell Check launchers.
+pub(super) const MTED_PARAGRAPH_LAUNCHER: &str = "MTED_PARAGRAPH_LAUNCHER";
+pub(super) const MTED_SPELL_LAUNCHER: &str = "MTED_SPELL_LAUNCHER";
 /// The Text panel's text height box.
 pub(super) const TEXT_HEIGHT: &str = "TEXT_HEIGHT";
 /// The Dimensions panel's corner arrow (Dimension Style).
@@ -245,7 +248,11 @@ pub fn key_released(key: &Key) -> Option<Message> {
 fn now_ms() -> u64 {
     static START: std::sync::OnceLock<iced::time::Instant> = std::sync::OnceLock::new();
     // Starts at 1 so that 0 keeps meaning "not set" for the timestamps.
-    START.get_or_init(iced::time::Instant::now).elapsed().as_millis() as u64 + 1
+    START
+        .get_or_init(iced::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
 }
 
 /// Clear any pending lone-Alt state.
@@ -284,6 +291,7 @@ fn tab_code(module: &str) -> Option<&'static str> {
         "view" => "VI",
         "manage" => "MA",
         "block_editor" => "BE",
+        "text_editor" => "TE",
         _ => return None,
     })
 }
@@ -434,6 +442,8 @@ const CODES: &[(&str, &str, &str)] = &[
     ("draw", "Groups", "GR"),
     ("draw", "GROUP", "GG"),
     ("draw", "UNGROUP", "GU"),
+    ("draw", "GROUPEDIT", "GE"),
+    ("draw", "TOGGLEGROUPS", "GS"),
     ("draw", "PASTE_MENU", "PA"),
     ("draw", "COPYCLIP", "CC"),
     ("draw", "CUTCLIP", "CX"),
@@ -467,6 +477,7 @@ const CODES: &[(&str, &str, &str)] = &[
     ("parametric", "DCHIDEALL", "HD"),
     ("parametric", "DELCONSTRAINT", "DE"),
     ("parametric", "PARAMETERS", "PM"),
+    ("parametric", "VISIBILITYSTATESPANELOPEN", "VS"),
     // Model (the reference Solid tab).
     ("model", "MODEL_PRIMITIVES", "SS"),
     ("MODEL_PRIMITIVES", "BOX", "BO"),
@@ -485,9 +496,30 @@ const CODES: &[(&str, &str, &str)] = &[
     ("model", "UNION", "UN"),
     ("model", "SUBTRACT", "SU"),
     ("model", "INTERSECT", "IN"),
+    ("model", "INTERFERE", "IF"),
+    ("model", "SLICE", "SL"),
+    ("model", "THICKEN", "TH"),
+    ("model", "SOLIDEDIT_EDGES", "XE"),
+    ("SOLIDEDIT_EDGES", "XEDGES", "XE"),
+    ("SOLIDEDIT_EDGES", "IMPRINT", "IM"),
+    ("SOLIDEDIT_EDGES", "SOLIDEDIT EDGE COLOR", "CE"),
+    ("SOLIDEDIT_EDGES", "SOLIDEDIT EDGE COPY", "CO"),
+    ("model", "SOLIDEDIT_FACES", "FE"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE EXTRUDE", "EF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE TAPER", "TF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE MOVE", "MF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE COPY", "CF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE OFFSET", "OF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE DELETE", "DF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE ROTATE", "RF"),
+    ("SOLIDEDIT_FACES", "SOLIDEDIT FACE COLOR", "LF"),
+    ("model", "SOLIDEDIT_BODY", "BE"),
+    ("SOLIDEDIT_BODY", "SOLIDEDIT BODY SEPARATE", "SP"),
+    ("SOLIDEDIT_BODY", "SOLIDEDIT BODY CLEAN", "CL"),
+    ("SOLIDEDIT_BODY", "SHELL", "SH"),
+    ("SOLIDEDIT_BODY", "SOLIDEDIT BODY CHECK", "CK"),
     ("model", "FILLETEDGE", "ED"),
     ("model", "CHAMFEREDGE", "CE"),
-    ("model", "SHELL", "SH"),
     // Insert.
     ("insert", "Block", "BK"),
     ("insert", "INSERT_GALLERY", "BI"),
@@ -562,7 +594,11 @@ const CODES: &[(&str, &str, &str)] = &[
     ("annotate", "Centerlines", "CE"),
     ("annotate", "CENTERMARK", "CM"),
     ("annotate", "CENTERLINE", "CL"),
-    ("centerlines_extension", super::widgets::CENTER_LAYER_COMBO, "CA"),
+    (
+        "centerlines_extension",
+        super::widgets::CENTER_LAYER_COMBO,
+        "CA",
+    ),
     ("annotate", "MLEADER", "ML"),
     ("annotate", "MLEADER_STYLE_COMBO", "MY"),
     ("annotate", super::widgets::MLEADER_LAYER_COMBO, "MU"),
@@ -626,6 +662,41 @@ const CODES: &[(&str, &str, &str)] = &[
     ("manage", "OVERKILL", "OK"),
     ("manage", "AUDIT", "AU"),
     // Block editor.
+    // Text Editor (contextual, while a multiline text is edited).
+    ("text_editor", "_MTED ANNOTATIVE", "AN"),
+    ("text_editor", "_MTED MASK", "BM"),
+    ("text_editor", "_MTED MATCH", "MP"),
+    ("text_editor", "_MTED BOLD", "BO"),
+    ("text_editor", "_MTED ITALIC", "IT"),
+    ("text_editor", "_MTED STRIKE", "ST"),
+    ("text_editor", "_MTED CLEAR", "CL"),
+    ("text_editor", "_MTED UNDERLINE", "UL"),
+    ("text_editor", "_MTED OVERLINE", "OL"),
+    ("text_editor", "_MTED STACK", "SK"),
+    ("text_editor", "_MTED SUPERSCRIPT", "PS"),
+    ("text_editor", "_MTED SUBSCRIPT", "BS"),
+    ("text_editor", "MTED_CASE", "MC"),
+    ("text_editor", "Formatting", "FM"),
+    ("text_editor", "MTED_JUSTIFY", "JU"),
+    ("text_editor", "MTED_BULLETS", "BU"),
+    ("text_editor", "MTED_LINESPACING", "LS"),
+    ("text_editor", "Paragraph", "PG"),
+    ("text_editor", MTED_PARAGRAPH_LAUNCHER, "PH"),
+    ("text_editor", "_MTED COMBINE", "CP"),
+    ("text_editor", "MTED_COLUMNS", "CL"),
+    ("text_editor", "MTED_SYMBOL", "SY"),
+    ("text_editor", "_MTED FIELD", "FI"),
+    ("text_editor", "_MTED SPELL", "CS"),
+    ("text_editor", "_MTED DICTIONARIES", "ED"),
+    ("text_editor", "_MTED FIND", "FR"),
+    ("text_editor", "Tools", "TO"),
+    ("text_editor", "_MTED IMPORT", "IE"),
+    ("text_editor", "_MTED AUTOCAPS", "AC"),
+    ("text_editor", "MTED_MORE", "MO"),
+    ("text_editor", "_MTED RULER", "RU"),
+    ("text_editor", "_MTED UNDO", "UN"),
+    ("text_editor", "_MTED REDO", "RE"),
+    ("text_editor", "_MTED CLOSE", "MX"),
     ("block_editor", "Open and Save", "BO"),
     ("block_editor", "BEDIT", "BE"),
     ("block_editor", "BSAVE", "BS"),
@@ -821,9 +892,7 @@ impl Ribbon {
 
     fn tab_tips(&self) -> Vec<Tip> {
         let tabs = self.modules.iter().enumerate().filter(|(index, module)| {
-            module.id() != "layout"
-                && (module.id() != "block_editor" || self.block_editing.is_some())
-                && !self.tab_hidden(*index)
+            module.id() != "layout" && !self.contextual_off(module.id()) && !self.tab_hidden(*index)
         });
         let mut tips: Vec<Tip> = tabs
             .map(|(index, module)| Tip {
@@ -1227,7 +1296,7 @@ fn bold(renderer: &Renderer) -> iced::Font {
     }
 }
 
-fn text_width(content: &str, size: f32, font: iced::Font) -> f32 {
+pub(crate) fn text_width(content: &str, size: f32, font: iced::Font) -> f32 {
     <Renderer as advanced_text::Renderer>::Paragraph::with_text(advanced_text::Text {
         content,
         bounds: Size::INFINITE,
@@ -1239,6 +1308,8 @@ fn text_width(content: &str, size: f32, font: iced::Font) -> f32 {
         shaping: advanced_text::Shaping::Advanced,
         wrapping: advanced_text::Wrapping::None,
         ellipsis: advanced_text::Ellipsis::None,
+        // Hinting is off in the pinned iced: `iced_graphics::text::hint_factor`
+        // returns `None`; follow `renderer.hint_factor()` once it is enabled.
         hint_factor: None,
     })
     .min_bounds()
@@ -1271,9 +1342,11 @@ fn draw_text(
             shaping: advanced_text::Shaping::Advanced,
             wrapping: advanced_text::Wrapping::None,
             ellipsis: advanced_text::Ellipsis::None,
+            // Hinting is off in the pinned iced: `iced_graphics::text::hint_factor`
+            // returns `None`; follow `renderer.hint_factor()` once it is enabled.
             hint_factor: None,
         },
-        at,
+        crate::ui::style::text::snap_point(at),
         color,
         clip,
     );

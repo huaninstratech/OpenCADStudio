@@ -1,16 +1,16 @@
 use crate::t;
-use codec::entities::{Polyline, Polyline2D, Polyline3D};
+use document::entities::{Polyline, Polyline2D, Polyline3D};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     edit_prop as edit, format_area, format_length, parse_f64, ro_prop as ro, square_grip,
     stepper_prop as stepper, VARIES_LABEL,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{extrusion_wall_tris, RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::TangentGeom;
-use kernel::space::{NurbsCurve3, Vec3};
+use ocs_geom::space::{NurbsCurve3, Vec3};
 
 // ── Polyline (old-style 3D heavy polyline) ────────────────────────────────────
 
@@ -38,7 +38,7 @@ fn tessellate_polyline(pl: &Polyline) -> RenderEntity {
 }
 
 impl RenderConvertible for Polyline {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(tessellate_polyline(self))
     }
 }
@@ -61,14 +61,14 @@ impl Grippable for Polyline {
         if let Some(v) = self.vertices.get_mut(grip_id) {
             match apply {
                 GripApply::Translate(d) => {
-                    v.location.x += d.x as f64;
-                    v.location.y += d.y as f64;
-                    v.location.z += d.z as f64;
+                    v.location.x += d.x;
+                    v.location.y += d.y;
+                    v.location.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    v.location.x = p.x as f64;
-                    v.location.y = p.y as f64;
-                    v.location.z = p.z as f64;
+                    v.location.x = p.x;
+                    v.location.y = p.y;
+                    v.location.z = p.z;
                 }
             }
         }
@@ -234,7 +234,7 @@ fn refit_spline_polyline2d(pl: &mut Polyline2D) {
         return;
     }
     let degree = match pl.smooth_surface {
-        codec::entities::polyline::SmoothSurfaceType::QuadraticBSpline => 2,
+        document::entities::polyline::SmoothSurfaceType::QuadraticBSpline => 2,
         _ => 3,
     };
     let segments = SPLINE_SEGMENTS.with(|c| c.get()).unsigned_abs().max(1);
@@ -243,7 +243,7 @@ fn refit_spline_polyline2d(pl: &mut Polyline2D) {
 
 /// The Fit/Smooth choice a 2D polyline shows.
 fn polyline2d_fit_smooth(pl: &Polyline2D) -> &'static str {
-    use codec::entities::polyline::SmoothSurfaceType;
+    use document::entities::polyline::SmoothSurfaceType;
     if pl.flags.bits() & 4 != 0 {
         match pl.smooth_surface {
             SmoothSurfaceType::QuadraticBSpline => "Quadratic",
@@ -263,8 +263,8 @@ fn polyline2d_fit_smooth(pl: &Polyline2D) -> &'static str {
 /// spokes across the fitted curve (#408). `None` = no fit data, draw the
 /// stored vertices as-is. A fit-flagged polyline whose fit points are missing
 /// falls back to the stored vertices rather than drawing nothing.
-pub fn drawn_vertices2d(pl: &Polyline2D) -> Option<Vec<codec::entities::Vertex2D>> {
-    use codec::entities::polyline::VertexFlags;
+pub fn drawn_vertices2d(pl: &Polyline2D) -> Option<Vec<document::entities::Vertex2D>> {
+    use document::entities::polyline::VertexFlags;
     let has_fit = pl.vertices.iter().any(|v| {
         v.flags.bits() & (VertexFlags::SPLINE_VERTEX.bits() | VertexFlags::EXTRA_VERTEX.bits()) != 0
     });
@@ -282,7 +282,7 @@ pub fn drawn_vertices2d(pl: &Polyline2D) -> Option<Vec<codec::entities::Vertex2D
 
 fn tessellate_polyline2d(pl: &Polyline2D, fill_mode: bool) -> RenderEntity {
     let filtered = drawn_vertices2d(pl);
-    let verts: &[codec::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
+    let verts: &[document::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
     if verts.is_empty() {
         return RenderEntity {
             pick_tris: Vec::new(),
@@ -304,14 +304,14 @@ fn tessellate_polyline2d(pl: &Polyline2D, fill_mode: bool) -> RenderEntity {
     let to_wcs = |x: f64, y: f64| -> (f64, f64, f64) {
         crate::scene::view::transform::ocs_point_to_wcs((x, y, elev), normal)
     };
-    let to_pt = |v: &codec::entities::Vertex2D| -> [f64; 3] {
+    let to_pt = |v: &document::entities::Vertex2D| -> [f64; 3] {
         let (wx, wy, wz) = to_wcs(v.location.x, v.location.y);
         [wx, wy, wz]
     };
 
     if !fill_mode {
         let continuous =
-            pl.flags.bits() & codec::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits() != 0;
+            pl.flags.bits() & document::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits() != 0;
         let mut boundary = crate::entities::common::wide_band_outline(
             &band_verts_2d(pl),
             pl.is_closed(),
@@ -384,7 +384,7 @@ fn tessellate_polyline2d(pl: &Polyline2D, fill_mode: bool) -> RenderEntity {
                     &arc, &to_wcs, normal,
                 ));
                 for s in arc
-                    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+                    .tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
                     .into_iter()
                     .skip(1)
                 {
@@ -481,6 +481,39 @@ fn tessellate_polyline2d(pl: &Polyline2D, fill_mode: bool) -> RenderEntity {
                 crate::entities::common::tapered_band_points(band_verts, pl.is_closed(), &to_wcs);
             RenderObject::TaperedLines(pts, widths)
         }
+        // PLINEGEN off: the linetype pattern restarts at every drawn vertex.
+        None if pl.flags.bits() & document::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits()
+            == 0 =>
+        {
+            let mut points: Vec<[f64; 3]> = Vec::new();
+            for i in 0..seg_count {
+                let v0 = &verts[i];
+                let v1 = &verts[(i + 1) % count];
+                if i > 0 {
+                    points.push([f64::NAN; 3]);
+                }
+                points.push(to_pt(v0));
+                match crate::entities::common::BulgeArc::from_bulge(
+                    [v0.location.x, v0.location.y],
+                    [v1.location.x, v1.location.y],
+                    v0.bulge,
+                )
+                .filter(|_| v0.bulge.abs() >= 1e-9)
+                {
+                    Some(arc) => points.extend(
+                        arc.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
+                            .into_iter()
+                            .skip(1)
+                            .map(|sample| {
+                                let (x, y, z) = to_wcs(sample[0], sample[1]);
+                                [x, y, z]
+                            }),
+                    ),
+                    None => points.push(to_pt(v1)),
+                }
+            }
+            RenderObject::SegmentedLines(points)
+        }
         None => RenderObject::Lines(
             crate::entities::curve::polyline2d_curve(pl)
                 .map(|planar| crate::entities::curve::curve_points(&planar))
@@ -498,11 +531,11 @@ fn tessellate_polyline2d(pl: &Polyline2D, fill_mode: bool) -> RenderEntity {
 }
 
 /// Effective segment widths for a Polyline2D band.
-fn band_verts_2d(pl: &codec::entities::Polyline2D) -> Vec<([f64; 2], f64, f64, f64)> {
+fn band_verts_2d(pl: &document::entities::Polyline2D) -> Vec<([f64; 2], f64, f64, f64)> {
     let default_start = pl.start_width;
     let default_end = pl.end_width;
     let filtered = drawn_vertices2d(pl);
-    let verts: &[codec::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
+    let verts: &[document::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
     verts
         .iter()
         .map(|v| {
@@ -536,7 +569,7 @@ fn tapered_band_verts_2d(
 }
 
 fn centerline_metadata_2d(
-    verts: &[codec::entities::Vertex2D],
+    verts: &[document::entities::Vertex2D],
     closed: bool,
     to_wcs: &dyn Fn(f64, f64) -> (f64, f64, f64),
     normal: (f64, f64, f64),
@@ -577,11 +610,11 @@ fn centerline_metadata_2d(
 }
 
 impl RenderConvertible for Polyline2D {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         let mut render = tessellate_polyline2d(self, document.header.fill_mode);
         // Arc segments offer their centres and quadrants.
         if self.vertices.iter().any(|v| v.bulge != 0.0) {
-            let entity = codec::EntityType::Polyline2D(self.clone());
+            let entity = document::EntityType::Polyline2D(self.clone());
             render
                 .snap_pts
                 .extend(crate::entities::curve::arc_segment_snaps(&entity));
@@ -592,7 +625,10 @@ impl RenderConvertible for Polyline2D {
 
 /// A heavy 2D polyline's vertices as (position, bulge) pairs.
 fn plain_points(pl: &Polyline2D) -> Vec<([f64; 2], f64)> {
-    pl.vertices.iter().map(|v| ([v.location.x, v.location.y], v.bulge)).collect()
+    pl.vertices
+        .iter()
+        .map(|v| ([v.location.x, v.location.y], v.bulge))
+        .collect()
 }
 
 impl Grippable for Polyline2D {
@@ -624,7 +660,12 @@ impl Grippable for Polyline2D {
         let n = self.vertices.len();
         if grip_id >= n && self.flags.bits() & (2 | 4) == 0 {
             let mut points = plain_points(self);
-            crate::entities::lwpolyline::apply_mid_grip(&mut points, self.flags.is_closed(), grip_id - n, apply);
+            crate::entities::lwpolyline::apply_mid_grip(
+                &mut points,
+                self.flags.is_closed(),
+                grip_id - n,
+                apply,
+            );
             for (vertex, ([x, y], bulge)) in self.vertices.iter_mut().zip(points) {
                 (vertex.location.x, vertex.location.y, vertex.bulge) = (x, y, bulge);
             }
@@ -633,12 +674,12 @@ impl Grippable for Polyline2D {
         if let Some(v) = self.vertices.get_mut(grip_id) {
             match apply {
                 GripApply::Translate(d) => {
-                    v.location.x += d.x as f64;
-                    v.location.y += d.y as f64;
+                    v.location.x += d.x;
+                    v.location.y += d.y;
                 }
                 GripApply::Absolute(p) => {
-                    v.location.x = p.x as f64;
-                    v.location.y = p.y as f64;
+                    v.location.x = p.x;
+                    v.location.y = p.y;
                 }
             }
         }
@@ -737,7 +778,7 @@ impl Grippable for Polyline2D {
 }
 
 pub(crate) fn polyline2d_vertex_segment_widths(
-    vertex: &codec::entities::Vertex2D,
+    vertex: &document::entities::Vertex2D,
     default_start: f64,
     default_end: f64,
 ) -> (f64, f64) {
@@ -750,7 +791,7 @@ pub(crate) fn polyline2d_vertex_segment_widths(
 
 pub(crate) fn polyline2d_global_width(pline: &Polyline2D) -> Option<f64> {
     let filtered = drawn_vertices2d(pline);
-    let verts: &[codec::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pline.vertices);
+    let verts: &[document::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pline.vertices);
     let count = verts.len();
     let seg_count = if pline.is_closed() {
         count
@@ -870,7 +911,9 @@ impl PropertyEditable for Polyline2D {
                     Property {
                         label: t!("Linetype generation").into_owned(),
                         field: "pl2_ltype_gen",
-                        value: crate::entities::common::enabled_choice(self.flags.bits() & 128 != 0),
+                        value: crate::entities::common::enabled_choice(
+                            self.flags.bits() & 128 != 0,
+                        ),
                     },
                 ],
             },
@@ -889,11 +932,11 @@ impl PropertyEditable for Polyline2D {
                 match value {
                     "None" => pedit::unfit_polyline2d(self),
                     "Curve fit" => {
-                        if let Some(codec::EntityType::Polyline2D(mut fitted)) =
-                            pedit::fit_entity(&codec::EntityType::Polyline2D(self.clone()), &[])
+                        if let Some(document::EntityType::Polyline2D(mut fitted)) =
+                            pedit::fit_entity(&document::EntityType::Polyline2D(self.clone()), &[])
                         {
                             fitted.smooth_surface =
-                                codec::entities::polyline::SmoothSurfaceType::None;
+                                document::entities::polyline::SmoothSurfaceType::None;
                             *self = fitted;
                         }
                     }
@@ -997,7 +1040,7 @@ impl PropertyEditable for Polyline2D {
                 } else {
                     self.flags.bits() & !128
                 };
-                self.flags = codec::entities::polyline::PolylineFlags::from_bits(bits);
+                self.flags = document::entities::polyline::PolylineFlags::from_bits(bits);
             }
             _ => {}
         }
@@ -1065,7 +1108,7 @@ pub(crate) fn polyline3d_control_vertex_count(pl: &Polyline3D) -> usize {
     polyline3d_control_indices(pl).len()
 }
 
-pub(crate) fn polyline3d_controls(pl: &Polyline3D) -> Vec<codec::entities::Vertex3DPolyline> {
+pub(crate) fn polyline3d_controls(pl: &Polyline3D) -> Vec<document::entities::Vertex3DPolyline> {
     polyline3d_control_indices(pl)
         .into_iter()
         .filter_map(|index| pl.vertices.get(index).cloned())
@@ -1119,7 +1162,7 @@ fn polyline3d_spline_samples(
     } else {
         NurbsCurve3::new(degree, controls.to_vec(), Vec::new(), None)?
     };
-    let mut samples = curve.tessellate_angle(kernel::tessellation::DEFAULT_ANGLE);
+    let mut samples = curve.tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE);
     if closed
         && samples.len() >= 2
         && Vec3::from(samples[0]).distance(Vec3::from(samples[samples.len() - 1])) <= 1.0e-9
@@ -1130,7 +1173,7 @@ fn polyline3d_spline_samples(
 }
 
 fn rebuild_polyline3d_fit(pl: &mut Polyline3D) -> bool {
-    use codec::entities::polyline3d::SmoothSurfaceType as SST;
+    use document::entities::polyline3d::SmoothSurfaceType as SST;
 
     let mut controls = polyline3d_controls(pl);
     if pl.smooth_type == SST::None {
@@ -1173,7 +1216,8 @@ fn rebuild_polyline3d_fit(pl: &mut Polyline3D) -> bool {
         .map(|vertex| vertex.layer.clone())
         .unwrap_or_else(|| "0".to_string());
     let curve_vertices = samples.into_iter().map(|point| {
-        let mut vertex = codec::entities::Vertex3DPolyline::from_xyz(point[0], point[1], point[2]);
+        let mut vertex =
+            document::entities::Vertex3DPolyline::from_xyz(point[0], point[1], point[2]);
         vertex.layer = vertex_layer.clone();
         vertex.flags = POLY3D_VERTEX | POLY3D_SPLINE_POINT;
         vertex
@@ -1187,7 +1231,7 @@ fn rebuild_polyline3d_fit(pl: &mut Polyline3D) -> bool {
 /// `frame` (SPLFRAME on) also draws a spline-fit polyline's frame, from the
 /// first frame vertex through every one to the last.
 fn tessellate_polyline3d(pl: &Polyline3D, frame: bool) -> RenderEntity {
-    let to_pt = |v: &codec::entities::Vertex3DPolyline| -> [f64; 3] {
+    let to_pt = |v: &document::entities::Vertex3DPolyline| -> [f64; 3] {
         [v.position.x, v.position.y, v.position.z]
     };
 
@@ -1239,7 +1283,7 @@ fn tessellate_polyline3d(pl: &Polyline3D, frame: bool) -> RenderEntity {
 }
 
 impl RenderConvertible for Polyline3D {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         Some(tessellate_polyline3d(self, document.header.spline_frame))
     }
 }
@@ -1264,17 +1308,17 @@ impl Grippable for Polyline3D {
         if let Some(v) = raw_index.and_then(|index| self.vertices.get_mut(index)) {
             match apply {
                 GripApply::Translate(d) => {
-                    v.position.x += d.x as f64;
-                    v.position.y += d.y as f64;
-                    v.position.z += d.z as f64;
+                    v.position.x += d.x;
+                    v.position.y += d.y;
+                    v.position.z += d.z;
                 }
                 GripApply::Absolute(p) => {
-                    v.position.x = p.x as f64;
-                    v.position.y = p.y as f64;
-                    v.position.z = p.z as f64;
+                    v.position.x = p.x;
+                    v.position.y = p.y;
+                    v.position.z = p.z;
                 }
             }
-            if self.smooth_type != codec::entities::polyline3d::SmoothSurfaceType::None {
+            if self.smooth_type != document::entities::polyline3d::SmoothSurfaceType::None {
                 let _ = rebuild_polyline3d_fit(self);
             }
         }
@@ -1282,7 +1326,7 @@ impl Grippable for Polyline3D {
 
     fn grip_menu(&self, _grip_id: usize) -> Vec<crate::scene::model::object::GripMenuItem> {
         use crate::scene::model::object::{GripMenuAction, GripMenuItem};
-        use codec::entities::polyline3d::SmoothSurfaceType as SST;
+        use document::entities::polyline3d::SmoothSurfaceType as SST;
 
         let mut items = vec![
             GripMenuItem {
@@ -1315,7 +1359,7 @@ impl Grippable for Polyline3D {
         action: crate::scene::model::object::GripMenuAction,
     ) {
         use crate::scene::model::object::GripMenuAction as A;
-        use codec::entities::polyline3d::SmoothSurfaceType as SST;
+        use document::entities::polyline3d::SmoothSurfaceType as SST;
 
         let mut controls = polyline3d_controls(self);
         let n = controls.len();
@@ -1332,7 +1376,7 @@ impl Grippable for Polyline3D {
                         new_v.position.y = next.y;
                         new_v.position.z = next.z;
                     }
-                    new_v.handle = codec::Handle::NULL;
+                    new_v.handle = document::Handle::NULL;
                     controls.push(new_v);
                 } else {
                     let i1 = (grip_id + 1) % n;
@@ -1344,7 +1388,7 @@ impl Grippable for Polyline3D {
                     new_v.position.x = midpoint.x;
                     new_v.position.y = midpoint.y;
                     new_v.position.z = midpoint.z;
-                    new_v.handle = codec::Handle::NULL;
+                    new_v.handle = document::Handle::NULL;
                     controls.insert(grip_id + 1, new_v);
                 }
                 self.vertices = controls;
@@ -1370,7 +1414,7 @@ impl Grippable for Polyline3D {
 
 impl PropertyEditable for Polyline3D {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
-        use codec::entities::polyline3d::SmoothSurfaceType as SST;
+        use document::entities::polyline3d::SmoothSurfaceType as SST;
         let control_indices = polyline3d_control_indices(self);
         let n = control_indices.len();
         let vi = if n == 0 {
@@ -1462,12 +1506,12 @@ impl PropertyEditable for Polyline3D {
                 } else {
                     self.open();
                 }
-                if self.smooth_type != codec::entities::polyline3d::SmoothSurfaceType::None {
+                if self.smooth_type != document::entities::polyline3d::SmoothSurfaceType::None {
                     let _ = rebuild_polyline3d_fit(self);
                 }
             }
             "pl3_smooth" => {
-                use codec::entities::polyline3d::SmoothSurfaceType as SST;
+                use document::entities::polyline3d::SmoothSurfaceType as SST;
                 let next = match fit_smooth_key(value).unwrap_or_default() {
                     "None" => SST::None,
                     "Quadratic" => SST::QuadraticBSpline,
@@ -1540,13 +1584,13 @@ impl Transformable for Polyline3D {
 /// Solid-fill bands for a wide Polyline2D, plus the `world_origin` they are
 /// relative to (the first vertex). See `lwpolyline::wide_fills` — offsets are
 /// f32 from `origin` so the band stays precise at UTM-scale coordinates.
-pub(crate) fn wide_fills(pl: &codec::entities::Polyline2D) -> ([f64; 2], Vec<Vec<[f32; 2]>>) {
+pub(crate) fn wide_fills(pl: &document::entities::Polyline2D) -> ([f64; 2], Vec<Vec<[f32; 2]>>) {
     // The stored widths are the band's FULL width and `polyline_segment_fill`
     // offsets ±hw about the centreline — halve them. See `lwpolyline::wide_fills`.
     let hw_default_start = pl.start_width as f32 * 0.5;
     let hw_default_end = pl.end_width as f32 * 0.5;
     let filtered = drawn_vertices2d(pl);
-    let verts: &[codec::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
+    let verts: &[document::entities::Vertex2D] = filtered.as_deref().unwrap_or(&pl.vertices);
     let n = verts.len();
     if n < 2 {
         return ([0.0; 2], vec![]);
@@ -1599,8 +1643,8 @@ pub(crate) fn wide_fills(pl: &codec::entities::Polyline2D) -> ([f64; 2], Vec<Vec
 mod tests {
     use super::*;
     use crate::entities::traits::PropertyEditable;
-    use codec::entities::{Polyline2D, Vertex2D};
-    use codec::Vector3;
+    use document::entities::{Polyline2D, Vertex2D};
+    use document::Vector3;
 
     fn make_test_polyline2d(count: usize, start_w: f64, end_w: f64) -> Polyline2D {
         let mut pl = Polyline2D::default();
@@ -1614,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_polyline2d_uniform_width_shows_global_width() {
+    fn polyline2d_uniform_width_shows_global_width() {
         let pl = make_test_polyline2d(3, 4.0, 4.0);
         assert_eq!(polyline2d_global_width(&pl), Some(4.0));
 
@@ -1631,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_polyline2d_varying_vertex_width_shows_varies() {
+    fn polyline2d_varying_vertex_width_shows_varies() {
         let mut pl = make_test_polyline2d(3, 4.0, 4.0);
         pl.vertices[0].start_width = 1.0;
         pl.vertices[0].end_width = 2.0;
@@ -1651,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn test_polyline2d_modifying_global_width_sets_all_vertex_widths() {
+    fn polyline2d_modifying_global_width_sets_all_vertex_widths() {
         let mut pl = make_test_polyline2d(3, 4.0, 4.0);
         pl.vertices[0].start_width = 1.0;
         pl.vertices[0].end_width = 2.0;
@@ -1668,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_polyline2d_modifying_segment_width_materializes_default_width() {
+    fn polyline2d_modifying_segment_width_materializes_default_width() {
         let mut pl = make_test_polyline2d(3, 4.0, 4.0);
         assert_eq!(pl.vertices[0].start_width, 0.0);
 

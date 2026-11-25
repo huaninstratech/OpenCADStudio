@@ -40,6 +40,7 @@ impl OpenCADStudio {
             self.tabs[i].active_cmd = None;
             return Some(Task::none());
         }
+        let ucs_z = self.tabs[i].ucs_xform().axes().3.to_array();
         let pending = self.begin_undo(i, "EXTRUDE", handles.len(), true);
         let mut created_handles = Vec::new();
         let mut associative_sources = Vec::new();
@@ -55,9 +56,8 @@ impl OpenCADStudio {
                 continue;
             };
             let direction = match extent {
-                ExtrudeExtent::Height(height) => profile.plane.normal().map(|normal| {
-                    glam::DVec3::new(normal[0] * height, normal[1] * height, normal[2] * height)
-                }),
+                ExtrudeExtent::Height(height) => sweep_model::extrusion_axis(&entity, ucs_z)
+                    .map(|normal| glam::DVec3::from_array(normal) * height),
                 ExtrudeExtent::Direction(direction) => Some(direction),
                 ExtrudeExtent::Path(_) => None,
             };
@@ -103,8 +103,8 @@ impl OpenCADStudio {
                     .flatten();
                 let mut surface = empty_extruded_surface(direction, taper_angle);
                 if let (
-                    Some(codec::objects::SolidHistoryOperation::Extrusion(value)),
-                    codec::EntityType::Surface(entity),
+                    Some(document::objects::SolidHistoryOperation::Extrusion(value)),
+                    document::EntityType::Surface(entity),
                 ) = (&history, &mut surface)
                 {
                     if let Some(data) =
@@ -226,7 +226,7 @@ impl OpenCADStudio {
         }
         if !distance.is_finite() {
             self.command_line
-                .push_error(crate::t!("Requires numeric distance or two points.").as_ref());
+                .push_rejection(crate::t!("Requires numeric distance or two points.").as_ref());
             return Some(Task::none());
         }
         if distance.abs() <= f64::EPSILON {
@@ -239,13 +239,13 @@ impl OpenCADStudio {
         let mut failed = 0usize;
         let mut self_intersections = 0usize;
         for handle in handles {
-            let Some(codec::EntityType::Surface(surface)) =
+            let Some(document::EntityType::Surface(surface)) =
                 self.tabs[i].scene.document.get_entity(handle)
             else {
                 failed += 1;
                 continue;
             };
-            let kernel_distance = if surface.kind == codec::entities::SurfaceKind::Revolved {
+            let kernel_distance = if surface.kind == document::entities::SurfaceKind::Revolved {
                 -distance
             } else {
                 distance
@@ -255,14 +255,14 @@ impl OpenCADStudio {
                 .solid_models
                 .get(&handle)
                 .cloned()
-                .or_else(|| crate::scene::convert::solid3d_tess::kernel_surface_body(surface));
+                .or_else(|| crate::scene::convert::solid3d_tess::surface_record(surface));
             let Some(body) = body else {
                 failed += 1;
                 continue;
             };
-            let solid = match kernel::brep::thicken(&body, kernel_distance) {
+            let solid = match ocs_solid::model::thicken(&body, kernel_distance) {
                 Ok(solid) => solid,
-                Err(kernel::brep::ThickenError::SelfIntersection) => {
+                Err(ocs_solid::model::Error::WallFolds { .. } | ocs_solid::model::Error::WallsTouch) => {
                     failed += 1;
                     self_intersections += 1;
                     continue;
@@ -416,7 +416,7 @@ impl OpenCADStudio {
             } else {
                 let result = sweep_model::revolve_history(&entity, from, to, angle, start_angle)
                     .and_then(|history| {
-                        kernel::acis::rebuild_body(&history)
+                        ocs_solid::rebuild_body(&history)
                             .ok()
                             .map(|solid| (solid, history))
                     })
@@ -529,43 +529,47 @@ impl OpenCADStudio {
         let mut consumed = Vec::new();
         for (handle, profile) in profiles {
             // A refused sweep reports the modeler error code, as the
-            // reference does.
-            let result = (|| -> Result<_, Option<u32>> {
+            // reference does; another modeling failure its reason (#3536).
+            let result = (|| -> Result<_, Option<Result<u32, String>>> {
                 let (path, options) = path.as_ref().zip(options).ok_or(None)?;
                 if sweep_model::spatial_profile(&profile).is_some() {
-                    let record = sweep_model::spatial_sweep_record(&profile, path, options)?;
-                    let body =
-                        kernel::acis::rebuild_sweep_with_mode(&record, true).map_err(|_| None)?;
+                    let record = sweep_model::spatial_sweep_record(&profile, path, options)
+                        .map_err(|code| code.map(Ok))?;
+                    let body = ocs_solid::rebuild_sweep_with_mode(&record, true)
+                        .map_err(|error| Some(Err(error.to_string())))?;
                     return Ok((body, record, true));
                 }
                 let mut record = sweep_model::sweep_record(&profile, path, options).ok_or(None)?;
                 record.flags_294_296[0] |= picked_base;
-                let (_, _, closed) = kernel::acis::sweep_profile_geometry(
+                let (_, _, closed) = ocs_solid::sweep_profile_geometry(
                     record.sweep_entity.as_ref().ok_or(None)?,
                     record.sweep_entity_transform,
                 )
                 .map_err(|_| None)?;
                 let surface = mode == ExtrudeMode::Surface || !closed;
                 let body =
-                    kernel::acis::rebuild_sweep_with_mode(&record, surface).map_err(|error| {
+                    ocs_solid::rebuild_sweep_with_mode(&record, surface).map_err(|error| {
                         match error {
-                            kernel::acis::HistoryRebuildError::Refused(why) => {
-                                Some(sweep_model::sweep_refusal_code(why))
+                            ocs_solid::HistoryRebuildError::Refused(why) => {
+                                Some(Ok(sweep_model::sweep_refusal_code(why)))
                             }
-                            _ => None,
+                            other => Some(Err(other.to_string())),
                         }
                     })?;
                 Ok((body, record, surface))
             })();
             let (body, record, surface) = match result {
                 Ok(value) => value,
-                Err(code) => {
-                    if let Some(code) = code {
+                Err(failure) => {
+                    if let Some(failure) = failure {
                         self.command_line
                             .push_output(crate::t!("Modeling Operation Error:").as_ref());
-                        self.command_line.push_output(
-                            crate::tf!("Error Code Number is {code}", code = code).as_ref(),
-                        );
+                        match failure {
+                            Ok(code) => self.command_line.push_output(
+                                crate::tf!("Error Code Number is {code}", code = code).as_ref(),
+                            ),
+                            Err(reason) => self.command_line.push_output(&reason),
+                        }
                     }
                     failed += 1;
                     continue;
@@ -610,7 +614,7 @@ impl OpenCADStudio {
                 self.add_solid_model(
                     empty_solid3d(),
                     body,
-                    codec::objects::SolidHistoryOperation::Sweep(record),
+                    document::objects::SolidHistoryOperation::Sweep(record),
                 )
             };
             if created.is_null() {
@@ -708,7 +712,7 @@ impl OpenCADStudio {
         } else {
             loft_command_model::record(&sections, &guides, path, &available, mode, options)
                 .and_then(|record| {
-                    kernel::acis::rebuild_loft_with_options(&record).map(|body| (body, record))
+                    ocs_solid::rebuild_loft_with_options(&record).map(|body| (body, record))
                 })
         };
         match result {
@@ -740,7 +744,7 @@ impl OpenCADStudio {
                     if !handle.is_null() {
                         self.tabs[i].scene.create_solid_history(
                             handle,
-                            codec::objects::SolidHistoryOperation::Loft(record),
+                            document::objects::SolidHistoryOperation::Loft(record),
                         );
                         // An associative surface keeps reading its cross
                         // sections (each section a single object).
@@ -771,7 +775,7 @@ impl OpenCADStudio {
                     self.add_solid_model(
                         empty_solid3d(),
                         body,
-                        codec::objects::SolidHistoryOperation::Loft(record),
+                        document::objects::SolidHistoryOperation::Loft(record),
                     )
                 };
                 if created.is_null() {
@@ -857,6 +861,27 @@ impl OpenCADStudio {
         task
     }
 
+    pub(super) fn handle_solid_edit(
+        &mut self,
+        request: crate::command::SolidEditRequest,
+    ) -> Task<Message> {
+        let i = self.active_tab;
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        self.tabs[i].scene.clear_preview_wire();
+        self.restore_pre_cmd_tangent();
+        self.solid_edit(request)
+    }
+
+    pub(super) fn handle_extract_edges(&mut self, handles: Vec<Handle>) -> Task<Message> {
+        let i = self.active_tab;
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        self.tabs[i].scene.clear_preview_wire();
+        self.restore_pre_cmd_tangent();
+        self.extract_edges(&handles)
+    }
+
     pub(super) fn handle_solid_subtract(
         &mut self,
         bases: Vec<Handle>,
@@ -875,7 +900,7 @@ impl OpenCADStudio {
     pub(super) fn handle_slice_entities(
         &mut self,
         targets: Vec<Handle>,
-        plane: kernel::space::Plane,
+        plane: ocs_geom::space::Plane,
         keep_point: Option<glam::DVec3>,
     ) -> Task<Message> {
         let i = self.active_tab;
@@ -890,7 +915,7 @@ impl OpenCADStudio {
     pub(super) fn handle_slice_surface_entities(
         &mut self,
         targets: Vec<Handle>,
-        cutter: Box<kernel::brep::Body>,
+        cutter: Box<ocs_solid::model::Brep>,
         keep_point: Option<glam::DVec3>,
     ) -> Task<Message> {
         let i = self.active_tab;
@@ -902,3 +927,4 @@ impl OpenCADStudio {
         task
     }
 }
+

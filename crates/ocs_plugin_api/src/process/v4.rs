@@ -2,23 +2,69 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, TryLockError, mpsc};
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::Stream;
 use interprocess::TryClone;
+use interprocess::local_socket::Stream;
 
 use crate::host::{CommandSource, ExecutionResult, HostApi, HostNotification, PluginNotification};
-use crate::ipc::protocol::{HostRequest, HostResponse, PluginRequest};
+use crate::ipc::protocol::{HostRequest, HostResponse, PluginRequest, PluginResponse};
 use crate::ipc::server::handle_plugin_request;
 use crate::ipc::transport::send;
 use crate::ipc::v4::protocol::{HostToPluginV4, NotificationEnvelope};
 use crate::ipc::v4::server::{
-    default_notify_rate_limit, run_host_reader_thread, HostIncoming, RateLimiter, V4HostShared,
+    HostIncoming, RateLimiter, V4HostShared, default_notify_rate_limit, run_host_reader_thread,
 };
-use crate::process::{request_kind, request_timeout, PluginError};
+use crate::process::{PluginError, request_kind, request_timeout};
 
 type DeferredRequest = (u64, Option<u64>, Box<PluginRequest>);
+
+/// Incoming-frame queue depth between the reader thread and the consumers
+/// (review finding 4): the reader BLOCKS on a full queue — a flood of
+/// plugin→host requests applies socket backpressure instead of growing host
+/// memory without bound while a call holds `call_lock`.
+const MAX_INCOMING_FRAMES: usize = 4096;
+
+/// Push `item` onto a bounded park queue with a drop-oldest policy (review
+/// finding 14): the overflow policy, cap and log live in exactly one place
+/// for every queue kind.
+fn park_bounded<T>(queue: &Mutex<VecDeque<T>>, cap: usize, what: &str, item: T) {
+    let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() >= cap {
+        queue.pop_front();
+        eprintln!("[plugin] dropped the oldest parked V4 {what}: the queue exceeded {cap}");
+    }
+    queue.push_back(item);
+}
+
+/// Maximum deferred (wrong-tab) plugin requests kept between drain ticks.
+/// Beyond the cap the OLDEST is dropped: the runner waiting for it times out
+/// and the connection dies honestly instead of growing without bound.
+const MAX_DEFERRED_REQUESTS: usize = 256;
+
+/// Maximum plugin requests served per `drain_requests` tick: bounds one
+/// host frame's plugin work; the rest stay queued for the next tick.
+const MAX_REQUESTS_PER_DRAIN: usize = 256;
+
+/// Maximum parked "late" responses (answered grip moves / stray frames).
+const MAX_DEFERRED_RESPONSES: usize = 256;
+
+/// Absolute per-call wall-time budget, capping deadline renewal (P1-1). The
+/// default is 10× the per-kind timeout so every per-kind floor and override
+/// still applies under it. `OCS_PLUGIN_CALL_MAX_SECONDS` overrides the budget;
+/// `0` disables the cap (keepalives may then renew forever).
+fn call_hard_budget(timeout: Duration) -> Option<Instant> {
+    let budget = match std::env::var("OCS_PLUGIN_CALL_MAX_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => return None,
+        Some(secs) => Duration::from_secs(secs),
+        None => timeout * 10,
+    };
+    Instant::now().checked_add(budget)
+}
 
 pub(crate) struct V4Connection {
     shared: Arc<V4HostShared>,
@@ -38,15 +84,22 @@ pub(crate) struct V4Connection {
     /// answered between polls, or a late frame while another call runs).
     /// Consumed first by the next [`V4Connection::call`], so no frame is lost.
     deferred_responses: Mutex<VecDeque<(u64, HostResponse)>>,
+    /// The runner child cell: killed (tree) whenever this connection is marked
+    /// dead, so a hung runner cannot linger half-alive holding handles.
+    terminator: Option<crate::process::SharedRunnerChild>,
 }
 
 impl V4Connection {
     /// Wrap a freshly accepted V4 stream. The stream is cloned so the reader
     /// thread owns one half and the writer half stays on the calling thread.
+    /// `terminator` is the runner child: when a call times out, the connection
+    /// is not just marked dead — the runner's whole process tree is killed
+    /// immediately, so a hung plugin cannot linger half-alive.
     #[allow(clippy::result_large_err)]
     pub fn new(
         stream: Stream,
         handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync>,
+        terminator: Option<crate::process::SharedRunnerChild>,
     ) -> Result<Self, PluginError> {
         let reader = stream.try_clone().map_err(|e| {
             PluginError::Io(std::io::Error::other(format!(
@@ -59,7 +112,8 @@ impl V4Connection {
             alive: AtomicBool::new(true),
         });
 
-        let (incoming_tx, incoming_rx) = mpsc::channel();
+        let (incoming_tx, incoming_rx) = mpsc::sync_channel(MAX_INCOMING_FRAMES);
+
         let rate_limiter = RateLimiter::new(default_notify_rate_limit());
 
         let shared_for_thread = Arc::clone(&shared);
@@ -83,7 +137,17 @@ impl V4Connection {
             plugin_id: Mutex::new(String::new()),
             grip_moves_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             deferred_responses: Mutex::new(VecDeque::new()),
+            terminator,
         })
+    }
+
+    /// Kill the runner's whole process tree (no-op without a terminator, e.g.
+    /// in unit tests using socket pairs). Called when the connection is marked
+    /// dead so the plugin process does not outlive its useful connection.
+    fn terminate_runner(&self) {
+        if let Some(child) = &self.terminator {
+            crate::process::reap_runner_cell(child);
+        }
     }
 
     pub fn is_alive(&self) -> bool {
@@ -102,6 +166,9 @@ impl V4Connection {
         command_id: Option<u64>,
         notification: HostNotification,
     ) -> Result<(), PluginError> {
+        if !self.is_alive() {
+            return Err(PluginError::Runner("V4 connection is dead".into()));
+        }
         let envelope = NotificationEnvelope {
             command_id,
             payload: notification,
@@ -131,6 +198,11 @@ impl V4Connection {
         let kind = request_kind(&req);
         let timeout = request_timeout(kind);
         let mut deadline = Instant::now() + timeout;
+        // Nested plugin traffic (including keep-alive heartbeats) renews the
+        // per-call deadline — that keeps debugger-paused plugins responsive,
+        // but it also lets a plugin renew the deadline forever. The absolute
+        // budget below caps a single call's wall time regardless of renewal.
+        let hard_deadline = call_hard_budget(timeout);
 
         // A coalesced grip move (API v11) may have been answered between
         // polls; its response waits in `deferred_responses`. Consume ours
@@ -160,14 +232,32 @@ impl V4Connection {
         let incoming = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
+            let hard_remaining =
+                hard_deadline.and_then(|end| end.checked_duration_since(Instant::now()));
+            if hard_remaining.map(|r| r.is_zero()).unwrap_or(false) {
+                // Always logged: the process may still run after the
+                // connection is marked dead, and this is the only record.
+                eprintln!(
+                    "[plugin] V4 absolute call budget exhausted: request={kind} \
+                     (nested traffic kept renewing the per-call deadline; marking the \
+                     connection dead and terminating the runner)"
+                );
+                self.shared.alive.store(false, Ordering::SeqCst);
+                self.terminate_runner();
+                return Err(PluginError::CallTimeout {
+                    request: kind,
+                    duration: timeout,
+                });
+            }
             if remaining.is_zero() {
                 // Always logged: the process may still run after the
                 // connection is marked dead, and this is the only record.
                 eprintln!(
                     "[plugin] V4 call deadline expired: request={kind} timeout={timeout:?} \
-                     (marking the connection dead)"
+                     (marking the connection dead and terminating the runner)"
                 );
                 self.shared.alive.store(false, Ordering::SeqCst);
+                self.terminate_runner();
                 return Err(PluginError::CallTimeout {
                     request: kind,
                     duration: timeout,
@@ -184,10 +274,12 @@ impl V4Connection {
                     {
                         // The answer to an outstanding coalesced move: park it
                         // for the poll instead of failing this call.
-                        self.deferred_responses
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back((rid, payload));
+                        park_bounded(
+                            &self.deferred_responses,
+                            MAX_DEFERRED_RESPONSES,
+                            "response",
+                            (rid, payload),
+                        );
                         continue;
                     }
                     return Err(PluginError::UnexpectedResponse(Box::new(payload)));
@@ -201,23 +293,50 @@ impl V4Connection {
                     // communicates (including periodic keep-alive heartbeats
                     // while paused in an interactive debugger).
                     deadline = Instant::now() + timeout;
+                    let current_tab_id = host.tab_id();
                     if matches!(*payload, PluginRequest::GetTabId)
-                        || tab_id.is_none_or(|request_tab| request_tab == host.tab_id() || host.tab_id() == 0)
+                        || tab_id.is_none_or(|request_tab| {
+                            request_tab == current_tab_id || current_tab_id == 0
+                        })
                     {
                         self.respond_to_plugin_request(host, rid, payload, on_start_interactive)?;
                     } else {
-                        self.deferred
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back((rid, tab_id, payload));
+                        // Deferring here causes a cycle: the runner waits for this
+                        // nested response before answering Dispatch, while this call
+                        // holds call_lock and blocks drain_requests from servicing
+                        // the deferred queue. Wrong-tab execution is forbidden, so
+                        // refuse the nested request and let the runner proceed.
+                        let requested_tab =
+                            tab_id.expect("an unserviceable foreign-tab request has a tab id");
+                        let response = PluginResponse::Error(format!(
+                            "nested plugin request for tab {requested_tab} cannot be served inline \
+                             while the host dispatches to tab {current_tab_id}; send it again \
+                             after that dispatch returns"
+                        ));
+                        let mut writer =
+                            self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
+                        let stream = writer.as_mut().ok_or_else(|| {
+                            PluginError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "V4 connection is shut down",
+                            ))
+                        })?;
+                        send(
+                            stream,
+                            &HostToPluginV4::Response {
+                                id: rid,
+                                payload: response,
+                            },
+                        )?;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     eprintln!(
                         "[plugin] V4 call recv timed out: request={kind} timeout={timeout:?} \
-                         (marking the connection dead)"
+                         (marking the connection dead and terminating the runner)"
                     );
                     self.shared.alive.store(false, Ordering::SeqCst);
+                    self.terminate_runner();
                     return Err(PluginError::CallTimeout {
                         request: kind,
                         duration: timeout,
@@ -269,20 +388,29 @@ impl V4Connection {
         }
 
         let incoming = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
+        let mut served = 0usize;
         loop {
+            if served >= MAX_REQUESTS_PER_DRAIN {
+                // Leave the rest for the next tick instead of letting one
+                // flood turn a single host frame into unbounded work.
+                return Ok(());
+            }
             match incoming.try_recv() {
                 Ok(HostIncoming::Request {
                     id,
                     tab_id,
                     payload,
                 }) => {
+                    served += 1;
                     if tab_id.is_none_or(|request_tab| request_tab == current_tab_id) {
                         self.respond_to_plugin_request(host, id, payload, on_start_interactive)?;
                     } else {
-                        self.deferred
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back((id, tab_id, payload));
+                        park_bounded(
+                            &self.deferred,
+                            MAX_DEFERRED_REQUESTS,
+                            "deferred foreign-tab request",
+                            (id, tab_id, payload),
+                        );
                     }
                 }
                 Ok(HostIncoming::Response { id, payload }) => {
@@ -296,10 +424,12 @@ impl V4Connection {
                         .unwrap_or_else(|e| e.into_inner())
                         .contains(&id)
                     {
-                        self.deferred_responses
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back((id, payload));
+                        park_bounded(
+                            &self.deferred_responses,
+                            MAX_DEFERRED_RESPONSES,
+                            "response",
+                            (id, payload),
+                        );
                     }
                     continue;
                 }
@@ -325,6 +455,9 @@ impl V4Connection {
         tab_index: usize,
         event: crate::host::CustomGripEvent,
     ) -> Result<u64, PluginError> {
+        if !self.is_alive() {
+            return Err(PluginError::Runner("V4 connection is dead".into()));
+        }
         let _call_guard = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
@@ -362,8 +495,28 @@ impl V4Connection {
         // grip routing, reaping). The runner is reaped with the process; the
         // reason travels via the host's error queue — the plugin process is
         // not trusted to log anything.
-        let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
-        *writer = None;
+        match self.shared.writer.try_lock() {
+            Ok(mut writer) => {
+                *writer = None;
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                *error.into_inner() = None;
+            }
+            Err(TryLockError::WouldBlock) => {
+                // A write is wedged inside `send` holding the writer lock —
+                // exactly the stall this watchdog exists for. The runner's
+                // tree dies now; its socket peer closes and unblocks that
+                // write, and a detached janitor clears the writer half so no
+                // state lingers.
+                self.terminate_runner();
+                let shared = Arc::clone(&self.shared);
+                std::thread::spawn(move || {
+                    if let Ok(mut writer) = shared.writer.lock() {
+                        *writer = None;
+                    }
+                });
+            }
+        }
         let _ = reason;
     }
 
@@ -425,10 +578,12 @@ impl V4Connection {
                         return Ok(Some((rid, payload)));
                     }
                     // Not ours (a late frame for a future call): park it.
-                    self.deferred_responses
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back((rid, payload));
+                    park_bounded(
+                        &self.deferred_responses,
+                        MAX_DEFERRED_RESPONSES,
+                        "response",
+                        (rid, payload),
+                    );
                 }
                 Ok(HostIncoming::Request {
                     id: rid,
@@ -444,10 +599,15 @@ impl V4Connection {
                             true,
                         )?;
                     } else {
-                        self.deferred
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_back((rid, tab_id, payload));
+                        // Same bounded park as the drain path (review
+                        // finding 7): a foreign-tab request flood during a
+                        // grip poll cannot grow the deferred queue forever.
+                        park_bounded(
+                            &self.deferred,
+                            MAX_DEFERRED_REQUESTS,
+                            "deferred foreign-tab request",
+                            (rid, tab_id, payload),
+                        );
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
@@ -549,25 +709,41 @@ impl V4Connection {
     }
 
     /// Shut down the V4 connection. The writer half is dropped, which causes
-    /// the reader thread to exit, then the thread handle is joined.
+    /// the reader thread to exit, then the thread handle is joined. If a
+    /// wedged write holds the writer lock, the runner's tree is killed first:
+    /// its socket peer closes, unblocking the write, and a janitor clears the
+    /// writer half — shutdown never blocks on a stuck plugin.
     pub fn shutdown(&self) {
-        {
-            let mut writer = self.shared.writer.lock().unwrap_or_else(|e| e.into_inner());
-            // Ask the runner to shut down gracefully so the plugin has a chance
-            // to clean up spawned child processes (e.g. the Python REPL). The
-            // runner will send an Ack, then observe EOF on the next loop
-            // iteration and exit.
-            if let Some(stream) = writer.as_mut() {
-                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                let _ = send(
-                    stream,
-                    &HostToPluginV4::Request {
-                        id,
-                        payload: HostRequest::Shutdown,
-                    },
-                );
+        match self.shared.writer.try_lock() {
+            Ok(mut writer) => {
+                // Ask the runner to shut down gracefully so the plugin has a chance
+                // to clean up spawned child processes (e.g. the Python REPL). The
+                // runner will send an Ack, then observe EOF on the next loop
+                // iteration and exit.
+                if let Some(stream) = writer.as_mut() {
+                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    let _ = send(
+                        stream,
+                        &HostToPluginV4::Request {
+                            id,
+                            payload: HostRequest::Shutdown,
+                        },
+                    );
+                }
+                let _ = writer.take();
             }
-            let _ = writer.take();
+            Err(TryLockError::Poisoned(error)) => {
+                let _ = error.into_inner().take();
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.terminate_runner();
+                let shared = Arc::clone(&self.shared);
+                std::thread::spawn(move || {
+                    if let Ok(mut writer) = shared.writer.lock() {
+                        let _ = writer.take();
+                    }
+                });
+            }
         }
         // Dropping the writer closes the socket. The reader thread will then
         // exit and clear `alive`. Joining can deadlock if a plugin child
@@ -596,10 +772,10 @@ mod tests {
     use crate::ipc::protocol::{HostResponse, PluginRequest, PluginResponse};
     use crate::ipc::transport::recv;
     use crate::ipc::v4::protocol::{HostToPluginV4, PluginToHostV4};
-    use codec::{Document, Handle};
+    use document::{Document, Handle};
     use interprocess::local_socket::{
-        traits::{Listener, Stream as StreamTrait},
         GenericNamespaced, ListenerOptions, ToNsName,
+        traits::{Listener, Stream as StreamTrait},
     };
 
     fn unique_socket_name() -> String {
@@ -643,12 +819,17 @@ mod tests {
     }
 
     struct DummyHost {
+        tab_id: u64,
         push_info_messages: StdMutex<Vec<String>>,
-        transactions: StdMutex<Vec<(String, Vec<codec::EntityType>)>>,
+        transactions: StdMutex<Vec<(String, Vec<document::EntityType>)>>,
     }
     impl DummyHost {
         fn new() -> Self {
+            Self::with_tab_id(0)
+        }
+        fn with_tab_id(tab_id: u64) -> Self {
             Self {
+                tab_id,
                 push_info_messages: StdMutex::new(Vec::new()),
                 transactions: StdMutex::new(Vec::new()),
             }
@@ -656,13 +837,16 @@ mod tests {
         fn take_push_info(&self) -> Vec<String> {
             std::mem::take(&mut *self.push_info_messages.lock().unwrap())
         }
-        fn take_transactions(&self) -> Vec<(String, Vec<codec::EntityType>)> {
+        fn take_transactions(&self) -> Vec<(String, Vec<document::EntityType>)> {
             std::mem::take(&mut *self.transactions.lock().unwrap())
         }
     }
     impl HostApi for DummyHost {
         fn tab_index(&self) -> usize {
             0
+        }
+        fn tab_id(&self) -> u64 {
+            self.tab_id
         }
         fn document(&self) -> &Document {
             panic!("not used")
@@ -673,7 +857,7 @@ mod tests {
         fn document_reader(&self) -> Box<dyn DocumentReader + '_> {
             Box::new(EmptyReader)
         }
-        fn add_entity(&mut self, _entity: codec::EntityType) -> Handle {
+        fn add_entity(&mut self, _entity: document::EntityType) -> Handle {
             panic!("not used")
         }
         fn bump_geometry(&mut self) {}
@@ -681,13 +865,13 @@ mod tests {
             &self,
             _handle: Handle,
             _app_name: &str,
-        ) -> Option<&codec::xdata::ExtendedDataRecord> {
+        ) -> Option<&document::xdata::ExtendedDataRecord> {
             None
         }
         fn write_record(
             &mut self,
             _handle: Handle,
-            _record: codec::xdata::ExtendedDataRecord,
+            _record: document::xdata::ExtendedDataRecord,
         ) -> bool {
             false
         }
@@ -698,7 +882,7 @@ mod tests {
         fn update_entities_transaction(
             &mut self,
             label: &str,
-            entities: Vec<codec::EntityType>,
+            entities: Vec<document::EntityType>,
         ) -> Result<(), String> {
             self.transactions
                 .lock()
@@ -792,7 +976,7 @@ mod tests {
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
             Arc::new(|_, _| {});
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
 
         let runner = thread::spawn(move || {
             // Read the host's V4 request and respond.
@@ -838,7 +1022,7 @@ mod tests {
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
             Arc::new(|_, _| {});
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
 
         let runner = thread::spawn(move || {
             let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
@@ -902,17 +1086,115 @@ mod tests {
     }
 
     #[test]
+    fn v4_connection_rejects_foreign_tab_nested_request_during_call() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_test_env();
+        // The old deferral deadlocks until this bounded call timeout fails the
+        // test; the fixed path answers the nested request immediately.
+        std::env::set_var("OCS_PLUGIN_CALL_TIMEOUT_SECS", "1");
+        let (host_stream, mut runner_stream) = connect_pair();
+        let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
+            Arc::new(|_, _| {});
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let runner = thread::spawn(move || {
+            let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
+            match req {
+                HostToPluginV4::Request {
+                    id,
+                    payload: HostRequest::Dispatch { .. },
+                } => {
+                    send(
+                        &mut runner_stream,
+                        &PluginToHostV4::Request {
+                            id: 99,
+                            tab_id: Some(1),
+                            payload: PluginRequest::PushInfo("wrong tab".to_string()),
+                        },
+                    )
+                    .unwrap();
+                    // The runner cannot answer Dispatch until its nested call
+                    // completes, reproducing the active-call dependency cycle.
+                    let resp = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
+                    match resp {
+                        HostToPluginV4::Response {
+                            id: 99,
+                            payload: PluginResponse::Error(message),
+                        } => {
+                            assert!(
+                                message.contains("tab 1"),
+                                "missing requested tab: {message}"
+                            );
+                            assert!(
+                                message.contains("while the host dispatches to tab 2"),
+                                "missing current tab: {message}"
+                            );
+                            assert!(
+                                message.contains("cannot be served inline"),
+                                "missing inline-dispatch refusal: {message}"
+                            );
+                        }
+                        other => panic!("unexpected nested response: {other:?}"),
+                    }
+                    send(
+                        &mut runner_stream,
+                        &PluginToHostV4::Response {
+                            id,
+                            payload: HostResponse::Bool(true),
+                        },
+                    )
+                    .unwrap();
+                    // Keep the socket open while the host checks liveness.
+                    let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+
+        let mut host = DummyHost::with_tab_id(2);
+        let resp = conn
+            .call(
+                &mut host,
+                HostRequest::Dispatch {
+                    cmd: "FOREIGN_TAB_NESTED".to_string(),
+                },
+                &mut |_| {},
+            )
+            .expect("foreign-tab refusal should unblock Dispatch");
+        assert!(matches!(resp, HostResponse::Bool(true)));
+        assert!(
+            host.take_push_info().is_empty(),
+            "foreign-tab PushInfo must not execute on the current tab"
+        );
+        assert!(
+            conn.is_alive(),
+            "the refusal must keep the connection alive"
+        );
+        assert!(
+            conn.deferred
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the refused request must not be retained in the deferred queue"
+        );
+        done_tx.send(()).unwrap();
+        runner.join().unwrap();
+        restore_test_env();
+    }
+
+    #[test]
     fn v4_connection_routes_entity_transaction_over_nested_ipc() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_test_env();
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
             Arc::new(|_, _| {});
-        let conn = V4Connection::new(host_stream, handler).unwrap();
-        let mut point = codec::entities::Point::new();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
+        let mut point = document::entities::Point::new();
         point.common.handle = Handle::new(42);
         point.location.x = 7.0;
-        let expected = codec::EntityType::Point(point);
+        let expected = document::EntityType::Point(point);
         let sent = expected.clone();
 
         let runner = thread::spawn(move || {
@@ -984,7 +1266,7 @@ mod tests {
             Arc::new(move |cmd_id, notif| {
                 received2.lock().unwrap().push((cmd_id, notif));
             });
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
 
         let runner = thread::spawn(move || {
             send(
@@ -1027,7 +1309,7 @@ mod tests {
                 }
                 received2.lock().unwrap().push((cmd_id, notif));
             });
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
 
         let runner = thread::spawn(move || {
             for i in 0..2 {
@@ -1072,7 +1354,7 @@ mod tests {
             Arc::new(move |_, _| {
                 *received2.lock().unwrap() += 1;
             });
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
         let (checked_tx, checked_rx) = mpsc::channel::<()>();
 
         let runner = thread::spawn(move || {
@@ -1119,7 +1401,7 @@ mod tests {
         let (host_stream, mut runner_stream) = connect_pair();
         let handler: Arc<dyn Fn(Option<u64>, PluginNotification) + Send + Sync> =
             Arc::new(|_, _| {});
-        let conn = V4Connection::new(host_stream, handler).unwrap();
+        let conn = V4Connection::new(host_stream, handler, None).unwrap();
 
         let runner = thread::spawn(move || {
             let req = recv::<HostToPluginV4>(&mut runner_stream).unwrap();
@@ -1193,7 +1475,7 @@ mod tests {
         fn document_reader(&self) -> Box<dyn DocumentReader + '_> {
             Box::new(EmptyReader)
         }
-        fn add_entity(&mut self, _entity: codec::EntityType) -> Handle {
+        fn add_entity(&mut self, _entity: document::EntityType) -> Handle {
             self.calls.lock().unwrap().push("add_entity");
             Handle::from(1u64)
         }
@@ -1202,13 +1484,13 @@ mod tests {
             &self,
             _handle: Handle,
             _app_name: &str,
-        ) -> Option<&codec::xdata::ExtendedDataRecord> {
+        ) -> Option<&document::xdata::ExtendedDataRecord> {
             None
         }
         fn write_record(
             &mut self,
             _handle: Handle,
-            _record: codec::xdata::ExtendedDataRecord,
+            _record: document::xdata::ExtendedDataRecord,
         ) -> bool {
             false
         }
@@ -1268,10 +1550,10 @@ mod tests {
                 PluginRequest::PushUndo {
                     label: "CVI: PI radius".to_string(),
                 },
-                PluginRequest::AddEntity(codec::EntityType::Line(
-                    codec::entities::Line::from_points(
-                        codec::types::Vector3::new(0.0, 0.0, 0.0),
-                        codec::types::Vector3::new(3.0, 0.0, 0.0),
+                PluginRequest::AddEntity(document::EntityType::Line(
+                    document::entities::Line::from_points(
+                        document::types::Vector3::new(0.0, 0.0, 0.0),
+                        document::types::Vector3::new(3.0, 0.0, 0.0),
                     ),
                 )),
             ] {
@@ -1326,7 +1608,7 @@ mod tests {
             )
             .expect("settle answer");
         });
-        let conn = V4Connection::new(host_end, Arc::new(|_, _| {})).expect("connection");
+        let conn = V4Connection::new(host_end, Arc::new(|_, _| {}), None).expect("connection");
         conn.attach_plugin_id("test.grip-points");
         let mut host = RecordingHost::default();
         let settle_id = conn
@@ -1385,7 +1667,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(1));
             let _ = id;
         });
-        let conn = V4Connection::new(host_end, Arc::new(|_, _| {})).expect("connection");
+        let conn = V4Connection::new(host_end, Arc::new(|_, _| {}), None).expect("connection");
         conn.attach_plugin_id("test.grip-points");
         let mut host = RecordingHost::default();
         let start = Instant::now();
@@ -1483,7 +1765,7 @@ mod tests {
             let _ = done_rx.recv_timeout(Duration::from_secs(10));
         });
 
-        let conn = V4Connection::new(host_end, Arc::new(|_, _| {})).expect("connection");
+        let conn = V4Connection::new(host_end, Arc::new(|_, _| {}), None).expect("connection");
         let mut host = RecordingHost::default();
         let resp = conn
             .call(

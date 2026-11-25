@@ -1,10 +1,10 @@
 // Freehand sketch tool.
 
-use codec::entities::{Line, LwPolyline, LwVertex, Spline};
-use codec::types::{Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{Line, LwPolyline, LwVertex, Spline};
+use document::types::{Vector2, Vector3};
+use document::EntityType;
 use glam::DVec3;
-use kernel::geom2d::NurbsCurve;
+use ocs_geom::geom2d::NurbsCurve;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -563,6 +563,12 @@ impl CadCommand for SketchCommand {
                 Some(result)
             }
         }
+    }
+
+    fn samples_motion(&self) -> bool {
+        // Only while the pen is actually recording: between strokes the
+        // preview is a function of the current point like any other command's.
+        self.stage == InputStage::Drawing && (self.pen_down || self.erasing)
     }
 
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {

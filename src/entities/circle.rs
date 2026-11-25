@@ -1,11 +1,11 @@
 use crate::t;
-use codec::entities::Circle;
+use document::entities::Circle;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_prop as edit, format_decimal, parse_f64, ro_prop as ro, square_grip,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{extrusion_wall_tris, RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::TangentGeom;
@@ -135,11 +135,11 @@ fn to_render(circle: &Circle) -> RenderEntity {
 
 /// Zoom-aware render converter for EntityType::Circle.
 pub fn relative_render(
-    entity: &codec::EntityType,
-    _document: &codec::Document,
+    entity: &document::EntityType,
+    _document: &document::Document,
     wpp: Option<f32>,
 ) -> Option<RenderEntity> {
-    let codec::EntityType::Circle(circle) = entity else {
+    let document::EntityType::Circle(circle) = entity else {
         return None;
     };
     Some(to_render_with_wpp(circle, wpp))
@@ -175,9 +175,21 @@ fn properties(circle: &Circle) -> Vec<PropSection> {
             edit(t!("Diameter").as_ref(), "diameter", r * 2.0),
             edit(t!("Circumference").as_ref(), "circumference", 2.0 * PI * r),
             edit(t!("Area").as_ref(), "area", PI * r * r),
-            ro(t!("Normal X").as_ref(), "normal_x", format_decimal(circle.normal.x)),
-            ro(t!("Normal Y").as_ref(), "normal_y", format_decimal(circle.normal.y)),
-            ro(t!("Normal Z").as_ref(), "normal_z", format_decimal(circle.normal.z)),
+            ro(
+                t!("Normal X").as_ref(),
+                "normal_x",
+                format_decimal(circle.normal.x),
+            ),
+            ro(
+                t!("Normal Y").as_ref(),
+                "normal_y",
+                format_decimal(circle.normal.y),
+            ),
+            ro(
+                t!("Normal Z").as_ref(),
+                "normal_z",
+                format_decimal(circle.normal.z),
+            ),
         ],
     }]
 }
@@ -245,7 +257,8 @@ fn apply_grip(circle: &mut Circle, grip_id: usize, apply: GripApply) {
 }
 
 fn apply_transform(circle: &mut Circle, t: &EntityTransform) {
-    crate::scene::view::transform::apply_standard_entity_transform(circle, t, |entity, p1, p2| {
+    let normal = circle.normal;
+    crate::scene::view::transform::apply_ocs_entity_transform(circle, t, normal, |entity, p1, p2| {
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.center.x,
             &mut entity.center.y,
@@ -256,7 +269,7 @@ fn apply_transform(circle: &mut Circle, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Circle {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(to_render(self))
     }
 }
@@ -383,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_circle_segments_scales_with_zoom() {
+    fn circle_segments_scales_with_zoom() {
         let r = 10.0;
         // Default / invalid cases return baseline floor of 48.
         assert_eq!(circle_segments(r, None), 48);
@@ -421,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_circle_segments_scales_with_radius() {
+    fn circle_segments_scales_with_radius() {
         let wpp = Some(0.1);
         let seg_small = circle_segments(1.0, wpp);
         let seg_med = circle_segments(20.0, wpp);
@@ -435,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_circle_to_render_points_increase_with_zoom() {
+    fn circle_to_render_points_increase_with_zoom() {
         let mut circle = Circle::default();
         circle.radius = 10.0;
 
@@ -459,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thick_circle_to_render_points_increase_with_zoom() {
+    fn thick_circle_to_render_points_increase_with_zoom() {
         let mut circle = Circle::default();
         circle.radius = 10.0;
         circle.thickness = 2.0;

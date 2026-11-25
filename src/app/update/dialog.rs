@@ -3,9 +3,7 @@
 #![allow(unused_imports)]
 use super::util::*;
 use super::{format_size, VIEWCUBE_HIT_SIZE};
-use crate::app::helpers::{
-    parse_coord, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind,
-};
+use crate::app::helpers::{parse_coord, ucs_rotate_vec, ucs_to_wcs, ucs_z_axis, CoordKind};
 use crate::app::{Message, OpenCADStudio, POLY_START_DELAY_MS};
 use crate::modules::ModuleEvent;
 use crate::scene::model::object::GripApply;
@@ -15,8 +13,8 @@ use crate::scene::{
 };
 use crate::ui::window::block_palette::BlockPaletteMsg;
 use crate::ui::PropertiesPanel;
-use codec::types::Color as AcadColor;
-use codec::{EntityType as AcadEntityType, Handle};
+use document::types::Color as AcadColor;
+use document::{EntityType as AcadEntityType, Handle};
 use iced::time::Instant;
 use iced::{mouse, Point, Task};
 
@@ -99,7 +97,7 @@ impl OpenCADStudio {
         // `gain_focus` alone is ignored by most Linux WMs (focus-stealing
         // prevention), so pair it with an urgency hint so the window is at
         // least flagged for attention when the compositor blocks the raise.
-        match self.main_window {
+        let focus = match self.main_window {
             Some(id) => Task::batch([
                 iced::window::gain_focus(id),
                 iced::window::request_user_attention(
@@ -108,7 +106,9 @@ impl OpenCADStudio {
                 ),
             ]),
             None => Task::none(),
-        }
+        };
+        // A previously focused command input must not capture the answer.
+        Task::batch([focus, self.unfocus_widgets()])
     }
 
     pub(in crate::app) fn close_unsaved_dialog_window(&mut self) -> Task<Message> {
@@ -138,7 +138,14 @@ impl OpenCADStudio {
         match event {
             // `dispatch_command` turns a one-shot tool's highlight off
             // again once nothing is left running (#355).
-            ModuleEvent::Command(cmd) => return self.dispatch_ribbon_command(&cmd),
+            ModuleEvent::Command(cmd) => {
+                if cmd == "TOOLPALETTES"
+                    && self.dock_panel_visible(crate::ui::dock::PanelId::ToolPalettes)
+                {
+                    return self.dispatch_ribbon_command("TOOLPALETTESCLOSE");
+                }
+                return self.dispatch_ribbon_command(&cmd);
+            }
             ModuleEvent::OpenFileDialog => {
                 self.command_line
                     .push_info(crate::t!("Open DWG/DXF: not yet implemented.").as_ref());
@@ -146,6 +153,7 @@ impl OpenCADStudio {
             ModuleEvent::ClearModels => {
                 let i = self.active_tab;
                 self.tabs[i].scene.clear();
+                self.tabs[i].note_drawing_cleared();
                 self.tabs[i].properties = PropertiesPanel::empty();
                 self.command_line
                     .push_output(crate::t!("Scene cleared.").as_ref());
@@ -188,6 +196,23 @@ impl OpenCADStudio {
                     |(command, path)| Message::PluginFileDialogResult { command, path },
                 );
             }
+            // A browser picks files, not folders.
+            #[cfg(target_arch = "wasm32")]
+            ModuleEvent::PluginFolderDialog { .. } => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            ModuleEvent::PluginFolderDialog { command, title } => {
+                return Task::perform(
+                    async move {
+                        let path = crate::sys::file_dialog()
+                            .set_title(title)
+                            .pick_folder()
+                            .await
+                            .map(|h| crate::sys::handle_path(&h));
+                        (command, path)
+                    },
+                    |(command, path)| Message::PluginFileDialogResult { command, path },
+                );
+            }
         }
         // Every non-Command event above is a one-shot (state toggle,
         // clear, dialog spawn) — nothing stays running to clear the
@@ -223,7 +248,7 @@ impl OpenCADStudio {
                 // would resurrect it after the remove, so defer to the round's
                 // end (the same guard the save flow uses).
                 #[cfg(target_arch = "wasm32")]
-                {
+                if !crate::io::host_bridge::is_embed_mode() {
                     let key = Self::web_autosave_key(&self.tabs[idx]);
                     if self.web_autosave_in_flight {
                         self.web_autosave_clear_after.push(key);
@@ -235,7 +260,8 @@ impl OpenCADStudio {
                 }
                 if self.tabs.len() == 1 {
                     self.tab_counter += 1;
-                    self.tabs[0] = crate::app::document::DocumentTab::new_drawing(self.tab_counter);
+                    self.tabs[0] =
+                        crate::app::tab_document::DocumentTab::new_drawing(self.tab_counter);
                     self.active_tab = 0;
                     self.apply_display_defaults(0);
                 } else {
@@ -308,7 +334,8 @@ impl OpenCADStudio {
                 }
             };
 
-            if self.active_save_jobs.contains_key(&self.tabs[idx].id) {
+            let tab_id = self.tabs[idx].id;
+            if self.active_save_jobs.contains_key(&tab_id) && !self.autosave_is_running(tab_id) {
                 self.command_line
                     .push_info(crate::t!("Save already running for this drawing.").as_ref());
                 return Task::none();
@@ -336,7 +363,7 @@ impl OpenCADStudio {
             self.save_dialog_for_unsaved = true;
             let close = self.close_unsaved_dialog_window();
             let save = self.save_with_default_format(idx);
-            return Task::batch([close, save]);
+            Task::batch([close, save])
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -440,7 +467,7 @@ impl OpenCADStudio {
     #[cfg(test)]
     fn import_document_as_block(
         &mut self,
-        doc: codec::Document,
+        doc: document::Document,
         stem: String,
     ) -> Result<String, String> {
         self.import_document_block(doc, stem, false)
@@ -448,7 +475,7 @@ impl OpenCADStudio {
 
     pub(super) fn import_document_block(
         &mut self,
-        doc: codec::Document,
+        doc: document::Document,
         stem: String,
         redefine: bool,
     ) -> Result<String, String> {
@@ -458,15 +485,15 @@ impl OpenCADStudio {
             .objects
             .values()
             .find_map(|o| {
-                if let codec::objects::ObjectType::Layout(l) = o {
+                if let document::objects::ObjectType::Layout(l) = o {
                     (l.name == "Model" && !l.block_record.is_null()).then_some(l.block_record)
                 } else {
                     None
                 }
             })
             .or_else(|| doc.block_records.get("*Model_Space").map(|br| br.handle))
-            .unwrap_or(codec::Handle::NULL);
-        let mut entities: Vec<codec::EntityType> = if model_br.is_null() {
+            .unwrap_or(document::Handle::NULL);
+        let mut entities: Vec<document::EntityType> = if model_br.is_null() {
             Vec::new()
         } else {
             let br = doc.block_records.iter().find(|br| br.handle == model_br);
@@ -479,7 +506,7 @@ impl OpenCADStudio {
                     .filter(|e| {
                         !matches!(
                             e,
-                            codec::EntityType::Block(_) | codec::EntityType::BlockEnd(_)
+                            document::EntityType::Block(_) | document::EntityType::BlockEnd(_)
                         )
                     })
                     .cloned()
@@ -495,7 +522,7 @@ impl OpenCADStudio {
                     .filter(|e| {
                         !matches!(
                             e,
-                            codec::EntityType::Block(_) | codec::EntityType::BlockEnd(_)
+                            document::EntityType::Block(_) | document::EntityType::BlockEnd(_)
                         )
                     })
                     .cloned()
@@ -505,6 +532,7 @@ impl OpenCADStudio {
         if entities.is_empty() {
             return Err("No model-space entities in that file.".to_string());
         }
+        let file_units = doc.header.insertion_units;
         let base = glam::DVec3::new(
             doc.header.model_space_insertion_base.x,
             doc.header.model_space_insertion_base.y,
@@ -525,7 +553,7 @@ impl OpenCADStudio {
         // Capture every table record needed by the top-level entities and their
         // nested block definitions. Importing only the definitions leaves
         // source-only layers, linetypes, and text/dimension styles dangling.
-        let deps = crate::app::ClipboardDeps::capture(&doc, &entities);
+        let deps = crate::app::ClipboardDeps::capture_drawing(&doc, &entities);
         // Capture the imported file's nested block definitions once. When a
         // name collides with a block already in the active drawing, we must
         // *preserve both*: keep the destination's block and import the file's
@@ -574,7 +602,7 @@ impl OpenCADStudio {
             .iter_mut()
             .chain(defs.iter_mut().flat_map(|def| def.entities.iter_mut()))
         {
-            if let codec::EntityType::Insert(ins) = entity {
+            if let document::EntityType::Insert(ins) = entity {
                 if let Some(new_name) = rename_map.get(&ins.block_name) {
                     ins.block_name = new_name.clone();
                 }
@@ -588,7 +616,7 @@ impl OpenCADStudio {
         // A drawing written out from a dynamic block keeps the block's
         // parameters and actions on its model space; the new definition
         // takes them over, as the file's nested definitions do theirs.
-        let base_point = codec::types::Vector3::new(base.x, base.y, base.z);
+        let base_point = document::types::Vector3::new(base.x, base.y, base.z);
         let file_def = (!redefine)
             .then(|| crate::scene::block_authoring::export_graph(&doc, model_br))
             .flatten()
@@ -608,7 +636,10 @@ impl OpenCADStudio {
                 .define_block_raw(&def.name, def.base_point, def.entities.clone());
         }
         if redefine {
-            if let Err(err) = self.tabs[i].scene.redefine_block_raw(&name, base_point, entities) {
+            if let Err(err) = self.tabs[i]
+                .scene
+                .redefine_block_raw(&name, base_point, entities)
+            {
                 self.command_line.push_error(&err);
                 return Err(err);
             }
@@ -617,8 +648,12 @@ impl OpenCADStudio {
             // geometry there and put the insertion base on the block.
             let scene = &mut self.tabs[i].scene;
             scene.define_block_from_owned_entities(entities, &name, glam::DVec3::ZERO)?;
-            let block = scene.document.block_records.get(&name).map(|r| r.block_entity_handle);
-            if let Some(codec::EntityType::Block(block)) =
+            let block = scene
+                .document
+                .block_records
+                .get(&name)
+                .map(|r| r.block_entity_handle);
+            if let Some(document::EntityType::Block(block)) =
                 block.and_then(|h| scene.document.get_entity_mut(h))
             {
                 block.base_point = base_point;
@@ -636,9 +671,35 @@ impl OpenCADStudio {
                 import_block_def_graph(document, def, &records);
             }
         }
+        // The block is drawn in the file's units: a reference placed later
+        // scales by them against the drawing's INSUNITS, as an XREF of the
+        // file does (#3474). A unitless file stays unitless.
+        if let Some(record) = self.tabs[i].scene.document.block_records.get_mut(&name) {
+            record.units = file_units;
+        }
         self.tabs[i].scene.populate_meshes_from_document();
         self.tabs[i].dirty = true;
         Ok(name)
+    }
+
+    /// Decode the Xref Manager preview that `request` asks for on a worker
+    /// (`reader`; a test can give one that panics); the panel takes it when
+    /// the decode ends.
+    pub(crate) fn read_xref_manager_preview_with(
+        &self,
+        request: crate::ui::window::xref_manager::PreviewRequest,
+        reader: crate::ui::window::xref_manager::PreviewReader,
+    ) -> Task<Message> {
+        let crate::ui::window::xref_manager::PreviewRequest {
+            generation,
+            key,
+            entry,
+        } = request;
+        crate::app::update::background_task(
+            crate::t!("External References"),
+            move || reader(&entry),
+            move |preview| Message::XrefPreviewRead(generation, key, preview),
+        )
     }
 
     /// Rebuild the Reference Manager's entry list from the active drawing.
@@ -676,6 +737,10 @@ impl OpenCADStudio {
             )
         };
         let tab = &mut self.tabs[i];
+        crate::io::xref::apply_native_source_status(
+            &mut self.xref_manager.entries,
+            tab.ifccad_session.as_ref(),
+        );
         for (key, mtime) in baselines {
             tab.xref_stat_cache.insert(key, mtime);
         }
@@ -708,30 +773,87 @@ impl OpenCADStudio {
         }
     }
 
+    /// Rebuild the automation-visible reference report (`state.xrefs`) from
+    /// the live drawing: the same entries, session sets and stat baselines
+    /// the Reference Manager scans, so a status query after an unload, a
+    /// reload or a source file disappearing reports what the palette would
+    /// show. Returns the entries so a caller that needs them (the `XREF ?`
+    /// list) does not stat the same files twice.
+    pub(crate) fn refresh_xref_report(
+        &mut self,
+        i: usize,
+    ) -> Vec<crate::io::xref_model::ReferenceEntry> {
+        let base_dir: std::path::PathBuf = self.tabs[i]
+            .current_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mut entries = crate::io::xref::collect_entries_with_prev(
+            &self.tabs[i].scene.document,
+            &base_dir,
+            self.tabs[i].xref_unloaded.as_set(),
+            &self.tabs[i].xref_stat_cache.0,
+        );
+        crate::io::xref::apply_native_source_status(
+            &mut entries,
+            self.tabs[i].ifccad_session.as_ref(),
+        );
+        self.tabs[i].xref_report = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.saved_path.clone(),
+                    crate::app::control::ref_status_name(e.status),
+                )
+            })
+            .collect();
+        self.tabs[i].xref_missing = entries
+            .iter()
+            .filter(|e| e.status == crate::io::xref_model::RefStatus::NotFound)
+            .count();
+        entries
+    }
+
     /// Shared post-mutation sequence for reference ops (CLI + palette):
     /// repopulate scene caches, mirror xref layers into the Layers panel,
     /// and mark the tab dirty. Both call sites use it so the 5-line
     /// sequence cannot drift.
+    /// Reload raster image references: drop their session unload flag and
+    /// load-time baseline, forget decoded pixels so each file is read again
+    /// (a new path or an edited file), and repopulate the image models.
+    pub(crate) fn reload_image_refs(&mut self, i: usize, keys: &[u64]) {
+        for key in keys {
+            self.tabs[i].xref_unloaded.remove(key);
+            self.tabs[i].xref_stat_cache.remove(key);
+        }
+        crate::scene::model::image_model::clear_image_cache();
+        self.post_ref_op(i);
+    }
+
     pub(crate) fn post_ref_op(&mut self, i: usize) {
+        if let Some(session) = &self.tabs[i].ifccad_session {
+            session.invalidate_source_generation();
+        }
         self.tabs[i].scene.populate_hatches_from_document();
         self.tabs[i].scene.populate_images_from_document();
         // Image/PDF unload is intentionally session-only (the file formats do
         // not persist an unloaded bit), so keep their source entities but
         // remove their decoded render models.  A reload repopulates the cache
         // after clearing the corresponding session key.
-        let hidden_images: Vec<codec::types::Handle> = self.tabs[i]
+        let hidden_images: Vec<document::types::Handle> = self.tabs[i]
             .scene
             .document
             .entities()
             .filter_map(|entity| match entity {
-                codec::EntityType::RasterImage(image)
+                document::EntityType::RasterImage(image)
                     if image
                         .definition_handle
                         .is_some_and(|key| self.tabs[i].xref_unloaded.is_unloaded(key.value())) =>
                 {
                     Some(entity.common().handle)
                 }
-                codec::EntityType::Underlay(underlay)
+                document::EntityType::Underlay(underlay)
                     if self.tabs[i]
                         .xref_unloaded
                         .is_unloaded(underlay.definition_handle.value()) =>
@@ -745,8 +867,19 @@ impl OpenCADStudio {
             self.tabs[i].scene.images.remove(&handle);
         }
         self.tabs[i].scene.populate_meshes_from_document();
+        // A reload re-links dimensions to the freshly merged xref copies;
+        // touching those copies re-measures the dimensions from them.
+        let xref_targets = xref_dimension_targets(&self.tabs[i].scene.document);
+        if !xref_targets.is_empty() {
+            self.tabs[i].scene.bump_entities(&xref_targets);
+        }
         self.refresh_layer_panel();
         self.tabs[i].dirty = true;
+        // The reference report the automation surface reads must follow the
+        // mutation: an unload, reload, detach or bind changes reference
+        // status, and a stale report would answer a status query with the
+        // open-time snapshot.
+        self.refresh_xref_report(i);
         if i == self.active_tab {
             // The selection often survives these edits — a transform, an
             // attribute change, an erase of other handles — so both surfaces
@@ -894,8 +1027,8 @@ impl OpenCADStudio {
                             if row_kind != kind || row_name != name {
                                 continue;
                             }
-                            let handle = codec::types::Handle::new(*key);
-                            if let Some(codec::objects::ObjectType::UnderlayDefinition(def)) =
+                            let handle = document::types::Handle::new(*key);
+                            if let Some(document::objects::ObjectType::UnderlayDefinition(def)) =
                                 self.tabs[i].scene.document.objects.get_mut(&handle)
                             {
                                 def.unloaded = false;
@@ -909,24 +1042,27 @@ impl OpenCADStudio {
                             if row_kind == kind && row_name == name {
                                 crate::io::xref::set_point_cloud_loaded(
                                     &mut self.tabs[i].scene.document,
-                                    codec::types::Handle::new(*key),
+                                    document::types::Handle::new(*key),
                                     true,
                                 );
                             }
                         }
                         self.tabs[i].scene.bump_geometry();
-                    } else if *kind != crate::io::xref_model::RefKind::DwgXref {
-                        self.command_line.push_error(
-                            crate::tf!("{}: reload applies to drawing references only.", name)
-                                .as_ref(),
-                        );
+                    } else if *kind == crate::io::xref_model::RefKind::Image {
+                        let keys: Vec<u64> = picked
+                            .iter()
+                            .filter(|(_, n, k, _)| k == kind && n == name)
+                            .map(|(key, ..)| *key)
+                            .collect();
+                        self.reload_image_refs(i, &keys);
+                        done += 1;
                     }
                 }
                 for (key, _) in &dwg_picked {
                     self.tabs[i].xref_unloaded.remove(key);
                     self.tabs[i].xref_stat_cache.remove(key);
                 }
-                let handles: rustc_hash::FxHashSet<codec::types::Handle> = self.tabs[i]
+                let handles: rustc_hash::FxHashSet<document::types::Handle> = self.tabs[i]
                     .scene
                     .document
                     .block_records
@@ -934,10 +1070,12 @@ impl OpenCADStudio {
                     .filter(|br| dwg_picked.iter().any(|(key, _)| *key == br.handle.value()))
                     .map(|br| br.handle)
                     .collect();
-                let infos = crate::io::xref::resolve_xrefs_for_keys(
+                let xref_session = self.tabs[i].ifccad_session.clone();
+                let infos = crate::io::xref::resolve_xrefs_for_keys_in_session(
                     &mut self.tabs[i].scene.document,
                     &base_dir,
                     &handles,
+                    xref_session.as_ref(),
                 );
                 // Targeted reload updates baselines only for selected rows.
                 {
@@ -1167,9 +1305,9 @@ impl OpenCADStudio {
 mod tests {
     use super::*;
     use crate::app::OpenCADStudio;
-    use codec::entities::Line;
-    use codec::types::Vector3;
-    use codec::EntityType;
+    use document::entities::Line;
+    use document::types::Vector3;
+    use document::EntityType;
 
     fn fresh() -> OpenCADStudio {
         let mut app = OpenCADStudio::new_for_test();
@@ -1178,13 +1316,13 @@ mod tests {
     }
 
     /// A foreign document: the fresh scene's document plus one model-space LINE.
-    fn foreign_doc(app: &OpenCADStudio) -> codec::Document {
+    fn foreign_doc(app: &OpenCADStudio) -> document::Document {
         let mut doc = app.tabs[app.active_tab].scene.document.clone();
         let model_br = doc
             .objects
             .values()
             .find_map(|o| {
-                if let codec::objects::ObjectType::Layout(l) = o {
+                if let document::objects::ObjectType::Layout(l) = o {
                     (l.name == "Model" && !l.block_record.is_null()).then_some(l.block_record)
                 } else {
                     None
@@ -1218,7 +1356,7 @@ mod tests {
 
     #[test]
     fn import_document_as_block_merges_source_only_layer() {
-        use codec::tables::Layer;
+        use document::tables::Layer;
 
         let mut app = fresh();
         let mut doc = foreign_doc(&app);
@@ -1229,7 +1367,9 @@ mod tests {
             .objects
             .values()
             .find_map(|o| match o {
-                codec::objects::ObjectType::Layout(l) if l.name == "Model" => Some(l.block_record),
+                document::objects::ObjectType::Layout(l) if l.name == "Model" => {
+                    Some(l.block_record)
+                }
                 _ => None,
             })
             .unwrap();
@@ -1248,14 +1388,61 @@ mod tests {
             .contains("Imported Fixtures"));
     }
 
+    /// Inserting a drawing brings every layer of it, also those nothing is
+    /// drawn on yet, with their state and the linetype they name; layers of
+    /// the drawing's xrefs stay behind, and a layer the destination already
+    /// has keeps the destination's settings.
+    #[test]
+    fn import_document_as_block_brings_every_layer() {
+        use document::tables::{Layer, LineType};
+
+        let mut app = fresh();
+        let i = app.active_tab;
+        let mut doc = foreign_doc(&app);
+        let mut dashed = LineType::new("OCS_TEST_DASHED");
+        dashed.handle = doc.allocate_handle();
+        let _ = doc.line_types.add(dashed);
+        let mut empty = Layer::new("Empty Frozen");
+        empty.handle = doc.allocate_handle();
+        empty.flags.frozen = true;
+        empty.line_type = "OCS_TEST_DASHED".to_string();
+        doc.layers.add(empty).unwrap();
+        let mut xref = Layer::new("Site|Walls");
+        xref.handle = doc.allocate_handle();
+        xref.flags.xref_dependent = true;
+        doc.layers.add(xref).unwrap();
+        let mut shared = Layer::new("Shared");
+        shared.handle = doc.allocate_handle();
+        shared.flags.frozen = true;
+        doc.layers.add(shared).unwrap();
+        let mut own = Layer::new("Shared");
+        own.handle = app.tabs[i].scene.document.allocate_handle();
+        app.tabs[i].scene.document.layers.add(own).unwrap();
+
+        app.import_document_as_block(doc, "Fixture".to_string())
+            .unwrap();
+        let dest = &app.tabs[i].scene.document;
+        let layer = dest.layers.get("Empty Frozen").expect("the empty layer comes along");
+        assert!(layer.flags.frozen, "with its state");
+        assert!(
+            dest.line_types.contains("OCS_TEST_DASHED"),
+            "the layer's linetype comes with it"
+        );
+        assert!(!dest.layers.contains("Site|Walls"), "xref layers stay behind");
+        assert!(
+            !dest.layers.get("Shared").unwrap().flags.frozen,
+            "an existing layer keeps the destination's settings"
+        );
+    }
+
     /// A foreign document whose model space INSERTs a `Fixture` block, whose
     /// definition itself INSERTs a `Door` block — so the imported `Door` is a
     /// *nested dependency*, not a top-level entity. The `Door` in this file is
     /// unrelated to any `Door` in the destination drawing.
-    fn nested_foreign_doc(app: &OpenCADStudio) -> codec::Document {
-        use codec::entities::Insert;
-        use codec::tables::BlockRecord;
-        use codec::Handle;
+    fn nested_foreign_doc(app: &OpenCADStudio) -> document::Document {
+        use document::entities::Insert;
+        use document::tables::BlockRecord;
+        use document::Handle;
         let mut doc = foreign_doc(app);
 
         // "Door" block definition: one LINE of geometry.
@@ -1283,7 +1470,7 @@ mod tests {
             .objects
             .values()
             .find_map(|o| {
-                if let codec::objects::ObjectType::Layout(l) = o {
+                if let document::objects::ObjectType::Layout(l) = o {
                     (l.name == "Model" && !l.block_record.is_null()).then_some(l.block_record)
                 } else {
                     None
@@ -1299,7 +1486,7 @@ mod tests {
     }
 
     /// The nested-INSERT's block name inside a defined block record.
-    fn nested_insert_target(doc: &codec::Document, block: &str) -> Option<String> {
+    fn nested_insert_target(doc: &document::Document, block: &str) -> Option<String> {
         let br = doc.block_records.get(block)?;
         br.entity_handles
             .iter()
@@ -1312,10 +1499,10 @@ mod tests {
     /// A foreign document whose model space INSERTs a `Fixture` block whose
     /// definition INSERTs `Door (2)`, whose definition in turn INSERTs `Door`.
     /// The file therefore carries *both* `Door` and `Door (2)` as nested deps.
-    fn doubly_nested_foreign_doc(app: &OpenCADStudio) -> codec::Document {
-        use codec::entities::Insert;
-        use codec::tables::BlockRecord;
-        use codec::Handle;
+    fn doubly_nested_foreign_doc(app: &OpenCADStudio) -> document::Document {
+        use document::entities::Insert;
+        use document::tables::BlockRecord;
+        use document::Handle;
         let mut doc = foreign_doc(app);
 
         let door_h = Handle::new(doc.next_handle());
@@ -1348,7 +1535,7 @@ mod tests {
             .objects
             .values()
             .find_map(|o| {
-                if let codec::objects::ObjectType::Layout(l) = o {
+                if let document::objects::ObjectType::Layout(l) = o {
                     (l.name == "Model" && !l.block_record.is_null()).then_some(l.block_record)
                 } else {
                     None
@@ -1481,7 +1668,7 @@ mod tests {
 
     #[test]
     fn blockpalette_reflects_new_block_without_reopen() {
-        use codec::types::Transform;
+        use document::types::Transform;
 
         let mut app = fresh();
         let i = app.active_tab;
@@ -1560,7 +1747,7 @@ mod tests {
         let new_dir = dir.join("new");
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
-        let mut br = codec::tables::BlockRecord::new("PLAN");
+        let mut br = document::tables::BlockRecord::new("PLAN");
         br.flags.is_xref = true;
         br.xref_path = "refs/plan.dwg".to_string();
         br.handle = app.tabs[i].scene.document.allocate_handle();
@@ -1576,6 +1763,7 @@ mod tests {
             revision: app.tabs[i].edit_revision,
             camera_generation: app.tabs[i].scene.camera_generation,
             path: new_dir.join("host.dwg"),
+            physical_path: None,
             version: app.tabs[i].scene.document.version,
             previous_autosave: None,
             set_current_path: true,
@@ -1656,9 +1844,9 @@ mod tests {
         // wording), never silently skip.
         use crate::app::Message;
         use crate::ui::window::xref_manager::{XrefPaletteOp, XrefRowId};
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let dir = palette_tmpdir("nestedmatrix");
-        let mut host_doc = codec::Document::new();
+        let mut host_doc = document::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -1715,7 +1903,7 @@ mod tests {
         // drive the exact GUI message path (row right-click menu item).
         use crate::app::Message;
         use crate::ui::window::xref_manager::{XrefPaletteOp, XrefRowId};
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let mut app = fresh();
         let i = app.active_tab;
         for name in ["PLAN", "SITE"] {
@@ -1778,7 +1966,7 @@ mod tests {
         use crate::app::Message;
         use crate::io::xref_model::{Pathtype, RefType};
         use crate::ui::window::xref_manager::{XrefPaletteOp, XrefRowId};
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let mut app = fresh();
         let i = app.active_tab;
         let mut br = BlockRecord::new("PLAN");
@@ -1839,9 +2027,9 @@ mod tests {
     fn palette_reload_all_resolves_direct_refs() {
         // Toolbar Reload All against a real on-disk reference: full
         // resolve, per-ref report, entry back to Loaded.
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let dir = palette_tmpdir("reloadall");
-        let ref_doc = codec::Document::new();
+        let ref_doc = document::Document::new();
         let bytes = crate::io::save_to_bytes(&ref_doc, "dwg", ref_doc.version).unwrap();
         std::fs::write(dir.join("plan.dwg"), &bytes).unwrap();
         let mut app = fresh();
@@ -1888,9 +2076,9 @@ mod tests {
         // F6: palette Unload on a nested row reports the per-entry nested
         // error (CLI wording) instead of the confusing 'no loaded reference'.
         use crate::ui::window::xref_manager::XrefPaletteOp;
-        use codec::tables::BlockRecord;
+        use document::tables::BlockRecord;
         let dir = palette_tmpdir("nested");
-        let mut host_doc = codec::Document::new();
+        let mut host_doc = document::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -1923,13 +2111,11 @@ mod tests {
     }
 
     #[test]
-    fn palette_reload_skips_images_without_clearing_flags() {
-        // F7: palette Reload on an image/PDF row reports the drawing-only
-        // error and leaves its unloaded flag untouched (no spurious
-        // no-match after a flag clear).
+    fn palette_reload_loads_unloaded_image() {
+        // Palette Reload on an unloaded image row loads it again (#3368).
         use crate::io::xref_model::RefKind;
         use crate::ui::window::xref_manager::XrefPaletteOp;
-        use codec::objects::{ImageDefinition, ObjectType};
+        use document::objects::{ImageDefinition, ObjectType};
         let dir = palette_tmpdir("imgreload");
         let mut app = fresh();
         let i = app.active_tab;
@@ -1941,13 +2127,17 @@ mod tests {
             .document
             .objects
             .insert(h, ObjectType::ImageDefinition(def));
-        let mut img =
-            codec::entities::RasterImage::new("img.png", codec::types::Vector3::ZERO, 8.0, 8.0);
+        let mut img = document::entities::RasterImage::new(
+            "img.png",
+            document::types::Vector3::ZERO,
+            8.0,
+            8.0,
+        );
         img.definition_handle = Some(h);
         app.tabs[i]
             .scene
             .document
-            .add_entity(codec::EntityType::RasterImage(img))
+            .add_entity(document::EntityType::RasterImage(img))
             .unwrap();
         app.tabs[i].current_path = Some(dir.join("host.dwg"));
         app.refresh_xref_manager();
@@ -1963,12 +2153,620 @@ mod tests {
         let start = app.command_line.history.len();
         app.xref_manager_op(XrefPaletteOp::Reload);
         let out = palette_output(&app, start);
-        assert!(out.contains("img.png"), "got: {out:?}");
-        assert_eq!(app.command_line.history.len(), start + 1);
+        assert!(!out.contains("drawing references only"), "got: {out:?}");
         assert!(
-            app.tabs[i].xref_unloaded.is_unloaded(key),
-            "image flag must stay untouched"
+            !app.tabs[i].xref_unloaded.is_unloaded(key),
+            "image must be loaded again"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn interactive_dialog_action_pick_updates_table() {
+        use crate::command::{CadCommand, CmdResult};
+        use ocs_plugin_api::dialog::{
+            DialogActionResponse, DialogControl, DialogDef, DialogEvent, DialogValue,
+        };
+        use std::collections::HashMap;
+
+        struct MockStartupCommand {
+            scripts: Vec<String>,
+        }
+
+        impl CadCommand for MockStartupCommand {
+            fn name(&self) -> &'static str {
+                "MOCKSTARTUP"
+            }
+            fn prompt(&self) -> String {
+                "Mock startup prompt".to_string()
+            }
+            fn on_point(&mut self, _pt: glam::DVec3) -> CmdResult {
+                CmdResult::Cancel
+            }
+            fn on_enter(&mut self) -> CmdResult {
+                CmdResult::Cancel
+            }
+            fn on_dialog_action(&mut self, event: DialogEvent) -> DialogActionResponse {
+                if event.control_id == "file_input" && event.action == "pick" {
+                    if let Some(DialogValue::FilePath(p)) = event.value {
+                        self.scripts.push(p);
+                        let mut updates = HashMap::new();
+                        updates.insert(
+                            "scripts_table".to_string(),
+                            DialogValue::Table(
+                                self.scripts.iter().map(|s| vec![s.clone()]).collect(),
+                            ),
+                        );
+                        updates.insert(
+                            "file_input".to_string(),
+                            DialogValue::FilePath(String::new()),
+                        );
+                        return DialogActionResponse::UpdateValues(updates);
+                    }
+                }
+                DialogActionResponse::None
+            }
+        }
+
+        let mut app = fresh();
+        let i = app.active_tab;
+        app.tabs[i].active_cmd = Some(Box::new(MockStartupCommand {
+            scripts: Vec::new(),
+        }));
+
+        let def = DialogDef::new("Startup Test")
+            .with_control(DialogControl::FilePicker {
+                id: "file_input".to_string(),
+                label: "Select Script:".to_string(),
+                default_path: String::new(),
+                filter_name: "LISP".to_string(),
+                extensions: vec!["lsp".to_string()],
+                save: false,
+            })
+            .with_control(DialogControl::Table {
+                id: "scripts_table".to_string(),
+                label: Some("Startup Scripts".to_string()),
+                headers: vec!["Path".to_string()],
+                rows: vec![],
+                allow_add: true,
+                allow_delete: true,
+            });
+
+        app.open_plugin_dialog(def);
+
+        let initial_table = app
+            .plugin_dialog_state
+            .as_ref()
+            .unwrap()
+            .table_values
+            .get("scripts_table")
+            .unwrap();
+        assert_eq!(initial_table.len(), 0);
+
+        // Simulate typing into the file input (should send "change", not "pick")
+        let _ = app.update(Message::PluginDialogFileTextChange(
+            "file_input".to_string(),
+            "C:/AutoLISP/partial".to_string(),
+        ));
+        {
+            let state = app.plugin_dialog_state.as_ref().unwrap();
+            assert_eq!(state.table_values.get("scripts_table").unwrap().len(), 0);
+            assert_eq!(
+                state.file_values.get("file_input").unwrap(),
+                "C:/AutoLISP/partial"
+            );
+        }
+
+        // Simulate picking a file via Browse dialog (sends "pick")
+        let _ = app.update(Message::PluginDialogFilePicked(
+            "file_input".to_string(),
+            Some(std::path::PathBuf::from("C:/AutoLISP/my_startup.lsp")),
+        ));
+
+        let updated_state = app.plugin_dialog_state.as_ref().unwrap();
+        let updated_table = updated_state.table_values.get("scripts_table").unwrap();
+        assert_eq!(updated_table.len(), 1);
+        assert_eq!(updated_table[0][0], "C:/AutoLISP/my_startup.lsp");
+        assert_eq!(updated_state.file_values.get("file_input").unwrap(), "");
+    }
+
+    #[test]
+    fn interactive_dialog_choice_static_and_dynamic_text_and_tab_routing() {
+        use crate::command::{CadCommand, CmdResult};
+        use ocs_plugin_api::dialog::{
+            DialogActionResponse, DialogControl, DialogDef, DialogEvent, DialogValue,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let recorded_events: Arc<Mutex<Vec<DialogEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct ChoiceRecorderCmd {
+            events: Arc<Mutex<Vec<DialogEvent>>>,
+            pending_updates: Vec<(String, HashMap<String, DialogValue>)>,
+        }
+
+        impl CadCommand for ChoiceRecorderCmd {
+            fn name(&self) -> &'static str {
+                "CHOICERECORDER"
+            }
+            fn prompt(&self) -> String {
+                "Choice recorder".to_string()
+            }
+            fn on_point(&mut self, _pt: glam::DVec3) -> CmdResult {
+                CmdResult::Cancel
+            }
+            fn on_enter(&mut self) -> CmdResult {
+                CmdResult::Cancel
+            }
+            fn on_dialog_action(&mut self, event: DialogEvent) -> DialogActionResponse {
+                self.events.lock().unwrap().push(event.clone());
+                if event.control_id == "mode" && event.action == "change" {
+                    let mut updates = HashMap::new();
+                    updates.insert(
+                        "submode".to_string(),
+                        DialogValue::ChoiceOptions {
+                            options: vec!["Dyn X".to_string(), "Dyn Y".to_string()],
+                            selected_index: 1,
+                        },
+                    );
+                    self.pending_updates
+                        .push(("Choice Test".to_string(), updates));
+                }
+                DialogActionResponse::None
+            }
+            fn take_pending_panel_updates(
+                &mut self,
+            ) -> Vec<(String, HashMap<String, DialogValue>)> {
+                std::mem::take(&mut self.pending_updates)
+            }
+        }
+
+        let mut app = fresh();
+        let _ = app.update(Message::TabNew);
+        let second_tab = app.active_tab;
+        let opening_tab = 0;
+        assert_ne!(opening_tab, second_tab);
+        app.active_tab = opening_tab;
+        app.tabs[opening_tab].active_cmd = Some(Box::new(ChoiceRecorderCmd {
+            events: recorded_events.clone(),
+            pending_updates: Vec::new(),
+        }));
+
+        let def = DialogDef::new("Choice Test")
+            .with_control(DialogControl::Choice {
+                id: "mode".to_string(),
+                label: "Mode".to_string(),
+                options: vec!["Static Alpha".to_string(), "Static Beta".to_string()],
+                default_index: 0,
+            })
+            .with_control(DialogControl::Choice {
+                id: "submode".to_string(),
+                label: "Submode".to_string(),
+                options: vec!["Init 1".to_string()],
+                default_index: 0,
+            });
+
+        app.open_plugin_dialog_on_tab(opening_tab, def, None);
+
+        // Switch active_tab to the other tab to verify events still route to opening_tab
+        app.active_tab = second_tab;
+        assert_ne!(app.active_tab, opening_tab);
+
+        // Select static option index 1 ("Static Beta")
+        let _ = app.update(Message::PluginDialogChoiceSelect("mode".to_string(), 1));
+
+        {
+            let events = recorded_events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].control_id, "mode");
+            assert_eq!(events[0].action, "change");
+            assert_eq!(
+                events[0].value,
+                Some(DialogValue::Choice {
+                    index: 1,
+                    text: "Static Beta".to_string(),
+                })
+            );
+        }
+
+        // Verify pending panel updates updated the open dialog's "submode" options
+        {
+            let state = app.plugin_dialog_state.as_ref().unwrap();
+            assert_eq!(state.choice_option_text("submode", 1), "Dyn Y");
+            assert_eq!(state.choice_values.get("submode").copied(), Some(1));
+        }
+
+        // Select dynamic option index 0 ("Dyn X")
+        let _ = app.update(Message::PluginDialogChoiceSelect("submode".to_string(), 0));
+        {
+            let events = recorded_events.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[1].value,
+                Some(DialogValue::Choice {
+                    index: 0,
+                    text: "Dyn X".to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_dialog_button_fallback_when_command_returns_none() {
+        use ocs_plugin_api::dialog::{DialogControl, DialogDef};
+
+        let mut app = fresh();
+        let def = DialogDef::new("Button Fallback Test")
+            .with_control(DialogControl::Text {
+                id: "txt".to_string(),
+                label: "Text".to_string(),
+                default: "initial".to_string(),
+            })
+            .with_control(DialogControl::Table {
+                id: "tbl".to_string(),
+                label: None,
+                headers: vec!["Col".to_string()],
+                rows: vec![vec!["Row1".to_string()]],
+                allow_add: true,
+                allow_delete: true,
+            })
+            .with_control(DialogControl::Button {
+                id: "btn_clear".to_string(),
+                label: "Clear".to_string(),
+                action: Some("clear".to_string()),
+                align_h: None,
+                width: None,
+            })
+            .with_control(DialogControl::Button {
+                id: "btn_reset".to_string(),
+                label: "Reset".to_string(),
+                action: Some("reset".to_string()),
+                align_h: None,
+                width: None,
+            })
+            .with_control(DialogControl::Button {
+                id: "btn_close".to_string(),
+                label: "Close".to_string(),
+                action: Some("close".to_string()),
+                align_h: None,
+                width: None,
+            });
+
+        app.open_plugin_dialog(def);
+
+        // Mutate text value, then test "clear" button fallback
+        let _ = app.update(Message::PluginDialogTextChange(
+            "txt".to_string(),
+            "modified".to_string(),
+        ));
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_clear".to_string(),
+            Some("clear".to_string()),
+        ));
+        assert!(app
+            .plugin_dialog_state
+            .as_ref()
+            .unwrap()
+            .table_values
+            .get("tbl")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            app.plugin_dialog_state
+                .as_ref()
+                .unwrap()
+                .text_values
+                .get("txt")
+                .unwrap(),
+            "modified"
+        );
+
+        // Test "reset" button fallback restores initial defaults
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_reset".to_string(),
+            Some("reset".to_string()),
+        ));
+        assert_eq!(
+            app.plugin_dialog_state
+                .as_ref()
+                .unwrap()
+                .text_values
+                .get("txt")
+                .unwrap(),
+            "initial"
+        );
+        assert_eq!(
+            app.plugin_dialog_state
+                .as_ref()
+                .unwrap()
+                .table_values
+                .get("tbl")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Test "close" button fallback closes the dialog
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_close".to_string(),
+            Some("close".to_string()),
+        ));
+        assert!(app.plugin_dialog_state.is_none());
+    }
+
+    #[test]
+    fn interactive_dialog_autolisp_exact_flow() {
+        use crate::command::CadCommand;
+        use ocs_plugin_api::dialog::*;
+
+        let mut app = fresh();
+        let opening_tab = app.active_tab;
+
+        // Command simulating interactive AutoLISP callback
+        struct MockLispCommand {
+            received_events: Vec<DialogEvent>,
+        }
+        impl CadCommand for MockLispCommand {
+            fn name(&self) -> &'static str {
+                "TESTDIALOG"
+            }
+            fn prompt(&self) -> String {
+                String::new()
+            }
+            fn on_point(&mut self, _pt: glam::DVec3) -> crate::command::CmdResult {
+                crate::command::CmdResult::Done
+            }
+            fn on_enter(&mut self) -> crate::command::CmdResult {
+                crate::command::CmdResult::Done
+            }
+            fn on_dialog_action(&mut self, event: DialogEvent) -> DialogActionResponse {
+                self.received_events.push(event.clone());
+                let mut updates = std::collections::HashMap::new();
+
+                if event.action == "pick" {
+                    // Like interactive_dialog_test.lsp:
+                    // (setq picked (oca-get "picker" values))
+                    // (setq current-tbl (oca-get "tbl_files" values))
+                    let picked = event
+                        .current_values
+                        .get("picker")
+                        .and_then(|v| match v {
+                            DialogValue::FilePath(p) => Some(p.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let mut tbl = event
+                        .current_values
+                        .get("tbl_files")
+                        .and_then(|v| match v {
+                            DialogValue::Table(rows) => Some(rows.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+
+                    if !picked.is_empty() {
+                        tbl.push(vec![picked, "Active".to_string()]);
+                        updates.insert("tbl_files".to_string(), DialogValue::Table(tbl.clone()));
+                        updates.insert("picker".to_string(), DialogValue::FilePath(String::new()));
+                        updates.insert(
+                            "lbl_status".to_string(),
+                            DialogValue::Text(format!("Added file. Total in list: {}", tbl.len())),
+                        );
+                        return DialogActionResponse::UpdateValues(updates);
+                    }
+                } else if event.control_id == "btn_clear" {
+                    // Empty list clears table:
+                    updates.insert("tbl_files".to_string(), DialogValue::Table(Vec::new()));
+                    updates.insert(
+                        "lbl_status".to_string(),
+                        DialogValue::Text("List cleared. 0 items in table.".to_string()),
+                    );
+                    return DialogActionResponse::UpdateValues(updates);
+                } else if event.control_id == "btn_inspect" {
+                    let mode = event
+                        .current_values
+                        .get("cmb_mode")
+                        .and_then(|v| match v {
+                            DialogValue::Choice { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let log = event
+                        .current_values
+                        .get("chk_log")
+                        .and_then(|v| match v {
+                            DialogValue::Bool(b) => Some(*b),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    updates.insert(
+                        "lbl_status".to_string(),
+                        DialogValue::Text(format!(
+                            "Active Mode: \"{}\" | Console Log: {}",
+                            mode,
+                            if log { "ON" } else { "OFF" }
+                        )),
+                    );
+                    return DialogActionResponse::UpdateValues(updates);
+                }
+
+                DialogActionResponse::None
+            }
+        }
+
+        app.tabs[opening_tab].active_cmd = Some(Box::new(MockLispCommand {
+            received_events: Vec::new(),
+        }));
+
+        let def = DialogDef::new("AutoLISP Reactive Dialog Test")
+            .with_control(DialogControl::Label {
+                id: "lbl_status".to_string(),
+                text: "Ready - Pick a file or click buttons to test reactivity".to_string(),
+                align_h: None,
+            })
+            .with_control(DialogControl::FilePicker {
+                id: "picker".to_string(),
+                label: "Pick LISP File".to_string(),
+                default_path: String::new(),
+                filter_name: "AutoLISP (*.lsp)".to_string(),
+                extensions: vec!["lsp".to_string()],
+                save: false,
+            })
+            .with_control(DialogControl::Button {
+                id: "btn_clear".to_string(),
+                label: "Clear List".to_string(),
+                action: Some("clear_action".to_string()),
+                align_h: None,
+                width: None,
+            })
+            .with_control(DialogControl::Table {
+                id: "tbl_files".to_string(),
+                label: Some("Configured Scripts".to_string()),
+                headers: vec!["File Path".to_string(), "Status".to_string()],
+                rows: vec![
+                    vec!["C:/example/first.lsp".to_string(), "Active".to_string()],
+                    vec!["C:/example/second.lsp".to_string(), "Active".to_string()],
+                ],
+                allow_add: true,
+                allow_delete: true,
+            })
+            .with_control(DialogControl::Choice {
+                id: "cmb_mode".to_string(),
+                label: "Execution Mode".to_string(),
+                options: vec![
+                    "Standard".to_string(),
+                    "Fast".to_string(),
+                    "Debug".to_string(),
+                ],
+                default_index: 0,
+            })
+            .with_control(DialogControl::Checkbox {
+                id: "chk_log".to_string(),
+                label: "Log to Console".to_string(),
+                default: true,
+            })
+            .with_control(DialogControl::Button {
+                id: "btn_inspect".to_string(),
+                label: "Inspect State".to_string(),
+                action: Some("inspect_action".to_string()),
+                align_h: None,
+                width: None,
+            });
+
+        app.open_plugin_dialog_on_tab(opening_tab, def, None);
+
+        // 1. Verify initial status text
+        assert_eq!(
+            app.plugin_dialog_state
+                .as_ref()
+                .unwrap()
+                .text_values
+                .get("lbl_status")
+                .unwrap(),
+            "Ready - Pick a file or click buttons to test reactivity"
+        );
+
+        // 2. Simulate FilePicked event
+        let _ = app.update(Message::PluginDialogFilePicked(
+            "picker".to_string(),
+            Some(std::path::PathBuf::from("C:/test/third.lsp")),
+        ));
+
+        let state = app.plugin_dialog_state.as_ref().unwrap();
+        assert_eq!(state.table_values.get("tbl_files").unwrap().len(), 3);
+        assert_eq!(state.file_values.get("picker").unwrap(), "");
+        assert_eq!(
+            state.text_values.get("lbl_status").unwrap(),
+            "Added file. Total in list: 3"
+        );
+
+        // 3. Inspect State button with custom action string
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_inspect".to_string(),
+            Some("inspect_action".to_string()),
+        ));
+        let state = app.plugin_dialog_state.as_ref().unwrap();
+        assert_eq!(
+            state.text_values.get("lbl_status").unwrap(),
+            "Active Mode: \"Standard\" | Console Log: ON"
+        );
+
+        // 4. Clear List button with custom action string
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_clear".to_string(),
+            Some("clear_action".to_string()),
+        ));
+        let state = app.plugin_dialog_state.as_ref().unwrap();
+        assert_eq!(state.table_values.get("tbl_files").unwrap().len(), 0);
+        assert_eq!(
+            state.text_values.get("lbl_status").unwrap(),
+            "List cleared. 0 items in table."
+        );
+
+        // 5. Inspect State button with None action (defaulting to click)
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_inspect".to_string(),
+            None,
+        ));
+        let state = app.plugin_dialog_state.as_ref().unwrap();
+        assert_eq!(
+            state.text_values.get("lbl_status").unwrap(),
+            "Active Mode: \"Standard\" | Console Log: ON"
+        );
+
+        // 6. Clear List button with None action (defaulting to click)
+        let _ = app.update(Message::PluginDialogButtonClick(
+            "btn_clear".to_string(),
+            None,
+        ));
+        let state = app.plugin_dialog_state.as_ref().unwrap();
+        assert_eq!(state.table_values.get("tbl_files").unwrap().len(), 0);
+        assert_eq!(
+            state.text_values.get("lbl_status").unwrap(),
+            "List cleared. 0 items in table."
+        );
+    }
+}
+
+/// Xref copies a dimension association points at, as modified changes.
+fn xref_dimension_targets(
+    doc: &document::Document,
+) -> Vec<(document::types::Handle, crate::scene::ChangeKind)> {
+    use document::objects::{AssociativeData, ObjectType};
+    let xref_blocks: rustc_hash::FxHashSet<document::types::Handle> = doc
+        .block_records
+        .iter()
+        .filter(|br| br.flags.is_xref || br.flags.is_xref_overlay)
+        .map(|br| br.handle)
+        .collect();
+    if xref_blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut targets: Vec<_> = doc
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            ObjectType::Associative(object) => match &object.data {
+                AssociativeData::DimensionAssociation(association) => Some(association),
+                _ => None,
+            },
+            _ => None,
+        })
+        .flat_map(|association| association.references.iter().flatten())
+        .flat_map(|reference| {
+            reference
+                .xrefs
+                .iter()
+                .chain(&reference.intersection_objects)
+        })
+        .filter(|handle| {
+            doc.get_entity(**handle)
+                .is_some_and(|entity| xref_blocks.contains(&entity.common().owner_handle))
+        })
+        .map(|handle| (*handle, crate::scene::ChangeKind::Modified))
+        .collect();
+    targets.sort_by_key(|(handle, _)| handle.value());
+    targets.dedup();
+    targets
 }

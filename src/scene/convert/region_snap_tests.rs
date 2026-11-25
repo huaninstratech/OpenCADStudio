@@ -4,9 +4,9 @@
 fn region_snap_insert_keeps_boundary_wires_hidden() {
     use crate::scene::cache::block_cache::{expand_insert, BlockCache};
     use crate::scene::view::render::InheritStyle;
-    use codec::entities::Insert;
-    use codec::tables::BlockRecord;
-    use codec::types::Vector3;
+    use document::entities::Insert;
+    use document::tables::BlockRecord;
+    use document::types::Vector3;
     for boundary in [
         ring(&[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]]),
         vec![Curve::Circle(Circle {
@@ -33,7 +33,7 @@ fn region_snap_insert_keeps_boundary_wires_hidden() {
         region.common_mut().owner_handle = owner;
         document.add_entity(region).unwrap();
         let mut line =
-            codec::entities::Line::from_points(Vector3::ZERO, Vector3::new(5.0, 0.0, 0.0));
+            document::entities::Line::from_points(Vector3::ZERO, Vector3::new(5.0, 0.0, 0.0));
         line.common.owner_handle = owner;
         document.add_entity(EntityType::Line(line)).unwrap();
         let insert = Insert::new("REGION_SNAPS", Vector3::ZERO);
@@ -77,6 +77,7 @@ fn region_snap_insert_keeps_boundary_wires_hidden() {
                 1.0,
                 crate::scene::BlockScalePolicy::FromInsert,
                 false,
+                1.0,
             )
             .unwrap();
             let boundaries: Vec<_> = expanded.iter().filter(|wire| wire.snap_only).collect();
@@ -125,12 +126,12 @@ fn region_snap_insert_keeps_boundary_wires_hidden() {
         }
     }
 }
-use codec::{Document, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 use glam::{DVec3, Mat4, Vec3};
 use iced::{Point, Rectangle};
-use kernel::geom2d::{Circle, Curve, Line};
+use ocs_geom::geom2d::{Circle, Curve, Line};
 
-use crate::command::WorkingPlane;
+use crate::entities::transform::WorkingPlane;
 use crate::scene::model::{presspull_model::region_from_loops, wire_model::WireModel};
 use crate::scene::pick::interaction_index::{InteractionIndex, WireSource};
 use crate::snap::{SnapResult, SnapType, Snapper};
@@ -166,8 +167,8 @@ fn wires(entity: &EntityType) -> Vec<WireModel> {
 
 #[test]
 fn native_region_binary_without_wires_is_pickable_at_circular_boundary() {
-    use codec::entities::acis::{SabWriter, SatDocument};
-    use codec::entities::{AcisData, Region};
+    use document::entities::acis::{SabWriter, SatDocument};
+    use document::entities::{AcisData, Region};
     let loops = vec![
         vec![Curve::Circle(Circle {
             centre: [0.0, 0.0],
@@ -178,13 +179,13 @@ fn native_region_binary_without_wires_is_pickable_at_circular_boundary() {
             radius: 5.0,
         })],
     ];
-    let body = kernel::brep::planar_region(
-        kernel::space::Plane::from_axes([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    let body = ocs_solid::model::planar_region(
+        ocs_geom::space::Plane::from_axes([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
         &loops,
     )
     .unwrap();
     let mut sat = SatDocument::new();
-    kernel::acis::append(&body, &mut sat).unwrap();
+    ocs_solid::append(&body, &mut sat).unwrap();
     let parsed = SatDocument::parse(&sat.to_sat_string()).unwrap();
     let mut region = Region::new();
     region.acis_data = AcisData {
@@ -306,7 +307,7 @@ fn assert_region_boundary_clicks(entity: &EntityType) {
     }
 }
 
-fn click_at<W: WireSource + ?Sized>(wires: &W, point: DVec3) -> Option<&str> {
+fn click_at<W: WireSource + Sync + ?Sized>(wires: &W, point: DVec3) -> Option<&str> {
     crate::scene::pick::hit_test::click_hit(
         Point::new(500.0 + point.x as f32 * 10.0, 500.0 - point.y as f32 * 10.0),
         wires,
@@ -428,9 +429,11 @@ fn snap<W: WireSource + ?Sized>(
     )
 }
 
+#[track_caller]
 fn assert_snap(wires: &[WireModel], kind: SnapType, point: DVec3, from: Option<DVec3>) {
-    let hit =
-        snap(wires, kind, point, from).unwrap_or_else(|| panic!("missing {kind:?} at {point:?}"));
+    let Some(hit) = snap(wires, kind, point, from) else {
+        panic!("missing {kind:?} at {point:?}");
+    };
     assert_eq!(hit.snap_type, kind);
     assert!(
         hit.world.distance(point) < 1e-6,
@@ -535,7 +538,7 @@ fn region_snap_tilted_plane_keeps_world_coordinates() {
 
 #[test]
 fn region_snap_arcs_ellipses_and_splines_reuse_curve_modes() {
-    use kernel::geom2d::{Arc, Ellipse, EllipseArc, NurbsCurve};
+    use ocs_geom::geom2d::{Arc, Ellipse, EllipseArc, NurbsCurve};
     let arc = vec![
         Curve::Arc(Arc {
             centre: [0.0, 0.0],
@@ -640,9 +643,9 @@ fn region_snap_intersects_other_geometry_and_keeps_shell_and_display() {
     assert!(region_wires[1..]
         .iter()
         .all(|w| w.snap_only && !w.display_visible && !w.plot_visible));
-    let mut line = codec::entities::Line::new();
-    line.start = codec::types::Vector3::new(-20.0, 0.0, 0.0);
-    line.end = codec::types::Vector3::new(20.0, 0.0, 0.0);
+    let mut line = document::entities::Line::new();
+    line.start = document::types::Vector3::new(-20.0, 0.0, 0.0);
+    line.end = document::types::Vector3::new(20.0, 0.0, 0.0);
     let mut crossing = wires(&EntityType::Line(line));
     for wire in &mut crossing {
         wire.name = "456".into();
@@ -658,8 +661,8 @@ fn region_snap_intersects_other_geometry_and_keeps_shell_and_display() {
 
 #[test]
 fn region_snap_wire_only_fallback_and_sibling_line_behavior() {
-    use codec::entities::{Region, Wire};
-    use codec::types::Vector3;
+    use document::entities::{Region, Wire};
+    use document::types::Vector3;
     let mut region = Region::new();
     region.wires = vec![Wire::from_points(vec![
         Vector3::new(0.0, 0.0, 0.0),
@@ -680,7 +683,7 @@ fn region_snap_wire_only_fallback_and_sibling_line_behavior() {
         DVec3::new(5.0, 0.0, 0.0),
         None,
     );
-    let mut line = codec::entities::Line::new();
+    let mut line = document::entities::Line::new();
     line.start = Vector3::new(0.0, 0.0, 0.0);
     line.end = Vector3::new(10.0, 0.0, 0.0);
     let line_wires = wires(&EntityType::Line(line));

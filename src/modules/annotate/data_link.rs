@@ -4,8 +4,8 @@ use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
 use crate::t;
-use codec::entities::Table;
-use codec::EntityType;
+use document::entities::Table;
+use document::EntityType;
 use glam::DVec3;
 
 pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/data_link.svg"));
@@ -59,10 +59,17 @@ impl DataLinkPlaceCommand {
         }
     }
 
+    /// Place a table of `cells` of a sheet of a file; on placement it is
+    /// linked to those cells, and DATALINKUPDATE refreshes it from them.
+    pub fn of_cells(table: Table, file: &str, sheet: &str, cells: &str) -> Self {
+        // A path holds no line ends, so they keep the three apart.
+        Self::new(table, &format!("{file}\n{sheet}\n{cells}"))
+    }
+
     /// Place a table that references a data-link object already stored in the
     /// drawing. Every populated cell is locked and points at the same link so
     /// update and save/reopen keep one stable relationship.
-    pub fn existing(mut table: Table, link: codec::Handle) -> Self {
+    pub fn existing(mut table: Table, link: document::Handle) -> Self {
         link_cells(&mut table, link, 0);
         Self {
             table,
@@ -71,10 +78,15 @@ impl DataLinkPlaceCommand {
         }
     }
 
-    /// The same, placed from -TABLE's data Link option.
-    pub fn existing_from_table(table: Table, link: codec::Handle) -> Self {
+    /// The same, placed from the data link option of TABLE or -TABLE
+    /// (`command_name`).
+    pub fn existing_from_table(
+        table: Table,
+        link: document::Handle,
+        command_name: &'static str,
+    ) -> Self {
         Self {
-            command_name: "-TABLE",
+            command_name,
             ..Self::existing(table, link)
         }
     }
@@ -101,81 +113,75 @@ impl DataLinkPlaceCommand {
     }
 
     fn preview(&self, point: DVec3) -> WireModel {
-        let point = self.plane.to_local(point);
-        let mut points = Vec::new();
-        let mut x = 0.0;
-        for column in 0..=self.table.column_count() {
-            if column > 0 {
-                x += self.table.columns[column - 1].width;
-            }
-            points.push(
-                self.plane
-                    .to_world(point + DVec3::X * x)
-                    .as_vec3()
-                    .to_array(),
-            );
-            points.push(
-                self.plane
-                    .to_world(point + DVec3::new(x, -self.table.total_height(), 0.0))
-                    .as_vec3()
-                    .to_array(),
-            );
+        table_grid_preview(&self.table, &self.plane, point)
+    }
+}
+
+/// The grid of `table` with its insertion point at `point`, to show where a
+/// prepared table lands while its insertion point is picked.
+pub fn table_grid_preview(table: &Table, plane: &WorkingPlane, point: DVec3) -> WireModel {
+    let point = plane.to_local(point);
+    let mut points = Vec::new();
+    let mut x = 0.0;
+    for column in 0..=table.column_count() {
+        if column > 0 {
+            x += table.columns[column - 1].width;
         }
-        let mut y = 0.0;
-        for row in 0..=self.table.row_count() {
-            if row > 0 {
-                y -= self.table.rows[row - 1].height;
-            }
-            points.push(
-                self.plane
-                    .to_world(point + DVec3::Y * y)
-                    .as_vec3()
-                    .to_array(),
-            );
-            points.push(
-                self.plane
-                    .to_world(point + DVec3::new(self.table.total_width(), y, 0.0))
-                    .as_vec3()
-                    .to_array(),
-            );
+        points.push(plane.to_world(point + DVec3::X * x).as_vec3().to_array());
+        points.push(
+            plane
+                .to_world(point + DVec3::new(x, -table.total_height(), 0.0))
+                .as_vec3()
+                .to_array(),
+        );
+    }
+    let mut y = 0.0;
+    for row in 0..=table.row_count() {
+        if row > 0 {
+            y -= table.rows[row - 1].height;
         }
-        WireModel {
-            bg_adapt: None,
-            point_marker: None,
+        points.push(plane.to_world(point + DVec3::Y * y).as_vec3().to_array());
+        points.push(
+            plane
+                .to_world(point + DVec3::new(table.total_width(), y, 0.0))
+                .as_vec3()
+                .to_array(),
+        );
+    }
+    WireModel {
+        bg_adapt: None,
+        point_marker: None,
+        world_width: 0.0,
+        depth_override: None,
+        display_visible: true,
+        snap_only: false,
+        plot_visible: true,
+        fill_is_3d: false,
+        fill_is_2d_solid: false,
+        solid_normal: None,
+        render_instance: None,
+        dash_from_start: false,
+        name: "data_link_preview".into(),
+        color: WireModel::CYAN,
+        selected: false,
+        pattern_length: 0.0,
+        pattern: [0.0; 8],
+        line_weight_px: 1.0,
+        aci: 0,
+        aabb: WireModel::UNBOUNDED_AABB,
+        plinegen: true,
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
             taper_widths: Vec::new(),
             pattern_stations: Vec::new(),
-            world_width: 0.0,
-            depth_override: None,
-            display_visible: true,
-            snap_only: false,
-            plot_visible: true,
-            fill_is_3d: false,
-            fill_is_2d_solid: false,
-            render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
             text_verts: Vec::new(),
-            name: "data_link_preview".into(),
             points,
-            points_low: Vec::new(),
-            color: WireModel::CYAN,
-            selected: false,
-            pattern_length: 0.0,
-            pattern: [0.0; 8],
-            line_weight_px: 1.0,
+            points_low: Default::default(),
             snap_pts: Vec::new(),
             tangent_geoms: Vec::new(),
-            aci: 0,
             key_vertices: Vec::new(),
-            aabb: WireModel::UNBOUNDED_AABB,
-            plinegen: true,
-            fill_tris: Vec::new(),
-            fill_tris_low: Vec::new(),
-
-            ..Default::default()
-        }
+            ..crate::scene::WireGeom::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -183,8 +189,8 @@ impl DataLinkPlaceCommand {
 /// first cell of the linked range (row `first_row`, column 0) carries the link
 /// and the size of the range; every cell of the range is locked and marked as
 /// linked. Rows above `first_row` (an extraction table's title) stay free.
-pub fn link_cells(table: &mut Table, link: codec::Handle, first_row: usize) {
-    use codec::entities::table::CellStateFlags;
+pub fn link_cells(table: &mut Table, link: document::Handle, first_row: usize) {
+    use document::entities::table::CellStateFlags;
     let rows = table.row_count().saturating_sub(first_row) as i32;
     let columns = table.column_count() as i32;
     for (row_index, row) in table.rows.iter_mut().enumerate() {
@@ -219,8 +225,8 @@ impl CadCommand for DataLinkPlaceCommand {
     fn prompt(&self) -> String {
         if self.command_name == "DATALINK" {
             t!("DATALINK  Specify insertion point:").into_owned()
-        } else if self.command_name == "-TABLE" {
-            t!("%{n}  Specify insertion point:", n = "-TABLE").into_owned()
+        } else if matches!(self.command_name, "TABLE" | "-TABLE") {
+            t!("%{n}  Specify insertion point:", n = self.command_name).into_owned()
         } else {
             t!("DATAEXTRACTION  Specify insertion point:").into_owned()
         }
@@ -228,7 +234,7 @@ impl CadCommand for DataLinkPlaceCommand {
 
     fn on_point(&mut self, point: DVec3) -> CmdResult {
         let point = self.plane.to_local(point);
-        self.table.insertion_point = codec::types::Vector3::new(point.x, point.y, point.z);
+        self.table.insertion_point = document::types::Vector3::new(point.x, point.y, point.z);
         CmdResult::CommitAndExit(
             self.plane
                 .place_entity(EntityType::Table(Box::new(self.table.clone()))),
@@ -274,7 +280,7 @@ enum UpdateStep {
 pub struct DataLinkUpdateCommand {
     links: Vec<String>,
     step: UpdateStep,
-    selected: Vec<codec::Handle>,
+    selected: Vec<document::Handle>,
 }
 
 impl DataLinkUpdateCommand {
@@ -349,14 +355,15 @@ impl CadCommand for DataLinkUpdateCommand {
     }
 
     fn selection_entity_filter(&self) -> Option<fn(&EntityType) -> bool> {
-        matches!(self.step, UpdateStep::Select { .. }).then_some(is_linked_table as fn(&EntityType) -> bool)
+        matches!(self.step, UpdateStep::Select { .. })
+            .then_some(is_linked_table as fn(&EntityType) -> bool)
     }
 
     fn selection_entity_filter_reports(&self) -> bool {
         true
     }
 
-    fn on_selection_complete(&mut self, handles: Vec<codec::Handle>) -> CmdResult {
+    fn on_selection_complete(&mut self, handles: Vec<document::Handle>) -> CmdResult {
         self.selected = handles;
         CmdResult::NeedPoint
     }

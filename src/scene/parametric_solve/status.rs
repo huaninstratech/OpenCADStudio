@@ -295,7 +295,7 @@ fn geometry_parameters(geometry: &EntityGeom) -> Vec<ParamId> {
 /// Analyze persistent equations in an isolated store, without edit-time pins,
 /// write-back, or mutation of the document and constraint set.
 pub(crate) fn analyze(
-    document: &codec::Document,
+    document: &document::Document,
     drawing_parameters: &ParameterTable,
     set: &super::super::parametric_constraints::ParametricConstraintSet,
 ) -> HashMap<Handle, Status> {
@@ -441,7 +441,7 @@ pub(crate) fn analyze(
                 }
             }
         }
-        let diagnosis = kernel_constraints::diagnosis::diagnose(partition, sys.store());
+        let diagnosis = ocs_constraints::diagnosis::diagnose(partition, sys.store());
         for row in diagnosis.redundant {
             if let Some((_, owner)) = owners
                 .iter()

@@ -4,8 +4,8 @@
 //! mask transparency are always kept unless the user changed that very option.
 use super::*;
 use crate::app::OpenCADStudio;
-use codec::entities::DrawingDirection;
-use codec::types::Color;
+use document::entities::DrawingDirection;
+use document::types::Color;
 
 /// Mask flags: 0x01 fill on, 0x02 with the drawing window colour.
 const FILL: i32 = 0x01;
@@ -40,11 +40,11 @@ impl MTextEditorState {
                 (
                     m.background_fill_flags,
                     m.background_scale,
-                    m.background_color.clone(),
+                    m.background_color,
                 )
             });
         MaskDraft {
-            on: flags & (FILL | WINDOW) != 0,
+            on: flags & FILL != 0,
             window: flags & FILL == 0 || flags & WINDOW != 0,
             color,
             scale: super::raw_span::number(scale),
@@ -93,7 +93,7 @@ impl MTextEditorState {
         }
         mt.background_fill_flags = flags;
         if draft.on && !draft.window {
-            mt.background_color = draft.color.clone();
+            mt.background_color = draft.color;
         }
         if let Some(scale) = self.mask_scale_value() {
             mt.background_scale = scale;

@@ -7,10 +7,10 @@
 //! an override over the style default, so editing one of these rows writes here
 //! and the change round-trips to file.
 
-use codec::entities::EntityCommon;
-use codec::types::Color;
-use codec::xdata::{ExtendedData, XDataValue};
-use codec::{Document, EntityType, Handle};
+use document::entities::EntityCommon;
+use document::types::Color;
+use document::xdata::{ExtendedData, XDataValue};
+use document::{Document, EntityType, Handle};
 
 // DXF group codes of the dimension variables surfaced on the leader panel.
 pub const DIMSCALE: i16 = 40; // overall scale       (real)
@@ -292,7 +292,7 @@ pub fn set_on_common(common: &mut EntityCommon, code: i16, value: Option<XDataVa
 
     // The new record takes the old one's place among the entity's records.
     let mut record = values.map(|vals| {
-        let mut record = codec::xdata::ExtendedDataRecord::new(app);
+        let mut record = document::xdata::ExtendedDataRecord::new(app);
         for v in vals {
             record.add_value(v);
         }
@@ -313,6 +313,88 @@ pub fn set_on_common(common: &mut EntityCommon, code: i16, value: Option<XDataVa
     }
     rebuilt.raw_dwg_eed = common.extended_data.raw_dwg_eed.clone();
     common.extended_data = rebuilt;
+}
+
+/// The style fields a dimension-variable override can replace, by group code:
+/// reals, integers, switches, handles and strings.
+macro_rules! style_vars {
+    ($m:ident) => {
+        $m!(real: dimscale DIMSCALE, dimasz DIMASZ, dimexo DIMEXO, dimdli DIMDLI, dimexe DIMEXE,
+            dimrnd DIMRND, dimdle DIMDLE, dimtp DIMTP, dimtm DIMTM, dimfxl DIMFXL,
+            dimjogang DIMJOGANG, dimtxt DIMTXT, dimcen DIMCEN, dimtsz DIMTSZ, dimaltf DIMALTF,
+            dimlfac DIMLFAC, dimtvp DIMTVP, dimtfac DIMTFAC, dimgap DIMGAP, dimaltrnd DIMALTRND,
+            dimaltmzf DIMALTMZF, dimmzf DIMMZF;
+        flag: dimtol DIMTOL, dimlim DIMLIM, dimtih DIMTIH, dimtoh DIMTOH, dimse1 DIMSE1,
+            dimse2 DIMSE2, dimalt DIMALT, dimtofl DIMTOFL, dimsah DIMSAH, dimtix DIMTIX,
+            dimsoxd DIMSOXD, dimsd1 DIMSD1, dimsd2 DIMSD2, dimupt DIMUPT, dimfxlon DIMFXLON,
+            dimtxtdirection DIMTXTDIRECTION;
+        int: dimzin DIMZIN, dimtad DIMTAD, dimazin DIMAZIN, dimarcsym DIMARCSYM, dimclrd DIMCLRD,
+            dimclre DIMCLRE, dimclrt DIMCLRT, dimadec DIMADEC, dimaltd DIMALTD, dimdec DIMDEC,
+            dimtdec DIMTDEC, dimaltu DIMALTU, dimalttd DIMALTTD, dimaunit DIMAUNIT,
+            dimfrac DIMFRAC, dimlunit DIMLUNIT, dimdsep DIMDSEP, dimtmove DIMTMOVE,
+            dimjust DIMJUST, dimtolj DIMTOLJ, dimtzin DIMTZIN, dimaltz DIMALTZ,
+            dimalttz DIMALTTZ, dimatfit DIMATFIT, dimtfill DIMTFILL, dimtfillclr DIMTFILLCLR,
+            dimlwd DIMLWD, dimlwe DIMLWE;
+        handle: dimldrblk DIMLDRBLK, dimblk DIMBLK, dimblk1 DIMBLK1, dimblk2 DIMBLK2,
+            dimltex_handle DIMLTYPE, dimltex1_handle DIMLTEX1, dimltex2_handle DIMLTEX2,
+            dimtxsty_handle DIMTXSTY;
+        text: dimpost DIMPOST, dimapost DIMAPOST, dimaltmzs DIMALTMZS, dimmzs DIMMZS)
+    };
+}
+
+/// `style` with the override `pairs` laid over it. A text style override
+/// carries a handle; its name is the caller's to resolve.
+pub fn apply_pairs(style: &mut document::tables::DimStyle, pairs: &[(i16, XDataValue)]) {
+    macro_rules! apply {
+        (real: $($r:ident $rc:ident),*; flag: $($f:ident $fc:ident),*;
+         int: $($i:ident $ic:ident),*; handle: $($h:ident $hc:ident),*;
+         text: $($t:ident $tc:ident),*) => {
+            for (code, value) in pairs {
+                match (*code, value) {
+                    $(($rc, XDataValue::Real(v) | XDataValue::Distance(v)
+                        | XDataValue::ScaleFactor(v)) => style.$r = *v,)*
+                    $(($fc, XDataValue::Integer16(v)) => style.$f = *v != 0,)*
+                    $(($ic, XDataValue::Integer16(v)) => style.$i = *v,)*
+                    $(($hc, XDataValue::Handle(v)) => style.$h = *v,)*
+                    $(($tc, XDataValue::String(v)) => style.$t = v.clone(),)*
+                    _ => {}
+                }
+            }
+        };
+    }
+    style_vars!(apply);
+}
+
+/// The overrides that turn `base` into `edited`, in group-code order.
+pub fn diff_pairs(
+    base: &document::tables::DimStyle,
+    edited: &document::tables::DimStyle,
+) -> Vec<(i16, XDataValue)> {
+    let mut out = Vec::new();
+    macro_rules! diff {
+        (real: $($r:ident $rc:ident),*; flag: $($f:ident $fc:ident),*;
+         int: $($i:ident $ic:ident),*; handle: $($h:ident $hc:ident),*;
+         text: $($t:ident $tc:ident),*) => {
+            $(if (base.$r - edited.$r).abs() > 1e-12 {
+                out.push(($rc, XDataValue::Real(edited.$r)));
+            })*
+            $(if base.$f != edited.$f {
+                out.push(($fc, XDataValue::Integer16(i16::from(edited.$f))));
+            })*
+            $(if base.$i != edited.$i {
+                out.push(($ic, XDataValue::Integer16(edited.$i)));
+            })*
+            $(if base.$h != edited.$h {
+                out.push(($hc, XDataValue::Handle(edited.$h)));
+            })*
+            $(if base.$t != edited.$t {
+                out.push(($tc, XDataValue::String(edited.$t.clone())));
+            })*
+        };
+    }
+    style_vars!(diff);
+    out.sort_by_key(|(code, _)| *code);
+    out
 }
 
 pub fn property_real_code(field: &str) -> Option<i16> {
@@ -409,7 +491,7 @@ const NAMED_VARS: &[(&str, i16, VarKind)] = named_vars! {
 
 /// How DIMOVERRIDE shows a variable's current value (`<2.5000>`): reals to
 /// four places, colours by name for ByBlock and ByLayer.
-pub fn style_value_text(style: &codec::tables::DimStyle, code: i16) -> Option<String> {
+pub fn style_value_text(style: &document::tables::DimStyle, code: i16) -> Option<String> {
     fn color_name(index: i16) -> String {
         match index {
             0 => "BYBLOCK".to_string(),
@@ -494,6 +576,15 @@ pub fn style_value_text(style: &codec::tables::DimStyle, code: i16) -> Option<St
     })
 }
 
+/// The name of the variable stored under `code`, if it is one of the
+/// variables DIMOVERRIDE knows by name.
+pub fn variable_for_code(code: i16) -> Option<(&'static str, VarKind)> {
+    NAMED_VARS
+        .iter()
+        .find(|(_, known, _)| *known == code)
+        .map(|&(name, _, kind)| (name, kind))
+}
+
 /// The group code and storage kind of the dimension variable `name`.
 pub fn named_var(name: &str) -> Option<(i16, VarKind)> {
     NAMED_VARS
@@ -507,7 +598,11 @@ pub fn named_var(name: &str) -> Option<(i16, VarKind)> {
 pub fn parse_var_value(kind: VarKind, text: &str) -> Option<XDataValue> {
     let text = text.trim();
     match kind {
-        VarKind::Real => text.parse().ok().filter(|v: &f64| v.is_finite()).map(XDataValue::Real),
+        VarKind::Real => text
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .map(XDataValue::Real),
         VarKind::Int => text
             .parse()
             .ok()

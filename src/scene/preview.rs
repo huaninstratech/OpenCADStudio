@@ -3,7 +3,7 @@ use super::*;
 use crate::command::{AreaPreviewRegion, AreaPreviewSource};
 use crate::scene::model::hatch_model::HatchPattern;
 
-mod block_parameter;
+pub(super) mod block_parameter;
 
 #[cfg(test)]
 mod transform_tests;
@@ -101,7 +101,7 @@ impl Scene {
             .iter()
             .copied()
             .filter(|&handle| {
-                let Some(codec::EntityType::Insert(insert)) = self.document.get_entity(handle)
+                let Some(document::EntityType::Insert(insert)) = self.document.get_entity(handle)
                 else {
                     return false;
                 };
@@ -209,7 +209,7 @@ impl Scene {
         for wire in self.wire_models_for(&[handle]) {
             let mut ring = Vec::new();
             for (index, point) in wire.points.iter().enumerate() {
-                let low = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
+                let low = wire.points_low.get(index).unwrap_or([0.0; 3]);
                 let x = point[0] as f64 + low[0] as f64;
                 let y = point[1] as f64 + low[1] as f64;
                 if x.is_finite() && y.is_finite() {
@@ -280,6 +280,8 @@ impl Scene {
             return None;
         }
         let mut model = HatchModel {
+            entity: None,
+            effective_layer: None,
             pattern_origin: None,
             render_instance: None,
             world_origin: origin,
@@ -290,7 +292,7 @@ impl Scene {
             boundary_exterior: None,
             boundary_sources: None,
             boundary_paths: None,
-            style: codec::entities::HatchStyleType::Normal,
+            style: document::entities::HatchStyleType::Normal,
             pattern: HatchPattern::Solid,
             name: "AREA_PREVIEW".into(),
             color: [0.0; 4],
@@ -356,6 +358,25 @@ impl Scene {
         self.preview_text = verts;
     }
 
+    /// Whether the rubber band and the dynamic-input guide of a running
+    /// command or grip drag are drawn. A view being dragged (pan, orbit,
+    /// zoom) shows neither: both end at the cursor's last drawing point,
+    /// which the drag leaves behind. They return with the first cursor
+    /// position after the drag.
+    pub fn drawing_feedback_shown(&self) -> bool {
+        !self.selection.borrow().input.middle_down
+    }
+
+    /// The rubber band a frame draws: the live segment and the preview
+    /// wires of the running command, or nothing while the view is dragged.
+    pub fn shown_rubber_band(&self) -> (Option<&WireModel>, &[WireModel]) {
+        if self.drawing_feedback_shown() {
+            (self.interim_wire.as_ref(), &self.preview_wires[..])
+        } else {
+            (None, &[])
+        }
+    }
+
     pub fn clear_preview_wire(&mut self) {
         self.set_command_preview_hidden(&[]);
         // No geometry bump — see `set_preview_wires`. Dropping the overlay
@@ -373,7 +394,8 @@ impl Scene {
         self.selection.borrow_mut().gesture.preview_box = None;
     }
 
-    pub fn wire_models_for(&self, handles: &[codec::Handle]) -> Vec<WireModel> {
+    pub fn wire_models_for(&self, handles: &[document::Handle]) -> Vec<WireModel> {
+        let context = std::cell::OnceCell::new();
         let wires = handles
             .iter()
             .flat_map(|h| {
@@ -384,7 +406,7 @@ impl Scene {
                     // from the current HatchModel — `apply_grip` keeps it in
                     // step, so the preview tracks a dragged grip in real time.
                     Some(EntityType::Hatch(_)) => self.hatch_outline_wire(*h).into_iter().collect(),
-                    Some(e) => self.tessellate_one(e),
+                    Some(e) => self.tessellate_one_in(&context, e),
                     None => Vec::new(),
                 }
             })
@@ -395,7 +417,7 @@ impl Scene {
     /// Current candidate geometry for a hot grip. Solid-history candidates
     /// live outside the document until placement; ordinary entities continue
     /// to use their current tessellation.
-    pub fn grip_wire_models_for(&self, handles: &[codec::Handle]) -> Vec<WireModel> {
+    pub fn grip_wire_models_for(&self, handles: &[document::Handle]) -> Vec<WireModel> {
         handles
             .iter()
             .flat_map(|handle| {
@@ -418,12 +440,13 @@ impl Scene {
     ) -> (Vec<WireModel>, Vec<(WireModel, glam::DVec3)>) {
         let mut plain: Vec<WireModel> = Vec::new();
         let mut texts: Vec<(WireModel, glam::DVec3)> = Vec::new();
+        let context = std::cell::OnceCell::new();
         for h in handles {
             let Some(e) = self.document.get_entity(*h) else {
                 continue;
             };
             if matches!(e, EntityType::Text(_)) {
-                let wires = self.tessellate_one(e);
+                let wires = self.tessellate_one_in(&context, e);
                 let mut lo = [f64::INFINITY; 2];
                 let mut hi = [f64::NEG_INFINITY; 2];
                 for w in &wires {
@@ -433,7 +456,7 @@ impl Scene {
                         }
                         // Reconstruct f64 world from the double-single pair (the
                         // low residual may be absent on some wires).
-                        let l = w.points_low.get(i).copied().unwrap_or([0.0; 3]);
+                        let l = w.points_low.get(i).unwrap_or([0.0; 3]);
                         let (x, y) = (p[0] as f64 + l[0] as f64, p[1] as f64 + l[1] as f64);
                         lo[0] = lo[0].min(x);
                         lo[1] = lo[1].min(y);
@@ -450,7 +473,7 @@ impl Scene {
                     texts.push((w, center));
                 }
             } else {
-                plain.extend(self.tessellate_one(e));
+                plain.extend(self.tessellate_one_in(&context, e));
             }
         }
         (transform_preview_wires(plain), texts)
@@ -549,7 +572,7 @@ impl Scene {
     ) -> Option<(Vec<WireModel>, Vec<HatchModel>)> {
         let source_entity = self.document.get_entity(source)?.clone();
         let mut target_entity = self.document.get_entity(target)?.clone();
-        let opts = crate::entities::match_props::MatchOpts::current();
+        let opts = crate::entities::match_props::MatchOpts::for_document(&self.document);
         crate::entities::match_props::match_properties_kernel(
             &source_entity,
             &mut target_entity,
@@ -567,6 +590,15 @@ impl Scene {
             match crate::entities::hatch::background_color(source_hatch) {
                 Some(color) => crate::entities::hatch::set_background_color(target_hatch, &color),
                 None => crate::entities::hatch::clear_background_color(target_hatch),
+            }
+        }
+        // A centre line is rebuilt on its own sources, as the click does.
+        if let (true, EntityType::Line(line)) = (
+            opts.has(crate::entities::match_props::MatchOpts::CENTER),
+            &target_entity,
+        ) {
+            if let Some(rebuilt) = self.centerline_with_extensions_of(&source_entity, line) {
+                target_entity = EntityType::Line(rebuilt);
             }
         }
 
@@ -594,10 +626,11 @@ impl Scene {
     /// Entities need not be in the document — they are tessellated directly.
     /// Resolve cached block copies before consumers transform or count their
     /// points, just like the handle-based edit preview snapshots.
-    pub fn wires_for_entities(&self, entities: &[codec::EntityType]) -> Vec<WireModel> {
+    pub fn wires_for_entities(&self, entities: &[document::EntityType]) -> Vec<WireModel> {
+        let context = std::cell::OnceCell::new();
         let wires = entities
             .iter()
-            .flat_map(|e| self.tessellate_one(e))
+            .flat_map(|e| self.tessellate_one_in(&context, e))
             .collect();
         transform_preview_wires(wires)
     }
@@ -613,11 +646,12 @@ impl Scene {
     /// expand through the block cache; invisible members (another visibility
     /// state) are left out, as on the canvas. Unknown / empty block → `vec![]`.
     pub(crate) fn block_preview_wires(&self, name: &str) -> Vec<WireModel> {
-        use codec::EntityType;
+        use document::EntityType;
         let Some(br) = self.document.block_records.get(name) else {
             return vec![];
         };
         let mut out = Vec::new();
+        let context = std::cell::OnceCell::new();
         for &eh in &br.entity_handles {
             let Some(e) = self.document.get_entity(eh) else {
                 continue;
@@ -625,7 +659,7 @@ impl Scene {
             if matches!(e, EntityType::Block(_) | EntityType::BlockEnd(_)) || e.common().invisible {
                 continue;
             }
-            out.extend(self.tessellate_one(e));
+            out.extend(self.tessellate_one_in(&context, e));
         }
         transform_preview_wires(out)
     }
@@ -634,9 +668,9 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::Line;
-    use codec::types::Vector3;
-    use codec::EntityType;
+    use document::entities::Line;
+    use document::types::Vector3;
+    use document::EntityType;
 
     #[test]
     fn block_preview_wires_tessellates_block_entities() {
@@ -659,6 +693,118 @@ mod tests {
         let s = Scene::new();
         assert!(s.block_preview_wires("Nope").is_empty());
     }
+
+    fn line(x: f64) -> EntityType {
+        let mut line = Line::new();
+        line.start = Vector3::new(x, 0.0, 0.0);
+        line.end = Vector3::new(x + 10.0, 5.0, 0.0);
+        EntityType::Line(line)
+    }
+
+    /// How many times `pass` resolved the tessellation context. Each one
+    /// scans the drawing's objects, so a pass over many entities takes one.
+    fn contexts_resolved(pass: impl FnOnce()) -> usize {
+        let before = crate::scene::TESSELLATION_CONTEXTS.with(|count| count.get());
+        pass();
+        crate::scene::TESSELLATION_CONTEXTS.with(|count| count.get()) - before
+    }
+
+    #[test]
+    fn an_edit_preview_resolves_the_context_one_time_for_all_its_entities() {
+        let mut s = Scene::new();
+        let handles: Vec<_> = (0..25).map(|i| s.add_entity(line(i as f64))).collect();
+        let mut wires = Vec::new();
+        let resolved = contexts_resolved(|| wires = s.wire_models_for(&handles));
+        assert_eq!(wires.len(), 25, "one wire for each line");
+        assert_eq!(resolved, 1, "not one for each of the 25 entities");
+    }
+
+    #[test]
+    fn an_edit_preview_of_many_entities_equals_the_previews_of_each_one() {
+        let mut s = Scene::new();
+        let handles: Vec<_> = (0..5).map(|i| s.add_entity(line(i as f64))).collect();
+        let together = s.wire_models_for(&handles);
+        let one_by_one: Vec<_> = handles
+            .iter()
+            .flat_map(|handle| s.wire_models_for(std::slice::from_ref(handle)))
+            .collect();
+        assert_eq!(format!("{together:?}"), format!("{one_by_one:?}"));
+    }
+
+    #[test]
+    fn a_mirror_preview_resolves_the_context_one_time_for_text_and_other_entities() {
+        let mut s = Scene::new();
+        let mut handles: Vec<_> = (0..6).map(|i| s.add_entity(line(i as f64))).collect();
+        for i in 0..4 {
+            let mut text = document::entities::Text::new();
+            text.value = format!("T{i}");
+            text.height = 2.5;
+            handles.push(s.add_entity(EntityType::Text(text)));
+        }
+        let mut parts = (Vec::new(), Vec::new());
+        let resolved = contexts_resolved(|| parts = s.mirror_preview_parts(&handles));
+        assert_eq!(parts.0.len(), 6, "the lines are the plain part");
+        assert!(!parts.1.is_empty(), "the text entities are the text part");
+        assert_eq!(resolved, 1, "not one for each of the 10 entities");
+    }
+
+    #[test]
+    fn a_preview_of_loose_entities_resolves_the_context_one_time() {
+        let s = Scene::new();
+        let entities: Vec<_> = (0..12).map(|i| line(i as f64)).collect();
+        let mut wires = Vec::new();
+        let resolved = contexts_resolved(|| wires = s.wires_for_entities(&entities));
+        assert_eq!(wires.len(), 12);
+        assert_eq!(resolved, 1, "not one for each of the 12 entities");
+    }
+
+    #[test]
+    fn a_block_thumbnail_resolves_the_context_one_time_for_all_its_entities() {
+        let mut s = Scene::new();
+        s.define_block_from_owned_entities(
+            (0..8).map(|i| line(i as f64)).collect(),
+            "Widget",
+            glam::DVec3::ZERO,
+        )
+        .unwrap();
+        let mut wires = Vec::new();
+        let resolved = contexts_resolved(|| wires = s.block_preview_wires("Widget"));
+        assert_eq!(wires.len(), 8);
+        assert_eq!(resolved, 1, "not one for each of the 8 entities");
+    }
+
+    #[test]
+    fn a_pass_that_tessellates_nothing_resolves_no_context() {
+        let mut s = Scene::new();
+        s.define_block_from_owned_entities(vec![], "Empty", glam::DVec3::ZERO)
+            .ok();
+        let resolved = contexts_resolved(|| {
+            assert!(s.wire_models_for(&[]).is_empty());
+            assert!(s
+                .wire_models_for(&[document::Handle::new(0xFFFF_FFFF)])
+                .is_empty());
+            assert!(s.mirror_preview_parts(&[]).0.is_empty());
+            assert!(s.wires_for_entities(&[]).is_empty());
+            assert!(s.block_preview_wires("Empty").is_empty());
+            assert!(s.block_preview_wires("Nope").is_empty());
+        });
+        assert_eq!(resolved, 0, "no entity, no scan of the drawing's objects");
+    }
+
+    #[test]
+    fn a_single_entity_still_resolves_its_own_context() {
+        let mut s = Scene::new();
+        let entity = line(0.0);
+        s.add_entity(entity.clone());
+        let resolved = contexts_resolved(|| {
+            s.tessellate_one(&entity);
+            s.tessellate_one(&entity);
+        });
+        assert_eq!(
+            resolved, 2,
+            "a call outside a pass takes the current context"
+        );
+    }
 }
 
 /// Label band colours of a table whose cells are picked (grey band, the
@@ -668,15 +814,14 @@ const INDICATOR_BAND: [f32; 4] = [173.0 / 255.0, 173.0 / 255.0, 173.0 / 255.0, 1
 const INDICATOR_PICKED: [f32; 4] = [1.0, 213.0 / 255.0, 141.0 / 255.0, 1.0];
 const INDICATOR_SELECTED: [f32; 4] = [117.0 / 255.0, 147.0 / 255.0, 208.0 / 255.0, 1.0];
 const INDICATOR_TEXT: [f32; 4] = [0.04, 0.04, 0.04, 1.0];
+/// The cells a fill drag reaches: the picked colour, see-through.
+const INDICATOR_FILL_SPAN: [f32; 4] = [1.0, 213.0 / 255.0, 141.0 / 255.0, 0.35];
 const INDICATOR_EDGE: [f32; 4] = [235.0 / 255.0, 235.0 / 255.0, 235.0 / 255.0, 1.0];
 
 impl Scene {
     /// Row and column labels round every selected table, and the picked
     /// range's outline in the table whose cells are picked. Screen only.
-    pub(super) fn table_indicator_overlay(
-        &self,
-        pixel: f64,
-    ) -> (Vec<WireModel>, Vec<HatchModel>) {
+    pub(super) fn table_indicator_overlay(&self, pixel: f64) -> (Vec<WireModel>, Vec<HatchModel>) {
         let mut wires = Vec::new();
         let mut hatches = Vec::new();
         let picked = self.table_cells_handle();
@@ -684,7 +829,15 @@ impl Scene {
             let Some(EntityType::Table(table)) = self.document.get_entity(handle) else {
                 continue;
             };
-            if self.entity_temporarily_hidden(handle) {
+            // A fill drag hides the table behind its grip preview; the
+            // range it reaches is the cue, so it stays drawn.
+            let fill_drag =
+                self.table_fill_drag == Some(handle) && self.preview_hidden.contains(&handle);
+            // The cell editor hides the table behind its own picture; the
+            // labels stay so the edited cell can be placed.
+            let cell_edit = self.table_cell_editing == Some(handle)
+                && self.command_preview_hidden.contains(&handle);
+            if self.entity_temporarily_hidden(handle) && !fill_drag && !cell_edit {
                 continue;
             }
             let range = (picked == Some(handle))
@@ -715,11 +868,22 @@ impl Scene {
                 edges.push(a.to_array());
                 edges.push(b.to_array());
             }
-            let edge_color = if cell_mode { INDICATOR_EDGE } else { self.selection_color };
+            let edge_color = if cell_mode {
+                INDICATOR_EDGE
+            } else {
+                self.selection_color
+            };
             let mut edge_wire = WireModel::solid(name.clone(), edges, edge_color, false);
             edge_wire.plot_visible = false;
             edge_wire.text_verts = Self::indicator_text(&indicator);
             wires.push(edge_wire);
+            if fill_drag {
+                for corners in &indicator.outlines {
+                    if let Some(model) = Self::indicator_box(corners, INDICATOR_FILL_SPAN) {
+                        hatches.push(model);
+                    }
+                }
+            }
             for corners in &indicator.outlines {
                 // A band inside each edge of the range: a quarter of the
                 // label text height wide, never thinner than 4 pixels.
@@ -740,6 +904,94 @@ impl Scene {
             }
         }
         (wires, hatches)
+    }
+
+    /// ANNOMONITOR 1: a yellow alert badge with an exclamation bar beside
+    /// the text of every dimension whose association no longer resolves
+    /// (measured: 17 x 11 px, upright, its middle 13 px right of and 14 px
+    /// above the end the text reads to, whatever the text's angle; nothing
+    /// at 0, -1 or -2). Screen size.
+    pub(super) fn anno_monitor_overlay(&self, pixel: f64) -> Vec<HatchModel> {
+        if crate::scene::annotative::anno_monitor() != 1 {
+            return Vec::new();
+        }
+        let block = self.content_render_block_handle();
+        let dimensions: Vec<Handle> = self
+            .document
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                document::objects::ObjectType::Associative(object) => match &object.data {
+                    document::objects::AssociativeData::DimensionAssociation(association) => {
+                        Some(association.dimension)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        for handle in dimensions {
+            let Some(entity) = self.document.get_entity(handle) else {
+                continue;
+            };
+            if entity.common().owner_handle != block || self.entity_temporarily_hidden(handle) {
+                continue;
+            }
+            let broken = self
+                .dimension_association_status(handle)
+                .iter()
+                .any(|(_, status)| {
+                    !matches!(
+                        status,
+                        crate::scene::dimension_assoc::ReferenceStatus::Resolved
+                    )
+                });
+            if !broken {
+                continue;
+            }
+            let Some((middle, width, _, angle)) = crate::entities::dimension::as_dimension(entity)
+                .and_then(|dim| crate::entities::dimension::text_box(dim, &self.document))
+            else {
+                continue;
+            };
+            let end_x = middle.x + angle.cos() * width * 0.5;
+            let end_y = middle.y + angle.sin() * width * 0.5;
+            let left = end_x + 4.5 * pixel;
+            let centre = end_y + 14.0 * pixel;
+            let rect = |x0: f64, y0: f64, x1: f64, y1: f64| {
+                let z = middle.z as f32;
+                [
+                    glam::Vec3::new(x0 as f32, y0 as f32, z),
+                    glam::Vec3::new(x1 as f32, y0 as f32, z),
+                    glam::Vec3::new(x1 as f32, y1 as f32, z),
+                    glam::Vec3::new(x0 as f32, y1 as f32, z),
+                ]
+            };
+            let badge = rect(left, centre - 5.5 * pixel, left + 17.0 * pixel, centre + 5.5 * pixel);
+            // An exclamation mark: a bar over a dot.
+            let bar = rect(
+                left + 7.0 * pixel,
+                centre - 0.5 * pixel,
+                left + 10.0 * pixel,
+                centre + 4.5 * pixel,
+            );
+            let dot = rect(
+                left + 7.0 * pixel,
+                centre - 3.5 * pixel,
+                left + 10.0 * pixel,
+                centre - 1.5 * pixel,
+            );
+            if let Some(model) = Self::indicator_box(&badge, [0.996, 0.851, 0.004, 1.0]) {
+                out.push(model);
+            }
+            for mark in [bar, dot] {
+                if let Some(model) = Self::indicator_box(&mark, [0.08, 0.08, 0.08, 1.0]) {
+                    out.push(model);
+                }
+            }
+        }
+        out
     }
 
     fn indicator_box(corners: &[glam::Vec3; 4], color: [f32; 4]) -> Option<HatchModel> {
@@ -801,5 +1053,89 @@ impl Scene {
             }
         }
         verts
+    }
+}
+
+#[cfg(test)]
+mod table_fill_cue_tests {
+    use super::*;
+
+    /// A fill drag hides the table behind its grip preview; the cells it
+    /// reaches stay drawn in the picked colour, with a see-through span.
+    #[test]
+    fn a_fill_drag_keeps_the_picked_range_drawn_over_the_grip_preview() {
+        let mut scene = Scene::new();
+        let table =
+            document::entities::Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 5, 4);
+        let handle = scene.add_entity(EntityType::Table(Box::new(table)));
+        scene.select_table_cells(crate::scene::TableCellSelection {
+            table: handle,
+            anchor: (2, 1),
+            end: (4, 1),
+        });
+        let span = |scene: &Scene| {
+            scene
+                .table_indicator_overlay(0.01)
+                .1
+                .iter()
+                .filter(|hatch| hatch.color == INDICATOR_FILL_SPAN)
+                .count()
+        };
+        let picked = |scene: &Scene| {
+            scene
+                .table_indicator_overlay(0.01)
+                .1
+                .iter()
+                .filter(|hatch| hatch.color == INDICATOR_PICKED)
+                .count()
+        };
+        assert!(picked(&scene) > 0, "picked cells show their range");
+        assert_eq!(span(&scene), 0, "no span outside a fill drag");
+
+        scene.preview_hidden.insert(handle);
+        assert_eq!(picked(&scene), 0, "a hidden table draws no range");
+
+        scene.table_fill_drag = Some(handle);
+        assert!(picked(&scene) > 0, "the fill drag keeps the range drawn");
+        assert_eq!(span(&scene), 1, "and lays a see-through span over it");
+
+        scene.preview_hidden.remove(&handle);
+        assert_eq!(
+            span(&scene),
+            0,
+            "a stale drag mark adds nothing once the drag ends"
+        );
+    }
+
+    /// The cell editor hides the table behind its picture; the row and
+    /// column labels and the edited cell's band stay drawn.
+    #[test]
+    fn the_cell_editor_keeps_the_row_and_column_labels() {
+        let mut scene = Scene::new();
+        let table =
+            document::entities::Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 5, 4);
+        let handle = scene.add_entity(EntityType::Table(Box::new(table)));
+        scene.select_table_cells(crate::scene::TableCellSelection {
+            table: handle,
+            anchor: (2, 1),
+            end: (2, 1),
+        });
+        let picked = |scene: &Scene| {
+            scene
+                .table_indicator_overlay(0.01)
+                .1
+                .iter()
+                .filter(|hatch| hatch.color == INDICATOR_PICKED)
+                .count()
+        };
+        scene.set_command_preview_hidden(&[handle]);
+        assert_eq!(picked(&scene), 0, "a command preview hides the labels");
+
+        scene.table_cell_editing = Some(handle);
+        assert!(picked(&scene) > 0, "the cell editor keeps them");
+
+        scene.set_command_preview_hidden(&[]);
+        scene.table_cell_editing = None;
+        assert!(picked(&scene) > 0, "a shown table keeps them");
     }
 }

@@ -32,8 +32,30 @@ pub struct AppConfig {
     pub dock: crate::ui::dock::DockState,
     /// Whether the optional Graphic Attributes palette is visible.
     pub show_graphic_attributes: bool,
+    /// Whether the Tool Palettes panel is visible.
+    pub show_tool_palettes: bool,
     /// Whether the Command History pallet is open.
     pub show_command_history: bool,
+    /// The Geometry Cleanup settings, in the form of a `.gcs` file. `None`
+    /// until the user saves them: each drawing then uses its proposed
+    /// tolerance.
+    /// Settings that cannot be read are dropped, not the whole profile.
+    #[serde(deserialize_with = "lenient")]
+    pub geometry_cleanup:
+        Option<crate::modules::manage::geometry_cleanup_settings::CleanupSettings>,
+    /// Whether the Layer Manager pallet is open.
+    pub show_layers: bool,
+    /// Whether the Blocks palette is open.
+    pub show_block_palette: bool,
+    /// Whether the External References pallet is open.
+    pub show_external_references: bool,
+    /// Whether the document file tabs are shown (FILETAB).
+    pub show_file_tabs: bool,
+    /// The drawing tabs run across the window above the palettes, instead
+    /// of between them over the drawing (the default).
+    pub file_tabs_above_docks: bool,
+    /// Whether the layout tabs are shown (LAYOUTTAB).
+    pub show_layout_tabs: bool,
     /// Graphic Attributes creates fills on the current layer instead of the
     /// layer of the filled object.
     pub graphic_fills_on_current_layer: bool,
@@ -55,6 +77,8 @@ pub struct AppConfig {
     pub model_space: ModelSpaceThemeConfig,
     /// The user's changes to the right-click menu.
     pub context_menu: crate::ui::popup::context_menu::MenuCustomization,
+    /// MCP control is on at start (the MCP button's last state).
+    pub mcp_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -67,7 +91,15 @@ impl Default for AppConfig {
             statusbar: StatusBarConfig::default(),
             dock: crate::ui::dock::DockState::default(),
             show_graphic_attributes: false,
+            show_tool_palettes: false,
             show_command_history: false,
+            geometry_cleanup: None,
+            show_layers: false,
+            show_block_palette: false,
+            show_external_references: false,
+            show_file_tabs: true,
+            file_tabs_above_docks: false,
+            show_layout_tabs: true,
             graphic_fills_on_current_layer: false,
             annotation_auto_scale: -4,
             annotation_scale_modelspace: false,
@@ -76,6 +108,7 @@ impl Default for AppConfig {
             shortcuts: ShortcutConfig::default(),
             model_space: ModelSpaceThemeConfig::default(),
             context_menu: Default::default(),
+            mcp_enabled: true,
         }
     }
 }
@@ -84,12 +117,20 @@ impl Default for AppConfig {
 #[serde(default)]
 pub struct ShortcutConfig {
     pub bindings: std::collections::BTreeMap<String, String>,
+    /// The shipped default keys this table has already been offered. A
+    /// default added in a later release is backfilled once; one the user
+    /// removed stays removed. A table saved before this field existed has
+    /// been offered none, so the field reads as empty there, not as the
+    /// struct's default (every current key).
+    #[serde(default)]
+    pub known_defaults: std::collections::BTreeSet<String>,
 }
 
 impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             bindings: super::shortcuts::default_bindings(),
+            known_defaults: super::shortcuts::default_bindings().into_keys().collect(),
         }
     }
 }
@@ -269,6 +310,7 @@ pub fn all_themes() -> Vec<iced::Theme> {
         .iter()
         .cloned()
         .chain(crate::ui::style::fusion_theme::fusion_themes())
+        .chain(crate::ui::style::studio_theme::studio_themes())
         .collect()
 }
 
@@ -345,6 +387,9 @@ pub const DEFAULT_PAPER_BG: [u8; 3] = [255, 255, 255];
 /// Standard paper space desk surround [138, 138, 138].
 pub const DEFAULT_DESK_BG: [u8; 3] = [138, 138, 138];
 
+/// Default VPHIGHLIGHTOPACITY: a soft outline that does not compete with the drawing.
+pub const DEFAULT_VIEWPORT_HOVER_OPACITY: u8 = 50;
+
 /// Persistent configuration for Model Space appearance and selection visual effects.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -375,6 +420,8 @@ pub struct ModelSpaceThemeConfig {
     /// VSEDGESMOOTH: crease angle in degrees; mesh edges whose faces meet
     /// flatter are not drawn in the shaded-with-edges modes (default 1).
     pub edge_smooth: f32,
+    /// VSOCCLUDEDEDGES: the Hidden style draws edges behind faces dashed.
+    pub occluded_edges: bool,
     /// COMPARECOLORADDED / REMOVED / MODIFIED: COMPARE's overlay colours.
     pub compare_added: [u8; 3],
     pub compare_removed: [u8; 3],
@@ -392,6 +439,8 @@ pub struct ModelSpaceThemeConfig {
     pub selection_effect: bool,
     /// SELECTIONPREVIEW bitmask: 1 = idle, 2 = during a command, 3 = both.
     pub selection_preview: u8,
+    /// Maximum number of entities highlighted while a selection box is open.
+    pub selection_preview_limit: u32,
     /// GRIPSIZE: grip marker half-size in pixels (1–25, default 5).
     pub grip_size: u8,
     /// GRIPCOLOR: unselected grip ACI color (0 = Theme Primary outline, 1..=255 = ACI).
@@ -402,6 +451,12 @@ pub struct ModelSpaceThemeConfig {
     pub grip_hover: u8,
     /// SNAPMARKERSIZE: object-snap marker half-size in pixels (1–20, default 5).
     pub snap_marker_size: u8,
+    /// VPHIGHLIGHT: outline the Model viewport under the cursor when the
+    /// view is split into several.
+    pub viewport_hover_highlight: bool,
+    /// VPHIGHLIGHTOPACITY: strength of that outline in percent (0–100);
+    /// the default keeps it barely visible.
+    pub viewport_hover_opacity: u8,
 }
 
 impl Default for ModelSpaceThemeConfig {
@@ -419,6 +474,7 @@ impl Default for ModelSpaceThemeConfig {
             selection_highlight_color: 0,
             edge_color: None,
             edge_smooth: 1.0,
+            occluded_edges: false,
             compare_added: crate::scene::compare::CompareSettings::default().colors[0],
             compare_removed: crate::scene::compare::CompareSettings::default().colors[1],
             compare_modified: crate::scene::compare::CompareSettings::default().colors[2],
@@ -428,11 +484,14 @@ impl Default for ModelSpaceThemeConfig {
             selection_highlight_widen: 0,
             selection_effect: true,
             selection_preview: 3,
+            selection_preview_limit: 20_000,
             grip_size: 5,
             grip_color: 0,
             grip_hot: 0,
             grip_hover: 0,
             snap_marker_size: 5,
+            viewport_hover_highlight: true,
+            viewport_hover_opacity: DEFAULT_VIEWPORT_HOVER_OPACITY,
         }
     }
 }
@@ -477,7 +536,7 @@ impl ModelSpaceThemeConfig {
 
     /// Resolve active selection highlight overlay color as [f32; 4].
     pub fn resolve_selection_color(&self) -> [f32; 4] {
-        let mut color = codec::types::aci_table::aci_to_rgb(self.selection_highlight_color)
+        let mut color = document::types::aci_table::aci_to_rgb(self.selection_highlight_color)
             .filter(|_| self.selection_highlight_color != 0)
             .map_or(
                 crate::scene::model::wire_model::WireModel::SELECTED,
@@ -513,7 +572,9 @@ pub fn theme_canvas_background(theme: &iced::Theme) -> [u8; 3] {
         // rule: black chrome is paired with a white canvas, so falling
         // through to the palette below would paint model space black and
         // undo the whole point of the theme.
-        other => match crate::ui::style::fusion_theme::fusion_canvas(other) {
+        other => match crate::ui::style::fusion_theme::fusion_canvas(other)
+            .or_else(|| crate::ui::style::studio_theme::studio_canvas(other))
+        {
             Some(rgb) => rgb,
             None => color_to_rgb(other.palette().background.base.color),
         },
@@ -549,6 +610,7 @@ pub fn parse_theme_name(s: &str) -> Option<iced::Theme> {
         "FERRA" => Some(iced::Theme::Ferra),
         "FUSIONBLACK" => Some(crate::ui::style::fusion_theme::fusion_black()),
         "FUSIONWHITE" => Some(crate::ui::style::fusion_theme::fusion_white()),
+        "STUDIODARK" => Some(crate::ui::style::studio_theme::studio_dark()),
         _ => None,
     }
 }
@@ -589,6 +651,14 @@ pub struct RibbonConfig {
     pub layout: RibbonLayout,
 }
 
+// How many times this thread asked for the config to be written. A test
+// build writes nothing (see `save`), so a test reads this to see that a step
+// would write the settings file.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SAVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl AppConfig {
     /// Read the saved config, or all-defaults when the file is missing or
     /// unreadable. Unknown or missing fields fall back to their section defaults
@@ -614,6 +684,8 @@ impl AppConfig {
     /// preferences on them — without this, running `cargo test` rewrites the
     /// settings of whoever ran it.
     pub fn save(&self) {
+        #[cfg(test)]
+        SAVES.with(|count| count.set(count.get() + 1));
         if cfg!(test) {
             return;
         }
@@ -639,6 +711,17 @@ impl AppConfig {
     }
 }
 
+/// A field that is `None` when its value cannot be read, so that one bad
+/// value does not reset the whole profile.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 #[cfg(target_arch = "wasm32")]
 const WEB_CONFIG_KEY: &str = "opencadstudio.settings";
 
@@ -650,6 +733,7 @@ fn config_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn system_scheme_resolves_to_a_concrete_theme_and_keeps_its_name() {
@@ -671,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_space_defaults() {
+    fn model_space_defaults() {
         let cfg = ModelSpaceThemeConfig::default();
         assert_eq!(cfg.mode, ModelSpaceMode::MatchTheme);
         assert_eq!(cfg.custom_bg, None);
@@ -687,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_model_bg_match_theme() {
+    fn resolve_model_bg_match_theme() {
         let cfg = ModelSpaceThemeConfig {
             mode: ModelSpaceMode::MatchTheme,
             ..Default::default()
@@ -705,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_model_bg_classic_dark() {
+    fn resolve_model_bg_classic_dark() {
         let cfg = ModelSpaceThemeConfig {
             mode: ModelSpaceMode::ClassicDark,
             ..Default::default()
@@ -719,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_model_bg_custom() {
+    fn resolve_model_bg_custom() {
         let cfg = ModelSpaceThemeConfig {
             mode: ModelSpaceMode::Custom,
             custom_bg: Some([10, 20, 30]),
@@ -732,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_space_config_serde_roundtrip() {
+    fn model_space_config_serde_roundtrip() {
         let mut original = AppConfig::default();
         original.model_space.mode = ModelSpaceMode::Custom;
         original.model_space.custom_bg = Some([12, 34, 56]);
@@ -761,6 +845,31 @@ mod tests {
         let serialized = serde_json::to_string(&original).expect("serialize config");
         let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
         assert!(restored.show_graphic_attributes);
+    }
+
+    // All four plot flags are serde-defaulted to false and round-trip through
+    // the same config; one parameterized test covers them without repeating the
+    // serialize/deserialize setup four times.
+    #[test]
+    fn plot_flag_configs_default_off_and_round_trip() {
+        let old: AppConfig = serde_json::from_str(r#"{"plot":{}}"#).expect("old config");
+        assert!(!old.plot.text_as_outlines);
+        assert!(!old.plot.non_scaling_stroke);
+        assert!(!old.plot.layer_attributes);
+        assert!(!old.plot.geopdf);
+
+        fn round_trip(set: impl FnOnce(&mut AppConfig), get: impl FnOnce(&AppConfig) -> bool) {
+            let mut original = AppConfig::default();
+            set(&mut original);
+            let serialized = serde_json::to_string(&original).expect("serialize config");
+            let restored: AppConfig =
+                serde_json::from_str(&serialized).expect("deserialize config");
+            assert!(get(&restored));
+        }
+        round_trip(|c| c.plot.text_as_outlines = true, |c| c.plot.text_as_outlines);
+        round_trip(|c| c.plot.non_scaling_stroke = true, |c| c.plot.non_scaling_stroke);
+        round_trip(|c| c.plot.layer_attributes = true, |c| c.plot.layer_attributes);
+        round_trip(|c| c.plot.geopdf = true, |c| c.plot.geopdf);
     }
 
     #[test]
@@ -836,6 +945,39 @@ mod tests {
     }
 
     #[test]
+    fn ribbon_centering_and_wheel_default_and_round_trip() {
+        // A config saved before these options keeps the ribbon at its left
+        // edge and lets the wheel step through the tabs.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"qat_below":true}}"#).expect("old config");
+        assert!(!old.ribbon.layout.centered);
+        assert!(old.ribbon.layout.wheel_switches_tabs);
+
+        let mut original = AppConfig::default();
+        original.ribbon.layout.centered = true;
+        original.ribbon.layout.wheel_switches_tabs = false;
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["centered"], true);
+        assert_eq!(value["ribbon"]["wheel_switches_tabs"], false);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn the_ribbon_options_reach_the_ribbon_and_the_saved_config() {
+        use crate::app::{Message, OpenCADStudio};
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.update(Message::RibbonCenteredChanged(true));
+        let _ = app.update(Message::RibbonWheelTabsChanged(false));
+        assert!(app.ribbon.layout().centered);
+        assert!(!app.ribbon.layout().wheel_switches_tabs);
+        let saved = app.current_config();
+        assert!(saved.ribbon.layout.centered);
+        assert!(!saved.ribbon.layout.wheel_switches_tabs);
+    }
+
+    #[test]
     fn floating_panels_default_and_round_trip() {
         use crate::ui::ribbon::FloatingPanel;
 
@@ -896,6 +1038,10 @@ mod tests {
             parse_theme_name("Kanagawa_Lotus"),
             Some(iced::Theme::KanagawaLotus)
         );
+        assert_eq!(
+            parse_theme_name("studio dark"),
+            Some(crate::ui::style::studio_theme::studio_dark())
+        );
         assert_eq!(parse_theme_name("1"), None);
         assert_eq!(parse_theme_name("0"), None);
         assert_eq!(parse_theme_name("nonexistent_theme"), None);
@@ -906,18 +1052,19 @@ mod tests {
     /// the guard and then split a character:
     /// `byte index 2 is not a char boundary; it is inside 'é'`. Pasting it
     /// into any Options colour field killed the process on the keystroke.
-    #[test]
-    fn test_parse_hex_rejects_multibyte_input_without_panicking() {
-        for value in ["aébé", "#aébé", "éééééé", "#ébé#"] {
-            assert_eq!(parse_hex(value), None, "{value} should not parse");
-        }
-        // Non-hex garbage and wrong lengths stay None.
-        for value in ["gggggg", "a1b2c", "a1b2c34", "#GGHHII"] {
-            assert_eq!(parse_hex(value), None, "{value} should not parse");
-        }
-        // Valid input keeps working, with and without '#', with whitespace.
-        assert_eq!(parse_hex("a1b2c3"), Some([0xa1, 0xb2, 0xc3]));
-        assert_eq!(parse_hex("#A1B2C3"), Some([0xa1, 0xb2, 0xc3]));
-        assert_eq!(parse_hex("  000000  "), Some([0, 0, 0]));
+    #[rstest]
+    #[case("aébé", None)]
+    #[case("#aébé", None)]
+    #[case("éééééé", None)]
+    #[case("#ébé#", None)]
+    #[case("gggggg", None)]
+    #[case("a1b2c", None)]
+    #[case("a1b2c34", None)]
+    #[case("#GGHHII", None)]
+    #[case("a1b2c3", Some([0xa1, 0xb2, 0xc3]))]
+    #[case("#A1B2C3", Some([0xa1, 0xb2, 0xc3]))]
+    #[case("  000000  ", Some([0, 0, 0]))]
+    fn parse_hex_handles_text_and_whitespace(#[case] value: &str, #[case] expected: Option<[u8; 3]>) {
+        assert_eq!(parse_hex(value), expected, "{value}");
     }
 }

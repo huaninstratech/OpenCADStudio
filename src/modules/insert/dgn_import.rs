@@ -14,14 +14,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codec::entities::{
+use document::entities::{
     Arc, AttachmentPoint, Circle, DrawingDirection, Ellipse, Insert, Line, LineSpacingStyle,
     LwPolyline, LwVertex, MText, Point, Polyline3D, Spline, Text, TextHorizontalAlignment,
     TextVerticalAlignment,
 };
-use codec::tables::DimStyle;
-use codec::types::{Color, LineWeight, Vector2, Vector3};
-use codec::EntityType;
+use document::tables::DimStyle;
+use document::types::{Color, LineWeight, Vector2, Vector3};
+use document::EntityType;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
 use crate::scene::model::underlay_vector::{
@@ -47,7 +47,73 @@ pub struct DgnImportRequest {
     pub references: ReferenceMode,
     /// What an earlier translation of a reference already on disk gets.
     pub existing_reference: ExistingReference,
+    /// The text code page of a V7 file (e.g. 1250 for Czech/Slovak files).
+    /// V7 names no page; `None` keeps the historical 1252 decoding.
+    pub code_page: Option<u16>,
 }
+
+/// Named equivalents of the -DGNIMPORT prompt answers. `None` and blank model,
+/// units and mapping answers select the command's defaults. A numeric
+/// `code_page` is present only when the caller explicitly supplied one; 0 and
+/// 1252 both select the default rather than inheriting the stored page.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DgnImportOptions<'a> {
+    pub path: &'a str,
+    pub model: Option<&'a str>,
+    pub units: Option<&'a str>,
+    pub mapping: Option<&'a str>,
+    pub code_page: Option<u16>,
+}
+
+/// Why a DGN request cannot be resolved or its model cannot be imported.
+/// The command shows `Display`; semantic callers can retain the stable code
+/// and the models available when a requested model is absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DgnImportError {
+    InvalidDgn,
+    ModelMissing {
+        requested: String,
+        path: String,
+        available_models: Vec<String>,
+    },
+    InvalidUnits,
+    InvalidMapping(String),
+    InvalidCodepage(String),
+    EmptyModel,
+    ImportFailed(String),
+}
+
+impl DgnImportError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidDgn => "invalid_dgn",
+            Self::ModelMissing { .. } => "model_missing",
+            Self::InvalidUnits => "invalid_units",
+            Self::InvalidMapping(_) => "invalid_mapping",
+            Self::InvalidCodepage(_) => "invalid_codepage",
+            Self::EmptyModel => "empty_dgn_model",
+            Self::ImportFailed(_) => "dgn_import_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for DgnImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDgn => f.write_str("Invalid or unsupported DGN file."),
+            Self::ModelMissing {
+                requested, path, ..
+            } => write!(f, "There is no {requested} in {path}."),
+            Self::InvalidUnits => f.write_str("Invalid option keyword."),
+            Self::InvalidMapping(message)
+            | Self::InvalidCodepage(message)
+            | Self::ImportFailed(message) => f.write_str(message),
+            Self::EmptyModel => f.write_str("The DGN model has nothing that can be imported."),
+        }
+    }
+}
+
+impl std::error::Error for DgnImportError {}
 
 /// The External DGN references choice: translated into drawings attached
 /// as external references, left out, or attached as DGN underlays.
@@ -71,7 +137,7 @@ pub enum ExistingReference {
 
 /// The objects of an import: layers (name, colour), text styles (name, font
 /// file), blocks (name, objects) and the model's objects, in file order.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Converted {
     pub layers: Vec<(String, Color)>,
     /// Layers that come in turned off.
@@ -82,6 +148,140 @@ pub struct Converted {
     pub dim_styles: Vec<(String, Option<DimStyle>)>,
     pub blocks: Vec<(String, Vec<EntityType>)>,
     pub entities: Vec<EntityType>,
+}
+
+/// What an import reads from its files, made off the UI thread
+/// ([`prepare_import`]): the model, its objects converted, and the
+/// reference attachments that are placed.
+#[derive(Clone)]
+pub struct PreparedImport {
+    pub import: DgnImport,
+    pub converted: Converted,
+    pub references: Vec<PreparedReference>,
+}
+
+impl std::fmt::Debug for PreparedImport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedImport")
+            .field("entities", &self.converted.entities.len())
+            .field("references", &self.references.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A reference attachment that is placed: the attachment, the file it
+/// names as found beside the host file, and the model it shows. For a
+/// translation, `converted` is the model to write as "<file>-<model>.dwg";
+/// none when the drawing is already there and is kept. `drawing` is that
+/// drawing written and read on the import's worker, or why it could not
+/// be written; none when nothing read it there yet.
+#[derive(Clone)]
+pub struct PreparedReference {
+    pub reference: crate::scene::model::underlay_vector::DgnReference,
+    pub file: std::path::PathBuf,
+    pub model: String,
+    pub converted: Option<Converted>,
+    pub drawing: Option<Result<crate::io::xref::XrefRead, String>>,
+}
+
+/// The drawing a translated reference is written to, beside its file.
+pub fn reference_drawing(file: &std::path::Path, model: &str) -> std::path::PathBuf {
+    let stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // The model name comes from the file: made a plain file name so the
+    // drawing is written in the reference's folder.
+    file.with_file_name(format!("{stem}-{}.dwg", symbol_name(model)))
+}
+
+/// Reads and converts what an import places, without the app: the
+/// request's model, then each reference attachment the request keeps.
+/// This is the part of DGNIMPORT that reads files, so it runs on a worker.
+pub fn prepare_import(request: &DgnImportRequest) -> Result<PreparedImport, DgnImportError> {
+    let Some(import) = crate::scene::model::underlay_vector::dgn_import(
+        &request.path,
+        &request.model,
+        request.code_page,
+    ) else {
+        return Err(DgnImportError::InvalidDgn);
+    };
+    prepare_read(request, import)
+}
+
+/// [`prepare_import`] after the model is read: the model converted, then
+/// its reference attachments.
+fn prepare_read(
+    request: &DgnImportRequest,
+    import: DgnImport,
+) -> Result<PreparedImport, DgnImportError> {
+    let converted = convert(&import, request.sub_units, request.explode_text_nodes);
+    let no_references = request.references == ReferenceMode::Ignore || import.references.is_empty();
+    if converted.entities.is_empty() && no_references {
+        return Err(DgnImportError::EmptyModel);
+    }
+    let references = if request.references == ReferenceMode::Ignore {
+        Vec::new()
+    } else {
+        import
+            .references
+            .iter()
+            .filter_map(|reference| prepare_reference(request, reference))
+            .collect()
+    };
+    Ok(PreparedImport {
+        import,
+        converted,
+        references,
+    })
+}
+
+/// One reference attachment for [`prepare_import`]; none when its file is
+/// not found, names no model, or (for a translation that writes the
+/// drawing) cannot be read.
+fn prepare_reference(
+    request: &DgnImportRequest,
+    reference: &crate::scene::model::underlay_vector::DgnReference,
+) -> Option<PreparedReference> {
+    use crate::scene::model::underlay_vector::{dgn_import, dgn_import_models};
+    let host_dir = std::path::Path::new(&request.path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    // A relative name is beside the host file; failing that, the file
+    // of that name in the host's folder.
+    let named = std::path::Path::new(&reference.file.replace('\\', "/")).to_path_buf();
+    let joined = host_dir.join(&named);
+    let file = if joined.is_file() {
+        joined
+    } else {
+        host_dir.join(named.file_name().unwrap_or_default())
+    };
+    let path = file.to_string_lossy().into_owned();
+    crate::scene::model::pdf_raster::source_bytes(&path)?;
+    let model = if reference.model.is_empty() {
+        dgn_import_models(&path).and_then(|m| m.into_iter().next())?
+    } else {
+        reference.model.clone()
+    };
+    let mut converted = None;
+    if request.references != ReferenceMode::Underlay {
+        // ponytail: "Prompt to overwrite" asks nothing and keeps the existing
+        // drawing, like "Do not overwrite"; add a confirmation if wanted.
+        let write = !reference_drawing(&file, &model).is_file()
+            || request.existing_reference == ExistingReference::Overwrite;
+        if write {
+            let source = dgn_import(&path, &model, request.code_page)?;
+            converted = Some(convert(&source, false, request.explode_text_nodes));
+        }
+    }
+    Some(PreparedReference {
+        reference: reference.clone(),
+        file,
+        model,
+        converted,
+        drawing: None,
+    })
 }
 
 /// A DGN weight (0-31) as a lineweight (1/100 mm), as the Standard mapping
@@ -95,8 +295,8 @@ pub fn lineweight_of(weight: u32) -> i16 {
 
 /// An RGB colour as the colour index of the same RGB, else a true colour.
 pub fn color_of(rgb: [u8; 3]) -> Color {
-    let index = codec::types::aci_table::nearest_aci(rgb[0], rgb[1], rgb[2]);
-    if codec::types::aci_table::aci_to_rgb(index) == Some((rgb[0], rgb[1], rgb[2])) {
+    let index = document::types::aci_table::nearest_aci(rgb[0], rgb[1], rgb[2]);
+    if document::types::aci_table::aci_to_rgb(index) == Some((rgb[0], rgb[1], rgb[2])) {
         Color::Index(index)
     } else {
         Color::from_rgb(rgb[0], rgb[1], rgb[2])
@@ -208,7 +408,7 @@ fn arc_plane(u: P3, v: P3) -> (P3, bool) {
 
 /// The angle of `d` in the entity coordinate system of `normal`.
 fn ocs_angle(normal: P3, d: P3) -> f64 {
-    let m = codec::types::Matrix3::arbitrary_axis(v3(normal));
+    let m = document::types::Matrix3::arbitrary_axis(v3(normal));
     let (x, y) = (
         m * Vector3::new(1.0, 0.0, 0.0),
         m * Vector3::new(0.0, 1.0, 0.0),
@@ -218,7 +418,7 @@ fn ocs_angle(normal: P3, d: P3) -> f64 {
 
 /// A point in the entity coordinate system of `normal`.
 fn to_ocs(normal: P3, p: P3) -> Vector3 {
-    codec::types::Matrix3::arbitrary_axis(v3(normal)).transpose() * v3(p)
+    document::types::Matrix3::arbitrary_axis(v3(normal)).transpose() * v3(p)
 }
 
 /// The unit normal of the plane the points lie in (Newell's, turned to
@@ -233,7 +433,10 @@ fn plane_normal(points: &[P3]) -> Option<P3> {
         n[2] += (p[0] - q[0]) * (p[1] + q[1]);
     }
     let len = norm(n);
-    let span = points.iter().map(|p| norm(sub(*p, points[0]))).fold(0.0, f64::max);
+    let span = points
+        .iter()
+        .map(|p| norm(sub(*p, points[0])))
+        .fold(0.0, f64::max);
     if !(len > 1e-12 * span * span) {
         return flat(points).then_some([0.0, 0.0, 1.0]);
     }
@@ -242,7 +445,10 @@ fn plane_normal(points: &[P3]) -> Option<P3> {
         n = [-n[0], -n[1], -n[2]];
     }
     let off = |p: &P3| dot(sub(*p, points[0]), n).abs();
-    points.iter().all(|p| off(p) <= 1e-6 * span.max(1e-12)).then_some(n)
+    points
+        .iter()
+        .all(|p| off(p) <= 1e-6 * span.max(1e-12))
+        .then_some(n)
 }
 
 /// True when every point is at the first one's z.
@@ -325,7 +531,7 @@ fn outline(points: &[P3], bulges: &[f64], filled: bool, by_winding: bool) -> Vec
 /// marked associative with no source yet: the outline converted just before
 /// it becomes its source once both are in the drawing.
 fn solid_hatch(points: &[P3], bulges: &[f64]) -> Option<EntityType> {
-    use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+    use document::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
     if points.len() < 3 || !flat(points) {
         return None;
     }
@@ -496,7 +702,7 @@ fn color_code(color: By<crate::scene::model::underlay_vector::DgnColor>) -> u16 
         By::Level => 256,
         By::Cell => 0,
         By::Own(c) => {
-            codec::types::aci_table::nearest_aci(c.table[0], c.table[1], c.table[2]) as u16
+            document::types::aci_table::nearest_aci(c.table[0], c.table[1], c.table[2]) as u16
         }
     }
 }
@@ -691,7 +897,7 @@ fn mtext_of_node(
             let last = lines
                 .iter()
                 .filter_map(text_line)
-                .last()
+                .next_back()
                 .map_or(first, |l| l.1);
             m.line_spacing_style = LineSpacingStyle::AtLeast;
             m.line_spacing_factor = 1.0;
@@ -753,9 +959,17 @@ fn arc_entity(center: P3, u: P3, v: P3, start: f64, sweep: f64) -> Vec<EntityTyp
             (u, lv / lu, Box::new(|t: f64| -t))
         }
     } else if ccw {
-        (v.map(|c| -c), lu / lv, Box::new(|t: f64| t + std::f64::consts::FRAC_PI_2))
+        (
+            v.map(|c| -c),
+            lu / lv,
+            Box::new(|t: f64| t + std::f64::consts::FRAC_PI_2),
+        )
     } else {
-        (v.map(|c| -c), lu / lv, Box::new(|t: f64| -t - std::f64::consts::FRAC_PI_2))
+        (
+            v.map(|c| -c),
+            lu / lv,
+            Box::new(|t: f64| -t - std::f64::consts::FRAC_PI_2),
+        )
     };
     let mut e = Ellipse::from_center_axes(v3(center), v3(major), ratio);
     e.normal = v3(normal);
@@ -813,7 +1027,11 @@ fn dim_style_values(import: &DgnImport, ds: &DgnDimStyle, k: f64, name: &str) ->
     s.dimcen = ds.center * k;
     s.dimscale = ds.scale;
     let bits = ds.accuracy & 0x7f;
-    let places = if bits == 0 { 0 } else { bits.trailing_zeros() as i16 + 1 };
+    let places = if bits == 0 {
+        0
+    } else {
+        bits.trailing_zeros() as i16 + 1
+    };
     s.dimdec = places;
     s.dimtdec = places;
     s.dimadec = i16::from(ds.angle_places);
@@ -857,10 +1075,10 @@ fn dimension_entity(
     axes: &[[f64; 2]; 2],
     style: &str,
     text: String,
-    overrides: &[(i16, codec::xdata::XDataValue)],
+    overrides: &[(i16, document::xdata::XDataValue)],
     layout: &DimTextLayout,
 ) -> Option<EntityType> {
-    use codec::entities::{Dimension, DimensionDiameter, DimensionLinear, DimensionRadius};
+    use document::entities::{Dimension, DimensionDiameter, DimensionLinear, DimensionRadius};
     let at = |k: usize| points.get(k).copied();
     let along = |p: P3, d: [f64; 2], t: f64| [p[0] + d[0] * t, p[1] + d[1] * t, p[2]];
     let mut entity = match kind {
@@ -912,9 +1130,17 @@ fn dimension_entity(
             let gaps = if layout.in_line { 3.0 } else { 1.0 };
             let beside = layout.arrow + gaps * layout.gap + width / 2.0;
             let fits = length >= layout.arrow + gaps * layout.gap + width;
-            let third = if fits && beside > length / 2.0 { 2.0 } else { 1.0 };
+            let third = if fits && beside > length / 2.0 {
+                2.0
+            } else {
+                1.0
+            };
             let mid = a0 + sweep * third / 3.0;
-            let arc = [vertex[0] + radius * mid.cos(), vertex[1] + radius * mid.sin(), vertex[2]];
+            let arc = [
+                vertex[0] + radius * mid.cos(),
+                vertex[1] + radius * mid.sin(),
+                vertex[2],
+            ];
             let dvec = |p: P3| glam::DVec3::from_array(p);
             crate::modules::annotate::angular_dim::angular_three_point_entity(
                 dvec(vertex),
@@ -985,9 +1211,13 @@ fn dimension_settings(
     look: &DgnDimLook,
     style: Option<&DgnDimStyle>,
     color: u16,
-) -> (String, Vec<(i16, codec::xdata::XDataValue)>, DimTextLayout) {
+) -> (
+    String,
+    Vec<(i16, document::xdata::XDataValue)>,
+    DimTextLayout,
+) {
     use crate::entities::dim_override as ov;
-    use codec::xdata::XDataValue::{Integer16, Real};
+    use document::xdata::XDataValue::{Integer16, Real};
     let own = dgn_font(import, look.font);
     let style_font = style.and_then(|s| dgn_font(import, s.font));
     let differs = |file: &str| style_font.is_some_and(|(_, f)| !f.eq_ignore_ascii_case(file));
@@ -1001,7 +1231,11 @@ fn dimension_settings(
     let text = format!(r"{{{font}\C{color};<>}}");
     let scale = style.map(|s| s.scale).filter(|s| *s > 0.0).unwrap_or(1.0);
     let length = |v: f64| v / (scale * scale);
-    let gap = length(if look.text_outside { look.gap } else { look.margin });
+    let gap = length(if look.text_outside {
+        look.gap
+    } else {
+        look.margin
+    });
     let horizontal = i16::from(style.is_some_and(|s| s.horizontal_text));
     let mut overrides = vec![
         (ov::DIMCEN, Real(0.0)),
@@ -1035,7 +1269,7 @@ fn dimension_settings(
 /// triangles whose inner edges are hidden. A polyface numbers its vertices
 /// in 16 bits, so faces that need further vertices go on further meshes.
 fn polyfaces(points: &[P3], loops: &[Vec<i32>]) -> Vec<EntityType> {
-    use codec::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
+    use document::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
     const MAX_VERTICES: usize = i16::MAX as usize;
     let mut out = Vec::new();
     let mut mesh = PolyfaceMesh::new();
@@ -1153,6 +1387,12 @@ struct Converter<'a> {
     /// Converting a shared cell definition: the cells inside it are not
     /// blocks of their own, their objects are part of the definition.
     in_definition: bool,
+    /// Self-contained cell headers whose geometry matches an already
+    /// defined one, per (base name, copy kind) → the cell's
+    /// origin-normalized parts and the block they defined. A GIS export
+    /// can place the same symbol cell thousands of times as separate
+    /// headers; those become one block and many inserts.
+    shares: HashMap<(String, bool, bool), Vec<(Vec<DgnElement>, String)>>,
     /// The construction layer of each level, once one is made.
     construction: HashMap<u32, String>,
 }
@@ -1177,19 +1417,35 @@ impl<'a> Converter<'a> {
         name
     }
 
-    /// Every colour index a cell draws with, through the cells it places.
-    fn cell_colors(&self, name: &str, depth: usize, out: &mut Vec<u32>) {
-        let Some(def) = self.defs.get(&name.to_ascii_uppercase()) else {
-            return;
-        };
-        for e in def.iter() {
-            if let By::Own(c) = e.color {
-                out.push(c.index);
+    /// Every colour index a cell draws with, through the cells it places
+    /// down to eight levels. Each cell is read once, at the shallowest level
+    /// that reaches it, so the colours are the same as following every
+    /// placement, which for a cell placing itself n times takes n⁸ steps.
+    fn cell_colors(&self, name: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut read = HashSet::new();
+        let mut level = vec![name.to_ascii_uppercase()];
+        for _ in 0..=8 {
+            let mut next = Vec::new();
+            for name in level {
+                if !read.insert(name.clone()) {
+                    continue;
+                }
+                let Some(def) = self.defs.get(&name) else {
+                    continue;
+                };
+                for e in def.iter() {
+                    if let By::Own(c) = e.color {
+                        out.push(c.index);
+                    }
+                    if let DgnGeom::Cell { name, .. } = &e.geom {
+                        next.push(name.to_ascii_uppercase());
+                    }
+                }
             }
-            if let (DgnGeom::Cell { name, .. }, true) = (&e.geom, depth < 8) {
-                self.cell_colors(name, depth + 1, out);
-            }
+            level = next;
         }
+        out
     }
 
     /// The block a V7 instance of `cell` inserts: a copy of the definition
@@ -1206,8 +1462,7 @@ impl<'a> Converter<'a> {
         let Some(def) = self.defs.get(&cell.to_ascii_uppercase()).copied() else {
             return name;
         };
-        let mut colors = Vec::new();
-        self.cell_colors(cell, 0, &mut colors);
+        let colors = self.cell_colors(cell);
         let copy = CellCopy {
             active: true,
             color_by_block: colors.windows(2).all(|w| w[0] == w[1]),
@@ -1311,13 +1566,15 @@ impl<'a> Converter<'a> {
                 let (text, overrides, layout) =
                     dimension_settings(self.import, *kind, look, record, color_code(element.color));
                 let style = dim_style_name(self.import, *style);
-                dimension_entity(*kind, points, *offset, axes, &style, text, &overrides, &layout)
-                    .into_iter()
-                    .collect()
+                dimension_entity(
+                    *kind, points, *offset, axes, &style, text, &overrides, &layout,
+                )
+                .into_iter()
+                .collect()
             }
             DgnGeom::Mesh { points, loops } => polyfaces(points, loops),
             DgnGeom::Leader { points, style } => {
-                let mut leader = codec::entities::Leader::new();
+                let mut leader = document::entities::Leader::new();
                 leader.vertices = points.iter().map(|p| v3(*p)).collect();
                 leader.dimension_style = dim_style_name(self.import, *style);
                 vec![EntityType::Leader(leader)]
@@ -1429,14 +1686,29 @@ impl<'a> Converter<'a> {
                 } else {
                     name.as_str()
                 };
-                let block = self.unique(&block_name(base));
-                let local = crate::scene::model::underlay_vector::scaled_elements(
+                // The definition's objects are relative to the cell's own
+                // origin, which makes repeats of one symbol comparable and
+                // placeable through the insert alone.
+                let normalized = crate::scene::model::underlay_vector::scaled_elements(
                     parts,
                     1.0,
                     origin.map(|c| -c),
                 );
-                let entities = self.elements(&local, false, copy, depth + 1);
+                let key = (base.to_ascii_uppercase(), copy.active, copy.color_by_block);
+                if let Some((_, shared)) = self
+                    .shares
+                    .get(&key)
+                    .and_then(|shares| shares.iter().find(|(seen, _)| *seen == normalized).cloned())
+                {
+                    return vec![insert_entity(shared, [1.0, 0.0, 0.0, 1.0], *origin, 1.0)];
+                }
+                let block = self.unique(&block_name(base));
+                let entities = self.elements(&normalized, false, copy, depth + 1);
                 self.out.blocks.push((block.clone(), entities));
+                self.shares
+                    .entry(key)
+                    .or_default()
+                    .push((normalized, block.clone()));
                 vec![insert_entity(block, [1.0, 0.0, 0.0, 1.0], *origin, 1.0)]
             }
             DgnGeom::Cell {
@@ -1511,7 +1783,12 @@ fn curve_fit_points(pts: &[P3]) -> Vec<P3> {
     }
     let mut u = vec![0.0];
     for k in 1..n {
-        u.push(u[k - 1] + dot(sub(pts[k], pts[k - 1]), sub(pts[k], pts[k - 1])).sqrt().max(1e-4));
+        u.push(
+            u[k - 1]
+                + dot(sub(pts[k], pts[k - 1]), sub(pts[k], pts[k - 1]))
+                    .sqrt()
+                    .max(1e-4),
+        );
     }
     // Each coordinate's slope at the points 2..n-3 (Akima).
     let slopes: Vec<Vec<f64>> = (0..3)
@@ -1622,6 +1899,7 @@ pub fn convert(import: &DgnImport, sub_units: bool, explode_text_nodes: bool) ->
             .collect(),
         next_number: HashMap::new(),
         in_definition: false,
+        shares: HashMap::new(),
         construction: HashMap::new(),
     };
     if !import.v7 {
@@ -1768,6 +2046,8 @@ pub struct DgnImportSettings {
     pub explode_text_nodes: bool,
     pub references: ReferenceMode,
     pub existing_reference: ExistingReference,
+    /// The V7 text code page the imports keep using (None: 1252).
+    pub code_page: Option<u16>,
 }
 
 static SETTINGS: std::sync::Mutex<Option<DgnImportSettings>> = std::sync::Mutex::new(None);
@@ -1778,8 +2058,245 @@ pub fn settings() -> DgnImportSettings {
 
 pub fn set_settings(mut settings: DgnImportSettings) {
     settings.mode = settings.mode.min(2);
+    // A test that reads the settings back owns them; other tests' apps
+    // (which apply their settings on start) wait until it is done.
+    #[cfg(test)]
+    let _owner = loop {
+        let owner = SETTINGS_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        if owner.is_none_or(|id| id == std::thread::current().id()) {
+            break owner;
+        }
+        drop(owner);
+        std::thread::yield_now();
+    };
     if let Ok(mut s) = SETTINGS.lock() {
         *s = Some(settings);
+    }
+}
+
+#[cfg(test)]
+static SETTINGS_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+/// Keeps other threads from changing the settings until dropped.
+#[cfg(test)]
+pub(crate) struct OwnSettings;
+
+#[cfg(test)]
+impl OwnSettings {
+    pub(crate) fn take() -> Self {
+        loop {
+            let mut owner = SETTINGS_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+            if owner.is_none() {
+                *owner = Some(std::thread::current().id());
+                return Self;
+            }
+            drop(owner);
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnSettings {
+    fn drop(&mut self) {
+        *SETTINGS_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The code pages a V7 file's text can be read with, as picker labels (the
+/// encodings' own names, which conventionally stay untranslated) paired with
+/// the page the parser takes. 1252 is the default.
+/// The picker rows: the label and the page the parser takes. The auto
+/// sentinel (0) detects from the file's own text runs; 1252 is the plain
+/// default.
+const CODE_PAGE_TABLE: [(&str, u16); 14] = [
+    ("Windows-1252 (Western, default)", 1252),
+    ("Windows-1250 (Central European)", 1250),
+    ("Windows-1251 (Cyrillic)", 1251),
+    ("Windows-1253 (Greek)", 1253),
+    ("Windows-1254 (Turkish)", 1254),
+    ("Windows-1255 (Hebrew)", 1255),
+    ("Windows-1256 (Arabic)", 1256),
+    ("Windows-1257 (Baltic)", 1257),
+    ("Windows-1258 (Vietnamese)", 1258),
+    ("Windows-874 (Thai)", 874),
+    ("Shift-JIS (Japanese, 932)", 932),
+    ("GBK (Simplified Chinese, 936)", 936),
+    ("Korean Wansung (949)", 949),
+    ("Big5 (Traditional Chinese, 950)", 950),
+];
+
+/// The picker's labels in order.
+pub fn code_page_choices() -> Vec<String> {
+    CODE_PAGE_TABLE
+        .iter()
+        .map(|(label, _)| label.to_string())
+        .collect()
+}
+
+/// The picker label's page; 1252 decodes as the default.
+pub fn code_page_from_label(label: &str) -> Option<Option<u16>> {
+    CODE_PAGE_TABLE
+        .iter()
+        .find(|(choice, _)| *choice == label)
+        .map(|&(_, page)| (page != 1252).then_some(page))
+}
+
+pub fn code_page_label(code_page: Option<u16>) -> String {
+    let page = code_page.unwrap_or(1252);
+    CODE_PAGE_TABLE
+        .iter()
+        .find(|(_, known)| *known == page)
+        .map_or_else(|| format!("Windows-{page}"), |(label, _)| label.to_string())
+}
+
+fn unknown_code_page(page: &str) -> DgnImportError {
+    DgnImportError::InvalidCodepage(format!(
+        "Unknown code page {page}; use another Windows page or 65001."
+    ))
+}
+
+fn parse_mapping(text: &str) -> Result<(String, Option<u16>), DgnImportError> {
+    let (mapping, page) = text
+        .split_once(';')
+        .map_or((text, ""), |(mapping, page)| (mapping, page));
+    let page = match page.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        rest => match rest.strip_prefix("codepage=").unwrap_or(rest) {
+            "1252" | "" => None,
+            page => match page
+                .parse::<u16>()
+                .ok()
+                .filter(|p| crate::scene::model::underlay_vector::code_page_supported(*p))
+            {
+                Some(page) => Some(page),
+                None => return Err(unknown_code_page(page)),
+            },
+        },
+    };
+    Ok((mapping.trim().to_string(), page))
+}
+
+/// The mapping setup token, optionally suffixed with the V7 text code page
+/// the import keeps: `Standard;codepage=1250`. The keyword is
+/// case-insensitive, like the setup name itself.
+pub fn parse_mapping_token(text: &str) -> Result<(String, Option<u16>), String> {
+    parse_mapping(text).map_err(|error| error.to_string())
+}
+
+/// The read of a file named at the -DGNIMPORT prompt: its models, checked
+/// by a read of the first; or the error to report.
+pub fn read_models_for_prompt(path: &str) -> Result<Vec<String>, String> {
+    import_models(path).map_err(|error| error.to_string())
+}
+
+/// Read the same design-model list, and apply the same first-model readability
+/// check, as the command's filename step.
+fn import_models(path: &str) -> Result<Vec<String>, DgnImportError> {
+    crate::scene::model::underlay_vector::dgn_import_models(path)
+        .filter(|models| {
+            !models.is_empty()
+                && crate::scene::model::underlay_vector::dgn_import(path, &models[0], None)
+                    .is_some()
+        })
+        .ok_or(DgnImportError::InvalidDgn)
+}
+
+fn resolve_model(
+    path: &str,
+    models: &[String],
+    requested: Option<&str>,
+) -> Result<String, DgnImportError> {
+    let requested = requested.unwrap_or("").trim();
+    let name = if requested.is_empty() {
+        models.first().map(String::as_str).unwrap_or("")
+    } else {
+        requested
+    };
+    models
+        .iter()
+        .find(|model| model.eq_ignore_ascii_case(name))
+        .cloned()
+        .ok_or_else(|| DgnImportError::ModelMissing {
+            requested: name.to_string(),
+            path: path.to_string(),
+            available_models: models.to_vec(),
+        })
+}
+
+fn conversion_units(text: &str) -> Result<bool, DgnImportError> {
+    let text = text.trim().to_ascii_uppercase();
+    match text.as_str() {
+        "" => Ok(false),
+        _ if "MASTER".starts_with(&text) => Ok(false),
+        _ if "SUB".starts_with(&text) => Ok(true),
+        _ => Err(DgnImportError::InvalidUnits),
+    }
+}
+
+fn explicit_code_page(page: u16) -> Result<Option<u16>, DgnImportError> {
+    match page {
+        0 | 1252 => Ok(None),
+        page if crate::scene::model::underlay_vector::code_page_supported(page) => Ok(Some(page)),
+        page => Err(unknown_code_page(&page.to_string())),
+    }
+}
+
+/// Finish a request from its resolved path, model and units. The interactive
+/// command passes no numeric page, retaining its mapping-token/stored-setting
+/// behavior; a semantic caller's numeric page explicitly overrides both.
+fn request_from_parts(
+    path: String,
+    model: String,
+    sub_units: bool,
+    mapping: &str,
+    numeric_code_page: Option<u16>,
+) -> Result<DgnImportRequest, DgnImportError> {
+    let (mapping, suffix_code_page) = parse_mapping(mapping)?;
+    if !mapping.is_empty() && !mapping.eq_ignore_ascii_case("Standard") {
+        return Err(DgnImportError::InvalidMapping(format!(
+            "{mapping} not found."
+        )));
+    }
+    // The rest comes from DGNIMPORTMODE and the import settings the window
+    // last kept.
+    let s = settings();
+    let code_page = match numeric_code_page {
+        Some(page) => explicit_code_page(page)?,
+        None => suffix_code_page.or(s.code_page),
+    };
+    Ok(DgnImportRequest {
+        path,
+        model,
+        sub_units,
+        explode_text_nodes: s.explode_text_nodes,
+        current_drawing: s.mode != 0,
+        prefix_duplicates: s.mode == 2,
+        references: s.references,
+        existing_reference: s.existing_reference,
+        code_page,
+    })
+}
+
+impl DgnImportRequest {
+    /// Resolve named options without constructing or replaying the positional
+    /// command. All file/model/option validation finishes before app mutation.
+    pub fn from_options(options: DgnImportOptions<'_>) -> Result<Self, DgnImportError> {
+        let path = options.path.trim().trim_matches('"').to_string();
+        if path.is_empty() {
+            return Err(DgnImportError::InvalidDgn);
+        }
+        let models = import_models(&path)?;
+        let model = resolve_model(&path, &models, options.model)?;
+        let sub_units = conversion_units(options.units.unwrap_or(""))?;
+        request_from_parts(
+            path,
+            model,
+            sub_units,
+            options.mapping.unwrap_or(""),
+            options.code_page,
+        )
     }
 }
 
@@ -1788,6 +2305,8 @@ pub fn set_settings(mut settings: DgnImportSettings) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Path,
+    /// The file named at the prompt is read off the UI thread.
+    Reading,
     Model,
     ListModels,
     Conversion,
@@ -1801,6 +2320,10 @@ pub struct DgnImportCommand {
     models: Vec<String>,
     model: String,
     sub_units: bool,
+    /// The effective V7 text code page (None: 1252), resolved at mapping.
+    code_page: Option<u16>,
+    /// The file read off the UI thread.
+    reading: Option<String>,
 }
 
 impl Default for DgnImportCommand {
@@ -1817,6 +2340,8 @@ impl DgnImportCommand {
             models: Vec::new(),
             model: String::new(),
             sub_units: false,
+            code_page: None,
+            reading: None,
         }
     }
 
@@ -1825,12 +2350,17 @@ impl DgnImportCommand {
         if path.is_empty() {
             return CmdResult::NeedPoint;
         }
-        let models = crate::scene::model::underlay_vector::dgn_import_models(&path).filter(|m| {
-            !m.is_empty()
-                && crate::scene::model::underlay_vector::dgn_import(&path, &m[0]).is_some()
-        });
-        let Some(models) = models else {
-            return CmdResult::ReportError("Invalid or unsupported DGN file.".to_string());
+        self.step = Step::Reading;
+        self.reading = Some(path.clone());
+        CmdResult::ReadDgnForImport(path)
+    }
+
+    /// The command goes on with what the read of the file named at the
+    /// prompt found: the model prompt, or the error.
+    fn take_models(&mut self, path: String, read: Result<Vec<String>, String>) -> CmdResult {
+        let models = match read {
+            Ok(models) => models,
+            Err(error) => return CmdResult::ReportError(error),
         };
         self.path = path;
         self.model = models[0].clone();
@@ -1845,18 +2375,13 @@ impl DgnImportCommand {
             self.step = Step::ListModels;
             return CmdResult::NeedPoint;
         }
-        let name = if text.is_empty() {
-            self.models[0].as_str()
-        } else {
-            text
-        };
-        match self.models.iter().find(|m| m.eq_ignore_ascii_case(name)) {
-            Some(found) => {
-                self.model = found.clone();
+        match resolve_model(&self.path, &self.models, Some(text)) {
+            Ok(model) => {
+                self.model = model;
                 self.step = Step::Conversion;
                 CmdResult::NeedPoint
             }
-            None => CmdResult::ReportError(format!("There is no {name} in {}.", self.path)),
+            Err(error) => CmdResult::ReportError(error.to_string()),
         }
     }
 
@@ -1875,39 +2400,32 @@ impl DgnImportCommand {
     }
 
     fn accept_conversion(&mut self, text: &str) -> CmdResult {
-        let t = text.trim().to_ascii_uppercase();
-        self.sub_units = match t.as_str() {
-            "" => false,
-            _ if "MASTER".starts_with(&t) => false,
-            _ if "SUB".starts_with(&t) => true,
-            _ => return CmdResult::ReportError("Invalid option keyword.".to_string()),
-        };
+        match conversion_units(text) {
+            Ok(sub_units) => self.sub_units = sub_units,
+            Err(error) => return CmdResult::ReportError(error.to_string()),
+        }
         self.step = Step::Mapping;
         CmdResult::NeedPoint
     }
 
     fn accept_mapping(&mut self, text: &str) -> CmdResult {
-        let text = text.trim();
-        if text == "?" {
+        if text.trim() == "?" {
             self.step = Step::ListMappings;
             return CmdResult::NeedPoint;
         }
-        if !text.is_empty() && !text.eq_ignore_ascii_case("Standard") {
-            return CmdResult::ReportError(format!("{text} not found."));
+        match request_from_parts(
+            self.path.clone(),
+            self.model.clone(),
+            self.sub_units,
+            text,
+            None,
+        ) {
+            Ok(request) => {
+                self.code_page = request.code_page;
+                CmdResult::DgnImport(request)
+            }
+            Err(error) => CmdResult::ReportError(error.to_string()),
         }
-        // The rest comes from DGNIMPORTMODE and the import settings the
-        // window last kept.
-        let s = settings();
-        CmdResult::DgnImport(DgnImportRequest {
-            path: self.path.clone(),
-            model: self.model.clone(),
-            sub_units: self.sub_units,
-            explode_text_nodes: s.explode_text_nodes,
-            current_drawing: s.mode != 0,
-            prefix_duplicates: s.mode == 2,
-            references: s.references,
-            existing_reference: s.existing_reference,
-        })
     }
 }
 
@@ -1919,6 +2437,7 @@ impl CadCommand for DgnImportCommand {
     fn prompt(&self) -> String {
         match self.step {
             Step::Path => "Enter filename for DGN import:".to_string(),
+            Step::Reading => "Reading the file…".to_string(),
             Step::Model => format!("Enter name of model or [?] <{}>:", self.models[0]),
             Step::ListModels => "Enter model(s) to list <*>:".to_string(),
             Step::Conversion => "Specify conversion units [Master/Sub] <Master>:".to_string(),
@@ -1937,7 +2456,7 @@ impl CadCommand for DgnImportCommand {
 
     fn input_kind(&self) -> InputKind {
         match self.step {
-            Step::Path | Step::Model => InputKind::FreeText,
+            Step::Path | Step::Reading | Step::Model => InputKind::FreeText,
             _ => InputKind::SingleToken,
         }
     }
@@ -1949,6 +2468,8 @@ impl CadCommand for DgnImportCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         Some(match self.step {
             Step::Path => self.accept_path(text),
+            // Input waits until the read ends.
+            Step::Reading => CmdResult::NeedPoint,
             Step::Model => self.accept_model(text),
             Step::ListModels => {
                 let models = self.models.clone();
@@ -1966,6 +2487,24 @@ impl CadCommand for DgnImportCommand {
         })
     }
 
+    fn waits_for_read(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    fn on_dgn_import_read(
+        &mut self,
+        path: &str,
+        read: Result<Vec<String>, String>,
+    ) -> Option<CmdResult> {
+        // `reading` is set only with the Reading step, and taken here.
+        if self.reading.as_deref() != Some(path) {
+            return None;
+        }
+        let path = self.reading.take()?;
+        self.step = Step::Path;
+        Some(self.take_models(path, read))
+    }
+
     fn on_enter(&mut self) -> CmdResult {
         match self.step {
             Step::Path => CmdResult::Cancel,
@@ -1973,3 +2512,402 @@ impl CadCommand for DgnImportCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod cell_sharing_tests {
+    use super::*;
+    use crate::scene::model::underlay_vector::{By, DgnColor, DgnElement, DgnGeom, DgnImport};
+
+    fn line(from: P3, to: P3) -> DgnElement {
+        DgnElement {
+            level: 1,
+            color: By::Own(DgnColor {
+                index: 3,
+                table: [8, 8, 8],
+                rgb: [8, 8, 8],
+            }),
+            weight: By::Own(1),
+            style: By::Own(0),
+            geom: DgnGeom::Line(from, to),
+            filled: false,
+            construction: false,
+        }
+    }
+
+    fn cell(name: &str, origin: P3, dx: f64) -> DgnElement {
+        let x = origin[0] + dx;
+        DgnElement {
+            level: 1,
+            color: By::Own(DgnColor {
+                index: 3,
+                table: [8, 8, 8],
+                rgb: [8, 8, 8],
+            }),
+            weight: By::Own(1),
+            style: By::Own(0),
+            geom: DgnGeom::CellGroup {
+                name: name.to_string(),
+                origin,
+                parts: vec![line([x + 10.0, origin[1], 0.0], [x + 40.0, origin[1], 0.0])],
+            },
+            filled: false,
+            construction: false,
+        }
+    }
+
+    fn import_with(elements: Vec<DgnElement>) -> DgnImport {
+        DgnImport {
+            elements,
+            cells: Vec::new(),
+            levels: [(1, ("Level 1".into(), None))].into(),
+            level_order: vec![1],
+            sub_per_master: 1.0,
+            unit_names: ("m".into(), "mm".into()),
+            v7: true,
+            references: Vec::new(),
+            text_styles: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Repeats of one symbol cell become one block and one insert per
+    /// placement: a survey file that carries the same cell thousands of
+    /// times must not flood the palette with renamed definitions.
+    #[test]
+    fn identical_cells_share_one_definition() {
+        let import = import_with(vec![
+            cell("4.02", [10_000.0, 0.0, 0.0], 0.0),
+            cell("4.02", [20_000.0, 5_000.0, 0.0], 0.0),
+        ]);
+        let c = convert(&import, true, false);
+        assert_eq!(c.blocks.len(), 1, "{}", c.blocks.len());
+        assert_eq!(c.blocks[0].0, "4.02");
+        // Two inserts at the two placements.
+        assert_eq!(c.entities.len(), 2, "{}", c.entities.len());
+    }
+
+    /// Different objects under one name keep their own definitions (the
+    /// second one renamed), exactly as before.
+    #[test]
+    fn differently_shaped_same_named_cells_stay_separate() {
+        let import = import_with(vec![
+            cell("4.02", [10_000.0, 0.0, 0.0], 0.0),
+            cell("4.02", [10_000.0, 0.0, 0.0], 50.0),
+        ]);
+        let c = convert(&import, true, false);
+        assert_eq!(c.blocks.len(), 2, "{}", c.blocks.len());
+        assert_eq!(c.blocks[0].0, "4.02");
+        assert_eq!(c.blocks[1].0, "4.021");
+        assert_eq!(c.entities.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod mapping_token_tests {
+    use super::parse_mapping_token;
+
+    #[test]
+    fn mapping_token_splits_the_code_page() {
+        for (text, mapping, page) in [
+            ("Standard", "Standard", None),
+            ("", "", None),
+            ("standard;codepage=1250", "standard", Some(1250)),
+            ("Standard ; CODEPAGE=1252", "Standard", None),
+            ("Standard;codepage=1251", "Standard", Some(1251)),
+            ("Standard;codepage=1257", "Standard", Some(1257)),
+            ("Standard;codepage=65001", "Standard", Some(65001)),
+            ("Standard;codepage=932", "Standard", Some(932)),
+        ] {
+            assert_eq!(
+                parse_mapping_token(text).ok(),
+                Some((mapping.to_owned(), page)),
+                "{text}"
+            );
+        }
+        for bad in [
+            "Standard;codepage=9999",
+            "Standard;page=1250",
+            "Standard;codepage=1259",
+            "Standard;codepage=931",
+            "Standard;codepage=auto",
+        ] {
+            assert!(parse_mapping_token(bad).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn units_keep_the_command_prefix_rules() {
+        for master in ["", " ", "M", "ma", "MASTER", "master"] {
+            assert_eq!(conversion_units(master), Ok(false), "{master}");
+        }
+        for sub in ["S", "su", "SUB", "sub"] {
+            assert_eq!(conversion_units(sub), Ok(true), "{sub}");
+        }
+        for invalid in ["Masters", "Subs", "unit", "1"] {
+            assert_eq!(
+                conversion_units(invalid).unwrap_err().code(),
+                "invalid_units",
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn models_default_and_resolve_case_insensitively() {
+        let models = vec!["Default".to_string(), "Site Plan".to_string()];
+        assert_eq!(
+            resolve_model("site.dgn", &models, None).ok(),
+            Some("Default".into())
+        );
+        assert_eq!(
+            resolve_model("site.dgn", &models, Some("  ")).ok(),
+            Some("Default".into())
+        );
+        assert_eq!(
+            resolve_model("site.dgn", &models, Some("site plan")).ok(),
+            Some("Site Plan".into())
+        );
+        let error = resolve_model("site.dgn", &models, Some("Missing")).unwrap_err();
+        assert_eq!(error.code(), "model_missing");
+        assert_eq!(
+            error,
+            DgnImportError::ModelMissing {
+                requested: "Missing".into(),
+                path: "site.dgn".into(),
+                available_models: models,
+            }
+        );
+    }
+
+    #[test]
+    fn numeric_code_page_overrides_suffix_and_stored_settings() {
+        let _own = OwnSettings::take();
+        let previous = settings();
+        set_settings(DgnImportSettings {
+            mode: 2,
+            explode_text_nodes: true,
+            references: ReferenceMode::Underlay,
+            existing_reference: ExistingReference::Keep,
+            code_page: Some(1251),
+        });
+        let request = request_from_parts(
+            "site.dgn".into(),
+            "Site Plan".into(),
+            true,
+            "standard",
+            None,
+        )
+        .expect("stored request settings");
+        assert_eq!(request.code_page, Some(1251));
+        assert!(request.current_drawing && request.prefix_duplicates);
+        assert!(request.explode_text_nodes && request.sub_units);
+        assert_eq!(request.references, ReferenceMode::Underlay);
+        assert_eq!(request.existing_reference, ExistingReference::Keep);
+        let suffix = request_from_parts(
+            "site.dgn".into(),
+            "Default".into(),
+            false,
+            "Standard;codepage=1250",
+            None,
+        )
+        .expect("mapping suffix code page");
+        assert_eq!(suffix.code_page, Some(1250));
+
+        for (page, expected) in [
+            (1250, Some(1250)),
+            (65001, Some(65001)),
+            (0, None),
+            (1252, None),
+        ] {
+            let request = request_from_parts(
+                "site.dgn".into(),
+                "Default".into(),
+                false,
+                "Standard;codepage=1251",
+                Some(page),
+            )
+            .expect("explicit numeric code page");
+            assert_eq!(request.code_page, expected, "page {page}");
+        }
+        let mapping =
+            request_from_parts("site.dgn".into(), "Default".into(), false, "Custom", None)
+                .unwrap_err();
+        assert_eq!(mapping.code(), "invalid_mapping");
+        for result in [
+            request_from_parts(
+                "site.dgn".into(),
+                "Default".into(),
+                false,
+                "Standard;codepage=9999",
+                None,
+            ),
+            request_from_parts(
+                "site.dgn".into(),
+                "Default".into(),
+                false,
+                "Standard",
+                Some(9999),
+            ),
+        ] {
+            assert_eq!(result.unwrap_err().code(), "invalid_codepage");
+        }
+        set_settings(previous);
+    }
+}
+
+#[cfg(test)]
+mod cell_color_tests {
+    use super::*;
+    use crate::scene::model::underlay_vector::{By, DgnColor, DgnElement, DgnGeom, DgnImport};
+
+    fn element(color: u32, geom: DgnGeom) -> DgnElement {
+        DgnElement {
+            level: 1,
+            color: By::Own(DgnColor {
+                index: color,
+                table: [8, 8, 8],
+                rgb: [8, 8, 8],
+            }),
+            weight: By::Own(1),
+            style: By::Own(0),
+            geom,
+            filled: false,
+            construction: false,
+        }
+    }
+
+    fn line(color: u32) -> DgnElement {
+        element(color, DgnGeom::Line([0.0; 3], [10.0, 10.0, 0.0]))
+    }
+
+    /// An instance of the shared cell `name`, drawn in colour 3.
+    fn place(name: &str) -> DgnElement {
+        element(
+            3,
+            DgnGeom::Cell {
+                name: name.to_string(),
+                m: [1.0, 0.0, 0.0, 1.0],
+                origin: [0.0; 3],
+                z_scale: 1.0,
+            },
+        )
+    }
+
+    /// A V7 model whose shared cells are `cells` and which places `A` once.
+    fn v7(cells: Vec<(&str, Vec<DgnElement>)>) -> DgnImport {
+        DgnImport {
+            elements: vec![place("A")],
+            cells: cells
+                .into_iter()
+                .map(|(name, elements)| (name.to_string(), elements))
+                .collect(),
+            levels: [(1, ("Level 1".into(), None))].into(),
+            level_order: vec![1],
+            sub_per_master: 1.0,
+            unit_names: ("m".into(), "mm".into()),
+            v7: true,
+            ..Default::default()
+        }
+    }
+
+    /// `f`'s result, run on its own thread, so that a conversion that never
+    /// ends fails the test instead of stopping the run.
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the conversion did not end")
+    }
+
+    /// Whether the line in the block the model's insert of `A` uses takes
+    /// its colour from the insert (the whole cell is one colour).
+    fn line_by_block(import: &DgnImport) -> bool {
+        let c = convert(import, false, false);
+        let Some(EntityType::Insert(insert)) = c.entities.first() else {
+            panic!("no insert in model space: {:?}", c.entities.len());
+        };
+        let (_, entities) = c
+            .blocks
+            .iter()
+            .find(|(name, _)| *name == insert.block_name)
+            .expect("the inserted block");
+        let line = entities
+            .iter()
+            .find_map(|e| match e {
+                EntityType::Line(line) => Some(line),
+                _ => None,
+            })
+            .expect("the cell's line");
+        line.common.color == Color::ByBlock
+    }
+
+    /// A cell that places itself is read once, not once per placement: ten
+    /// placements took about 10⁸ steps before, a hundred never ended.
+    #[test]
+    fn a_cell_that_places_itself_converts_in_bounded_time() {
+        for (n, with_line) in [(10, true), (100, false)] {
+            let mut a: Vec<DgnElement> = (0..n).map(|_| place("A")).collect();
+            if with_line {
+                a.insert(0, line(3));
+            }
+            let import = v7(vec![("A", a)]);
+            let blocks = within_ten_seconds(move || convert(&import, false, false).blocks.len());
+            assert!(blocks > 0, "n = {n}");
+        }
+    }
+
+    /// A cell's colours are read through the cells it places down to eight
+    /// levels: a second colour at the eighth makes the cell keep its own
+    /// colours, one at the ninth does not count.
+    #[test]
+    fn colours_count_through_eight_levels_of_placed_cells() {
+        let chain = |other_at: usize| {
+            let names: Vec<String> = (0..=9).map(|k| format!("C{k}")).collect();
+            let mut cells = vec![("A", vec![line(3), place("C1")])];
+            for k in 1..=9 {
+                let mut def = vec![line(if k == other_at { 5 } else { 3 })];
+                if k < 9 {
+                    def.push(place(&names[k + 1]));
+                }
+                cells.push((names[k].as_str(), def));
+            }
+            line_by_block(&v7(cells))
+        };
+        assert!(!chain(8));
+        assert!(chain(9));
+    }
+
+    /// A cell reached first by a long path and again by a short one is read
+    /// at the short one's level, so the cells it places still count.
+    #[test]
+    fn a_cell_reached_by_two_paths_counts_from_the_shorter() {
+        let names: Vec<String> = (1..=7).map(|k| format!("C{k}")).collect();
+        // A places C1 (the long way: C1 … C7, then D at level 8) and then D
+        // itself (level 1); D places E (level 2), which has the other colour.
+        let mut cells = vec![("A", vec![line(3), place("C1"), place("D")])];
+        for k in 0..7 {
+            let next = if k + 1 < 7 {
+                names[k + 1].as_str()
+            } else {
+                "D"
+            };
+            cells.push((names[k].as_str(), vec![line(3), place(next)]));
+        }
+        cells.push(("D", vec![line(3), place("E")]));
+        cells.push(("E", vec![line(5)]));
+        assert!(!line_by_block(&v7(cells)));
+    }
+}
+
+#[cfg(test)]
+#[path = "dgn_import_test_files.rs"]
+pub(crate) mod test_files;
+
+#[cfg(test)]
+#[path = "dgn_import_prepare_tests.rs"]
+mod prepare_tests;

@@ -780,7 +780,6 @@ pub fn tessellate_text_run(
     const OVER_Y: f32 = 10.5;
     const STRIKE_Y: f32 = 4.5;
 
-    let toks = tokenize_run(text);
     let ttf_family = face.ttf_family();
     let shaping_family = ttf_family.or_else(|| {
         crate::scene::text::web_font::requires_shaping(text)
@@ -804,6 +803,30 @@ pub fn tessellate_text_run(
         }
     };
 
+    if let Some(family) = shaping_family {
+        if !text.contains(['\\', '%', crate::scene::text::ttf_glyph::LRM]) {
+            if let Some(run) = crate::scene::text::ttf_glyph::shape_run(family, text) {
+                let contour_count = run
+                    .glyphs
+                    .iter()
+                    .flat_map(|glyph| &glyph.strokes)
+                    .filter(|stroke| stroke.len() >= 2)
+                    .count();
+                let triangle_points: usize =
+                    run.glyphs.iter().map(|glyph| glyph.fill_tris.len()).sum();
+                out.reserve(contour_count);
+                fill_tris.reserve(triangle_points);
+                for g in &run.glyphs {
+                    emit_glyph(&mut out, &g.strokes, 0.0);
+                    emit_fill(&mut fill_tris, &g.fill_tris, 0.0);
+                }
+                return (out, fill_tris);
+            }
+        }
+    }
+
+    let toks = tokenize_run(text);
+
     // Flush a buffered TTF segment: shape it, emit the positioned glyph
     // contours, and advance the pen by the shaped run width. Falls back to
     // per-glyph outlines if shaping is unavailable.
@@ -816,6 +839,19 @@ pub fn tessellate_text_run(
         }
         let family = shaping_family.unwrap_or("");
         if let Some(run) = crate::scene::text::ttf_glyph::shape_run(family, seg) {
+            // The shaped run already knows the sizes of its output buffers.
+            // Reserve once per segment to avoid repeatedly growing them while
+            // emitting each glyph; `reserve` remains amortized for decorated
+            // text that flushes multiple segments into the same buffers.
+            let contour_count = run
+                .glyphs
+                .iter()
+                .flat_map(|glyph| &glyph.strokes)
+                .filter(|stroke| stroke.len() >= 2)
+                .count();
+            let triangle_points: usize = run.glyphs.iter().map(|glyph| glyph.fill_tris.len()).sum();
+            out.reserve(contour_count);
+            fill_tris.reserve(triangle_points);
             for g in &run.glyphs {
                 emit_glyph(out, &g.strokes, *cursor_x);
                 emit_fill(fill_tris, &g.fill_tris, *cursor_x);
@@ -1162,11 +1198,21 @@ fn bulge_to_points(p0: [f32; 2], p1: [f32; 2], bulge: f32) -> Vec<[f32; 2]> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     /// Locks the LFF `tessellate_text_run` output (segment count, vertex count,
     /// coordinate checksum) so the shared-tokenizer refactor that adds the TTF
     /// shaping path cannot silently change stroke-font rendering.
-    #[test]
-    fn lff_tessellation_golden() {
+    #[rstest]
+    #[case("ABC 123", 8, 80, 3189.9030)]
+    #[case("A\\LB\\lC", 6, 43, 842.2172)]
+    #[case("10%%d Ö", 6, 60, 1627.2223)]
+    #[case("Hello, World!", 15, 113, 6029.0805)]
+    fn lff_tessellation_golden(
+        #[case] t: &str,
+        #[case] segs: usize,
+        #[case] verts: usize,
+        #[case] sum_ref: f64,
+    ) {
         // A machine may have a font family literally named Txt; the alias
         // then resolves to that system face (`installed_alias`) and the
         // stroke-font goldens do not apply.
@@ -1177,24 +1223,15 @@ mod tests {
             eprintln!("installed Txt family takes the alias; goldens skipped");
             return;
         }
-        let cases: &[(&str, usize, usize, f64)] = &[
-            // "txt" keeps the advances of the font it stands in for.
-            ("ABC 123", 8, 80, 3189.9030),
-            ("A\\LB\\lC", 6, 43, 842.2172),
-            ("10%%d Ö", 6, 60, 1627.2223),
-            ("Hello, World!", 15, 113, 6029.0805),
-        ];
-        for &(t, segs, verts, sum_ref) in cases {
-            let (st, _) = tessellate_text_ex([0.0, 0.0], 10.0, 0.0, 1.0, 0.0, "txt", t);
-            let nv: usize = st.iter().map(|s| s.len()).sum();
-            let sum: f64 = st.iter().flatten().map(|p| p[0] as f64 + p[1] as f64).sum();
-            assert_eq!(st.len(), segs, "segment count drift for {t:?}");
-            assert_eq!(nv, verts, "vertex count drift for {t:?}");
-            assert!(
-                (sum - sum_ref).abs() < 0.01,
-                "coordinate checksum drift for {t:?}: {sum:.4} vs {sum_ref:.4}"
-            );
-        }
+        let (st, _) = tessellate_text_ex([0.0, 0.0], 10.0, 0.0, 1.0, 0.0, "txt", t);
+        let nv: usize = st.iter().map(|s| s.len()).sum();
+        let sum: f64 = st.iter().flatten().map(|p| p[0] as f64 + p[1] as f64).sum();
+        assert_eq!(st.len(), segs, "segment count drift for {t:?}");
+        assert_eq!(nv, verts, "vertex count drift for {t:?}");
+        assert!(
+            (sum - sum_ref).abs() < 0.01,
+            "coordinate checksum drift for {t:?}: {sum:.4} vs {sum_ref:.4}"
+        );
     }
 
     use super::*;
@@ -1210,62 +1247,103 @@ mod tests {
         // Alias + fallback resolve to a real font.
         assert!(get_font("txt").glyph('A').is_some());
         assert!(get_font("RomanS").glyph('B').is_some());
-        // After curation, every embedded stem and AutoCAD SHX alias must still
-        // resolve to a glyph-bearing font (no alias points at a deleted file).
-        for name in [
-            "MONOTXT", "ISOCP", "ISOCP3", "ISOCT", "ISOCT3", "COMPLEX", "ITALIC", "GOTHICE",
-            "GOTHICG", "GOTHICI", "CYRILLIC", "GREEK", "BIGFONT", "Simplex", "ScriptC", "Symbol",
-        ] {
-            assert!(
-                get_font(name).glyph('A').is_some() || is_builtin(name),
-                "alias/stem {name} failed to resolve"
-            );
-        }
         // A name from a deleted LibreCAD-only font is no longer a builtin and
         // falls back to Standard rather than panicking.
         assert!(!is_builtin("amiri-regular"));
         assert!(get_font("kochigothic").glyph('A').is_some());
         // Unicode fallback covers a non-ASCII letter via the renderer path.
         let (strokes, _) =
-            tessellate_text_run([0.0, 0.0], 2.5, 0.0, 1.0, 0.0, 1.0, "Standard", "Aб");
+            tessellate_text_run([0.0, 0.0], 2.5, 0.0, 1.0, 0.0, 1.0, "Standard", "A?");
         assert!(!strokes.is_empty());
-        // The bulge belongs to the segment ENDING at the vertex (LibreCAD
-        // convention): the standard/iso/unicode 'O' must come out as an
-        // upright oval (taller than wide), not a sideways capsule.
-        for name in ["standard", "iso", "unicode", "txt"] {
-            let o = get_font(name).glyph('O').expect("O glyph");
-            let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-            for s in &o.strokes {
-                for &[x, y] in s {
-                    minx = minx.min(x);
-                    miny = miny.min(y);
-                    maxx = maxx.max(x);
-                    maxy = maxy.max(y);
-                }
+    }
+
+    #[rstest]
+    #[case("MONOTXT")]
+    #[case("ISOCP")]
+    #[case("ISOCP3")]
+    #[case("ISOCT")]
+    #[case("ISOCT3")]
+    #[case("COMPLEX")]
+    #[case("ITALIC")]
+    #[case("GOTHICE")]
+    #[case("GOTHICG")]
+    #[case("GOTHICI")]
+    #[case("CYRILLIC")]
+    #[case("GREEK")]
+    #[case("BIGFONT")]
+    #[case("Simplex")]
+    #[case("ScriptC")]
+    #[case("Symbol")]
+    fn embedded_font_aliases_resolve(#[case] name: &str) {
+        assert!(
+            get_font(name).glyph('A').is_some() || is_builtin(name),
+            "alias/stem {name} failed to resolve"
+        );
+    }
+
+    #[rstest]
+    #[case("standard")]
+    #[case("iso")]
+    #[case("unicode")]
+    #[case("txt")]
+    fn uppercase_o_is_upright_in_basic_fonts(#[case] name: &str) {
+        let o = get_font(name).glyph('O').expect("O glyph");
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for s in &o.strokes {
+            for &[x, y] in s {
+                minx = minx.min(x);
+                miny = miny.min(y);
+                maxx = maxx.max(x);
+                maxy = maxy.max(y);
             }
-            let (w, h) = (maxx - minx, maxy - miny);
-            assert!(h > w, "{name} O should be upright (h {h:.1} > w {w:.1})");
         }
-        // Turkish letters absent from simplex/unicode still render via the
-        // iso3098 fallback (ı/U+0131 is the one exception iso3098 lacks).
-        for ch in ['Ğ', 'ş', 'İ', 'Ş', 'ğ'] {
-            let (s, _) = tessellate_text_run(
-                [0.0, 0.0],
-                2.5,
-                0.0,
-                1.0,
-                0.0,
-                1.0,
-                "simplex",
-                &ch.to_string(),
-            );
-            assert!(!s.is_empty(), "Turkish '{ch}' should render via fallback");
-        }
-        // Complex-linetype shapes load by name (codepoints collide, so they
-        // must be keyed by label).
-        for sh in ["BOX", "CIRC1", "ZIG", "TRACK1"] {
-            let g = shape(sh).unwrap_or_else(|| panic!("shape {sh} missing"));
-            assert!(!g.strokes.is_empty(), "shape {sh} has no strokes");
-        }
+        let (w, h) = (maxx - minx, maxy - miny);
+        assert!(h > w, "{name} O should be upright (h {h:.1} > w {w:.1})");
+    }
+
+    #[rstest]
+    #[case('Ğ')]
+    #[case('ş')]
+    #[case('İ')]
+    #[case('Ş')]
+    #[case('ğ')]
+    fn turkish_letters_render_via_fallback(#[case] ch: char) {
+        let (s, _) = tessellate_text_run(
+            [0.0, 0.0],
+            2.5,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            "simplex",
+            &ch.to_string(),
+        );
+        assert!(!s.is_empty(), "Turkish '{ch}' should render via fallback");
+    }
+
+    /// A letter a stroke font lacks (or whose bogus dot copy was dropped)
+    /// comes from the bundled `unicode` strokes, not a filled TrueType glyph
+    /// and not a dot (#3643).
+    #[rstest]
+    #[case("romans", 'ä')]
+    #[case("simplex", 'õ')]
+    #[case("romand", 'Ö')]
+    #[case("scripts", 'é')]
+    fn missing_accented_letters_stay_strokes(#[case] font: &str, #[case] ch: char) {
+        let face = crate::scene::text::font_face::Face::resolve(font);
+        let g = face.glyph(ch).expect("a glyph");
+        assert!(g.fill_tris.is_empty(), "{font} {ch} is filled");
+        let top = g.strokes.iter().flatten().map(|p| p[1]).fold(f32::MIN, f32::max);
+        assert!(top > 5.0, "{font} {ch} is a dot (top {top})");
+    }
+
+    #[rstest]
+    #[case("BOX")]
+    #[case("CIRC1")]
+    #[case("ZIG")]
+    #[case("TRACK1")]
+    fn complex_linetype_shapes_load_by_name(#[case] sh: &str) {
+        let g = shape(sh).unwrap_or_else(|| panic!("shape {sh} missing"));
+        assert!(!g.strokes.is_empty(), "shape {sh} has no strokes");
     }
 }

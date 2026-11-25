@@ -1,6 +1,6 @@
 use super::*;
 use crate::scene::block_actions::{self as actions, instance::ParameterFrame, Parameter, Value};
-use codec::types::Transform;
+use document::types::Transform;
 use glam::DVec3;
 
 pub const START: usize = crate::scene::pick::grip::CUSTOM_GRIP_ID_START;
@@ -130,16 +130,21 @@ pub struct Input {
 
 #[derive(Default)]
 pub struct Limits {
-    distance: Option<codec::objects::BlockParameterValueSet>,
-    angle: Option<codec::objects::BlockParameterValueSet>,
-    x: Option<codec::objects::BlockParameterValueSet>,
-    y: Option<codec::objects::BlockParameterValueSet>,
+    distance: Option<document::objects::BlockParameterValueSet>,
+    angle: Option<document::objects::BlockParameterValueSet>,
+    x: Option<document::objects::BlockParameterValueSet>,
+    y: Option<document::objects::BlockParameterValueSet>,
+    /// Definition end minus base: the side each XY distance is measured toward.
+    xy_sense: DVec3,
     table: Vec<f64>,
 }
 
 impl Limits {
     pub fn read(doc: &Document, definition: Handle, p: &Parameter) -> Self {
-        let mut limits = Self::default();
+        let mut limits = Self {
+            xy_sense: p.end - p.base,
+            ..Self::default()
+        };
         if let Some(ObjectType::DynamicBlock(object)) = doc.objects.get(&p.handle) {
             match &object.data {
                 DynamicBlockData::LinearParameter(p) => limits.distance = Some(p.value_set.clone()),
@@ -176,12 +181,20 @@ impl Limits {
     }
 
     fn delta(&self, delta: DVec3) -> DVec3 {
-        let scalar = |value, set: &Option<codec::objects::BlockParameterValueSet>| {
+        let scalar = |value, set: &Option<document::objects::BlockParameterValueSet>| {
             set.as_ref()
                 .map_or(value, |set| actions::constrain_value_set(value, set))
         };
         if self.x.is_some() || self.y.is_some() {
-            return DVec3::new(scalar(delta.x, &self.x), scalar(delta.y, &self.y), delta.z);
+            let xy = |value, sense, set: &Option<document::objects::BlockParameterValueSet>| {
+                set.as_ref()
+                    .map_or(value, |set| actions::constrain_xy_distance(value, sense, set))
+            };
+            return DVec3::new(
+                xy(delta.x, self.xy_sense.x, &self.x),
+                xy(delta.y, self.xy_sense.y, &self.y),
+                delta.z,
+            );
         }
         let mut length = scalar(delta.length(), &self.distance);
         if let Some(nearest) = self.table.iter().copied().min_by(|a, b| {
@@ -396,7 +409,7 @@ mod tests {
 
     #[test]
     fn block_runtime_xy_corner_constraints_keep_the_opposite_corner_fixed() {
-        let set = codec::objects::BlockParameterValueSet {
+        let set = document::objects::BlockParameterValueSet {
             flags: 8,
             values: vec![5., 10., 15.],
             ..Default::default()

@@ -38,8 +38,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::entities::{Circle, EntityType, Line};
-use codec::types::{Color, Handle, LineWeight, Vector3};
+use document::entities::{Circle, EntityType, Line};
+use document::types::{Color, Handle, LineWeight, Vector3};
 use OpenCADStudio::scene::model::object::PropSection;
 use OpenCADStudio::scene::view::dispatch;
 use OpenCADStudio::scene::Scene;
@@ -79,10 +79,17 @@ fn line_entity(i: usize, identical: bool) -> EntityType {
     let common = entity.common_mut();
     common.layer = LAYERS[if identical { 1 } else { i % LAYERS.len() }].to_string();
     common.color = COLORS[if identical { 0 } else { i % COLORS.len() }];
-    common.linetype =
-        LINETYPES[if identical { 0 } else { (i / 3) % LINETYPES.len() }].to_string();
-    common.line_weight =
-        LINEWEIGHTS[if identical { 0 } else { (i / 5) % LINEWEIGHTS.len() }];
+    common.linetype = LINETYPES[if identical {
+        0
+    } else {
+        (i / 3) % LINETYPES.len()
+    }]
+    .to_string();
+    common.line_weight = LINEWEIGHTS[if identical {
+        0
+    } else {
+        (i / 5) % LINEWEIGHTS.len()
+    }];
     entity
 }
 
@@ -149,7 +156,12 @@ fn run_scenario(label: &str, n: usize, identical: bool) {
     // borrowed straight out of `scene.document`; this mirrors that list.
     let selected: Vec<(Handle, &EntityType)> = handles
         .iter()
-        .map(|&handle| (handle, scene.document.get_entity(handle).expect("committed entity")))
+        .map(|&handle| {
+            (
+                handle,
+                scene.document.get_entity(handle).expect("committed entity"),
+            )
+        })
         .collect();
 
     let mut rows_acc = 0u64;

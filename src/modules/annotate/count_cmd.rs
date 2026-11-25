@@ -12,8 +12,8 @@
 // area being `C` (current area, which counts all of model space), `E`
 // (entire model space), `R x,y x,y`, `P x,y x,y …` or `O <handle>`.
 
-use codec::types::Handle;
-use codec::EntityType;
+use document::types::Handle;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -178,7 +178,7 @@ impl CadCommand for CountCommand {
 
     fn on_entity_pick(&mut self, handle: Handle, _pt: DVec3) -> CmdResult {
         match self.picked.take() {
-            Some(EntityType::LwPolyline(pl)) if codec::count::valid_boundary(&pl) => {
+            Some(EntityType::LwPolyline(pl)) if document::count::valid_boundary(&pl) => {
                 self.area_done(format!("O {:X}", handle.value()))
             }
             _ => CmdResult::CancelWithMessage(
@@ -454,6 +454,12 @@ impl CadCommand for CountTableCommand {
 /// evaluated again.
 pub struct UpdateFieldCommand {
     selected: Vec<Handle>,
+}
+
+impl Default for UpdateFieldCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UpdateFieldCommand {

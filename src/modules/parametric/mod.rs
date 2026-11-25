@@ -99,43 +99,23 @@ impl CadModule for ParametricModule {
                         RibbonItem::LabeledDropdown {
                             id: "GCVISIBILITY",
                             label: "Show/Hide",
-                            icon: IconKind::Svg(include_bytes!(
-                                "../../../assets/icons/constrain/show.svg"
-                            )),
+                            icon: IconKind::Svg(crate::ui::icons::EYE),
                             items: vec![
-                                (
-                                    "GCSHOW",
-                                    "Show",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/constrain/show.svg"
-                                    )),
-                                ),
-                                (
-                                    "GCHIDE",
-                                    "Hide",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/constrain/hide_all.svg"
-                                    )),
-                                ),
-                                (
-                                    "GCRESET",
-                                    "Reset",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/constrain/show.svg"
-                                    )),
-                                ),
+                                ("GCSHOW", "Show", IconKind::Svg(crate::ui::icons::EYE)),
+                                ("GCHIDE", "Hide", IconKind::Svg(crate::ui::icons::EYE_OFF)),
+                                ("GCRESET", "Reset", IconKind::Svg(crate::ui::icons::EYE)),
                             ],
                             default: "GCSHOW",
                         },
                         RibbonItem::LabeledTool(command(
                             "GCSHOWALL",
                             "Show All",
-                            include_bytes!("../../../assets/icons/constrain/show_all.svg"),
+                            crate::ui::icons::EYE_ALL,
                         )),
                         RibbonItem::LabeledTool(command(
                             "GCHIDEALL",
                             "Hide All",
-                            include_bytes!("../../../assets/icons/constrain/hide_all.svg"),
+                            crate::ui::icons::EYE_OFF,
                         )),
                     ],
                 },
@@ -168,36 +148,22 @@ impl CadModule for ParametricModule {
                         RibbonItem::LabeledDropdown {
                             id: "DCVISIBILITY",
                             label: "Show/Hide",
-                            icon: IconKind::Svg(include_bytes!(
-                                "../../../assets/icons/constrain/show.svg"
-                            )),
+                            icon: IconKind::Svg(crate::ui::icons::EYE),
                             items: vec![
-                                (
-                                    "DCSHOW",
-                                    "Show",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/constrain/show.svg"
-                                    )),
-                                ),
-                                (
-                                    "DCHIDE",
-                                    "Hide",
-                                    IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/constrain/hide_all.svg"
-                                    )),
-                                ),
+                                ("DCSHOW", "Show", IconKind::Svg(crate::ui::icons::EYE)),
+                                ("DCHIDE", "Hide", IconKind::Svg(crate::ui::icons::EYE_OFF)),
                             ],
                             default: "DCSHOW",
                         },
                         RibbonItem::LabeledTool(command(
                             "DCSHOWALL",
                             "Show All",
-                            include_bytes!("../../../assets/icons/constrain/show_all.svg"),
+                            crate::ui::icons::EYE_ALL,
                         )),
                         RibbonItem::LabeledTool(command(
                             "DCHIDEALL",
                             "Hide All",
-                            include_bytes!("../../../assets/icons/constrain/hide_all.svg"),
+                            crate::ui::icons::EYE_OFF,
                         )),
                     ],
                 },
@@ -213,6 +179,12 @@ impl CadModule for ParametricModule {
                             "PARAMETERS",
                             "Parameters Manager",
                             include_bytes!("../../../assets/icons/constrain/parameters.svg"),
+                        )),
+                        // The visibility states of a BricsCAD parametric block.
+                        RibbonItem::LargeTool(command(
+                            "VISIBILITYSTATESPANELOPEN",
+                            "Visibility States",
+                            crate::ui::icons::EYE,
                         )),
                     ],
                 },
@@ -312,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             groups[2].tools.iter().map(item_id).collect::<Vec<_>>(),
-            ["DELCONSTRAINT", "PARAMETERS"]
+            ["DELCONSTRAINT", "PARAMETERS", "VISIBILITYSTATESPANELOPEN"]
         );
 
         let RibbonItem::LargeDropdown { items, default, .. } = &groups[1].tools[0] else {

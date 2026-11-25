@@ -37,7 +37,7 @@ struct InstanceIn {
 }
 
 struct VertexOut {
-    @builtin(position) clip_pos:       vec4<f32>,
+    @invariant @builtin(position) clip_pos:       vec4<f32>,
     @location(0)       local_pos:      vec2<f32>,
     @location(1)       semi_axes:      vec2<f32>,
     @location(2)       hw_px:          f32,
@@ -48,6 +48,7 @@ struct VertexOut {
     @location(7) @interpolate(flat) min_elem:    f32,
     @location(8) @interpolate(flat) start_param: f32,
     @location(9) @interpolate(flat) end_param:   f32,
+    @location(10) clip_xyw:      vec3<f32>,
 }
 
 // The selection pass widens highlighted lines by `highlight_widen` pixels;
@@ -107,6 +108,8 @@ fn resolve_hw_base(px_hw: f32) -> f32 {
 
     var out: VertexOut;
     out.clip_pos = clip_pos;
+    // Divided per fragment: WebGL2 has no noperspective interpolation (#3543).
+    out.clip_xyw = vec3<f32>(clip_pos.xy, clip_pos.w);
     out.local_pos = vec2<f32>(u_val * ext_u, v_val * ext_v);
     out.semi_axes = vec2<f32>(a, b);
     out.hw_px = hw_px;
@@ -214,8 +217,18 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
     return false;
 }
 
+// Physical pixels per logical pixel at this fragment. Lineweights are in
+// logical pixels (`u.viewport_size`, as the wire shader extrudes lines), but
+// the coverage below measures distance in framebuffer pixels; on a scaled
+// display (200 %) an arc would otherwise come out half as wide as a line.
+fn physical_per_logical(ndc: vec2<f32>) -> f32 {
+    let step = abs(dpdx(ndc.x)) * u.viewport_size.x;
+    return select(1.0, 2.0 / step, step > 1e-6);
+}
+
 @fragment fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let ab = in.semi_axes;
+    let px_scale = physical_per_logical(in.clip_xyw.xy / in.clip_xyw.z);
     let res = closest_point_ellipse(in.local_pos, ab);
     let q = res.q;
     let t = res.t;
@@ -261,7 +274,7 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>) -> bool {
     let fw = max(select(u.world_per_pixel, fw_len, fw_len > 1e-6), 1e-6);
 
     let d_px = d_world / fw;
-    let alpha_cov = clamp(0.5 + in.hw_px - d_px, 0.0, 1.0);
+    let alpha_cov = clamp(0.5 + in.hw_px * px_scale - d_px, 0.0, 1.0);
     if alpha_cov <= 0.0 {
         discard;
     }

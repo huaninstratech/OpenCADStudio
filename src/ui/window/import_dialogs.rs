@@ -4,18 +4,32 @@
 //! Import (the objects of a .3ds file to bring in, their layers and what a
 //! mesh with several materials becomes).
 
-use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Space};
+use iced::widget::{
+    Space, button, column, container, image, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Background, Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
 use crate::t;
 use crate::ui::style::common::muted_style;
 use crate::ui::style::form::{button_style, dialog_button, dialog_button_styled_opt, field_style};
-use crate::ui::window::pdf_dialogs::{card, well_style, PageThumb};
+use crate::ui::window::pdf_dialogs::{PageThumb, card, well_style};
+
+/// Which read of an import window (3D Studio Import, DGN Import, Import
+/// PDF) a result belongs to: its number, and whether its window was open
+/// when it started (Change… or Browse). The window takes only the result of
+/// its newest read, and a read started from the window only while the
+/// window is still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadTicket {
+    pub id: u64,
+    pub from_window: bool,
+}
 
 /// One edit in the Import File or DGN Import window.
 #[derive(Debug, Clone)]
 pub enum ImportDialogMsg {
+    IfcPlan(super::ifc_plan::IfcPlanMsg),
     // Import File
     Path(String),
     Browse,
@@ -34,6 +48,8 @@ pub enum ImportDialogMsg {
     DgnPrefix(bool),
     DgnSub(bool),
     DgnExplode(bool),
+    /// V7 text decode page chosen by label from the code-page picker.
+    DgnCodePage(String),
     DgnReferences(crate::modules::insert::dgn_import::ReferenceMode),
     DgnExisting(crate::modules::insert::dgn_import::ExistingReference),
     DgnMappingTab(usize),
@@ -57,7 +73,108 @@ pub enum ImportDialogMsg {
     TdsMatPick(usize),
     TdsMatRemember(bool),
     TdsMatApply,
+    /// A 3D Studio file read off the UI thread for the 3D Studio Import
+    /// window: the read's ticket, the file, and its model (none when it is
+    /// no 3D Studio file).
+    TdsRead(
+        ReadTicket,
+        String,
+        Option<std::sync::Arc<crate::io::tds_import::TdsScene>>,
+    ),
+    /// A 3D Studio import converted off the UI thread: the tab it was
+    /// started for, that document's generation, the import's choices, the
+    /// file's model, and the conversion.
+    TdsConverted(
+        u64,
+        u64,
+        Box<crate::modules::insert::tds_import::TdsImportRequest>,
+        std::sync::Arc<crate::io::tds_import::TdsScene>,
+        Box<crate::io::tds_import::TdsImport>,
+    ),
+    /// A file read off the UI thread for the DGN Import window: the read's
+    /// ticket, the file, what was read (none when it is no DGN model), and
+    /// where the read started (which says where an error goes).
+    DgnRead(
+        ReadTicket,
+        String,
+        Option<std::sync::Arc<DgnWindowRead>>,
+        DgnReadFrom,
+    ),
+    /// IMPORT with FILEDIA off: whether the file is a DGN model, checked off
+    /// the UI thread; the error to show when it is not.
+    DgnChecked(String, bool, String),
+    /// The file named at the -DGNIMPORT prompt, read off the UI thread: the
+    /// tab of the command, the file, and its models or the error.
+    DgnPromptRead(u64, String, Result<Vec<String>, String>),
+    /// A model read off the UI thread again after the window chose a model
+    /// or a code page: the file, the model, the code page and the model
+    /// (none when it cannot be read).
+    DgnDecoded(
+        String,
+        String,
+        Option<u16>,
+        Option<std::sync::Arc<crate::scene::model::underlay_vector::DgnImport>>,
+    ),
+    /// The automation `dgn_import` operation's read off the UI thread: the
+    /// tab it was started for, that document's generation, and the request
+    /// with its prepared import, or why it failed.
+    DgnOpPrepared(
+        u64,
+        u64,
+        Box<
+            Result<
+                (
+                    crate::modules::insert::dgn_import::DgnImportRequest,
+                    crate::modules::insert::dgn_import::PreparedImport,
+                ),
+                crate::modules::insert::dgn_import::DgnImportError,
+            >,
+        >,
+    ),
+    /// A DGN import read and converted off the UI thread: the tab it was
+    /// started for, that document's generation, the import's choices, and
+    /// what was read.
+    DgnPrepared(
+        u64,
+        u64,
+        Box<crate::modules::insert::dgn_import::DgnImportRequest>,
+        Box<
+            Result<
+                crate::modules::insert::dgn_import::PreparedImport,
+                crate::modules::insert::dgn_import::DgnImportError,
+            >,
+        >,
+    ),
     Help(&'static str),
+}
+
+/// Where a read for the DGN Import window started, and thus where its
+/// error goes when the file is no DGN model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DgnReadFrom {
+    /// DGNIMPORT or "Change…": the command line says the file is invalid.
+    DgnImport,
+    /// IMPORT on the command line or from a script: this error on the
+    /// command line.
+    Import(String),
+    /// OK in the Import File window: this error in that window.
+    ImportFileWindow(String),
+}
+
+/// What the DGN Import window shows of a file, read off the UI thread:
+/// the design models, the first model, and a thumbnail of each model.
+pub struct DgnWindowRead {
+    pub models: Vec<String>,
+    pub import: crate::scene::model::underlay_vector::DgnImport,
+    pub thumbs: Vec<PageThumb>,
+}
+
+impl std::fmt::Debug for DgnWindowRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DgnWindowRead")
+            .field("models", &self.models)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The colour of a format that is read in part or only written.
@@ -102,7 +219,7 @@ const fn format(
 }
 
 /// The reference's Import File types, in its order of groups.
-pub const FORMATS: [ImportFormat; 22] = [
+pub const FORMATS: [ImportFormat; 23] = [
     format("PDF Files", "*.pdf", &["pdf"], 0, Support::Yes),
     format("MicroStation DGN", "*.dgn", &["dgn"], 0, Support::Yes),
     format("All DGN Files", "*.*", &["*"], 0, Support::Yes),
@@ -154,6 +271,7 @@ pub const FORMATS: [ImportFormat; 22] = [
         1,
         Support::Yes,
     ),
+    format("IFC (*.ifc)", "*.ifc", &["ifc"], 2, Support::Yes),
     format("All Files", "*.*", &["*"], 2, Support::ByExtension),
 ];
 
@@ -174,6 +292,10 @@ pub struct DgnImportState {
     pub prefix_duplicates: bool,
     pub sub_units: bool,
     pub explode_text_nodes: bool,
+    /// V7 files only: the Windows code page the file's single-byte text
+    /// decodes from (e.g. 1250 for Czech/Slovak MicroStation). `None` is the
+    /// default Windows-1252.
+    pub code_page: Option<u16>,
     pub references: crate::modules::insert::dgn_import::ReferenceMode,
     pub existing_reference: crate::modules::insert::dgn_import::ExistingReference,
     /// Master and sub unit names.
@@ -199,6 +321,8 @@ pub struct TdsImportState {
     pub layers: usize,
     /// 0 always ask, 1 split by material, 2 first material, 3 no material.
     pub multi: usize,
+    /// The file's model, read once when the window opened.
+    pub scene: std::sync::Arc<crate::io::tds_import::TdsScene>,
 }
 
 /// A 3D Studio import set to ask: the meshes with several materials still to
@@ -219,11 +343,15 @@ pub struct TdsMaterialState {
     pub list_open: bool,
     /// The choice answers the remaining meshes too.
     pub remember: bool,
+    /// The file's model, read once when the 3D Studio Import window opened.
+    pub scene: std::sync::Arc<crate::io::tds_import::TdsScene>,
 }
 
 /// The windows' working copies and the files imported this session.
 #[derive(Default)]
 pub struct ImportDialogs {
+    pub(crate) ifc_plan: Option<super::ifc_plan::IfcPlanDialog>,
+    pub(crate) previous_ifc_plan: Option<super::ifc_plan::PreviousIfcPlan>,
     pub file: Option<ImportFileState>,
     pub dgn: Option<DgnImportState>,
     pub tds: Option<TdsImportState>,
@@ -258,7 +386,7 @@ fn badge<'a>(support: Support) -> Element<'a, Message> {
     };
     let color = move |theme: &Theme| match tone {
         0 => theme.palette().success.base.color,
-        _ => theme.palette().background.base.text.scale_alpha(0.55),
+        _ => crate::ui::style::readable::muted_text(theme),
     };
     container(
         text(label)
@@ -368,21 +496,23 @@ pub fn view_import_file<'a>(
             msg(ImportDialogMsg::Recent(n)),
         ));
     }
-    let mut file = column![row![
-        text_input("", &state.path)
-            .on_input(|s| msg(ImportDialogMsg::Path(s)))
-            .on_submit(msg(ImportDialogMsg::ImportOk))
-            .size(12)
-            .padding([6, 8])
-            .width(Fill)
-            .style(field_style),
-        button(text(t!("Browse...")).size(11))
-            .on_press(msg(ImportDialogMsg::Browse))
-            .style(button_style(false))
-            .padding([6, 14]),
+    let mut file = column![
+        row![
+            text_input("", &state.path)
+                .on_input(|s| msg(ImportDialogMsg::Path(s)))
+                .on_submit(msg(ImportDialogMsg::ImportOk))
+                .size(12)
+                .padding([6, 8])
+                .width(Fill)
+                .style(field_style),
+            button(text(t!("Browse...")).size(11))
+                .on_press(msg(ImportDialogMsg::Browse))
+                .style(button_style(false))
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center)
     ]
-    .spacing(8)
-    .align_y(iced::Center)]
     .spacing(8);
     if !recent.is_empty() {
         file = file.push(chips);
@@ -795,13 +925,15 @@ pub fn view_tds_material<'a>(
         },
         ..Default::default()
     });
-    let mut chips = row![text(crate::tr!(
-        "import-3ds",
-        "materials",
-        n = (materials.len() as i64)
-    ))
-    .size(11)
-    .style(muted_style)]
+    let mut chips = row![
+        text(crate::tr!(
+            "import-3ds",
+            "materials",
+            n = (materials.len() as i64)
+        ))
+        .size(11)
+        .style(muted_style)
+    ]
     .spacing(6)
     .align_y(iced::Center);
     for (material, color) in materials {
@@ -877,7 +1009,7 @@ pub fn view_tds_material<'a>(
             list = list.push(
                 button(head_label(k.checked_sub(1).and_then(|j| materials.get(j))))
                     .on_press(msg(ImportDialogMsg::TdsMatPick(k)))
-                    .style(crate::ui::color_select::list_row_style)
+                    .style(crate::ui::kit::dropdown_row_style)
                     .padding([4, 8])
                     .width(Fill),
             );
@@ -885,7 +1017,7 @@ pub fn view_tds_material<'a>(
         iced_aw::DropDown::new(
             head,
             container(list)
-                .style(crate::ui::color_select::popup_panel_style)
+                .style(crate::ui::kit::menu::frame_style)
                 .padding(2),
             true,
         )
@@ -969,12 +1101,11 @@ pub fn view_tds_material<'a>(
 
 /// The round amber warning mark the warning windows lead with.
 pub(crate) fn warning_badge<'a>() -> Element<'a, Message> {
-    container(
-        iced::widget::svg(crate::ui::icons::themed_handle(crate::ui::icons::WARNING))
-            .width(18.0)
-            .height(18.0)
-            .style(|_: &Theme, _| iced::widget::svg::Style { color: Some(AMBER) }),
-    )
+    container(crate::ui::icons::tinted(
+        crate::ui::icons::WARNING,
+        18.0,
+        |_: &Theme| AMBER,
+    ))
     .width(34)
     .height(34)
     .center_x(34)
@@ -992,7 +1123,10 @@ pub(crate) fn warning_badge<'a>() -> Element<'a, Message> {
 
 /// A texture map a 3D Studio import did not find: the file and the material
 /// that comes in without it.
-pub fn view_tds_map<'a>(map: &'a (String, String), sizing: crate::ui::modal::ModalSizing) -> Element<'a, Message> {
+pub fn view_tds_map<'a>(
+    map: &'a (String, String),
+    sizing: crate::ui::modal::ModalSizing,
+) -> Element<'a, Message> {
     let (file, material) = map;
     let badge = warning_badge();
     let chip = container(
@@ -1017,14 +1151,20 @@ pub fn view_tds_map<'a>(map: &'a (String, String), sizing: crate::ui::modal::Mod
         row![
             badge,
             column![
-                text(crate::tr!("import-3ds-map", "heading")).size(13).font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::DEFAULT
-                }),
+                text(crate::tr!("import-3ds-map", "heading"))
+                    .size(13)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    }),
                 chip,
-                text(crate::tr!("import-3ds-map", "note", material = material.as_str()))
-                    .size(11)
-                    .style(muted_style),
+                text(crate::tr!(
+                    "import-3ds-map",
+                    "note",
+                    material = material.as_str()
+                ))
+                .size(11)
+                .style(muted_style),
             ]
             .spacing(8),
         ]
@@ -1158,6 +1298,28 @@ pub fn view_dgn_import<'a>(
             format!(" · {}", t!(word.as_str()))
         }
     };
+    let code_page_card: Element<'_, Message> = if state.version == "V7" {
+        card(
+            t!("V7 text code page").into_owned(),
+            row![
+                pick_list(
+                    Some(crate::modules::insert::dgn_import::code_page_label(
+                        state.code_page
+                    )),
+                    crate::modules::insert::dgn_import::code_page_choices(),
+                    |label: &String| label.clone(),
+                )
+                .on_select(|label| msg(ImportDialogMsg::DgnCodePage(label)))
+                .text_size(11)
+                .padding([4, 8])
+                .width(Fill),
+            ]
+            .spacing(8),
+        )
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
     let units = card(
         t!("Units").into_owned(),
         column![
@@ -1276,19 +1438,91 @@ pub fn view_dgn_import<'a>(
         ]
         .spacing(8),
     );
+    let intrinsic = sizing.width == crate::ui::modal::ModalSizing::INTRINSIC.width;
+    let body = row![
+        scrollable(column![model, target, units, code_page_card, references].spacing(10))
+            .width(Length::FillPortion(3)),
+        container(mapping).width(Length::FillPortion(2)),
+    ]
+    .spacing(10)
+    // The measurement pass takes the dialog's natural height; the laid-out
+    // pass then pins the footer and lets the cards scroll through whatever
+    // height the window leaves, so the Ok/Cancel labels are never clipped.
+    .height(if intrinsic {
+        Length::Fixed(540.0)
+    } else {
+        Length::Fill
+    });
     column![
         top,
-        row![
-            column![model, target, units, references]
-                .spacing(10)
-                .width(Length::FillPortion(3)),
-            container(mapping).width(Length::FillPortion(2)),
-        ]
-        .spacing(10),
+        body,
         footer("dgn", t!("Import"), Some(msg(ImportDialogMsg::DgnOk))),
     ]
     .spacing(10)
     .padding([10, 12])
     .width(sizing.width)
     .into()
+}
+
+#[cfg(test)]
+mod dgn_dialog_view_tests {
+    use super::*;
+    use iced::advanced::widget;
+
+    /// A generated DGN Import dialog must keep its Ok/Cancel bar visible at
+    /// the dialog's capped height and at clamped window heights: the body
+    /// scrolls instead of cliping the footer, whatever the window leaves.
+    #[test]
+    fn ok_and_cancel_stay_visible_at_the_dialog_height_cap() {
+        let state = DgnImportState {
+            path: "/tmp/no-such-ocs-drawing.dgn".into(),
+            version: "V7",
+            models: vec![crate::ui::window::pdf_dialogs::PageThumb {
+                label: "Default".into(),
+                image: None,
+            }],
+            model: 0,
+            current_drawing: false,
+            prefix_duplicates: false,
+            sub_units: false,
+            explode_text_nodes: false,
+            code_page: Some(1250),
+            references: crate::modules::insert::dgn_import::ReferenceMode::Translate,
+            existing_reference: crate::modules::insert::dgn_import::ExistingReference::Prompt,
+            units: ("m".into(), "mm".into()),
+            mapping_tab: 0,
+            mapping: Default::default(),
+        };
+        let _lock = crate::headless_ui_lock();
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        // 680 is the dialog's cap; smaller heights are the window clamping
+        // the modal below it (the reported blank footer buttons).
+        for window_height in [680.0, 620.0, 580.0] {
+            let mut ui = iced_test::runtime::user_interface::UserInterface::build(
+                view_dgn_import(&state, crate::ui::modal::ModalSizing::FILL),
+                iced::Size::new(900.0, window_height),
+                iced_test::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            for label in ["Import", "Cancel"] {
+                let mut find = iced_test::Selector::find(label);
+                ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+                let bounds = match widget::Operation::finish(&find) {
+                    widget::operation::Outcome::Some(Some(target)) => target.visible_bounds(),
+                    _ => panic!("{label} button is not in the rendered dialog"),
+                };
+                assert!(
+                    matches!(bounds, Some(iced::Rectangle { y, height, .. })
+                        if height >= 14.0 && y >= 0.0 && y + height <= window_height + 1.0),
+                    "at window height {window_height}: {label} button renders {bounds:?}"
+                );
+            }
+        }
+    }
 }

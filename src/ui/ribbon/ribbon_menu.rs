@@ -3,8 +3,6 @@
 //! It opens where the tab row or the tool area is right-clicked; its two
 //! lists open beside it on hover.
 
-use std::time::Duration;
-
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, tree, Widget};
 use iced::advanced::{mouse, overlay, renderer, Shell};
@@ -17,21 +15,22 @@ use iced::{
 };
 
 use super::layout::QatItem;
-use super::widgets::{make_tip, popup_panel_style, tip_style};
 use super::{extras, Ribbon};
 use crate::app::Message;
 use crate::ui::icons;
 use crate::ui::popup::context_menu::{MENU_ROW_H, MENU_SEP_H};
 use crate::ui::style::{chrome, text_metrics};
 
-/// Size of the check mark at the end of a checked row, as in the viewport
-/// menu.
-const CHECK_SIZE: f32 = 10.0;
-const CARET_SIZE: f32 = 9.0;
+// The kit menu's look: a check in the mark column before the label, UI
+// text, the hover colour, its row and separator heights and its frame.
+use crate::ui::style::{kit_metrics as km, text as ui_text};
+/// Size of the check mark before a checked row's label.
+const CHECK_SIZE: f32 = km::BAR_ICON;
+const CARET_SIZE: f32 = km::CARET;
 /// Size of a row's label.
-const LABEL_SIZE: f32 = 12.0;
-/// Least gap between a label and the check or caret at the row's end.
-const MARK_GAP: f32 = 16.0;
+const LABEL_SIZE: f32 = ui_text::UI;
+/// Least gap between a label and the caret at the row's end.
+const MARK_GAP: f32 = km::MENU_PAD_X;
 
 /// The lists the menu opens beside itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +67,10 @@ pub enum RibbonMenuMsg {
     TogglePanel(String),
     Reset,
     TogglePanelTitles,
+    /// Center the tabs and panels (`true`), or put them at the left edge.
+    SetCentered(bool),
+    /// Let the mouse wheel over the ribbon step through the tabs, or not.
+    SetWheelTabs(bool),
     /// Show or hide the menu bar (handled by the app).
     ShowMenuBar(bool),
     /// Show the ribbon (`true`) or close it (handled by the app).
@@ -81,6 +84,8 @@ pub enum RibbonMenuMsg {
     QatSeparatorAfter(usize),
     /// Show the Quick Access Toolbar below the ribbon (`true`) or above.
     QatBelow(bool),
+    /// Put this command on the My Tools tab, or take it off.
+    MyToolsToggle(String),
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +162,11 @@ impl Ribbon {
                 self.layout.qat_below = below;
                 true
             }
+            RibbonMenuMsg::MyToolsToggle(command) => {
+                self.menu = None;
+                self.my_tools_toggle(&command);
+                true
+            }
             RibbonMenuMsg::Close => {
                 self.menu = None;
                 false
@@ -198,6 +208,16 @@ impl Ribbon {
             RibbonMenuMsg::TogglePanelTitles => {
                 self.menu = None;
                 self.layout.show_panel_titles ^= true;
+                true
+            }
+            RibbonMenuMsg::SetCentered(centered) => {
+                self.menu = None;
+                self.set_centered(centered);
+                true
+            }
+            RibbonMenuMsg::SetWheelTabs(on) => {
+                self.menu = None;
+                self.set_wheel_switches_tabs(on);
                 true
             }
         }
@@ -348,6 +368,26 @@ impl Ribbon {
                 },
                 None,
             )),
+            Some((
+                Row {
+                    label: crate::tr!("ribbon-menu", "center-ribbon"),
+                    checked: self.layout.centered,
+                    enabled: true,
+                    reason: None,
+                    action: RibbonMenuMsg::SetCentered(!self.layout.centered),
+                },
+                None,
+            )),
+            Some((
+                Row {
+                    label: crate::tr!("ribbon-menu", "wheel-switches-tabs"),
+                    checked: self.layout.wheel_switches_tabs,
+                    enabled: true,
+                    reason: None,
+                    action: RibbonMenuMsg::SetWheelTabs(!self.layout.wheel_switches_tabs),
+                },
+                None,
+            )),
             None,
             Some((
                 Row {
@@ -397,7 +437,21 @@ impl Ribbon {
                 } else {
                     crate::tr!("ribbon-menu", "add-to-qat")
                 };
-                let mut rows = vec![plain(label, RibbonMenuMsg::QatToggle(item.clone())), None];
+                let mut rows = vec![plain(label, RibbonMenuMsg::QatToggle(item.clone()))];
+                // A dropdown goes on My Tools as its default command.
+                if let QatItem::Command(command) = item {
+                    let command = self
+                        .ribbon_dropdown(command)
+                        .map_or(command.as_str(), |(_, _, _, default)| default)
+                        .to_string();
+                    let label = if self.my_tools_has(&command) {
+                        crate::tr!("ribbon-menu", "remove-from-my-tools")
+                    } else {
+                        crate::tr!("ribbon-menu", "add-to-my-tools")
+                    };
+                    rows.push(plain(label, RibbonMenuMsg::MyToolsToggle(command)));
+                }
+                rows.push(None);
                 rows.extend(ribbon_rows);
                 rows
             }
@@ -533,7 +587,7 @@ pub(super) fn fit_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     let longest = labels
         .map(|label| text_metrics::width(label, LABEL_SIZE, false))
         .fold(0.0, f32::max);
-    longest + ROW_PADDING.left + ROW_PADDING.right + MARK_GAP + CHECK_SIZE.max(CARET_SIZE) + 2.0
+    longest + km::MENU_CHECK_W + ROW_PADDING.right + MARK_GAP + CARET_SIZE + 2.0 * frame()
 }
 
 fn placed<'a>(panel: Element<'a, Message>, left: f32, top: f32) -> Element<'a, Message> {
@@ -558,7 +612,7 @@ fn frame() -> f32 {
 /// one-pixel border, as the menu bar's do.
 pub(super) fn panel_of_width(items: Vec<Element<'_, Message>>, width: f32) -> Element<'_, Message> {
     container(column(items).width(Fill))
-        .style(popup_panel_style)
+        .style(crate::ui::kit::menu::frame_style)
         .padding(frame())
         .width(Length::Fixed(width))
         .into()
@@ -567,30 +621,15 @@ pub(super) fn panel_of_width(items: Vec<Element<'_, Message>>, width: f32) -> El
 /// A line one physical pixel high across the menu, inset at the sides: a
 /// logical pixel would draw one or two pixels high at a fractional scale.
 fn separator<'a>() -> Element<'a, Message> {
-    let line =
-        container(Space::new().width(Fill).height(icons::hairline())).style(|theme: &Theme| {
-            container::Style {
-                background: Some(Background::Color(chrome::border(theme))),
-                ..Default::default()
-            }
-        });
-    container(line)
-        .padding(Padding {
-            top: (MENU_SEP_H - icons::hairline()) / 2.0,
-            bottom: (MENU_SEP_H - icons::hairline()) / 2.0,
-            left: 6.0,
-            right: 6.0,
-        })
-        .width(Fill)
-        .height(MENU_SEP_H)
-        .into()
+    crate::ui::kit::menu::entry(crate::ui::kit::menu::Item::Separator)
 }
 
+/// A row's padding: the kit menu's mark column before the label.
 const ROW_PADDING: Padding = Padding {
-    top: 3.0,
-    right: 12.0,
-    bottom: 3.0,
-    left: 12.0,
+    top: 0.0,
+    right: km::MENU_PAD_X,
+    bottom: 0.0,
+    left: 0.0,
 };
 
 fn item_row<'a>(row: Row) -> Element<'a, Message> {
@@ -600,10 +639,7 @@ fn item_row<'a>(row: Row) -> Element<'a, Message> {
         row.enabled.then_some(Message::RibbonMenu(row.action)),
     );
     match row.reason {
-        Some(reason) => tooltip(item, make_tip(reason), tooltip::Position::Right)
-            .delay(Duration::from_millis(400))
-            .style(tip_style)
-            .into(),
+        Some(reason) => crate::ui::kit::tooltip(item, reason, tooltip::Position::Right),
         None => item.into(),
     }
 }
@@ -616,14 +652,22 @@ pub(super) fn check_row<'a>(
     on_press: Option<Message>,
 ) -> button::Button<'a, Message> {
     let enabled = on_press.is_some();
-    let mut content = row![text(label).size(LABEL_SIZE)].align_y(iced::Center);
-    if checked {
-        content = content.push(Space::new().width(Fill)).push(if enabled {
-            icons::themed(icons::CHECK, CHECK_SIZE)
-        } else {
-            icons::themed_disabled(icons::CHECK, CHECK_SIZE)
-        });
-    }
+    let check: Element<'a, Message> = if !checked {
+        Space::new().into()
+    } else if enabled {
+        icons::themed(icons::CHECK, CHECK_SIZE)
+    } else {
+        icons::themed_disabled(icons::CHECK, CHECK_SIZE)
+    };
+    let content = row![
+        container(check).center_x(Length::Fixed(km::MENU_CHECK_W)),
+        text(label)
+            .size(LABEL_SIZE)
+            .line_height(ui_text::line())
+            .wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .height(Fill)
+    .align_y(iced::Center);
     button(content)
         .padding(ROW_PADDING)
         .width(Fill)
@@ -635,10 +679,15 @@ pub(super) fn check_row<'a>(
 /// A row that opens `list` beside the menu when hovered or clicked.
 fn submenu_row<'a>(label: String, open: bool, list: Submenu) -> Element<'a, Message> {
     let content = row![
-        text(label).size(LABEL_SIZE),
+        Space::new().width(km::MENU_CHECK_W),
+        text(label)
+            .size(LABEL_SIZE)
+            .line_height(ui_text::line())
+            .wrapping(iced::widget::text::Wrapping::None),
         Space::new().width(Fill),
         icons::themed_arrow_right(CARET_SIZE),
     ]
+    .height(Fill)
     .align_y(iced::Center);
     let item = button(content)
         .padding(ROW_PADDING)
@@ -667,7 +716,7 @@ fn row_style(theme: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => (
             Some(Background::Color(chrome::hover(theme))),
-            chrome::strong(theme),
+            chrome::text(theme),
         ),
         button::Status::Disabled => (None, chrome::muted(theme)),
         button::Status::Active => (None, chrome::text(theme)),
@@ -1050,6 +1099,18 @@ mod tests {
         assert!(ribbon.on_menu(modify.action));
         assert!(ribbon.layout.floating.is_empty());
         assert!(ribbon.layout.panel_hidden("draw", "Modify"));
+    }
+
+    #[test]
+    fn reset_keeps_the_centering_and_the_wheel_option() {
+        let mut ribbon = Ribbon::default();
+        ribbon.on_menu(RibbonMenuMsg::SetCentered(true));
+        ribbon.on_menu(RibbonMenuMsg::SetWheelTabs(false));
+        ribbon.on_menu(RibbonMenuMsg::TogglePanelTitles);
+        assert!(ribbon.on_menu(RibbonMenuMsg::Reset));
+        assert!(ribbon.layout.show_panel_titles, "the layout is reset");
+        assert!(ribbon.layout.centered, "the preferences stay");
+        assert!(!ribbon.layout.wheel_switches_tabs);
     }
 
     #[test]

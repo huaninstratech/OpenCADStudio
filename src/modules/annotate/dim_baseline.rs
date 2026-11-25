@@ -1,16 +1,16 @@
 use std::f64::consts::PI;
 
-use codec::entities::{
+use document::entities::{
     Dimension, DimensionAligned, DimensionAngular2Ln, DimensionAngular3Pt, DimensionBase,
     DimensionLinear, DimensionOrdinate,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
-use kernel::geom2d::{
+use ocs_geom::geom2d::{
     arc_span, intersect, nearest_of, Arc, Curve, Line, Tolerance, Transform, Vec2, XLine,
 };
-use kernel::space::Plane;
+use ocs_geom::space::Plane;
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview,
@@ -87,7 +87,7 @@ pub(super) struct SourceStyle {
     text_rotation: f64,
     pub(super) horizontal_direction: f64,
     /// The base dimension's dimension variable overrides.
-    overrides: Vec<(i16, codec::xdata::XDataValue)>,
+    overrides: Vec<(i16, document::xdata::XDataValue)>,
 }
 
 impl SourceStyle {
@@ -495,7 +495,11 @@ impl CadCommand for DimBaselineCommand {
     fn prompt(&self) -> String {
         if self.offset_pending {
             let current = self.offset_override.unwrap_or(self.dimdli);
-            return crate::tr!("dim-cmd", "offset-distance", offset = format!("{current:.6}"));
+            return crate::tr!(
+                "dim-cmd",
+                "offset-distance",
+                offset = format!("{current:.6}")
+            );
         }
         if self.in_dim {
             return match &self.base {
@@ -649,9 +653,7 @@ impl CadCommand for DimBaselineCommand {
             self.offset_pending = true;
             return Some(CmdResult::NeedPoint);
         }
-        if self.base.is_none() {
-            return None;
-        }
+        self.base.as_ref()?;
         match word.as_str() {
             "S" | "SELECT" => {
                 self.base = None;

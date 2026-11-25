@@ -12,8 +12,9 @@
 
 use super::circle_gpu::CircleInstance;
 use super::ellipse_gpu::EllipseInstance;
+use super::gpu_upload::{rebuild_is_cheaper, write_all, WriteBatch};
 use super::wire_gpu::BlockWireInstance;
-use codec::Handle;
+use document::Handle;
 use iced::wgpu;
 use rustc_hash::FxHashMap;
 
@@ -143,9 +144,13 @@ pub(crate) enum Edit {
         index: u32,
         value: EllipseInstance,
     },
-    /// Only the depth field: enough to hide an instance.
-    HideCircle { index: u32 },
-    HideEllipse { index: u32 },
+    /// An instance with a depth no entity has, which draws nothing.
+    HideCircle {
+        index: u32,
+    },
+    HideEllipse {
+        index: u32,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,7 +165,11 @@ pub(crate) enum Outcome {
 
 /// The instance record for a placement relative to its definition's base,
 /// split into the high and low parts the shaders recombine.
-pub(crate) fn block_instance_at(position: [f64; 3], base: [f64; 3], depth: f32) -> BlockWireInstance {
+pub(crate) fn block_instance_at(
+    position: [f64; 3],
+    base: [f64; 3],
+    depth: f32,
+) -> BlockWireInstance {
     let delta = [
         position[0] - base[0],
         position[1] - base[1],
@@ -184,6 +193,18 @@ fn hidden_block() -> BlockWireInstance {
         translation_low: [0.0; 3],
         depth: [HIDDEN_DEPTH, 0.0],
     }
+}
+
+fn hidden_circle() -> CircleInstance {
+    let mut hidden = <CircleInstance as bytemuck::Zeroable>::zeroed();
+    hidden.params[2] = HIDDEN_DEPTH;
+    hidden
+}
+
+fn hidden_ellipse() -> EllipseInstance {
+    let mut hidden = <EllipseInstance as bytemuck::Zeroable>::zeroed();
+    hidden.params[2] = HIDDEN_DEPTH;
+    hidden
 }
 
 /// Whether two block-local point lists are the same shape, allowing for the
@@ -219,14 +240,23 @@ pub(crate) fn plan_reference(
     if new.is_empty() {
         // Hidden or erased: keep the slots so that showing it again lands on
         // the same instances.
-        let mut edits = Vec::with_capacity(old.blocks.len() + old.circles.len() + old.ellipses.len());
+        let mut edits =
+            Vec::with_capacity(old.blocks.len() + old.circles.len() + old.ellipses.len());
         edits.extend(old.blocks.iter().map(|slot| Edit::Block {
             chunk: slot.chunk,
             index: slot.index,
             value: hidden_block(),
         }));
-        edits.extend(old.circles.iter().map(|slot| Edit::HideCircle { index: slot.index }));
-        edits.extend(old.ellipses.iter().map(|slot| Edit::HideEllipse { index: slot.index }));
+        edits.extend(
+            old.circles
+                .iter()
+                .map(|slot| Edit::HideCircle { index: slot.index }),
+        );
+        edits.extend(
+            old.ellipses
+                .iter()
+                .map(|slot| Edit::HideEllipse { index: slot.index }),
+        );
         return Outcome::Edits(edits);
     }
     if old.blocks.len() != new.blocks.len() {
@@ -330,63 +360,90 @@ look_equal={} kind_equal={} first_difference={:?} recorded_point={:?} now_point=
     Outcome::Edits(edits)
 }
 
-impl AnalyticSlots {
-    /// Write the edits into the buffers the slots describe.
-    pub(crate) fn apply(&self, queue: &wgpu::Queue, edits: &[Edit]) {
-        use std::mem::{offset_of, size_of};
-        for edit in edits {
-            match edit {
-                Edit::Block { chunk, index, value } => {
-                    if let Some(buffer) = self.block_buffers.get(*chunk as usize) {
-                        queue.write_buffer(
-                            buffer,
-                            *index as u64 * size_of::<BlockWireInstance>() as u64,
-                            bytemuck::bytes_of(value),
-                        );
-                    }
-                }
-                Edit::Circle { index, value } => {
-                    if let Some(buffer) = &self.circle_buffer {
-                        queue.write_buffer(
-                            buffer,
-                            *index as u64 * size_of::<CircleInstance>() as u64,
-                            bytemuck::bytes_of(value),
-                        );
-                    }
-                }
-                Edit::Ellipse { index, value } => {
-                    if let Some(buffer) = &self.ellipse_buffer {
-                        queue.write_buffer(
-                            buffer,
-                            *index as u64 * size_of::<EllipseInstance>() as u64,
-                            bytemuck::bytes_of(value),
-                        );
-                    }
-                }
-                Edit::HideCircle { index } => {
-                    if let Some(buffer) = &self.circle_buffer {
-                        queue.write_buffer(
-                            buffer,
-                            *index as u64 * size_of::<CircleInstance>() as u64
-                                + offset_of!(CircleInstance, params) as u64
-                                + 2 * size_of::<f32>() as u64,
-                            bytemuck::bytes_of(&HIDDEN_DEPTH),
-                        );
-                    }
-                }
-                Edit::HideEllipse { index } => {
-                    if let Some(buffer) = &self.ellipse_buffer {
-                        queue.write_buffer(
-                            buffer,
-                            *index as u64 * size_of::<EllipseInstance>() as u64
-                                + offset_of!(EllipseInstance, params) as u64
-                                + 2 * size_of::<f32>() as u64,
-                            bytemuck::bytes_of(&HIDDEN_DEPTH),
-                        );
-                    }
+/// The writes of a patch, buffer by buffer.
+#[derive(Default)]
+pub(crate) struct PlannedWrites {
+    /// One per block arena, in the order the uploaded batches name them.
+    pub blocks: Vec<WriteBatch>,
+    pub circles: WriteBatch,
+    pub ellipses: WriteBatch,
+}
+
+/// Sort the edits into the buffers they write, `chunks` block arenas among
+/// them.
+pub(crate) fn plan_writes(edits: &[Edit], chunks: usize) -> PlannedWrites {
+    use std::mem::size_of;
+    let mut planned = PlannedWrites::default();
+    planned.blocks.resize_with(chunks, WriteBatch::default);
+    for edit in edits {
+        match edit {
+            Edit::Block {
+                chunk,
+                index,
+                value,
+            } => {
+                if let Some(blocks) = planned.blocks.get_mut(*chunk as usize) {
+                    blocks.push(
+                        *index as u64 * size_of::<BlockWireInstance>() as u64,
+                        bytemuck::bytes_of(value),
+                    );
                 }
             }
+            Edit::Circle { index, value } => planned.circles.push(
+                *index as u64 * size_of::<CircleInstance>() as u64,
+                bytemuck::bytes_of(value),
+            ),
+            Edit::Ellipse { index, value } => planned.ellipses.push(
+                *index as u64 * size_of::<EllipseInstance>() as u64,
+                bytemuck::bytes_of(value),
+            ),
+            // A hidden instance is written whole, like a shown one, so that a
+            // run of them is one write. Only its depth is read while it is
+            // hidden, and showing it again writes every field.
+            Edit::HideCircle { index } => planned.circles.push(
+                *index as u64 * size_of::<CircleInstance>() as u64,
+                bytemuck::bytes_of(&hidden_circle()),
+            ),
+            Edit::HideEllipse { index } => planned.ellipses.push(
+                *index as u64 * size_of::<EllipseInstance>() as u64,
+                bytemuck::bytes_of(&hidden_ellipse()),
+            ),
         }
+    }
+    planned
+}
+
+impl AnalyticSlots {
+    /// Write the edits into the buffers the slots describe. `Err` names why
+    /// the full rebuild is the better way, and nothing was written.
+    pub(crate) fn apply(&self, queue: &wgpu::Queue, edits: &[Edit]) -> Result<(), &'static str> {
+        use std::mem::size_of;
+        let planned = plan_writes(edits, self.block_buffers.len());
+        let block = size_of::<BlockWireInstance>();
+        let mut targets: Vec<(&wgpu::Buffer, &WriteBatch, usize)> = self
+            .block_buffers
+            .iter()
+            .zip(&planned.blocks)
+            .map(|(buffer, batch)| (buffer, batch, block))
+            .collect();
+        if let Some(buffer) = &self.circle_buffer {
+            targets.push((buffer, &planned.circles, size_of::<CircleInstance>()));
+        }
+        if let Some(buffer) = &self.ellipse_buffer {
+            targets.push((buffer, &planned.ellipses, size_of::<EllipseInstance>()));
+        }
+        let mut writes = Vec::with_capacity(targets.len());
+        for (buffer, batch, element) in targets {
+            let pieces = batch.writes();
+            if rebuild_is_cheaper(pieces.len(), buffer.size() / element as u64) {
+                return Err("more separate writes than the rebuild costs");
+            }
+            writes.push((buffer, pieces));
+        }
+        for (buffer, pieces) in &writes {
+            write_all(queue, buffer, pieces);
+        }
+        Ok(())
     }
 }
 
@@ -396,11 +453,8 @@ pub(crate) fn sort_by_depth<T: Copy + Send + Sync>(
     depth: impl Fn(&T) -> f32 + Sync,
 ) -> (Vec<T>, Vec<u32>) {
     let mut order: Vec<u32> = (0..items.len() as u32).collect();
-    let compare = |a: &u32, b: &u32| {
-        depth(&items[*a as usize])
-            .partial_cmp(&depth(&items[*b as usize]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
+    let compare =
+        |a: &u32, b: &u32| depth(&items[*a as usize]).total_cmp(&depth(&items[*b as usize]));
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
@@ -469,7 +523,10 @@ mod tests {
             depth: 0.25,
             style: look(),
             // Definition 7 is the recorded unit segment; any other is longer.
-            points: vec![[0.0, 0.0, 0.0], [if source_id == 7 { 1.0 } else { 2.0 }, 0.0, 0.0]],
+            points: vec![
+                [0.0, 0.0, 0.0],
+                [if source_id == 7 { 1.0 } else { 2.0 }, 0.0, 0.0],
+            ],
             magnitude: 100.0,
         }
     }
@@ -499,7 +556,11 @@ mod tests {
         assert_eq!(edits.len(), 3);
         // The instance is stored relative to the definition's base.
         match &edits[0] {
-            Edit::Block { chunk, index, value } => {
+            Edit::Block {
+                chunk,
+                index,
+                value,
+            } => {
                 assert_eq!((*chunk, *index), (0, 10));
                 assert_eq!(value.translation, [10.0, 0.0, 0.0]);
                 assert_eq!(value.depth, [0.25, 0.0]);
@@ -621,7 +682,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn placements_that_return_in_another_order_take_the_slot_of_their_shape() {
         let two_shapes = vec![
@@ -659,8 +719,16 @@ mod tests {
         // The long shape (group 1) goes to its own slot, the short one to its.
         match (&edits[0], &edits[1]) {
             (
-                Edit::Block { index: first, value: a, .. },
-                Edit::Block { index: second, value: b, .. },
+                Edit::Block {
+                    index: first,
+                    value: a,
+                    ..
+                },
+                Edit::Block {
+                    index: second,
+                    value: b,
+                    ..
+                },
             ) => {
                 assert_eq!((*first, *second), (11, 10));
                 assert_eq!(a.translation[0], 5.0);
@@ -697,6 +765,104 @@ mod tests {
         assert!(same_shape(&with_separator, &with_separator.clone(), 100.0));
         let separator_elsewhere = vec![[0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [f32::NAN; 3]];
         assert!(!same_shape(&with_separator, &separator_elsewhere, 100.0));
+    }
+
+    fn spans(writes: &[(u64, Vec<u8>)], element: usize) -> Vec<(u64, usize)> {
+        writes
+            .iter()
+            .map(|(offset, bytes)| (*offset / element as u64, bytes.len() / element))
+            .collect()
+    }
+
+    /// Moving every circle of a drawing rewrites its whole buffer, in the
+    /// order the edit names them.
+    #[test]
+    fn curves_side_by_side_are_one_write() {
+        let circle_at = |index| Edit::Circle {
+            index,
+            value: circle(0.5),
+        };
+        let ellipse_at = |index| Edit::Ellipse {
+            index,
+            value: bytemuck::Zeroable::zeroed(),
+        };
+        let edits = [
+            circle_at(6),
+            ellipse_at(2),
+            circle_at(5),
+            circle_at(7),
+            ellipse_at(1),
+            circle_at(20),
+        ];
+        let planned = plan_writes(&edits, 0);
+        assert_eq!(
+            spans(
+                &planned.circles.writes(),
+                std::mem::size_of::<CircleInstance>()
+            ),
+            vec![(5, 3), (20, 1)]
+        );
+        assert_eq!(
+            spans(
+                &planned.ellipses.writes(),
+                std::mem::size_of::<EllipseInstance>()
+            ),
+            vec![(1, 2)]
+        );
+    }
+
+    /// Erasing or freezing objects hides their curves. A hidden one is written
+    /// whole, so a run of them is one write too.
+    #[test]
+    fn hidden_curves_side_by_side_are_one_write() {
+        let edits = [
+            Edit::HideCircle { index: 4 },
+            Edit::HideEllipse { index: 9 },
+            Edit::HideCircle { index: 3 },
+            Edit::HideEllipse { index: 8 },
+            Edit::HideCircle { index: 5 },
+        ];
+        let planned = plan_writes(&edits, 0);
+        let circles = planned.circles.writes();
+        assert_eq!(
+            spans(&circles, std::mem::size_of::<CircleInstance>()),
+            vec![(3, 3)]
+        );
+        let hidden: Vec<CircleInstance> = bytemuck::pod_collect_to_vec(&circles[0].1);
+        assert!(hidden.iter().all(|circle| circle.params[2] == HIDDEN_DEPTH));
+        let ellipses = planned.ellipses.writes();
+        assert_eq!(
+            spans(&ellipses, std::mem::size_of::<EllipseInstance>()),
+            vec![(8, 2)]
+        );
+        let hidden: Vec<EllipseInstance> = bytemuck::pod_collect_to_vec(&ellipses[0].1);
+        assert!(hidden
+            .iter()
+            .all(|ellipse| ellipse.params[2] == HIDDEN_DEPTH));
+    }
+
+    #[test]
+    fn block_placements_are_joined_within_their_own_arena() {
+        let block_at = |chunk, index| Edit::Block {
+            chunk,
+            index,
+            value: block_instance_at([1.0, 2.0, 0.0], [0.0; 3], 0.5),
+        };
+        let edits = [
+            block_at(1, 11),
+            block_at(0, 10),
+            block_at(1, 10),
+            block_at(0, 12),
+            // An arena the slots do not hold is skipped, as before.
+            block_at(7, 0),
+        ];
+        let planned = plan_writes(&edits, 2);
+        let size = std::mem::size_of::<BlockWireInstance>();
+        assert_eq!(
+            spans(&planned.blocks[0].writes(), size),
+            vec![(10, 1), (12, 1)]
+        );
+        assert_eq!(spans(&planned.blocks[1].writes(), size), vec![(10, 2)]);
     }
 
     #[test]

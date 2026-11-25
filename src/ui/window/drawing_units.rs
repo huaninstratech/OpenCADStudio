@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use iced::widget::{checkbox, column, container, row, text, text_input, Space};
+use iced::widget::{Space, checkbox, column, container, row, text, text_input};
 use iced::{Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -72,7 +72,7 @@ pub enum Field {
 
 fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.6)),
+        color: Some(crate::ui::style::readable::muted_text(theme)),
     }
 }
 
@@ -97,11 +97,12 @@ fn drop_row<'a>(
     selected: Option<Choice>,
     ctor: fn(i16) -> Field,
 ) -> Element<'a, Message> {
-    let picker = crate::ui::dropdown_list::pick_list(selected, options, |choice| choice.to_string())
-        .on_select(move |choice| Message::DrawingUnitsField(ctor(choice.code)))
-        .text_size(12)
-        .padding([3, 6])
-        .width(Fill);
+    let picker =
+        crate::ui::dropdown_list::pick_list(selected, options, |choice| choice.to_string())
+            .on_select(move |choice| Message::DrawingUnitsField(ctor(choice.code)))
+            .text_size(12)
+            .padding([3, 6])
+            .width(Fill);
     row![text(label).size(11).style(muted).width(78), picker]
         .spacing(8)
         .align_y(iced::Center)
@@ -300,7 +301,7 @@ fn sample_angle(state: &State) -> String {
 /// of the frame is drawing with. Without the restore the sample would leak its
 /// settings into every widget drawn after it.
 fn with_context(state: &State, body: impl FnOnce() -> String) -> String {
-    use crate::entities::common::{set_unit_context, unit_context, UnitContext};
+    use crate::entities::common::{UnitContext, set_unit_context, unit_context};
     let previous = unit_context();
     set_unit_context(UnitContext {
         lunits: state.linear_format,

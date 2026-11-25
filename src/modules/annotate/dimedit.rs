@@ -1,6 +1,6 @@
 // DIMEDIT — edit dimension text, rotation, extension-line obliquing or home position.
 
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, DimensionEditOperation, InputKind};
@@ -30,6 +30,12 @@ enum Step {
 
 pub struct DimEditCommand {
     step: Step,
+}
+
+impl Default for DimEditCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DimEditCommand {

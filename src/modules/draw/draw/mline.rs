@@ -1,9 +1,9 @@
 // MLINE command — create a styled group of parallel lines.
 
-use codec::entities::{MLine, MLineFlags, MLineJustification, MLineSegment, MLineVertex};
-use codec::objects::MLineStyle;
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::entities::{MLine, MLineFlags, MLineJustification, MLineSegment, MLineVertex};
+use document::objects::MLineStyle;
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, WorkingPlane};
@@ -174,8 +174,6 @@ impl MlineCommand {
         Some(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -183,29 +181,35 @@ impl MlineCommand {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: true,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: "mline_preview".into(),
-            points,
-            points_low,
             color: WireModel::CYAN,
             selected: false,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: Vec::new(),
-            tangent_geoms: Vec::new(),
             aci: 0,
-            key_vertices: Vec::new(),
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris,
-            fill_tris_low,
-
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                text_verts: Vec::new(),
+                points,
+                points_low: points_low.into(),
+                snap_pts: Vec::new(),
+                tangent_geoms: Vec::new(),
+                key_vertices: Vec::new(),
+                surfaces: crate::scene::model::wire_model::WireSurfaces {
+                    fill_tris,
+                    fill_tris_low,
+                    ..Default::default()
+                }
+                .into_optional(),
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         })
     }

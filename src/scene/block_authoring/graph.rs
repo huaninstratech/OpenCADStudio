@@ -1,6 +1,6 @@
 //! Maintain native adjacency lists while adding/replacing action dependencies.
-use codec::objects::{BlockEvaluationEdge, BlockEvaluationGraph, DynamicBlockData, ObjectType};
-use codec::{Document, Handle};
+use document::objects::{BlockEvaluationEdge, BlockEvaluationGraph, DynamicBlockData, ObjectType};
+use document::{Document, Handle};
 
 pub(crate) fn valid_lists(g: &BlockEvaluationGraph, node: i32) -> bool {
     let Some(n) = g.nodes.iter().find(|n| n.id == node) else {
@@ -210,7 +210,7 @@ pub(crate) fn bind_ids(
     for node in bindings {
         add(&mut g, id, node, action, id + 1);
         add(&mut g, id + 1, action, node, id);
-        id = id.checked_add(2).unwrap_or(i32::MAX);
+        id = id.saturating_add(2);
     }
     let ObjectType::DynamicBlock(object) = document.objects.get_mut(&graph).unwrap() else {
         unreachable!()

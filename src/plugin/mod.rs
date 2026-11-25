@@ -13,14 +13,14 @@
 /// (`app::plugin_host`) builds commands with it.
 pub(crate) const QUAD_PLUGIN_PREFIX: &str = "quadplugin:";
 
-#[cfg(not(target_arch = "wasm32"))]
-pub mod plugin_classes;
 pub mod entity_labels;
 pub mod external;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod grip_points;
 pub mod host;
 pub mod marketplace;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod plugin_classes;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod quad;
 pub mod registry;
@@ -33,13 +33,24 @@ pub mod v4_support {
         _control_id: String,
         _action: String,
         _value: Option<ocs_plugin_api::dialog::DialogValue>,
-    ) {}
+    ) {
+    }
+
+    pub fn publish_panel_action_to_plugin(
+        _plugin_id: Option<&str>,
+        _command_id: Option<u64>,
+        _panel_id: String,
+        _control_id: String,
+        _action: String,
+        _value: Option<ocs_plugin_api::dialog::DialogValue>,
+    ) {
+    }
 
     pub fn publish_quad_action(
         _plugin_id: &str,
         _panel_id: &str,
         _control_id: &str,
-        _handles: Vec<codec::Handle>,
+        _handles: Vec<document::Handle>,
         _type_keys: Vec<String>,
         _pick_point: [f64; 3],
     ) {
@@ -70,24 +81,40 @@ pub(crate) fn guard<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
             // The plugin hooks run deep inside the update / render loop where
             // the app's command line isn't reachable, so queue the error and
             // let the next update tick drain it into the command line. (#145)
-            errors().lock().unwrap().push(line);
+            with_errors(|errors| errors.push(line));
             None
         }
     }
 }
 
-/// Process-wide queue of plugin-guard errors waiting to surface in the host's
+/// Queue of plugin-guard errors waiting to surface in the host's
 /// command-line history. Flushed by [`drain_errors`] from the app loop.
+///
+/// Process-wide in the app. Under `cfg(test)` each thread has its own, so
+/// tests running in parallel drain only the errors their own app queued:
+/// errors are queued and drained on the thread that runs the app's update.
 #[cfg(not(target_arch = "wasm32"))]
-fn errors() -> &'static std::sync::Mutex<Vec<String>> {
-    static E: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    E.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn with_errors<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    #[cfg(test)]
+    {
+        use std::cell::RefCell;
+        thread_local! {
+            static E: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        E.with(|errors| f(&mut errors.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        static E: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+        let errors = E.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        f(&mut errors.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 /// Take and return every queued plugin-guard error since the last drain.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn drain_errors() -> Vec<String> {
-    std::mem::take(&mut *errors().lock().unwrap())
+    with_errors(std::mem::take)
 }
 
 /// Queue one line for the command-line history from plugin paths that cannot
@@ -95,7 +122,7 @@ pub(crate) fn drain_errors() -> Vec<String> {
 /// failures). Surfaced by [`drain_errors`] on the next update tick.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn push_guard_error(line: String) {
-    errors().lock().unwrap().push(line);
+    with_errors(|errors| errors.push(line));
 }
 
 #[cfg(test)]

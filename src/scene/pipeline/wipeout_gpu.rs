@@ -160,6 +160,7 @@ pub struct WipeoutGpu {
     pub world_aabb: [f32; 4],
     /// Binding 0 (uniform) and binding 1 (boundary), in binding order.
     pub dynamic_offsets: [u32; 2],
+    pub(super) uniform_buffers: [wgpu::Buffer; 2],
 }
 
 // Dynamic offsets are u32 even when max_buffer_size is larger. Each
@@ -181,9 +182,7 @@ impl WipeoutPacking {
             boundary_size,
             std::mem::size_of::<FamilyBatchData>() as u64,
         ] {
-            if size > u64::from(limits.max_uniform_buffer_binding_size)
-                || size > limits.max_buffer_size
-            {
+            if size > limits.max_uniform_buffer_binding_size || size > limits.max_buffer_size {
                 return None;
             }
         }
@@ -554,6 +553,7 @@ impl WipeoutGpu {
             bind_group,
             world_aabb,
             dynamic_offsets,
+            uniform_buffers: [uniforms.clone(), boundaries.clone()],
         }
     }
 }

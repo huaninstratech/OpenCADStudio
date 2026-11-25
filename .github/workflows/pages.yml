@@ -63,7 +63,7 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.source.outputs.commit }}
           # Full history so build.rs can measure the distance from the
@@ -83,14 +83,15 @@ jobs:
             test "v$VERSION" = "$RELEASE_TAG"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install trunk
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: trunk
 
@@ -103,7 +104,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install wasm-bindgen CLI
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: wasm-bindgen@${{ steps.wasm-bindgen-version.outputs.version }}
 
@@ -121,7 +122,7 @@ jobs:
           grep -q "^const CACHE_VERSION = \"$hash\";" dist/app/sw.js
 
       - name: Check out current website
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           path: website
@@ -148,14 +149,20 @@ jobs:
 
       # Attach the bundle to the release so a version can be pinned and
       # self-hosted; it expects to be served from /app/. Taken before the
-      # site data below is added, and skipped for hotfixes built from main.
+      # site data below is added. A hotfix built from main attaches only when
+      # the release has no bundle (its own web build failed).
       - name: Attach web bundle to the release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_main) }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          HOTFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.build_main }}
         run: |
           ASSET="OpenCADStudio-$RELEASE_TAG-web.zip"
+          if [ "$HOTFIX" = "true" ] && gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | grep -qxF "$ASSET"; then
+            echo "The release already has $ASSET; a hotfix leaves it as released."
+            exit 0
+          fi
           (cd dist && zip -qr "../$ASSET" app)
           gh release upload "$RELEASE_TAG" "$ASSET" --clobber --repo "$GITHUB_REPOSITORY"
 
@@ -290,7 +297,7 @@ jobs:
             > dist/app/discussions.json
           echo "discussions: $(jq 'length' dist/app/discussions.json)"
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: dist
 
@@ -302,7 +309,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 
       - name: Verify deployed release
         env:

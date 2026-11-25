@@ -31,7 +31,7 @@ use crate::io::line_read::{is_line_too_long, read_line_capped};
 use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +67,13 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// generic `POST /api/v1/{op}` passthrough. Everything else runs legacy.
 const ENVELOPE_OPS: &[&str] = &[
     "entities_create",
+    "entities_set",
+    "xref_reload",
+    "xref_unload",
+    "xref_detach",
+    "xref_bind",
+    "xref_set_path",
+    "xref_set_type",
     "entities_delete",
     "entities_transform",
     "node_graph",
@@ -77,12 +84,19 @@ const ENVELOPE_OPS: &[&str] = &[
     "view_focus",
     "wblock",
     "plot",
+    "capture",
     "embed_image",
+    "dgn_import",
     "set_properties",
     "property",
     "activate",
     "get_selection",
     "getpoint",
+    "layout_create",
+    "layout_rename",
+    "layout_activate",
+    "layout_delete",
+    "page_setup_set",
 ];
 
 /// The port the loopback REST channel serves when `--http` is omitted: plain
@@ -234,23 +248,24 @@ fn listen(mut app: OpenCADStudio, port: u16, bound_port: Arc<AtomicU16>) {
     eprintln!("OpenCADStudio REST listening on http://127.0.0.1:{bound}/api/v1");
     announce_token();
     let (jobs, incoming) = std::sync::mpsc::channel::<Job>();
-    // Connections are served one thread each: a slow op (plot, open a large
-    // drawing) or a client that connects and stalls must never keep other
-    // callers — `state`, `get_selection`, `cancel`, `operation` — from being
-    // accepted and answered.
-    let clients = Arc::new(AtomicUsize::new(0));
+    // Slow connections occupy independent workers without creating a fresh
+    // OS thread for every request or status poll.
+    let workers = match crate::io::connection_workers::ConnectionWorkers::new(
+        "ocs-rest",
+        MAX_CONNECTIONS,
+    ) {
+        Ok(workers) => workers,
+        Err(error) => {
+            eprintln!("--http: cannot start connection workers: {error}");
+            return;
+        }
+    };
     let acceptor = jobs.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            if clients.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                clients.fetch_sub(1, Ordering::SeqCst);
-                continue;
-            }
             let jobs = acceptor.clone();
-            let clients = clients.clone();
-            std::thread::spawn(move || {
+            workers.try_execute(move || {
                 serve_connection(stream, jobs);
-                clients.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -530,7 +545,7 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         }
         ("DELETE", ["documents", id]) => {
             let mut fields = json!({});
-            if let Some(id) = id.parse::<u64>().ok() {
+            if let Ok(id) = id.parse::<u64>() {
                 fields["document_id"] = json!(id);
             }
             if request
@@ -566,9 +581,36 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
             fields: body,
             created: 201,
         },
+        ("GET", ["layouts"]) => Plan::Run {
+            request: json!({"op":"layouts"}),
+            created: 200,
+        },
+        ("GET", ["xrefs"]) => Plan::Run {
+            request: json!({"op":"xrefs"}),
+            created: 200,
+        },
+        ("PATCH", ["layouts", name]) => Plan::Mutate {
+            op: "layout_rename".into(),
+            fields: json!({"name": percent_decode(name), "new_name": body["new_name"]}),
+            created: 200,
+        },
+        ("DELETE", ["layouts", name]) => Plan::Mutate {
+            op: "layout_delete".into(),
+            fields: json!({"name": percent_decode(name)}),
+            created: 200,
+        },
+        ("POST", ["layouts", name, "activate"]) => Plan::Mutate {
+            op: "layout_activate".into(),
+            fields: json!({"name": percent_decode(name)}),
+            created: 200,
+        },
+        ("GET", ["layouts", layout, "page-setup"]) => Plan::Run {
+            request: json!({"op":"page_setup_get","layout":percent_decode(layout)}),
+            created: 200,
+        },
         ("PUT", ["layouts", layout, "page-setup"]) => {
             let mut fields = body;
-            fields["layout"] = json!(layout);
+            fields["layout"] = json!(percent_decode(layout));
             Plan::Mutate {
                 op: "page_setup_set".into(),
                 fields,
@@ -752,9 +794,15 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
         ("POST", ["commands"]) => {
             // Mutate: the "run" op requires a document_id; the Run path never stamps
             // one and would always answer "document_required".
+            let mut fields = json!({"cmd": body["cmd"]});
+            // The GUI channel refuses `run` without the tab's document_id: a
+            // caller-supplied one is honoured on top of the cached id.
+            if let Some(id) = body["document_id"].as_u64() {
+                fields["document_id"] = json!(id);
+            }
             Plan::Mutate {
                 op: "run".into(),
-                fields: json!({"cmd": body["cmd"]}),
+                fields,
                 created: 200,
             }
         }
@@ -849,7 +897,7 @@ pub(crate) fn plan(method: &str, rest: &[&str], request: &HttpRequest) -> Plan {
                 created: 200,
             }
         }
-        (method, _) if matches!(method, "GET" | "POST" | "PUT" | "DELETE") => {
+        (method, _) if matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") => {
             let path = request.path.trim_end_matches('/');
             let path = if path.is_empty() { "/" } else { path };
             Plan::Local(
@@ -995,7 +1043,7 @@ pub(crate) fn map_status(response: Value, created: bool) -> u16 {
         return if created { 201 } else { 200 };
     }
     match response["code"].as_str().unwrap_or("") {
-        "entity_absent" | "unknown_route" => 404,
+        "entity_absent" | "layout_missing" | "xref_missing" | "unknown_route" => 404,
         "stale_state" | "session_changed" | "document_not_active" | "gui_required" => 409,
         "busy" => 503,
         _ => 400,
@@ -1023,6 +1071,143 @@ mod tests {
         assert_eq!(percent_decode("Walls%20and%2BFloors"), "Walls and+Floors");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("bad%2"), "bad%2");
+    }
+
+    #[test]
+    fn layout_routes_decode_names_and_build_core_requests() {
+        let read = |method: &str, segments: &[&str], path: &str| match plan(
+            method,
+            segments,
+            &request(method, path, ""),
+        ) {
+            Plan::Run { request, created } => {
+                assert_eq!(created, 200);
+                request
+            }
+            _ => panic!("layout read must plan a direct automation request"),
+        };
+        let mutate = |method: &str, segments: &[&str], path: &str, body: &str| match plan(
+            method,
+            segments,
+            &request(method, path, body),
+        ) {
+            Plan::Mutate {
+                op,
+                fields,
+                created,
+            } => {
+                assert_eq!(created, 200);
+                (op, fields)
+            }
+            _ => panic!("layout mutation must use the protocol-1 mutation wrapper"),
+        };
+
+        assert_eq!(
+            read("GET", &["layouts"], "/api/v1/layouts"),
+            json!({"op":"layouts"})
+        );
+        assert_eq!(
+            read(
+                "GET",
+                &["layouts", "Floor%20Plan", "page-setup"],
+                "/api/v1/layouts/Floor%20Plan/page-setup",
+            ),
+            json!({"op":"page_setup_get","layout":"Floor Plan"})
+        );
+
+        let (op, fields) = mutate(
+            "PATCH",
+            &["layouts", "Floor%20Plan"],
+            "/api/v1/layouts/Floor%20Plan",
+            r#"{"new_name":"Second Floor"}"#,
+        );
+        assert_eq!(op, "layout_rename");
+        assert_eq!(
+            fields,
+            json!({"name":"Floor Plan","new_name":"Second Floor"})
+        );
+
+        let (op, fields) = mutate(
+            "POST",
+            &["layouts", "Floor%20Plan", "activate"],
+            "/api/v1/layouts/Floor%20Plan/activate",
+            "",
+        );
+        assert_eq!(op, "layout_activate");
+        assert_eq!(fields, json!({"name":"Floor Plan"}));
+
+        let (op, fields) = mutate(
+            "DELETE",
+            &["layouts", "Floor%20Plan"],
+            "/api/v1/layouts/Floor%20Plan",
+            "",
+        );
+        assert_eq!(op, "layout_delete");
+        assert_eq!(fields, json!({"name":"Floor Plan"}));
+
+        let (op, fields) = mutate(
+            "PUT",
+            &["layouts", "Floor%20Plan", "page-setup"],
+            "/api/v1/layouts/Floor%20Plan/page-setup",
+            r#"{"paper":"A4"}"#,
+        );
+        assert_eq!(op, "page_setup_set");
+        assert_eq!(fields, json!({"layout":"Floor Plan","paper":"A4"}));
+    }
+
+    #[test]
+    fn openapi_documents_structured_automation_routes() {
+        let document: Value = serde_json::from_str(include_str!("rest_openapi.json"))
+            .expect("REST OpenAPI document parses");
+        for (path, method) in [
+            ("/api/v1/layouts", "get"),
+            ("/api/v1/layouts", "post"),
+            ("/api/v1/layouts/{name}", "patch"),
+            ("/api/v1/layouts/{name}", "delete"),
+            ("/api/v1/layouts/{name}/activate", "post"),
+            ("/api/v1/layouts/{name}/page-setup", "get"),
+            ("/api/v1/layouts/{name}/page-setup", "put"),
+            ("/api/v1/entities_set", "post"),
+            ("/api/v1/dgn_import", "post"),
+            ("/api/v1/xrefs", "get"),
+            ("/api/v1/xref_reload", "post"),
+            ("/api/v1/xref_unload", "post"),
+            ("/api/v1/xref_detach", "post"),
+            ("/api/v1/xref_bind", "post"),
+            ("/api/v1/xref_set_path", "post"),
+            ("/api/v1/xref_set_type", "post"),
+        ] {
+            assert!(
+                document["paths"][path][method].is_object(),
+                "missing OpenAPI operation {method} {path}"
+            );
+        }
+        for (path, method) in [
+            ("/api/v1/layouts/{name}", "patch"),
+            ("/api/v1/layouts/{name}", "delete"),
+            ("/api/v1/layouts/{name}/activate", "post"),
+            ("/api/v1/layouts/{name}/page-setup", "get"),
+            ("/api/v1/layouts/{name}/page-setup", "put"),
+        ] {
+            assert!(
+                document["paths"][path][method]["responses"]["404"].is_object(),
+                "missing layout_missing response for {method} {path}"
+            );
+        }
+        for operation in [
+            "xref_reload",
+            "xref_unload",
+            "xref_detach",
+            "xref_bind",
+            "xref_set_path",
+            "xref_set_type",
+        ] {
+            let path = format!("/api/v1/{operation}");
+            assert!(
+                document["paths"][&path]["post"]["responses"]["404"].is_object(),
+                "missing xref_missing response for POST {path}"
+            );
+        }
     }
 
     /// One connection that never sends a request must not keep the listener
@@ -1071,12 +1256,42 @@ mod tests {
         assert!(status("Authorization: Bearer guess\r\n").contains("401"));
     }
 
+    /// The fork routes commands through `Mutate`, which stamps the cached
+    /// document_id (the `Run` path never stamps one); a caller-supplied id
+    /// rides on top of it in the fields.
+    #[test]
+    fn commands_forward_document_id() {
+        let fields_for =
+            |body: &str| match plan("POST", &["commands"], &request("POST", "/commands", body)) {
+                Plan::Mutate { op, fields, .. } => {
+                    assert_eq!(op, "run");
+                    fields
+                }
+                _ => panic!("commands must plan a mutate"),
+            };
+        assert_eq!(
+            fields_for(r#"{"cmd":"LINE 0,0 1,1 ","document_id":2}"#)["document_id"],
+            2
+        );
+        assert!(fields_for(r#"{"cmd":"AUDIT N"}"#)
+            .get("document_id")
+            .is_none());
+    }
+
     #[test]
     fn failure_codes_map_to_http_statuses() {
         assert_eq!(map_status(json!({"ok": true}), false), 200);
         assert_eq!(map_status(json!({"ok": true}), true), 201);
         assert_eq!(
             map_status(json!({"ok": false, "code": "entity_absent"}), false),
+            404
+        );
+        assert_eq!(
+            map_status(json!({"ok": false, "code": "layout_missing"}), false),
+            404
+        );
+        assert_eq!(
+            map_status(json!({"ok": false, "code": "xref_missing"}), false),
             404
         );
         assert_eq!(
@@ -1088,6 +1303,32 @@ mod tests {
             map_status(json!({"ok": false, "code": "invalid_point"}), false),
             400
         );
+    }
+
+    #[test]
+    fn xrefs_listing_uses_the_structured_read() {
+        match plan("GET", &["xrefs"], &request("GET", "/api/v1/xrefs", "")) {
+            Plan::Run { request, created } => {
+                assert_eq!(created, 200);
+                assert_eq!(request, json!({"op":"xrefs"}));
+            }
+            _ => panic!("xrefs must plan a direct read"),
+        }
+    }
+
+    #[test]
+    fn entity_and_dgn_passthroughs_use_protocol_envelopes() {
+        for (operation, body) in [
+            ("entities_set", r#"{"handles":["2A"],"color":"ByLayer"}"#),
+            ("dgn_import", r#"{"path":"site.dgn"}"#),
+            ("xref_set_type", r#"{"id":"2A","reference_type":"overlay"}"#),
+        ] {
+            let path = format!("/api/v1/{operation}");
+            match plan("POST", &[operation], &request("POST", &path, body)) {
+                Plan::Mutate { op, .. } => assert_eq!(op, operation),
+                _ => panic!("{operation} must use the protocol-1 mutation wrapper"),
+            }
+        }
     }
 
     /// The generic `POST /api/v1/{op}` passthrough must reach the protocol-1
@@ -1403,6 +1644,64 @@ mod tests {
         assert_eq!(body["result"]["layout"], "PLAN");
         assert!(body["result"]["paper"].as_str().unwrap().contains("ISO_A4"));
         assert_eq!(body["result"]["scale"]["fit"], true);
+
+        let (status, body) = route(
+            &mut app,
+            &request("GET", "/api/v1/layouts", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body["layouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|layout| layout["name"] == "PLAN"));
+        let (status, body) = route(
+            &mut app,
+            &request(
+                "PATCH",
+                "/api/v1/layouts/plan",
+                r#"{"new_name":"Floor Plan"}"#,
+            ),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["new_name"], "Floor Plan");
+        let (status, body) = route(
+            &mut app,
+            &request("POST", "/api/v1/layouts/floor%20plan/activate", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["current"], "Floor Plan");
+        let (status, body) = route(
+            &mut app,
+            &request("GET", "/api/v1/layouts/Floor%20Plan/page-setup", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["layout"], "Floor Plan");
+        assert_eq!(body["page_setup"]["orientation"], "landscape");
+        let (status, body) = route(
+            &mut app,
+            &request("DELETE", "/api/v1/layouts/Floor%20Plan", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["current"], "Model");
+        let (status, body) = route(
+            &mut app,
+            &request("GET", "/api/v1/layouts/Floor%20Plan/page-setup", ""),
+            &mut document_id,
+            &mut counter,
+        );
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["code"], "layout_missing");
 
         // Groups and selection sets address the drawing's entities (the
         // created layout also owns a sheet viewport, so filter to circles).

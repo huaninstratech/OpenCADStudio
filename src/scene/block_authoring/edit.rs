@@ -1,8 +1,8 @@
 //! Editor picking and native definition-point edits. No proxy drawing entities.
 use super::*;
 use crate::scene::block_distance_parameter::{self as distance, Graphic};
-use codec::objects::{BlockGrip, BlockTwoPointParameter};
-use codec::types::Vector3;
+use document::objects::{BlockGrip, BlockTwoPointParameter};
+use document::types::Vector3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
@@ -144,7 +144,11 @@ pub fn items(doc: &Document, definition: Handle) -> Vec<Item> {
             if let ObjectType::DynamicBlock(object) = object {
                 if object.owner == owner {
                     if let DynamicBlockData::PropertiesTable(table) = &object.data {
-                        result.push(single(*handle, table.parameter.parameter.element.name.clone(), table.parameter.definition_point));
+                        result.push(single(
+                            *handle,
+                            table.parameter.parameter.element.name.clone(),
+                            table.parameter.definition_point,
+                        ));
                     }
                 }
             }
@@ -173,7 +177,12 @@ pub fn items(doc: &Document, definition: Handle) -> Vec<Item> {
         result.push(item);
     }
     for item in &mut result {
-        let _ = crate::scene::block_grips::config::apply_graphic(doc, definition, item.handle, &mut item.graphic);
+        let _ = crate::scene::block_grips::config::apply_graphic(
+            doc,
+            definition,
+            item.handle,
+            &mut item.graphic,
+        );
     }
     result
 }
@@ -236,8 +245,12 @@ pub fn move_part(
     if (at - old).length() < 1e-10 {
         return Ok(false);
     }
-    let native_grips = if crate::scene::block_grips::config::choices(doc, definition, handle).is_empty() { vec![] }
-        else { crate::scene::block_grips::config::locations(doc, definition, handle)? };
+    let native_grips =
+        if crate::scene::block_grips::config::choices(doc, definition, handle).is_empty() {
+            vec![]
+        } else {
+            crate::scene::block_grips::config::locations(doc, definition, handle)?
+        };
     let mut staged = doc.clone();
     if handle == definition
         || crate::scene::block_basepoint::parameter(doc, definition)
@@ -285,8 +298,10 @@ pub fn move_part(
                 }
             }
             if let DynamicBlockData::XYParameter(p) = &mut object.data {
-                p.x_value = p.parameter.definition_end_point.x - p.parameter.definition_base_point.x;
-                p.y_value = p.parameter.definition_end_point.y - p.parameter.definition_base_point.y;
+                p.x_value =
+                    p.parameter.definition_end_point.x - p.parameter.definition_base_point.x;
+                p.y_value =
+                    p.parameter.definition_end_point.y - p.parameter.definition_base_point.y;
             }
             match &mut object.data {
                 DynamicBlockData::PointParameter(p) => match part {
@@ -426,7 +441,11 @@ pub fn move_part(
                     if o.owner == graph {
                         if let DynamicBlockData::LinearGrip(g) = &mut o.data {
                             if ids.contains(&g.grip.element.eval.node_id) {
-                                g.orientation = if ids[0] == g.grip.element.eval.node_id { orientation * -1.0 } else { orientation };
+                                g.orientation = if ids[0] == g.grip.element.eval.node_id {
+                                    orientation * -1.0
+                                } else {
+                                    orientation
+                                };
                             }
                         }
                     }
@@ -466,9 +485,18 @@ pub fn move_part(
     if !native_grips.is_empty() {
         let updated = crate::scene::block_grips::config::locations(&staged, definition, handle)?;
         for original in native_grips {
-            let current = updated.iter().find(|grip| grip.handle == original.handle).ok_or("The native grip binding changed during the edit.")?;
+            let current = updated
+                .iter()
+                .find(|grip| grip.handle == original.handle)
+                .ok_or("The native grip binding changed during the edit.")?;
             let point = current.key_point + (original.point - original.key_point);
-            crate::scene::block_grips::config::set_location(&mut staged, definition, handle, original.role, point)?;
+            crate::scene::block_grips::config::set_location(
+                &mut staged,
+                definition,
+                handle,
+                original.role,
+                point,
+            )?;
         }
     }
     if let Some(item) = items(&staged, definition)
@@ -760,8 +788,8 @@ mod tests {
                 }
             }
         }
-        let bytes = codec::DxfWriter::new(doc).write_to_vec().unwrap();
-        let saved = codec::DxfReader::from_reader(std::io::Cursor::new(bytes))
+        let bytes = document::DxfWriter::new(doc).write_to_vec().unwrap();
+        let saved = document::DxfReader::from_reader(std::io::Cursor::new(bytes))
             .unwrap()
             .read()
             .unwrap();

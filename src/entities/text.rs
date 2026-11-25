@@ -1,6 +1,5 @@
-use codec::entities::{Text, TextHorizontalAlignment as HA, TextVerticalAlignment as VA};
+use document::entities::{Text, TextHorizontalAlignment as HA, TextVerticalAlignment as VA};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     edit_angle_prop as edit_angle, edit_prop as edit, num_prop as num_row, parse_f64,
     ro_prop as ro, square_grip,
@@ -9,6 +8,7 @@ use crate::entities::text_support::{
     resolve_dxf_special_chars, resolve_text_style, text_local_bounds,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{GlyphRun, RenderEntity, RenderObject, TextStroke};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -53,7 +53,7 @@ pub(crate) fn sync_text_alignment_point(t: &mut Text) {
                     * t.width_factor.abs().max(0.01)
                     * t.value.chars().count().max(1) as f64
                     * 0.6;
-                t.alignment_point = Some(codec::types::Vector3::new(
+                t.alignment_point = Some(document::types::Vector3::new(
                     t.insertion_point.x + t.rotation.cos() * span,
                     t.insertion_point.y + t.rotation.sin() * span,
                     t.insertion_point.z,
@@ -101,13 +101,13 @@ pub struct TextPlacement {
     pub wcs_insertion: [f64; 3],
 }
 
-/// Parse a TEXT value's `%%` control codes through opencadcodec's `parse_plain_text`
+/// Parse a TEXT value's `%%` control codes through document's `parse_plain_text`
 /// (the same parser MTEXT uses), then re-encode into the stroke tessellator's
 /// inline grammar: specials arrive resolved to Unicode, and `%%u`/`%%o`
 /// underline/overline become `\L…\l` / `\O…\o` decoration markers. This keeps
-/// TEXT parsing in opencadcodec rather than OCS's own tokenizer.
+/// TEXT parsing in document rather than OCS's own tokenizer.
 pub(crate) fn acad_text_encode(value: &str) -> String {
-    use codec::entities::mtext_format::parse_plain_text;
+    use document::entities::mtext_format::parse_plain_text;
     let doc = parse_plain_text(value);
     let mut out = String::new();
     for para in &doc.paragraphs {
@@ -133,12 +133,12 @@ pub(crate) fn acad_text_encode(value: &str) -> String {
 
 pub(crate) fn to_render_at_scale(
     t: &Text,
-    document: &codec::Document,
+    document: &document::Document,
     annotation_scale: f32,
 ) -> RenderEntity {
     let p = text_run_placement_at_scale(t, document, annotation_scale);
     let snap_pt = glam::DVec3::new(p.wcs_insertion[0], p.wcs_insertion[1], p.wcs_insertion[2]);
-    // Parse `%%` codes via opencadcodec, re-encoded for the stroke tessellator.
+    // Parse `%%` codes via document, re-encoded for the stroke tessellator.
     let value = acad_text_encode(&p.value);
     // Strokes are in glyph-local space (origin = [0,0]).
     let (strokes, fill_tris) = lff::tessellate_text_ex(
@@ -186,7 +186,7 @@ pub(crate) fn to_render_at_scale(
 /// from `to_render` verbatim so the stroke and SDF-quad paths agree exactly.
 pub fn text_run_placement_at_scale(
     t: &Text,
-    document: &codec::Document,
+    document: &document::Document,
     annotation_scale: f32,
 ) -> TextPlacement {
     let annotation_scale = if annotation_scale.is_finite() && annotation_scale > 1.0e-9 {
@@ -221,11 +221,9 @@ pub fn text_run_placement_at_scale(
     let eff_backward = resolved_style.is_backward ^ (t.generation_flags & 0x2 != 0);
     let eff_upside = resolved_style.is_upside_down ^ (t.generation_flags & 0x4 != 0);
     let mut width_factor = if eff_backward { -base_wf } else { base_wf };
-    let oblique_angle = if t.oblique_angle.abs() > 1e-9 {
-        t.oblique_angle as f32
-    } else {
-        resolved_style.oblique_angle
-    };
+    // An oblique angle of 0 is the text's own (an upright text of a slanted
+    // style stays upright); only the width factor, never 0, falls back.
+    let oblique_angle = t.oblique_angle as f32;
     let value_for_bounds = resolve_dxf_special_chars(&t.value);
     let mut height = t.height.max(1.0e-9) as f32;
     let mut base_rotation = t.rotation as f32;
@@ -336,9 +334,7 @@ pub(crate) fn justification_offset(
     let ay = match v {
         _ if matches!(h, HA::Middle) => (b.ink_min[1] + b.ink_max[1]) * 0.5,
         VA::Baseline => 0.0,
-        VA::Bottom => {
-            -height * crate::entities::text_support::descent_ratio(font_name)
-        }
+        VA::Bottom => -height * crate::entities::text_support::descent_ratio(font_name),
         VA::Middle => height * 0.5,
         VA::Top => height,
     };
@@ -362,7 +358,7 @@ fn grips(t: &Text) -> Vec<GripDef> {
 /// alignment is exposed separately as calculated coordinates; for aligned
 /// and fit text Position is the first endpoint, for every other non-left
 /// mode the alignment anchor that actually places the glyph run.
-pub(crate) fn position(t: &Text) -> codec::types::Vector3 {
+pub(crate) fn position(t: &Text) -> document::types::Vector3 {
     let is_plain_left =
         matches!(t.horizontal_alignment, HA::Left) && matches!(t.vertical_alignment, VA::Baseline);
     let is_two_point = matches!(t.horizontal_alignment, HA::Aligned | HA::Fit);
@@ -441,12 +437,13 @@ fn properties(t: &Text, text_style_names: &[String]) -> Vec<PropSection> {
                     },
                 },
                 // A style that fixes its height fixes this text's too, so the
-                // value shows but cannot be changed here.
-                crate::entities::common::num_prop(
+                // value shows read-only with a tooltip explaining why.
+                crate::entities::common::text_height_prop(
                     t!("Height").as_ref(),
                     "height",
                     t.height,
-                    !is_aligned && crate::entities::common::style_fixed_height(&t.style).is_none(),
+                    &t.style,
+                    !is_aligned,
                 ),
                 if is_two_point {
                     ro(
@@ -584,7 +581,6 @@ fn apply_geom_prop(t: &mut Text, field: &str, value: &str) {
         }
         "align_x" | "align_y" | "align_z" => {
             // Calculated display rows are intentionally not writable.
-            return;
         }
         "height" if v > 0.0 && !matches!(t.horizontal_alignment, HA::Aligned) => t.height = v,
         "rotation" if !matches!(t.horizontal_alignment, HA::Aligned | HA::Fit) => {
@@ -623,7 +619,8 @@ fn apply_grip(t: &mut Text, grip_id: usize, apply: GripApply) {
 }
 
 fn apply_transform(t: &mut Text, tr: &EntityTransform) {
-    crate::scene::view::transform::apply_standard_entity_transform(t, tr, |entity, p1, p2| {
+    let normal = t.normal;
+    crate::scene::view::transform::apply_ocs_entity_transform(t, tr, normal, |entity, p1, p2| {
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.insertion_point.x,
             &mut entity.insertion_point.y,
@@ -633,8 +630,8 @@ fn apply_transform(t: &mut Text, tr: &EntityTransform) {
         if let Some(ref mut a) = entity.alignment_point {
             crate::scene::view::transform::reflect_xy_point(&mut a.x, &mut a.y, p1, p2);
         }
-        let dx = (p2.x - p1.x) as f64;
-        let dy = (p2.y - p1.y) as f64;
+        let dx = p2.x - p1.x;
+        let dy = p2.y - p1.y;
         let line_angle = dy.atan2(dx);
         entity.rotation = 2.0 * line_angle - entity.rotation;
         entity.oblique_angle = -entity.oblique_angle;
@@ -642,7 +639,7 @@ fn apply_transform(t: &mut Text, tr: &EntityTransform) {
 }
 
 impl RenderConvertible for Text {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         Some(to_render_at_scale(self, document, 1.0))
     }
 }
@@ -716,14 +713,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_arabic_text_placement() {
+    fn arabic_text_placement() {
         let mut t = Text::default();
         t.value = "بسم الله".to_string();
         t.height = 2.5;
-        t.insertion_point = codec::types::Vector3::new(10.0, 20.0, 0.0);
+        t.insertion_point = document::types::Vector3::new(10.0, 20.0, 0.0);
         t.horizontal_alignment = HA::Left;
 
-        let doc = codec::Document::default();
+        let doc = document::Document::default();
         let placement = text_run_placement_at_scale(&t, &doc, 1.0);
 
         // Left alignment does not depend on the script: Arabic text starts
@@ -752,7 +749,7 @@ impl Transformable for Text {
     }
 }
 
-impl crate::entities::traits::TextContent for codec::entities::Text {
+impl crate::entities::traits::TextContent for document::entities::Text {
     fn text_content(&self) -> Option<String> {
         Some(self.value.clone())
     }

@@ -177,6 +177,18 @@ fn file_name_only(path: &str) -> String {
     base.to_string()
 }
 
+/// The path type a stored reference path already has: a rooted path is
+/// `Full`, a bare file name `None`, anything else `Relative`.
+pub fn pathtype_of(path: &str) -> Pathtype {
+    if !is_relative_path(&normalize_display(path)) {
+        Pathtype::Full
+    } else if path.contains(['/', '\\']) {
+        Pathtype::Relative
+    } else {
+        Pathtype::None
+    }
+}
+
 /// Fallible pathtype conversion. `Full` and `None` always succeed;
 /// `Relative` fails with [`PathtypeError::AcrossDrives`] when drive letters
 /// or UNC hosts differ (UNC vs drive-letter counts as different), and with
@@ -277,6 +289,16 @@ pub fn to_pathtype(path: &str, host: &std::path::Path, pathtype: Pathtype) -> St
 /// Case-insensitive name match: `*` matches any run (including empty),
 /// `?` matches exactly one char.
 pub fn wildcard_match(name: &str, pattern: &str) -> bool {
+    wildcard_match_inner(name, pattern, false)
+}
+
+/// [`wildcard_match`] where `#` also matches one digit (or a literal `#`), as
+/// the selection filters read it.
+pub fn wildcard_match_with_digits(name: &str, pattern: &str) -> bool {
+    wildcard_match_inner(name, pattern, true)
+}
+
+fn wildcard_match_inner(name: &str, pattern: &str, digits: bool) -> bool {
     let n: Vec<char> = name.chars().flat_map(|c| c.to_lowercase()).collect();
     let p: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
     let mut si = 0usize;
@@ -289,7 +311,11 @@ pub fn wildcard_match(name: &str, pattern: &str) -> bool {
             star = Some(pi);
             match_idx = si;
             pi += 1;
-        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[si]) {
+        } else if pi < p.len()
+            && (p[pi] == '?'
+                || p[pi] == n[si]
+                || (digits && p[pi] == '#' && n[si].is_ascii_digit()))
+        {
             si += 1;
             pi += 1;
         } else if let Some(s) = star {
@@ -324,6 +350,7 @@ pub enum RefKind {
 /// produces them yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefStatus {
+    Circular,
     Loaded,
     Unloaded,
     NotFound,
@@ -369,6 +396,9 @@ pub struct ReferenceEntry {
     pub saved_path: String,
     pub found_at: Option<String>,
     pub parent_key: Option<u64>,
+    pub owner_resource: Option<u64>,
+    pub source_id: Option<u64>,
+    pub diagnostic: Option<String>,
 }
 
 impl ReferenceEntry {
@@ -384,6 +414,9 @@ impl ReferenceEntry {
             saved_path: String::new(),
             found_at: None,
             parent_key: None,
+            owner_resource: None,
+            source_id: None,
+            diagnostic: None,
         }
     }
 
@@ -514,6 +547,27 @@ pub enum UnloadKey {
 pub struct UnloadSet(pub std::collections::HashSet<UnloadKey>);
 
 impl UnloadSet {
+    /// The direct references `doc` stores as unloaded.
+    pub fn from_document(doc: &document::Document) -> Self {
+        let mut set = Self::default();
+        for br in doc.block_records.iter() {
+            if (br.flags.is_xref || br.flags.is_xref_overlay) && br.flags.is_xref_unloaded {
+                set.add(br.handle.value());
+            }
+        }
+        set
+    }
+
+    /// Store this session's load state on `doc`'s xref records, so a save
+    /// keeps which references are unloaded.
+    pub fn write_flags(&self, doc: &mut document::Document) {
+        for br in doc.block_records.iter_mut() {
+            if br.flags.is_xref || br.flags.is_xref_overlay {
+                br.flags.is_xref_unloaded = self.is_unloaded(br.handle.value());
+            }
+        }
+    }
+
     pub fn add(&mut self, key: u64) {
         self.0.insert(UnloadKey::Direct(key));
     }
@@ -572,6 +626,7 @@ impl RefStatCache {
 
 #[cfg(test)]
 mod tests {
+    use super::wildcard_match_with_digits;
     use super::{bind_symbol, bind_symbol_taken, RefKind, ReferenceEntry};
     use super::{child_key, decide_status, RefStatCache, RefStatus, UnloadSet};
     use super::{
@@ -767,9 +822,9 @@ mod tests {
     // every SPIKE1 cell survived the round trip.
     #[cfg(not(target_arch = "wasm32"))]
     fn roundtrip_probe(ext: &str) {
-        use codec::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
-        use codec::tables::BlockRecord;
-        use codec::Document;
+        use document::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
+        use document::tables::BlockRecord;
+        use document::Document;
 
         let dir = std::env::temp_dir().join(format!(
             "ocs_xref_probe_{}_{}",
@@ -879,6 +934,10 @@ mod tests {
     #[test]
     fn wildcard_name_match_case_insensitive() {
         assert!(wildcard_match("PLAN-East", "plan-*"));
+        // `#` is a digit only for the selection filters; names keep it literal.
+        assert!(wildcard_match("A#", "A#") && !wildcard_match("A1", "A#"));
+        assert!(wildcard_match_with_digits("A1", "A#") && wildcard_match_with_digits("A#", "A#"));
+        assert!(!wildcard_match_with_digits("AB", "A#"));
         assert!(wildcard_match("A1", "a?"));
         assert!(!wildcard_match("A12", "a?"));
     }

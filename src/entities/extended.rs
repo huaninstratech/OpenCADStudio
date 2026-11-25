@@ -1,16 +1,16 @@
 use crate::t;
-use codec::entities::{
+use document::entities::{
     ArcAlignedTextData, ExtendedEntity, ExtendedEntityData, GeoPositionMarkerData, PointCloudData,
     PointCloudExData, RemoteTextData, SectionObjectData,
 };
-use codec::types::{Handle, Transform, Vector3};
-use codec::xdata::{ExtendedDataRecord, XDataValue};
+use document::types::{Handle, Transform, Vector3};
+use document::xdata::{ExtendedDataRecord, XDataValue};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_angle_prop, edit_prop, parse_f64, ro_prop, square_grip,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{
     GripApply, GripDef, GripMenuAction, GripMenuItem, PropSection, PropValue, Property,
@@ -249,7 +249,11 @@ fn arc_aligned_text_render(data: &ArcAlignedTextData) -> RenderEntity {
         let (axis_x, axis_y, normal) = plane_axes(data.normal);
         // The centre in the text plane's own coordinates.
         let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
-        let (cx, cy, elevation) = (dot(center, axis_x), dot(center, axis_y), dot(center, normal));
+        let (cx, cy, elevation) = (
+            dot(center, axis_x),
+            dot(center, axis_y),
+            dot(center, normal),
+        );
         let size = data.text_size.abs();
         let x_scale = data.x_scale.abs().max(0.01);
         // Outward text stands on the arc reading clockwise; inward text hangs
@@ -366,7 +370,10 @@ fn arc_aligned_text_render(data: &ArcAlignedTextData) -> RenderEntity {
     RenderEntity {
         pick_tris: Vec::new(),
         object: RenderObject::Text(runs),
-        snap_pts: vec![(glam::DVec3::new(center.x, center.y, center.z), SnapHint::Center)],
+        snap_pts: vec![(
+            glam::DVec3::new(center.x, center.y, center.z),
+            SnapHint::Center,
+        )],
         tangent_geoms: vec![],
         key_vertices: vec![[center.x, center.y, center.z]],
         fill_tris: vec![],
@@ -552,7 +559,7 @@ fn point_cloud_clip_lines(data: &PointCloudData) -> Vec<[f64; 3]> {
 /// The cloud's extents box, placed in the drawing. Its points are drawn from
 /// the scan file; the box only picks the cloud, unless the file cannot be
 /// found: then the box shows, with the saved path written across it.
-fn point_cloud_ex_lines(data: &PointCloudExData, document: &codec::Document) -> Vec<[f64; 3]> {
+fn point_cloud_ex_lines(data: &PointCloudExData, document: &document::Document) -> Vec<[f64; 3]> {
     let mut points = point_cloud_ex_box(data);
     if crate::scene::model::point_cloud::resolve_source(document, data).is_none() {
         let saved = crate::scene::model::point_cloud::definition(document, data)
@@ -564,7 +571,7 @@ fn point_cloud_ex_lines(data: &PointCloudExData, document: &codec::Document) -> 
 }
 
 fn point_cloud_ex_box(data: &PointCloudExData) -> Vec<[f64; 3]> {
-    let corners = codec::entities::point_cloud_ex_corners(data).map(|c| [c.x, c.y, c.z]);
+    let corners = document::entities::point_cloud_ex_corners(data).map(|c| [c.x, c.y, c.z]);
     let mut points = Vec::new();
     for a in 0..8 {
         for bit in [1, 2, 4] {
@@ -624,7 +631,7 @@ fn append_missing_cloud_label(points: &mut Vec<[f64; 3]>, data: &PointCloudExDat
                     center[1] + (y as f64 - mid[1]) * scale,
                     min.z,
                 );
-                let p = codec::entities::point_cloud_ex_to_world(data, local);
+                let p = document::entities::point_cloud_ex_to_world(data, local);
                 [p.x, p.y, p.z]
             }),
         );
@@ -641,7 +648,7 @@ fn point_cloud_ex_clip_lines(data: &PointCloudExData) -> Vec<[f64; 3]> {
             // Crop points are kept in the cloud's own coordinates; the crop
             // runs along the normal of the plane its two directions span.
             let place = |p: Vector3| {
-                let w = codec::entities::point_cloud_ex_to_world(data, p);
+                let w = document::entities::point_cloud_ex_to_world(data, p);
                 [w.x, w.y, w.z]
             };
             // A circle is stored as its centre and a point on it.
@@ -675,7 +682,7 @@ pub(crate) fn point_cloud_frame_lines(entity: &ExtendedEntity) -> Option<Vec<[f6
     }
 }
 
-fn camera_lines(document: &codec::Document, view_handle: Handle) -> Vec<[f64; 3]> {
+fn camera_lines(document: &document::Document, view_handle: Handle) -> Vec<[f64; 3]> {
     // CAMERADISPLAY 0 hides every camera glyph.
     if !document.header.camera_display {
         return Vec::new();
@@ -717,9 +724,12 @@ fn camera_lines(document: &codec::Document, view_handle: Handle) -> Vec<[f64; 3]
     points
 }
 
-fn to_render(entity: &ExtendedEntity, document: &codec::Document) -> Option<RenderEntity> {
+fn to_render(entity: &ExtendedEntity, document: &document::Document) -> Option<RenderEntity> {
     if let ExtendedEntityData::ArcAlignedText(data) = &entity.data {
         return Some(arc_aligned_text_render(data));
+    }
+    if let ExtendedEntityData::Arch(data) = &entity.data {
+        return crate::entities::civil::render(data, entity.common.handle.value(), document);
     }
     let (points, snaps, keys): (Vec<[f64; 3]>, Vec<(glam::DVec3, SnapHint)>, Vec<[f64; 3]>) =
         match &entity.data {
@@ -1604,7 +1614,7 @@ pub(crate) fn validate_point_cloud_property(field: &str, value: &str) -> Result<
     Ok(())
 }
 
-fn semantic_properties(properties: &[codec::objects::SemanticProperty]) -> String {
+fn semantic_properties(properties: &[document::objects::SemanticProperty]) -> String {
     properties
         .iter()
         .map(|property| {
@@ -1617,12 +1627,89 @@ fn semantic_properties(properties: &[codec::objects::SemanticProperty]) -> Strin
         .join("\n")
 }
 
-fn reference_properties(references: &[codec::objects::ProxyObjectReference]) -> String {
+fn reference_properties(references: &[document::objects::ProxyObjectReference]) -> String {
     references
         .iter()
         .map(|reference| format!("{:X}: {:?}", reference.handle.value(), reference.kind))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A Civil 3D alignment's start station, design speeds and station
+/// equations (raw station back, then the station ahead; a down arrow for
+/// stations that decrease after it).
+fn alignment_properties(data: &document::classes::arch::ArchEntityData) -> Vec<crate::scene::model::object::Property> {
+    let mut props = Vec::new();
+    if let Some(name) = data.alignment_name() {
+        props.push(ro_prop(t!("Name").as_ref(), "ext_civil_name", name));
+    }
+    if let Some(kind) = data.alignment_type() {
+        props.push(ro_prop(t!("Alignment Type").as_ref(), "ext_civil_alignment_type", format!("{kind:?}")));
+    }
+    if let Some(criteria) = data.alignment_criteria() {
+        props.push(ro_prop(t!("Criteria-Based Design").as_ref(), "ext_civil_criteria", yes_no(criteria.criteria_based_design)));
+    }
+    if let Some(offset) = data.alignment_offset_parameters() {
+        let side = if offset.left { t!("Left") } else { t!("Right") };
+        props.push(ro_prop(t!("Offset").as_ref(), "ext_civil_offset", format!("{:.3} {side}", offset.offset)));
+    }
+    if let Some(start) = data.alignment_start_station() {
+        props.push(ro_prop(t!("Start Station").as_ref(), "ext_civil_start_station", format!("{start:.3}")));
+    }
+    let speeds = data.alignment_design_speeds();
+    if !speeds.is_empty() {
+        let text = speeds.iter().map(|s| format!("{:.3}: {}", s.station, s.speed)).collect::<Vec<_>>().join("\n");
+        props.push(ro_prop(t!("Design Speeds").as_ref(), "ext_civil_design_speeds", text));
+    }
+    let equations = data.alignment_station_equations();
+    if !equations.is_empty() {
+        let text = equations
+            .iter()
+            .map(|e| format!("{:.3} → {:.3}{}", e.raw, e.ahead, if e.increasing { "" } else { " ↓" }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        props.push(ro_prop(t!("Station Equations").as_ref(), "ext_civil_station_equations", text));
+    }
+    props
+}
+
+fn yes_no(flag: bool) -> String {
+    if flag { t!("Yes") } else { t!("No") }.into_owned()
+}
+
+/// What a Civil 3D object of `kind` keeps beyond its geometry: names,
+/// design settings, sample line stations.
+fn civil_properties(data: &document::classes::arch::ArchEntityData, kind: document::classes::civil::CivilKind) -> Vec<crate::scene::model::object::Property> {
+    use document::classes::civil::CivilKind;
+    let named = |(name, description): (String, String)| {
+        let mut props = vec![ro_prop(t!("Name").as_ref(), "ext_civil_name", name)];
+        if !description.is_empty() {
+            props.push(ro_prop(t!("Description").as_ref(), "ext_civil_description", description));
+        }
+        props
+    };
+    match kind {
+        CivilKind::Alignment => alignment_properties(data),
+        CivilKind::Profile => {
+            let mut props: Vec<_> = data.profile_name().map(|name| ro_prop(t!("Name").as_ref(), "ext_civil_name", name)).into_iter().collect();
+            if let Some(criteria) = data.profile_criteria() {
+                props.push(ro_prop(t!("Criteria-Based Design").as_ref(), "ext_civil_criteria", yes_no(criteria.criteria_based_design)));
+            }
+            props
+        }
+        CivilKind::Parcel => data.face_name().map(named).unwrap_or_default(),
+        CivilKind::Other if data.dxf_name == "AECC_FEATURE_LINE" => data.feature_line_name().map(named).unwrap_or_default(),
+        CivilKind::SampleLineGroup => data
+            .sample_lines()
+            .map(|lines| {
+                vec![
+                    ro_prop(t!("Stations").as_ref(), "ext_civil_stations", lines.stations.len().to_string()),
+                    ro_prop(t!("Swath Width").as_ref(), "ext_civil_swath", format!("{:.3} / {:.3}", lines.left, lines.right)),
+                ]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 fn properties(entity: &ExtendedEntity) -> Vec<PropSection> {
@@ -1636,13 +1723,28 @@ fn properties(entity: &ExtendedEntity) -> Vec<PropSection> {
             )],
         }],
         ExtendedEntityData::SectionObject(data) => section_properties(entity, data),
-        ExtendedEntityData::Arch(data) => vec![PropSection {
-            title: t!("Class").into_owned(),
-            props: vec![
-                ro_prop(t!("Class").as_ref(), "ext_arch_class", data.dxf_name.clone()),
-                ro_prop(t!("Kind").as_ref(), "ext_arch_kind", format!("{:?}", data.kind)),
-            ],
-        }],
+        ExtendedEntityData::Arch(data) => {
+            let mut props = vec![
+                ro_prop(
+                    t!("Class").as_ref(),
+                    "ext_arch_class",
+                    data.dxf_name.clone(),
+                ),
+                ro_prop(
+                    t!("Kind").as_ref(),
+                    "ext_arch_kind",
+                    data.civil_kind()
+                        .map_or_else(|| format!("{:?}", data.kind), |kind| format!("{kind:?}")),
+                ),
+            ];
+            if let Some(kind) = data.civil_kind() {
+                props.extend(civil_properties(data, kind));
+            }
+            vec![PropSection {
+                title: t!("Class").into_owned(),
+                props,
+            }]
+        }
         ExtendedEntityData::ArcAlignedText(data) => arc_text_properties(data),
         ExtendedEntityData::RemoteText(data) => remote_text_properties(data),
         ExtendedEntityData::GeoPositionMarker(data) => geo_marker_properties(data),
@@ -2454,11 +2556,11 @@ fn apply_transform(entity: &mut ExtendedEntity, requested: &EntityTransform) {
             data.radius *= scale;
             data.landing_gap *= scale;
             if let Some(text) = data.embedded_mtext.as_mut() {
-                codec::Entity::apply_transform(text, &transform);
+                document::Entity::apply_transform(text, &transform);
             }
         }
         ExtendedEntityData::CoordinationModel(data) => {
-            let mut matrix = codec::types::Matrix4::zero();
+            let mut matrix = document::types::Matrix4::zero();
             for row in 0..4 {
                 for column in 0..4 {
                     matrix.m[row][column] = data.transform[row * 4 + column];
@@ -2531,7 +2633,7 @@ fn apply_transform(entity: &mut ExtendedEntity, requested: &EntityTransform) {
 }
 
 impl RenderConvertible for ExtendedEntity {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         to_render(self, document)
     }
 }
@@ -2631,8 +2733,8 @@ impl Transformable for ExtendedEntity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::EntityCommon;
-    use codec::types::Color;
+    use document::entities::EntityCommon;
+    use document::types::Color;
 
     #[test]
     fn reselecting_slice_keeps_its_depth() {

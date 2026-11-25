@@ -1,16 +1,14 @@
-use codec::entities::{LwPolyline, LwVertex};
-use kernel::geom2d::{
-    Curve, Polyline, PolylineVertex, RectangleFrame, Tolerance, Vec2,
-};
+use document::entities::{LwPolyline, LwVertex};
+use ocs_geom::geom2d::{Curve, Polyline, PolylineVertex, RectangleFrame, Tolerance, Vec2};
 
 use crate::t;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
-    edit_prop as edit, format_area, format_length, parse_f64,
-    rectangle_grip, ro_prop as ro, square_grip, stepper_prop as stepper, VARIES_LABEL,
+    edit_prop as edit, format_area, format_length, parse_f64, rectangle_grip, ro_prop as ro,
+    square_grip, stepper_prop as stepper, VARIES_LABEL,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{extrusion_wall_tris, RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::TangentGeom;
@@ -48,6 +46,18 @@ pub(crate) fn lwpolyline_global_width(pline: &LwPolyline) -> Option<f64> {
         }
     }
     Some(w0)
+}
+
+/// Append a provisional vertex on the end of an open polyline, joined to the
+/// old end by a straight segment.
+fn append_end_vertex(pline: &mut LwPolyline) {
+    let Some(last) = pline.vertices.last_mut() else {
+        return;
+    };
+    last.bulge = 0.0;
+    let mut new_v = *last;
+    new_v.vertex_id = 0;
+    pline.vertices.push(new_v);
 }
 
 /// Midpoint position on an arc segment defined by its bulge.
@@ -145,12 +155,12 @@ pub(crate) fn split_bulges_from_point(
 /// ensures this placement originated from an arc, so straight-segment Add
 /// Vertex remains two straight segments when the cursor moves off the chord.
 pub(crate) fn refit_added_arc_vertex(
-    entity: &mut codec::EntityType,
+    entity: &mut document::EntityType,
     vertex_id: usize,
     original_bulge: f64,
 ) {
     match entity {
-        codec::EntityType::LwPolyline(polyline) => {
+        document::EntityType::LwPolyline(polyline) => {
             let n = polyline.vertices.len();
             if vertex_id == 0 || vertex_id >= n {
                 return;
@@ -171,7 +181,7 @@ pub(crate) fn refit_added_arc_vertex(
             polyline.vertices[prev].bulge = first.clamp(-1e6, 1e6);
             polyline.vertices[vertex_id].bulge = second.clamp(-1e6, 1e6);
         }
-        codec::EntityType::Polyline2D(polyline) => {
+        document::EntityType::Polyline2D(polyline) => {
             let n = polyline.vertices.len();
             if vertex_id == 0 || vertex_id >= n {
                 return;
@@ -371,7 +381,7 @@ fn to_render(pline: &LwPolyline, fill_mode: bool) -> RenderEntity {
                     &arc, &to_wcs, normal,
                 ));
                 for s in arc
-                    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+                    .tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
                     .into_iter()
                     .skip(1)
                 {
@@ -470,7 +480,7 @@ fn to_render(pline: &LwPolyline, fill_mode: bool) -> RenderEntity {
                 crate::entities::common::BulgeArc::from_bulge([ox0, oy0], [ox1, oy1], bulge)
             {
                 for s in arc
-                    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+                    .tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
                     .into_iter()
                     .skip(1)
                 {
@@ -584,8 +594,11 @@ fn centerline_metadata(
 
 /// Split at vertex `idx`: a closed polyline re-opens there (one piece); an
 /// open one splits into two (interior vertices only). `None` when invalid.
-pub(crate) fn break_at_vertex(p: &codec::LwPolyline, idx: usize) -> Option<Vec<codec::EntityType>> {
-    use codec::EntityType;
+pub(crate) fn break_at_vertex(
+    p: &document::LwPolyline,
+    idx: usize,
+) -> Option<Vec<document::EntityType>> {
+    use document::EntityType;
     let n = p.vertices.len();
     if n < 3 || idx >= n {
         return None;
@@ -595,7 +608,7 @@ pub(crate) fn break_at_vertex(p: &codec::LwPolyline, idx: usize) -> Option<Vec<c
         verts.extend_from_slice(&p.vertices[idx..]);
         verts.extend_from_slice(&p.vertices[..=idx]);
         let mut out = p.clone();
-        out.common.handle = codec::Handle::NULL;
+        out.common.handle = document::Handle::NULL;
         out.is_closed = false;
         out.vertices = verts;
         return Some(vec![EntityType::LwPolyline(out)]);
@@ -604,13 +617,13 @@ pub(crate) fn break_at_vertex(p: &codec::LwPolyline, idx: usize) -> Option<Vec<c
         return None;
     }
     let mut a = p.clone();
-    a.common.handle = codec::Handle::NULL;
+    a.common.handle = document::Handle::NULL;
     a.vertices = p.vertices[..=idx].to_vec();
     if let Some(last) = a.vertices.last_mut() {
         last.bulge = 0.0;
     }
     let mut b = p.clone();
-    b.common.handle = codec::Handle::NULL;
+    b.common.handle = document::Handle::NULL;
     b.vertices = p.vertices[idx..].to_vec();
     Some(vec![EntityType::LwPolyline(a), EntityType::LwPolyline(b)])
 }
@@ -635,7 +648,7 @@ pub(crate) fn is_revision_cloud(pline: &LwPolyline) -> bool {
 
 pub(crate) fn rectangle_frame(
     pline: &LwPolyline,
-) -> Option<(RectangleFrame, kernel::space::Plane)> {
+) -> Option<(RectangleFrame, ocs_geom::space::Plane)> {
     let planar = crate::entities::curve::lwpolyline_curve(pline)?;
     let Curve::Polyline(polyline) = &planar.curve else {
         return None;
@@ -850,12 +863,12 @@ fn apply_grip(pline: &mut LwPolyline, grip_id: usize, apply: GripApply) {
         let v = &mut pline.vertices[grip_id];
         match apply {
             GripApply::Absolute(p) => {
-                v.location.x = p.x as f64;
-                v.location.y = p.y as f64;
+                v.location.x = p.x;
+                v.location.y = p.y;
             }
             GripApply::Translate(d) => {
-                v.location.x += d.x as f64;
-                v.location.y += d.y as f64;
+                v.location.x += d.x;
+                v.location.y += d.y;
             }
         }
     } else {
@@ -879,7 +892,12 @@ fn segment_points(pline: &LwPolyline) -> Vec<([f64; 2], f64)> {
 /// given as (vertex, bulge) pairs, ids from `first_id`. The marker is a small
 /// box rotated along the chord direction so the shape itself signals which
 /// way the segment runs.
-pub(crate) fn mid_grips(points: &[([f64; 2], f64)], closed: bool, elev: f64, first_id: usize) -> Vec<GripDef> {
+pub(crate) fn mid_grips(
+    points: &[([f64; 2], f64)],
+    closed: bool,
+    elev: f64,
+    first_id: usize,
+) -> Vec<GripDef> {
     let n = points.len();
     let seg_count = if closed { n } else { n.saturating_sub(1) };
     (0..seg_count)
@@ -906,7 +924,12 @@ pub(crate) fn mid_grips(points: &[([f64; 2], f64)], closed: bool, elev: f64, fir
 /// Drag of the mid grip of segment `seg`: a straight segment translates both
 /// its endpoints (the shared vertices carry the neighbouring segments along);
 /// an arc segment takes the bulge that puts its midpoint at the new spot.
-pub(crate) fn apply_mid_grip(points: &mut [([f64; 2], f64)], closed: bool, seg: usize, apply: GripApply) {
+pub(crate) fn apply_mid_grip(
+    points: &mut [([f64; 2], f64)],
+    closed: bool,
+    seg: usize,
+    apply: GripApply,
+) {
     let n = points.len();
     let count = if closed { n } else { n.saturating_sub(1) };
     if seg >= count {
@@ -955,7 +978,7 @@ fn edit_polyline_geometry(polyline: &mut LwPolyline, edit: impl FnOnce(&mut Poly
     let mut geometry = kernel_polyline(polyline);
     if edit(&mut geometry) {
         for (target, source) in polyline.vertices.iter_mut().zip(geometry.vertices) {
-            target.location = codec::types::Vector2::new(source.position[0], source.position[1]);
+            target.location = document::types::Vector2::new(source.position[0], source.position[1]);
             target.bulge = source.bulge;
         }
     }
@@ -963,7 +986,7 @@ fn edit_polyline_geometry(polyline: &mut LwPolyline, edit: impl FnOnce(&mut Poly
 
 fn move_segment_parallel(polyline: &mut LwPolyline, segment: usize, offset: f64) {
     edit_polyline_geometry(polyline, |geometry| {
-        kernel::geom2d::move_polyline_segment_parallel(geometry, segment, offset)
+        ocs_geom::geom2d::move_polyline_segment_parallel(geometry, segment, offset)
     });
 }
 
@@ -971,18 +994,19 @@ fn move_segment_parallel(polyline: &mut LwPolyline, segment: usize, offset: f64)
 fn resize_arc_concentrically(polyline: &mut LwPolyline, segment: usize, offset: f64) {
     edit_polyline_geometry(polyline, |geometry| {
         geometry.segment_arc(segment).is_some_and(|arc| {
-            kernel::geom2d::resize_polyline_arc(geometry, segment, arc.radius + offset)
+            ocs_geom::geom2d::resize_polyline_arc(geometry, segment, arc.radius + offset)
         })
     });
 }
 
 fn resize_arc_segment_radius(polyline: &mut LwPolyline, segment: usize, radius: f64) {
     edit_polyline_geometry(polyline, |geometry| {
-        kernel::geom2d::resize_polyline_arc(geometry, segment, radius)
+        ocs_geom::geom2d::resize_polyline_arc(geometry, segment, radius)
     });
 }
 fn apply_transform(pline: &mut LwPolyline, t: &EntityTransform) {
-    crate::scene::view::transform::apply_standard_entity_transform(pline, t, |entity, p1, p2| {
+    let normal = pline.normal;
+    crate::scene::view::transform::apply_ocs_entity_transform(pline, t, normal, |entity, p1, p2| {
         for v in &mut entity.vertices {
             crate::scene::view::transform::reflect_xy_point(
                 &mut v.location.x,
@@ -998,11 +1022,11 @@ fn apply_transform(pline: &mut LwPolyline, t: &EntityTransform) {
 }
 
 impl RenderConvertible for LwPolyline {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         let mut render = to_render(self, document.header.fill_mode);
         // Arc segments offer their centres and quadrants.
         if self.vertices.iter().any(|v| v.bulge != 0.0) {
-            let entity = codec::EntityType::LwPolyline(self.clone());
+            let entity = document::EntityType::LwPolyline(self.clone());
             render
                 .snap_pts
                 .extend(crate::entities::curve::arc_segment_snaps(&entity));
@@ -1051,11 +1075,17 @@ impl crate::entities::traits::Grippable for LwPolyline {
                     label: "Add Vertex",
                     action: GripMenuAction::AddVertex,
                 },
-                GripMenuItem {
-                    label: "Remove Vertex",
-                    action: GripMenuAction::RemoveVertex,
-                },
             ]);
+            if !self.is_closed && (grip_id == 0 || grip_id == n - 1) {
+                items.push(GripMenuItem {
+                    label: "Extend Vertex",
+                    action: GripMenuAction::ExtendVertex,
+                });
+            }
+            items.push(GripMenuItem {
+                label: "Remove Vertex",
+                action: GripMenuAction::RemoveVertex,
+            });
             if breakable {
                 items.push(GripMenuItem {
                     label: "Break",
@@ -1069,7 +1099,7 @@ impl crate::entities::traits::Grippable for LwPolyline {
         let is_arc = self
             .vertices
             .get(seg)
-            .map_or(false, |v| v.bulge.abs() >= 1e-9);
+            .is_some_and(|v| v.bulge.abs() >= 1e-9);
         let convert = if is_arc {
             GripMenuItem {
                 label: "Convert to Line",
@@ -1096,8 +1126,12 @@ impl crate::entities::traits::Grippable for LwPolyline {
         if is_rectangle(self) && seg < 4 {
             // Moving an edge changes the dimension perpendicular to it.
             items.push(GripMenuItem {
-                label: if seg % 2 == 0 { "Height" } else { "Width" },
-                action: if seg % 2 == 0 {
+                label: if seg.is_multiple_of(2) {
+                    "Height"
+                } else {
+                    "Width"
+                },
+                action: if seg.is_multiple_of(2) {
                     GripMenuAction::RectangleHeight
                 } else {
                     GripMenuAction::RectangleWidth
@@ -1167,7 +1201,7 @@ impl crate::entities::traits::Grippable for LwPolyline {
             let seg = grip_id.checked_sub(n)?;
             let plane = crate::entities::curve::lwpolyline_curve(self)?.plane;
             let point = Vec2::from(plane.project(point.to_array())?);
-            return kernel::geom2d::polyline_arc_radius_from_point(
+            return ocs_geom::geom2d::polyline_arc_radius_from_point(
                 &kernel_polyline(self),
                 seg,
                 point.into(),
@@ -1178,7 +1212,7 @@ impl crate::entities::traits::Grippable for LwPolyline {
             let seg = grip_id.checked_sub(n)?;
             let plane = crate::entities::curve::lwpolyline_curve(self)?.plane;
             let point = Vec2::from(plane.project(point.to_array())?);
-            return kernel::geom2d::polyline_segment_parallel_offset(
+            return ocs_geom::geom2d::polyline_segment_parallel_offset(
                 &kernel_polyline(self),
                 seg,
                 point.into(),
@@ -1257,7 +1291,7 @@ impl crate::entities::traits::Grippable for LwPolyline {
         if signed_distance.abs() <= Tolerance::default().linear() {
             return;
         }
-        let direction = codec::types::Vector2::new(axis[0], axis[1]) * signed_distance.signum();
+        let direction = document::types::Vector2::new(axis[0], axis[1]) * signed_distance.signum();
         self.vertices[i0].location = self.vertices[o0].location + direction * value;
         self.vertices[i1].location = self.vertices[o1].location + direction * value;
     }
@@ -1270,6 +1304,18 @@ impl crate::entities::traits::Grippable for LwPolyline {
         let n = self.vertices.len();
         match action {
             A::Stretch => {}
+            // Start the provisional vertex on the end it extends; the grip
+            // driver then moves it with the cursor until the placement click.
+            A::ExtendVertex if !self.is_closed => {
+                if grip_id + 1 == n {
+                    append_end_vertex(self);
+                } else if let (0, Some(&first)) = (grip_id, self.vertices.first()) {
+                    let mut new_v = first;
+                    new_v.bulge = 0.0;
+                    new_v.vertex_id = 0;
+                    self.vertices.insert(0, new_v);
+                }
+            }
             A::AddVertex => {
                 if n == 0 {
                     return;
@@ -1278,11 +1324,7 @@ impl crate::entities::traits::Grippable for LwPolyline {
                 // the provisional vertex on the endpoint; the grip driver then
                 // moves it with the cursor until the placement click.
                 if grip_id == n - 1 && !self.is_closed {
-                    self.vertices[grip_id].bulge = 0.0;
-                    let mut new_v = self.vertices[grip_id].clone();
-                    new_v.bulge = 0.0;
-                    new_v.vertex_id = 0;
-                    self.vertices.push(new_v);
+                    append_end_vertex(self);
                     return;
                 }
                 // Insert a provisional vertex midway along the following
@@ -1363,7 +1405,7 @@ impl crate::entities::traits::PropertyEditable for LwPolyline {
 }
 
 impl crate::entities::traits::Transformable for LwPolyline {
-    fn apply_transform(&mut self, t: &crate::command::EntityTransform) {
+    fn apply_transform(&mut self, t: &crate::entities::transform::EntityTransform) {
         apply_transform(self, t);
     }
 }
@@ -1373,7 +1415,7 @@ impl crate::entities::traits::Transformable for LwPolyline {
 /// first vertex), so the relative-to-eye hatch fill keeps sub-unit precision at
 /// UTM-scale coordinates — building them in absolute f32 collapsed the band into
 /// a string of squares far from the origin.
-pub(crate) fn wide_fills(pl: &codec::entities::LwPolyline) -> ([f64; 2], Vec<Vec<[f32; 2]>>) {
+pub(crate) fn wide_fills(pl: &document::entities::LwPolyline) -> ([f64; 2], Vec<Vec<[f32; 2]>>) {
     // Codes 43 / 40 / 41 store the band's FULL width, and
     // `polyline_segment_fill` offsets ±hw about the centreline — so halve it.
     // Feeding the stored width in whole draws every wide polyline twice as wide
@@ -1428,7 +1470,7 @@ pub(crate) fn wide_fills(pl: &codec::entities::LwPolyline) -> ([f64; 2], Vec<Vec
     (origin, out)
 }
 
-impl crate::entities::traits::MassPropsCalc for codec::entities::LwPolyline {
+impl crate::entities::traits::MassPropsCalc for document::entities::LwPolyline {
     fn mass_props(&self) -> crate::entities::traits::MassProps {
         let p = self;
         let n = p.vertices.len();
@@ -1467,8 +1509,8 @@ mod tests {
 
     use crate::entities::traits::{Grippable, PropertyEditable};
     use crate::scene::model::object::GripMenuAction;
-    use codec::entities::{LwPolyline, LwVertex};
-    use codec::{Vector2, Vector3};
+    use document::entities::{LwPolyline, LwVertex};
+    use document::{Vector2, Vector3};
 
     fn make_test_lwpolyline(count: usize, constant_width: f64) -> LwPolyline {
         let mut pl = LwPolyline::default();
@@ -1813,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lwpolyline_uniform_width_shows_global_width() {
+    fn lwpolyline_uniform_width_shows_global_width() {
         let pl = make_test_lwpolyline(3, 5.0);
         assert_eq!(lwpolyline_global_width(&pl), Some(5.0));
 
@@ -1830,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lwpolyline_varying_vertex_width_shows_varies() {
+    fn lwpolyline_varying_vertex_width_shows_varies() {
         let mut pl = make_test_lwpolyline(3, 5.0);
         pl.vertices[0].start_width = 2.0;
         pl.vertices[0].end_width = 3.0;
@@ -1850,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lwpolyline_modifying_global_width_sets_all_vertex_widths() {
+    fn lwpolyline_modifying_global_width_sets_all_vertex_widths() {
         let mut pl = make_test_lwpolyline(3, 5.0);
         pl.vertices[0].start_width = 2.0;
         pl.vertices[0].end_width = 3.0;
@@ -1866,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lwpolyline_modifying_segment_width_materializes_constant_width() {
+    fn lwpolyline_modifying_segment_width_materializes_constant_width() {
         let mut pl = make_test_lwpolyline(3, 5.0);
         // Initially constant_width is 5.0, vertices start/end are 0.0
         assert_eq!(pl.vertices[0].start_width, 0.0);

@@ -11,6 +11,22 @@ use crate::app::{ExtractionPrompt, Message, ModalKind, OpenCADStudio};
 use crate::ui::window::extraction_outdated::OutdatedChoice;
 use iced::Task;
 
+pub(super) struct LinkedCellRange {
+    pub row: usize,
+    pub column: usize,
+    pub rows: usize,
+    pub columns: usize,
+}
+
+pub(super) struct LinkUpdate {
+    pub table: document::Handle,
+    pub link: document::Handle,
+    pub rows: Vec<Vec<String>>,
+    /// External spreadsheet ranges are fixed. An extraction owns its data
+    /// rows and may resize them when the extraction is run again.
+    pub range: Option<LinkedCellRange>,
+}
+
 /// DXEVAL event bits. Save, plot and publish shifted four bits up (32, 64,
 /// 128) update without asking; an open only asks.
 pub(crate) const EVENT_OPEN: i32 = 1;
@@ -19,34 +35,42 @@ pub(crate) const EVENT_PLOT: i32 = 4;
 pub(crate) const EVENT_PUBLISH: i32 = 8;
 
 impl OpenCADStudio {
-    /// Writes `rows` into each linked table (from `first_linked_row` on) and
-    /// stamps its link's update time, as one undo step; the tables updated.
-    pub(crate) fn apply_link_updates(
-        &mut self,
-        i: usize,
-        updates: Vec<(codec::Handle, codec::Handle, Vec<Vec<String>>, usize)>,
-    ) -> usize {
+    /// Refreshes the linked tables and stamps their links in one undo step.
+    pub(super) fn apply_link_updates(&mut self, i: usize, updates: Vec<LinkUpdate>) -> usize {
         if updates.is_empty() {
             return 0;
         }
         self.push_undo_snapshot(i, "DATALINKUPDATE");
         let mut changed = Vec::new();
-        for (table_handle, link_handle, rows, first_linked_row) in updates {
+        for LinkUpdate {
+            table: table_handle,
+            link,
+            rows,
+            range,
+        } in updates
+        {
             let document = &mut self.tabs[i].scene.document;
-            let Some(codec::EntityType::Table(table)) = document.get_entity_mut(table_handle)
+            let Some(document::EntityType::Table(table)) = document.get_entity_mut(table_handle)
             else {
                 continue;
             };
-            crate::app::commands::display::apply_link_rows(
-                table,
-                link_handle,
-                &rows,
-                first_linked_row,
-            );
+            if let Some(range) = range {
+                for (row, values) in rows.iter().take(range.rows).enumerate() {
+                    for (column, value) in values.iter().take(range.columns).enumerate() {
+                        if let Some(cell) = table.cell_mut(range.row + row, range.column + column) {
+                            cell.set_text(value);
+                        }
+                    }
+                }
+            } else {
+                crate::app::commands::display::apply_link_rows(table, link, &rows, 1);
+            }
             // The stored picture no longer shows the cells: draw from them.
             table.block_record_handle = None;
-            annotation_data::stamp_data_link_handle(document, link_handle);
-            changed.push(table_handle);
+            annotation_data::stamp_data_link_handle(document, link);
+            if !changed.contains(&table_handle) {
+                changed.push(table_handle);
+            }
         }
         if !changed.is_empty() {
             self.invalidate_property_targets(i, &changed);
@@ -97,7 +121,12 @@ impl OpenCADStudio {
     fn update_outdated(&mut self, i: usize, tables: Vec<OutdatedExtraction>) {
         let updates = tables
             .into_iter()
-            .map(|table| (table.table, table.link, table.rows, 1))
+            .map(|table| LinkUpdate {
+                table: table.table,
+                link: table.link,
+                rows: table.rows,
+                range: None,
+            })
             .collect();
         self.apply_link_updates(i, updates);
     }
@@ -149,7 +178,10 @@ impl OpenCADStudio {
     pub(super) fn dispatch_dxeval(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         let rest = cmd.strip_prefix("SETVAR ").map(str::trim).unwrap_or(cmd);
         let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        if !name.trim_start_matches(['_', '.']).eq_ignore_ascii_case("DXEVAL") {
+        if !name
+            .trim_start_matches(['_', '.'])
+            .eq_ignore_ascii_case("DXEVAL")
+        {
             return None;
         }
         let current = annotation_data::dxeval(&self.tabs[i].scene.document);
@@ -168,7 +200,7 @@ impl OpenCADStudio {
             _ => {
                 if !value.is_empty() {
                     let (min, max) = (0, 511);
-                    self.command_line.push_error(&crate::tf!(
+                    self.command_line.push_rejection(&crate::tf!(
                         "Requires an integer between {min} and {max}."
                     ));
                 }

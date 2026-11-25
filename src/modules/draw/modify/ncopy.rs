@@ -1,8 +1,8 @@
 use crate::command::{CadCommand, CmdOption, CmdResult, EntityTransform};
 use crate::entities::traits::EntityTypeOps;
 use crate::scene::convert::acad_to_render::RenderObject;
-use codec::nested_copy::{NestedCopyMode, NestedCopySymbolNames};
-use codec::{Document, EntityType, Handle};
+use document::nested_copy::{NestedCopyMode, NestedCopySymbolNames};
+use document::{Document, EntityType, Handle};
 use glam::DVec3;
 use std::collections::{HashMap, HashSet};
 
@@ -200,14 +200,14 @@ impl CadCommand for NcopyCommand {
                     let distance = if let Some(curve) = crate::entities::curve::entity_curve(entity)
                     {
                         let projected = curve.plane.project([point.x, point.y, point.z])?;
-                        kernel::geom2d::closest_point(&curve.curve, projected)
+                        ocs_geom::geom2d::closest_point(&curve.curve, projected)
                             .distance
                             .hypot(curve.plane.distance_to(point.to_array())?)
                     } else {
                         let path = self.hit_paths.get(&handle)?.get(index)?;
-                        let point = kernel::space::Vec3::from(point.to_array());
+                        let point = ocs_geom::space::Vec3::from(point.to_array());
                         if path.len() == 1 {
-                            point.distance(kernel::space::Vec3::from(path[0]))
+                            point.distance(ocs_geom::space::Vec3::from(path[0]))
                         } else {
                             path.windows(2)
                                 .filter(|segment| segment.iter().flatten().all(|v| v.is_finite()))
@@ -344,8 +344,8 @@ impl CadCommand for NcopyCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::Line;
-    use codec::types::Vector3;
+    use document::entities::Line;
+    use document::types::Vector3;
 
     #[test]
     fn placement_moves_only_geometry_and_keeps_source_style() {

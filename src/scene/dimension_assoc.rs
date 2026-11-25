@@ -1,15 +1,15 @@
-use codec::entities::Dimension;
-use codec::objects::{
+use document::entities::Dimension;
+use document::objects::{
     AssocDimensionAssociation, AssocDimensionReference, AssociativeData, AssociativeObject,
     ObjectType,
 };
-use codec::types::{Handle, Transform, Vector3};
-use codec::EntityType;
-use kernel::geom2d::{
+use document::types::{Handle, Transform, Vector3};
+use document::EntityType;
+use ocs_geom::geom2d::{
     angle_within_arc, arc as tessellate_arc, arc_span, closest_point, Arc as KernelArc, BulgeArc,
     Circle as KernelCircle, Curve as KernelCurve, DEFAULT_SEGMENTS_PER_RADIAN,
 };
-use kernel::space::Plane;
+use ocs_geom::space::Plane;
 use std::f64::consts::TAU;
 
 use crate::command::DimensionAssociationSource;
@@ -103,7 +103,7 @@ type DPoint = [f64; 3];
 
 /// The shared-contract vector (`glam`) as the codec's vector. `AcceptedSnap`
 /// speaks `glam` because the snap engine does; everything stored in a
-/// drawing speaks `opencadcodec`.
+/// drawing speaks `document`.
 fn dvec3(point: glam::DVec3) -> Vector3 {
     Vector3::new(point.x, point.y, point.z)
 }
@@ -122,7 +122,7 @@ struct RegionBoundaryPiece {
 }
 
 fn certified_rational_quadratic_circle(
-    nurbs: &kernel::geom2d::NurbsCurve,
+    nurbs: &ocs_geom::geom2d::NurbsCurve,
 ) -> Option<([f64; 2], f64, f64, f64)> {
     if nurbs.degree() != 2 {
         return None;
@@ -310,7 +310,7 @@ fn loop_is_full_circle(pieces: &[KernelCurve]) -> bool {
 fn region_boundary_pieces(entity: &EntityType) -> Option<(Plane, Vec<RegionBoundaryPiece>)> {
     let (plane, loops, _) = crate::scene::model::presspull_model::profile_geometry(entity)?;
     let unit = Plane::orthonormal(plane.origin, plane.x_axis, plane.normal()?)?;
-    let transform = kernel::geom2d::Transform {
+    let transform = ocs_geom::geom2d::Transform {
         origin: unit.project(plane.origin)?.into(),
         x_axis: unit.project_vector(plane.x_axis)?.into(),
         y_axis: unit.project_vector(plane.y_axis)?.into(),
@@ -476,7 +476,7 @@ fn ocs_point(x: f64, y: f64, elevation: f64, normal: Vector3) -> Vector3 {
     Vector3::new(point.0, point.1, point.2)
 }
 
-fn circle_curve(circle: &codec::entities::Circle) -> KernelCurve {
+fn circle_curve(circle: &document::entities::Circle) -> KernelCurve {
     KernelCurve::Circle(KernelCircle {
         centre: [circle.center.x, circle.center.y],
         radius: circle.radius,
@@ -628,6 +628,27 @@ fn source_marker(entity: &EntityType, point: Vector3) -> Option<i32> {
             point_distance_squared(*first, point).total_cmp(&point_distance_squared(*second, point))
         })
         .map(|(index, _)| index as i32)
+}
+
+/// The stored form of a reference to `marker`: a polyline vertex is written
+/// the way the file format names it, as an edge (subentity 2, one-based edge
+/// marker) and its start (0) or end (1). Everything else keeps subentity 1.
+fn stored_marker(entity: &EntityType, marker: i32, parameter: f64) -> (i32, i32, f64) {
+    let vertices = match entity {
+        EntityType::LwPolyline(polyline) => Some((polyline.vertices.len(), polyline.is_closed)),
+        EntityType::Polyline2D(polyline) => Some((polyline.vertices.len(), polyline.is_closed())),
+        _ => None,
+    };
+    match (vertices, usize::try_from(marker)) {
+        (Some((count, closed)), Ok(vertex)) if parameter == 0.0 && vertex < count && count > 1 => {
+            if vertex + 1 < count || closed {
+                (2, vertex as i32 + 1, 0.0)
+            } else {
+                (2, vertex as i32, 1.0)
+            }
+        }
+        _ => (1, marker, parameter),
+    }
 }
 
 // ── Chain-aware reference resolution ──────────────────────────────────────
@@ -808,6 +829,13 @@ pub fn resolve_reference_chain(
     reference: &AssocDimensionReference,
     from_space: Option<Vector3>,
 ) -> Result<ResolvedReference, ReferenceStatus> {
+    // A reference still held by the handle its object has in an xref's own
+    // drawing: the xref is not loaded, or no longer has the object. Its
+    // chain ends on the INSERT that places the xref, which is not what the
+    // dimension measures.
+    if !reference.xref_paths.is_empty() || !reference.intersection_xref_paths.is_empty() {
+        return Err(ReferenceStatus::Unresolved);
+    }
     let walked = match chain::walk_chain(&scene.document, &reference.xrefs) {
         Ok(walked) => walked,
         Err(ChainError::Missing(handle)) => return Err(ReferenceStatus::Broken(handle)),
@@ -1076,7 +1104,7 @@ fn remap_plane_offset(
 /// its first handle, so "some handle in `xrefs` exists" was true even for a
 /// reference whose actual source had been erased. Walking the chain asks the
 /// question that was meant — is the geometry still there.
-pub(crate) fn dimension_is_associative(document: &codec::Document, dimension: Handle) -> bool {
+pub(crate) fn dimension_is_associative(document: &document::Document, dimension: Handle) -> bool {
     document.objects.values().any(|object| {
         let ObjectType::Associative(object) = object else {
             return false;
@@ -1095,7 +1123,7 @@ pub(crate) fn dimension_is_associative(document: &codec::Document, dimension: Ha
 }
 
 pub(crate) fn constraint_from_associative_dimension(
-    document: &codec::Document,
+    document: &document::Document,
     handle: Handle,
 ) -> Option<(
     super::parametric_constraints::ConstraintKind,
@@ -1128,10 +1156,14 @@ pub(crate) fn constraint_from_associative_dimension(
     }
     let point = |index: usize| {
         let reference = association.references.get(index)?.first()?;
-        Some(ParametricRef::point(
-            *reference.xrefs.first()?,
-            reference.main_gs_marker,
-        ))
+        // An edge reference (subentity 2) names a vertex as the start (0) or
+        // the end (1) of a one-based edge.
+        let vertex = if reference.main_subent_type == 2 {
+            reference.main_gs_marker - 1 + reference.osnap_distance.round() as i32
+        } else {
+            reference.main_gs_marker
+        };
+        Some(ParametricRef::point(*reference.xrefs.first()?, vertex))
     };
     let whole = |index: usize| {
         let reference = association.references.get(index)?.first()?;
@@ -1182,7 +1214,7 @@ pub(crate) fn constraint_from_associative_dimension(
 }
 
 pub(crate) fn radial_extension_points(
-    document: &codec::Document,
+    document: &document::Document,
     dimension: Handle,
     gap: f64,
     extension: f64,
@@ -1337,7 +1369,7 @@ impl Scene {
         if source_data.is_empty() {
             return;
         }
-        let resolved: Vec<Option<(Handle, i32, f64, u8)>> = source_data
+        let resolved: Vec<Option<(Handle, i32, i32, f64, u8)>> = source_data
             .iter()
             .take(4)
             .enumerate()
@@ -1353,7 +1385,12 @@ impl Scene {
                 } else {
                     1
                 };
-                Some((source.handle, marker, parameter, osnap_type))
+                let (subent, marker, parameter) = if osnap_type == 1 {
+                    stored_marker(entity, marker, parameter)
+                } else {
+                    (1, marker, parameter)
+                };
+                Some((source.handle, subent, marker, parameter, osnap_type))
             })
             .collect();
         if resolved.iter().all(Option::is_none) {
@@ -1361,12 +1398,12 @@ impl Scene {
         }
 
         let reference =
-            |source: Handle, marker: i32, parameter: f64, osnap_type: u8, point: Vector3| {
+            |source: Handle, subent: i32, marker: i32, parameter: f64, osnap_type: u8, point: Vector3| {
                 AssocDimensionReference {
                     class_name: "AcDbOsnapPointRef".to_string(),
                     osnap_type,
                     xrefs: vec![source],
-                    main_subent_type: 1,
+                    main_subent_type: subent,
                     main_gs_marker: marker,
                     osnap_distance: parameter,
                     osnap_point: point,
@@ -1379,10 +1416,11 @@ impl Scene {
             if index >= references.len() {
                 break;
             }
-            if let Some((source, marker, parameter, osnap_type)) = resolved {
+            if let Some((source, subent, marker, parameter, osnap_type)) = resolved {
                 associativity |= 1 << index;
                 references[index].push(reference(
                     source,
+                    subent,
                     marker,
                     parameter,
                     osnap_type,
@@ -1434,6 +1472,34 @@ impl Scene {
         let mut object = AssociativeObject::new("DIMASSOC", "AcDbDimAssoc");
         object.handle = association_handle;
         self.has_dimension_associations.set(Some(true));
+        // The association lives in the dimension's extension dictionary,
+        // under ACAD_DIMASSOC and owned by it, as the file format keeps it.
+        let existing = self.document.extension_dictionary_handle(dimension);
+        if self.is_recording_undo() {
+            let before = self.document.get_entity_arc(dimension);
+            self.record_undo_before(dimension, before);
+        }
+        if let Some(dictionary) = existing {
+            let before = self.document.objects.get(&dictionary).cloned();
+            self.record_undo_object_before(dictionary, before);
+        }
+        let dictionary = self.document.ensure_extension_dictionary(dimension);
+        if existing.is_none() {
+            self.record_undo_object_before(dictionary, None);
+        }
+        if let Some(ObjectType::Dictionary(entries)) = self.document.objects.get_mut(&dictionary) {
+            if let Some((_, handle)) = entries
+                .entries
+                .iter_mut()
+                .find(|(name, _)| name.eq_ignore_ascii_case("ACAD_DIMASSOC"))
+            {
+                *handle = association_handle;
+            } else {
+                entries.add_entry("ACAD_DIMASSOC", association_handle);
+            }
+        }
+        object.owner = dictionary;
+        object.reactors.push(dictionary);
         object.reactors.push(dimension);
         object.data = AssociativeData::DimensionAssociation(AssocDimensionAssociation {
             associativity,
@@ -1537,6 +1603,11 @@ impl Scene {
             let Some((marker, parameter)) = marker_parameter else {
                 continue;
             };
+            let (subent, marker, parameter) = if osnap_type == chain::osnap::END {
+                stored_marker(entity, marker, parameter)
+            } else {
+                (1, marker, parameter)
+            };
             let mut intersection_objects = Vec::new();
             if matches!(
                 source.snap_type,
@@ -1561,7 +1632,7 @@ impl Scene {
                 osnap_type,
                 xrefs,
                 intersection_objects,
-                main_subent_type: 1,
+                main_subent_type: subent,
                 main_gs_marker: marker,
                 osnap_distance: parameter,
                 // Store the source's owning-space point: model coordinates for
@@ -1830,33 +1901,72 @@ impl Scene {
     /// reactor it left on every entity and its entry in the owning dictionary.
     /// Returns whether the dimension was associative.
     pub(crate) fn detach_dimension_association(&mut self, dimension: Handle) -> bool {
-        let found = self.document.objects.iter().find_map(|(handle, object)| {
-            let ObjectType::Associative(object) = object else {
-                return None;
-            };
-            matches!(
-                &object.data,
-                AssociativeData::DimensionAssociation(data) if data.dimension == dimension
-            )
-            .then_some((*handle, object.owner))
-        });
-        let Some((association, owner)) = found else {
-            return false;
-        };
-        let before = self.document.objects.get(&association).cloned();
-        self.record_undo_object_before(association, before);
-        if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get(&owner) {
-            let before = ObjectType::Dictionary(dictionary.clone());
-            self.record_undo_object_before(owner, Some(before));
+        let dimensions: rustc_hash::FxHashSet<Handle> = [dimension].into_iter().collect();
+        self.detach_dimension_associations(&dimensions) > 0
+    }
+
+    /// The DIMASSOCs of erased dimensions go with them: one left behind
+    /// points at a dimension no reader can resolve.
+    pub(crate) fn detach_erased_dimension_associations(
+        &mut self,
+        erased: &rustc_hash::FxHashSet<Handle>,
+    ) {
+        if !erased.is_empty() && self.dimension_associations_possible() {
+            self.detach_dimension_associations(erased);
         }
-        if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get_mut(&owner) {
-            dictionary.entries.retain(|(_, handle)| *handle != association);
+    }
+
+    /// [`Self::detach_dimension_association`] for every dimension in
+    /// `dimensions` at once, in one walk over the objects and one over the
+    /// entities. Returns how many associations were removed.
+    fn detach_dimension_associations(
+        &mut self,
+        dimensions: &rustc_hash::FxHashSet<Handle>,
+    ) -> usize {
+        let found: Vec<(Handle, Handle)> = self
+            .document
+            .objects
+            .iter()
+            .filter_map(|(handle, object)| {
+                let ObjectType::Associative(object) = object else {
+                    return None;
+                };
+                matches!(
+                    &object.data,
+                    AssociativeData::DimensionAssociation(data) if dimensions.contains(&data.dimension)
+                )
+                .then_some((*handle, object.owner))
+            })
+            .collect();
+        if found.is_empty() {
+            return 0;
         }
-        self.document.objects.remove(&association);
+        for &(association, owner) in &found {
+            let before = self.document.objects.get(&association).cloned();
+            self.record_undo_object_before(association, before);
+            if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get(&owner) {
+                let before = ObjectType::Dictionary(dictionary.clone());
+                self.record_undo_object_before(owner, Some(before));
+            }
+            if let Some(ObjectType::Dictionary(dictionary)) = self.document.objects.get_mut(&owner)
+            {
+                dictionary
+                    .entries
+                    .retain(|(_, handle)| *handle != association);
+            }
+            self.document.objects.remove(&association);
+        }
+        let removed: rustc_hash::FxHashSet<Handle> = found.iter().map(|(h, _)| *h).collect();
         let holders: Vec<Handle> = self
             .document
             .entities()
-            .filter(|entity| entity.common().reactors.contains(&association))
+            .filter(|entity| {
+                entity
+                    .common()
+                    .reactors
+                    .iter()
+                    .any(|reactor| removed.contains(reactor))
+            })
             .map(|entity| entity.common().handle)
             .collect();
         for handle in holders {
@@ -1865,11 +1975,14 @@ impl Scene {
                 self.record_undo_before(handle, before);
             }
             if let Some(entity) = self.document.get_entity_mut(handle) {
-                entity.common_mut().reactors.retain(|reactor| *reactor != association);
+                entity
+                    .common_mut()
+                    .reactors
+                    .retain(|reactor| !removed.contains(reactor));
             }
         }
         self.invalidate_dependency_index();
-        true
+        found.len()
     }
 
     /// Preserve an association only when the dimension and every source-chain
@@ -2025,7 +2138,10 @@ impl Scene {
                     (2, arc.end_point_wcs()),
                 ]);
             }
-            T::Line { index, object: handle } => {
+            T::Line {
+                index,
+                object: handle,
+            } => {
                 let Some(EntityType::Line(line)) = object(*handle) else {
                     return false;
                 };
@@ -2116,8 +2232,16 @@ impl Scene {
     }
 
     pub(crate) fn infer_dimension_sources(&self, dimension: Handle) -> Vec<Option<Handle>> {
-        let Some(EntityType::Dimension(entity)) = self.document.get_entity(dimension) else {
+        let Some(found @ EntityType::Dimension(entity)) = self.document.get_entity(dimension) else {
             return Vec::new();
+        };
+        // Only geometry of the dimension's own space: a block definition's
+        // member at the same point is not a source (#3502).
+        let owner = found.common().owner_handle;
+        let candidates = || {
+            self.document.entities().filter(move |candidate| {
+                candidate.common().handle != dimension && candidate.common().owner_handle == owner
+            })
         };
         let radial_data = match &**entity {
             Dimension::Radius(radius) => Some((
@@ -2139,10 +2263,7 @@ impl Scene {
         };
         if let Some((center, radius, chord)) = radial_data {
             let tolerance = radius.abs().max(1.0) * 1e-9;
-            let source = self
-                .document
-                .entities()
-                .filter(|candidate| candidate.common().handle != dimension)
+            let source = candidates()
                 .filter_map(|candidate| {
                     let radial = radial_source_matching(candidate, center, radius, chord)?;
                     let center_error = point_distance_squared(radial.center_world(), center);
@@ -2158,9 +2279,7 @@ impl Scene {
             .into_iter()
             .map(|point| {
                 point.and_then(|point| {
-                    self.document
-                        .entities()
-                        .filter(|entity| entity.common().handle != dimension)
+                    candidates()
                         .filter_map(|entity| {
                             source_distance_squared(entity, point)
                                 .map(|distance| (distance, entity.common().handle))
@@ -2733,7 +2852,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::{Circle, DimensionDiameter};
+    use document::entities::{Circle, DimensionDiameter};
 
     #[test]
     fn diameter_angle_sync_records_the_association_for_undo() {
@@ -2782,6 +2901,38 @@ mod tests {
             .any(|(handle, before)| *handle == association && before.is_some()));
     }
 
+    /// A reference a file kept by the handle of an xref's object ends on the
+    /// INSERT that places the xref. While the xref is not loaded it has
+    /// nothing to measure from: the insertion point is not it.
+    #[test]
+    fn a_reference_to_an_object_of_an_xref_that_is_not_loaded_is_unresolved() {
+        let mut scene = Scene::new();
+        let mut walls = document::tables::BlockRecord::new("WALLS");
+        walls.flags.is_xref = true;
+        walls.handle = scene.document.allocate_handle();
+        scene.document.block_records.add(walls).unwrap();
+        let insert = scene.add_entity(EntityType::Insert(document::entities::Insert::new(
+            "WALLS",
+            Vector3::new(40.0, 10.0, 0.0),
+        )));
+        let on_the_insert = AssocDimensionReference {
+            osnap_type: chain::osnap::INS,
+            xrefs: vec![insert],
+            ..Default::default()
+        };
+        let resolved = resolve_reference_chain(&scene, &on_the_insert, None)
+            .expect("the insertion point of a block reference");
+        assert!((resolved.model.x - 40.0).abs() < 1e-9 && (resolved.model.y - 10.0).abs() < 1e-9);
+        let in_the_xref = AssocDimensionReference {
+            xref_paths: vec!["2F".to_owned()],
+            ..on_the_insert
+        };
+        assert_eq!(
+            resolve_reference_chain(&scene, &in_the_xref, None).err(),
+            Some(ReferenceStatus::Unresolved)
+        );
+    }
+
     #[test]
     fn dimension_association_gate_tracks_creation_and_reset() {
         let mut scene = Scene::new();
@@ -2812,6 +2963,41 @@ mod tests {
         assert!(scene.detach_dimension_association(dimension));
         assert!(!scene.dimension_associations_possible());
     }
+
+    /// The DIMASSOC sits in its dimension's extension dictionary, owned by
+    /// it, and goes when the dimension is erased (#3124: one left behind,
+    /// unowned, crashed an older reader).
+    #[test]
+    fn a_dimension_association_lives_in_the_dimensions_dictionary_and_goes_with_it() {
+        let mut scene = Scene::new();
+        let circle = scene.add_entity(EntityType::Circle(Circle::from_center_radius(
+            Vector3::ZERO,
+            5.0,
+        )));
+        let dimension = scene.add_entity(EntityType::Dimension(Box::new(Dimension::Diameter(
+            DimensionDiameter::new(Vector3::new(5.0, 0.0, 0.0), Vector3::new(-5.0, 0.0, 0.0)),
+        ))));
+        scene.attach_dimension_association(dimension, vec![Some(circle)]);
+        let dictionary = scene
+            .document
+            .extension_dictionary_handle(dimension)
+            .expect("the dimension gets an extension dictionary");
+        let Some(ObjectType::Dictionary(entries)) = scene.document.objects.get(&dictionary) else {
+            panic!("expected the extension dictionary");
+        };
+        let association = entries.get("ACAD_DIMASSOC").expect("ACAD_DIMASSOC entry");
+        let Some(ObjectType::Associative(object)) = scene.document.objects.get(&association) else {
+            panic!("expected the DIMASSOC object");
+        };
+        assert_eq!(object.owner, dictionary);
+
+        scene.erase_entities(&[dimension]);
+        assert!(scene.document.objects.get(&association).is_none());
+        assert!(scene
+            .document
+            .get_entity(circle)
+            .is_some_and(|c| !c.common().reactors.contains(&association)));
+    }
 }
 
 /// Average displacement of the dimension's resolved definition points.
@@ -2830,7 +3016,7 @@ fn centroid_shift(before: [Option<Vector3>; 2], after: [Option<Vector3>; 2]) -> 
     Vector3::new(delta.x / count, delta.y / count, delta.z / count)
 }
 
-fn linear_measurement(linear: &codec::entities::DimensionLinear) -> f64 {
+fn linear_measurement(linear: &document::entities::DimensionLinear) -> f64 {
     let plane = plane_from_normal(linear.first_point, linear.base.normal);
     let first = plane
         .project(dpoint(linear.first_point))
@@ -2927,11 +3113,11 @@ fn feature_reference(
 }
 
 fn persisted_measurement_scale(
-    doc: &codec::Document,
+    doc: &document::Document,
     entity: &EntityType,
 ) -> Option<MeasurementScale> {
     use crate::entities::dim_override;
-    use codec::xdata::XDataValue;
+    use document::xdata::XDataValue;
     let EntityType::Dimension(dimension) = entity else {
         return None;
     };
@@ -2975,7 +3161,7 @@ fn persisted_measurement_scale(
 /// made by earlier releases kept their source's association this way, which
 /// the reference application reports as a damaged drawing. Returns how many
 /// reactors were dropped.
-pub(crate) fn drop_stray_dimension_reactors(document: &mut codec::Document) -> usize {
+pub(crate) fn drop_stray_dimension_reactors(document: &mut document::Document) -> usize {
     let associations: rustc_hash::FxHashMap<Handle, (Handle, Vec<Handle>)> = document
         .objects
         .iter()
@@ -3004,21 +3190,26 @@ pub(crate) fn drop_stray_dimension_reactors(document: &mut codec::Document) -> u
     if associations.is_empty() {
         return 0;
     }
-    let mut dropped = 0;
-    let handles: Vec<Handle> = document
+    let keep = |handle: Handle, reactor: &Handle| match associations.get(reactor) {
+        Some((dimension, geometry)) => *dimension == handle || geometry.contains(&handle),
+        None => true,
+    };
+    // Mutable access drops an entity's verbatim record, so only entities
+    // that actually lose a reactor are touched.
+    let stray: Vec<Handle> = document
         .entities()
-        .map(|entity| entity.common().handle)
+        .map(|entity| entity.common())
+        .filter(|common| !common.reactors.iter().all(|r| keep(common.handle, r)))
+        .map(|common| common.handle)
         .collect();
-    for handle in handles {
+    let mut dropped = 0;
+    for handle in stray {
         let Some(entity) = document.get_entity_mut(handle) else {
             continue;
         };
         let reactors = &mut entity.common_mut().reactors;
         let before = reactors.len();
-        reactors.retain(|reactor| match associations.get(reactor) {
-            Some((dimension, geometry)) => *dimension == handle || geometry.contains(&handle),
-            None => true,
-        });
+        reactors.retain(|reactor| keep(handle, reactor));
         dropped += before - reactors.len();
     }
     dropped

@@ -7,24 +7,6 @@ use crate::app::{Message, OpenCADStudio};
 /// so a plain click never moves anything.
 const DOCK_DRAG_THRESHOLD: f32 = 5.0;
 
-/// Resolves once the dock hover delay has passed (a sleeping helper thread;
-/// the web build has none and resolves at once).
-fn hover_delay() -> impl std::future::Future<Output = ()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let rx = {
-        let (tx, rx) = iced::futures::channel::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            std::thread::sleep(crate::ui::dock::DOCK_HOVER_DELAY);
-            let _ = tx.send(());
-        });
-        rx
-    };
-    async move {
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = rx.await;
-    }
-}
-
 impl OpenCADStudio {
     /// Dock chrome interaction (grab / pin / resize / hover / move) applied to
     /// whichever panel the message names.
@@ -43,6 +25,10 @@ impl OpenCADStudio {
                 self.dock_begin(DockDrag::moving(id, None), Some(id));
             }
             DockMsg::GroupGrab(side, gi) => {
+                // The strips are rebuilt under the drag's capture layer, so
+                // the grip never hears the pointer leave: unlight it now.
+                self.dock_grip_hover = None;
+                self.dock_grip_lit = None;
                 if let Some(&id) = self.dock_group_visible(side, gi).first() {
                     self.dock_begin(DockDrag::moving(id, Some((side, gi))), Some(id));
                 }
@@ -88,10 +74,24 @@ impl OpenCADStudio {
                     self.dock_title_hover = None;
                 }
             }
-            DockMsg::GripHover(side, gi) => self.dock_grip_hover = Some((side, gi)),
+            DockMsg::GripHover(side, gi) => {
+                self.dock_grip_hover = Some((side, gi));
+                self.dock_grip_gen = self.dock_grip_gen.wrapping_add(1);
+                let gen = self.dock_grip_gen;
+                return iced::Task::perform(
+                    crate::app::update::rest(crate::ui::dock::GRIP_LIT_DELAY),
+                    move |()| Message::Dock(crate::ui::dock::DockMsg::GripLit(side, gi, gen)),
+                );
+            }
             DockMsg::GripHoverEnd(side, gi) => {
                 if self.dock_grip_hover == Some((side, gi)) {
                     self.dock_grip_hover = None;
+                    self.dock_grip_lit = None;
+                }
+            }
+            DockMsg::GripLit(side, gi, gen) => {
+                if gen == self.dock_grip_gen && self.dock_grip_hover == Some((side, gi)) {
+                    self.dock_grip_lit = Some((side, gi));
                 }
             }
             DockMsg::FloatRaise(id) => self.dock.raise_float(id),
@@ -120,6 +120,7 @@ impl OpenCADStudio {
             DockMsg::DockTo(id, side) => {
                 self.dock_drag = None;
                 self.dock_float_menu = None;
+                self.dock_clear_hover();
                 if self.dock.dock(id, side, usize::MAX) {
                     self.save_config();
                 }
@@ -144,10 +145,18 @@ impl OpenCADStudio {
                     self.save_config();
                 }
             }
-            DockMsg::EdgeMenu(side) => self.dock_edge_menu = side,
-            DockMsg::StripLabels(on) => {
+            DockMsg::EdgeMenu(side) => {
+                self.dock_edge_menu = side;
+                self.dock_edge_menu_y = None;
+            }
+            DockMsg::EdgeMenuAtPointer(side) => {
+                self.dock_edge_menu = Some(side);
+                self.dock_edge_menu_y = Some(self.dock_strip_pointer_y);
+            }
+            DockMsg::StripPointer(p) => self.dock_strip_pointer_y = p.y,
+            DockMsg::StripNames(names) => {
                 self.dock_edge_menu = None;
-                self.dock.strip_labels = on;
+                self.dock.strip_names = names;
                 self.save_config();
             }
             DockMsg::EdgeMenuToggle(side, id) => {
@@ -184,7 +193,14 @@ impl OpenCADStudio {
             | DockMsg::HoverExit
             | DockMsg::HoverStay
             | DockMsg::HoverSettled(_) => return self.dock_hover(m),
-            DockMsg::DragMove(point) => self.dock_drag_move(point),
+            DockMsg::DragMove(point) => {
+                self.dock_drag_over(None);
+                self.dock_drag_move(point);
+            }
+            DockMsg::DragMoveIn(window, point) => {
+                self.dock_drag_over(Some(window));
+                self.dock_drag_move(point);
+            }
             DockMsg::DragRelease => self.dock_drag_release(),
         }
         iced::Task::none()
@@ -257,9 +273,38 @@ impl OpenCADStudio {
         iced::Task::none()
     }
 
+    /// Forget which strip cell and group grip are hovered, after the strips
+    /// were rebuilt without the pointer leaving them.
+    fn dock_clear_hover(&mut self) {
+        self.dock_icon_hover = None;
+        self.dock_grip_hover = None;
+        self.dock_grip_lit = None;
+    }
+
+    /// The pointer moved over `window` (`None`: the main window). Points of
+    /// two windows have different origins, so moving from one into the other
+    /// starts the drag's deltas afresh instead of jumping by the windows'
+    /// offset.
+    fn dock_drag_over(&mut self, window: Option<iced::window::Id>) {
+        if self.dock_drag_window != window {
+            self.dock_drag_window = window;
+            self.dock_drag_last = None;
+        }
+    }
+
     /// Pointer released: land what was dragged and save a changed layout.
     fn dock_drag_release(&mut self) {
         use crate::ui::dock::{DockDrag, DropTarget, FloatPanel};
+        // A real drag rebuilds the strips under the drag's capture layer,
+        // so no cell ever hears the pointer leave: drop the hover marks,
+        // or a cell stays lit as if hovered. A plain click keeps them.
+        let dragged = self
+            .dock_drag
+            .and_then(|d| d.movement())
+            .is_some_and(|(_, _, target)| target.is_some());
+        if dragged {
+            self.dock_clear_hover();
+        }
         let mut changed = false;
         match self.dock_drag.take() {
             Some(DockDrag::Move {
@@ -290,7 +335,8 @@ impl OpenCADStudio {
                     }
                 };
             }
-            Some(DockDrag::Move { .. } | DockDrag::LayerColumn) | None => {}
+            Some(DockDrag::Move { .. } | DockDrag::LayerColumn(_) | DockDrag::WalkColumn(_))
+            | None => {}
             Some(
                 DockDrag::Width(_)
                 | DockDrag::Split { .. }
@@ -304,6 +350,7 @@ impl OpenCADStudio {
             self.save_config();
         }
         self.dock_drag_last = None;
+        self.dock_drag_window = None;
         self.xref_col_drag = None;
         self.xref_col_last = None;
         self.xref_split_drag = false;
@@ -437,10 +484,28 @@ impl OpenCADStudio {
                 let pos = self.quick_properties_pos + (point - last);
                 self.quick_properties_pos = iced::Point::new(pos.x.max(0.0), pos.y.max(0.0));
             }
-            DockDrag::LayerColumn => {
+            DockDrag::LayerColumn(col) => {
                 let Some(last) = last else { return };
-                self.layer_name_col_w =
-                    (self.layer_name_col_w + point.x - last.x).clamp(60.0, 640.0);
+                let dx = point.x - last.x;
+                match col {
+                    None => {
+                        self.layer_name_col_w = (self.layer_name_col_w + dx).clamp(60.0, 640.0);
+                    }
+                    Some(col) => {
+                        let w = crate::ui::window::layers::column_width(&self.layer_col_w, col);
+                        self.layer_col_w.insert(
+                            col,
+                            (w + dx).clamp(crate::ui::window::layers::COL_MIN_W, 640.0),
+                        );
+                    }
+                }
+            }
+            DockDrag::WalkColumn(i) => {
+                let Some(last) = last else { return };
+                if let Some(w) = self.layer_walk_col_w.get_mut(i) {
+                    *w = (*w + point.x - last.x)
+                        .clamp(crate::ui::window::layer_walk::COL_MIN_W, 640.0);
+                }
             }
             DockDrag::Width(id) => {
                 let Some(last) = last else { return };
@@ -480,9 +545,10 @@ impl OpenCADStudio {
         self.dock_hover_gen = self.dock_hover_gen.wrapping_add(1);
         self.dock_hover_pending = Some(target);
         let gen = self.dock_hover_gen;
-        iced::Task::perform(hover_delay(), move |()| {
-            Message::Dock(crate::ui::dock::DockMsg::HoverSettled(gen))
-        })
+        iced::Task::perform(
+            crate::app::update::rest(crate::ui::dock::DOCK_HOVER_DELAY),
+            move |()| Message::Dock(crate::ui::dock::DockMsg::HoverSettled(gen)),
+        )
     }
 
     /// Whether a popup a pallet opened is showing: a colour dropdown in the
@@ -553,12 +619,19 @@ impl OpenCADStudio {
                     PanelId::BlockPalette => self.open_blocks_palette(None),
                     PanelId::ParametersManager => {
                         self.show_parameters_manager = true;
-                        self.dock_open_at_default(id);
+                        self.dock_open_above_palettes(id);
                         self.save_config();
                     }
                     PanelId::AuthoringPalettes => {
                         self.show_authoring_palettes = true;
                         self.dock_open_at_default(id);
+                        self.save_config();
+                    }
+                    PanelId::ToolPalettes => {
+                        self.show_tool_palettes = true;
+                        self.refresh_tool_palettes();
+                        self.dock_open_at_default(id);
+                        self.ribbon.show_tool_palettes = !self.tabs[self.active_tab].is_start;
                         self.save_config();
                     }
                     PanelId::ExternalReferences => {
@@ -572,10 +645,13 @@ impl OpenCADStudio {
                     }
                     PanelId::PointCloudManager => self.pc_manager.show = true,
                     PanelId::Count => self.set_count_palette(true),
+                    PanelId::GeometryCleanup => self.geometry_cleanup.show = true,
+                    PanelId::BricscadVisibility => self.set_bricscad_visibility_panel(true),
                     PanelId::SheetSetManager => self.show_sheet_set_manager(true),
                     PanelId::Layers => {
                         self.sync_ribbon_layers();
                         self.show_layers = true;
+                        self.save_config();
                     }
                     // The walk session is the pallet's state, so opening from
                     // a collapsed tab starts a walk exactly like LAYWALK does.
@@ -585,6 +661,7 @@ impl OpenCADStudio {
                         }
                     }
                     PanelId::QuickCalc => self.quick_calc.show = true,
+                    PanelId::Assistant => self.assistant.opened(),
                     PanelId::CommandHistory => {
                         self.show_command_history = true;
                         self.sync_command_history_panel();
@@ -597,7 +674,19 @@ impl OpenCADStudio {
                                 panel.visible = true;
                             }
                         }
+                        // Visibility alone does not place a newly registered
+                        // panel. Give it the same default dock as other
+                        // pallets so an explicit show is actually rendered.
+                        self.dock_open_at_default(id);
                     }
+                }
+            }
+            if self.clean_screen {
+                match id {
+                    PanelId::ParametersManager => self.clean_screen_parameters_manager = true,
+                    PanelId::AuthoringPalettes => self.clean_screen_authoring_palettes = true,
+                    PanelId::ToolPalettes => self.clean_screen_tool_palettes = true,
+                    _ => {}
                 }
             }
             self.dock_reveal(id);
@@ -609,9 +698,18 @@ impl OpenCADStudio {
                 self.block_palette.placing = None;
             }
             PanelId::AuthoringPalettes => {
+                self.clean_screen_authoring_palettes = false;
                 self.show_authoring_palettes = false;
             }
+            PanelId::ToolPalettes => {
+                self.clean_screen_tool_palettes = false;
+                self.show_tool_palettes = false;
+                self.tool_palettes.placing = None;
+                self.ribbon.show_tool_palettes = false;
+                self.save_config();
+            }
             PanelId::ParametersManager => {
+                self.clean_screen_parameters_manager = false;
                 // Closing the pane moves the click off an open cell, which is how
                 // every other route out of a cell applies what was typed. A cell
                 // left on another definition is not this pane's to apply, so it
@@ -630,7 +728,13 @@ impl OpenCADStudio {
                     let _ = self.commit_parameters_manager(false);
                 }
                 self.show_parameters_manager = false;
-                self.tabs[i].parameters_panel = Default::default();
+                // The column choice is the pane's own setting, not the
+                // transient state of this opening: it survives the close.
+                let columns = self.tabs[i].parameters_panel.columns;
+                self.tabs[i].parameters_panel = crate::ui::window::parameters_manager::Panel {
+                    columns,
+                    ..Default::default()
+                };
             }
             PanelId::ExternalReferences => self.show_external_references = false,
             PanelId::Browser => self.show_browser = false,
@@ -641,6 +745,8 @@ impl OpenCADStudio {
                 self.count_palette.show = false;
                 self.ribbon.set_count_palette(false);
             }
+            PanelId::GeometryCleanup => self.geometry_cleanup.show = false,
+            PanelId::BricscadVisibility => self.bricscad_visibility.show = false,
             PanelId::SheetSetManager => {
                 self.sheet_set.show = false;
                 self.ribbon.set_sheet_set(false);
@@ -656,9 +762,11 @@ impl OpenCADStudio {
             PanelId::Layers => {
                 self.show_layers = false;
                 self.ribbon.deactivate_tool_if("LAYERS");
+                self.save_config();
             }
             PanelId::Laywalk => self.close_layer_walk(false),
             PanelId::QuickCalc => self.quick_calc.show = false,
+            PanelId::Assistant => self.assistant.show = false,
             PanelId::CommandHistory => {
                 self.show_command_history = false;
                 self.save_config();
@@ -692,9 +800,19 @@ impl OpenCADStudio {
     /// Show `id` where the layout has it, first docking it on the right edge
     /// when it has no place yet (opened for the first time, or never moved).
     pub(crate) fn dock_open_at_default(&mut self, id: crate::ui::dock::PanelId) {
+        self.dock_open_at(id, usize::MAX);
+    }
+
+    /// Dock `id` at the top of the right edge when it has no place yet, so it
+    /// lists above palettes docked later.
+    pub(crate) fn dock_open_above_palettes(&mut self, id: crate::ui::dock::PanelId) {
+        self.dock_open_at(id, 0);
+    }
+
+    fn dock_open_at(&mut self, id: crate::ui::dock::PanelId, index: usize) {
         if !self.dock.is_placed(id) {
             self.dock
-                .dock(id, crate::app::config::DockSide::Right, usize::MAX);
+                .dock(id, crate::app::config::DockSide::Right, index);
         }
         self.dock_reveal(id);
     }
@@ -716,6 +834,7 @@ impl OpenCADStudio {
         }
         self.dock.raise_float(PanelId::Layers);
         self.dock_reveal(PanelId::Layers);
+        self.save_config();
     }
 
     /// Stop revealing `id` (it closed).
@@ -733,8 +852,22 @@ impl OpenCADStudio {
         if self.tabs[self.active_tab].is_start {
             return false;
         }
-        if self.clean_screen && !(id == PanelId::Properties && self.clean_screen_properties) {
-            return false;
+        if self.clean_screen {
+            let reopened = match id {
+                PanelId::Properties => self.clean_screen_properties,
+                PanelId::ParametersManager => self.clean_screen_parameters_manager,
+                PanelId::AuthoringPalettes => self.clean_screen_authoring_palettes,
+                PanelId::ToolPalettes => self.clean_screen_tool_palettes,
+                // A plugin panel explicitly opened after Clean Screen was
+                // entered must be visible just like a built-in reopened
+                // pallet. `dock_reveal` marks that explicit request; other
+                // plugin panels still stay hidden for the whole session.
+                PanelId::Plugin(_) if self.dock_peek == Some(id) => true,
+                _ => false,
+            };
+            if !reopened {
+                return false;
+            }
         }
         self.dock_panel_wanted(id)
     }
@@ -747,6 +880,7 @@ impl OpenCADStudio {
         match id {
             PanelId::Properties => self.show_properties,
             PanelId::BlockPalette => self.show_block_palette,
+            PanelId::ToolPalettes => self.show_tool_palettes,
             PanelId::ParametersManager => {
                 self.show_parameters_manager
                     && self.tabs[self.active_tab]
@@ -765,6 +899,8 @@ impl OpenCADStudio {
             PanelId::NodeGraph => self.show_node_graph,
             PanelId::PointCloudManager => self.pc_manager.show,
             PanelId::Count => self.count_palette.show,
+            PanelId::GeometryCleanup => self.geometry_cleanup.show,
+            PanelId::BricscadVisibility => self.bricscad_visibility.show,
             PanelId::SheetSetManager => self.sheet_set.show,
             PanelId::Layers => self.show_layers,
             // The walk session is the pallet's state. While the Select Objects
@@ -772,15 +908,18 @@ impl OpenCADStudio {
             // comes back when the pick ends or is cancelled.
             PanelId::Laywalk => {
                 let tab = &self.tabs[self.active_tab];
-                tab.layer_walk.is_some()
-                    && !(tab.layer_walk_picking && tab.active_cmd.is_some())
+                tab.layer_walk.is_some() && !(tab.layer_walk_picking && tab.active_cmd.is_some())
             }
             PanelId::QuickCalc => self.quick_calc.show,
+            PanelId::Assistant => self.assistant.show,
             PanelId::CommandHistory => self.show_command_history,
             PanelId::GraphicAttributes => self.show_graphic_attributes,
             PanelId::Plugin(num) => {
                 if let Some(panel_id) = self.plugin_panel_by_num.get(&num) {
-                    self.plugin_panels.get(panel_id).map(|p| p.visible).unwrap_or(false)
+                    self.plugin_panels
+                        .get(panel_id)
+                        .map(|p| p.visible)
+                        .unwrap_or(false)
                 } else {
                     false
                 }
@@ -789,8 +928,14 @@ impl OpenCADStudio {
     }
 
     /// Size of the workspace the dock lays out in: window width by viewport
-    /// height.
+    /// height, plus the drawing-tab bar when it sits over the drawing
+    /// between the docks (the docks then run from the ribbon down).
     pub(crate) fn dock_workspace_size(&self) -> (f32, f32) {
+        let tabs = if self.doc_tabs_in_center() {
+            crate::ui::style::kit_metrics::TAB_BAR_H
+        } else {
+            0.0
+        };
         (
             self.win_size.0,
             self.tabs[self.active_tab]
@@ -799,8 +944,15 @@ impl OpenCADStudio {
                 .borrow()
                 .view
                 .vp_size
-                .1,
+                .1
+                + tabs,
         )
+    }
+
+    /// Whether the drawing-tab bar sits over the drawing, between the
+    /// docks, rather than across the window above them.
+    pub(crate) fn doc_tabs_in_center(&self) -> bool {
+        self.show_file_tabs && !self.file_tabs_above_docks
     }
 
     /// The open pallets of group `gi` on `side`, top → bottom. Closed
@@ -830,19 +982,20 @@ impl OpenCADStudio {
             .collect()
     }
 
-    /// The group `side` draws: the one it shows, or the first with an open
-    /// pallet when that one has none.
-    /// Whether open pallet `id` is drawn: floating, or in the shown group of
-    /// an expanded edge.
+    /// Whether open pallet `id` is drawn: in a window of its own, floating
+    /// unless it collapsed itself, or in the shown group of an expanded edge.
     pub(crate) fn dock_panel_on_screen(&self, id: crate::ui::dock::PanelId) -> bool {
         match self.dock.location(id) {
             Some((side, group)) => {
                 self.dock_shown_group(side) == Some(group) && self.dock_edge_expanded(side)
             }
-            None => true,
+            None if self.dock.is_separate(id) => true,
+            None => !self.dock.auto_collapse(id) || self.dock_peek == Some(id),
         }
     }
 
+    /// The group `side` draws: the one it shows, or the first with an open
+    /// pallet when that one has none.
     pub(crate) fn dock_shown_group(&self, side: crate::app::config::DockSide) -> Option<usize> {
         let visible = self.dock_visible_groups(side);
         let shown = self.dock.shown(side);
@@ -885,29 +1038,24 @@ impl OpenCADStudio {
         &self,
         side: crate::app::config::DockSide,
     ) -> (Vec<crate::ui::dock::StripGroup>, f32) {
-        let groups: Vec<(usize, usize)> = self
+        let names = self.dock.strip_names;
+        let groups: Vec<(usize, Vec<f32>)> = self
             .dock_visible_groups(side)
             .into_iter()
-            .map(|gi| (gi, self.dock_group_visible(side, gi).len()))
+            .map(|gi| {
+                let cells = self
+                    .dock_group_visible(side, gi)
+                    .into_iter()
+                    .map(|id| crate::ui::dock::strip_tab_h(&crate::t!(id.title()), names))
+                    .collect();
+                (gi, cells)
+            })
             .collect();
-        crate::ui::dock::strip_layout(&groups, self.dock_strip_cell_h(&groups))
-    }
-
-    /// Height of a pallet cell in an icon strip holding `groups`: fixed for
-    /// icons only; labelled, the edge's height shared between the pallets.
-    fn dock_strip_cell_h(&self, groups: &[(usize, usize)]) -> f32 {
-        use crate::ui::dock::{
-            STRIP_CELL_H, STRIP_DIVIDER_H, STRIP_LABEL_MIN_H, STRIP_PAD, STRIP_PLUS_GAP, STRIP_PLUS_H,
-        };
-        if !self.dock.strip_labels {
-            return STRIP_CELL_H;
-        }
-        let pallets: usize = groups.iter().map(|&(_, icons)| icons).sum();
-        let fixed = groups.len() as f32 * (2.0 * STRIP_PAD + STRIP_DIVIDER_H)
-            + STRIP_PLUS_GAP
-            + STRIP_PLUS_H
-            + STRIP_PAD;
-        ((self.dock_workspace_size().1 - fixed) / pallets.max(1) as f32).max(STRIP_LABEL_MIN_H)
+        let (layout, plus_top) = crate::ui::dock::strip_layout(&groups);
+        (
+            layout,
+            crate::ui::dock::strip_plus_top(plus_top, self.dock_workspace_size().1),
+        )
     }
 
     /// The open pallets of `side`'s shown group, each as (position in the
@@ -954,11 +1102,8 @@ impl OpenCADStudio {
         let inset = |side: DockSide| match self.dock_shown_group(side) {
             None => 0.0,
             Some(_) if self.dock.edge_auto_hide(side) => crate::ui::dock::DOCK_STRIP_W,
-            Some(gi) => {
-                crate::ui::dock::DOCK_STRIP_W
-                    + self.dock_group_width(side, gi)
-                    + crate::ui::dock::DOCK_DIVIDER_W
-            }
+            // The grab band lies over the drawing: it takes no room.
+            Some(gi) => crate::ui::dock::DOCK_STRIP_W + self.dock_group_width(side, gi),
         };
         (inset(DockSide::Left), inset(DockSide::Right))
     }
@@ -1145,5 +1290,51 @@ impl OpenCADStudio {
             _ => bar,
         };
         crate::ui::dock::DropTarget::Float { x, y, bar }
+    }
+}
+
+#[cfg(test)]
+mod ui_state_tests {
+    use crate::app::{Message, OpenCADStudio};
+
+    /// #2616: the Layer Manager and the file tabs come back as they were left.
+    #[test]
+    fn layers_pallet_and_file_tabs_survive_a_restart() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.open_layers_pallet();
+        app.open_blocks_palette(None);
+        let _ = app.update(Message::ToggleFileTabs);
+        let saved = app.current_config();
+        assert!(saved.show_layers);
+        assert!(saved.show_block_palette);
+        assert!(!saved.show_file_tabs);
+
+        let mut again = OpenCADStudio::new_for_test();
+        again.apply_config(saved);
+        assert!(again.show_layers);
+        assert!(again.show_block_palette);
+        assert!(!again.show_file_tabs);
+    }
+
+    /// #3527: the External References pallet docked on the right comes back
+    /// open, in its place.
+    #[test]
+    fn external_references_pallet_survives_a_restart() {
+        use crate::ui::dock::PanelId;
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.update(Message::ToggleXrefManager);
+        assert!(app.dock_panel_visible(PanelId::ExternalReferences));
+        let place = app.dock.location(PanelId::ExternalReferences);
+        let saved = app.current_config();
+        assert!(saved.show_external_references);
+
+        let mut again = OpenCADStudio::new_for_test();
+        again.apply_config(saved);
+        again.automation_op(r#"{"op":"new"}"#);
+        assert!(again.show_external_references);
+        assert_eq!(again.dock.location(PanelId::ExternalReferences), place);
+        assert!(again.dock_panel_visible(PanelId::ExternalReferences));
     }
 }

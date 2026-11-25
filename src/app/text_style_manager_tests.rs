@@ -1,12 +1,13 @@
 //! Text style manager engine: the draft keeps untouched values exact, list
-//! operations keep typed values, and Close / Undo bring back the texts a
+//! operations keep typed values, and one Undo brings back the texts a
 //! rename touched (#2413).
 
 use super::*;
 use crate::ui::font_picker::{FontChoice, FontPickerEvent};
-use codec::entities::{AttributeDefinition, AttributeEntity, EntityType, Insert, MText, Text};
-use codec::tables::{BlockRecord, TextStyle};
-use codec::types::{Handle, Vector3};
+use crate::ui::style::textstyle::CardMsg;
+use document::entities::{AttributeDefinition, AttributeEntity, EntityType, Insert, MText, Text};
+use document::tables::{BlockRecord, TextStyle};
+use document::types::{Handle, Vector3};
 
 fn exact_style(name: &str) -> TextStyle {
     let mut style = TextStyle::new(name);
@@ -87,7 +88,10 @@ fn open_apply_switch_and_close_keep_the_style_exact() {
     assert_eq!(stored(&app, "Exact"), Some(expected));
     // Not only the style: nothing in the drawing changed.
     assert!(app.tabs[i].scene.document == before, "the drawing changed");
-    assert!(!app.tabs[i].dirty, "an untouched Apply must not dirty the tab");
+    assert!(
+        !app.tabs[i].dirty,
+        "an untouched Apply must not dirty the tab"
+    );
     assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
 }
 
@@ -109,19 +113,23 @@ fn a_changed_field_is_written_and_the_rest_stays_exact() {
 }
 
 #[test]
-fn rename_then_close_restores_the_texts() {
+fn rename_then_close_keeps_the_rename_and_undo_restores_the_texts() {
     let (mut app, text, mtext) = app_with_exact_style();
     open_on(&mut app, "Exact");
     rename(&mut app, "Exact", "Notes");
     assert_eq!(style_of(&app, text), "Notes");
 
+    // What the window did is kept on Close, as one undo step.
     app.close_active_modal();
+    assert!(stored(&app, "Notes").is_some());
+    assert_eq!(style_of(&app, mtext), "Notes");
+    assert!(app.tabs[app.active_tab].dirty);
 
+    let _ = app.update(Message::Undo);
     assert!(stored(&app, "Exact").is_some());
     assert!(stored(&app, "Notes").is_none());
     assert_eq!(style_of(&app, text), "Exact");
     assert_eq!(style_of(&app, mtext), "Exact");
-    assert!(!app.tabs[app.active_tab].dirty);
 }
 
 #[test]
@@ -153,6 +161,8 @@ fn copy_takes_the_value_typed_before_it() {
         value: "0.8".to_string(),
     });
     let _ = app.update(Message::TextStyleDialogCopy);
+    // The pending change is answered for first: Yes writes it.
+    let _ = app.update(Message::TextStyleCard(CardMsg::ModifiedAnswer(true)));
 
     let copy = stored(&app, "Exact (1)").unwrap();
     assert_eq!(copy.width_factor, 0.8);
@@ -168,7 +178,10 @@ fn rename_start_keeps_the_typed_value() {
         field: "height",
         value: "5".to_string(),
     });
-    let _ = app.update(Message::StyleRenameStart(StyleKind::Text, "Exact".to_string()));
+    let _ = app.update(Message::StyleRenameStart(
+        StyleKind::Text,
+        "Exact".to_string(),
+    ));
     assert_eq!(app.textstyle_draft.height.text, "5.0000");
 }
 
@@ -237,9 +250,19 @@ fn a_new_style_starts_from_the_selected_one() {
     let (mut app, _, _) = app_with_exact_style();
     open_on(&mut app, "Exact");
     let _ = app.update(Message::TextStyleDialogNew);
+    let _ = app.update(Message::TextStyleCard(CardMsg::NewOk));
 
     let new = app.textstyle_selected.clone();
-    assert_ne!(new, "Exact");
+    assert_eq!(new, "style1");
+    // A new style is the current one.
+    assert_eq!(
+        app.tabs[app.active_tab]
+            .scene
+            .document
+            .header
+            .current_text_style_name,
+        new
+    );
     let mut expected = exact_style(&new);
     expected.handle = stored(&app, &new).unwrap().handle;
     assert_eq!(stored(&app, &new), Some(expected));
@@ -289,7 +312,7 @@ fn the_window_names_the_field_to_fix_and_why() {
     );
     for shown in [
         "1 field needs fixing before Apply.",
-        "Must be between \u{2212}85° and 85°.",
+        "Invalid Oblique angle, please enter a new angle.",
     ] {
         assert!(simulator.find(shown).is_ok(), "{shown:?} is not shown");
     }
@@ -347,12 +370,6 @@ fn rename_reaches_attributes_inserts_and_block_texts_and_undo_brings_them_back()
     rename(&mut app, "Exact", "Notes");
     assert_eq!(styles_of(&app, &all), vec!["Notes"; 5]);
     app.close_active_modal();
-    assert_eq!(styles_of(&app, &all), vec!["Exact"; 5], "Close restores");
-
-    open_on(&mut app, "Exact");
-    rename(&mut app, "Exact", "Notes");
-    let _ = app.update(Message::TextStyleApply);
-    app.close_active_modal();
     assert_eq!(styles_of(&app, &all), vec!["Notes"; 5]);
     let _ = app.update(Message::Undo);
     assert_eq!(styles_of(&app, &all), vec!["Exact"; 5], "one Undo restores");
@@ -383,6 +400,8 @@ fn a_copy_or_new_style_from_a_referenced_one_is_the_drawings_own() {
 
     let _ = app.update(Message::TextStyleDialogSelect("PLAN|Notes".to_string()));
     let _ = app.update(Message::TextStyleDialogNew);
+    let _ = app.update(Message::TextStyleCard(CardMsg::NewOk));
+    assert_eq!(app.textstyle_selected, "style1");
     assert!(!app.selected_textstyle_is_read_only());
     assert!(stored(&app, "PLAN|Notes").unwrap().xref_dependent);
 }

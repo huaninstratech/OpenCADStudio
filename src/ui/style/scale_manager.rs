@@ -8,7 +8,9 @@
 use crate::app::Message;
 use crate::t;
 use crate::ui::style::form::field_style_with_radius;
-use crate::ui::style::style_manager::{hdivider, muted_text_style, tb_button, vsep};
+use crate::ui::style::style_manager::{
+    hdivider, muted_text_style, tb_button, tb_button_maybe, vsep,
+};
 use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input, Space};
 use iced::{Background, Border, Element, Theme};
 use std::borrow::Cow;
@@ -18,27 +20,118 @@ pub fn rename_input_id() -> iced::widget::Id {
     iced::widget::Id::new("scale-rename-input")
 }
 
-/// `scales` is (name, "paper:drawing" ratio label). The editor buffers hold the
-/// name / paper / drawing of the row being added or edited.
+/// What the list buttons may do for the selected scales, and the line that
+/// describes them.
+#[derive(Clone)]
+pub struct ListState {
+    pub can_up: bool,
+    pub can_down: bool,
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub units: String,
+    /// Reset asks which default list to restore.
+    pub reset_asking: bool,
+    /// Delete asks whether to drop the selected scales not in use.
+    pub delete_asking: bool,
+}
+
+/// The Edit / Add card: the scale's name and its paper : drawing units, with
+/// the units line it would read as.
+#[derive(Clone)]
+pub struct EditCard<'a> {
+    pub adding: bool,
+    pub name: &'a str,
+    pub paper: &'a str,
+    pub drawing: &'a str,
+    pub preview: String,
+    /// A scale in use, the current one or the unit scale keeps its ratio.
+    pub units_locked: bool,
+    /// Editing names the fields by unit ("Paper Millimeters").
+    pub paper_unit: i16,
+    pub drawing_unit: i16,
+    /// The last refusal, shown under the fields.
+    pub error: Option<&'a str>,
+}
+
+/// `1 paper Millimeter = 2 drawing Meters`: the paper unit of the drawing's
+/// scale family and the drawing's own unit, plural past one.
+pub fn units_line(paper: f64, drawing: f64, paper_unit: i16, drawing_unit: i16) -> String {
+    let number = |value: f64| {
+        let text = format!("{value:.6}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    let one = |value: f64| (value - 1.0).abs() < 1e-12;
+    format!(
+        "{} {} {} = {} {} {}",
+        number(paper),
+        t!("paper"),
+        unit_name(paper_unit, !one(paper)),
+        number(drawing),
+        t!("drawing"),
+        unit_name(drawing_unit, !one(drawing))
+    )
+}
+
+fn unit_name(code: i16, plural: bool) -> Cow<'static, str> {
+    match (code, plural) {
+        (1, false) => t!("Inch"),
+        (1, true) => t!("Inches"),
+        (2, false) => t!("Foot"),
+        (2, true) => t!("Feet"),
+        (3, false) => t!("Mile"),
+        (3, true) => t!("Miles"),
+        (4, false) => t!("Millimeter"),
+        (4, true) => t!("Millimeters"),
+        (5, false) => t!("Centimeter"),
+        (5, true) => t!("Centimeters"),
+        (6, false) => t!("Meter"),
+        (6, true) => t!("Meters"),
+        (7, false) => t!("Kilometer"),
+        (7, true) => t!("Kilometers"),
+        (_, false) => t!("unit"),
+        (_, true) => t!("units"),
+    }
+}
+
+/// `scales` is (name, "paper:drawing" ratio label) in the drawing's list
+/// order; `selected` the picked rows (Ctrl adds, Shift extends). `edit` opens
+/// the Edit / Add card in place of the details panel.
 pub fn view_window<'a, 'b>(
+    list: ListState,
     scales: &'b [(String, String)],
-    selected: &'b str,
+    selected: &'b [String],
     current: &'b str,
-    rename_active: Option<&'b str>,
-    rename_buf: &'a str,
-    paper_buf: &'a str,
-    drawing_buf: &'a str,
+    edit: Option<EditCard<'a>>,
     sizing: crate::ui::modal::ModalSizing,
 ) -> Element<'a, Message> {
-    // ── Toolbar: New / Delete | Set Current / Apply ───────────────────────
+    let editing = edit.is_some();
+    let idle = |msg: Message| (!editing).then_some(msg);
+    // ── Toolbar: Add / Edit / Delete / Move Up / Move Down | Reset ───────
     let toolbar = container(
         row![
-            tb_button(t!("New"), Message::ScaleManagerNew, false),
-            tb_button(t!("Copy"), Message::ScaleManagerCopy, false),
-            tb_button(t!("Delete"), Message::ScaleManagerDelete, false),
+            tb_button_maybe(t!("Add..."), idle(Message::ScaleManagerNew), false),
+            tb_button_maybe(
+                t!("Edit…"),
+                list.can_edit.then_some(Message::ScaleManagerEdit).filter(|_| !editing),
+                false
+            ),
+            tb_button_maybe(
+                t!("Delete"),
+                list.can_delete.then_some(Message::ScaleManagerDelete).filter(|_| !editing),
+                false
+            ),
+            tb_button_maybe(
+                t!("Move Up"),
+                list.can_up.then_some(Message::ScaleManagerMove(-1)).filter(|_| !editing),
+                false
+            ),
+            tb_button_maybe(
+                t!("Move Down"),
+                list.can_down.then_some(Message::ScaleManagerMove(1)).filter(|_| !editing),
+                false
+            ),
             Space::new().width(sizing.width),
-            tb_button(t!("Set Current"), Message::ScaleManagerSetCurrent, false),
-            tb_button(t!("Apply"), Message::ScaleManagerApply, true),
+            tb_button_maybe(t!("Reset"), idle(Message::ScaleManagerReset), false),
         ]
         .spacing(4)
         .align_y(iced::Center),
@@ -51,53 +144,56 @@ pub fn view_window<'a, 'b>(
     .padding([5, 8]);
 
     // ── Left: scale list ──────────────────────────────────────────────────
-    let rows: Vec<Element<'_, Message>> =
-        scales
-            .iter()
-            .map(|(name, ratio)| {
-                // The row being renamed shows an inline text field; a single click
-                // selects, a double click starts renaming.
-                if rename_active == Some(name.as_str()) {
-                    return text_input("", rename_buf)
-                        .id(rename_input_id())
-                        .on_input(Message::ScaleRenameEdit)
-                        .on_submit(Message::ScaleRenameCommit)
-                        .size(11)
-                        .padding([4, 8])
-                        .width(sizing.width)
-                        .into();
-                }
-                let is_sel = name.as_str() == selected;
-                let is_cur = name.eq_ignore_ascii_case(current);
-                let check = crate::ui::icons::themed_check_cell(is_cur);
-                let label = row![
-                    check,
-                    text(name.clone()).size(11).width(sizing.width),
-                    text(ratio.clone()).size(10).style(muted_text_style),
-                ]
-                .spacing(4)
-                .align_y(iced::Center);
-                let cell = container(label).padding([4, 8]).width(sizing.width).style(
-                    move |theme: &Theme| {
-                        let pair = theme.palette().primary.strong;
-                        container::Style {
-                            background: is_sel.then_some(Background::Color(pair.color)),
-                            text_color: is_sel.then_some(pair.text),
-                            ..Default::default()
-                        }
-                    },
-                );
-                mouse_area(cell)
-                    .on_press(Message::ScaleManagerSelect(name.clone()))
+    let rows: Vec<Element<'_, Message>> = scales
+        .iter()
+        .map(|(name, ratio)| {
+            let is_sel = selected.iter().any(|s| s.eq_ignore_ascii_case(name));
+            let is_cur = name.eq_ignore_ascii_case(current);
+            let check = crate::ui::icons::themed_check_cell(is_cur);
+            // The ratio keeps its whole width; the name takes the rest.
+            let label = row![
+                check,
+                text(name.clone()).size(11).width(iced::Length::Fill),
+                text(ratio.clone())
+                    .size(10)
+                    .style(muted_text_style)
+                    .width(iced::Length::Shrink),
+            ]
+            .spacing(4)
+            .align_y(iced::Center);
+            let cell = container(label).padding([4, 8]).width(sizing.width).style(
+                move |theme: &Theme| {
+                    let pair = theme.palette().primary.strong;
+                    container::Style {
+                        background: is_sel.then_some(Background::Color(pair.color)),
+                        text_color: is_sel.then_some(pair.text),
+                        ..Default::default()
+                    }
+                },
+            );
+            let area = mouse_area(cell);
+            if editing {
+                area.into()
+            } else {
+                area.on_press(Message::ScaleManagerSelect(name.clone()))
                     .on_double_click(Message::ScaleRenameStart(name.clone()))
                     .into()
-            })
-            .collect();
+            }
+        })
+        .collect();
 
     let list_panel = container(
         column![
             text(t!("Scales")).size(10).style(muted_text_style),
-            container(scrollable(column(rows).spacing(1)).height(sizing.height))
+            // The rows leave room on the right for the scrollbar, so it never
+            // covers a ratio.
+            container(
+                scrollable(column(rows).spacing(1).padding(iced::Padding {
+                    right: 12.0,
+                    ..iced::Padding::ZERO
+                }))
+                .height(sizing.height)
+            )
                 .style(|theme: &Theme| {
                     let palette = theme.palette();
                     container::Style {
@@ -117,7 +213,7 @@ pub fn view_window<'a, 'b>(
         .spacing(4)
         .height(sizing.height),
     )
-    .width(190)
+    .width(270)
     .height(sizing.height)
     .padding(iced::Padding {
         top: 12.0,
@@ -126,48 +222,218 @@ pub fn view_window<'a, 'b>(
         left: 12.0,
     });
 
-    // ── Right: editor (name + paper:drawing) ──────────────────────────────
+    // ── Right: the selected scale, or the Edit / Add card ────────────────
+    let right: Element<'a, Message> = match edit {
+        Some(card) => edit_card(card, sizing),
+        None => {
+            let (name, ratio) = match selected {
+                [one] => scales
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(one))
+                    .map(|(n, r)| (n.clone(), r.clone()))
+                    .unwrap_or_default(),
+                _ => (String::new(), String::new()),
+            };
+            container(
+                column![
+                    text(t!("Scale")).size(10).style(muted_text_style),
+                    text(name).size(15),
+                    text(ratio).size(12).style(muted_text_style),
+                    Space::new().height(4),
+                    text(list.units.clone()).size(11),
+                    Space::new().height(6),
+                    text(t!("Double-click a scale or use Edit… to change its name and its paper : drawing units. Ctrl or Shift click picks several scales. Nothing is kept unless you click OK."))
+                        .size(10)
+                        .style(muted_text_style),
+                ]
+                .spacing(8),
+            )
+            .width(sizing.width)
+            .height(sizing.height)
+            .padding(12)
+            .into()
+        }
+    };
+
+    // The details panel keeps one width, so the window does not change
+    // size when the card opens.
+    let right = container(right).width(iced::Length::Fixed(440.0)).height(sizing.height);
+    let body = row![list_panel, vsep(sizing.height), right].height(sizing.height);
+    let footer: Element<'a, Message> = if list.reset_asking {
+        // Reset asks which default list to restore before it purges anything.
+        row![
+            text(t!(
+                "Restore which default list? Unreferenced scales are purged."
+            ))
+            .size(11),
+            Space::new().width(sizing.width),
+            tb_button(t!("Metric"), Message::ScaleManagerResetChoice(0), false),
+            tb_button(t!("Imperial"), Message::ScaleManagerResetChoice(1), false),
+            tb_button(
+                t!("Metric and Imperial"),
+                Message::ScaleManagerResetChoice(2),
+                false
+            ),
+            tb_button(t!("Cancel"), Message::ScaleManagerResetChoice(3), false),
+        ]
+        .spacing(4)
+        .align_y(iced::Center)
+        .into()
+    } else if list.delete_asking {
+        row![
+            text(t!("Scales in use cannot be deleted. Delete the selected scales not in use?"))
+                .size(11),
+            Space::new().width(sizing.width),
+            tb_button(t!("Yes"), Message::ScaleManagerDeleteChoice(true), true),
+            tb_button(t!("No"), Message::ScaleManagerDeleteChoice(false), false),
+        ]
+        .spacing(4)
+        .align_y(iced::Center)
+        .into()
+    } else {
+        row![
+            Space::new().width(sizing.width),
+            tb_button_maybe(t!("Cancel"), idle(Message::CloseModal), false),
+            tb_button_maybe(t!("OK"), idle(Message::ScaleManagerOk), true),
+        ]
+        .spacing(4)
+        .into()
+    };
+
+    container(column![
+        toolbar,
+        hdivider(sizing.width),
+        body,
+        hdivider(sizing.width),
+        container(footer).padding([6, 8]),
+    ])
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(theme.palette().background.base.color)),
+        ..Default::default()
+    })
+    .width(sizing.width)
+    .height(sizing.height)
+    .into()
+}
+
+/// The Edit / Add card: an accented panel with the name, the two unit
+/// fields, the units line they make and its own Cancel / Apply.
+fn edit_card<'a>(card: EditCard<'a>, sizing: crate::ui::modal::ModalSizing) -> Element<'a, Message> {
     let field = |label: Cow<'static, str>,
                  ph: Cow<'static, str>,
                  value: &str,
-                 on: fn(String) -> Message| {
-        row![
-            text(label).size(11).style(muted_text_style).width(96),
-            text_input(ph.as_ref(), value)
-                .on_input(on)
-                .style(|theme, status| field_style_with_radius(theme, status, 4.0))
-                .size(12)
-                .padding([5, 8])
-                .width(sizing.width),
-        ]
-        .align_y(iced::Center)
-        .spacing(6)
+                 on: Option<fn(String) -> Message>,
+                 id: Option<iced::widget::Id>| {
+        let locked = on.is_none();
+        let mut input = text_input(ph.as_ref(), value)
+            .on_input_maybe(on)
+            .on_submit(Message::ScaleRenameCommit)
+            .style(move |theme, status| {
+                let style = field_style_with_radius(theme, status, 4.0);
+                if locked {
+                    // Greyed: the weak panel background and dimmed digits.
+                    let palette = theme.palette();
+                    text_input::Style {
+                        background: Background::Color(palette.background.weak.color),
+                        value: palette.background.base.text.scale_alpha(0.45),
+                        ..style
+                    }
+                } else {
+                    style
+                }
+            })
+            .size(12)
+            .padding([5, 8])
+            .width(sizing.width);
+        if let Some(id) = id {
+            input = input.id(id);
+        }
+        row![text(label).size(11).style(muted_text_style).width(104), input]
+            .align_y(iced::Center)
+            .spacing(6)
     };
-
-    let editor = container(
+    let title = if card.adding { t!("Add Scale") } else { t!("Edit Scale") };
+    // Adding names the fields by role, editing by the units they hold.
+    let (paper_label, drawing_label): (Cow<'static, str>, Cow<'static, str>) = if card.adding {
+        (t!("Paper units"), t!("Drawing units"))
+    } else {
+        let capital = |word: Cow<'static, str>| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                .unwrap_or_default()
+        };
+        (
+            Cow::Owned(format!("{} {}", capital(t!("paper")), unit_name(card.paper_unit, true))),
+            Cow::Owned(format!(
+                "{} {}",
+                capital(t!("drawing")),
+                unit_name(card.drawing_unit, true)
+            )),
+        )
+    };
+    let units_on = (!card.units_locked).then_some(());
+    let error: Element<'a, Message> = match card.error {
+        Some(line) => text(line.to_string())
+            .size(11)
+            .style(crate::ui::style::editor_table::danger_text_style)
+            .into(),
+        None => Space::new().height(0).into(),
+    };
+    let ok_label = if card.adding { t!("Add") } else { t!("Apply") };
+    let inner = container(
         column![
-            text(Cow::Borrowed("Scale")).size(10).style(muted_text_style),
-            field(t!("Paper units"), Cow::Borrowed("1"), paper_buf, Message::ScaleManagerPaperBuf),
-            field(t!("Drawing units"), Cow::Borrowed("50"), drawing_buf, Message::ScaleManagerDrawingBuf),
-            Space::new().height(6),
-            text(t!("Double-click a scale to rename it; edit its paper : drawing ratio here. New / Copy add a scale. Changes are kept only if you click Apply before closing."))
-                .size(10)
-                .style(muted_text_style),
+            text(title).size(13),
+            field(
+                t!("Name"),
+                Cow::Borrowed("1:50"),
+                card.name,
+                Some(Message::ScaleRenameEdit),
+                Some(rename_input_id())
+            ),
+            field(
+                paper_label,
+                Cow::Borrowed("1"),
+                card.paper,
+                units_on.map(|_| Message::ScaleManagerPaperBuf as fn(String) -> Message),
+                None
+            ),
+            field(
+                drawing_label,
+                Cow::Borrowed("50"),
+                card.drawing,
+                units_on.map(|_| Message::ScaleManagerDrawingBuf as fn(String) -> Message),
+                None
+            ),
+            text(card.preview).size(11).style(muted_text_style),
+            error,
+            row![
+                Space::new().width(sizing.width),
+                tb_button(t!("Cancel"), Message::ScaleManagerEditCancel, false),
+                tb_button(ok_label, Message::ScaleRenameCommit, true),
+            ]
+            .spacing(4),
         ]
-        .spacing(8),
+        .spacing(10),
     )
+    .padding(12)
     .width(sizing.width)
-    .height(sizing.height)
-    .padding(12);
-
-    let body = row![list_panel, vsep(sizing.height), editor].height(sizing.height);
-
-    container(column![toolbar, hdivider(sizing.width), body])
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(theme.palette().background.base.color)),
+    .style(|theme: &Theme| {
+        let palette = theme.palette();
+        container::Style {
+            background: Some(Background::Color(palette.background.weak.color)),
+            border: Border {
+                color: palette.primary.base.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
             ..Default::default()
-        })
+        }
+    });
+    container(inner)
         .width(sizing.width)
         .height(sizing.height)
+        .padding(12)
         .into()
 }

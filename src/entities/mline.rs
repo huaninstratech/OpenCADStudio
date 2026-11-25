@@ -1,11 +1,11 @@
-use codec::entities::{MLine, MLineFlags, MLineSegment, MLineVertex};
-use codec::types::Vector3;
-use kernel::geom2d::{intersect::line_line, Vec2};
-use kernel::space::Plane;
+use document::entities::{MLine, MLineFlags, MLineSegment, MLineVertex};
+use document::types::Vector3;
+use ocs_geom::geom2d::{intersect::line_line, Vec2};
+use ocs_geom::space::Plane;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{edit_prop as edit, ro_prop, square_grip};
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -14,7 +14,7 @@ use crate::t;
 /// One styled line or cap of a multiline.
 pub struct MLineLine {
     pub points: Vec<[f64; 3]>,
-    pub color: codec::types::Color,
+    pub color: document::types::Color,
     pub linetype: String,
 }
 
@@ -38,20 +38,20 @@ pub(crate) fn rebuild_mline_geometry(mline: &mut MLine) -> bool {
     let axis = points
         .windows(2)
         .find_map(|pair| {
-            (kernel::space::Vec3::from(pair[1]) - kernel::space::Vec3::from(pair[0]))
+            (ocs_geom::space::Vec3::from(pair[1]) - ocs_geom::space::Vec3::from(pair[0]))
                 .normalize()
-                .map(kernel::space::Vec3::to_array)
+                .map(ocs_geom::space::Vec3::to_array)
         })
         .or_else(|| {
             mline
                 .is_closed()
                 .then(|| {
-                    (kernel::space::Vec3::from(points[0])
-                        - kernel::space::Vec3::from(points[count - 1]))
+                    (ocs_geom::space::Vec3::from(points[0])
+                        - ocs_geom::space::Vec3::from(points[count - 1]))
                     .normalize()
                 })
                 .flatten()
-                .map(kernel::space::Vec3::to_array)
+                .map(ocs_geom::space::Vec3::to_array)
         });
     let Some(plane) = axis.and_then(|axis| {
         Plane::orthonormal(
@@ -135,12 +135,20 @@ pub(crate) fn mline_miter_factor(vertex: &MLineVertex, normal: Vector3) -> f64 {
         .normalize_or(glam::DVec3::X);
     let miter = glam::DVec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z)
         .normalize_or(glam::DVec3::Y);
-    miter.dot(normal.cross(direction)).abs().max(1.0e-9)
+    // Signed: an element's offset is measured from the left of the segment
+    // direction, and after a mirror the miter points to its right while the
+    // scale factor turns negative (#3497).
+    let factor = miter.dot(normal.cross(direction));
+    if factor.abs() < 1.0e-9 {
+        1.0e-9_f64.copysign(factor)
+    } else {
+        factor
+    }
 }
 
 fn adjusted_mline_endpoint(
     mline: &MLine,
-    style: &codec::objects::MLineStyle,
+    style: &document::objects::MLineStyle,
     vertex: usize,
     point: [f64; 3],
 ) -> [f64; 3] {
@@ -149,7 +157,7 @@ fn adjusted_mline_endpoint(
     } else {
         style.end_angle
     };
-    let Some(tangent) = kernel::space::Vec3::new(
+    let Some(tangent) = ocs_geom::space::Vec3::new(
         mline.vertices[vertex].direction.x,
         mline.vertices[vertex].direction.y,
         mline.vertices[vertex].direction.z,
@@ -158,23 +166,23 @@ fn adjusted_mline_endpoint(
         return point;
     };
     let Some(normal) =
-        kernel::space::Vec3::new(mline.normal.x, mline.normal.y, mline.normal.z).normalize()
+        ocs_geom::space::Vec3::new(mline.normal.x, mline.normal.y, mline.normal.z).normalize()
     else {
         return point;
     };
     let Some(transverse) = normal.cross(tangent).normalize() else {
         return point;
     };
-    let base = kernel::space::Vec3::new(
+    let base = ocs_geom::space::Vec3::new(
         mline.vertices[vertex].position.x,
         mline.vertices[vertex].position.y,
         mline.vertices[vertex].position.z,
     );
-    let current = kernel::space::Vec3::from(point);
+    let current = ocs_geom::space::Vec3::from(point);
     let tangent = if angle.tan().abs() > 1.0e-9 {
         tangent * ((current - base).dot(transverse) / angle.tan())
     } else {
-        kernel::space::Vec3::ZERO
+        ocs_geom::space::Vec3::ZERO
     };
     (current + tangent).to_array()
 }
@@ -350,7 +358,7 @@ fn mline_element_endpoints(
     mline: &MLine,
     vertex: usize,
     element: usize,
-) -> Option<(kernel::space::Vec3, kernel::space::Vec3)> {
+) -> Option<(ocs_geom::space::Vec3, ocs_geom::space::Vec3)> {
     let next = if vertex + 1 < mline.vertices.len() {
         vertex + 1
     } else if mline.is_closed() {
@@ -362,8 +370,8 @@ fn mline_element_endpoints(
         let vertex = mline.vertices.get(index)?;
         let offset = vertex.segments.get(element)?.parameters.first().copied()?;
         let position =
-            kernel::space::Vec3::new(vertex.position.x, vertex.position.y, vertex.position.z);
-        let miter = kernel::space::Vec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z);
+            ocs_geom::space::Vec3::new(vertex.position.x, vertex.position.y, vertex.position.z);
+        let miter = ocs_geom::space::Vec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z);
         Some(position + miter * offset)
     };
     Some((point(vertex)?, point(next)?))
@@ -428,7 +436,7 @@ fn restore_shifted_mline_segment(
 pub(crate) fn normalize_scripted_mline(
     old: Option<&MLine>,
     new: &mut MLine,
-    document: &codec::Document,
+    document: &document::Document,
 ) -> Result<(), String> {
     let style = resolved_mline_style(new, document)
         .ok_or_else(|| format!("MLine style {:?} does not exist", new.style_name))?;
@@ -473,9 +481,9 @@ pub(crate) fn normalize_scripted_mline(
 /// Resolve a multiline into styled parallel lines in WCS.
 pub fn resolved_mline_style<'a>(
     m: &MLine,
-    document: &'a codec::Document,
-) -> Option<&'a codec::objects::MLineStyle> {
-    use codec::objects::ObjectType;
+    document: &'a document::Document,
+) -> Option<&'a document::objects::MLineStyle> {
+    use document::objects::ObjectType;
 
     m.style_handle
         .and_then(|handle| match document.objects.get(&handle) {
@@ -492,17 +500,86 @@ pub fn resolved_mline_style<'a>(
         })
 }
 
-pub fn mline_lines(m: &MLine, document: &codec::Document) -> Vec<MLineLine> {
+/// The linetype an element draws with: a ByLayer element follows the layer of its
+/// multiline (with that layer's override in `viewport`), whose own linetype plays
+/// no part.
+pub(crate) fn element_linetype_name<'a>(
+    document: &'a document::Document,
+    layer: &str,
+    element: &'a str,
+    viewport: Option<document::Handle>,
+) -> &'a str {
+    if element.is_empty() || element.eq_ignore_ascii_case("bylayer") {
+        crate::scene::view::render::layer_linetype_name_for_viewport(document, layer, viewport)
+    } else {
+        element
+    }
+}
+
+/// The line an element becomes: the multiline's own common with the element's
+/// colour and linetype as they are, ByLayer and ByBlock included. EXPLODE makes
+/// these lines, and the renderer draws each element as one of them.
+pub(crate) fn element_common(
+    m: &MLine,
+    color: document::types::Color,
+    linetype: &str,
+    document: &document::Document,
+) -> document::entities::EntityCommon {
+    let mut common = m.common.clone();
+    common.handle = document::Handle::NULL;
+    common.color = color;
+    common.color_name = None;
+    common.color_book_handle = None;
+    common.linetype = if linetype.is_empty() || linetype.eq_ignore_ascii_case("ByLayer") {
+        "ByLayer".to_string()
+    } else if linetype.eq_ignore_ascii_case("ByBlock") {
+        "ByBlock".to_string()
+    } else {
+        linetype.to_string()
+    };
+    common.linetype_handle = document
+        .line_types
+        .iter()
+        .find(|line_type| line_type.name.eq_ignore_ascii_case(&common.linetype))
+        .map(|line_type| line_type.handle);
+    common
+}
+
+/// How an element draws in `viewport`: its [`element_common`] line styled like
+/// any other entity, as `(colour, pattern length, pattern, ACI)`. A complex
+/// linetype is walked along the element rather than dashed, so it has no pattern.
+pub(crate) fn element_style(
+    document: &document::Document,
+    m: &MLine,
+    color: document::types::Color,
+    linetype: &str,
+    viewport: Option<document::Handle>,
+) -> ([f32; 4], f32, [f32; 8], u8) {
+    let common = element_common(m, color, linetype, document);
+    let (color, pattern_length, pattern, _, aci) =
+        crate::scene::view::render::render_style_for_common_viewport(document, &common, viewport);
+    let drawn = element_linetype_name(document, &m.common.layer, linetype, viewport);
+    if crate::io::linetypes::resolve_complex_lt(document, drawn).is_some() {
+        (color, 0.0, [0.0; 8], aci)
+    } else {
+        (color, pattern_length, pattern, aci)
+    }
+}
+
+pub fn mline_lines(m: &MLine, document: &document::Document) -> Vec<MLineLine> {
     mline_lines_resolved(m, resolved_mline_style(m, document))
 }
 
-pub fn mline_lines_with_style(m: &MLine, style: &codec::objects::MLineStyle) -> Vec<MLineLine> {
+pub fn mline_lines_with_style(m: &MLine, style: &document::objects::MLineStyle) -> Vec<MLineLine> {
     mline_lines_resolved(m, Some(style))
 }
 
-fn mline_lines_resolved(m: &MLine, style: Option<&codec::objects::MLineStyle>) -> Vec<MLineLine> {
-    use codec::entities::{MLineFlags, MLineJustification};
-    use codec::types::Color;
+fn mline_lines_resolved(
+    m: &MLine,
+    style: Option<&document::objects::MLineStyle>,
+) -> Vec<MLineLine> {
+    use document::entities::{MLineFlags, MLineJustification};
+    use document::types::Color;
 
     if m.vertices.is_empty() {
         return Vec::new();
@@ -551,8 +628,8 @@ fn mline_lines_resolved(m: &MLine, style: Option<&codec::objects::MLineStyle>) -
     };
     let off_pt = |vi: usize, d: f64| -> [f64; 3] {
         let v = &m.vertices[vi];
-        (kernel::space::Vec3::new(v.position.x, v.position.y, v.position.z)
-            + kernel::space::Vec3::new(v.miter.x, v.miter.y, v.miter.z) * d)
+        (ocs_geom::space::Vec3::new(v.position.x, v.position.y, v.position.z)
+            + ocs_geom::space::Vec3::new(v.miter.x, v.miter.y, v.miter.z) * d)
             .to_array()
     };
     let endpoint_pt = |vi: usize, ei: usize| -> [f64; 3] {
@@ -585,8 +662,8 @@ fn mline_lines_resolved(m: &MLine, style: Option<&codec::objects::MLineStyle>) -
             } else {
                 off_pt(wi, elem_off(wi, ei))
             };
-            let a = kernel::space::Vec3::from(a);
-            let b = kernel::space::Vec3::from(b);
+            let a = ocs_geom::space::Vec3::from(a);
+            let b = ocs_geom::space::Vec3::from(b);
             let segment = b - a;
             let len = segment.length();
             let Some(direction) = segment.normalize() else {
@@ -732,33 +809,33 @@ fn semicircle_cap(
     direction: [f64; 3],
     start: bool,
 ) -> Vec<[f64; 3]> {
-    let first = kernel::space::Vec3::from(first);
-    let second = kernel::space::Vec3::from(second);
+    let first = ocs_geom::space::Vec3::from(first);
+    let second = ocs_geom::space::Vec3::from(second);
     let center = (first + second) * 0.5;
     let transverse = (first - second) * 0.5;
     let radius = transverse.length();
     let Some(x_axis) = transverse.normalize() else {
         return Vec::new();
     };
-    let Some(direction) = kernel::space::Vec3::from(direction).normalize() else {
+    let Some(direction) = ocs_geom::space::Vec3::from(direction).normalize() else {
         return Vec::new();
     };
     let y_axis = if start { -direction } else { direction };
-    kernel::space::PlanarCurve::new(
+    ocs_geom::space::PlanarCurve::new(
         Plane::from_axes(center.to_array(), x_axis.to_array(), y_axis.to_array()),
-        kernel::geom2d::Curve::Arc(kernel::geom2d::Arc {
+        ocs_geom::geom2d::Curve::Arc(ocs_geom::geom2d::Arc {
             centre: [0.0, 0.0],
             radius,
             start_angle: 0.0,
             end_angle: std::f64::consts::PI,
         }),
     )
-    .tessellate_angle(kernel::tessellation::DEFAULT_ANGLE)
+    .tessellate_angle(ocs_geom::tessellation::DEFAULT_ANGLE)
 }
 
 pub fn mline_fill_triangles_with_style(
     m: &MLine,
-    style: &codec::objects::MLineStyle,
+    style: &document::objects::MLineStyle,
 ) -> Vec<[f64; 3]> {
     if !style.flags.fill_on || m.vertices.len() < 2 || style.elements.len() < 2 {
         return Vec::new();
@@ -793,9 +870,9 @@ pub fn mline_fill_triangles_with_style(
         .map(|element| element.offset)
         .fold(f64::NEG_INFINITY, f64::max);
     let shift = match m.justification {
-        codec::entities::MLineJustification::Top => -maximum,
-        codec::entities::MLineJustification::Zero => 0.0,
-        codec::entities::MLineJustification::Bottom => -minimum,
+        document::entities::MLineJustification::Top => -maximum,
+        document::entities::MLineJustification::Zero => 0.0,
+        document::entities::MLineJustification::Bottom => -minimum,
     };
     let offset_point = |vertex: usize, element: usize, endpoint: bool| -> [f64; 3] {
         let item = &m.vertices[vertex];
@@ -808,8 +885,8 @@ pub fn mline_fill_triangles_with_style(
                 (style.elements[element].offset + shift) * m.scale_factor
                     / mline_miter_factor(item, m.normal)
             });
-        let point = (kernel::space::Vec3::new(item.position.x, item.position.y, item.position.z)
-            + kernel::space::Vec3::new(item.miter.x, item.miter.y, item.miter.z) * distance)
+        let point = (ocs_geom::space::Vec3::new(item.position.x, item.position.y, item.position.z)
+            + ocs_geom::space::Vec3::new(item.miter.x, item.miter.y, item.miter.z) * distance)
             .to_array();
         if endpoint {
             adjusted_mline_endpoint(m, style, vertex, point)
@@ -828,11 +905,11 @@ pub fn mline_fill_triangles_with_style(
         let next = (vertex + 1) % m.vertices.len();
         let start_endpoint = !closed && vertex == 0;
         let end_endpoint = !closed && next + 1 == m.vertices.len();
-        let low_start = kernel::space::Vec3::from(offset_point(vertex, low_index, start_endpoint));
-        let low_end = kernel::space::Vec3::from(offset_point(next, low_index, end_endpoint));
+        let low_start = ocs_geom::space::Vec3::from(offset_point(vertex, low_index, start_endpoint));
+        let low_end = ocs_geom::space::Vec3::from(offset_point(next, low_index, end_endpoint));
         let high_start =
-            kernel::space::Vec3::from(offset_point(vertex, high_index, start_endpoint));
-        let high_end = kernel::space::Vec3::from(offset_point(next, high_index, end_endpoint));
+            ocs_geom::space::Vec3::from(offset_point(vertex, high_index, start_endpoint));
+        let high_end = ocs_geom::space::Vec3::from(offset_point(next, high_index, end_endpoint));
         let low_length = low_start.distance(low_end);
         let high_length = high_start.distance(high_end);
         if low_length <= 1.0e-12 || high_length <= 1.0e-12 {
@@ -870,7 +947,7 @@ pub fn mline_fill_triangles_with_style(
 }
 
 impl RenderConvertible for MLine {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         if self.vertices.is_empty() {
             return None;
         }
@@ -932,14 +1009,12 @@ impl Grippable for MLine {
             return;
         };
         let position = match apply {
-            GripApply::Translate(delta) => codec::types::Vector3::new(
-                vertex.position.x + delta.x as f64,
-                vertex.position.y + delta.y as f64,
-                vertex.position.z + delta.z as f64,
+            GripApply::Translate(delta) => document::types::Vector3::new(
+                vertex.position.x + delta.x,
+                vertex.position.y + delta.y,
+                vertex.position.z + delta.z,
             ),
-            GripApply::Absolute(point) => {
-                codec::types::Vector3::new(point.x as f64, point.y as f64, point.z as f64)
-            }
+            GripApply::Absolute(point) => document::types::Vector3::new(point.x, point.y, point.z),
         };
         let count = self.vertices.len();
         let segment_count = if self.is_closed() {
@@ -1033,7 +1108,7 @@ impl Grippable for MLine {
                 new_v.position.y = (v0.position.y + v1.position.y) * 0.5;
                 new_v.position.z = (v0.position.z + v1.position.z) * 0.5;
                 let point =
-                    kernel::space::Vec3::new(new_v.position.x, new_v.position.y, new_v.position.z);
+                    ocs_geom::space::Vec3::new(new_v.position.x, new_v.position.y, new_v.position.z);
                 let source: Option<Vec<_>> = (0..self.style_element_count)
                     .map(|element| {
                         let endpoints = mline_element_endpoints(self, grip_id, element)?;
@@ -1201,9 +1276,9 @@ impl Grippable for MLine {
 impl PropertyEditable for MLine {
     fn geometry_properties(&self, _text_style_names: &[String]) -> Vec<PropSection> {
         let just_str = match self.justification {
-            codec::entities::MLineJustification::Top => "Top",
-            codec::entities::MLineJustification::Zero => "Zero",
-            codec::entities::MLineJustification::Bottom => "Bottom",
+            document::entities::MLineJustification::Top => "Top",
+            document::entities::MLineJustification::Zero => "Zero",
+            document::entities::MLineJustification::Bottom => "Bottom",
         };
         vec![PropSection {
             title: t!("Misc").into_owned(),
@@ -1229,13 +1304,13 @@ impl PropertyEditable for MLine {
         match field {
             "ml_closed" => {
                 let closed = if value == "toggle" {
-                    !self.flags.contains(codec::entities::MLineFlags::CLOSED)
+                    !self.flags.contains(document::entities::MLineFlags::CLOSED)
                 } else {
                     value == "true"
                 };
                 let offsets = mline_perpendicular_offsets(self);
                 self.flags.set(
-                    codec::entities::MLineFlags::CLOSED,
+                    document::entities::MLineFlags::CLOSED,
                     closed && self.vertices.len() >= 3,
                 );
                 rebuild_mline_geometry(self);
@@ -1244,9 +1319,9 @@ impl PropertyEditable for MLine {
             }
             "ml_justification" => {
                 self.justification = match value {
-                    "Top" => codec::entities::MLineJustification::Top,
-                    "Bottom" => codec::entities::MLineJustification::Bottom,
-                    _ => codec::entities::MLineJustification::Zero,
+                    "Top" => document::entities::MLineJustification::Top,
+                    "Bottom" => document::entities::MLineJustification::Bottom,
+                    _ => document::entities::MLineJustification::Zero,
                 };
                 return;
             }
@@ -1297,16 +1372,16 @@ fn set_mline_scale(mline: &mut MLine, scale: f64) {
 
 fn mline_vertex_factor(mline: &MLine, index: usize) -> f64 {
     let vertex = &mline.vertices[index];
-    let normal = kernel::space::Vec3::new(mline.normal.x, mline.normal.y, mline.normal.z)
+    let normal = ocs_geom::space::Vec3::new(mline.normal.x, mline.normal.y, mline.normal.z)
         .normalize()
-        .unwrap_or(kernel::space::Vec3::Z);
+        .unwrap_or(ocs_geom::space::Vec3::Z);
     let direction =
-        kernel::space::Vec3::new(vertex.direction.x, vertex.direction.y, vertex.direction.z)
+        ocs_geom::space::Vec3::new(vertex.direction.x, vertex.direction.y, vertex.direction.z)
             .normalize()
-            .unwrap_or(kernel::space::Vec3::X);
-    let miter = kernel::space::Vec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z)
+            .unwrap_or(ocs_geom::space::Vec3::X);
+    let miter = ocs_geom::space::Vec3::new(vertex.miter.x, vertex.miter.y, vertex.miter.z)
         .normalize()
-        .unwrap_or(kernel::space::Vec3::Y);
+        .unwrap_or(ocs_geom::space::Vec3::Y);
     miter.dot(normal.cross(direction)).abs().max(1.0e-9)
 }
 
@@ -1345,34 +1420,41 @@ fn restore_mline_offsets(mline: &mut MLine, offsets: &[Vec<Option<f64>>]) {
 
 impl Transformable for MLine {
     fn apply_transform(&mut self, t: &EntityTransform) {
-        crate::scene::view::transform::apply_standard_entity_transform(
-            self,
-            t,
-            |entity, p1, p2| {
-                for v in &mut entity.vertices {
-                    crate::scene::view::transform::reflect_xy_point(
-                        &mut v.position.x,
-                        &mut v.position.y,
-                        p1,
-                        p2,
-                    );
-                }
-                crate::scene::view::transform::reflect_xy_point(
-                    &mut entity.start_point.x,
-                    &mut entity.start_point.y,
-                    p1,
-                    p2,
-                );
-            },
-        );
+        // The document's mirror keeps the reflected side as a negative scale
+        // factor, the file's own way, so a later edit rebuilds the elements
+        // on the mirrored side.
+        match t {
+            EntityTransform::Mirror {
+                p1,
+                p2,
+                working_normal,
+            } => document::Entity::apply_mirror(
+                self,
+                &crate::scene::view::transform::reflection_about_working_line(
+                    *p1,
+                    *p2,
+                    *working_normal,
+                ),
+            ),
+            EntityTransform::Affine(transform)
+                if transform.matrix.to_matrix3().determinant() < 0.0 =>
+            {
+                document::Entity::apply_mirror(self, transform)
+            }
+            _ => crate::scene::view::transform::apply_standard_entity_transform(
+                self,
+                t,
+                |_, _, _| {},
+            ),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::{MLineJustification, MLineVertex};
-    use codec::objects::{MLineStyle, MLineStyleElement};
+    use document::entities::{MLineJustification, MLineVertex};
+    use document::objects::{MLineStyle, MLineStyleElement};
 
     const TOLERANCE: f64 = 1.0e-9;
 
@@ -1651,5 +1733,89 @@ mod tests {
                 &mline_fill_triangles_with_style(&case.stored, style),
             );
         }
+    }
+
+    /// MIRROR in the world XY plane: the lines that are drawn after it are
+    /// the mirror image of the lines that were drawn before it. The typed
+    /// mirror reflected the positions and left the direction and the miter
+    /// of each vertex, so the elements were drawn at the wrong place.
+    #[test]
+    fn a_mirrored_multiline_draws_the_mirror_image_of_its_lines() {
+        use crate::entities::transform::EntityTransform;
+        let (p1, p2) = (
+            glam::DVec3::new(3.0, -2.0, 0.0),
+            glam::DVec3::new(6.0, 9.0, 0.0),
+        );
+        let axis = (p2 - p1).normalize();
+        let mirror_image = |p: [f64; 3]| {
+            let d = glam::DVec3::new(p[0], p[1], p[2]) - p1;
+            let r = p1 + 2.0 * d.dot(axis) * axis - d;
+            [r.x, r.y, p[2]]
+        };
+        let mut compared = 0;
+        for case in cases() {
+            for (form, original) in [("bare", &case.bare), ("stored", &case.stored)] {
+                let before = mline_lines_resolved(original, case.style.as_ref());
+                let mut mirrored = original.clone();
+                Transformable::apply_transform(
+                    &mut mirrored,
+                    &EntityTransform::Mirror {
+                        p1,
+                        p2,
+                        working_normal: glam::DVec3::Z,
+                    },
+                );
+                let after = mline_lines_resolved(&mirrored, case.style.as_ref());
+                let name = format!("{} ({form})", case.name);
+                assert_eq!(before.len(), after.len(), "{name}: line count");
+                for (index, (b, a)) in before.iter().zip(&after).enumerate() {
+                    let expected: Vec<[f64; 3]> =
+                        b.points.iter().copied().map(mirror_image).collect();
+                    assert_same_points(&name, &format!("line {index}"), &expected, &a.points);
+                    compared += expected.len();
+                }
+            }
+        }
+        // Guards against a list of cases that draws nothing.
+        assert!(compared > 2000, "only {compared} points were compared");
+    }
+
+    /// An edit after MIRROR (a grip edit, MLEDIT) rebuilds the geometry; the
+    /// elements stay on the mirrored side (#3497).
+    #[test]
+    fn a_mirrored_multiline_keeps_its_mirror_image_after_a_rebuild() {
+        use crate::entities::transform::EntityTransform;
+        let (p1, p2) = (
+            glam::DVec3::new(3.0, -2.0, 0.0),
+            glam::DVec3::new(6.0, 9.0, 0.0),
+        );
+        let axis = (p2 - p1).normalize();
+        let mirror_image = |p: [f64; 3]| {
+            let d = glam::DVec3::new(p[0], p[1], p[2]) - p1;
+            let r = p1 + 2.0 * d.dot(axis) * axis - d;
+            [r.x, r.y, p[2]]
+        };
+        let mut compared = 0;
+        for case in cases() {
+            let before = mline_lines_resolved(&case.bare, case.style.as_ref());
+            let mut mirrored = case.bare.clone();
+            Transformable::apply_transform(
+                &mut mirrored,
+                &EntityTransform::Mirror {
+                    p1,
+                    p2,
+                    working_normal: glam::DVec3::Z,
+                },
+            );
+            rebuild_mline_geometry(&mut mirrored);
+            let after = mline_lines_resolved(&mirrored, case.style.as_ref());
+            assert_eq!(before.len(), after.len(), "{}: line count", case.name);
+            for (index, (b, a)) in before.iter().zip(&after).enumerate() {
+                let expected: Vec<[f64; 3]> = b.points.iter().copied().map(mirror_image).collect();
+                assert_same_points(&case.name, &format!("line {index}"), &expected, &a.points);
+                compared += expected.len();
+            }
+        }
+        assert!(compared > 1000, "only {compared} points were compared");
     }
 }

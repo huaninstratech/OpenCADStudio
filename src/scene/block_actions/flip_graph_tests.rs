@@ -61,8 +61,126 @@ fn authored_flip_links_require_complete_ordered_selections() {
     };
     assert!(dependencies(&doc).contains(&movement));
     assert!(!retarget(&mut doc, def, linked, &selection, None).unwrap());
+    let before = doc.clone();
+    assert!(retarget(&mut doc, def, movement, &geometry[..1], None).is_err());
+    assert!(create(
+        &mut doc,
+        def,
+        Kind::Move,
+        linear,
+        &geometry[1..],
+        DVec3::ZERO
+    )
+    .is_err());
+    assert_eq!(doc, before);
     assert!(retarget(&mut doc, def, linked, &geometry[1..], None).unwrap());
     assert_eq!(dependencies(&doc), geometry[1..]);
+}
+
+#[test]
+fn reciprocal_native_flips_preserve_perpendicular_axes_and_compose() {
+    let (mut doc, def, geometry) = super::tests::fixture();
+    let anchor = Vector3::new(1., 2., 0.);
+    let basepoint = block_basepoint::create(&mut doc, def, anchor).unwrap();
+    let (_, base) = block_basepoint::parameter(&doc, def).unwrap();
+    let base_id = base.parameter.parameter.element.eval.node_id;
+    let first = orientation::create(
+        &mut doc,
+        def,
+        orientation::Kind::Flip,
+        Vector3::ZERO,
+        Vector3::UNIT_X * 10.,
+        Vector3::UNIT_Y,
+    )
+    .unwrap();
+    let second = orientation::create(
+        &mut doc,
+        def,
+        orientation::Kind::Flip,
+        Vector3::ZERO,
+        Vector3::UNIT_Y * 10.,
+        Vector3::UNIT_X,
+    )
+    .unwrap();
+    let linear = distance::create(
+        &mut doc,
+        def,
+        distance::Kind::Linear,
+        Vector3::new(2., 1., 0.),
+        Vector3::new(4., 1., 0.),
+        Vector3::UNIT_X,
+    )
+    .unwrap();
+    let parameters = all_parameters(&doc, def);
+    let a = create(&mut doc, def, Kind::Flip, first, &geometry, DVec3::ZERO).unwrap();
+    let b = create(&mut doc, def, Kind::Flip, second, &geometry, DVec3::ZERO).unwrap();
+    create(&mut doc, def, Kind::Scale, linear, &geometry, DVec3::ZERO).unwrap();
+    for (action, target) in [(a, second), (b, first)] {
+        let ObjectType::DynamicBlock(object) = doc.objects.get_mut(&action).unwrap() else {
+            panic!()
+        };
+        let DynamicBlockData::FlipAction(action) = &mut object.data else {
+            panic!()
+        };
+        action.action.dependencies.push(basepoint);
+        action.action.action_ids.push(base_id);
+        for parameter in [target, linear] {
+            action.action.dependencies.push(parameter);
+            action.action.action_ids.push(
+                parameters
+                    .iter()
+                    .find(|p| p.handle == parameter)
+                    .unwrap()
+                    .id,
+            );
+        }
+    }
+    let insert = doc
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
+            "ACTIONS",
+            Vector3::ZERO,
+        )))
+        .unwrap();
+    for order in [[first, second], [second, first]] {
+        let mut evaluated =
+            instance::evaluate_value(&doc, insert, linear, Value::Point(DVec3::new(6., 1., 0.)))
+                .unwrap()
+                .unwrap();
+        for axis in order {
+            evaluated = instance::evaluate_value(&evaluated, insert, axis, Value::Flip(true))
+                .unwrap()
+                .unwrap();
+        }
+        for p in parameters.iter().filter(|p| p.flip) {
+            assert_eq!(
+                instance::value(&evaluated, insert, p).unwrap(),
+                Value::Flip(true)
+            );
+            let frame = instance::frame(&evaluated, insert, p).unwrap();
+            assert!((frame.end + p.end).length() < 1e-8);
+        }
+        let EntityType::Insert(reference) = evaluated.get_entity(insert).unwrap() else {
+            panic!()
+        };
+        assert_eq!(reference.insert_point, -anchor * 2.);
+        let circle_handle = evaluated
+            .block_records
+            .get(&reference.block_name)
+            .unwrap()
+            .entity_handles[1];
+        let EntityType::Circle(circle) = evaluated.get_entity(circle_handle).unwrap() else {
+            panic!()
+        };
+        assert_eq!(circle.center_wcs(), Vector3::new(-6., -5., 0.));
+        instance::clear_canonical_inputs(&mut evaluated, insert);
+        let toggled = instance::evaluate_value(&evaluated, insert, first, Value::Flip(false))
+            .unwrap()
+            .unwrap();
+        let EntityType::Circle(circle) = toggled.get_entity(circle_handle).unwrap() else {
+            panic!()
+        };
+        assert_eq!(circle.center_wcs(), Vector3::new(-6., 5., 0.));
+    }
 }
 
 #[test]
@@ -88,7 +206,7 @@ fn authored_flip_link_reflects_an_unbound_flip_axis() {
     .unwrap();
     create(&mut doc, def, Kind::Flip, source, &[target], DVec3::ZERO).unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -158,13 +276,13 @@ fn coupled_flips_preserve_geometry_inputs_and_reload() {
             flip_actions.push(action);
         }
         let first = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
             .unwrap();
         let second = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::UNIT_X * 30.,
             )))
@@ -680,7 +798,8 @@ fn coupled_refresh_migrates_polar_and_rotation_values() {
         if flips.is_empty() {
             create(&mut doc, def, Kind::Flip, flip, &selection, DVec3::ZERO).unwrap();
         } else {
-            let action = create(&mut doc, def, Kind::Flip, flip, &geometry[1..], DVec3::ZERO).unwrap();
+            let action =
+                create(&mut doc, def, Kind::Flip, flip, &geometry[1..], DVec3::ZERO).unwrap();
             assert!(retarget(&mut doc, def, action, &selection, None).unwrap());
         }
         flips.push(flip);
@@ -688,7 +807,7 @@ fn coupled_refresh_migrates_polar_and_rotation_values() {
     let mut inserts = Vec::new();
     for origin in [Vector3::ZERO, Vector3::UNIT_Y * 30.] {
         let insert = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS", origin,
             )))
             .unwrap();

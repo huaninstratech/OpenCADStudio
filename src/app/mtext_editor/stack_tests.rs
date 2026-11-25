@@ -6,7 +6,7 @@ use crate::app::{Message, OpenCADStudio};
 fn app(raw: &str) -> OpenCADStudio {
     let mut app = OpenCADStudio::new_for_test();
     app.tabs
-        .push(crate::app::document::DocumentTab::new_drawing(1));
+        .push(crate::app::tab_document::DocumentTab::new_drawing(1));
     app.active_tab = 1;
     app.open_mtext_editor(DVec3::ZERO, None, raw, 2.5, None);
     app
@@ -98,7 +98,7 @@ fn an_index_keeps_the_formatting_of_its_characters_and_the_text_around_it() {
     assert!(props.stroke.underline());
     assert_eq!(
         props.color,
-        Some(codec::entities::mtext_format::MTextColor::Index(1))
+        Some(document::entities::mtext_format::MTextColor::Index(1))
     );
 }
 
@@ -287,4 +287,18 @@ fn stack_splits_the_selection_at_its_first_separator_as_before() {
         assert_eq!(raw(&app), text);
         assert!(ed(&app).undo.is_empty());
     }
+}
+
+#[test]
+fn a_selected_superscript_takes_a_height() {
+    let mut app = app("m\\S2^;");
+    let len = raw_len(&app);
+    select(&mut app, 0, len);
+    let _ = app.update(Message::MTextHeight("5".into()));
+    assert_eq!(raw(&app), "{\\H5;m\\S2^;}");
+    assert_eq!(stacks(&app).len(), 1);
+}
+
+fn raw_len(app: &OpenCADStudio) -> usize {
+    doc_to_cells(&ed(app).doc).len()
 }

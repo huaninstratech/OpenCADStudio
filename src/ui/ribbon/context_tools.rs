@@ -9,7 +9,7 @@ use crate::modules::{ModuleEvent, ToolDef};
 /// as on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnderlayContext {
-    pub kind: codec::entities::UnderlayType,
+    pub kind: document::entities::UnderlayType,
     pub monochrome: bool,
     pub shown: bool,
     pub snap: bool,
@@ -30,7 +30,7 @@ const UNCLIP: &[u8] = include_bytes!("../../../assets/icons/xclip_remove.svg");
 
 /// Underlay tools: display, clipping, options, layers and (PDF only)
 /// import.
-pub fn pdf_underlay_tools(kind: codec::entities::UnderlayType) -> Vec<ToolDef> {
+pub fn pdf_underlay_tools(kind: document::entities::UnderlayType) -> Vec<ToolDef> {
     const FRAMES: &[u8] = include_bytes!("../../../assets/icons/underlay_frames.svg");
     let mut tools = vec![
         tool("_PDFULMONO", "Display in\nMonochrome", FRAMES),
@@ -53,7 +53,7 @@ pub fn pdf_underlay_tools(kind: codec::entities::UnderlayType) -> Vec<ToolDef> {
             include_bytes!("../../../assets/icons/underlay_layers.svg"),
         ),
     ];
-    if kind == codec::entities::UnderlayType::Pdf {
+    if kind == document::entities::UnderlayType::Pdf {
         tools.push(tool(
             "_PDFULIMPORT",
             "Import As\nObjects",
@@ -139,11 +139,6 @@ pub fn table_cell_tools() -> Vec<ToolDef> {
             include_bytes!("../../../assets/icons/match_prop.svg"),
         ),
         tool(
-            "_TCELLALIGN",
-            "Alignment",
-            include_bytes!("../../../assets/icons/align_hcenter.svg"),
-        ),
-        tool(
             "_TCELLBORDERS",
             "Cell\nBorders",
             include_bytes!("../../../assets/icons/table_cell_borders.svg"),
@@ -188,6 +183,30 @@ pub fn table_cell_tools() -> Vec<ToolDef> {
             "Edit\nText",
             include_bytes!("../../../assets/icons/ddedit.svg"),
         ),
+    ]
+}
+
+/// The nine cell alignments, top row first, left to right.
+pub fn table_cell_alignments() -> Vec<ToolDef> {
+    macro_rules! align {
+        ($code:literal, $label:literal, $icon:literal) => {
+            tool(
+                concat!("_TCELLALIGN ", $code),
+                $label,
+                include_bytes!(concat!("../../../assets/icons/table_align_", $icon, ".svg")),
+            )
+        };
+    }
+    vec![
+        align!("TL", "Top\nLeft", "tl"),
+        align!("TC", "Top\nCenter", "tc"),
+        align!("TR", "Top\nRight", "tr"),
+        align!("ML", "Middle\nLeft", "ml"),
+        align!("MC", "Middle\nCenter", "mc"),
+        align!("MR", "Middle\nRight", "mr"),
+        align!("BL", "Bottom\nLeft", "bl"),
+        align!("BC", "Bottom\nCenter", "bc"),
+        align!("BR", "Bottom\nRight", "br"),
     ]
 }
 

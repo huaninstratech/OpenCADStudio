@@ -9,11 +9,11 @@
 /// itself). Text formatting crosses TEXT ↔ MTEXT; the dimension style crosses
 /// Dimension / Leader / Tolerance.
 pub fn match_special_props(
-    src: &codec::EntityType,
-    dst: &mut codec::EntityType,
+    src: &document::EntityType,
+    dst: &mut document::EntityType,
     opts: &MatchOpts,
 ) {
-    use codec::EntityType as E;
+    use document::EntityType as E;
 
     // Text-ish source formatting.
     let text_fmt = match src {
@@ -184,7 +184,10 @@ pub fn match_special_props(
         dt.legacy_border_visibility = st.legacy_border_visibility.clone();
     }
 
-    if let (E::MLine(sm), E::MLine(dm)) = (src, dst as &mut E) {
+    // Multi-line style: the display switch, like the images below.
+    if let (true, E::MLine(sm), E::MLine(dm)) =
+        (opts.has(MatchOpts::DISPLAY), src, dst as &mut E)
+    {
         dm.style_handle = sm.style_handle;
         dm.style_name = sm.style_name.clone();
         dm.style_element_count = sm.style_element_count;
@@ -273,8 +276,10 @@ pub fn match_special_props(
     }
 
     // External-reference identity, placement and clip geometry stay. Only
-    // display controls/appearance are matched.
-    if let (E::RasterImage(si), E::RasterImage(di)) = (src, dst as &mut E) {
+    // display controls/appearance are matched, under the display switch.
+    if let (true, E::RasterImage(si), E::RasterImage(di)) =
+        (opts.has(MatchOpts::DISPLAY), src, dst as &mut E)
+    {
         di.flags = si.flags;
         di.clipping_enabled = si.clipping_enabled;
         di.brightness = si.brightness;
@@ -282,7 +287,9 @@ pub fn match_special_props(
         di.fade = si.fade;
         di.clip_boundary.clip_mode = si.clip_boundary.clip_mode;
     }
-    if let (E::Wipeout(sw), E::Wipeout(dw)) = (src, dst as &mut E) {
+    if let (true, E::Wipeout(sw), E::Wipeout(dw)) =
+        (opts.has(MatchOpts::DISPLAY), src, dst as &mut E)
+    {
         dw.flags = sw.flags;
         dw.clipping_enabled = sw.clipping_enabled;
         dw.brightness = sw.brightness;
@@ -290,7 +297,9 @@ pub fn match_special_props(
         dw.fade = sw.fade;
         dw.clip_mode = sw.clip_mode;
     }
-    if let (E::Underlay(su), E::Underlay(du)) = (src, dst as &mut E) {
+    if let (true, E::Underlay(su), E::Underlay(du)) =
+        (opts.has(MatchOpts::DISPLAY), src, dst as &mut E)
+    {
         du.flags = su.flags;
         du.contrast = su.contrast;
         du.fade = su.fade;
@@ -302,7 +311,7 @@ pub fn match_special_props(
     // size or gap keeps its ratio to the destination's own diameter.
     // Centre lines are rebuilt from their source lines caller-side.
     if let (true, E::Line(sl), E::Line(dl)) = (opts.has(MatchOpts::CENTER), src, dst as &mut E) {
-        use codec::entities::CenterMarkAssociation as Mark;
+        use document::entities::CenterMarkAssociation as Mark;
         if let (Some(s), Some(mut d)) = (
             Mark::read(&sl.common.extended_data),
             Mark::read(&dl.common.extended_data),
@@ -332,8 +341,8 @@ pub struct PolylineMatchStyle {
 }
 
 impl PolylineMatchStyle {
-    pub fn from_entity(entity: &codec::EntityType) -> Option<Self> {
-        use codec::EntityType as E;
+    pub fn from_entity(entity: &document::EntityType) -> Option<Self> {
+        use document::EntityType as E;
 
         match entity {
             E::LwPolyline(poly) => {
@@ -371,7 +380,7 @@ impl PolylineMatchStyle {
                 };
                 Some(Self {
                     plinegen: poly.flags.bits()
-                        & codec::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits()
+                        & document::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits()
                         != 0,
                     widths,
                 })
@@ -380,8 +389,8 @@ impl PolylineMatchStyle {
         }
     }
 
-    pub fn apply_to(&self, entity: &mut codec::EntityType) {
-        use codec::EntityType as E;
+    pub fn apply_to(&self, entity: &mut document::EntityType) {
+        use document::EntityType as E;
 
         match entity {
             E::LwPolyline(poly) => {
@@ -402,13 +411,13 @@ impl PolylineMatchStyle {
             }
             E::Polyline2D(poly) => {
                 let mut bits = poly.flags.bits();
-                let flag = codec::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits();
+                let flag = document::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits();
                 if self.plinegen {
                     bits |= flag;
                 } else {
                     bits &= !flag;
                 }
-                poly.flags = codec::entities::PolylineFlags::from_bits(bits);
+                poly.flags = document::entities::PolylineFlags::from_bits(bits);
                 let sampled = resample_widths(&self.widths, poly.vertices.len());
                 let first = sampled.first().copied().unwrap_or((0.0, 0.0));
                 let can_use_defaults = widths_are_same(&sampled);
@@ -482,9 +491,9 @@ pub enum MatchLayerError {
 /// that resolve to nothing are skipped. Lock-filtering, undo, dirty-state and
 /// command-line echo stay caller-side in `handle_match_entity_layer`.
 pub fn match_layer_kernel(
-    doc: &mut codec::Document,
-    dest: &[codec::Handle],
-    src: codec::Handle,
+    doc: &mut document::Document,
+    dest: &[document::Handle],
+    src: document::Handle,
 ) -> Result<usize, MatchLayerError> {
     let layer = doc
         .get_entity(src)
@@ -510,8 +519,9 @@ pub fn match_mode() -> u32 {
     MATCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Kept as given: bits with no property of their own are stored too.
 pub fn set_match_mode(mode: u32) {
-    MATCH_MODE.store(mode & MatchOpts::ALL_BITS, std::sync::atomic::Ordering::Relaxed);
+    MATCH_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// MATCHPROP transfer switches: the MATCHMODE bitmask. The entity-level
@@ -540,12 +550,15 @@ impl MatchOpts {
     pub const MLEADER: u32 = 32768;
     pub const TRANSPARENCY: u32 = 65536;
     pub const CENTER: u32 = 131072;
-    pub const ALL_BITS: u32 = 262143;
+    // Display controls of an image, wipeout, underlay or multi-line: the
+    // clip mode, the flags, the brightness and the fade.
+    pub const DISPLAY: u32 = 262144;
+    pub const ALL_BITS: u32 = 524287;
     /// Everything but the plot style.
-    pub const DEFAULT_MODE: u32 = 261631;
+    pub const DEFAULT_MODE: u32 = 523775;
 
     /// The order and names of the settings line (command-line tokens).
-    pub const NAMES: [(u32, &'static str); 17] = [
+    pub const NAMES: [(u32, &'static str); 18] = [
         (Self::COLOR, "Color"),
         (Self::LAYER, "Layer"),
         (Self::LTYPE, "Ltype"),
@@ -563,6 +576,7 @@ impl MatchOpts {
         (Self::MATERIAL, "Material"),
         (Self::MLEADER, "Multileader"),
         (Self::CENTER, "Center object"),
+        (Self::DISPLAY, "Display"),
     ];
 
     /// Every transfer enabled — what pasting with properties uses.
@@ -573,6 +587,16 @@ impl MatchOpts {
     /// The MATCHMODE in force.
     pub fn current() -> Self {
         Self(match_mode())
+    }
+
+    /// The MATCHMODE in force for `document`: a plot style only crosses
+    /// between named plot styles, never under colour-dependent ones.
+    pub fn for_document(document: &document::Document) -> Self {
+        let mut opts = Self::current();
+        if document.header.plotstyle_mode {
+            opts.0 &= !Self::PLOTSTYLE;
+        }
+        opts
     }
 
     pub fn has(&self, bit: u32) -> bool {
@@ -594,7 +618,11 @@ pub fn active_settings_line(mode: u32) -> String {
         .filter(|(bit, _)| mode & bit != 0)
         .map(|(_, name)| *name)
         .collect();
-    format!("{}  {} ", crate::t!("Current active settings:"), names.join(" "))
+    format!(
+        "{}  {} ",
+        crate::t!("Current active settings:"),
+        names.join(" ")
+    )
 }
 
 /// MATCHPROP kernel: transfer the source entity's properties onto one
@@ -605,8 +633,8 @@ pub fn active_settings_line(mode: u32) -> String {
 /// stay caller-side; lock-filtering, undo, dirty-state, selection and echo
 /// stay caller-side too.
 pub fn match_properties_kernel(
-    src: &codec::EntityType,
-    dst: &mut codec::EntityType,
+    src: &document::EntityType,
+    dst: &mut document::EntityType,
     opts: &MatchOpts,
 ) {
     let common = src.common().clone();
@@ -663,19 +691,19 @@ pub fn match_properties_kernel(
 mod match_layer_kernel_tests {
     use super::{match_layer_kernel, MatchLayerError};
 
-    fn line_on(layer: &str) -> codec::EntityType {
-        let mut line = codec::entities::Line::new();
+    fn line_on(layer: &str) -> document::EntityType {
+        let mut line = document::entities::Line::new();
         line.common.layer = layer.to_string();
-        codec::EntityType::Line(line)
+        document::EntityType::Line(line)
     }
 
-    fn layer_of(doc: &codec::Document, handle: codec::Handle) -> String {
+    fn layer_of(doc: &document::Document, handle: document::Handle) -> String {
         doc.get_entity(handle).unwrap().common().layer.clone()
     }
 
     #[test]
     fn copies_src_layer_onto_every_dest_and_returns_count() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         let src = doc.add_entity(line_on("WALLS")).unwrap();
         let a = doc.add_entity(line_on("0")).unwrap();
         let b = doc.add_entity(line_on("0")).unwrap();
@@ -690,7 +718,7 @@ mod match_layer_kernel_tests {
 
     #[test]
     fn missing_src_errors_and_leaves_dest_untouched() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         let dest = doc.add_entity(line_on("0")).unwrap();
         let missing = doc.allocate_handle();
 
@@ -702,7 +730,7 @@ mod match_layer_kernel_tests {
 
     #[test]
     fn skips_missing_dest_handles_but_counts_the_rest() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         let src = doc.add_entity(line_on("WALLS")).unwrap();
         let dest = doc.add_entity(line_on("0")).unwrap();
         let missing = doc.allocate_handle();
@@ -717,10 +745,10 @@ mod match_layer_kernel_tests {
 #[cfg(test)]
 mod match_properties_kernel_tests {
     use super::{match_properties_kernel, MatchOpts};
-    use codec::EntityType;
+    use document::EntityType;
 
     fn line_src() -> EntityType {
-        let mut line = codec::entities::Line::new();
+        let mut line = document::entities::Line::new();
         line.common.layer = "WALLS".to_string();
         line.common.linetype_scale = 2.5;
         line.thickness = 1.25;
@@ -728,7 +756,7 @@ mod match_properties_kernel_tests {
     }
 
     fn line_dst() -> EntityType {
-        let mut line = codec::entities::Line::new();
+        let mut line = document::entities::Line::new();
         line.common.layer = "0".to_string();
         line.common.linetype_scale = 1.0;
         line.thickness = 0.0;
@@ -753,12 +781,12 @@ mod match_properties_kernel_tests {
 
     #[test]
     fn transfers_text_style_via_special_props_flag() {
-        let mut src_text = codec::entities::Text::new();
+        let mut src_text = document::entities::Text::new();
         src_text.value = "SRC".into();
         src_text.style = "BIG".into();
         src_text.height = 5.0;
         let src = EntityType::Text(src_text);
-        let mut dst_text = codec::entities::Text::new();
+        let mut dst_text = document::entities::Text::new();
         dst_text.value = "DST".into();
         let mut dst = EntityType::Text(dst_text);
 
@@ -788,5 +816,60 @@ mod match_properties_kernel_tests {
             crate::scene::view::dispatch::entity_thickness(&dst) == Some(1.25),
             "enabled thickness must still copy"
         );
+    }
+
+    /// The display transfer is a switch like the others. With every bit off
+    /// the kernel must not repaint an image, wipeout or underlay; the
+    /// default profile keeps the whole transfer on.
+    #[test]
+    fn display_only_transfers_are_gated_by_the_display_bit() {
+        use document::entities::{Wipeout, WipeoutClipMode, WipeoutDisplayFlags};
+
+        let mut src_w = Wipeout::default();
+        src_w.brightness = 20;
+        src_w.clip_mode = WipeoutClipMode::Inside;
+        src_w.flags = source_display_flags();
+        let dst_w = {
+            let mut w = Wipeout::default();
+            w.brightness = 80;
+            w.clip_mode = WipeoutClipMode::Outside;
+            w.flags = WipeoutDisplayFlags::USE_CLIPPING_BOUNDARY;
+            w
+        };
+
+        let src = EntityType::Wipeout(src_w);
+        let mut dst = EntityType::Wipeout(dst_w.clone());
+        match_properties_kernel(&src, &mut dst, &MatchOpts(0));
+        let EntityType::Wipeout(dst) = &dst else {
+            unreachable!()
+        };
+        assert_eq!(dst.brightness, 80);
+        assert_eq!(dst.clip_mode, WipeoutClipMode::Outside);
+        assert_eq!(dst.flags, WipeoutDisplayFlags::USE_CLIPPING_BOUNDARY);
+
+        let mut dst = EntityType::Wipeout(dst_w);
+        match_properties_kernel(&src, &mut dst, &MatchOpts::all());
+        let EntityType::Wipeout(dst) = &dst else {
+            unreachable!()
+        };
+        assert_eq!(dst.brightness, 20);
+        assert_eq!(dst.clip_mode, WipeoutClipMode::Inside);
+        assert_eq!(dst.flags, source_display_flags());
+
+        // The default profile carries the display switch.
+        assert_ne!(MatchOpts::DEFAULT_MODE & MatchOpts::DISPLAY, 0);
+    }
+
+    fn source_display_flags() -> document::entities::WipeoutDisplayFlags {
+        document::entities::WipeoutDisplayFlags::SHOW_IMAGE
+            | document::entities::WipeoutDisplayFlags::TRANSPARENCY_ON
+    }
+
+    #[test]
+    fn display_settings_appear_in_the_settings_line() {
+        let line = super::active_settings_line(super::MatchOpts::DEFAULT_MODE);
+        assert!(line.contains("Display"), "{line}");
+        let off = super::active_settings_line(0);
+        assert!(!off.contains("Display"), "{off}");
     }
 }

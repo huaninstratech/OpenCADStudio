@@ -87,6 +87,14 @@ fn a_visibility_row_names_the_parameter_and_prints_no_number() {
         found.order.is_empty() && found.description.is_empty(),
         "and the row leaves the two cells no rule is measured for empty: {found:?}"
     );
+    assert!(
+        !found.description_writable,
+        "a visibility row names no parameter component whose text it could write"
+    );
+    assert!(
+        !found.order_writable,
+        "a visibility row has no parameter order to write"
+    );
 }
 
 #[test]
@@ -139,6 +147,37 @@ fn the_expression_cell_edits_the_same_number_as_the_value_cell() {
 }
 
 #[test]
+fn a_typed_name_is_refused_and_the_used_filter_lists_nothing() {
+    let (mut app, tab, definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
+    let before = manager::rows(&app.tabs[tab].scene.document, definition);
+    answer(&mut app, "Angle1", Cell::Expression, "Distance1");
+    assert_eq!(
+        app.command_line.last_error.as_deref(),
+        Some("Specify a finite numeric parameter value."),
+        "the cell keeps a number, so text is refused rather than stored"
+    );
+    assert_eq!(
+        manager::rows(&app.tabs[tab].scene.document, definition),
+        before,
+        "nothing a name types reaches the definition"
+    );
+    let listed = manager::displayed(&before, manager::FilterMode::UsedInExpressions, "*", "");
+    assert!(
+        listed.is_empty(),
+        "with every expression a literal, the used-in-expressions filter keeps no row"
+    );
+    assert_eq!(
+        manager::footer(
+            manager::FilterMode::UsedInExpressions,
+            before.len(),
+            listed.len()
+        ),
+        "All Used in Expressions: 0 of 2 parameters displayed"
+    );
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+}
+
+#[test]
 fn an_angle_is_typed_in_degrees_and_leaves_the_distance_alone() {
     let (mut app, tab, definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
     answer(&mut app, "Angle1", Cell::Value, "90");
@@ -157,6 +196,449 @@ fn an_angle_is_typed_in_degrees_and_leaves_the_distance_alone() {
         printed(&app, tab, definition, "Angle1").value,
         "90",
         "the angle reads back at the drawing's angular precision"
+    );
+}
+
+#[test]
+fn the_description_cell_writes_the_text_it_shows() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "a freshly authored parameter has no description"
+    );
+    let before = endpoints(&app, tab, definition);
+    answer(&mut app, "Distance1", Cell::Description, "Left edge");
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "Left edge",
+        "the text typed in the cell is what the definition stores"
+    );
+    assert_eq!(
+        endpoints(&app, tab, definition),
+        before,
+        "writing text moves no geometry"
+    );
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Description,
+    ));
+    assert_eq!(
+        app.tabs[tab].parameters_panel.edit_buf, "Left edge",
+        "the field opens on the text it replaces, as an in-place edit does"
+    );
+    let _ = app.update(Message::ParametersManagerCommit);
+    let _ = app.update(Message::Undo);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "a commit that changes no text adds no undo step"
+    );
+}
+
+#[test]
+fn every_parameter_kind_writes_the_description_of_the_row_it_prints() {
+    use crate::scene::block_authoring::metadata;
+    use crate::scene::block_distance_parameter as distance;
+    use crate::scene::block_orientation_parameter as orientation;
+    use crate::scene::block_point_parameter as point;
+    let (mut app, tab, definition) = open(&[], &[]);
+    let doc = &mut app.tabs[tab].scene.document;
+    let xy = distance::create(
+        doc,
+        definition,
+        distance::Kind::XY,
+        Vector3::ZERO,
+        Vector3::new(10., 5., 0.),
+        Vector3::new(3., 3., 0.),
+    )
+    .unwrap();
+    let rotation = orientation::create(
+        doc,
+        definition,
+        orientation::Kind::Rotation,
+        Vector3::ZERO,
+        Vector3::new(10., 0., 0.),
+        Vector3::new(0., 10., 0.),
+    )
+    .unwrap();
+    let flip = orientation::create(
+        doc,
+        definition,
+        orientation::Kind::Flip,
+        Vector3::ZERO,
+        Vector3::new(10., 0., 0.),
+        Vector3::new(5., 5., 0.),
+    )
+    .unwrap();
+    let point = point::create(doc, definition, Vector3::ZERO, Vector3::new(5., 5., 0.)).unwrap();
+    let ends: Vec<_> = crate::scene::block_actions::all_parameters(doc, definition)
+        .into_iter()
+        .map(|parameter| (parameter.handle, parameter.end))
+        .collect();
+    for (parameter, component, text) in [
+        (xy, Component::X, "Pin"),
+        (xy, Component::Y, "Height"),
+        (rotation, Component::Angle, "Turn"),
+        (flip, Component::Flip, "Mirror"),
+        (point, Component::X, "Anchor"),
+    ] {
+        assert!(
+            manager::write_description(doc, definition, parameter, component, text).unwrap(),
+            "the description of the {component:?} row is written"
+        );
+    }
+    let text = |parameter, field| {
+        metadata::read(doc, definition, parameter)
+            .unwrap()
+            .text
+            .into_iter()
+            .find(|text| text.field == field)
+            .map(|text| text.value)
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        text(xy, metadata::Field::Description),
+        "Pin",
+        "an XY parameter's X row writes the horizontal label's own text"
+    );
+    assert_eq!(
+        text(xy, metadata::Field::SecondaryDescription),
+        "Height",
+        "and its Y row writes the vertical label's own text"
+    );
+    assert_eq!(text(rotation, metadata::Field::Description), "Turn");
+    assert_eq!(text(flip, metadata::Field::Description), "Mirror");
+    assert_eq!(
+        text(point, metadata::Field::Description),
+        "Anchor",
+        "a point parameter's rows share the position text"
+    );
+    assert_eq!(
+        crate::scene::block_actions::all_parameters(doc, definition)
+            .into_iter()
+            .map(|parameter| (parameter.handle, parameter.end))
+            .collect::<Vec<_>>(),
+        ends,
+        "and no parameter's endpoint moves"
+    );
+}
+
+#[test]
+fn an_emptied_description_cell_clears_the_text() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Description, "Left edge");
+    answer(&mut app, "Distance1", Cell::Description, "");
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "an emptied cell writes the empty text"
+    );
+    let _ = app.update(Message::Undo);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "Left edge",
+        "and one undo step brings the text back"
+    );
+}
+
+#[test]
+fn an_emptied_description_commits_when_the_click_moves_away() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Description, "Left edge");
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Description,
+    ));
+    let _ = app.update(Message::ParametersManagerInput(String::new()));
+    let _ = app.update(Message::ParametersManagerFocus(None));
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_none(),
+        "the field closes with the click"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "an emptied description is a text to write, so moving the click away commits it"
+    );
+}
+
+#[test]
+fn an_untouched_description_waits_for_its_own_field() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Description, "Left edge");
+    let field = crate::ui::window::parameters_manager::edit_input_id();
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Description,
+    ));
+    let _ = app.update(Message::ParametersManagerFocus(None));
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_some(),
+        "a field that has not been typed into stays open with the text it shows"
+    );
+    let _ = app.update(Message::ParametersManagerInput("Right edge".to_owned()));
+    let _ = app.update(Message::ParametersManagerFocus(Some(field)));
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_some(),
+        "focus moving onto the field itself commits nothing"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "Left edge",
+        "and writes none of what was typed so far"
+    );
+    let _ = app.update(Message::ParametersManagerCommit);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "Right edge",
+        "Enter still writes the typed text"
+    );
+}
+
+#[test]
+fn a_description_undone_under_the_open_field_is_not_written_back() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Description, "Left edge");
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Description,
+    ));
+    let _ = app.update(Message::Undo);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "the undo takes the text back under the field that shows it"
+    );
+    let _ = app.update(Message::ParametersManagerFocus(None));
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "leaving the field alone writes nothing back"
+    );
+}
+
+/// The order column ranks a parameter, not a row: both rows of a polar
+/// parameter print the rank typed on either of them, and the list keeps its
+/// alphabetical order because the rank is not a display position yet.
+#[test]
+fn an_order_ranks_the_whole_parameter() {
+    let (mut app, tab, definition) = open(
+        &[
+            "BPARAMETER POLAR 0,0 10,0 5,2",
+            "BPARAMETER LINEAR 0,0 3,4 6,6",
+        ],
+        &[],
+    );
+    answer(&mut app, "Distance1", Cell::Order, "2");
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "2",
+        "the typed rank is what the definition keeps"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Angle1").order,
+        "2",
+        "the other row of the same parameter prints the same rank"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance2").order,
+        "",
+        "a rank given to one parameter leaves the other unranked"
+    );
+    let rows = manager::rows(&app.tabs[tab].scene.document, definition);
+    assert_eq!(
+        rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+        ["Angle1", "Distance1", "Distance2"],
+        "the rank does not reorder the listed rows"
+    );
+}
+
+#[test]
+fn an_emptied_order_cell_clears_the_rank() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Order, "3");
+    answer(&mut app, "Distance1", Cell::Order, "");
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "",
+        "an emptied cell clears the rank"
+    );
+    let _ = app.update(Message::Undo);
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "3",
+        "and one undo step brings it back"
+    );
+}
+
+#[test]
+fn an_untouched_order_waits_for_its_own_field() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Order, "3");
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Order,
+    ));
+    let _ = app.update(Message::ParametersManagerFocus(None));
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_some(),
+        "a field that has not been typed into stays open with the rank it shows"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "3",
+        "and writes nothing while it stays open"
+    );
+    let _ = app.update(Message::ParametersManagerInput(String::new()));
+    let _ = app.update(Message::ParametersManagerFocus(None));
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "",
+        "an emptied order is a rank to clear, so moving the click away commits it"
+    );
+}
+
+#[test]
+fn a_non_integer_order_is_refused_and_writes_nothing() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Order, "1.5");
+    assert_eq!(
+        app.command_line.last_error.as_deref(),
+        Some("Specify a whole-number parameter order."),
+        "the refusal says what the cell takes"
+    );
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_some(),
+        "the field stays open with the text to correct"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").order,
+        "",
+        "and nothing is written"
+    );
+}
+
+/// The rank lives beside the parameter object in the drawing, so closing the
+/// session and reading the file back lists the same order column.
+#[test]
+fn the_order_survives_a_dxf_round_trip() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    answer(&mut app, "Distance1", Cell::Order, "3");
+    let path =
+        std::env::temp_dir().join(format!("ocs_parameters_order_{}.dxf", std::process::id()));
+    crate::io::save(&app.tabs[tab].scene.document, &path).expect("save the drawing");
+    let reopened = crate::io::load_file(&path).expect("reopen the drawing");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        row(&manager::rows(&reopened, definition), "Distance1").order,
+        "3",
+        "the rank is kept in the file, not only in the open session"
+    );
+    let parameter = crate::scene::block_actions::all_parameters(&reopened, definition)[0].handle;
+    assert!(
+        matches!(
+            reopened.objects.get(&parameter),
+            Some(document::objects::ObjectType::DynamicBlock(object))
+                if object.xdictionary_handle.is_some()
+        ),
+        "the parameter names the dictionary that holds its rank, so another reader finds it"
+    );
+}
+
+#[test]
+fn a_polar_parameters_two_rows_keep_their_own_descriptions() {
+    let (mut app, tab, definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
+    answer(&mut app, "Angle1", Cell::Description, "Swing");
+    assert_eq!(
+        printed(&app, tab, definition, "Angle1").description,
+        "Swing"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "",
+        "the angle text does not land on the distance row"
+    );
+    answer(&mut app, "Distance1", Cell::Description, "Reach");
+    assert_eq!(
+        printed(&app, tab, definition, "Angle1").description,
+        "Swing"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Distance1").description,
+        "Reach"
+    );
+}
+
+#[test]
+fn an_attribute_row_opens_no_description_field() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &["TAG1"]);
+    let before = manager::rows(&app.tabs[tab].scene.document, definition);
+    assert!(
+        !row(&before, "TAG1").description_writable,
+        "an attribute row names no parameter text"
+    );
+    assert!(
+        row(&before, "Distance1").description_writable,
+        "a parameter row names text the manager writes"
+    );
+    answer(&mut app, "TAG1", Cell::Description, "note");
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_none(),
+        "an attribute's row names no parameter text the manager writes"
+    );
+    assert_eq!(
+        manager::rows(&app.tabs[tab].scene.document, definition),
+        before,
+        "and nothing is written"
+    );
+}
+
+#[test]
+fn an_attribute_row_opens_no_order_field() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &["TAG1"]);
+    let before = manager::rows(&app.tabs[tab].scene.document, definition);
+    assert!(
+        !row(&before, "TAG1").order_writable,
+        "an attribute row has no parameter rank to keep"
+    );
+    assert!(
+        row(&before, "Distance1").order_writable,
+        "a parameter row keeps a rank"
+    );
+    answer(&mut app, "TAG1", Cell::Order, "2");
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_none(),
+        "an attribute's row opens no order field"
+    );
+    assert_eq!(
+        manager::rows(&app.tabs[tab].scene.document, definition),
+        before,
+        "and nothing is written"
+    );
+}
+
+/// A point's axes print a position rather than a number the manager writes, but
+/// the parameter itself still takes a rank, so its order cell opens.
+#[test]
+fn a_point_row_opens_its_order_field() {
+    let (mut app, tab, definition) = open(&["BPARAMETER POINT 0,0 5,5"], &[]);
+    let name = manager::rows(&app.tabs[tab].scene.document, definition)
+        .into_iter()
+        .find(|row| row.type_name == "Point")
+        .expect("the placed point parameter gets a row")
+        .name;
+    let _ = app.update(Message::ParametersManagerEdit(name.clone(), Cell::Order));
+    assert!(
+        app.tabs[tab].parameters_panel.editing.is_some(),
+        "the point row opens an order field even though its numeric cells stay printed"
+    );
+    let _ = app.update(Message::ParametersManagerInput("1".to_owned()));
+    let _ = app.update(Message::ParametersManagerCommit);
+    assert_eq!(
+        printed(&app, tab, definition, &name).order,
+        "1",
+        "and the typed rank is kept"
     );
 }
 
@@ -246,7 +728,7 @@ fn a_manager_edit_runs_the_actions_attached_to_the_parameter() {
     begin(&mut app, reference);
     let copy = |app: &OpenCADStudio| {
         let doc = &app.tabs[tab].scene.document;
-        let codec::EntityType::Insert(native) = doc.get_entity(reference).unwrap() else {
+        let document::EntityType::Insert(native) = doc.get_entity(reference).unwrap() else {
             panic!("the reference is no longer an insert");
         };
         doc.block_records
@@ -255,14 +737,14 @@ fn a_manager_edit_runs_the_actions_attached_to_the_parameter() {
             .entity_handles
             .iter()
             .find_map(|handle| match doc.get_entity(*handle) {
-                Some(codec::EntityType::Line(line)) => Some(line.start),
+                Some(document::EntityType::Line(line)) => Some(line.start),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the reference has no line to move"))
     };
     let before = copy(&app);
     let authored = match app.tabs[tab].scene.document.get_entity(target) {
-        Some(codec::EntityType::Line(line)) => line.start,
+        Some(document::EntityType::Line(line)) => line.start,
         other => panic!("the definition member is not a plain line: {other:?}"),
     };
     assert!(
@@ -282,7 +764,7 @@ fn a_manager_edit_runs_the_actions_attached_to_the_parameter() {
         "the manager edit rebuilt the reference along the parameter's axis, got {shift:?}"
     );
     match app.tabs[tab].scene.document.get_entity(target) {
-        Some(codec::EntityType::Line(line)) => assert_eq!(
+        Some(document::EntityType::Line(line)) => assert_eq!(
             line.start, authored,
             "and the definition's own member stays where it was authored"
         ),
@@ -299,7 +781,7 @@ fn an_edit_left_open_by_a_closed_session_writes_nothing() {
     // from whichever one is active. A field left open from another session must
     // not write onto a same-named parameter of this one.
     app.tabs[tab].parameters_panel.editing = Some(crate::ui::window::parameters_manager::Edit {
-        definition: codec::Handle::NULL,
+        definition: document::Handle::NULL,
         parameter: crate::scene::block_actions::all_parameters(
             &app.tabs[tab].scene.document,
             definition,
@@ -541,20 +1023,33 @@ fn the_filter_and_search_narrow_the_rows_and_the_footer_counts_them() {
         &["TAG1"],
     );
     assert_eq!(
-        manager::displayed(&rows, "*", "").len(),
+        manager::displayed(&rows, manager::FilterMode::All, "*", "").len(),
         4,
         "the default filter lists every row"
     );
     assert_eq!(
-        manager::displayed(&rows, "*1", "").len(),
+        manager::displayed(&rows, manager::FilterMode::All, "*1", "").len(),
         3,
         "Angle1, Distance1 and TAG1 end in 1"
     );
-    assert_eq!(manager::displayed(&rows, "Distance*", "").len(), 2);
-    assert_eq!(manager::displayed(&rows, "*", "angle").len(), 1);
-    assert_eq!(manager::displayed(&rows, "Angle*", "distance").len(), 0);
     assert_eq!(
-        manager::footer(rows.len(), manager::displayed(&rows, "Angle*", "").len()),
+        manager::displayed(&rows, manager::FilterMode::All, "Distance*", "").len(),
+        2
+    );
+    assert_eq!(
+        manager::displayed(&rows, manager::FilterMode::All, "*", "angle").len(),
+        1
+    );
+    assert_eq!(
+        manager::displayed(&rows, manager::FilterMode::All, "Angle*", "distance").len(),
+        0
+    );
+    assert_eq!(
+        manager::footer(
+            manager::FilterMode::All,
+            rows.len(),
+            manager::displayed(&rows, manager::FilterMode::All, "Angle*", "").len()
+        ),
         "All: 1 of 4 parameters displayed"
     );
 }
@@ -587,6 +1082,80 @@ fn bparameters_opens_the_manager_panel_inside_the_block_editor() {
 }
 
 #[test]
+fn a_renamed_lookup_row_shows_the_parameter_name() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LOOKUP 3,3"], &[]);
+    let lookup = crate::scene::block_lookup::parameters(&app.tabs[tab].scene.document, definition)
+        .into_iter()
+        .next()
+        .map(|(handle, _)| handle)
+        .expect("one lookup parameter");
+    crate::scene::block_authoring::metadata::set_parameter_name(
+        &mut app.tabs[tab].scene.document,
+        definition,
+        lookup,
+        "Grip9",
+    )
+    .expect("the lookup takes a name");
+    let rows = manager::rows(&app.tabs[tab].scene.document, definition);
+    let row = rows
+        .iter()
+        .find(|row| row.type_name == "Lookup")
+        .expect("the lookup still lists a row");
+    assert_eq!(
+        row.name, "Grip9",
+        "the row shows the parameter's own name, not its lookup label"
+    );
+}
+
+/// The rename is a property of the definition, so it has to survive the
+/// drawing being written and read back; the row must not fall back to the
+/// lookup's own label or to the name the parameter was placed with.
+#[test]
+fn a_renamed_lookup_row_keeps_the_name_across_a_save() {
+    let (mut app, tab, definition) = open(&["BPARAMETER LOOKUP 3,3"], &[]);
+    let lookup = crate::scene::block_lookup::parameters(&app.tabs[tab].scene.document, definition)
+        .into_iter()
+        .next()
+        .map(|(handle, _)| handle)
+        .expect("one lookup parameter");
+    crate::scene::block_authoring::metadata::set_parameter_name(
+        &mut app.tabs[tab].scene.document,
+        definition,
+        lookup,
+        "Grip9",
+    )
+    .expect("the lookup takes a name");
+    let document = app.tabs[tab].scene.document_for_save();
+    let version = document.version;
+    let prepared = crate::io::prepare_document_for_save(document, version);
+    let bytes = document::DxfWriter::new(&prepared).write_to_vec().unwrap();
+    let reopened = document::DxfReader::from_reader(std::io::Cursor::new(bytes))
+        .unwrap()
+        .read()
+        .unwrap();
+    let row = manager::rows(&reopened, definition)
+        .into_iter()
+        .find(|row| row.type_name == "Lookup")
+        .expect("the lookup still lists a row after the save");
+    assert_eq!(
+        row.name, "Grip9",
+        "the reopened row shows the parameter's own name"
+    );
+    let bytes = document::DwgWriter::write_to_vec(&app.tabs[tab].scene.document).unwrap();
+    let reopened = document::DwgReader::from_stream(std::io::Cursor::new(bytes))
+        .read()
+        .unwrap();
+    let row = manager::rows(&reopened, definition)
+        .into_iter()
+        .find(|row| row.type_name == "Lookup")
+        .expect("the lookup still lists a row after the DWG round trip");
+    assert_eq!(
+        row.name, "Grip9",
+        "the DWG round trip keeps the parameter's own name too"
+    );
+}
+
+#[test]
 fn a_lookup_parameter_lists_one_row_typed_lookup() {
     let rows = edited(
         &["BPARAMETER POLAR 0,0 10,0 5,2", "BPARAMETER LOOKUP 3,3"],
@@ -613,6 +1182,10 @@ fn a_lookup_parameter_lists_one_row_typed_lookup() {
     assert!(
         lookup.expression.is_empty() && lookup.value.is_empty(),
         "a lookup parameter has no number of its own to print"
+    );
+    assert!(
+        !lookup.description_writable,
+        "and no parameter component whose text its description cell could write"
     );
     assert_eq!(
         rows.iter().filter(|row| row.name == lookup.name).count(),
@@ -724,7 +1297,7 @@ fn a_cell_left_open_when_the_session_ends_writes_nothing() {
     // A field that outlives its session by any route is refused the same way.
     app.tabs[tab].parameters_panel.editing = Some(crate::ui::window::parameters_manager::Edit {
         definition,
-        parameter: codec::Handle::new(1),
+        parameter: document::Handle::new(1),
         component: Component::Distance,
         name: "Distance1".to_owned(),
         cell: Cell::Value,
@@ -956,7 +1529,7 @@ fn a_cell_the_pane_does_not_own_closes_without_a_refusal() {
     // refusal for it and writes nothing. (Which real route leaves such a cell
     // behind is not measured; the guard is the pane's own promise.)
     app.tabs[tab].parameters_panel.editing = Some(crate::ui::window::parameters_manager::Edit {
-        definition: codec::Handle::NULL,
+        definition: document::Handle::NULL,
         parameter: crate::scene::block_actions::all_parameters(
             &app.tabs[tab].scene.document,
             definition,
@@ -982,6 +1555,75 @@ fn a_cell_the_pane_does_not_own_closes_without_a_refusal() {
 }
 
 #[test]
+fn the_funnel_menu_opens_and_a_choice_sets_the_filter_and_closes_it() {
+    let (mut app, tab, _definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
+    assert!(
+        !app.tabs[tab].parameters_panel.filter_menu,
+        "the menu starts closed"
+    );
+    let _ = app.update(Message::ParametersManagerFilterMenu);
+    assert!(
+        app.tabs[tab].parameters_panel.filter_menu,
+        "the funnel opens it"
+    );
+    let _ = app.update(Message::ParametersManagerFilterMode(
+        manager::FilterMode::UsedInExpressions,
+    ));
+    assert_eq!(
+        app.tabs[tab].parameters_panel.mode,
+        manager::FilterMode::UsedInExpressions
+    );
+    assert!(
+        !app.tabs[tab].parameters_panel.filter_menu,
+        "choosing an entry closes the menu"
+    );
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+}
+
+#[test]
+fn a_header_menu_entry_toggles_its_column() {
+    use crate::ui::window::parameters_manager::Column;
+    let (mut app, tab, _definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
+    assert!(
+        !app.tabs[tab].parameters_panel.columns[Column::Type.index()],
+        "Type starts hidden, as the recorded menu leaves it"
+    );
+    let _ = app.update(Message::ParametersManagerColumn(Column::Type));
+    assert!(
+        app.tabs[tab].parameters_panel.columns[Column::Type.index()],
+        "choosing Type shows that column"
+    );
+    let _ = app.update(Message::ParametersManagerColumn(Column::Type));
+    assert!(
+        !app.tabs[tab].parameters_panel.columns[Column::Type.index()],
+        "choosing it again hides the column"
+    );
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+}
+
+#[test]
+fn closing_the_manager_keeps_the_columns_that_were_shown() {
+    use crate::ui::window::parameters_manager::Column;
+    let (mut app, tab, _definition) = open(&["BPARAMETER POLAR 0,0 10,0 5,2"], &[]);
+    let _ = app.update(Message::ParametersManagerColumn(Column::Description));
+    assert!(
+        app.tabs[tab].parameters_panel.columns[Column::Description.index()],
+        "Description can be turned on"
+    );
+    let _ = app.dispatch_command("PARAMETERSCLOSE");
+    let _ = app.dispatch_command("BPARAMETERS");
+    assert!(
+        app.tabs[tab].parameters_panel.columns[Column::Description.index()],
+        "and the pane that opens again still shows it"
+    );
+    assert!(
+        !app.tabs[tab].parameters_panel.columns[Column::Type.index()],
+        "while Type stays hidden"
+    );
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+}
+
+#[test]
 fn the_two_fields_narrow_the_list_and_the_count_follows() {
     let (mut app, tab, definition) = open(
         &[
@@ -993,8 +1635,13 @@ fn the_two_fields_narrow_the_list_and_the_count_follows() {
     let count = |app: &OpenCADStudio| {
         let panel = &app.tabs[tab].parameters_panel;
         let rows = manager::rows(&app.tabs[tab].scene.document, definition);
-        let shown = manager::displayed(&rows, &panel.filter, &panel.search);
-        manager::footer(rows.len(), shown.len())
+        let shown = manager::displayed(
+            &rows,
+            manager::FilterMode::All,
+            &panel.filter,
+            &panel.search,
+        );
+        manager::footer(manager::FilterMode::All, rows.len(), shown.len())
     };
     assert_eq!(
         app.tabs[tab].parameters_panel.filter, "*",
@@ -1083,6 +1730,30 @@ fn closing_the_pane_applies_the_number_typed_in_its_open_cell() {
 }
 
 #[test]
+fn closing_the_manager_in_clean_screen_applies_its_open_cell() {
+    use crate::ui::dock::PanelId;
+    let (mut app, tab, definition) = open(&["BPARAMETER LINEAR 0,0 10,0 6,6"], &[]);
+    let _ = app.update(Message::ToggleCleanScreen);
+    let _ = app.dispatch_command("PARAMETERS");
+    assert!(app.dock_panel_visible(PanelId::ParametersManager));
+    let history = app.tabs[tab].history.undo_stack.len();
+    let _ = app.update(Message::ParametersManagerEdit(
+        "Distance1".to_owned(),
+        Cell::Value,
+    ));
+    let _ = app.update(Message::ParametersManagerInput("20".to_owned()));
+    let _ = app.dispatch_command("PARAMETERSCLOSE");
+    assert!(app.clean_screen);
+    assert!(!app.dock_panel_visible(PanelId::ParametersManager));
+    assert!(app.tabs[tab].parameters_panel.editing.is_none());
+    assert!(app.tabs[tab].parameters_panel.edit_buf.is_empty());
+    assert_eq!(printed(&app, tab, definition, "Distance1").expression, "20");
+    assert_eq!(endpoints(&app, tab, definition).1, glam::DVec3::X * 20.);
+    assert_eq!(app.tabs[tab].history.undo_stack.len(), history + 1);
+    let _ = app.dispatch_command("BEDIT_DISCARD");
+}
+
+#[test]
 fn manager_edit_refreshes_ordered_actions_and_transported_parameters_with_undo() {
     use crate::scene::block_actions::{self as actions, instance, Kind, Value};
     use crate::scene::{block_distance_parameter as distance, block_point_parameter as point};
@@ -1129,16 +1800,16 @@ fn manager_edit_refreshes_ordered_actions_and_transported_parameters_with_undo()
             point::create(doc, definition, Vector3::ZERO, Vector3::UNIT_Y).unwrap()
         };
         for handle in [parent, child] {
-            let codec::objects::ObjectType::DynamicBlock(object) =
+            let document::objects::ObjectType::DynamicBlock(object) =
                 doc.objects.get_mut(&handle).unwrap()
             else {
                 panic!()
             };
             match &mut object.data {
-                codec::objects::DynamicBlockData::LinearParameter(p) => {
+                document::objects::DynamicBlockData::LinearParameter(p) => {
                     p.parameter.parameter.chain_actions = true
                 }
-                codec::objects::DynamicBlockData::PointParameter(p) => {
+                document::objects::DynamicBlockData::PointParameter(p) => {
                     p.parameter.parameter.chain_actions = true
                 }
                 _ => panic!(),
@@ -1149,11 +1820,12 @@ fn manager_edit_refreshes_ordered_actions_and_transported_parameters_with_undo()
         let scaled =
             actions::create(doc, definition, Kind::Scale, parent, &[member], DVec3::ZERO).unwrap();
         actions::create(doc, definition, Kind::Move, child, &[member], DVec3::ZERO).unwrap();
-        let codec::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&moved).unwrap()
+        let document::objects::ObjectType::DynamicBlock(object) =
+            doc.objects.get_mut(&moved).unwrap()
         else {
             panic!()
         };
-        let codec::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
+        let document::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
             panic!()
         };
         action.action.dependencies = vec![member, child];
@@ -1187,7 +1859,7 @@ fn manager_edit_refreshes_ordered_actions_and_transported_parameters_with_undo()
         .unwrap();
         app.apply_action_document(tab, changed);
         begin(&mut app, insert);
-        let line = |doc: &codec::Document, handle: Handle| {
+        let line = |doc: &document::Document, handle: Handle| {
             let EntityType::Insert(reference) = doc.get_entity(handle).unwrap() else {
                 panic!()
             };
@@ -1256,14 +1928,14 @@ fn manager_edit_refreshes_ordered_actions_and_transported_parameters_with_undo()
 }
 
 /// The definition's evaluation graph — the fixture's definition holds one.
-fn evaluation_graph(document: &codec::Document) -> codec::Handle {
+fn evaluation_graph(document: &document::Document) -> document::Handle {
     document
         .objects
         .values()
         .find_map(|object| match object {
-            codec::objects::ObjectType::DynamicBlock(object) => matches!(
+            document::objects::ObjectType::DynamicBlock(object) => matches!(
                 object.data,
-                codec::objects::DynamicBlockData::EvaluationGraph(_)
+                document::objects::DynamicBlockData::EvaluationGraph(_)
             )
             .then_some(object.handle),
             _ => None,
@@ -1273,13 +1945,14 @@ fn evaluation_graph(document: &codec::Document) -> codec::Handle {
 
 /// Leave the graph naming one node twice: every parameter it held is still
 /// named, and no authoring read will edit it.
-fn duplicate_a_node(document: &mut codec::Document, graph: codec::Handle) -> bool {
-    let Some(codec::objects::ObjectType::DynamicBlock(object)) = document.objects.get_mut(&graph)
+fn duplicate_a_node(document: &mut document::Document, graph: document::Handle) -> bool {
+    let Some(document::objects::ObjectType::DynamicBlock(object)) =
+        document.objects.get_mut(&graph)
     else {
         return false;
     };
     match &mut object.data {
-        codec::objects::DynamicBlockData::EvaluationGraph(graph) => {
+        document::objects::DynamicBlockData::EvaluationGraph(graph) => {
             match graph.nodes.first().cloned() {
                 Some(node) => {
                     graph.nodes.push(node);
@@ -1409,5 +2082,96 @@ fn an_uneditable_graph_keeps_the_component_rows_it_holds_listed() {
     assert!(
         after.iter().all(|(_, type_name, _)| *type_name == "Polar"),
         "and they still read as the parameter type they came from: {after:?}"
+    );
+}
+
+/// An XY parameter's two rows are its two offsets from the base point, and each
+/// row writes only its own axis. The two branches share the writer with the
+/// linear and polar rows, so an axis mapped the wrong way would put the endpoint
+/// somewhere neither number asked for.
+#[test]
+fn an_xy_row_writes_its_own_axis_as_an_offset_from_the_base() {
+    let (mut app, tab, definition) = open(&["BPARAMETER XY 2,3 12,13 5,5"], &[]);
+    let rows = manager::rows(&app.tabs[tab].scene.document, definition);
+    let xy: Vec<_> = rows.iter().filter(|row| row.type_name == "XY").collect();
+    assert_eq!(
+        xy.len(),
+        2,
+        "an XY parameter lists one row per axis: {rows:?}"
+    );
+    assert_eq!(xy[0].name, "X Distance1");
+    assert_eq!(xy[1].name, "Y Distance1");
+    assert_eq!(
+        xy[0].expression, "10",
+        "the X row reads the offset it was placed at"
+    );
+    assert_eq!(xy[1].expression, "10", "and so does the Y row");
+
+    answer(&mut app, "X Distance1", Cell::Value, "4");
+    let (base, end) = endpoints(&app, tab, definition);
+    assert!(
+        (base - glam::DVec3::new(2.0, 3.0, 0.0)).length() < 1e-9,
+        "the base point stays put"
+    );
+    assert!(
+        (end - glam::DVec3::new(6.0, 13.0, 0.0)).length() < 1e-9,
+        "the X row adds its offset to the base and leaves Y: {end:?}"
+    );
+
+    answer(&mut app, "Y Distance1", Cell::Value, "3");
+    let (_, end) = endpoints(&app, tab, definition);
+    assert!(
+        (end - glam::DVec3::new(6.0, 6.0, 0.0)).length() < 1e-9,
+        "the Y row adds its offset to the base and keeps the X just written: {end:?}"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "X Distance1").expression,
+        "4"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, "Y Distance1").expression,
+        "3"
+    );
+}
+
+/// A rotation parameter's row is its angle, written as a bearing from the base
+/// point: the endpoint keeps the parameter's radius and turns to the typed angle.
+#[test]
+fn a_rotation_row_writes_its_angle_and_keeps_the_radius() {
+    let (mut app, tab, definition) = open(&["BPARAMETER ROTATION 2,3 10 0 5,5"], &[]);
+    let row = manager::rows(&app.tabs[tab].scene.document, definition)
+        .into_iter()
+        .find(|row| row.type_name == "Rotation")
+        .expect("a rotation parameter gets a row");
+    assert!(row.numeric, "the angle is a number the manager writes back");
+    assert_eq!(
+        row.expression, "0",
+        "the row reads the angle it was placed at"
+    );
+    let (base, end) = endpoints(&app, tab, definition);
+    assert!(
+        ((end - base).length() - 10.0).abs() < 1e-9,
+        "the parameter starts at its authored radius: {end:?}"
+    );
+
+    answer(&mut app, &row.name, Cell::Value, "90");
+    assert_eq!(
+        printed(&app, tab, definition, &row.name).value,
+        "90",
+        "the value cell prints the angle just written"
+    );
+    assert_eq!(
+        printed(&app, tab, definition, &row.name).expression,
+        "90",
+        "and the definition stores that angle"
+    );
+    let (base, end) = endpoints(&app, tab, definition);
+    assert!(
+        (base - glam::DVec3::new(2.0, 3.0, 0.0)).length() < 1e-9,
+        "the base point stays put"
+    );
+    assert!(
+        (end - glam::DVec3::new(2.0, 13.0, 0.0)).length() < 1e-9,
+        "the endpoint turned about the base to the typed bearing at the same radius: {end:?}"
     );
 }

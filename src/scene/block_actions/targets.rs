@@ -21,6 +21,14 @@ pub(super) fn geometry(
         if !doc.objects.contains_key(handle) {
             return Err("An action target is unavailable.");
         }
+        // The base point parameter only places the insertion grip; the
+        // geometry an action moves does not depend on it.
+        if matches!(kind, Kind::Stretch | Kind::PolarStretch | Kind::Move)
+            && super::super::block_basepoint::parameter(doc, definition)
+                .is_some_and(|(basepoint, _)| basepoint == *handle)
+        {
+            continue;
+        }
         if grips.is_none() {
             let parameter = parameters(doc, definition, kind)
                 .into_iter()
@@ -33,10 +41,40 @@ pub(super) fn geometry(
                     .collect::<std::collections::BTreeSet<_>>(),
             );
         }
-        if kind == Kind::Move && chains::frame_target(doc, definition, parameter_id, *handle).is_some() {
+        if kind == Kind::Move
+            && chains::frame_target(doc, definition, parameter_id, *handle).is_some()
+        {
             continue;
         }
         if grips.as_ref().unwrap().contains(handle) {
+            continue;
+        }
+        // Visibility, lookup and alignment grips, the alignment and visibility
+        // parameters, and other actions carry no frame another parameter
+        // reads: a selection that sweeps them in only keeps the link.
+        let bookkeeping = match doc.objects.get(handle) {
+            Some(ObjectType::BlockVisibilityParameter(_)) => true,
+            Some(ObjectType::DynamicBlock(o)) => {
+                matches!(
+                    o.data,
+                    DynamicBlockData::VisibilityGrip(_)
+                        | DynamicBlockData::LookupGrip(_)
+                        | DynamicBlockData::LookupParameter(_)
+                        | DynamicBlockData::LookupAction(_)
+                        | DynamicBlockData::AlignmentGrip(_)
+                        | DynamicBlockData::AlignmentParameter(_)
+                        | DynamicBlockData::MoveAction(_)
+                        | DynamicBlockData::StretchAction(_)
+                        | DynamicBlockData::PolarStretchAction(_)
+                        | DynamicBlockData::FlipAction(_)
+                        | DynamicBlockData::ArrayAction(_)
+                        | DynamicBlockData::RotateAction(_)
+                        | DynamicBlockData::ScaleAction(_)
+                )
+            }
+            _ => false,
+        };
+        if bookkeeping {
             continue;
         }
         // Flip-linked parameters need frame transport; silently treating them
@@ -46,9 +84,8 @@ pub(super) fn geometry(
         }
         let all_params = all_parameters(doc, definition);
         let is_block_param_or_grip = all_params.iter().any(|p| {
-            // Linear grip aliases are not yet transport targets. The driving
-            // parameter's own grips and supported whole-parameter links were
-            // handled above; accepting another Linear grip would drop its move.
+            // Move links to Linear parameters and their grips were taken as
+            // frame transport above; anything else Linear would drop a move.
             !(kind == Kind::Move && p.linear)
                 && (p.handle == *handle
                     || p.grip == *handle

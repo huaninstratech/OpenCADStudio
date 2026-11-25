@@ -6,9 +6,9 @@
 //! the annotation factor. Paper space is out of scope here — the policy never
 //! touches non-model blocks.
 
-use codec::entities::{EntityType, Line, MText};
-use codec::objects::Scale;
-use codec::types::Vector3;
+use document::entities::{EntityType, Line, MText};
+use document::objects::Scale;
+use document::types::Vector3;
 use OpenCADStudio::app::{QSelectMode, QSelectOp, QSelectScope};
 use OpenCADStudio::scene::{annotative, Scene};
 

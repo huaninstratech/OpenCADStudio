@@ -23,7 +23,7 @@ impl fmt::Display for PlotLineweightItem {
 
 fn plot_lineweight_options() -> Vec<PlotLineweightItem> {
     let mut options = vec![PlotLineweightItem {
-        index: 255,
+        index: 0,
         label: t!("Use object lineweight").into_owned(),
     }];
 
@@ -31,8 +31,9 @@ fn plot_lineweight_options() -> Vec<PlotLineweightItem> {
         crate::io::plot_style::LW_TABLE
             .iter()
             .enumerate()
+            // A style's number is one more than its entry: 0 is "object".
             .map(|(index, lw)| PlotLineweightItem {
-                index: index as u8,
+                index: index as u8 + 1,
                 label: format!("{lw:.2} mm"),
             }),
     );
@@ -70,11 +71,11 @@ fn btn_s(accent: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
 /// unit-tested and benched without building widgets. `pub` (not
 /// `pub(crate)`) so the `cargo bench` harness (`benches/`, an external
 /// crate) can measure it as `ui_plotstyle_layer_usage`.
-pub fn build_layer_usage(document: &codec::Document) -> Vec<Vec<String>> {
+pub fn build_layer_usage(document: &document::Document) -> Vec<Vec<String>> {
     let mut layer_usage = vec![Vec::<String>::new(); 256];
 
     for layer in document.layers.iter() {
-        if let codec::types::Color::Index(aci) = &layer.color {
+        if let document::types::Color::Index(aci) = &layer.color {
             let index = *aci as usize;
 
             if index > 0 && index < layer_usage.len() {
@@ -92,7 +93,7 @@ pub fn build_layer_usage(document: &codec::Document) -> Vec<Vec<String>> {
 }
 
 pub fn view_window<'a>(
-    document: &'a codec::Document,
+    document: &'a document::Document,
     table: Option<&'a crate::io::plot_style::PlotStyleTable>,
     selected_aci: u8,
     color_buf: &'a str,
@@ -155,17 +156,17 @@ pub fn view_window<'a>(
                 String::new()
             };
             let (aci_color, _) =
-                crate::ui::properties::acad_color_display(codec::types::Color::Index(aci));
+                crate::ui::properties::acad_color_display(document::types::Color::Index(aci));
             let has_override = table
                 .and_then(|t| t.aci_entries.get(aci as usize))
-                .map(|e| e.color.is_some() || e.lineweight != 255 || e.screening != 100)
+                .map(|e| e.color.is_some() || !matches!(e.lineweight, 0 | 255) || e.screening != 100)
                 .unwrap_or(false);
             let lw_str = table
                 .and_then(|t| t.aci_entries.get(aci as usize))
                 .and_then(|e| {
-                    if e.lineweight != 255 {
+                    if !matches!(e.lineweight, 0 | 255) {
                         crate::io::plot_style::LW_TABLE
-                            .get(e.lineweight as usize)
+                            .get(e.lineweight as usize - 1)
                             .map(|lw| format!("{lw:.2}mm"))
                     } else {
                         None
@@ -274,11 +275,11 @@ pub fn view_window<'a>(
         .unwrap_or_else(|| t!("(none)").into());
     let cur_lw = entry
         .map(|e| {
-            if e.lineweight == 255 {
+            if matches!(e.lineweight, 0 | 255) {
                 t!("object").into()
             } else {
                 crate::io::plot_style::LW_TABLE
-                    .get(e.lineweight as usize)
+                    .get(e.lineweight as usize - 1)
                     .map(|lw| crate::tf!("{lw:.2}mm (idx {})", e.lineweight).into_owned())
                     .unwrap_or_else(|| crate::tf!("idx {}", e.lineweight).into_owned())
             }
@@ -291,7 +292,10 @@ pub fn view_window<'a>(
     let lbl = |s: Cow<'static, str>| text(s).size(11).style(muted_style);
     let lw_items = plot_lineweight_options();
 
-    let current_lw_index = lw_buf.trim().parse::<u8>().unwrap_or(255);
+    let current_lw_index = match lw_buf.trim().parse::<u8>() {
+        Ok(255) | Err(_) => 0,
+        Ok(n) => n,
+    };
 
     let current_lw = lw_items
         .iter()
@@ -331,14 +335,14 @@ pub fn view_window<'a>(
                     .strip_prefix('#')
                     .filter(|hex| hex.len() == 6)
                     .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                    .map(|rgb| codec::types::Color::Rgb {
+                    .map(|rgb| document::types::Color::Rgb {
                         r: ((rgb >> 16) & 0xFF) as u8,
                         g: ((rgb >> 8) & 0xFF) as u8,
                         b: (rgb & 0xFF) as u8,
                     });
 
                 let display_color =
-                    selected_color.unwrap_or(codec::types::Color::Index(selected_aci));
+                    selected_color.unwrap_or(document::types::Color::Index(selected_aci));
 
                 let (swatch_color, _) = crate::ui::properties::acad_color_display(display_color);
 
@@ -376,11 +380,12 @@ pub fn view_window<'a>(
             },
             // ── Lineweight ───────────────────────────────────────────────────
             lbl(t!("Lineweight:")),
-            crate::ui::dropdown_list::pick_list(Some(current_lw), lw_items, |item| item.to_string(),)
-                .on_select(|item: PlotLineweightItem| { Message::PlotStylePanelLwSet(item.index) })
-                .text_size(11)
-                .padding([3, 5])
-                .width(iced::Length::Fill),
+            crate::ui::dropdown_list::pick_list(Some(current_lw), lw_items, |item| item
+                .to_string(),)
+            .on_select(|item: PlotLineweightItem| { Message::PlotStylePanelLwSet(item.index) })
+            .text_size(11)
+            .padding([3, 5])
+            .width(iced::Length::Fill),
             // ── Screening ────────────────────────────────────────────────────
             lbl(t!("Screening (0-100):")),
             text_input("100", screen_buf)
@@ -462,16 +467,16 @@ pub fn view_window<'a>(
 mod layer_usage_tests {
     use super::*;
 
-    fn indexed_layer(doc: &mut codec::Document, name: &str, aci: u8) -> codec::tables::Layer {
-        let mut layer = codec::tables::Layer::new(name);
+    fn indexed_layer(doc: &mut document::Document, name: &str, aci: u8) -> document::tables::Layer {
+        let mut layer = document::tables::Layer::new(name);
         layer.handle = doc.allocate_handle();
-        layer.color = codec::types::Color::Index(aci);
+        layer.color = document::types::Color::Index(aci);
         layer
     }
 
     #[test]
     fn build_layer_usage_buckets_index_colors() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         let a = indexed_layer(&mut doc, "WALLS", 1);
         let b = indexed_layer(&mut doc, "doors", 1);
         let c = indexed_layer(&mut doc, "ROOF", 3);
@@ -489,10 +494,10 @@ mod layer_usage_tests {
 
     #[test]
     fn build_layer_usage_ignores_non_index_colors() {
-        let mut doc = codec::Document::new();
-        let mut truecolor = codec::tables::Layer::new("TRUECOLOR");
+        let mut doc = document::Document::new();
+        let mut truecolor = document::tables::Layer::new("TRUECOLOR");
         truecolor.handle = doc.allocate_handle();
-        truecolor.color = codec::types::Color::Rgb {
+        truecolor.color = document::types::Color::Rgb {
             r: 10,
             g: 20,
             b: 30,

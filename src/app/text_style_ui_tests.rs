@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::ui::font_picker::{drawn_with, FontChoice, FontPickerEvent};
-use codec::tables::TextStyle;
+use document::tables::TextStyle;
 use iced_test::Simulator;
 
 fn style(name: &str, font_file: &str, family: &str) -> TextStyle {
@@ -34,9 +34,8 @@ fn app_with(styles: Vec<TextStyle>) -> OpenCADStudio {
 fn font_list_open() -> OpenCADStudio {
     let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/web/fonts/latin.ttf"))
         .expect("bundled web font");
-    let (family, _) =
-        crate::scene::text::sysfont::register_font_file("FontList-Test.ttf", &bytes)
-            .expect("a face");
+    let (family, _) = crate::scene::text::sysfont::register_font_file("FontList-Test.ttf", &bytes)
+        .expect("a face");
     let mut app = app_with(vec![
         style("Notes", "txt.shx", ""),
         style("Office", "FontList-Test.ttf", &family),
@@ -93,8 +92,14 @@ fn the_font_list_opens_right_under_the_font_field() {
         // up; the open list covers it, framed and padded by 2 + 6.
         let field = shown(&mut ui, "Regular");
         let title = shown(&mut ui, "IN THIS DRAWING");
-        assert!((title.x - field.x - 8.0).abs() < 1.0, "{width}: {field:?} {title:?}");
-        assert!((title.y - field.y).abs() < 20.0, "{width}: {field:?} {title:?}");
+        assert!(
+            (title.x - field.x - 8.0).abs() < 1.0,
+            "{width}: {field:?} {title:?}"
+        );
+        assert!(
+            (title.y - field.y).abs() < 20.0,
+            "{width}: {field:?} {title:?}"
+        );
     }
 }
 
@@ -104,11 +109,30 @@ fn the_font_list_opens_right_under_the_font_field() {
 fn the_font_list_is_coloured_in_both_themes() {
     let app = font_list_open();
     let mut ui = window(&app, 1280.0);
-    for text in ["SHX", "TT", "missing · drawn with Standard"] {
+    for text in ["SHX", "TT"] {
         shown(&mut ui, text);
     }
+    // The missing font's row is in the list, but on a machine with many
+    // system fonts (Windows) it sits below the scrolled part.
+    assert!(ui.find("missing · drawn with Standard".to_string()).is_ok());
     drop(ui);
     snapshots(&app, "text-style-font-list", 1280.0);
+}
+
+/// The missing font's note has room in its row, wide and narrow: the list
+/// is at least as wide as its narrowest width also under a field that
+/// fills its column (114 px in a wide window). The note's layout width
+/// does not depend on the row being scrolled into view.
+#[test]
+fn the_missing_font_note_has_room_in_its_row() {
+    let app = font_list_open();
+    for width in [1280.0, 780.0] {
+        let mut ui = window(&app, width);
+        let note = ui
+            .find("missing · drawn with Standard".to_string())
+            .unwrap_or_else(|_| panic!("{width}: the note is not in the list"));
+        assert!(note.bounds().width > 50.0, "{width}: {:?}", note.bounds());
+    }
 }
 
 /// B5: the stand-in is the font that really draws: the bundled stroke
@@ -132,6 +156,7 @@ fn mtext_editor(raw: &str) -> OpenCADStudio {
         .document
         .header
         .current_text_style_name = "Notes".into();
+    app.tabs[app.active_tab].scene.selection.borrow_mut().view.vp_size = (1280.0, 650.0);
     app.open_mtext_editor(glam::DVec3::ZERO, None, raw, 2.5, None);
     app
 }
@@ -160,9 +185,14 @@ fn the_font_field_shows_the_style_font_after_a_style_switch() {
     let mut app = mtext_editor("Text");
     shown(&mut window(&app, 1280.0), "lostfont.shx");
     let _ = app.update(Message::MTextStyle("Roman".into()));
-    let mut ui = window(&app, 1280.0);
-    shown(&mut ui, "RomanS");
-    assert!(ui.find("[Style default]").is_err());
+    // With nothing selected the style change is asked about first.
+    let _ = app.update(Message::MTextDialog(
+        crate::ui::window::mtext_dialogs::MTextDialogMsg::StyleYes,
+    ));
+    // The Text Editor tab now shows the editor's fields: its font list
+    // names the style's font, not "[Style default]".
+    let state = app.text_editor_ribbon_state().expect("the editor is open");
+    assert_eq!(state.font, "RomanS");
 }
 
 /// B6: switching to a TrueType font says what it turned off.

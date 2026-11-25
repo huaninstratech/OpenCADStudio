@@ -5,13 +5,13 @@
 // the real entity is re-tessellated into the scene's preview wires on every
 // change so the user sees the actual drawing result while typing.
 
-use codec::entities::mtext::AttachmentPoint;
-use codec::entities::mtext_format::{
+use document::entities::mtext::AttachmentPoint;
+use document::entities::mtext_format::{
     parse_mtext, MTextDocument, MTextFont, MTextParagraph, MTextSpan, ParagraphProperties,
     SpanProperties, StackingData, StackingType,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle, MText};
+use document::types::Vector3;
+use document::{EntityType, Handle, MText};
 use glam::DVec3;
 use iced::widget::text_editor;
 
@@ -25,12 +25,22 @@ mod raw_edit;
 mod raw_field;
 mod raw_geometry;
 mod raw_list;
+pub(crate) mod context_menu;
+mod raw_paragraph_codes;
+pub(crate) mod prefs;
+mod raw_tools;
+mod import_text;
+mod tool_dialogs;
+pub(in crate::app) use raw_tools::ClearMode;
+mod ribbon;
+mod dialogs;
 mod raw_operations;
 mod raw_span;
 mod raw_stack;
 mod raw_style;
 mod style_from;
 pub(in crate::app) use raw_edit::FormatState;
+pub(in crate::app) use raw_field::locates_fields;
 pub(in crate::app) use raw_list::ListKind;
 pub(in crate::app) use raw_stack::{FractionPart, Script};
 pub(in crate::app) use raw_style::{sets_whole_text, ValueOrigin};
@@ -53,10 +63,14 @@ pub enum MTextFmt {
 /// Paragraph alignment written as `\pxq<l|c|r|j>;`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParaAlign {
+    /// Back to the attachment's alignment (`\pq*;`).
+    Default,
     Left,
     Center,
     Right,
     Justify,
+    /// Letters spread over the whole line, the last one too (`\pqd;`).
+    Distribute,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,11 +140,14 @@ impl std::fmt::Display for JustifyChoice {
 
 /// Live state of the open MText editor. Absent (`None`) when no editor is up.
 pub struct MTextEditorState {
+    /// Which editor this is: each one opens with a new number, so a file
+    /// read for an earlier editor does not go into this one.
+    pub(super) opened: u64,
     /// World insertion point (WCS, same convention the committed entity uses).
     pub pos: DVec3,
     /// The editable text buffer (raw value with inline codes).
     pub content: text_editor::Content,
-    /// Structured mirror of `content`, parsed via opencadcodec `parse_mtext` — the
+    /// Structured mirror of `content`, parsed via document `parse_mtext` — the
     /// target authority for the editor. Phase 1: passive mirror kept in sync on
     /// every rebuild, cross-checked against the rendered glyph boxes; later
     /// phases make it the source of truth and delete the raw-string path.
@@ -156,7 +173,7 @@ pub struct MTextEditorState {
     /// What the current text style supplies where the source sets nothing.
     pub object_style: raw_style::ObjectStyle,
     /// The object colour set in the editor; `None` keeps the entity's own.
-    pub object_color: Option<codec::types::Color>,
+    pub object_color: Option<document::types::Color>,
     /// Tessellated strokes of the current text, drawn in the editor's own
     /// preview area (NOT on the drawing canvas).
     pub preview_wires: Vec<WireModel>,
@@ -166,7 +183,7 @@ pub struct MTextEditorState {
     pub line_spacing: f64,
     /// Whether the spacing is at least the factor or exactly it (entity
     /// field of an MTEXT and of a multileader's text).
-    pub line_spacing_style: codec::entities::LineSpacingStyle,
+    pub line_spacing_style: document::entities::LineSpacingStyle,
     /// The spacing factor as typed while it is not a valid factor yet.
     pub line_spacing_draft: Option<String>,
     /// Object rotation in degrees, kept as typed so partial input is allowed.
@@ -188,6 +205,7 @@ pub struct MTextEditorState {
     pub rect_width_draft: Option<String>,
     /// A ruler drag is under way: the whole drag is one undo step.
     pub(super) box_dragging: bool,
+    pub(super) height_dragging: bool,
     pub rect_height: String,
     pub annotative: bool,
     pub column_type: i16,
@@ -219,7 +237,7 @@ pub struct MTextEditorState {
     /// The Background menu's mask while it differs from the stored one.
     pub mask_draft: Option<entity_options::MaskDraft>,
     /// The Position menu's direction while it differs from the stored one.
-    pub direction: Option<codec::entities::DrawingDirection>,
+    pub direction: Option<document::entities::DrawingDirection>,
     /// The native FIELDs of the edited MTEXT, located in its value: the
     /// text around them is edited, their own text is not.
     pub(super) field_host: Option<raw_field::FieldHost>,
@@ -250,17 +268,47 @@ pub struct MTextEditorState {
     /// Canvas-space anchor where the toolbar + text area are drawn (the
     /// insertion-point click position).
     pub screen_anchor: iced::Point,
+    /// Displacement and pointer state of the floating formatting bar.
+    pub toolbar_offset: iced::Vector,
+    pub toolbar_drag_last: Option<iced::Point>,
+    pub toolbar_dragging: bool,
     /// The entity as it was opened, when editing an existing MText. `build_mtext`
     /// starts from this so every field the toolbar doesn't touch — columns,
     /// rotation, normal, background fill, defined height, annotative flag —
     /// survives the edit instead of resetting to `MText::default()`. `None` for
     /// a freshly created MText, which has nothing to preserve.
     pub original: Option<MText>,
+    /// Tab owning the existing MTEXT hidden while its draft is displayed.
+    pub(super) hidden_source_tab: Option<u64>,
+    /// The ruler above the text shows (Text Editor > Options > Ruler).
+    pub ruler: bool,
+    /// Letters typed come in upper case (Text Editor > Tools > All CAPS).
+    pub auto_caps: bool,
+    /// Match is on: the formatting each pointer selection takes.
+    pub matching: Option<SpanProperties>,
+    /// The visible ranges of the misspelled words, and the text and
+    /// dictionary they were found for.
+    pub spell_marks: Vec<(usize, usize)>,
+    pub(super) spell_key: String,
+    /// Words Ignore All took off the marks while this text is edited.
+    pub(super) spell_ignored: Vec<String>,
+    /// The misspelled word the right-click menu was opened on.
+    pub(super) spell_word: Option<(usize, usize)>,
+    /// The tag AutoStack or an automatic list left, and whether its menu
+    /// is open.
+    pub smart_tag: Option<context_menu::SmartTag>,
+    pub smart_tag_open: bool,
+    /// The list tag's Remove ran: its Redo puts the list back.
+    pub(super) list_tag_removed: bool,
+    /// The right-click menu while it is open.
+    pub context_menu: Option<context_menu::EditorContextMenu>,
 }
 
 impl MTextEditorState {
     pub fn new(pos: DVec3, initial: &str, height: f64, editing: Option<Handle>) -> Self {
+        static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            opened: OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pos,
             content: text_editor::Content::with_text(initial),
             doc: parse_mtext(initial, true),
@@ -308,6 +356,7 @@ impl MTextEditorState {
             keep_width: false,
             rect_width_draft: None,
             box_dragging: false,
+            height_dragging: false,
             rect_height: "0".to_string(),
             annotative: false,
             column_type: 0,
@@ -327,7 +376,22 @@ impl MTextEditorState {
             redo: Vec::new(),
             editing,
             screen_anchor: iced::Point::new(60.0, 90.0),
+            toolbar_offset: iced::Vector::ZERO,
+            toolbar_drag_last: None,
+            toolbar_dragging: false,
+            ruler: true,
+            auto_caps: false,
+            matching: None,
+            spell_marks: Vec::new(),
+            spell_key: String::new(),
+            spell_ignored: Vec::new(),
+            spell_word: None,
+            smart_tag: None,
+            smart_tag_open: false,
+            list_tag_removed: false,
+            context_menu: None,
             original: None,
+            hidden_source_tab: None,
         }
     }
 
@@ -366,7 +430,7 @@ impl MTextEditorState {
         let unit = if heights.is_empty() {
             self.height_value() as f32
         } else {
-            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            heights.sort_by(|a, b| a.total_cmp(b));
             let (mut best_height, mut best_count, mut index) = (heights[0], 0usize, 0usize);
             while index < heights.len() {
                 let mut end = index;
@@ -483,6 +547,7 @@ fn flatten_stack(st: &StackingData) -> String {
         StackingType::Limit => '^',
         StackingType::Diagonal => '#',
         StackingType::Horizontal => '/',
+        StackingType::Decimal => '~',
     };
     let mut flat = st.numerator.clone();
     if !st.denominator.is_empty() {
@@ -616,17 +681,14 @@ fn word_range(cells: &[Cell], off: usize) -> (usize, usize) {
 use crate::scene::convert::tessellate;
 use crate::scene::model::wire_model::WireModel;
 
-fn vertical_caret_target(
+/// Where the caret at `caret` stands: its x and the bottom and top of its
+/// line, as the preview draws it (the leading edge of the cell after it, or
+/// the trailing edge of the cell before it).
+fn caret_anchor(
     boxes: &[crate::entities::text_support::GlyphBox],
     caret: usize,
-    visible_count: usize,
-    direction: i8,
-) -> usize {
-    if boxes.is_empty() || direction == 0 {
-        return caret.min(visible_count);
-    }
-
-    let anchor = boxes
+) -> Option<(f32, f32, f32)> {
+    boxes
         .iter()
         .find(|item| item.vis == caret)
         .map(|item| {
@@ -655,8 +717,43 @@ fn vertical_caret_target(
                     item.ymax,
                 )
             })
-        });
-    let Some((anchor_x, anchor_y, anchor_top)) = anchor else {
+        })
+}
+
+/// The caret at the start (`end` false) or the end of the caret's line.
+fn line_edge_caret(
+    boxes: &[crate::entities::text_support::GlyphBox],
+    caret: usize,
+    visible_count: usize,
+    end: bool,
+) -> usize {
+    let Some((_, anchor_y, anchor_top)) = caret_anchor(boxes, caret) else {
+        return caret.min(visible_count);
+    };
+    let line_epsilon = ((anchor_top - anchor_y).abs() * 0.15).max(1e-5);
+    let line = boxes
+        .iter()
+        .filter(|item| (item.ymin - anchor_y).abs() <= line_epsilon);
+    let edge = if end {
+        // A zero-width slot (an empty line's start) is the caret place itself.
+        line.map(|item| item.vis + usize::from(item.xmax > item.xmin))
+            .max()
+    } else {
+        line.map(|item| item.vis).min()
+    };
+    edge.unwrap_or(caret).min(visible_count)
+}
+
+fn vertical_caret_target(
+    boxes: &[crate::entities::text_support::GlyphBox],
+    caret: usize,
+    visible_count: usize,
+    direction: i8,
+) -> usize {
+    if boxes.is_empty() || direction == 0 {
+        return caret.min(visible_count);
+    }
+    let Some((anchor_x, anchor_y, anchor_top)) = caret_anchor(boxes, caret) else {
         return caret.min(visible_count);
     };
 
@@ -731,6 +828,9 @@ impl super::OpenCADStudio {
         if handle.is_some_and(|h| self.tabs[self.active_tab].scene.is_layer_locked(h)) {
             return;
         }
+        if self.mtext_editor.is_some() {
+            self.mtext_cancel();
+        }
         let mut state = MTextEditorState::new(pos, initial, height, handle);
         if let Some(p) = self.tabs[self.active_tab]
             .scene
@@ -792,6 +892,14 @@ impl super::OpenCADStudio {
                 .working_plane()
                 .z
                 .abs_diff_eq(DVec3::Z, 1e-12);
+        }
+        // Render the draft instead of the original MTEXT so the original
+        // doesn't show through the translucent editor or duplicate its text.
+        if let Some(h) = handle.filter(|&h| matches!(
+            self.tabs[self.active_tab].scene.document.get_entity(h), Some(EntityType::MText(_))
+        )) {
+            state.hidden_source_tab = Some(self.tabs[self.active_tab].id);
+            self.tabs[self.active_tab].scene.set_mtext_editor_hidden(Some(h));
         }
         self.mtext_editor = Some(state);
         // Open centred at the editor's natural size: it renders through the
@@ -892,17 +1000,18 @@ impl super::OpenCADStudio {
     }
 
     pub(super) fn mtext_apply_span_number(&mut self, field: &'static str, value: String) {
-        let number = value
-            .trim()
-            .replace(',', ".")
-            .parse::<f64>()
-            .ok()
-            .filter(|&number| match field {
-                "height" | "width" => number > 0.0,
-                "oblique" => (-85.0..=85.0).contains(&number),
-                "tracking" => number.is_finite(),
-                _ => false,
-            });
+        let number =
+            value
+                .trim()
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|&number| match field {
+                    "height" | "width" => number > 0.0,
+                    "oblique" => (-85.0..=85.0).contains(&number),
+                    "tracking" => number.is_finite(),
+                    _ => false,
+                });
         let has_selection = self
             .mtext_editor
             .as_ref()
@@ -1062,9 +1171,7 @@ impl super::OpenCADStudio {
                     ed.font.clone()
                 } else {
                     // The family, not the style's bold / italic face of it.
-                    let font =
-                        crate::entities::text_support::resolve_text_style(&ed.style, doc).font_name;
-                    crate::scene::text::sysfont::split_style(&font).0.to_string()
+                    style_font_family(&ed.style, doc)
                 }
             })
             .unwrap_or_default()
@@ -1080,11 +1187,33 @@ impl super::OpenCADStudio {
     /// Insert text (or replace the current selection) at the preview caret,
     /// patching the raw source in place (a line break goes in as `\P`).
     pub(super) fn mtext_type(&mut self, s: &str) {
+        if let Some(ed) = self.mtext_editor.as_mut() {
+            // A list tag stays while its item is typed on (measured); a
+            // paragraph break or a stack's next character takes a tag away.
+            if s == "\n" || !matches!(ed.smart_tag, Some(context_menu::SmartTag::List(_))) {
+                ed.smart_tag = None;
+            }
+            ed.smart_tag_open = false;
+            ed.list_tag_removed = false;
+        }
         // Enter in a list item continues the list or leaves it.
         if s == "\n" && self.mtext_list_enter() {
             return;
         }
-        self.raw_type(s, true);
+        // A tab after a marker that opens a paragraph makes a list item.
+        if s == "\t" && self.mtext_list_auto() {
+            return;
+        }
+        // All CAPS: letters typed come in upper case.
+        if self.mtext_editor.as_ref().is_some_and(|ed| ed.auto_caps) {
+            self.raw_type(&s.to_uppercase(), true);
+        } else {
+            self.raw_type(s, true);
+        }
+        // AutoStack: a space after `1/2` stacks it.
+        if s == " " {
+            self.mtext_autostack();
+        }
     }
 
     /// Delete the selection, or the visible character before the caret.
@@ -1140,6 +1269,46 @@ impl super::OpenCADStudio {
         }
     }
 
+    /// Home / End / Page Up / Page Down in the editor: the start or end of
+    /// the caret's line, or with Ctrl (and the page keys) of the whole text.
+    /// Shift extends the selection. `false` when the editor is closed or the
+    /// key is another one.
+    pub(in crate::app) fn mtext_navigation_key(&mut self, key: &str) -> bool {
+        let Some(ed) = self.mtext_editor.as_mut().filter(|ed| ed.show_preview) else {
+            return false;
+        };
+        let mut parts: Vec<&str> = key.split('+').collect();
+        let Some(name) = parts.pop() else {
+            return false;
+        };
+        if parts.iter().any(|part| !matches!(*part, "SHIFT" | "CTRL")) {
+            return false;
+        }
+        let extend_selection = parts.contains(&"SHIFT");
+        let whole = parts.contains(&"CTRL");
+        let visible_count = doc_to_cells(&ed.doc).len();
+        let caret = match name {
+            "PAGEUP" => 0,
+            "PAGEDOWN" => visible_count,
+            "HOME" if whole => 0,
+            "END" if whole => visible_count,
+            "HOME" | "END" => {
+                line_edge_caret(&ed.glyph_boxes, ed.caret, visible_count, name == "END")
+            }
+            _ => return false,
+        };
+        ed.typing_format = Default::default();
+        ed.caret = caret;
+        if extend_selection {
+            ed.sel = Some((ed.sel_anchor.min(caret), ed.sel_anchor.max(caret)));
+        } else {
+            ed.sel = Some((caret, caret));
+            ed.sel_anchor = caret;
+        }
+        ed.caret_blink_on = true;
+        true
+    }
+
     /// Visible-character count of the current text.
     pub(super) fn mtext_vis_count(&self) -> usize {
         self.mtext_editor
@@ -1172,10 +1341,7 @@ impl super::OpenCADStudio {
             self.mtext_editor
                 .as_ref()
                 .map(|ed| {
-                    let font =
-                        crate::entities::text_support::resolve_text_style(&ed.style, doc)
-                            .font_name;
-                    crate::scene::text::sysfont::split_style(&font).0.to_string()
+                    style_font_family(&ed.style, doc)
                 })
                 .unwrap_or_default()
         } else {
@@ -1196,8 +1362,8 @@ impl super::OpenCADStudio {
     /// Apply a colour from the shared Properties-style picker: to the selection
     /// (per-run) when there is one, else the whole text via the global colour.
     /// Closes the picker popup.
-    pub(super) fn mtext_apply_color(&mut self, color: codec::types::Color) {
-        use codec::types::Color as C;
+    pub(super) fn mtext_apply_color(&mut self, color: document::types::Color) {
+        use document::types::Color as C;
         let has_sel = self
             .mtext_editor
             .as_ref()
@@ -1227,8 +1393,12 @@ impl super::OpenCADStudio {
         self.rebuild_mtext_preview();
     }
 
-    /// Select the word at visible offset `off` (double-click).
+    /// Select the word at visible offset `off` (double-click); on a field,
+    /// open the Field dialog on it.
     pub(super) fn mtext_select_word(&mut self, off: usize) {
+        if self.mtext_edit_field_at(off) {
+            return;
+        }
         if let Some(ed) = self.mtext_editor.as_mut() {
             ed.typing_format = Default::default();
             let cells = doc_to_cells(&ed.doc);
@@ -1266,9 +1436,24 @@ impl super::OpenCADStudio {
         self.commit_mtext_draft(true);
     }
 
+    /// Restore only the source hidden by this editor, even after a tab change.
+    pub(super) fn restore_mtext_editor_source(&mut self) {
+        let tab_id = self.mtext_editor.as_mut().and_then(|ed| ed.hidden_source_tab.take());
+        if let Some(tab) = tab_id.and_then(|id| self.tabs.iter_mut().find(|tab| tab.id == id)) {
+            tab.scene.set_mtext_editor_hidden(None);
+        }
+    }
+
+    /// Drop the draft only after restoring the source in its owning tab.
+    pub(in crate::app) fn close_mtext_editor(&mut self) {
+        self.restore_mtext_editor_source();
+        self.mtext_editor = None;
+    }
+
     /// Discard the editor without changing the drawing.
     pub(super) fn mtext_cancel(&mut self) {
-        self.mtext_editor = None;
+        self.close_table_cell_editor();
+        self.close_mtext_editor();
         self.command_mtext_input = false;
         self.pending_command_editor_text = None;
         self.reset_modal_geometry();
@@ -1291,7 +1476,7 @@ mod stack_tests;
 #[cfg(test)]
 mod cell_tests {
     use super::*;
-    use codec::entities::mtext_format::MTextParagraphAlignment;
+    use document::entities::mtext_format::MTextParagraphAlignment;
 
     fn rt(s: &str) -> String {
         let doc = parse_mtext(s, true);
@@ -1395,7 +1580,7 @@ mod cell_tests {
     // round-trip so the renderer actually sees them.
     #[test]
     fn per_run_color_and_font_persist() {
-        use codec::entities::mtext_format::{MTextColor, MTextFont};
+        use document::entities::mtext_format::{MTextColor, MTextFont};
         let mut p = SpanProperties::default();
         p.color = Some(MTextColor::Index(1)); // red
         p.font = Some(MTextFont::with_flags("Arial".to_string(), true, false)); // bold Arial
@@ -1408,4 +1593,17 @@ mod cell_tests {
         assert_eq!(f.name, "Arial");
         assert!(f.bold);
     }
+}
+
+/// The font family of text style `style`, as a `\f` code names it. A
+/// resolved .shx font is a full path: only its file name goes in, since a
+/// path's separators are not allowed there.
+fn style_font_family(style: &str, doc: &document::Document) -> String {
+    let font = crate::entities::text_support::resolve_text_style(style, doc).font_name;
+    let family = crate::scene::text::sysfont::split_style(&font).0;
+    family
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(family)
+        .to_string()
 }

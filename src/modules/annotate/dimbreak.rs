@@ -1,6 +1,6 @@
 // DIMBREAK — create automatic, object-driven or manual gaps in dimensions.
 
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -39,6 +39,12 @@ pub struct DimBreakCommand {
 
 fn is_dimension(entity: &EntityType) -> bool {
     matches!(entity, EntityType::Dimension(_))
+}
+
+impl Default for DimBreakCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DimBreakCommand {

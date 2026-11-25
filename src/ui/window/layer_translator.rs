@@ -6,7 +6,7 @@
 //! which is only applied when Translate is pressed — so a mapping can be
 //! reconsidered, and a translation is one undo step rather than many.
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
+use iced::widget::{Space, button, checkbox, column, container, row, scrollable, text};
 use iced::{Background, Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -31,7 +31,7 @@ pub struct State {
 
 fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
-        color: Some(theme.palette().background.base.text.scale_alpha(0.6)),
+        color: Some(crate::ui::style::readable::muted_text(theme)),
     }
 }
 

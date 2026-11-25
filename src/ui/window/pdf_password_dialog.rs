@@ -3,7 +3,7 @@
 //! step bar, a wrong-password band inside the window and a session switch
 //! that offers the password to the other PDFs opened later.
 
-use iced::widget::{button, column, container, row, svg, text, text_input, Space};
+use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -19,6 +19,14 @@ pub enum PdfPasswordMsg {
     Remember(bool),
     Help,
     Ok,
+    /// The password checked off the UI thread: the file, the stage and the
+    /// password checked, and the answer.
+    Checked(
+        String,
+        crate::scene::model::pdf_password::Stage,
+        String,
+        crate::scene::model::pdf_password::Check,
+    ),
 }
 
 fn msg(m: PdfPasswordMsg) -> Message {
@@ -70,17 +78,13 @@ impl PdfPasswordState {
 }
 
 fn icon<'a>(bytes: &'static [u8], size: f32, accent: bool) -> Element<'a, Message> {
-    svg(crate::ui::icons::themed_handle(bytes))
-        .width(size)
-        .height(size)
-        .style(move |theme: &Theme, _| svg::Style {
-            color: Some(if accent {
-                theme.palette().primary.base.color
-            } else {
-                theme.palette().background.base.text
-            }),
-        })
-        .into()
+    crate::ui::icons::tinted(bytes, size, move |theme: &Theme| {
+        if accent {
+            theme.palette().primary.base.color
+        } else {
+            theme.palette().background.base.text
+        }
+    })
 }
 
 /// The file the window is about: lock badge, name and the end of its path.
@@ -177,12 +181,9 @@ fn steps<'a>(stage: Stage) -> Element<'a, Message> {
 fn wrong_band<'a>() -> Element<'a, Message> {
     container(
         row![
-            svg(crate::ui::icons::themed_handle(crate::ui::icons::ALERT))
-                .width(14.0)
-                .height(14.0)
-                .style(|theme: &Theme, _| svg::Style {
-                    color: Some(theme.palette().danger.base.color),
-                }),
+            crate::ui::icons::tinted(crate::ui::icons::ALERT, 14.0, |theme: &Theme| {
+                theme.palette().danger.base.color
+            }),
             text(crate::tr!("pdf-password", "wrong")).size(11),
         ]
         .spacing(8)
@@ -241,16 +242,18 @@ pub fn view<'a>(
     .on_press(msg(PdfPasswordMsg::Show(!state.show)))
     .style(button_style(false))
     .padding([4, 6]);
-    let mut body = column![row![
-        text(crate::tr!("pdf-password", "password"))
-            .size(11)
-            .style(muted_style)
-            .width(Length::Fixed(70.0)),
-        input,
-        eye
+    let mut body = column![
+        row![
+            text(crate::tr!("pdf-password", "password"))
+                .size(11)
+                .style(muted_style)
+                .width(Length::Fixed(70.0)),
+            input,
+            eye
+        ]
+        .spacing(6)
+        .align_y(iced::Center)
     ]
-    .spacing(6)
-    .align_y(iced::Center)]
     .spacing(8);
     if state.wrong {
         body = body.push(wrong_band());

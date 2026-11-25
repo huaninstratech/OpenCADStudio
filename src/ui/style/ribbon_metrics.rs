@@ -43,7 +43,7 @@ pub const QAT_ROW_PAD: f32 = 6.0;
 /// The customize button at the end of the Quick Access Toolbar.
 pub const QAT_CUSTOMIZE_W: f32 = 20.0;
 /// The title of a Quick Access menu.
-pub const QAT_MENU_TITLE_SIZE: f32 = 11.5;
+pub const QAT_MENU_TITLE_SIZE: f32 = super::text::UI;
 /// The Quick Access menus: the title's room, a separator's room, the
 /// size of a check mark, the size of plain menu text (and of a command
 /// shown by its name), and the gap between an icon and its ▾.
@@ -63,9 +63,11 @@ pub const QAT_PICKER_ROW_PAD: [f32; 2] = [3.0, 10.0];
 pub const QAT_PICKER_ICON_GAP: f32 = 8.0;
 pub const QAT_PICKER_LABEL_SIZE: f32 = 12.0;
 pub const QAT_PICKER_PATH_SIZE: f32 = 10.0;
-pub const QAT_PICKER_INPUT_SIZE: f32 = 11.5;
+pub const QAT_PICKER_INPUT_SIZE: f32 = super::text::UI;
 pub const QAT_PICKER_INPUT_PAD: [f32; 2] = [4.0, 6.0];
 pub const QAT_PICKER_EMPTY_PAD: [f32; 2] = [6.0, 10.0];
+/// Gap between a ribbon control and its tooltip.
+pub const TIP_GAP: f32 = 6.0;
 /// Gap between two tabs: none, so a hovered tab meets the active one.
 pub const TAB_GAP: f32 = 0.0;
 /// The minimize split button after the last tab: this far from the tab,
@@ -116,7 +118,7 @@ pub const FLOAT_MOVE_THRESHOLD: f32 = 3.0;
 /// has been drawn.
 pub const FLOAT_EXTRAS_MIN_W: f32 = 120.0;
 /// Size of a floating panel's title in its footer and side strip.
-pub const FLOAT_TITLE_SIZE: f32 = 11.5;
+pub const FLOAT_TITLE_SIZE: f32 = super::text::UI;
 /// A floating panel's band of extra tools, to the right of a side title:
 /// its buttons, the room at its ends and above and below the lines
 /// between its groups, the gap on either side of those lines, and the
@@ -197,6 +199,9 @@ pub const MINIMIZED_BUTTON_ICON: f32 = 22.0;
 pub const SMALL_ICON: f32 = 16.0;
 /// Size large icons are drawn at.
 pub const LARGE_ICON: f32 = 32.0;
+/// From this logical size up an icon is drawn from its 32 px artwork
+/// (`assets/icons/32/`) instead of its 16 px artwork.
+pub const LARGE_ART_MIN: f32 = 24.0;
 /// Size of the icons of tiny strip buttons, such as the search box's
 /// collapse button.
 pub const STRIP_ICON: f32 = 14.0;

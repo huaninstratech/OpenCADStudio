@@ -1,7 +1,7 @@
 //! Import named text and dimension styles into the open style manager.
 
 use crate::app::{Message, ModalKind, OpenCADStudio, StyleKind};
-use codec::{Document, Handle};
+use document::{Document, Handle};
 use iced::Task;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -156,7 +156,9 @@ fn import_one(
             match doc
                 .text_styles
                 .iter()
-                .find(|text| !style.dimtxsty_handle.is_null() && text.handle == style.dimtxsty_handle)
+                .find(|text| {
+                    !style.dimtxsty_handle.is_null() && text.handle == style.dimtxsty_handle
+                })
                 .or_else(|| doc.text_styles.get("Standard"))
             {
                 Some(text) => {
@@ -310,7 +312,7 @@ impl OpenCADStudio {
         let kind = draft.kind;
         match kind {
             StyleKind::Text => self.flush_textstyle_draft(),
-            StyleKind::Dim => self.apply_dimstyle_bufs(self.active_tab),
+            StyleKind::Dim => {}
             _ => return,
         }
         let doc = &mut self.tabs[self.active_tab].scene.document;
@@ -339,10 +341,7 @@ impl OpenCADStudio {
                     self.textstyle_selected = first.clone();
                     self.load_textstyle_draft(self.active_tab);
                 }
-                StyleKind::Dim => {
-                    self.dimstyle_selected = first.clone();
-                    self.load_dimstyle_bufs(self.active_tab);
-                }
+                StyleKind::Dim => self.dimstyle_selected = first.clone(),
                 _ => {}
             }
         }
@@ -374,7 +373,7 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::tables::{DimStyle, LineType, TextStyle};
+    use document::tables::{DimStyle, LineType, TextStyle};
 
     #[test]
     fn every_name_collision_gets_a_separate_decision() {
@@ -388,7 +387,9 @@ mod tests {
             selected: Vec::new(),
             conflict: None,
             remaining: VecDeque::from([
-                "First".to_string(), "Fresh".to_string(), "Second".to_string(),
+                "First".to_string(),
+                "Fresh".to_string(),
+                "Second".to_string(),
             ]),
             approved: Vec::new(),
         };
@@ -400,9 +401,10 @@ mod tests {
         assert_eq!(draft.conflict.take().as_deref(), Some("Second"));
         // Declining the second conflict leaves its name out of the import.
         assert!(!draft.next_conflict(&target));
-        assert_eq!(draft.approved, vec![
-            ("First".to_string(), true), ("Fresh".to_string(), false),
-        ]);
+        assert_eq!(
+            draft.approved,
+            vec![("First".to_string(), true), ("Fresh".to_string(), false),]
+        );
     }
 
     #[test]

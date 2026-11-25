@@ -3,7 +3,7 @@
 //! patch is kept only when exactly that value changed and nothing else.
 use super::raw_adapter::{EditError, SourceIndex};
 use super::raw_edit::editor_document;
-use super::raw_operations::{apply_patches, TextEdit};
+use super::raw_operations::TextEdit;
 use super::*;
 use std::ops::Range;
 
@@ -20,7 +20,7 @@ fn template(code: &str) -> SpanProperties {
 /// Put the code `code_for` gives each selected character in front of it.
 /// `copy` moves the one value the code sets from a template; each character
 /// must come out as it was with only that value changed.
-fn patch_span(
+pub(super) fn patch_span(
     raw: &str,
     range: Range<usize>,
     code_for: impl Fn(&SpanProperties) -> Result<String, EditError>,
@@ -34,8 +34,10 @@ fn patch_span(
         Ok(want)
     };
     let out = index.format(range.clone(), |n| match cells.get(n) {
-        Some(Cell::Char(_, p)) if expected(p)? == *p => Ok(String::new()),
-        Some(Cell::Char(_, p)) => code_for(p),
+        Some(Cell::Char(_, p) | Cell::Stack { props: p, .. }) if expected(p)? == *p => {
+            Ok(String::new())
+        }
+        Some(Cell::Char(_, p) | Cell::Stack { props: p, .. }) => code_for(p),
         _ => Err(EditError::ProjectionMismatch),
     })?;
     let after = doc_to_cells(&editor_document(&out));
@@ -45,6 +47,18 @@ fn patch_span(
             (Cell::Char(a, p), Cell::Char(b, q)) if range.contains(&n) => {
                 a == b && expected(p)? == *q
             }
+            (
+                Cell::Stack {
+                    data: a,
+                    props: p,
+                    head: h,
+                },
+                Cell::Stack {
+                    data: b,
+                    props: q,
+                    head: k,
+                },
+            ) if range.contains(&n) => a == b && h == k && expected(p)? == *q,
             (old, new) => old == new,
         };
     }
@@ -76,69 +90,29 @@ fn touched_paragraphs(index: &SourceIndex, range: &Range<usize>) -> Range<usize>
     paragraph_at(range.start)..paragraph_at(last) + 1
 }
 
-/// Add the paragraph setting `code` at the end of every paragraph `range`
-/// touches. `copy` moves the one value it sets; each touched paragraph must
-/// come out with only that value changed, the others and the text as they
+/// Set the values of the paragraph code `code` in every paragraph `range`
+/// touches; the paragraphs after them keep the values they had. All the
+/// paragraph settings are then written as the format writes them (see
+/// `raw_paragraph_codes`); the text and every other value come out as they
 /// were.
-fn patch_paragraphs(
-    raw: &str,
-    range: Range<usize>,
-    code: &str,
-    copy: fn(&mut ParagraphProperties, &ParagraphProperties),
-) -> Result<String, EditError> {
+fn patch_paragraphs(raw: &str, range: Range<usize>, code: &str) -> Result<String, EditError> {
     let index = SourceIndex::new(raw);
-    let count = index.validate(false)?;
+    index.validate(false)?;
     index.validate_range(&range)?;
     let touched = touched_paragraphs(&index, &range);
-    let mut ends: Vec<usize> = index
-        .tokens
-        .iter()
-        .filter(|t| {
-            matches!(
-                t.kind,
-                super::raw_adapter::Kind::Break | super::raw_adapter::Kind::Column
-            )
-        })
-        .map(|t| t.raw.start)
-        .collect();
-    ends.push(index.tail_boundary());
-    let patches = ends
-        .into_iter()
-        .enumerate()
-        .filter(|(n, _)| touched.contains(n))
-        .map(|(_, end)| (end..end, code.to_string()))
-        .collect();
-    let out = apply_patches(raw, patches)?;
-    index.certify(&out, count)?;
-    let setting = parse_mtext(&format!("{code}x"), true)
-        .paragraphs
-        .first()
-        .map(|p| p.properties.clone())
-        .unwrap_or_default();
-    let before = editor_document(raw).paragraphs;
-    let after = editor_document(&out).paragraphs;
-    let certified = before.len() == after.len()
-        && before
-            .iter()
-            .zip(&after)
-            .enumerate()
-            .all(|(n, (old, new))| {
-                let mut want = old.properties.clone();
-                if touched.contains(&n) {
-                    copy(&mut want, &setting);
-                }
-                old.spans == new.spans && want == new.properties
-            });
-    if !certified {
-        return Err(EditError::ParagraphBoundary);
-    }
-    Ok(out)
+    let setting = super::raw_paragraph_codes::code_setting(code);
+    super::raw_paragraph_codes::rewrite(raw, |n, state| {
+        if touched.contains(&n) {
+            *state = state.after(&setting);
+        }
+    })
 }
 
 /// A number as a code writes it.
 pub(super) fn number(value: f64) -> String {
     let text = format!("{value:.6}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    crate::entities::common::without_negative_zero(text.to_string())
 }
 
 impl crate::app::OpenCADStudio {
@@ -156,7 +130,7 @@ impl crate::app::OpenCADStudio {
             _ => return,
         };
         let copy: fn(&mut SpanProperties, &SpanProperties) = match field {
-            "height" => |p, t| p.height = t.height.clone(),
+            "height" => |p, t| p.height = t.height,
             "oblique" => |p, t| p.oblique_angle = t.oblique_angle,
             "width" => |p, t| p.width_factor = t.width_factor,
             _ => |p, t| p.tracking = t.tracking,
@@ -188,8 +162,8 @@ impl crate::app::OpenCADStudio {
 
     /// The colour of the selection: an index, a true colour, ByLayer or
     /// ByBlock, as the MTEXT colour codes store them.
-    pub(in crate::app) fn raw_selection_color(&mut self, color: codec::types::Color) {
-        use codec::types::Color as C;
+    pub(in crate::app) fn raw_selection_color(&mut self, color: document::types::Color) {
+        use document::types::Color as C;
         let code = match color {
             C::Index(i) => format!("\\C{i};"),
             C::Rgb { r, g, b } => format!(
@@ -209,7 +183,7 @@ impl crate::app::OpenCADStudio {
                 range,
                 |_| Ok(code.clone()),
                 |p, t| {
-                    p.color = t.color.clone();
+                    p.color = t.color;
                     p.color_rgb = t.color_rgb;
                 },
             )
@@ -219,37 +193,94 @@ impl crate::app::OpenCADStudio {
     /// Alignment of every paragraph the selection (or caret) touches.
     pub(in crate::app) fn raw_align(&mut self, align: ParaAlign) {
         let code = match align {
+            ParaAlign::Default => "\\pq*;",
             ParaAlign::Left => "\\pql;",
             ParaAlign::Center => "\\pqc;",
             ParaAlign::Right => "\\pqr;",
             ParaAlign::Justify => "\\pqj;",
+            ParaAlign::Distribute => "\\pqd;",
         };
-        self.raw_paragraph(code, |p, s| p.alignment = s.alignment);
+        self.raw_paragraph(code);
     }
 
     /// An indent or paragraph spacing of every paragraph the selection (or
     /// caret) touches.
     pub(in crate::app) fn raw_paragraph_number(&mut self, field: ParaNumber, value: f64) {
-        let (key, copy): (char, fn(&mut ParagraphProperties, &ParagraphProperties)) = match field {
-            ParaNumber::FirstIndent => ('i', |p, s| p.first_line_indent = s.first_line_indent),
-            ParaNumber::LeftIndent => ('l', |p, s| p.left_margin = s.left_margin),
-            ParaNumber::RightIndent => ('r', |p, s| p.right_margin = s.right_margin),
-            ParaNumber::SpaceBefore => ('b', |p, s| p.spacing_before = s.spacing_before),
-            ParaNumber::SpaceAfter => ('a', |p, s| p.spacing_after = s.spacing_after),
+        let key = match field {
+            ParaNumber::FirstIndent => 'i',
+            ParaNumber::LeftIndent => 'l',
+            ParaNumber::RightIndent => 'r',
+            ParaNumber::SpaceBefore => 'b',
+            ParaNumber::SpaceAfter => 'a',
         };
-        self.raw_paragraph(&format!("\\px{key}{};", number(value)), copy);
+        self.raw_paragraph(&format!("\\px{key}{};", number(value)));
     }
 
-    fn raw_paragraph(
+    /// The line spacing of every paragraph the selection (or caret) touches:
+    /// `se<n>` (exactly), `sa<n>` (at least), `sm<n>` (a multiple) or `s*`
+    /// (the text's own).
+    pub(in crate::app) fn raw_paragraph_line_spacing(
         &mut self,
-        code: &str,
-        copy: fn(&mut ParagraphProperties, &ParagraphProperties),
+        spacing: document::entities::mtext_format::MTextLineSpacing,
     ) {
+        use document::entities::mtext_format::MTextLineSpacing as L;
+        let code = match spacing {
+            L::Exact(v) => format!("\\pxse{};", number(v)),
+            L::AtLeast(v) => format!("\\pxsa{};", number(v)),
+            L::Multiple(v) => format!("\\pxsm{};", number(v)),
+            L::Default => "\\pxs*;".to_string(),
+        };
+        self.raw_paragraph(&code);
+    }
+
+    /// The tab stops of every paragraph the selection (or caret) touches:
+    /// `\pxt<n>,c<n>,r<n>,D<n>;`, or none (`tz`).
+    pub(in crate::app) fn raw_paragraph_tabs(
+        &mut self,
+        tabs: &[document::entities::mtext_format::TabStop],
+    ) {
+        let list: Vec<String> = tabs.iter().map(|tab| tab.to_string()).collect();
+        let code = if list.is_empty() {
+            "\\pxtz;".to_string()
+        } else {
+            format!("\\pxt{};", list.join(","))
+        };
+        self.raw_paragraph(&code);
+    }
+
+    /// Replace each of `ranges` (visible-character offsets, left to right)
+    /// with `replacement`, as one undo step.
+    pub(in crate::app) fn raw_replace_ranges(&mut self, ranges: &[(usize, usize)], replacement: &str) {
+        if ranges.is_empty() {
+            return;
+        }
+        let ranges = ranges.to_vec();
+        let replacement = replacement.to_string();
+        self.edit_raw(|_, index| {
+            let mut raw = index.raw.to_string();
+            let mut caret = 0;
+            for (n, (start, end)) in ranges.iter().rev().enumerate() {
+                let edit = SourceIndex::new(&raw).replace(*start..*end, &replacement)?;
+                if n == 0 {
+                    caret = edit.caret;
+                }
+                raw = edit.raw;
+            }
+            let removed: usize = ranges[..ranges.len() - 1].iter().map(|(s, e)| e - s).sum();
+            let added = (ranges.len() - 1) * replacement.chars().count();
+            Ok(TextEdit {
+                raw,
+                caret: caret + added - removed.min(caret + added),
+            })
+        });
+    }
+
+    fn raw_paragraph(&mut self, code: &str) {
         let range = match self.mtext_editor.as_ref() {
             Some(ed) => ed.selected_range(),
             None => return,
         };
-        self.raw_selection_patch(range, |raw, range| patch_paragraphs(raw, range, code, copy));
+        self.raw_selection_patch(range, |raw, range| patch_paragraphs(raw, range, code));
     }
 
     /// Replace every occurrence of the find text, as one undo step. Each
@@ -303,7 +334,7 @@ impl crate::app::OpenCADStudio {
     }
 
     /// One selection patch as one undo step; the selection stays.
-    fn raw_selection_patch(
+    pub(super) fn raw_selection_patch(
         &mut self,
         range: Range<usize>,
         patch: impl FnOnce(&str, Range<usize>) -> Result<String, EditError>,
@@ -322,13 +353,13 @@ impl crate::app::OpenCADStudio {
 mod tests {
     use crate::app::mtext_editor::{Cell, ParaAlign, ParaNumber};
     use crate::app::OpenCADStudio;
-    use codec::entities::mtext_format::{MTextColor, MTextParagraphAlignment, SpanProperties};
+    use document::entities::mtext_format::{MTextColor, MTextParagraphAlignment, SpanProperties};
     use glam::DVec3;
 
     fn app(raw: &str) -> OpenCADStudio {
         let mut app = OpenCADStudio::new_for_test();
         app.tabs
-            .push(crate::app::document::DocumentTab::new_drawing(1));
+            .push(crate::app::tab_document::DocumentTab::new_drawing(1));
         app.active_tab = 1;
         app.open_mtext_editor(DVec3::ZERO, None, raw, 2.5, None);
         app
@@ -388,9 +419,9 @@ mod tests {
     fn a_selection_colour_is_an_index_a_true_colour_or_by_layer() {
         let mut app = app("abc");
         select(&mut app, 0, 1);
-        app.mtext_apply_color(codec::types::Color::Index(3));
+        app.mtext_apply_color(document::types::Color::Index(3));
         select(&mut app, 1, 2);
-        app.mtext_apply_color(codec::types::Color::Rgb {
+        app.mtext_apply_color(document::types::Color::Rgb {
             r: 10,
             g: 20,
             b: 30,
@@ -398,7 +429,7 @@ mod tests {
         assert_eq!(props(&app, 0).color, Some(MTextColor::Index(3)));
         assert_eq!(props(&app, 1).color_rgb, Some((10, 20, 30)));
         select(&mut app, 0, 1);
-        app.mtext_apply_color(codec::types::Color::ByLayer);
+        app.mtext_apply_color(document::types::Color::ByLayer);
         assert_eq!(props(&app, 0).color, Some(MTextColor::ByLayer));
         // The object colour was not touched by any of them.
         assert_eq!(app.mtext_editor.as_ref().unwrap().object_color, None);
@@ -415,9 +446,25 @@ mod tests {
         assert_eq!(props[1].alignment, Some(MTextParagraphAlignment::Center));
         assert_eq!(props[1].first_line_indent, Some(2.0));
         assert_eq!(props[0].alignment, None);
-        assert_eq!(props[2].first_line_indent, None);
+        // The paragraph after keeps its values: they are written back.
+        assert_eq!(props[2].first_line_indent, Some(0.0));
+        assert_eq!(props[2].alignment, Some(MTextParagraphAlignment::Default));
         assert_eq!(doc.to_plain_text(), "ab\ncd\nef");
-        assert!(raw(&app).starts_with(r"\pxt4;ab\P"));
+        assert_eq!(raw(&app), r"\pxt4;ab\P\pi2,qc;cd\P\pi0,q*;ef");
+    }
+
+    #[test]
+    fn removing_the_last_tab_stop_writes_tz_only_after_a_paragraph_with_tabs() {
+        // The reference's Paragraph window: the second paragraph's stop
+        // removed gives `\ptz;`; every stop removed leaves no code at all.
+        let mut app = app("\\pxt10;A\tB\\PC\tD");
+        select(&mut app, 4, 4);
+        app.raw_paragraph_tabs(&[]);
+        assert_eq!(raw(&app), "\\pxt10;A\tB\\P\\ptz;C\tD");
+        let mut app = self::app("\\pxt10;A\tB\\PC\tD");
+        select(&mut app, 0, 7);
+        app.raw_paragraph_tabs(&[]);
+        assert_eq!(raw(&app), "A\tB\\PC\tD");
     }
 
     #[test]
@@ -438,19 +485,20 @@ mod tests {
         let mut app = app(r"ab\Zopaque");
         select(&mut app, 0, 2);
         app.mtext_apply_span_number("height", "5".into());
-        app.mtext_apply_color(codec::types::Color::Index(1));
+        app.mtext_apply_color(document::types::Color::Index(1));
         app.mtext_apply_align(ParaAlign::Right);
         assert_eq!(raw(&app), r"ab\Zopaque");
     }
 
     #[test]
-    fn alignment_appends_only_alignment_and_observes_the_selection_end() {
+    fn alignment_is_written_at_the_paragraph_start_and_observes_the_selection_end() {
         // The selection ends on the break: only the first paragraph changes,
-        // and its tab stops and the second one's alignment stay.
+        // and its tab stops and the second one's alignment stay. One code at
+        // the paragraph start, the values in the order i l r b a s q t.
         let mut app = app(r"\pxqc,i-1,l2,t4;ab\P\pqr;cd");
         select(&mut app, 0, 3);
         app.mtext_apply_align(ParaAlign::Left);
-        assert_eq!(raw(&app), r"\pxqc,i-1,l2,t4;ab\pql;\P\pqr;cd");
+        assert_eq!(raw(&app), r"\pxi-1,l2,ql,t4;ab\P\pqr;cd");
         let doc = &app.mtext_editor.as_ref().unwrap().doc;
         assert_eq!(doc.paragraphs[0].properties.tab_stops.len(), 1);
         assert_eq!(

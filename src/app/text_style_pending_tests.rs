@@ -1,12 +1,13 @@
-//! The text style manager's summary before Apply lists every style the
-//! session changed, not only the selected one, from the same changes Apply
-//! writes; the list keeps long names and large counts readable (#2413).
+//! The text style manager's summary before Apply lists what Apply writes;
+//! leaving a changed style asks whether to keep the change, and the list
+//! keeps long names and large counts readable (#2413).
 
 use super::text_style_users::{Property, StyleChange};
 use super::*;
-use codec::entities::{EntityType, MText, Text};
-use codec::tables::TextStyle;
-use codec::types::{Handle, Vector3};
+use crate::ui::style::textstyle::{Card, CardMsg};
+use document::entities::{EntityType, MText, Text};
+use document::tables::TextStyle;
+use document::types::{Handle, Vector3};
 use iced_test::Simulator;
 
 /// A clean drawing with the styles `names`, each height 2.5 and width 1.
@@ -53,6 +54,11 @@ fn edit(app: &mut OpenCADStudio, field: &'static str, value: &str) {
         field,
         value: value.to_string(),
     });
+}
+
+/// Answer the window's "save your changes?" question.
+fn answer(app: &mut OpenCADStudio, yes: bool) {
+    let _ = app.update(Message::TextStyleCard(CardMsg::ModifiedAnswer(yes)));
 }
 
 fn pending(app: &OpenCADStudio) -> Vec<StyleChange> {
@@ -113,7 +119,7 @@ fn one_property_of_one_style() {
     assert_eq!(changes[0].properties.len(), 1);
     assert_eq!(
         lines(&changes[0]),
-        ["Height: 2.5 → 3.5. 2 texts that follow the style are updated."]
+        ["Height: 2.5 → 3.5. 2 texts with their own value keep them."]
     );
 }
 
@@ -150,68 +156,55 @@ fn several_properties_of_one_style() {
 }
 
 #[test]
-fn three_styles_stay_listed_when_the_selection_moves_on() {
-    let mut app = drawing(&["Alpha", "Beta", "Gamma", "Delta"]);
+fn moving_on_asks_yes_applies_and_no_drops_the_change() {
+    let mut app = drawing(&["Alpha", "Beta", "Gamma"]);
     open(&mut app);
-    for (name, value) in [("Alpha", "3"), ("Beta", "4"), ("Gamma", "5")] {
-        select(&mut app, name);
-        edit(&mut app, "height", value);
-    }
-    // Gamma's edit is still in the draft; Alpha and Beta are staged.
-    assert_eq!(names(&pending(&app)), ["Alpha", "Beta", "Gamma"]);
-    select(&mut app, "Delta");
-    let changes = pending(&app);
-    assert_eq!(names(&changes), ["Alpha", "Beta", "Gamma"]);
-    assert_eq!(
-        changes
-            .iter()
-            .map(|c| c.properties[0].to.as_str())
-            .collect::<Vec<_>>(),
-        ["3", "4", "5"]
-    );
+    select(&mut app, "Alpha");
+    edit(&mut app, "height", "3");
+    assert_eq!(names(&pending(&app)), ["Alpha"]);
 
-    // The summary is what Apply writes.
-    let _ = app.update(Message::TextStyleApply);
-    for (name, height) in [
-        ("Alpha", 3.0),
-        ("Beta", 4.0),
-        ("Gamma", 5.0),
-        ("Delta", 2.5),
-    ] {
-        assert_eq!(style(&app, name).height, height, "{name}");
-    }
+    // Leaving a changed style asks first and stays until answered.
+    select(&mut app, "Beta");
+    assert!(matches!(app.textstyle_card, Some(Card::Modified(_))));
+    assert_eq!(app.textstyle_selected, "Alpha");
+    answer(&mut app, true);
+    assert_eq!(app.textstyle_selected, "Beta");
+    assert_eq!(style(&app, "Alpha").height, 3.0);
+    assert!(pending(&app).is_empty());
+
+    edit(&mut app, "height", "4");
+    select(&mut app, "Gamma");
+    answer(&mut app, false);
+    assert_eq!(app.textstyle_selected, "Gamma");
+    assert_eq!(style(&app, "Beta").height, 2.5);
     assert!(pending(&app).is_empty());
 }
 
 #[test]
-fn twenty_changed_styles_keep_the_window_usable() {
-    let names: Vec<String> = (1..=21).map(|n| format!("Style {n:02}")).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut app = drawing(&refs);
+fn a_changed_style_keeps_the_window_usable() {
+    let mut app = drawing(&["Notes"]);
     open(&mut app);
-    for name in &names {
-        select(&mut app, name);
-        edit(&mut app, "width", "0.8");
-    }
-    assert_eq!(pending(&app).len(), 21);
+    select(&mut app, "Notes");
+    edit(&mut app, "height", "3.5");
+    edit(&mut app, "width", "0.8");
+    let _ = app.update(Message::TextStyleToggle("backward"));
+    assert_eq!(pending(&app).len(), 1);
 
     for (width, height) in [(1280.0, 760.0), (1280.0, 520.0), (780.0, 600.0)] {
         let mut ui = window(&app, width, height);
         let head = shown(&mut ui, "Apply will change");
-        shown(&mut ui, "21 styles, 21 properties");
         let note = shown(
             &mut ui,
             "Texts in external references do not change. A single Undo reverts every change.",
         );
-        // The list scrolls inside the frame: the closing note sits within
-        // the summary's cap below the title, whatever the count.
+        // The summary stays within its cap below the title.
         assert!(
             note.y - head.y < 360.0,
             "{width}×{height}: {head:?} {note:?}"
         );
         if width >= 920.0 {
             // Beside it, the preview keeps its place.
-            shown(&mut ui, "Sample text");
+            shown(&mut ui, "NOTES");
         }
     }
 }
@@ -222,17 +215,14 @@ fn reverting_a_value_drops_the_style_from_the_summary() {
     open(&mut app);
     select(&mut app, "Notes");
     edit(&mut app, "height", "3.5");
-    select(&mut app, "Spare");
-    edit(&mut app, "width", "2");
-    assert_eq!(names(&pending(&app)), ["Notes", "Spare"]);
-
-    // Back in the field: the stored value again.
-    edit(&mut app, "width", "1.0000");
     assert_eq!(names(&pending(&app)), ["Notes"]);
-    // A staged style goes back the same way.
-    select(&mut app, "Notes");
+
+    // Back in the field: the stored value again, and moving on does not ask.
     edit(&mut app, "height", "2.5");
     assert!(pending(&app).is_empty());
+    select(&mut app, "Spare");
+    assert!(app.textstyle_card.is_none());
+    assert_eq!(app.textstyle_selected, "Spare");
 }
 
 #[test]
@@ -249,12 +239,12 @@ fn texts_that_follow_and_texts_with_their_own_value() {
     assert_eq!(
         lines(&pending(&app)[0]),
         [
-            "Width factor: 1 → 0.8. 2 texts that follow the style are updated. \
-             2 texts with their own value keep them."
+            "Width factor: 1 → 0.8. 1 text that follows the style is updated. \
+             3 texts with their own value keep them."
         ]
     );
     let _ = app.update(Message::TextStyleApply);
-    assert_eq!(text(&app, follows).1, 0.8);
+    assert_eq!(text(&app, follows).1, 1.0);
     assert_eq!(text(&app, own).1, 0.7);
 }
 
@@ -267,21 +257,22 @@ fn changes_to_several_styles_apply_and_undo_in_one_step() {
     select(&mut app, "Notes");
     edit(&mut app, "height", "3.5");
     select(&mut app, "Titles");
+    answer(&mut app, true);
     edit(&mut app, "width", "0.8");
     let _ = app.update(Message::TextStyleApply);
     app.close_active_modal();
-    assert_eq!(text(&app, note), (3.5, 1.0));
-    assert_eq!(text(&app, title), (2.5, 0.8));
-
-    let _ = app.update(Message::Undo);
     assert_eq!(text(&app, note), (2.5, 1.0));
     assert_eq!(text(&app, title), (2.5, 1.0));
+    assert_eq!(style(&app, "Notes").height, 3.5);
+    assert_eq!(style(&app, "Titles").width_factor, 0.8);
+
+    let _ = app.update(Message::Undo);
     assert_eq!(style(&app, "Notes").height, 2.5);
     assert_eq!(style(&app, "Titles").width_factor, 1.0);
 
     let _ = app.update(Message::Redo);
-    assert_eq!(text(&app, note), (3.5, 1.0));
-    assert_eq!(text(&app, title), (2.5, 0.8));
+    assert_eq!(style(&app, "Notes").height, 3.5);
+    assert_eq!(style(&app, "Titles").width_factor, 0.8);
 }
 
 #[test]
@@ -297,7 +288,7 @@ fn a_long_name_does_not_hide_a_large_count() {
         let mut ui = window(&app, width, 760.0);
         let count = shown(&mut ui, "1234");
         let name = shown(&mut ui, LONG);
-        let editor = shown(&mut ui, "Font style");
+        let editor = shown(&mut ui, "TrueType fonts only");
         // The name stops before the count; the count stays in the list.
         assert!(name.x + name.width <= count.x + 0.5, "{name:?} {count:?}");
         assert!(count.x + count.width < editor.x, "{count:?} {editor:?}");

@@ -27,6 +27,7 @@ without it keeps working, and the default `HostApi` methods refuse.
 | Solids | `solid_operation` | Kernel-backed create, transform, booleans, extrude, region and surface from a profile, picture embedding. Every result is verified to lift back from its ACIS payload without loss; a refusal leaves the operands untouched. |
 | Tables | `table_operation` | Layers, text and dimension styles, blocks and their contents, linetypes, layouts (see below). |
 | Objects | `create_xrecord`, `read_xrecord`, `update_xrecord`, `delete_xrecord`, `list_xrecords` | Name-addressed XRecords under the drawing's named-object dictionary (API v8, see below): a non-graphical record carrier with strict create-vs-update semantics and one undo step per change. |
+| Geographic location | `set_geo_location`, `remove_geo_location` | Write or remove the drawing's model-space GEODATA object (API v22): CRS (`EPSG:<code>`, WKT or MapGuide XML), design point, reference point and north, with its `ACAD_GEOGRAPHICDATA` entry, as one undo step; GEOGRAPHICLOCATION's storage, so other CAD programs open the drawing georeferenced. |
 | Commands | `run_command` | Drives the real OCS command one step at a time (see below). |
 | Settings | `system_variable`, `set_system_variable` | `CLAYER`, `SNAPANG`, and a read-only `CTAB` (the current layout). |
 
@@ -80,8 +81,13 @@ recorded, so a failure changes nothing and leaves the history alone.
 - **Linetypes:** simple dash, gap and dot patterns; rename follows layers and
   entities; delete is refused while anything uses it.
 - **Layouts:** create with the default page setup and sheet viewport, rename, delete,
-  switch (through OCS's own layout switch), and page setup (paper size, rotation,
-  custom scale). `Model` is protected.
+  switch (through OCS's own layout switch), page setup (paper size, rotation,
+  custom scale) and the order of the layout tabs (API v23, one undo step).
+  `Model` is protected.
+- **Custom properties:** set the drawing's custom properties (the Custom tab of
+  `DWGPROPS`, API v26): a listed name replaces the value of the property with the
+  same name or is appended, the rest are kept; one undo step, and fields showing a
+  custom property update.
 
 Style and layout operations act on the active document, because they use the
 application's shared style and view machinery.

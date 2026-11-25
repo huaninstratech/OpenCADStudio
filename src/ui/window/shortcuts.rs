@@ -3,8 +3,8 @@
 use crate::app::Message;
 use crate::t;
 use crate::ui::style::common::muted_style;
-use crate::ui::style::editor_table::{danger_input_style, danger_text_style, EDITOR_TABLE_GUTTER};
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use crate::ui::style::editor_table::{EDITOR_TABLE_GUTTER, danger_input_style, danger_text_style};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Background, Element, Length, Theme};
 
 #[derive(Clone, Copy, Debug)]
@@ -13,9 +13,56 @@ pub enum ShortcutField {
     Command,
 }
 
+/// Narrowest suggestion list; a longer command name widens it.
+const SUGGESTION_LIST_MIN_WIDTH: f32 = 220.0;
+
+/// Widget id of row `idx`'s Command box, so picking a suggestion can put the
+/// caret after the picked name instead of where the typed prefix ended.
+pub fn command_input_id(idx: usize) -> iced::widget::Id {
+    iced::widget::Id::from(format!("shortcut-command-{idx}"))
+}
+
+/// Commands to offer for the text typed in a Command box: the command
+/// line's own autocomplete list (names that start with the text first, then
+/// names that contain it; an alias offers the command it stands for). Empty
+/// when the text already is the only command it could become.
+pub fn suggestions(
+    typed: &str,
+    dynamic: &[String],
+    aliases: &rustc_hash::FxHashMap<String, String>,
+) -> Vec<String> {
+    let found = crate::ui::command_line::ranked_matches(typed, dynamic, aliases);
+    match found.as_slice() {
+        [only] if only.eq_ignore_ascii_case(typed.trim()) => Vec::new(),
+        _ => found,
+    }
+}
+
+/// Indices of the rows a search query keeps visible. The match is a
+/// case-insensitive substring of the key or the command; an empty query keeps
+/// every row. The unfinished draft row (index 0 while `pending_add`) is always
+/// kept so adding stays possible while a filter is typed. Only the display is
+/// filtered: the rows themselves, and so what Apply saves, are untouched.
+pub fn visible_rows(rows: &[(String, String)], query: &str, pending_add: bool) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter(|(idx, (key, command))| {
+            q.is_empty()
+                || (pending_add && *idx == 0)
+                || key.to_lowercase().contains(&q)
+                || command.to_lowercase().contains(&q)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 pub fn view_window<'a>(
     rows: &'a [(String, String)],
+    filter: &str,
     capture_row: Option<usize>,
+    suggest_row: Option<usize>,
+    suggestions: &[String],
     pending_add: bool,
     reset_confirm: bool,
     duplicate_keys: &rustc_hash::FxHashSet<String>,
@@ -48,7 +95,8 @@ pub fn view_window<'a>(
     .padding(gutter);
 
     let mut list = column![].spacing(3);
-    for (idx, (key, command)) in rows.iter().enumerate() {
+    for idx in visible_rows(rows, filter, pending_add) {
+        let (key, command) = &rows[idx];
         // Key cell: click to arm capture, then press the combination. The
         // armed cell shows what is expected and highlights until a key
         // arrives; clicking it again cancels. A key that already exists in
@@ -85,6 +133,7 @@ pub fn view_window<'a>(
         };
         let unknown_command = !command.is_empty() && unknown_commands.contains(command.trim());
         let command_box = text_input(t!("command").as_ref(), command)
+            .id(command_input_id(idx))
             .on_input(move |value| Message::ShortcutEditorInput {
                 idx,
                 field: ShortcutField::Command,
@@ -100,6 +149,44 @@ pub fn view_window<'a>(
         } else {
             command_box
         };
+        // The suggestion list floats under the box, so it moves no row and
+        // needs no room in the window. Every row carries the (closed) list:
+        // the box keeps its place in the widget tree, and with it its focus
+        // and caret, when its list opens.
+        let offered: &[String] = if suggest_row == Some(idx) {
+            suggestions
+        } else {
+            &[]
+        };
+        let options = offered
+            .iter()
+            .map(|name| {
+                crate::ui::kit::dropdown_option(
+                    name.clone(),
+                    name.clone(),
+                    Message::ShortcutEditorSuggestionPick {
+                        idx,
+                        command: name.clone(),
+                    },
+                    false,
+                )
+            })
+            .collect();
+        let command_box = crate::ui::kit::dropdown(
+            command_box.into(),
+            crate::ui::dropdown_list::DropdownList::new(options)
+                .query(command.clone())
+                // No row is marked until an arrow key marks one: Enter alone
+                // must leave the typed text as it is.
+                .select_first_by_default(false)
+                .on_escape(Message::ShortcutEditorSuggestionDismiss),
+            crate::ui::kit::dropdown_width(
+                offered.iter().map(String::as_str),
+                SUGGESTION_LIST_MIN_WIDTH,
+            ),
+            Message::ShortcutEditorSuggestionDismiss,
+            !offered.is_empty(),
+        );
         // Draft rows get a check (finish the addition, without applying) and
         // a cancel ✕; committed rows get the trash bin.
         let remove = if pending_add && idx == 0 {
@@ -128,13 +215,15 @@ pub fn view_window<'a>(
             .spacing(4)
             .align_y(iced::Center)
         } else {
-            row![button(crate::ui::icons::themed_danger_text(
-                crate::ui::icons::TRASH,
-                12.0,
-            ))
-            .on_press(Message::ShortcutEditorRemove(idx))
-            .padding([2, 6])
-            .style(button::danger)]
+            row![
+                button(crate::ui::icons::themed_danger_text(
+                    crate::ui::icons::TRASH,
+                    12.0,
+                ))
+                .on_press(Message::ShortcutEditorRemove(idx))
+                .padding([2, 6])
+                .style(button::danger)
+            ]
             .align_y(iced::Center)
         };
         list = list.push(
@@ -202,6 +291,10 @@ pub fn view_window<'a>(
                     .on_press(Message::KeyListExport(false))
                     .padding([4, 10])
                     .style(button::secondary),
+                button(text(t!("Import...")).size(12))
+                    .on_press_maybe((!pending_add).then_some(Message::ShortcutEditorImport))
+                    .padding([4, 10])
+                    .style(button::secondary),
             ]
             .spacing(8)
             .align_y(iced::Center),
@@ -249,6 +342,11 @@ pub fn view_window<'a>(
         column![
             title,
             hint,
+            crate::ui::kit::search_field(
+                t!("Search…").as_ref(),
+                filter,
+                Message::ShortcutEditorFilter
+            ),
             Space::new().height(6),
             head,
             scrollable(container(list).padding(gutter)).height(sizing.height),
@@ -330,4 +428,48 @@ pub fn view_window<'a>(
         .align_x(iced::alignment::Horizontal::Center)
         .align_y(iced::alignment::Vertical::Center);
     iced::widget::stack![content, iced::widget::opaque(shield), centered].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_rows;
+
+    fn rows() -> Vec<(String, String)> {
+        vec![
+            ("CTRL+D".to_owned(), "DIST".to_owned()),
+            ("CTRL+SHIFT+L".to_owned(), "LAYER".to_owned()),
+            ("F3".to_owned(), "OSNAP".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn empty_query_keeps_all_rows() {
+        assert_eq!(visible_rows(&rows(), "", false), vec![0, 1, 2]);
+        assert_eq!(visible_rows(&rows(), "  ", false), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn query_matches_command_name_case_insensitive() {
+        assert_eq!(visible_rows(&rows(), "layer", false), vec![1]);
+        assert_eq!(visible_rows(&rows(), "OSN", false), vec![2]);
+    }
+
+    #[test]
+    fn query_matches_key_text() {
+        assert_eq!(visible_rows(&rows(), "ctrl", false), vec![0, 1]);
+        assert_eq!(visible_rows(&rows(), "f3", false), vec![2]);
+    }
+
+    #[test]
+    fn query_matching_nothing_shows_no_rows() {
+        assert!(visible_rows(&rows(), "zzz", false).is_empty());
+    }
+
+    #[test]
+    fn draft_row_stays_visible_and_indices_stay_original() {
+        let mut r = rows();
+        r.insert(0, (String::new(), String::new()));
+        assert_eq!(visible_rows(&r, "osnap", true), vec![0, 3]);
+        assert_eq!(visible_rows(&r, "osnap", false), vec![3]);
+    }
 }

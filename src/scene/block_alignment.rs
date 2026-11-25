@@ -3,14 +3,15 @@ use super::{
     block_actions as actions, block_grips, block_orientation_parameter as orientation,
     render_graph, Scene,
 };
-use crate::command::{EntityTransform, PointPickContext, WorkingPlane};
-use codec::{
+use crate::command::PointPickContext;
+use crate::entities::transform::{EntityTransform, WorkingPlane};
+use document::{
     entities::Insert,
     objects::{DynamicBlockData, ObjectType},
     Document, EntityType, Handle,
 };
 use glam::DVec3;
-use kernel::geom2d::{self, Curve, Extent, Line, Tolerance};
+use ocs_geom::geom2d::{self, Curve, Extent, Line, Tolerance};
 
 #[derive(Clone)]
 pub struct Alignment {
@@ -42,7 +43,7 @@ pub(crate) fn insertion_grips(doc: &Document, name: &str) -> Vec<Alignment> {
     reference_grips(
         doc,
         definition.handle,
-        &Insert::new(name, codec::types::Vector3::ZERO),
+        &Insert::new(name, document::types::Vector3::ZERO),
     )
 }
 

@@ -63,14 +63,34 @@ impl MTextEditorState {
 
 impl crate::app::OpenCADStudio {
     /// The edited MTEXT hosts native FIELDs the editor could not locate.
+    /// For a table cell only that cell counts: a field in another cell of
+    /// the table leaves this one editable.
     pub(super) fn unlocated_field_host(&self) -> bool {
         let doc = &self.tabs[self.active_tab].scene.document;
         self.mtext_editor.as_ref().is_some_and(|ed| {
             ed.field_host.is_none()
-                && ed
-                    .editing
-                    .and_then(|h| doc.get_entity(h))
-                    .is_some_and(|entity| crate::entities::field::hosts_field(doc, entity))
+                && ed.editing.is_some_and(|h| {
+                    let Some(entity) = doc.get_entity(h) else {
+                        return false;
+                    };
+                    match (self.table_cell_editor.as_ref(), entity) {
+                        (Some(cell), document::EntityType::Table(table)) if cell.handle == h => {
+                            // A formula cell is edited as its formula text, not
+                            // through the field template.
+                            crate::entities::table::cell_formula_text(
+                                doc,
+                                table,
+                                cell.row,
+                                cell.column,
+                            )
+                            .is_none()
+                                && table.cell(cell.row, cell.column).is_some_and(|c| {
+                                    c.contents.iter().any(|item| item.field_handle.is_some())
+                                })
+                        }
+                        _ => crate::entities::field::hosts_field(doc, entity),
+                    }
+                })
         })
     }
 
@@ -139,13 +159,19 @@ impl crate::app::OpenCADStudio {
                     let symbol = match text.as_str() {
                         "d" | "D" => Some("°"),
                         "p" | "P" => Some("±"),
-                        "c" | "C" => Some("Ø"),
+                        "c" | "C" => Some("∅"),
                         _ => None,
                     };
                     if let Some(symbol) = symbol {
                         range.start -= 2;
                         text = symbol.into();
                     }
+                }
+                // The fourth hex digit of a typed `\U+XXXX` makes that
+                // character (`m\U+00B2` → m²).
+                if let Some(ch) = typed_unicode_code(&cells, range.start, &text) {
+                    range.start -= 6;
+                    text = ch.to_string();
                 }
             }
             let start = range.start;
@@ -215,7 +241,11 @@ impl crate::app::OpenCADStudio {
                 } else {
                     range.end = MTextEditorState::safe_caret(index, (range.end + 1).min(count), 1);
                 }
-                if let Some(whole) = ed.field_host.as_ref().and_then(|h| h.whole_field(index, range.clone())) {
+                if let Some(whole) = ed
+                    .field_host
+                    .as_ref()
+                    .and_then(|h| h.whole_field(index, range.clone()))
+                {
                     range = whole;
                 }
             }
@@ -226,6 +256,27 @@ impl crate::app::OpenCADStudio {
 
 /// A font control for `font`; refused when a field would not survive the
 /// control's own syntax. A stroke font file is written as `\F…;`.
+/// The character a `\U+` code becomes when `typed` is its fourth hex digit,
+/// with `\U+` and the first three digits right before `at`.
+fn typed_unicode_code(cells: &[Cell], at: usize, typed: &str) -> Option<char> {
+    let last = typed.chars().next().filter(char::is_ascii_hexdigit)?;
+    let before: String = cells
+        .get(at.checked_sub(6)?..at)?
+        .iter()
+        .map(|cell| match cell {
+            Cell::Char(ch, _) => Some(*ch),
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    let digits = before
+        .strip_prefix("\\U+")
+        .or_else(|| before.strip_prefix("\\u+"))?;
+    if !digits.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    char::from_u32(u32::from_str_radix(&format!("{digits}{last}"), 16).ok()?)
+}
+
 pub(super) fn font_code(font: &MTextFont) -> Result<String, EditError> {
     if font.name.trim().is_empty()
         || font.name.contains(['|', ','])
@@ -484,7 +535,7 @@ fn only_format_changed(kind: MTextFmt, before: &SpanProperties, after: &SpanProp
             let Some(new) = normalized.font.as_ref() else {
                 return false;
             };
-            let same_face = before.font.as_ref().map_or(true, |old| {
+            let same_face = before.font.as_ref().is_none_or(|old| {
                 old.name.trim().is_empty() || (old.name == new.name && old.italic == new.italic)
             });
             if !same_face {
@@ -620,7 +671,7 @@ mod tests {
     fn app(raw: &str) -> OpenCADStudio {
         let mut app = OpenCADStudio::new_for_test();
         app.tabs
-            .push(crate::app::document::DocumentTab::new_drawing(1));
+            .push(crate::app::tab_document::DocumentTab::new_drawing(1));
         app.active_tab = 1;
         app.open_mtext_editor(DVec3::ZERO, None, raw, 2.5, None);
         app
@@ -688,7 +739,18 @@ mod tests {
         for ch in ["%", "%", "c"] {
             app.mtext_type(ch);
         }
-        assert_eq!(app.mtext_editor.as_ref().unwrap().doc.to_plain_text(), "xØ");
+        assert_eq!(app.mtext_editor.as_ref().unwrap().doc.to_plain_text(), "x∅");
+    }
+
+    /// D#2575: `\U+00B2` typed after `m` becomes m².
+    #[test]
+    fn a_typed_unicode_code_becomes_its_character() {
+        let mut app = app("m");
+        caret(&mut app, 1);
+        for ch in ["\\", "U", "+", "0", "0", "B", "2"] {
+            app.mtext_type(ch);
+        }
+        assert_eq!(app.mtext_editor.as_ref().unwrap().doc.to_plain_text(), "m²");
     }
 
     #[test]
@@ -728,7 +790,7 @@ mod tests {
     fn cells(app: &OpenCADStudio) -> Vec<super::Cell> {
         super::doc_to_cells(&app.mtext_editor.as_ref().unwrap().doc)
     }
-    fn props(app: &OpenCADStudio, n: usize) -> codec::entities::mtext_format::SpanProperties {
+    fn props(app: &OpenCADStudio, n: usize) -> document::entities::mtext_format::SpanProperties {
         match &cells(app)[n] {
             super::Cell::Char(_, p) => p.clone(),
             _ => panic!("char"),
@@ -862,7 +924,7 @@ mod tests {
             .document
             .entities()
             .find_map(|e| match e {
-                codec::EntityType::MText(t) => Some((t.common.handle, t.value.clone())),
+                document::EntityType::MText(t) => Some((t.common.handle, t.value.clone())),
                 _ => None,
             })
             .unwrap();
@@ -871,11 +933,11 @@ mod tests {
             let bytes = crate::io::save_to_bytes(
                 &app.tabs[1].scene.document,
                 ext,
-                codec::DxfVersion::AC1032,
+                document::DxfVersion::AC1032,
             )
             .unwrap();
             let doc = crate::io::load_bytes(&format!("clear.{ext}"), bytes).unwrap();
-            let Some(codec::EntityType::MText(t)) = doc.get_entity(h) else {
+            let Some(document::EntityType::MText(t)) = doc.get_entity(h) else {
                 panic!()
             };
             assert_eq!(t.value, value, "{ext}");

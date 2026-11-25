@@ -19,9 +19,9 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
-use codec::entities::Line;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::Line;
+use document::types::Vector3;
+use document::EntityType;
 use glam::{DVec3, Mat4, Vec3};
 use iced::{Point, Rectangle};
 
@@ -115,8 +115,8 @@ fn main() {
     };
     // World-space aperture radius exactly as the production flat-ortho query
     // computes it from the snap pixel radius.
-    let world_per_px = (VIEW_SCALE * bounds.width * 0.5)
-        .min(VIEW_SCALE * bounds.height * 0.5) as f64;
+    let world_per_px =
+        (VIEW_SCALE * bounds.width * 0.5).min(VIEW_SCALE * bounds.height * 0.5) as f64;
     let radius_world = snapper.osnap_radius_px as f64 / world_per_px;
 
     let eval_once = |step: usize| -> (bool, u64) {

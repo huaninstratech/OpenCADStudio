@@ -21,9 +21,9 @@
 //   Enter the number of model space units <1>:
 
 use crate::t;
-use codec::entities::{LwPolyline, LwVertex, Viewport};
-use codec::types::{Vector2, Vector3};
-use codec::{EntityType, Handle};
+use document::entities::{LwPolyline, LwVertex, Viewport};
+use document::types::{Vector2, Vector3};
+use document::{EntityType, Handle};
 use glam::{DVec2, DVec3};
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
@@ -142,7 +142,7 @@ impl MvsetupCommand {
                 viewport.height = height;
                 viewport.id = 2;
                 if self.arrangement == Arrangement::Engineering {
-                    viewport.view_direction = directions[(row * 2 + column) as usize].clone();
+                    viewport.view_direction = directions[(row * 2 + column) as usize];
                 }
                 viewports.push(EntityType::Viewport(Box::new(viewport)));
             }

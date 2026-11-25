@@ -18,19 +18,20 @@ fn dirty_definition_edit() -> OpenCADStudio {
     let i = app.active_tab;
     app.tabs[i].scene.define_block_raw(
         "EDIT_ME",
-        codec::types::Vector3::ZERO,
-        vec![codec::EntityType::Line(codec::entities::Line::from_points(
-            codec::types::Vector3::ZERO,
-            codec::types::Vector3::UNIT_X,
-        ))],
+        document::types::Vector3::ZERO,
+        vec![document::EntityType::Line(
+            document::entities::Line::from_points(
+                document::types::Vector3::ZERO,
+                document::types::Vector3::UNIT_X,
+            ),
+        )],
     );
     let reference = app.tabs[i]
         .scene
         .document
-        .add_entity(codec::EntityType::Insert(codec::entities::Insert::new(
-            "EDIT_ME",
-            codec::types::Vector3::ZERO,
-        )))
+        .add_entity(document::EntityType::Insert(
+            document::entities::Insert::new("EDIT_ME", document::types::Vector3::ZERO),
+        ))
         .unwrap();
     let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
     let _ = app.automation_op(r#"{"op":"run","cmd":"CIRCLE 1,0 2"}"#);
@@ -64,12 +65,11 @@ fn block_close_dialog_explains_the_risk_and_counts_references() {
     with_ui_test(|| {
         let app = dirty_definition_edit();
         assert_eq!(app.modal_title(), "Block - Save Parameter Changes?");
-        let mut ui = Simulator::with_size(
-            iced::Settings::default(),
-            (900.0, 700.0),
-            dialog(&app),
+        let mut ui = Simulator::with_size(iced::Settings::default(), (900.0, 700.0), dialog(&app));
+        assert!(
+            ui.find("Save changes to EDIT_ME?").is_err(),
+            "the block-close dialog has no per-block line above the body"
         );
-        visible(&mut ui, "Save changes to EDIT_ME?");
         visible(
             &mut ui,
             "Changes to parameters may update existing block references in ways that are not always obvious. What do you want to do?",
@@ -82,5 +82,23 @@ fn block_close_dialog_explains_the_risk_and_counts_references() {
         assert!(ui
             .into_messages()
             .any(|message| matches!(message, Message::BlockEditChangesSave)));
+    });
+}
+
+#[test]
+fn unsaved_dialog_shows_shortcut_hints() {
+    with_ui_test(|| {
+        let content = unsaved_changes_dialog_window(
+            "Drawing.dwg",
+            crate::ui::modal::ModalSizing {
+                width: 500.0.into(),
+                height: 250.0.into(),
+            },
+            None,
+        );
+        let mut ui = Simulator::with_size(iced::Settings::default(), (900.0, 700.0), content);
+        visible(&mut ui, "Save (S)");
+        visible(&mut ui, "Don't Save (N)");
+        visible(&mut ui, "Cancel (C)");
     });
 }

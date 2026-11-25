@@ -7,7 +7,7 @@
 //      and when closed, resumes the command loop.
 //   4. In Single mode, editing an object exits the command immediately.
 
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
@@ -228,12 +228,10 @@ impl CadCommand for TexteditmodeCommand {
         } else {
             String::new()
         };
-        t!(
-            "%{prefix}TEXTEDITMODE Enter new value for TEXTEDITMODE <%{v}>:",
-            prefix = prefix,
-            v = v
+        format!(
+            "{prefix}{}",
+            crate::ui::command_line::value_prompt("TEXTEDITMODE", &v)
         )
-        .into_owned()
     }
 
     fn wants_text_input(&self) -> bool {

@@ -4,7 +4,7 @@ use crate::scene::{
     block_orientation_parameter as orientation, block_point_parameter as point, block_visibility,
     Scene,
 };
-use codec::types::Vector3;
+use document::types::Vector3;
 
 fn fixture() -> (Document, Handle, Vec<Handle>) {
     let mut scene = Scene::new();
@@ -185,7 +185,9 @@ fn block_parameter_metadata_rejects_collisions_foreign_objects_and_invalid_field
         "Foreign"
     )
     .is_err());
-    let graph = crate::scene::block_authoring::graph(&doc, def).unwrap().unwrap();
+    let graph = crate::scene::block_authoring::graph(&doc, def)
+        .unwrap()
+        .unwrap();
     assert!(set_text(&mut doc, def, graph, Field::Name, "Graph").is_err());
     assert!(set_chain(&mut doc, def, graph, true).is_err());
     assert_eq!(doc, before);

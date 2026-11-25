@@ -73,10 +73,12 @@ pub enum Language {
     ElGr,
     #[serde(rename = "vi-VN")]
     ViVn,
+    #[serde(rename = "uz-UZ")]
+    UzUz,
 }
 
 impl Language {
-    pub const ALL: [Language; 24] = [
+    pub const ALL: [Language; 25] = [
         Language::System,
         Language::EnUs,
         Language::BgBg,
@@ -101,6 +103,7 @@ impl Language {
         Language::HiIn,
         Language::ArSa,
         Language::ViVn,
+        Language::UzUz,
     ];
 
     fn requested(self) -> Vec<i18n_embed::unic_langid::LanguageIdentifier> {
@@ -129,6 +132,7 @@ impl Language {
             Language::ZhTw => vec!["zh-TW".parse().expect("valid locale")],
             Language::ElGr => vec!["el-GR".parse().expect("valid locale")],
             Language::ViVn => vec!["vi-VN".parse().expect("valid locale")],
+            Language::UzUz => vec!["uz-UZ".parse().expect("valid locale")],
         }
     }
 
@@ -158,6 +162,7 @@ impl Language {
             Language::ZhTw => crate::tr!("language", "chinese-traditional"),
             Language::ElGr => crate::tr!("language", "greek"),
             Language::ViVn => crate::tr!("language", "vietnamese"),
+            Language::UzUz => crate::tr!("language", "uzbek"),
         }
     }
 }
@@ -231,6 +236,17 @@ fn load_language(
         }
     }
     Ok(())
+}
+
+/// `text` without the Unicode isolation marks Fluent puts around each
+/// placeable: what a translated message gives a name (a style named "Copy of
+/// X") must hold only the characters it shows.
+pub fn plain(text: String) -> String {
+    if text.contains(['\u{2068}', '\u{2069}']) {
+        text.replace(['\u{2068}', '\u{2069}'], "")
+    } else {
+        text
+    }
 }
 
 pub fn loader() -> &'static FluentLanguageLoader {
@@ -327,12 +343,14 @@ fn format_attribute_with(
     arguments: &[(&str, &str)],
 ) -> Option<String> {
     let arguments = arguments.iter().copied().collect();
-    loader.with_fluent_message_and_bundle(message, |message, bundle| {
-        let pattern = message.get_attribute(attribute)?;
-        let mut errors = Vec::new();
-        let rendered = bundle.format_pattern(pattern.value(), Some(&arguments), &mut errors);
-        errors.is_empty().then(|| rendered.into_owned())
-    }).flatten()
+    loader
+        .with_fluent_message_and_bundle(message, |message, bundle| {
+            let pattern = message.get_attribute(attribute)?;
+            let mut errors = Vec::new();
+            let rendered = bundle.format_pattern(pattern.value(), Some(&arguments), &mut errors);
+            errors.is_empty().then(|| rendered.into_owned())
+        })
+        .flatten()
 }
 
 /// Translate a catalog message and replace the named values used by legacy
@@ -419,7 +437,80 @@ fn cached_translation_with(
     }
     let label: &'static str = Box::leak(loader.get_attr(message_id, attribute_id).into_boxed_str());
     labels.1.insert(source.into(), label);
+    record_option_groups(source, label);
     label
+}
+
+thread_local! {
+    /// Translated `[A/B/C]` option list → the source list, recorded as
+    /// prompts are translated, so typed localized keywords can be mapped back.
+    static OPTION_GROUPS: RefCell<rustc_hash::FxHashMap<String, String>> =
+        RefCell::default();
+}
+
+/// The `[...]` option lists of a prompt, Fluent isolation marks removed.
+fn option_groups(text: &str) -> Vec<String> {
+    plain(text.to_string())
+        .split('[')
+        .skip(1)
+        .filter_map(|rest| rest.split_once(']').map(|(group, _)| group.to_string()))
+        .collect()
+}
+
+fn record_option_groups(source: &str, translated: &str) {
+    if !source.contains('[') {
+        return;
+    }
+    let (source, translated) = (option_groups(source), option_groups(translated));
+    if source.len() != translated.len() {
+        return;
+    }
+    OPTION_GROUPS.with(|map| {
+        let mut map = map.borrow_mut();
+        if map.len() >= 16_384 {
+            map.clear();
+        }
+        for (source, translated) in source.into_iter().zip(translated) {
+            if source != translated && source.split('/').count() == translated.split('/').count()
+            {
+                map.insert(translated, source);
+            }
+        }
+    });
+}
+
+/// The source option a typed answer picks from a translated prompt's `[...]`
+/// list: the whole localized option, or a prefix only one option has. Commands
+/// compare against source keywords, so `M` for `Monde` must reach UCS as
+/// `World`. `_`-prefixed input is the source keyword already; `None` when
+/// nothing localized matches.
+pub fn source_option(prompt: &str, typed: &str) -> Option<String> {
+    let typed = typed.trim().to_lowercase();
+    if typed.is_empty() || typed.starts_with('_') {
+        return None;
+    }
+    OPTION_GROUPS.with(|map| {
+        let map = map.borrow();
+        let mut prefixed = Vec::new();
+        for group in option_groups(prompt) {
+            let Some(source) = map.get(&group) else {
+                continue;
+            };
+            for (local, option) in group.split('/').zip(source.split('/')) {
+                let local = local.trim().to_lowercase();
+                if local == typed {
+                    return Some(option.trim().to_string());
+                }
+                if local.starts_with(&typed) {
+                    prefixed.push(option.trim());
+                }
+            }
+        }
+        match prefixed.as_slice() {
+            [option] => Some(option.to_string()),
+            _ => None,
+        }
+    })
 }
 
 fn format_values(template: &str, rendered: &str) -> Option<Vec<String>> {
@@ -482,6 +573,8 @@ pub fn ribbon_module_title(id: &str, fallback: &str) -> String {
         "annotate" => crate::tr!("ribbon-tab", "annotate"),
         "insert" => crate::tr!("ribbon-tab", "insert"),
         "model" => crate::tr!("ribbon-tab", "model"),
+        "surface" => crate::tr!("ribbon-tab", "surface"),
+        "civil" => crate::tr!("ribbon-tab", "civil"),
         "layout" => crate::tr!("ribbon-tab", "layout"),
         "manage" => crate::tr!("ribbon-tab", "manage"),
         "view" => crate::tr!("ribbon-tab", "view"),
@@ -544,6 +637,7 @@ macro_rules! tf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::BTreeSet;
 
     #[test]
@@ -579,8 +673,13 @@ mod tests {
             let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
             load_language(&loader, language).unwrap();
             let created = loader.get_attr("block-action-targets", "create-prompt");
-            assert!(created.contains("Parameter") && created.contains("\"…\""), "{language:?}: {created}");
-            assert!(!loader.get_attr("block-action-targets", "create-stale").is_empty());
+            assert!(
+                created.contains("Parameter") && created.contains("\"…\""),
+                "{language:?}: {created}"
+            );
+            assert!(!loader
+                .get_attr("block-action-targets", "create-stale")
+                .is_empty());
             let prompt = loader.get_attr("block-action-targets", "prompt");
             assert!(prompt.contains("Parameter"), "{language:?}: {prompt}");
             assert!(prompt.contains("\"…\""), "{language:?}: {prompt}");
@@ -589,17 +688,36 @@ mod tests {
             let flip = loader.get_attr("block-history-kinds", "flip");
             for rendered in [&prompt, &created] {
                 assert!(
-                    [&point, &linear, &flip].iter().all(|label| rendered.contains(label.as_str())),
+                    [&point, &linear, &flip]
+                        .iter()
+                        .all(|label| rendered.contains(label.as_str())),
                     "{language:?}: {rendered}"
                 );
             }
-            assert!(!loader.get_attr("block-action-targets", "unique-point").is_empty());
+            assert!(!loader
+                .get_attr("block-action-targets", "unique-point")
+                .is_empty());
+            for attribute in ["flip-prompt", "flip-create-prompt"] {
+                let rendered = loader.get_attr("block-action-targets", attribute);
+                assert!(
+                    rendered.contains("Parameter")
+                        && rendered.contains(&linear)
+                        && rendered.contains(&flip),
+                    "{language:?}: {rendered}"
+                );
+            }
+            assert!(!loader
+                .get_attr("block-action-targets", "flip-invalid")
+                .is_empty());
         }
     }
 
     #[test]
     fn parameters_manager_footer_formats_both_counts_in_every_locale() {
-        for language in Language::ALL.into_iter().filter(|language| *language != Language::System) {
+        for language in Language::ALL
+            .into_iter()
+            .filter(|language| *language != Language::System)
+        {
             let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
             load_language(&loader, language).unwrap();
             let footer = format_attribute_with(
@@ -607,52 +725,98 @@ mod tests {
                 "parameters-manager",
                 "footer",
                 &[("shown", "7"), ("total", "13")],
-            ).expect("the localized footer must format");
-            assert!(footer.contains('7') && footer.contains("13"), "{language:?}: {footer:?}");
+            )
+            .expect("the localized footer must format");
+            assert!(
+                footer.contains('7') && footer.contains("13"),
+                "{language:?}: {footer:?}"
+            );
         }
     }
 
-    #[test]
-    fn formatted_history_preserves_authored_values_in_every_locale() {
-        for language in Language::ALL.into_iter().filter(|language| *language != Language::System) {
+    #[rstest]
+    #[case("action")]
+    #[case("parameter")]
+    #[case("edit-block")]
+    #[case("save-block")]
+    #[case("delete-block")]
+    fn formatted_history_preserves_authored_values_in_every_locale(#[case] attribute: &str) {
+        for language in Language::ALL
+            .into_iter()
+            .filter(|language| *language != Language::System)
+        {
             let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
             load_language(&loader, language).unwrap();
-            for attribute in ["action", "parameter", "edit-block", "save-block", "delete-block"] {
-                for authored in ["Revert", "  Door { $label } \\ literal __ocs_fmt_0__ \n", "باب — 扉"] {
-                    let rendered = format_attribute_with(
-                        &loader, "block-formatted-history", attribute, &[("label", authored)],
-                    ).expect("history template must format without errors");
-                    assert!(rendered.contains(authored), "{language:?}/{attribute}: {rendered:?}");
-                }
+            for authored in [
+                "Revert",
+                "  Door { $label } \\ literal __ocs_fmt_0__ \n",
+                "??? - ?",
+            ] {
+                let rendered = format_attribute_with(
+                    &loader,
+                    "block-formatted-history",
+                    attribute,
+                    &[("label", authored)],
+                )
+                .expect("history template must format without errors");
+                assert!(
+                    rendered.contains(authored),
+                    "{language:?}/{attribute}: {rendered:?}"
+                );
             }
-            for source in ["Move", "Scale", "Rotate", "Flip", "Stretch", "Polar Stretch", "Array", "Basepoint", "Lookup"] {
-                let (message, attribute) = catalog_ids(source).expect("kind must have a Fluent key");
-                assert!(!loader.get_attr(message, attribute).is_empty());
-            }
-            assert!(format_attribute_with(&loader, "block-formatted-history", "edit-block", &[]).is_none());
         }
     }
 
     #[test]
-    fn construction_prompts_preserve_operation_keywords_in_every_locale() {
+    fn formatted_history_catalog_ids_exist_in_every_locale() {
+        for language in Language::ALL
+            .into_iter()
+            .filter(|language| *language != Language::System)
+        {
+            let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
+            load_language(&loader, language).unwrap();
+            for source in [
+                "Move",
+                "Scale",
+                "Rotate",
+                "Flip",
+                "Stretch",
+                "Polar Stretch",
+                "Array",
+                "Basepoint",
+                "Lookup",
+            ] {
+                let (message, attribute) =
+                    catalog_ids(source).expect("kind must have a Fluent key");
+                assert!(!loader.get_attr(message, attribute).is_empty());
+            }
+            assert!(
+                format_attribute_with(&loader, "block-formatted-history", "edit-block", &[])
+                    .is_none()
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("prompt-selection", &["[Convert/Revert/Show/Hide]"][..])]
+    #[case("prompt-operation", &["[Convert/Revert]", "<Convert>"][..])]
+    #[case("choose-operation", &["Convert", "Revert", "Show", "Hide"][..])]
+    fn construction_prompts_preserve_operation_keywords_in_every_locale(
+        #[case] attribute: &str,
+        #[case] tokens: &[&str],
+    ) {
         for language in Language::ALL
             .into_iter()
             .filter(|language| *language != Language::System)
         {
             let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
             load_language(&loader, language).expect("Fluent resources must parse");
-            for (attribute, tokens) in [
-                ("prompt-selection", &["[Convert/Revert/Show/Hide]"][..]),
-                ("prompt-operation", &["[Convert/Revert]", "<Convert>"][..]),
-                ("choose-operation", &["Convert", "Revert", "Show", "Hide"][..]),
-            ] {
-                let translated = loader.get_attr("block-construction", attribute);
-                for token in tokens {
-                    assert!(translated.contains(token), "{language:?}/{attribute}");
-                }
-                if attribute.starts_with("prompt-") {
-                    assert!(translated.starts_with("BCONSTRUCTION  "), "{language:?}");
-                }
+            let translated = loader.get_attr("block-construction", attribute);
+            for token in tokens {
+                assert!(translated.contains(token), "{language:?}/{attribute}");
+            }
+            if attribute.starts_with("prompt-") {
+                assert!(translated.starts_with("BCONSTRUCTION  "), "{language:?}");
             }
             if language != Language::EnUs {
                 assert_ne!(loader.get_attr("block-construction", "revert"), "Revert");
@@ -706,6 +870,60 @@ mod tests {
                     assert!(translated.contains(keyword), "{language:?}/{attribute}");
                 }
             }
+        }
+    }
+
+    /// The messages of the DWF export are in every catalog: the dialog's
+    /// title and the web notice name the format, the usage line keeps the
+    /// command's own words, and the result line takes its five values.
+    #[test]
+    fn the_dwf_export_messages_are_in_every_catalog() {
+        let result = "Exported: {}  {sheets} sheet(s), {bytes} bytes, {width:.1}×{height:.1} mm";
+        let messages = [
+            ("Export as DWF", ("common", "export-as-dwf")),
+            (
+                "DWF export is not available in the web version.",
+                ("common", "dwf-export-is-not-available-in-the-web-version"),
+            ),
+            (
+                "Usage: EXPORTDWF <file.dwf> [ALL]",
+                ("plot", "usage-exportdwf-file-dwf-all"),
+            ),
+            (result, ("plot", "exported-sheets-bytes-size")),
+        ];
+        let values = format_values(
+            result,
+            "Exported: out/plan.dwf  3 sheet(s), 20480 bytes, 297.0×210.0 mm",
+        )
+        .expect("the result line gives its values back");
+        assert_eq!(values, ["out/plan.dwf", "3", "20480", "297.0", "210.0"]);
+        for language in Language::ALL
+            .into_iter()
+            .filter(|language| *language != Language::System)
+        {
+            let loader = FluentLanguageLoader::new("opencadstudio", "en-US".parse().unwrap());
+            load_language(&loader, language).expect("Fluent resources must parse");
+            for (source, ids) in messages {
+                assert_eq!(catalog_ids(source), Some(ids), "{source}");
+            }
+            let title = loader.get_attr("common", "export-as-dwf");
+            assert!(title.contains("DWF"), "{language:?}: {title}");
+            let notice =
+                loader.get_attr("common", "dwf-export-is-not-available-in-the-web-version");
+            assert!(notice.contains("DWF"), "{language:?}: {notice}");
+            let usage = loader.get_attr("plot", "usage-exportdwf-file-dwf-all");
+            assert!(
+                usage.contains("EXPORTDWF <") && usage.contains(".dwf> [ALL]"),
+                "{language:?}: {usage}"
+            );
+            let mut line = loader.get_attr("plot", "exported-sheets-bytes-size");
+            for (index, value) in values.iter().enumerate() {
+                let marker = format!("__ocs_fmt_{index}__");
+                assert!(line.contains(&marker), "{language:?}: {line}");
+                line = line.replace(&marker, value);
+            }
+            assert!(line.contains("out/plan.dwf"), "{language:?}: {line}");
+            assert!(line.contains("297.0×210.0 mm"), "{language:?}: {line}");
         }
     }
 
@@ -864,6 +1082,8 @@ mod tests {
             "qat-properties",
             "add-to-qat",
             "remove-from-qat",
+            "add-to-my-tools",
+            "remove-from-my-tools",
             "add-separator",
             "remove-separator",
             "qat-show-below",
@@ -1085,11 +1305,16 @@ mod tests {
         load_language(&chinese, Language::ZhCn).expect("Chinese Fluent resources must parse");
         let cache = RefCell::new((0, rustc_hash::FxHashMap::default()));
         let source = "Draw";
-        let english_label = cached_translation_with(&english, &cache, 0, source, "ribbon-tab", "draw");
-        let chinese_label = cached_translation_with(&chinese, &cache, 1, source, "ribbon-tab", "draw");
+        let english_label =
+            cached_translation_with(&english, &cache, 0, source, "ribbon-tab", "draw");
+        let chinese_label =
+            cached_translation_with(&chinese, &cache, 1, source, "ribbon-tab", "draw");
         assert_eq!(english_label, "Draw");
         assert_eq!(chinese_label, chinese.get_attr("ribbon-tab", "draw"));
-        assert_ne!(english_label, chinese_label, "the memo must re-render on a language switch");
+        assert_ne!(
+            english_label, chinese_label,
+            "the memo must re-render on a language switch"
+        );
     }
 
     #[test]

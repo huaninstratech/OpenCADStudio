@@ -106,6 +106,9 @@ pub(super) struct State {
     completed: VecDeque<(String, Value, Value)>,
     owner: Option<(u64, String)>,
     pub enabled: bool,
+    /// The MCP button's last state, restored at the next start (#3126). Only
+    /// the button writes it: a client's `stop` must not outlive the session.
+    pub start_enabled: bool,
     /// Set by the first control request of the session (or by a web host's
     /// boot-time opt-in): while control is enabled, startup prompts that
     /// would block automation — the donation prompt — are suppressed (#1349).
@@ -117,7 +120,7 @@ pub(super) struct State {
     selection_revision: u64,
     pub(super) routing: bool,
     /// Session-scoped named handle sets for selection_set_save/load.
-    selection_sets: std::collections::BTreeMap<String, Vec<codec::Handle>>,
+    selection_sets: std::collections::BTreeMap<String, Vec<document::Handle>>,
     /// Live `user_select` request — the client asked the person at the screen
     /// to pick entities; Some until that person answers with Enter/Escape.
     pub(super) user_select: Option<UserSelectSession>,
@@ -128,6 +131,8 @@ pub(super) struct State {
     /// screenshotting in the same batch as the state change used to return the
     /// previous frame (C11). Cleared by `on_control_capture_frame`.
     pub(super) capture_frame_pending: bool,
+    /// Shared cancellation token for an in-flight off-screen `capture` worker.
+    pub(super) capture_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether the parked capture actually waited for a redraw (vs. the
     /// anti-hang timer). Reported in the capture result as `waited_for_frame`.
     pub(super) capture_after_redraw: bool,
@@ -141,7 +146,7 @@ pub(super) struct State {
     /// document-level snapshot. Such a step bumps geometry as a whole, so the
     /// journal cannot name what moved; the step's own delta can, and the
     /// response of the request that ran it reports these instead of `null`.
-    history_changes: Option<Vec<(codec::Handle, crate::scene::ChangeKind)>>,
+    history_changes: Option<Vec<(document::Handle, crate::scene::ChangeKind)>>,
 }
 
 /// The pending half of an interactive `user_select` operation (`interactive`
@@ -171,6 +176,7 @@ impl State {
     pub(super) fn new() -> Self {
         Self {
             enabled: true,
+            start_enabled: true,
             ..Self::default()
         }
     }
@@ -181,7 +187,7 @@ impl State {
     /// (or while an interactive request is parked) records nothing.
     pub(super) fn note_history_changes(
         &mut self,
-        changes: Vec<(codec::Handle, crate::scene::ChangeKind)>,
+        changes: Vec<(document::Handle, crate::scene::ChangeKind)>,
     ) {
         if self.routing {
             self.history_changes = Some(changes);
@@ -190,7 +196,7 @@ impl State {
 
     pub(super) fn take_history_changes(
         &mut self,
-    ) -> Option<Vec<(codec::Handle, crate::scene::ChangeKind)>> {
+    ) -> Option<Vec<(document::Handle, crate::scene::ChangeKind)>> {
         self.history_changes.take()
     }
 
@@ -212,6 +218,10 @@ struct Operation {
     /// Set when an interactive request (`getpoint`/`user_select`) was answered
     /// with a cancellation, so the final status reports "cancelled".
     cancelled: bool,
+    /// A failure found after the request returned (work off the UI thread):
+    /// the settled answer is this failure, as the request would have
+    /// answered it at once.
+    failure: Option<Value>,
 }
 fn failure(code: &str, error: impl ToString) -> Value {
     json!({"ok":false,"status":"failed","code":code,"error":error.to_string()})
@@ -236,6 +246,7 @@ fn background_mutation(op: &str) -> bool {
         op,
         "set_properties"
             | "entities_create"
+            | "entities_set"
             | "entities_delete"
             | "entities_transform"
             | "text_replace"
@@ -290,9 +301,9 @@ fn string<'a>(req: &'a Value, key: &str) -> Result<&'a str, Value> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| failure("invalid_request", format!("Missing {key}")))
 }
-fn handle(req: &Value) -> Result<codec::Handle, Value> {
+fn handle(req: &Value) -> Result<document::Handle, Value> {
     u64::from_str_radix(string(req, "handle")?.trim_start_matches("0x"), 16)
-        .map(codec::Handle::new)
+        .map(document::Handle::new)
         .map_err(|_| failure("invalid_handle", "Expected hexadecimal handle"))
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -364,6 +375,8 @@ fn command_category(name: &str) -> &'static str {
         "SPLINEDIT",
         "REVERSE",
         "ALIGN",
+        "ADDVERTEX",
+        "DELVERTEX",
     ]
     .contains(&name)
     {
@@ -541,7 +554,7 @@ pub(super) fn active_command_metadata(command: &dyn crate::command::CadCommand) 
     })
 }
 
-fn xref_status_name(status: &crate::io::xref::XrefStatus) -> &'static str {
+pub(super) fn xref_status_name(status: &crate::io::xref::XrefStatus) -> &'static str {
     use crate::io::xref::XrefStatus as S;
     match status {
         S::Loaded => "loaded",
@@ -549,6 +562,23 @@ fn xref_status_name(status: &crate::io::xref::XrefStatus) -> &'static str {
         S::Failed => "failed",
         S::NotFound => "not_found",
         S::Unloaded => "unloaded",
+    }
+}
+
+/// Status label for a live [`crate::io::xref_model::RefStatus`] row. The
+/// palette shows the same vocabulary (`xref_manager::status_label`), so the
+/// automation report and the Reference Manager can never disagree.
+pub(super) fn ref_status_name(status: crate::io::xref_model::RefStatus) -> &'static str {
+    use crate::io::xref_model::RefStatus as S;
+    match status {
+        S::Circular => "circular",
+        S::Loaded => "loaded",
+        S::Unloaded => "unloaded",
+        S::NotFound => "not_found",
+        S::Failed => "failed",
+        S::Stale => "stale",
+        S::Orphaned => "orphaned",
+        S::Unreferenced => "unreferenced",
     }
 }
 
@@ -562,6 +592,14 @@ impl OpenCADStudio {
     /// dialog, a popup, typed text) or step a command back a level, and the
     /// client has no other way to finish the job. (#1930)
     fn control_cancel(&mut self) -> Task<Message> {
+        self.control.capture_frame_pending = false;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.control.capture_deadline = None;
+        }
+        if let Some(cancel) = self.control.capture_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let mut tasks = vec![self.update(Message::CommandEscape)];
         // ponytail: fixed Esc budget; covers every overlay + step-back chain
         // in the escape path today, raise it if a deeper chain appears.
@@ -578,7 +616,7 @@ impl OpenCADStudio {
     /// plugin host already publishes the V4 selection event; automation clients
     /// need the same signal instead of polling `state`.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn control_record_selection_event(&mut self, handles: &[codec::Handle]) {
+    pub(super) fn control_record_selection_event(&mut self, handles: &[document::Handle]) {
         let (document_id, revision) = {
             let tab = &self.tabs[self.active_tab];
             (tab.id, tab.edit_revision)
@@ -610,14 +648,42 @@ impl OpenCADStudio {
         json!({"ok":true,"protocol":1,"session_id":session_id(),"version":env!("OCS_APP_VERSION"),
             "mode":if self.main_window.is_some(){"gui"}else{"headless"},"enabled":self.control.enabled,
             "read_only":self.read_only,"missing_fonts":missing_fonts,
-            "xrefs":tab.xref_report.iter().map(|(name,path,status)|json!({"name":name,"path":path,"status":xref_status_name(status)})).collect::<Vec<_>>(),
+            "xrefs":tab.xref_report.iter().map(|(name,path,status)|json!({"name":name,"path":path,"status":status})).collect::<Vec<_>>(),
             "document_id":tab.id,"revision":tab.edit_revision,"geometry_revision":tab.scene.geometry_epoch,"camera_revision":tab.scene.camera_generation,
             "hand_seed":format!("{:X}",tab.scene.document.header.handle_seed.max(tab.scene.document.next_handle())),
             "plugins":plugin_ids(),
             "documents":self.tabs.iter().map(|t|json!({"id":t.id,"title":t.tab_title,"path":t.current_path,"dirty":t.dirty,"revision":t.edit_revision,"start":t.is_start})).collect::<Vec<_>>(),
+            "clean_screen":self.clean_screen,
+            "dock":{
+                "left":self.dock.left.iter().enumerate().map(|(index,group)|json!({"index":index,"panels":group.panels.iter().map(|id|json!({"id":format!("{:?}",id),"visible":self.dock_panel_visible(*id)})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "right":self.dock.right.iter().enumerate().map(|(index,group)|json!({"index":index,"panels":group.panels.iter().map(|id|json!({"id":format!("{:?}",id),"visible":self.dock_panel_visible(*id)})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "auto_hide":[self.dock.auto_hide.0,self.dock.auto_hide.1],
+            },
+            "plugin_panels":self.plugin_panels.iter().map(|(id,panel)|{
+                let number = self.plugin_panel_by_num.iter().find_map(|(number,panel_id)| (panel_id == id).then_some(*number));
+                json!({"id":id,"dock_id":number,"owner":panel.owner_plugin_id,"title":panel.def.title,"visible":panel.visible,"on_screen":number.map(|number|self.dock_panel_on_screen(crate::ui::dock::PanelId::Plugin(number))),"location":number.and_then(|number|self.dock.location(crate::ui::dock::PanelId::Plugin(number))).map(|(side,group)|json!({"side":format!("{:?}",side),"group":group})),"auto_collapse":number.map(|number|self.dock.auto_collapse(crate::ui::dock::PanelId::Plugin(number))),"fields":panel.def.controls.iter().map(|control|match control {
+                    ocs_plugin_api::dialog::DialogControl::Text { id, label, default } => json!({"id":id,"kind":"Text","label":label,"value":panel.text_values.get(id).cloned().unwrap_or_else(||default.clone())}),
+                    ocs_plugin_api::dialog::DialogControl::Number { id, label, .. } => json!({"id":id,"kind":"Number","label":label,"value":panel.text_values.get(id)}),
+                    ocs_plugin_api::dialog::DialogControl::InfoText { text, .. } => json!({"kind":"InfoText","text":text}),
+                    ocs_plugin_api::dialog::DialogControl::Button { id, label, .. } => json!({"id":id,"kind":"Button","label":label}),
+                    // Structured drafts (additive): every kind also carries a
+                    // `value` next to the legacy debug `kind` string so
+                    // automation reads typed state without parsing Rust
+                    // debug output.
+                    ocs_plugin_api::dialog::DialogControl::Checkbox { id, .. } => json!({"id":id,"kind":"Checkbox","value":panel.bool_values.get(id)}),
+                    ocs_plugin_api::dialog::DialogControl::Choice { id, options, .. } => {
+                        let index = panel.choice_values.get(id).copied();
+                        let text = index.map(|index| options.get(index).cloned().unwrap_or_default());
+                        json!({"id":id,"kind":"Choice","value":{"index":index,"text":text},"options":options.iter().map(|o|o.as_str()).collect::<Vec<_>>()})
+                    }
+                    ocs_plugin_api::dialog::DialogControl::Color { id, .. } => json!({"id":id,"kind":"Color","value":panel.color_values.get(id)}),
+                    ocs_plugin_api::dialog::DialogControl::Label { id, .. } => json!({"id":id,"kind":"Label","value":panel.text_values.get(id)}),
+                    other => json!({"kind":format!("{:?}",other)}),
+                }).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>(),
             "selection":tab.scene.selected_handles_in_order().iter().map(|h|format!("{:X}",h.value())).collect::<Vec<_>>(),
             "selection_revision":self.control.selection_revision,
-            "command":command,"modal":self.active_modal.as_ref().map(|m|format!("{m:?}")),
+            "command":command,"command_owner_client_id":self.control.owner.as_ref().filter(|(owner_tab,_)|*owner_tab==tab.id).map(|(_,owner)|owner.clone()),"modal":self.active_modal.as_ref().map(|m|format!("{m:?}")),
             "tool_windows":self.tool_windows.iter().map(|t|format!("{:?}",t.kind)).collect::<Vec<_>>(),
             "layout":tab.scene.current_layout,
             "block_editor":tab.active_block_edit
@@ -635,7 +701,22 @@ impl OpenCADStudio {
     }
 
     pub(super) fn control_request(&mut self, req: Value) -> (Value, Task<Message>) {
-        // First control contact marks the session automated (#1349).
+        // A test build checks that a change of the drawing has an undo step.
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        let undo_guard =
+            crate::app::update::undo_record_guard::begin_request(self, "control", &req);
+        let response = self.control_request_unguarded(req);
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        crate::app::update::undo_record_guard::end(self, undo_guard);
+        response
+    }
+
+    fn control_request_unguarded(&mut self, req: Value) -> (Value, Task<Message>) {
+        // First control contact marks the session automated (#1349): a
+        // DonationPrompt that is still queued (not yet shown) is dropped so
+        // automation never waits behind it, and `queue_startup_prompts`
+        // stops queueing one. A prompt already on screen stays — a human
+        // may be reading it; clients close it with `close_modal`.
         if !self.control.automation_seen && self.control.enabled {
             self.control.automation_seen = true;
             if !self.dialog_open(super::ModalKind::DonationPrompt) {
@@ -656,12 +737,17 @@ impl OpenCADStudio {
                 | "snap"
                 | "grips"
                 | "query"
+                | "civil_station_offset"
+                | "civil_surface_stats"
                 | "records"
                 | "record_schema"
                 | "capabilities"
                 | "tools"
                 | "entities"
                 | "layers"
+                | "layouts"
+                | "xrefs"
+                | "page_setup_get"
                 | "header"
                 | "history"
                 | "xdata_get"
@@ -674,6 +760,8 @@ impl OpenCADStudio {
                 | "cad_get_blocks"
                 | "cad_extract_block_instances"
                 | "keytips"
+                | "plugins"
+                | "plugin_panels"
         );
         if !query && !self.control.enabled {
             return (
@@ -806,6 +894,9 @@ impl OpenCADStudio {
                 Task::none(),
             );
         }
+        if op == "plugins" {
+            return self.control_plugins();
+        }
         let id = if query {
             String::new()
         } else {
@@ -924,8 +1015,10 @@ impl OpenCADStudio {
                     "activate" | "switch_document" | "close" | "entities_copy_to"
                 )
             {
+                let background_capture =
+                    op == "capture" && offscreen_capture::is_offscreen_capture(&req);
                 if req["active_only"].as_bool() == Some(true)
-                    || !query && !background_mutation(op)
+                    || !query && !background_mutation(op) && !background_capture
                 {
                     return (
                         failure(
@@ -942,7 +1035,13 @@ impl OpenCADStudio {
         } else if !query
             && !matches!(
                 op,
-                "new" | "open" | "font_register" | "stop" | "user_select" | "getpoint"
+                "new"
+                    | "open"
+                    | "font_register"
+                    | "stop"
+                    | "user_select"
+                    | "getpoint"
+                    | "plugin_panel_action"
             )
         {
             return (
@@ -962,7 +1061,7 @@ impl OpenCADStudio {
                 .is_some_and(|v| v != tab.scene.camera_generation)
         {
             return (
-                json!({"ok":false,"status":"failed","code":"stale_state","error":"Refresh state before editing","state":self.control_state()}),
+                json!({"ok":false,"status":"failed","code":"stale_state","error":"Nothing ran. Read state (ocs_read op state) and retry, omitting revision or using state.revision","state":self.control_state()}),
                 Task::none(),
             );
         }
@@ -1018,7 +1117,7 @@ impl OpenCADStudio {
                     if off_screen {
                         json!({"ok":true,"snap":null,"reason":"point_outside_viewport"})
                     } else {
-                        match self.snap_query(i, world, from) {
+                        match self.snap_query(i, world, from, None) {
                             Some(hit) => {
                                 json!({"ok":true,"snap":format!("{:?}", hit.snap_type),"world":[hit.world.x,hit.world.y,hit.world.z]})
                             }
@@ -1034,10 +1133,9 @@ impl OpenCADStudio {
                 "get_selection" => self.control_get_selection(),
                 "text_search" => self.control_text_search(&req).unwrap_or_else(|e| e),
                 "text_audit" => self.control_text_audit(&req).unwrap_or_else(|e| e),
-                "blocks"
-                | "block_instances"
-                | "cad_get_blocks"
-                | "cad_extract_block_instances" => self.control_blocks(&req).unwrap_or_else(|e| e),
+                "blocks" | "block_instances" | "cad_get_blocks" | "cad_extract_block_instances" => {
+                    self.control_blocks(&req).unwrap_or_else(|e| e)
+                }
                 "history" => {
                     json!({"ok":true,"entries":self.command_line.history.iter().map(|e|json!({"kind":format!("{:?}",e.kind),"text":e.text})).collect::<Vec<_>>()})
                 }
@@ -1055,16 +1153,33 @@ impl OpenCADStudio {
             && self.dialog_open(crate::app::ModalKind::InsertAttributes)
             && matches!(
                 req["name"].as_str(),
-                Some("dialog_answer") | Some("dialog_ok") | Some("dialog_cancel") | Some("close_modal")
+                Some("dialog_answer")
+                    | Some("dialog_page")
+                    | Some("dialog_ok")
+                    | Some("dialog_cancel")
+                    | Some("close_modal")
             );
+        // Another client's command ends only on an explicit `force`; a command
+        // the user holds stays cancellable, as Esc is (#2484).
+        let cancels_foreign_command = op == "cancel"
+            && req["force"].as_bool() != Some(true)
+            && self
+                .control
+                .owner
+                .as_ref()
+                .is_some_and(|(owner_tab, owner)| *owner_tab == tab.id && *owner != client);
+        let offscreen_capture_req =
+            op == "capture" && offscreen_capture::is_offscreen_capture(&req);
         if tab.active_cmd.is_some()
-            && (self.control.owner.as_ref() != Some(&(tab.id, client.clone()))
-                || matches!(
-                    op,
-                    "run" | "start" | "new" | "open" | "activate" | "switch_document"
-                ))
-            && op != "cancel"
-            && !answers_attribute_form
+            && !offscreen_capture_req
+            && (cancels_foreign_command
+                || (self.control.owner.as_ref() != Some(&(tab.id, client.clone()))
+                    || matches!(
+                        op,
+                        "run" | "start" | "new" | "open" | "activate" | "switch_document"
+                    ))
+                    && op != "cancel"
+                    && !answers_attribute_form)
         {
             // Say who holds the command: the client that started it, or the
             // user (no client) when it was started or taken over in the window.
@@ -1079,7 +1194,7 @@ impl OpenCADStudio {
                 .map(|(_, owner)| owner.clone()));
             return (busy, Task::none());
         }
-        if matches!(op, "run" | "start" | "input") && tab.is_start {
+        if (matches!(op, "run" | "start" | "input") || offscreen_capture_req) && tab.is_start {
             return (
                 failure("no_document", "Create or open a drawing first"),
                 Task::none(),
@@ -1118,6 +1233,7 @@ impl OpenCADStudio {
             geometry_revision: tab.scene.geometry_epoch,
             result: json!({}),
             cancelled: false,
+            failure: None,
         });
         self.control.routing = true;
         let action = self.control_action(&req);
@@ -1136,10 +1252,10 @@ impl OpenCADStudio {
                 return (error, Task::none());
             }
         };
-        if self.tabs[self.active_tab].active_cmd.is_some() {
+        if !offscreen_capture_req && self.tabs[self.active_tab].active_cmd.is_some() {
             self.control.owner = Some((self.tabs[self.active_tab].id, client));
         }
-        if matches!(op, "new" | "activate" | "switch_document")
+        if matches!(op, "new" | "activate" | "switch_document" | "dgn_import")
             && self
                 .control
                 .pending
@@ -1157,10 +1273,10 @@ impl OpenCADStudio {
             // counter stays at one so settle keeps returning `running` until
             // the person at the screen answers and the resolver zeroes it.
             // `capture` is parked the same way until the next drawn frame.
-            if !matches!(
-                p.request["op"].as_str(),
-                Some("user_select" | "getpoint" | "capture")
-            ) {
+            let parked = matches!(p.request["op"].as_str(), Some("user_select" | "getpoint"))
+                || (p.request["op"].as_str() == Some("capture")
+                    && self.control.capture_frame_pending);
+            if !parked {
                 p.pending -= 1;
             }
         }
@@ -1184,7 +1300,10 @@ impl OpenCADStudio {
     fn control_request_in_background(&mut self, id: u64, req: Value) -> (Value, Task<Message>) {
         let visible = self.tabs[self.active_tab].id;
         let Some(target) = self.tabs.iter().position(|t| t.id == id) else {
-            return (failure("document_closed", "Document no longer exists"), Task::none());
+            return (
+                failure("document_closed", "Document no longer exists"),
+                Task::none(),
+            );
         };
         self.active_tab = target;
         let (response, task) = self.control_request(req);
@@ -1323,7 +1442,7 @@ impl OpenCADStudio {
                                         v.as_str().unwrap_or("").trim_start_matches("0x"),
                                         16,
                                     )
-                                    .map(codec::Handle::new)
+                                    .map(document::Handle::new)
                                     .map_err(|_| {
                                         failure("invalid_handle", "Expected hexadecimal handle")
                                     })?;
@@ -1355,7 +1474,7 @@ impl OpenCADStudio {
                             v.as_str().unwrap_or("").trim_start_matches("0x"),
                             16,
                         )
-                        .map(codec::Handle::new)
+                        .map(document::Handle::new)
                         .map_err(|_| failure("invalid_handle", "Expected hexadecimal handle"))?;
                         if self.tabs[i].scene.document.get_entity(h).is_none() {
                             return Err(failure(
@@ -1378,13 +1497,35 @@ impl OpenCADStudio {
             "pointer" => self.control_pointer(req)?,
             "set_properties" => self.control_set_record_properties(req)?,
             "action" => self.control_ui_action(req)?,
+            "panel_input" => self.control_panel_input(req)?,
+            "panel_button" => self.control_panel_button(req)?,
+            "panel_action" => self.control_panel_action(req)?,
+            // The surface facade's activation rides the same route as the GUI
+            // gesture; the control envelope owns request_id idempotency.
+            "plugin_panel_action" => {
+                let result = self.automation_op_inner(&req.to_string());
+                if result["ok"] != true {
+                    return Err(result);
+                }
+                self.set_control_result(result);
+                Task::none()
+            }
             #[cfg(not(target_arch = "wasm32"))]
             "embed_image" => self.control_embed_image(req)?,
+            "dgn_import" => self.control_dgn_import(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "wblock" => self.control_wblock(req)?,
             #[cfg(not(target_arch = "wasm32"))]
             "plot" => self.control_plot(req)?,
             "entities_create" => self.control_entities_create(req)?,
+            "entities_set" => self.control_entities_set(req)?,
+            "xref_source_register" => self.control_xref_source_register(req)?,
+            "xref_reload" => self.control_xref_reload(req)?,
+            "xref_unload" => self.control_xref_unload(req)?,
+            "xref_detach" => self.control_xref_detach(req)?,
+            "xref_bind" => self.control_xref_bind(req)?,
+            "xref_set_path" => self.control_xref_set_path(req)?,
+            "xref_set_type" => self.control_xref_set_type(req)?,
             "entities_delete" => self.control_entities_delete(req)?,
             "entities_transform" => self.control_entities_transform(req)?,
             "node_graph" => self.control_node_graph(req)?,
@@ -1400,7 +1541,12 @@ impl OpenCADStudio {
             "getpoint" => self.control_getpoint(req)?,
             "close" => self.control_close(req)?,
             "sysvar" => self.control_sysvar(req)?,
+            #[cfg(not(target_arch = "wasm32"))]
+            "plugin_call" => self.control_plugin_call(req)?,
             "layout_create" => self.control_layout_create(req)?,
+            "layout_rename" => self.control_layout_rename(req)?,
+            "layout_activate" => self.control_layout_activate(req)?,
+            "layout_delete" => self.control_layout_delete(req)?,
             "page_setup_set" => self.control_page_setup_set(req)?,
             "file_identity" => self.control_file_identity(req)?,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1421,6 +1567,25 @@ impl OpenCADStudio {
                     .map(std::path::PathBuf::from)
                     .or_else(|| self.tabs[i].current_path.clone())
                     .ok_or_else(|| failure("path_required", "Supply a save path"))?;
+                let destination_is_current = self.tabs[i]
+                    .current_path
+                    .as_deref()
+                    .is_some_and(|current| super::update::native_paths_match(current, &path));
+                // Keep the document's logical reference base for a current
+                // file reached through another spelling. The writer resolves
+                // its physical destination without moving the document.
+                let path = match self.tabs[i].current_path.as_ref() {
+                    Some(current) if destination_is_current => current.clone(),
+                    _ => path,
+                };
+                let require_new_destination =
+                    !destination_is_current && req["overwrite"].as_bool() != Some(true);
+                if require_new_destination && path.exists() {
+                    return Err(failure(
+                        "destination_exists",
+                        "Destination exists; set overwrite=true to replace a different file",
+                    ));
+                }
                 let default_is_dxf = crate::io::source_is_dxf(
                     self.tabs[i].current_path.as_deref(),
                     &self.tabs[i].scene.document,
@@ -1448,8 +1613,14 @@ impl OpenCADStudio {
                     "mtext_losses":losses.mtext_json(),
                 }));
                 if self.main_window.is_none() {
-                    self.save_tab_synchronously_protected_as(i, path, version, true)
-                        .map_err(|e| failure("save_failed", e))?;
+                    self.save_tab_synchronously_protected_as(
+                        i,
+                        path,
+                        version,
+                        true,
+                        require_new_destination,
+                    )
+                    .map_err(|e| failure("save_failed", e))?;
                     Task::none()
                 } else {
                     self.prepare_native_save(i);
@@ -1466,7 +1637,11 @@ impl OpenCADStudio {
                         i,
                         path,
                         version,
-                        super::SavePurpose::SaveAs,
+                        if require_new_destination {
+                            super::SavePurpose::SaveAsNew
+                        } else {
+                            super::SavePurpose::SaveAs
+                        },
                         super::SaveContinuation::None,
                         true,
                         true,
@@ -1501,6 +1676,11 @@ impl OpenCADStudio {
                     return Err(lossy_refusal(&losses));
                 }
                 let ext = if is_dxf { "dxf" } else { "dwg" };
+                if let Some(session) = &self.tabs[i].ifccad_session {
+                    session
+                        .check_destination(&self.tabs[i].scene.document, ext)
+                        .map_err(|error| failure("save_failed", error))?;
+                }
                 self.sync_view_state_for_save(i);
                 super::update::util::sync_annotation_scale_header(&mut self.tabs[i].scene);
                 self.stamp_header_sysvars(i);
@@ -1540,6 +1720,9 @@ impl OpenCADStudio {
                         "view region needs bounds [min_x, min_y, max_x, max_y]",
                     ));
                 }
+                if offscreen_capture::is_offscreen_capture(req) {
+                    return self.control_capture_offscreen(req);
+                }
                 self.main_window
                     .ok_or_else(|| failure("gui_required", "Capture requires a GUI window"))?;
                 string(req, "path")?;
@@ -1550,11 +1733,11 @@ impl OpenCADStudio {
 
                 // Optional framing / selection adjustments prior to snapshot:
                 if let Some(handles) = req.get("highlight_handles").and_then(Value::as_array) {
-                    let hex_handles: Vec<codec::Handle> = handles
+                    let hex_handles: Vec<document::Handle> = handles
                         .iter()
                         .filter_map(|v| v.as_str())
                         .filter_map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-                        .map(codec::Handle::new)
+                        .map(document::Handle::new)
                         .collect();
                     if !hex_handles.is_empty() {
                         let scene = &mut self.tabs[self.active_tab].scene;
@@ -1565,11 +1748,11 @@ impl OpenCADStudio {
                     }
                 }
                 if let Some(focus) = req.get("focus_handles").and_then(Value::as_array) {
-                    let hex_handles: Vec<codec::Handle> = focus
+                    let hex_handles: Vec<document::Handle> = focus
                         .iter()
                         .filter_map(|v| v.as_str())
                         .filter_map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-                        .map(codec::Handle::new)
+                        .map(document::Handle::new)
                         .collect();
                     if !hex_handles.is_empty() {
                         self.tabs[self.active_tab]
@@ -1625,6 +1808,15 @@ impl OpenCADStudio {
         }
     }
 
+    /// The pending request failed after it returned (work off the UI
+    /// thread): it settles with `value` (from `failure`), with its
+    /// `request_id`, as if it had failed at once.
+    pub(super) fn set_control_failure(&mut self, value: Value) {
+        if let Some(operation) = self.control.pending.as_mut() {
+            operation.failure = Some(value);
+        }
+    }
+
     pub(super) fn control_track(&mut self, task: Task<Message>) -> Task<Message> {
         let track_zero_unit = self.control.pending.as_ref().is_some_and(|p| {
             p.request["op"] == "run"
@@ -1649,7 +1841,7 @@ impl OpenCADStudio {
             .chain(Task::done(Message::ControlTaskDone(end)))
     }
     pub(super) fn control_step(&mut self, id: String, msg: Message) -> Task<Message> {
-        if !self.control.pending.as_ref().is_some_and(|p| p.id == id) {
+        if self.control.pending.as_ref().is_none_or(|p| p.id != id) {
             return Task::none();
         }
         let previous = self.active_tab;
@@ -1665,18 +1857,22 @@ impl OpenCADStudio {
         self.control.routing = true;
         let task = self.update(msg);
         self.control.routing = false;
+        let mut moved_to_new_tab = false;
         if let Some(pending) = self.control.pending.as_mut() {
-            if pending.document_id.is_none()
-                && matches!(
-                    pending.request["op"].as_str(),
-                    Some("new" | "open" | "activate" | "switch_document")
-                )
-                && pending.origin_document != self.tabs[self.active_tab].id
-            {
+            let op = pending.request["op"].as_str();
+            // A DGN import into a new drawing opens it when its read ends:
+            // the request follows that drawing, as it does when the import
+            // places at once.
+            let follows = (pending.document_id.is_none()
+                && matches!(op, Some("new" | "open" | "activate" | "switch_document")))
+                || (op == Some("dgn_import")
+                    && pending.document_id == Some(pending.origin_document));
+            if follows && pending.origin_document != self.tabs[self.active_tab].id {
                 pending.document_id = Some(self.tabs[self.active_tab].id);
+                moved_to_new_tab = op == Some("dgn_import");
             }
         }
-        if target.is_some() && previous < self.tabs.len() {
+        if target.is_some() && !moved_to_new_tab && previous < self.tabs.len() {
             self.active_tab = previous;
         }
         self.control_track(task)
@@ -1744,19 +1940,30 @@ impl OpenCADStudio {
         {
             self.active_tab = index;
         }
-        let failed = self.command_line.error_revision != p.error_revision;
+        let is_offscreen_capture =
+            p.request["op"] == "capture" && offscreen_capture::is_offscreen_capture(&p.request);
+        let failed = p.failure.is_some() || self.command_line.error_revision != p.error_revision;
         let waiting = self.tabs[self.active_tab].active_cmd.is_some()
             || self.active_modal.is_some()
             || self.mtext_editor.is_some()
             || self.text_inline.is_some();
-        if !waiting {
+        if !is_offscreen_capture && !waiting {
             self.control.owner = None;
+        }
+        // A command that starts after the request returned (one that asks
+        // for a file first) belongs to the client that ran it.
+        if matches!(p.request["op"].as_str(), Some("run" | "start"))
+            && self.control.owner.is_none()
+            && self.tabs[self.active_tab].active_cmd.is_some()
+        {
+            let client = p.request["client_id"].as_str().unwrap_or("default").to_owned();
+            self.control.owner = Some((self.tabs[self.active_tab].id, client));
         }
         let status = if failed {
             "failed"
         } else if p.cancelled || p.request["op"] == "cancel" {
             "cancelled"
-        } else if waiting {
+        } else if waiting && !is_offscreen_capture {
             "waiting_input"
         } else {
             "completed"
@@ -1781,7 +1988,15 @@ impl OpenCADStudio {
                 })
                 .collect::<Vec<_>>()
         });
-        let response = json!({"ok":!failed,"status":status,"request_id":p.id,"error":if failed{self.command_line.last_error.clone()}else{None},"result":p.result,"changes":changes,"state":self.control_state()});
+        let response = match p.failure.clone() {
+            Some(mut reply) => {
+                reply["request_id"] = json!(p.id);
+                reply
+            }
+            None => {
+                json!({"ok":!failed,"status":status,"request_id":p.id,"error":if failed{self.command_line.last_error.clone()}else{None},"result":p.result,"changes":changes,"state":self.control_state()})
+            }
+        };
         self.control.serial += 1;
         self.control.events.push_back(json!({"sequence":self.control.serial,"request_id":p.id,"status":status,"document_id":self.tabs[self.active_tab].id,"revision":self.tabs[self.active_tab].edit_revision}));
         while self.control.events.len() > 128 {
@@ -1800,13 +2015,13 @@ impl OpenCADStudio {
     }
     pub(super) fn control_measure(&self, req: &Value) -> Value {
         let tab = &self.tabs[self.active_tab];
-        let requested: Vec<codec::Handle> = req["handles"]
+        let requested: Vec<document::Handle> = req["handles"]
             .as_array()
             .map(|a| {
                 a.iter()
                     .filter_map(|v| v.as_str())
                     .filter_map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-                    .map(codec::Handle::new)
+                    .map(document::Handle::new)
                     .collect()
             })
             .unwrap_or_else(|| tab.scene.selected_handles_in_order());
@@ -1836,9 +2051,9 @@ impl OpenCADStudio {
                     min[axis].is_finite() && max[axis].is_finite() && min[axis] <= max[axis]
                 })
             };
-            let solid_bounds = if let codec::EntityType::Solid3D(solid) = entity {
-                crate::scene::convert::solid3d_tess::kernel_body(solid)
-                    .and_then(|body| kernel::brep::body_bounds(&body))
+            let solid_bounds = if let document::EntityType::Solid3D(solid) = entity {
+                crate::scene::convert::solid3d_tess::solid_record(solid)
+                    .and_then(|body| ocs_solid::model::aabb(&body))
                     .map(|bounds| (bounds.min, bounds.max))
                     .filter(valid_bounds)
                     .or_else(|| {
@@ -1988,48 +2203,12 @@ impl OpenCADStudio {
 
             // Optional Set-of-Marks visual overlay badges
             if annotate {
-                for ent_val in &grounding.visible_entities {
-                    if let (Some(tag), Some(px_arr), Some(selected)) = (
-                        ent_val["tag"].as_u64(),
-                        ent_val["screen_pixel"].as_array(),
-                        ent_val["selected"].as_bool(),
-                    ) {
-                        if px_arr.len() == 2 {
-                            if let (Some(x), Some(y)) = (px_arr[0].as_i64(), px_arr[1].as_i64()) {
-                                vision::draw_som_badge(
-                                    &mut image,
-                                    x as i32,
-                                    y as i32,
-                                    tag as usize,
-                                    selected,
-                                );
-                            }
-                        }
-                    }
-                }
+                offscreen_capture::draw_som_annotations(&mut image, &grounding.visible_entities);
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            image
-                .save_with_format(&path, image::ImageFormat::Png)
-                .map_err(|e| e.to_string())?;
-            // No filesystem behind a web "path": encode the PNG in memory and
-            // hand it to the browser as a download named after the request's
-            // file name — the delivery every other web output uses.
-            #[cfg(target_arch = "wasm32")]
-            {
-                let mut png = Vec::new();
-                image
-                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-                    .map_err(|e| e.to_string())?;
-                let download = path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("capture.png")
-                    .to_string();
-                crate::sys::download_bytes(&download, &png);
-            }
+            // On native, save PNG directly; on web (no filesystem), hand the
+            // encoded PNG to the browser as a download named after the path.
+            offscreen_capture::save_capture_png(&image, &path)?;
 
             let doc_unit = crate::app::properties::insunits_name(
                 self.tabs[self.active_tab]
@@ -2039,21 +2218,14 @@ impl OpenCADStudio {
                     .insertion_units,
             );
 
-            let spatial_obj = json!({
-                "crs": "CAD_WCS",
-                "unit": doc_unit,
-                "pixel_resolution": [image.width(), image.height()],
-                "world_bounds": grounding.viewport_world_bounds,
-                "pixel_to_world_matrix": grounding.pixel_to_world_matrix,
-                "world_to_pixel_matrix": grounding.world_to_pixel_matrix,
-                "camera": grounding.camera,
-                "target_plane": grounding.target_plane,
-                "annotations": grounding.visible_entities.clone(),
-            });
+            let spatial_obj =
+                offscreen_capture::spatial_metadata_json(doc_unit, &image, &grounding);
 
             Ok(json!({
                 "path": path,
                 "scope": actual_scope,
+                "layout": self.tabs[self.active_tab].scene.current_layout,
+                "offscreen": false,
                 "width": image.width(),
                 "height": image.height(),
                 "scale_factor": s.scale_factor,
@@ -2167,21 +2339,34 @@ impl OpenCADStudio {
     }
 }
 mod actions;
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) use actions::EmbedImageRead;
 pub(crate) mod vision;
-pub(crate) use actions::{property_json, row_id};
+pub(crate) use actions::{color_value, control_color, property_json, row_id};
+mod dgn_import;
 mod entities;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod http_bridge;
 mod interactive;
 mod node_graph;
+mod offscreen_capture;
+#[cfg(not(target_arch = "wasm32"))]
+mod offscreen_gpu;
+mod plugins;
 mod sheets;
+mod xrefs;
 pub(crate) use sheets::new_guid_v4;
+pub(crate) use sheets::{layout_listing, page_setup_read};
 pub(crate) mod block_ops;
 pub(crate) mod spellcheck;
 pub(crate) mod text_ops;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod embed_image_tests;
 #[cfg(test)]
 mod p1_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod save_tests;
 pub(super) fn action_names() -> &'static [&'static str] {
     actions::NAMES
 }
@@ -2196,7 +2381,7 @@ pub(super) fn controlled_open_pending(app: &OpenCADStudio) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn request(app: &mut OpenCADStudio, mut req: Value) -> Value {
+    pub(super) fn request(app: &mut OpenCADStudio, mut req: Value) -> Value {
         let state = app.control_state();
         req["protocol"] = json!(1);
         req["document_id"] = state["document_id"].clone();
@@ -2215,6 +2400,34 @@ mod tests {
         }
     }
     #[test]
+    fn plugin_panel_surface_ops_pass_the_control_envelope() {
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        // plugin_panels is a query: no request_id, no document_id.
+        let read = request(&mut app, json!({"op":"plugin_panels"}));
+        assert_eq!(read["ok"], true, "{read}");
+        assert!(read["panels"].is_array(), "{read}");
+        // plugin_panel_action carries a request_id (idempotent replay) but
+        // needs no document_id — panel surfaces are app-level state.
+        let payload = json!({
+            "op":"plugin_panel_action","request_id":"env-1",
+            "panel_id":"nobody:here","element":1,"kind":"node_activated"
+        });
+        let act = request(&mut app, payload.clone());
+        assert_eq!(act["ok"], false, "{act}");
+        assert!(
+            act["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown panel"),
+            "the envelope must let the action reach the facade: {act}"
+        );
+        // The same request_id replays the cached response (no double fire).
+        let replay = request(&mut app, payload);
+        assert_eq!(replay, act, "replay returns the cached response");
+    }
+
+    #[test]
     fn edits_reach_an_inactive_document_without_switching_tabs() {
         let mut app = OpenCADStudio::new_for_test();
         assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
@@ -2222,7 +2435,11 @@ mod tests {
         assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
         let visible = app.active_tab;
         let revision = |app: &OpenCADStudio| {
-            app.tabs.iter().find(|t| t.id == target).unwrap().edit_revision
+            app.tabs
+                .iter()
+                .find(|t| t.id == target)
+                .unwrap()
+                .edit_revision
         };
         let send = |app: &mut OpenCADStudio, mut req: Value| {
             req["protocol"] = json!(1);
@@ -2373,10 +2590,12 @@ mod tests {
         app.tabs[i]
             .scene
             .document
-            .add_entity(codec::entities::EntityType::Ray(codec::entities::Ray::new(
-                codec::types::Vector3::ZERO,
-                codec::types::Vector3::UNIT_X,
-            )))
+            .add_entity(document::entities::EntityType::Ray(
+                document::entities::Ray::new(
+                    document::types::Vector3::ZERO,
+                    document::types::Vector3::UNIT_X,
+                ),
+            ))
             .unwrap();
         let path = std::env::temp_dir().join(format!(
             "ocs_allow_lossy_converter_{}.ifcx",
@@ -2518,9 +2737,9 @@ mod tests {
     fn control_property_reads_dynamic_rows_as_scalars_and_sets_them_by_id() {
         use crate::scene::block_actions as actions;
         use crate::scene::block_distance_parameter as distance;
-        use codec::entities::{Insert, Line};
-        use codec::types::Vector3;
-        use codec::EntityType;
+        use document::entities::{Insert, Line};
+        use document::types::Vector3;
+        use document::EntityType;
 
         let mut app = OpenCADStudio::new_for_test();
         assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
@@ -2534,8 +2753,18 @@ mod tests {
                 Vector3::UNIT_X,
             ))],
         );
-        let definition = scene.document.block_records.get("DYN_PROPS").unwrap().handle;
-        let member = scene.document.block_records.get("DYN_PROPS").unwrap().entity_handles[0];
+        let definition = scene
+            .document
+            .block_records
+            .get("DYN_PROPS")
+            .unwrap()
+            .handle;
+        let member = scene
+            .document
+            .block_records
+            .get("DYN_PROPS")
+            .unwrap()
+            .entity_handles[0];
         let doc = &mut scene.document;
         let parameter = distance::create(
             doc,
@@ -2555,10 +2784,8 @@ mod tests {
             glam::DVec3::ZERO,
         )
         .unwrap();
-        let reference = scene.add_entity(EntityType::Insert(Insert::new(
-            "DYN_PROPS",
-            Vector3::ZERO,
-        )));
+        let reference =
+            scene.add_entity(EntityType::Insert(Insert::new("DYN_PROPS", Vector3::ZERO)));
         assert_eq!(
             request(&mut app, json!({"op":"select","type":"INSERT"}))["ok"],
             true
@@ -2607,10 +2834,7 @@ mod tests {
             .expect("X component row")
             .clone();
         let depth = app.tabs[i].history.undo_stack.len();
-        let changed = request(
-            &mut app,
-            json!({"op":"property","field":x["id"],"value":3}),
-        );
+        let changed = request(&mut app, json!({"op":"property","field":x["id"],"value":3}));
         assert_eq!(changed["ok"], true, "{changed}");
         assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
         let after = rows(&mut app);
@@ -2661,9 +2885,9 @@ mod tests {
     #[test]
     fn control_property_sets_dynamic_visibility_with_tooltip() {
         use crate::scene::block_visibility;
-        use codec::entities::{Insert, Line};
-        use codec::types::Vector3;
-        use codec::EntityType;
+        use document::entities::{Insert, Line};
+        use document::types::Vector3;
+        use document::EntityType;
 
         let mut app = OpenCADStudio::new_for_test();
         assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
@@ -2800,7 +3024,10 @@ mod tests {
         let before = revision(&app);
         request(&mut app, json!({"op":"select","handles":[&lines[0]]}));
         let first = revision(&app);
-        assert!(first > before, "the first select left the counter at {first}");
+        assert!(
+            first > before,
+            "the first select left the counter at {first}"
+        );
 
         request(&mut app, json!({"op":"select","handles":[&lines[1]]}));
         let second = revision(&app);
@@ -2851,21 +3078,29 @@ mod tests {
         );
         assert_eq!(fed["ok"], true, "{fed}");
         request(&mut app, json!({"op":"input","kind":"enter"}));
-        request(&mut app, json!({"op":"input","kind":"point","point":[0,0,0]}));
-        request(&mut app, json!({"op":"input","kind":"point","point":[5,5,0]}));
+        request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[0,0,0]}),
+        );
+        request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[5,5,0]}),
+        );
         let applied = request(&mut app, json!({"op":"input","kind":"enter"}));
         assert_eq!(applied["ok"], true, "{applied}");
 
         let document = &app.tabs[app.active_tab].scene.document;
-        let codec::EntityType::Line(line) = document
-            .get_entity(codec::Handle::new(u64::from_str_radix(&handle, 16).unwrap()))
+        let document::EntityType::Line(line) = document
+            .get_entity(document::Handle::new(
+                u64::from_str_radix(&handle, 16).unwrap(),
+            ))
             .unwrap()
         else {
             panic!("expected the line");
         };
         assert_eq!(
             line.start,
-            codec::types::Vector3::new(5.0, 5.0, 0.0),
+            document::types::Vector3::new(5.0, 5.0, 0.0),
             "the alignment translated the named handle, not the scene selection"
         );
     }
@@ -2880,7 +3115,10 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
         for y in [0.0, 4.0, 8.0] {
-            request(&mut app, json!({"op":"run","cmd":format!("LINE 0,{y} 10,{y}")}));
+            request(
+                &mut app,
+                json!({"op":"run","cmd":format!("LINE 0,{y} 10,{y}")}),
+            );
         }
         let i = app.active_tab;
         app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600.0, 900.0);
@@ -2895,7 +3133,10 @@ mod tests {
                 json!({"op":"click","point":[2.0,y,0.0],"modifiers":modifiers}),
             );
             assert_eq!(r["ok"], true, "{r}");
-            app.tabs[app.active_tab].scene.selected_handles_in_order().len()
+            app.tabs[app.active_tab]
+                .scene
+                .selected_handles_in_order()
+                .len()
         };
         assert_eq!(click(&mut app, 0.0, ""), 1, "the first plain click picks");
         assert_eq!(click(&mut app, 4.0, ""), 2, "a second plain click adds");
@@ -2905,7 +3146,11 @@ mod tests {
             1,
             "Shift-click on an unselected line leaves the set alone"
         );
-        assert_eq!(click(&mut app, 8.0, ""), 2, "the set accumulates afterwards");
+        assert_eq!(
+            click(&mut app, 8.0, ""),
+            2,
+            "the set accumulates afterwards"
+        );
 
         // PICKADD 0 swaps the plain pick's rule to replace, and Shift becomes
         // the toggle that puts an unselected object into the set.
@@ -2916,7 +3161,11 @@ mod tests {
             2,
             "PICKADD 0 Shift-click adds an unselected line"
         );
-        assert_eq!(click(&mut app, 4.0, "shift"), 1, "and the next one takes it back");
+        assert_eq!(
+            click(&mut app, 4.0, "shift"),
+            1,
+            "and the next one takes it back"
+        );
     }
 
     /// A region capture frames the camera from `bounds`; without them there is
@@ -2927,14 +3176,20 @@ mod tests {
     fn a_region_capture_without_bounds_is_refused_by_name() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
-        let r = request(&mut app, json!({"op":"capture","path":"x.png","view":"region"}));
+        let r = request(
+            &mut app,
+            json!({"op":"capture","path":"x.png","view":"region"}),
+        );
         assert_eq!(r["ok"], false, "{r}");
         assert_eq!(r["code"], "invalid_request", "{r}");
         let r = request(
             &mut app,
             json!({"op":"capture","path":"x.png","view":"region","bounds":[-1,-1,1,1]}),
         );
-        assert_eq!(r["code"], "gui_required", "well-formed, only the window is missing: {r}");
+        assert_eq!(
+            r["code"], "gui_required",
+            "well-formed, only the window is missing: {r}"
+        );
     }
 
     /// CPCONSTRAINT's point pick resolves against the addressable points in
@@ -2950,11 +3205,11 @@ mod tests {
         request(&mut app, json!({"op":"new"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
         request(&mut app, json!({"op":"run","cmd":"CIRCLE 5,5 2"}));
-        let circle =
-            request(&mut app, json!({"op":"query","type":"Circle"}))["entities"][0]["handle"]
-                .as_str()
-                .unwrap()
-                .to_string();
+        let circle = request(&mut app, json!({"op":"query","type":"Circle"}))["entities"][0]
+            ["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let constraints = |app: &OpenCADStudio| {
             app.tabs[app.active_tab]
                 .scene
@@ -2963,20 +3218,39 @@ mod tests {
         };
 
         request(&mut app, json!({"op":"run","cmd":"CPCONSTRAINT"}));
-        request(&mut app, json!({"op":"input","kind":"selection","handles":[&circle]}));
+        request(
+            &mut app,
+            json!({"op":"input","kind":"selection","handles":[&circle]}),
+        );
         request(&mut app, json!({"op":"input","kind":"enter"}));
-        let r = request(&mut app, json!({"op":"input","kind":"point","point":[5,5,0]}));
+        let r = request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[5,5,0]}),
+        );
         assert_eq!(r["ok"], false, "{r}");
         assert!(
-            r["error"].as_str().unwrap_or("").contains("didn't land on a point"),
+            r["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("didn't land on a point"),
             "{r}"
         );
-        assert_eq!(constraints(&app), 0, "the target's own centre is not a point pick");
+        assert_eq!(
+            constraints(&app),
+            0,
+            "the target's own centre is not a point pick"
+        );
 
         request(&mut app, json!({"op":"run","cmd":"CPCONSTRAINT"}));
-        request(&mut app, json!({"op":"input","kind":"selection","handles":[&circle]}));
+        request(
+            &mut app,
+            json!({"op":"input","kind":"selection","handles":[&circle]}),
+        );
         request(&mut app, json!({"op":"input","kind":"enter"}));
-        let r = request(&mut app, json!({"op":"input","kind":"point","point":[0,0,0]}));
+        let r = request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[0,0,0]}),
+        );
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(
             constraints(&app),
@@ -3042,17 +3316,34 @@ mod tests {
             let r = request(&mut app, json!({"op":"input","kind":"point","point":point}));
             assert_eq!(r["ok"], true, "picks 1-3 are not judged yet: {r}");
         }
-        assert_eq!(constraints(&app), 0, "nothing is judged before the fourth pick");
-        let r = request(&mut app, json!({"op":"input","kind":"point","point":[10.0,5.0,0.0]}));
+        assert_eq!(
+            constraints(&app),
+            0,
+            "nothing is judged before the fourth pick"
+        );
+        let r = request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[10.0,5.0,0.0]}),
+        );
         assert_eq!(r["ok"], true, "{r}");
-        assert_eq!(constraints(&app), 1, "four exact endpoints make the constraint");
+        assert_eq!(
+            constraints(&app),
+            1,
+            "four exact endpoints make the constraint"
+        );
 
         request(&mut app, json!({"op":"run","cmd":"EDCONSTRAINT"}));
         for point in [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 5.0, 0.0]] {
             request(&mut app, json!({"op":"input","kind":"point","point":point}));
         }
-        let r = request(&mut app, json!({"op":"input","kind":"point","point":[5.0,2.0,0.0]}));
-        assert_eq!(r["ok"], false, "a point on nothing is refused at the fourth: {r}");
+        let r = request(
+            &mut app,
+            json!({"op":"input","kind":"point","point":[5.0,2.0,0.0]}),
+        );
+        assert_eq!(
+            r["ok"], false,
+            "a point on nothing is refused at the fourth: {r}"
+        );
         assert_eq!(constraints(&app), 1);
     }
 
@@ -3067,13 +3358,13 @@ mod tests {
         request(&mut app, json!({"op":"new"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,5 4,5"}));
-        let handles: Vec<String> =
-            request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entity| entity["handle"].as_str().unwrap().to_string())
-                .collect();
+        let handles: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))
+            ["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(handles.len(), 2);
         let constraints = |app: &OpenCADStudio| {
             app.tabs[app.active_tab]
@@ -3082,10 +3373,12 @@ mod tests {
                 .map_or(0, |set| set.constraints.len())
         };
         let line_length = |app: &OpenCADStudio, handle: &str| {
-            let codec::EntityType::Line(line) = app.tabs[app.active_tab]
+            let document::EntityType::Line(line) = app.tabs[app.active_tab]
                 .scene
                 .document
-                .get_entity(codec::Handle::new(u64::from_str_radix(handle, 16).unwrap()))
+                .get_entity(document::Handle::new(
+                    u64::from_str_radix(handle, 16).unwrap(),
+                ))
                 .unwrap()
             else {
                 panic!("expected a line");
@@ -3139,7 +3432,8 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
-        let handle = request(&mut app, json!({"op":"query","type":"Line"}))["entities"][0]["handle"]
+        let handle = request(&mut app, json!({"op":"query","type":"Line"}))["entities"][0]
+            ["handle"]
             .as_str()
             .unwrap()
             .to_string();
@@ -3216,8 +3510,7 @@ mod tests {
         assert!(
             solved["changes"].as_array().is_some_and(|changes| changes
                 .iter()
-                .any(|change| change["handle"] == sloped.as_str()
-                    && change["kind"] == "Modified")),
+                .any(|change| change["handle"] == sloped.as_str() && change["kind"] == "Modified")),
             "a line the solver levelled is named: {solved}"
         );
     }
@@ -3231,7 +3524,8 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
-        let handle = request(&mut app, json!({"op":"query","type":"Line"}))["entities"][0]["handle"]
+        let handle = request(&mut app, json!({"op":"query","type":"Line"}))["entities"][0]
+            ["handle"]
             .as_str()
             .unwrap()
             .to_string();
@@ -3277,20 +3571,27 @@ mod tests {
         let i = app.active_tab;
         app.tabs[i].scene.define_block_raw(
             "HIDE_ME",
-            codec::types::Vector3::ZERO,
-            vec![codec::EntityType::Line(codec::entities::Line::from_points(
-                codec::types::Vector3::ZERO,
-                codec::types::Vector3::UNIT_X,
-            ))],
+            document::types::Vector3::ZERO,
+            vec![document::EntityType::Line(
+                document::entities::Line::from_points(
+                    document::types::Vector3::ZERO,
+                    document::types::Vector3::UNIT_X,
+                ),
+            )],
         );
-        let definition = app.tabs[i].scene.document.block_records.get("HIDE_ME").unwrap().handle;
+        let definition = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("HIDE_ME")
+            .unwrap()
+            .handle;
         let reference = app.tabs[i]
             .scene
             .document
-            .add_entity(codec::EntityType::Insert(codec::entities::Insert::new(
-                "HIDE_ME",
-                codec::types::Vector3::ZERO,
-            )))
+            .add_entity(document::EntityType::Insert(
+                document::entities::Insert::new("HIDE_ME", document::types::Vector3::ZERO),
+            ))
             .unwrap();
         let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
         assert!(app.tabs[i].active_block_edit.is_some());
@@ -3301,7 +3602,10 @@ mod tests {
             .get("HIDE_ME")
             .unwrap()
             .entity_handles[0];
-        request(&mut app, json!({"op":"select","handles":[format!("{:X}", line.value())]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[format!("{:X}", line.value())]}),
+        );
         request(&mut app, json!({"op":"run","cmd":"GCHORIZONTAL"}));
         let id = app.tabs[i]
             .scene
@@ -3449,7 +3753,10 @@ mod tests {
         };
 
         // Two lines form a collinear pair, so the alias applies it.
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &lines[1]]}),
+        );
         let colinear = request(&mut app, json!({"op":"run","cmd":"LCONSTRAINT"}));
         assert_eq!(colinear["ok"], true, "{colinear}");
         assert!(
@@ -3470,7 +3777,10 @@ mod tests {
         );
 
         // A line and a circle are a normal pair, so the alias applies it.
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &circle]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &circle]}),
+        );
         let normal = request(&mut app, json!({"op":"run","cmd":"NRCONSTRAINT"}));
         assert_eq!(normal["ok"], true, "{normal}");
         assert!(
@@ -3488,7 +3798,10 @@ mod tests {
 
         // Two objects are more than the point-on-curve alias can place a
         // point against, so it refuses instead of answering success.
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &circle]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &circle]}),
+        );
         let on_curve = request(&mut app, json!({"op":"run","cmd":"OCCONSTRAINT"}));
         assert_eq!(
             on_curve["ok"], false,
@@ -3497,7 +3810,10 @@ mod tests {
         assert!(app.tabs[app.active_tab].active_cmd.is_none());
 
         // The distance alias takes one object; two is a refusal.
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &lines[1]]}),
+        );
         let distance = request(&mut app, json!({"op":"run","cmd":"DCONSTRAINT"}));
         assert_eq!(
             distance["ok"], false,
@@ -3508,13 +3824,17 @@ mod tests {
         // With nothing picked it asks for the objects instead.
         request(&mut app, json!({"op":"select","clear":true}));
         let distance_prompt = request(&mut app, json!({"op":"run","cmd":"DCONSTRAINT"}));
-        assert_eq!(distance_prompt["status"], "waiting_input", "{distance_prompt}");
+        assert_eq!(
+            distance_prompt["status"], "waiting_input",
+            "{distance_prompt}"
+        );
         app.tabs[app.active_tab].active_cmd = None;
 
         // One object the distance alias cannot measure: refuse, and name the
         // objects it does accept.
         request(&mut app, json!({"op":"run","cmd":"POINT 5,5"}));
-        let point = request(&mut app, json!({"op":"query","type":"Point"}))["entities"][0]["handle"]
+        let point = request(&mut app, json!({"op":"query","type":"Point"}))["entities"][0]
+            ["handle"]
             .as_str()
             .unwrap()
             .to_string();
@@ -3531,12 +3851,18 @@ mod tests {
         for cmd in ["QCONSTRAINT", "TCONSTRAINT"] {
             request(&mut app, json!({"op":"select","handles":[&lines[0]]}));
             let refused = request(&mut app, json!({"op":"run","cmd":cmd}));
-            assert_eq!(refused["ok"], false, "{cmd} must refuse one object: {refused}");
+            assert_eq!(
+                refused["ok"], false,
+                "{cmd} must refuse one object: {refused}"
+            );
             assert!(app.tabs[app.active_tab].active_cmd.is_none());
         }
 
         // A refusal must not leave the symmetric command mid-flight.
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &lines[1]]}),
+        );
         let symmetric = request(&mut app, json!({"op":"run","cmd":"SYCONSTRAINT"}));
         assert_eq!(symmetric["ok"], false, "{symmetric}");
         assert!(
@@ -3583,7 +3909,7 @@ mod tests {
             .iter()
             .map(|entity| entity["handle"].as_str().unwrap().to_string())
             .collect();
-        let line = codec::Handle::new(u64::from_str_radix(&lines[0], 16).unwrap());
+        let line = document::Handle::new(u64::from_str_radix(&lines[0], 16).unwrap());
         let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
             kind: ConstraintKind::DistanceX,
             first: ParametricRef::point(line, 0),
@@ -3605,7 +3931,9 @@ mod tests {
             .and_then(|set| set.dimensions.values().next())
             .expect("the dimensional constraint created its dimension");
         assert!(
-            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            !app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "a new dimensional constraint starts in the dynamic form"
         );
 
@@ -3638,20 +3966,26 @@ mod tests {
             "converting the selection finishes the command"
         );
         assert!(
-            app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "the selected constraint now uses the annotational form: {converted}"
         );
         // The conversion is one undo step; redo re-applies it.
         let undone = request(&mut app, json!({"op":"run","cmd":"UNDO"}));
         assert_eq!(undone["ok"], true, "{undone}");
         assert!(
-            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            !app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "UNDO restores the dynamic form: {undone}"
         );
         let redone = request(&mut app, json!({"op":"run","cmd":"REDO"}));
         assert_eq!(redone["ok"], true, "{redone}");
         assert!(
-            app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "REDO re-applies the annotational form: {redone}"
         );
         let annotational = record(&mut app);
@@ -3671,11 +4005,15 @@ mod tests {
         assert_eq!(same["ok"], true, "{same}");
         let undone = request(&mut app, json!({"op":"run","cmd":"UNDO"}));
         assert!(
-            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            !app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "a repeated answer leaves no phantom undo step: {undone}"
         );
         request(&mut app, json!({"op":"run","cmd":"REDO"}));
-        assert!(app.tabs[app.active_tab].scene.dimension_is_annotational(dimension));
+        assert!(app.tabs[app.active_tab]
+            .scene
+            .dimension_is_annotational(dimension));
 
         // And back, so the conversion works both ways.
         request(
@@ -3683,10 +4021,15 @@ mod tests {
             json!({"op":"select","handles":[format!("{:X}", dimension.value())]}),
         );
         request(&mut app, json!({"op":"run","cmd":"DCFORM"}));
-        let converted = request(&mut app, json!({"op":"input","kind":"token","text":"Dynamic"}));
+        let converted = request(
+            &mut app,
+            json!({"op":"input","kind":"token","text":"Dynamic"}),
+        );
         assert_eq!(converted["ok"], true, "{converted}");
         assert!(
-            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            !app.tabs[app.active_tab]
+                .scene
+                .dimension_is_annotational(dimension),
             "the selected constraint is dynamic again: {converted}"
         );
 
@@ -3721,7 +4064,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        let line = codec::Handle::new(
+        let line = document::Handle::new(
             u64::from_str_radix(lines[0]["handle"].as_str().unwrap(), 16).unwrap(),
         );
         let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
@@ -3741,7 +4084,7 @@ mod tests {
         app.drive_headless_task(task).unwrap();
 
         let document = &app.tabs[app.active_tab].scene.document;
-        let codec::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
+        let document::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
             panic!("the picked entity is the line");
         };
         assert!(
@@ -3766,7 +4109,7 @@ mod tests {
             .parametric_constraint_set(ParametricScope::ModelSpace)
             .and_then(|set| set.dimensions.values().next().copied())
             .expect("the constraint drives a dimension");
-        let codec::EntityType::Dimension(printed) = app.tabs[app.active_tab]
+        let document::EntityType::Dimension(printed) = app.tabs[app.active_tab]
             .scene
             .document
             .get_entity(dimension)
@@ -3798,7 +4141,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        let line = codec::Handle::new(
+        let line = document::Handle::new(
             u64::from_str_radix(drawn[0]["handle"].as_str().unwrap(), 16).unwrap(),
         );
         let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
@@ -3822,9 +4165,10 @@ mod tests {
             .parametric_constraint_set(ParametricScope::ModelSpace)
             .and_then(|set| set.dimensions.values().next().copied())
             .expect("the constraint drives a dimension");
-        let placement = |document: &codec::Document| {
-            let codec::EntityType::Dimension(printed) =
-                document.get_entity(dimension).expect("the dimension is in the document")
+        let placement = |document: &document::Document| {
+            let document::EntityType::Dimension(printed) = document
+                .get_entity(dimension)
+                .expect("the dimension is in the document")
             else {
                 panic!("the constraint's dimension is a dimension");
             };
@@ -3840,13 +4184,13 @@ mod tests {
             "the dimension line keeps the side the label was given on: {definition:?}"
         );
         assert!(
-            text == codec::types::Vector3::ZERO && !positioned,
+            text == document::types::Vector3::ZERO && !positioned,
             "a dynamic label is placed automatically, not pinned: {text:?}"
         );
-        let bytes = codec::DxfWriter::new(&app.tabs[app.active_tab].scene.document)
+        let bytes = document::DxfWriter::new(&app.tabs[app.active_tab].scene.document)
             .write_to_vec()
             .unwrap();
-        let reopened = codec::DxfReader::from_reader(std::io::Cursor::new(bytes))
+        let reopened = document::DxfReader::from_reader(std::io::Cursor::new(bytes))
             .unwrap()
             .read()
             .unwrap();
@@ -3875,7 +4219,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        let line = codec::Handle::new(
+        let line = document::Handle::new(
             u64::from_str_radix(drawn[0]["handle"].as_str().unwrap(), 16).unwrap(),
         );
         let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
@@ -3895,7 +4239,7 @@ mod tests {
         app.drive_headless_task(task).unwrap();
         let end_x = |app: &OpenCADStudio| {
             let document = &app.tabs[app.active_tab].scene.document;
-            let codec::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
+            let document::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
                 panic!("the picked entity is the line");
             };
             line_entity.end.x
@@ -4005,7 +4349,10 @@ mod tests {
                     .count()
             })
             .unwrap_or(0);
-        assert_eq!(horizontal, 2, "Enter applied the remembered type: {accepted}");
+        assert_eq!(
+            horizontal, 2,
+            "Enter applied the remembered type: {accepted}"
+        );
     }
 
     /// The dedicated geometric-constraint names run the same handlers as the
@@ -4025,7 +4372,10 @@ mod tests {
             .map(|entity| entity["handle"].as_str().unwrap().to_string())
             .collect();
 
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &lines[1]]}),
+        );
         let parallel = request(&mut app, json!({"op":"run","cmd":"GCPARALLEL"}));
         assert_eq!(parallel["ok"], true, "{parallel}");
         let parallel_count = app.tabs[app.active_tab]
@@ -4053,7 +4403,10 @@ mod tests {
             .iter()
             .map(|entity| entity["handle"].as_str().unwrap().to_string())
             .collect();
-        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        request(
+            &mut app,
+            json!({"op":"select","handles":[&lines[0], &lines[1]]}),
+        );
         let collinear = request(&mut app, json!({"op":"run","cmd":"GCCOLLINEAR"}));
         assert_eq!(collinear["ok"], true, "{collinear}");
         let collinear_count = app.tabs[app.active_tab]
@@ -4167,16 +4520,17 @@ mod tests {
             let queried = request(&mut app, json!({"op":"query","type":"3DSOLID"}));
             let handle = queried["entities"][0]["handle"].clone();
             if center[0] != 0.0 {
-                let key =
-                    codec::Handle::new(u64::from_str_radix(handle.as_str().unwrap(), 16).unwrap());
+                let key = document::Handle::new(
+                    u64::from_str_radix(handle.as_str().unwrap(), 16).unwrap(),
+                );
                 let scene = &mut app.tabs[app.active_tab].scene;
                 assert!(scene.meshes.contains_key(&key));
                 // Keep the real mesh but force bounds to use its double-single vertices.
-                let Some(codec::EntityType::Solid3D(solid)) = scene.document.get_entity_mut(key)
+                let Some(document::EntityType::Solid3D(solid)) = scene.document.get_entity_mut(key)
                 else {
                     panic!("expected a torus solid");
                 };
-                solid.acis_data = codec::entities::AcisData::from_sat("");
+                solid.acis_data = document::entities::AcisData::from_sat("");
             }
             let measured = request(&mut app, json!({"op":"measure","handles":[handle]}));
             let bounds = &measured["measurements"][0]["bounds"];
@@ -4290,7 +4644,9 @@ mod tests {
         let scene = &mut app.tabs[app.active_tab].scene;
         let handle = scene
             .document
-            .add_entity(codec::EntityType::Solid3D(codec::entities::Solid3D::new()))
+            .add_entity(document::EntityType::Solid3D(
+                document::entities::Solid3D::new(),
+            ))
             .unwrap();
         let entity = scene.document.get_entity(handle).unwrap();
         let (min, max) = crate::scene::convert::tess::entity_bounds_in(&scene.document, entity);
@@ -4333,7 +4689,7 @@ mod tests {
             .document
             .entities()
             .find_map(|entity| {
-                matches!(entity, codec::EntityType::Solid3D(_)).then(|| entity.common().handle)
+                matches!(entity, document::EntityType::Solid3D(_)).then(|| entity.common().handle)
             })
             .unwrap();
         let handle_text = format!("{:X}", handle.value());
@@ -4352,14 +4708,18 @@ mod tests {
 
         let measured = app.control_measure(&json!({"handles":[handle_text]}));
         let mesh = &measured["measurements"][0]["mesh"];
-        assert!((mesh["volume"].as_f64().unwrap() - 50.0).abs() < 1e-9);
+        assert!(
+            (mesh["volume"].as_f64().unwrap() - 50.0).abs() < 1e-9,
+            "{}",
+            mesh["volume"]
+        );
         assert_eq!(mesh["principal_moments"].as_array().unwrap().len(), 3);
         assert!(matches!(
             app.tabs[app.active_tab]
                 .scene
                 .document
                 .solid_history_operation(handle),
-            Some(codec::objects::SolidHistoryOperation::Brep(_))
+            Some(document::objects::SolidHistoryOperation::Brep(_))
         ));
 
         assert_eq!(request(&mut app, json!({"op":"undo"}))["ok"], true);
@@ -4460,8 +4820,35 @@ mod tests {
         ));
     }
 
+    /// A request that fails after it returned settles with that failure
+    /// (its `code` and `error`) and its `request_id`, as if it had failed
+    /// at once.
     #[test]
-    fn controlled_open_fails_instead_of_waiting_on_the_recovery_prompt() {
+    fn a_later_failure_settles_with_its_code_and_request_id() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.control.pending = Some(Operation {
+            id: "later-failure".to_string(),
+            request: json!({"op":"dgn_import"}),
+            pending: 0,
+            error_revision: app.command_line.error_revision,
+            document_id: None,
+            origin_document: app.tabs[app.active_tab].id,
+            geometry_revision: 0,
+            result: json!({}),
+            cancelled: false,
+            failure: None,
+        });
+        app.set_control_failure(failure("invalid_dgn", "Not a DGN file"));
+        app.control_settle();
+        let (_, _, response) = app.control.completed.back().expect("settled").clone();
+        assert_eq!(
+            response,
+            json!({"ok":false,"status":"failed","code":"invalid_dgn","error":"Not a DGN file","request_id":"later-failure"})
+        );
+    }
+
+    #[test]
+    fn controlled_open_recovers_instead_of_waiting_on_the_recovery_prompt() {
         let mut app = OpenCADStudio::new_for_test();
         let errors = app.command_line.error_revision;
         app.control.pending = Some(Operation {
@@ -4474,6 +4861,7 @@ mod tests {
             geometry_revision: 0,
             result: json!({}),
             cancelled: false,
+            failure: None,
         });
         recoverable_open_failure(&mut app);
         assert!(app.opening.is_none());
@@ -4520,7 +4908,10 @@ mod tests {
     fn close_confirmation_prompt_is_automatable() {
         use crate::app::ModalKind;
         let mut app = OpenCADStudio::new_for_test();
-        assert_eq!(request(&mut app, json!({"op":"new"}))["status"], "completed");
+        assert_eq!(
+            request(&mut app, json!({"op":"new"}))["status"],
+            "completed"
+        );
         assert_eq!(
             request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}))["status"],
             "completed"
@@ -4548,7 +4939,10 @@ mod tests {
         assert_eq!(request(&mut app, json!({"op":"entities"}))["total"], 0);
         // Save closes the drawing through the save flow rather than refusing.
         let mut app = OpenCADStudio::new_for_test();
-        assert_eq!(request(&mut app, json!({"op":"new"}))["status"], "completed");
+        assert_eq!(
+            request(&mut app, json!({"op":"new"}))["status"],
+            "completed"
+        );
         let path = std::env::temp_dir().join(format!("ocs-close-{}.dwg", session_id()));
         assert_eq!(
             request(&mut app, json!({"op":"save","path":path}))["ok"],
@@ -4564,6 +4958,156 @@ mod tests {
         assert_ne!(app.active_modal, Some(ModalKind::Unsaved));
         assert!(path.is_file(), "the closed drawing was written to disk");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn block_edit_changes_dialog_is_answerable_through_the_automation_bridge() {
+        use crate::app::ModalKind;
+        use document::entities::{Insert, Line};
+        use document::types::Vector3;
+        use document::EntityType;
+
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        app.tabs[i].scene.define_block_raw(
+            "EDIT_ME",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::UNIT_X,
+            ))],
+        );
+        let reference = app.tabs[i]
+            .scene
+            .document
+            .add_entity(EntityType::Insert(Insert::new("EDIT_ME", Vector3::ZERO)))
+            .unwrap();
+        app.tabs[i].dirty = false;
+
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+        assert!(app.tabs[i].active_block_edit.is_some());
+        let drawn = request(&mut app, json!({"op":"run","cmd":"LINE 0,0 5,0"}));
+        assert_eq!(drawn["ok"], true, "{drawn}");
+
+        let _ = app.dispatch_command("BCLOSE");
+        assert_eq!(app.active_modal, Some(ModalKind::BlockEditChanges));
+        let cancelled = request(&mut app, json!({"op":"action","name":"dialog_cancel"}));
+        assert_eq!(cancelled["ok"], true, "{cancelled}");
+        assert!(app.tabs[i].active_block_edit.is_some());
+
+        let _ = app.dispatch_command("BCLOSE");
+        assert_eq!(app.active_modal, Some(ModalKind::BlockEditChanges));
+        let discarded = request(&mut app, json!({"op":"action","name":"dialog_discard"}));
+        assert_eq!(discarded["ok"], true, "{discarded}");
+        assert!(app.tabs[i].active_block_edit.is_none());
+
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+        assert!(app.tabs[i].active_block_edit.is_some());
+        let drawn = request(&mut app, json!({"op":"run","cmd":"LINE 5,0 10,0"}));
+        assert_eq!(drawn["ok"], true, "{drawn}");
+
+        let _ = app.dispatch_command("BCLOSE");
+        assert_eq!(app.active_modal, Some(ModalKind::BlockEditChanges));
+        let saved = request(&mut app, json!({"op":"action","name":"dialog_ok"}));
+        assert_ne!(saved["code"], "no_dialog", "{saved}");
+        assert!(app.tabs[i].active_block_edit.is_none());
+    }
+
+    #[test]
+    fn write_block_dialog_is_answerable_through_the_automation_bridge() {
+        use crate::app::ModalKind;
+        use document::entities::Line;
+        use document::types::Vector3;
+        use document::EntityType;
+
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        app.tabs[i]
+            .scene
+            .document
+            .add_entity(EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::UNIT_X,
+            )))
+            .unwrap();
+
+        let temp = std::env::temp_dir().join(format!("ocs-wblock-{}.dwg", session_id()));
+        let _ = std::fs::remove_file(&temp);
+        let drawn = request(&mut app, json!({"op":"run","cmd":"SELECTALL"}));
+        assert_eq!(drawn["ok"], true, "{drawn}");
+        let opened = request(&mut app, json!({"op":"run","cmd":"WBLOCK"}));
+        assert_ne!(opened["code"], "bad_request", "{opened}");
+        assert_eq!(app.active_modal, Some(ModalKind::WriteBlock));
+        for value in [
+            "source=objects",
+            "object_mode=delete",
+            &format!("file={}", temp.to_string_lossy()),
+            "unit=6",
+        ] {
+            let reply = request(
+                &mut app,
+                json!({"op":"action","name":"wblock_dialog","value":value}),
+            );
+            assert_eq!(reply["ok"], true, "{value}: {reply}");
+        }
+        let applied = request(&mut app, json!({"op":"action","name":"dialog_ok"}));
+        assert_ne!(applied["code"], "no_dialog", "{applied}");
+        assert!(temp.is_file(), "WBLOCK wrote {}", temp.display());
+        let _ = std::fs::remove_file(&temp);
+        assert_ne!(app.active_modal, Some(ModalKind::WriteBlock));
+    }
+
+    #[test]
+    fn block_definition_dialog_fields_are_automatable() {
+        use crate::app::ModalKind;
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(
+            request(&mut app, json!({"op":"new"}))["status"],
+            "completed"
+        );
+        let drawn = request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        assert_eq!(drawn["ok"], true, "{drawn}");
+        let selected = request(&mut app, json!({"op":"run","cmd":"SELECTALL"}));
+        assert_eq!(selected["ok"], true, "{selected}");
+        let opened = request(&mut app, json!({"op":"run","cmd":"BLOCK"}));
+        assert_ne!(opened["code"], "bad_request", "{opened}");
+        assert_eq!(app.active_modal, Some(ModalKind::BlockDefinition));
+        for value in [
+            "name=ROBOT_BA_5",
+            "mode=delete",
+            "annotative=1",
+            "scale_uniformly=1",
+            "allow_exploding=0",
+            "match_orientation=1",
+            "unit=4",
+            "description=A welded part",
+        ] {
+            let reply = request(
+                &mut app,
+                json!({"op":"action","name":"block_def_dialog","value":value}),
+            );
+            assert_eq!(reply["ok"], true, "{value}: {reply}");
+        }
+        let applied = request(&mut app, json!({"op":"action","name":"dialog_ok"}));
+        assert_ne!(applied["code"], "no_dialog", "{applied}");
+        assert_ne!(app.active_modal, Some(ModalKind::BlockDefinition));
+        let record = app.tabs[app.active_tab]
+            .scene
+            .document
+            .block_records
+            .get("ROBOT_BA_5")
+            .cloned();
+        let record = record.expect("the definition was created through the bridge");
+        assert_eq!(record.units, 4, "the unit was applied");
+        assert_eq!(record.explodable, false, "allow_exploding=0 was applied");
+        assert_eq!(record.scale_uniformly, true, "scale_uniformly was applied");
+        assert!(
+            record.description.contains("welded part"),
+            "description was applied: {}",
+            record.description
+        );
     }
 
     #[test]
@@ -4635,6 +5179,38 @@ mod tests {
         assert_eq!(next["status"], "waiting_input", "{next}");
     }
     #[test]
+    fn cancel_of_another_clients_command_needs_force() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let id = app.control_state()["document_id"].clone();
+        let send = |app: &mut OpenCADStudio, extra: Value| {
+            let mut req = json!({
+                "protocol":1,
+                "request_id":format!("force-{}", app.control.serial),
+                "document_id":id.clone(),
+            });
+            req.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (reply, task) = app.control_request(req);
+            app.drive_headless_task(task).unwrap();
+            reply
+        };
+        send(&mut app, json!({"op":"start","cmd":"LINE","client_id":"a"}));
+        assert_eq!(app.control_state()["command_owner_client_id"], "a");
+        let refused = send(&mut app, json!({"op":"cancel","client_id":"b"}));
+        assert_eq!(refused["code"], "command_busy");
+        assert_eq!(refused["owner_client_id"], "a");
+        assert!(!app.control_state()["command"].is_null());
+        let forced = send(
+            &mut app,
+            json!({"op":"cancel","client_id":"b","force":true}),
+        );
+        assert_ne!(forced["code"], "command_busy");
+        assert!(app.control_state()["command"].is_null());
+    }
+
+    #[test]
     fn direct_user_input_takes_command_ownership() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
@@ -4646,7 +5222,11 @@ mod tests {
         );
         assert_eq!(result["code"], "command_busy");
         assert_eq!(result["command"], "LINE");
-        assert_eq!(result["owner_client_id"], Value::Null, "the user holds it now");
+        assert_eq!(
+            result["owner_client_id"],
+            Value::Null,
+            "the user holds it now"
+        );
     }
     #[test]
     fn control_preserves_other_documents_and_waits_for_async_open() {
@@ -4672,9 +5252,9 @@ mod tests {
 
     #[test]
     fn open_with_missing_xrefs_succeeds_and_lists_every_reference() {
-        let mut doc = codec::Document::new();
+        let mut doc = document::Document::new();
         for name in ["Grid Plan", "Wall Base"] {
-            let mut record = codec::tables::BlockRecord::new(name);
+            let mut record = document::tables::BlockRecord::new(name);
             record.flags.is_xref = true;
             record.xref_path = format!("missing-dir/{name}.dwg");
             doc.block_records.add(record).unwrap();
@@ -4807,7 +5387,7 @@ mod tests {
             .document
             .entities()
             .find_map(|e| match e {
-                codec::EntityType::Circle(c) => Some(c.center.y),
+                document::EntityType::Circle(c) => Some(c.center.y),
                 _ => None,
             });
         assert_eq!(circle, Some(-10.0));
@@ -4833,7 +5413,7 @@ mod tests {
                 .scene
                 .document
                 .entities()
-                .filter(|e| matches!(e, codec::EntityType::Ole2Frame(_)))
+                .filter(|e| matches!(e, document::EntityType::Ole2Frame(_)))
                 .count()
         };
         assert_eq!(ole_count(&app), 1);
@@ -4891,7 +5471,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[app.active_tab]
             .scene
-            .select_entity(codec::Handle::new(value), false);
+            .select_entity(document::Handle::new(value), false);
         handle
     }
 
@@ -4952,7 +5532,7 @@ mod tests {
             .add(
                 crate::scene::parametric_constraints::ConstraintKind::Fixed,
                 vec![crate::scene::parametric_constraints::ParametricRef::whole(
-                    codec::Handle::new(u64::from_str_radix(&handle, 16).unwrap()),
+                    document::Handle::new(u64::from_str_radix(&handle, 16).unwrap()),
                 )],
                 None,
             );
@@ -5231,7 +5811,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[i]
             .scene
-            .select_entity(codec::Handle::new(value), false);
+            .select_entity(document::Handle::new(value), false);
         let _ = app.update(Message::CommandFinalize);
         let done = user_select_result(&mut app, "us-snap");
         assert_eq!(done["status"], "completed", "{done}");
@@ -5288,7 +5868,7 @@ mod tests {
             .add(
                 crate::scene::parametric_constraints::ConstraintKind::Fixed,
                 vec![crate::scene::parametric_constraints::ParametricRef::whole(
-                    codec::Handle::new(u64::from_str_radix(&circle_handle, 16).unwrap()),
+                    document::Handle::new(u64::from_str_radix(&circle_handle, 16).unwrap()),
                 )],
                 None,
             );
@@ -5308,19 +5888,19 @@ mod tests {
             let scene = &mut app.tabs[app.active_tab].scene;
             // Two layers set to different pen weights; entities fully ByLayer.
             for (name, weight) in [
-                ("THIN", codec::types::LineWeight::Value(13)),
-                ("THICK", codec::types::LineWeight::Value(50)),
+                ("THIN", document::types::LineWeight::Value(13)),
+                ("THICK", document::types::LineWeight::Value(50)),
             ] {
-                let mut layer = codec::tables::Layer::new(name);
+                let mut layer = document::tables::Layer::new(name);
                 layer.line_weight = weight;
                 let _ = scene.document.layers.add(layer);
             }
             for (name, origin) in [("THIN", 0.0), ("THICK", 3000.0)] {
-                let mut line = codec::entities::Line::new();
+                let mut line = document::entities::Line::new();
                 line.common.layer = name.to_string();
-                line.start = codec::types::Vector3::new(origin, origin, 0.0);
-                line.end = codec::types::Vector3::new(origin + 3000.0, origin + 2000.0, 0.0);
-                scene.add_entity(codec::EntityType::Line(line));
+                line.start = document::types::Vector3::new(origin, origin, 0.0);
+                line.end = document::types::Vector3::new(origin + 3000.0, origin + 2000.0, 0.0);
+                scene.add_entity(document::EntityType::Line(line));
             }
         }
 
@@ -5363,34 +5943,197 @@ mod tests {
     }
 
     #[test]
+    fn plot_op_geopdf_preserves_model_pages_in_single_mixed_and_per_page_pdfs() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,80"}));
+        app.tabs[app.active_tab]
+            .scene
+            .document
+            .header
+            .insertion_units = 6;
+        let crs = crate::io::crs::CrsDefinition::from_epsg(5514).unwrap();
+        crate::io::crs::set_document_crs(&mut app.tabs[app.active_tab].scene.document, &crs)
+            .unwrap();
+        app.plot_dialog.geopdf = true;
+        // The destination extension, not this stale device selection, decides
+        // whether the output is PDF and needs GeoPDF validation.
+        app.plot_dialog.file_svg = true;
+        let model_index = app.tabs[app.active_tab]
+            .scene
+            .layout_names()
+            .iter()
+            .position(|name| name == "Model")
+            .unwrap();
+        let vp_by_page = |path: &std::path::Path| {
+            let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(
+                std::fs::read(path).expect("plot PDF"),
+            ))
+            .unwrap();
+            pdf.pages()
+                .iter()
+                .map(|page| page.raw().contains_key(b"VP"))
+                .collect::<Vec<_>>()
+        };
+
+        for (kind, layout) in [("model", "Model"), ("mixed", "all")] {
+            let path = std::env::temp_dir().join(format!(
+                "ocs-geopdf-control-{kind}-{}.pdf",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let mut plot = json!({"op":"plot","layout":layout,"path":path.to_string_lossy()});
+            if kind == "mixed" {
+                // Paper-space non-Layout areas are deliberately plain. They
+                // must not inherit the model page's GeoPDF eligibility check.
+                plot["area"] = "window".into();
+                plot["window"] = json!([0, 0, 297, 210]);
+            }
+            let response = request(&mut app, plot);
+            assert_eq!(response["status"], "completed", "{response}");
+            let flags = vp_by_page(&path);
+            if kind == "model" {
+                assert_eq!(flags, [true]);
+            } else {
+                assert!(flags.len() > 1);
+                assert!(flags[model_index]);
+                assert!(flags
+                    .iter()
+                    .enumerate()
+                    .all(|(index, vp)| { index == model_index || !vp }));
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "ocs-geopdf-control-per-page-{}.pdf",
+            std::process::id()
+        ));
+        let response = request(
+            &mut app,
+            json!({
+                "op":"plot",
+                "layout":"all",
+                "per_page":true,
+                "path":path.to_string_lossy(),
+                "area":"window",
+                "window":[0,0,297,210]
+            }),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+        for file in response["result"]["files"].as_array().unwrap() {
+            let path = std::path::Path::new(file["path"].as_str().unwrap());
+            assert_eq!(vp_by_page(path), [file["layout"] == "Model"]);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn vp_by_page(bytes: Vec<u8>) -> Vec<bool> {
+        let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(bytes)).unwrap();
+        pdf.pages()
+            .iter()
+            .map(|page| page.raw().contains_key(b"VP"))
+            .collect()
+    }
+
+    #[test]
+    fn plot_op_geopdf_missing_crs_falls_back_to_plain_pdf_and_blocks_nothing() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,80"}));
+        app.plot_dialog.geopdf = true;
+        app.plot_dialog.file_svg = true;
+        let pdf = std::env::temp_dir().join(format!(
+            "ocs-geopdf-control-missing-crs-{}.pdf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pdf);
+
+        // A drawing without a CRS exports as an ordinary plain PDF; the
+        // GeoPDF opt-in neither fails the plot nor writes geospatial metadata.
+        let response = request(&mut app, json!({"op":"plot","path":pdf.to_string_lossy()}));
+        assert_eq!(response["status"], "completed", "{response}");
+        assert!(pdf.exists(), "{response}");
+        assert_eq!(
+            vp_by_page(std::fs::read(&pdf).expect("fallback PDF")),
+            [false]
+        );
+        let _ = std::fs::remove_file(&pdf);
+
+        let svg = std::env::temp_dir().join(format!(
+            "ocs-geopdf-control-missing-crs-{}.svg",
+            std::process::id()
+        ));
+        let response = request(&mut app, json!({"op":"plot","path":svg.to_string_lossy()}));
+        assert_eq!(response["status"], "completed", "{response}");
+        roxmltree::Document::parse(&std::fs::read_to_string(&svg).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&svg);
+    }
+
+    #[test]
+    fn plot_op_svg_text_as_outlines_uses_vector_paths() {
+        let svg = std::env::temp_dir().join(format!("ocs-outline-{}.svg", std::process::id()));
+        let mut svg_text = String::new();
+        let mut stable = false;
+        for _ in 0..8 {
+            let mut app = OpenCADStudio::new_for_test();
+            request(&mut app, json!({"op":"new"}));
+            let generation = crate::scene::text::sdf_atlas::generation();
+            let text = document::entities::MText::with_value(
+                "OUTLINE",
+                document::types::Vector3::new(10.0, 10.0, 0.0),
+            );
+            app.tabs[app.active_tab]
+                .scene
+                .add_entity(document::EntityType::MText(Box::new(text)));
+            let response = request(
+                &mut app,
+                json!({"op":"plot","path":svg.to_string_lossy(),"text_as_outlines":true}),
+            );
+            assert_eq!(response["status"], "completed", "{response}");
+            svg_text = std::fs::read_to_string(&svg).expect("SVG written");
+            if crate::scene::text::sdf_atlas::generation() == generation {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "glyph atlas did not stabilize after eight attempts");
+        assert!(!svg_text.contains("<text"));
+        assert!(!svg_text.contains("font-family"));
+        assert!(svg_text.contains("<path"));
+        roxmltree::Document::parse(&svg_text).expect("well-formed outline SVG");
+        let _ = std::fs::remove_file(&svg);
+    }
+
+    #[test]
     fn plot_op_applies_ctb_colors_through_layer_aci() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
         {
             let scene = &mut app.tabs[app.active_tab].scene;
             // Frame layer carries the classic cyan ACI 4; its entity is ByLayer.
-            let mut frame = codec::tables::Layer::new("FRAME-CYAN");
-            frame.color = codec::types::Color::Index(4);
+            let mut frame = document::tables::Layer::new("FRAME-CYAN");
+            frame.color = document::types::Color::Index(4);
             let _ = scene.document.layers.add(frame);
-            let mut frame_line = codec::entities::Line::new();
+            let mut frame_line = document::entities::Line::new();
             frame_line.common.layer = "FRAME-CYAN".to_string();
-            frame_line.start = codec::types::Vector3::new(0.0, 0.0, 0.0);
-            frame_line.end = codec::types::Vector3::new(3000.0, 0.0, 0.0);
-            scene.add_entity(codec::EntityType::Line(frame_line));
+            frame_line.start = document::types::Vector3::new(0.0, 0.0, 0.0);
+            frame_line.end = document::types::Vector3::new(3000.0, 0.0, 0.0);
+            scene.add_entity(document::EntityType::Line(frame_line));
 
             // An explicit red ACI 1 and a true-color green: index must map
             // through the CTB, the true color must stay RGB (aci 0).
-            let mut red = codec::entities::Line::new();
-            red.common.color = codec::types::Color::Index(1);
-            red.start = codec::types::Vector3::new(0.0, 1000.0, 0.0);
-            red.end = codec::types::Vector3::new(3000.0, 1000.0, 0.0);
-            scene.add_entity(codec::EntityType::Line(red));
+            let mut red = document::entities::Line::new();
+            red.common.color = document::types::Color::Index(1);
+            red.start = document::types::Vector3::new(0.0, 1000.0, 0.0);
+            red.end = document::types::Vector3::new(3000.0, 1000.0, 0.0);
+            scene.add_entity(document::EntityType::Line(red));
 
-            let mut true_color = codec::entities::Line::new();
-            true_color.common.color = codec::types::Color::from_true_color_value(0x0000FF00);
-            true_color.start = codec::types::Vector3::new(0.0, 2000.0, 0.0);
-            true_color.end = codec::types::Vector3::new(3000.0, 2000.0, 0.0);
-            scene.add_entity(codec::EntityType::Line(true_color));
+            let mut true_color = document::entities::Line::new();
+            true_color.common.color = document::types::Color::from_true_color_value(0x0000FF00);
+            true_color.start = document::types::Vector3::new(0.0, 2000.0, 0.0);
+            true_color.end = document::types::Vector3::new(3000.0, 2000.0, 0.0);
+            scene.add_entity(document::EntityType::Line(true_color));
         }
 
         let pdf = std::env::temp_dir().join(format!("ocs-plot-aci-{}.pdf", std::process::id()));
@@ -5405,19 +6148,19 @@ mod tests {
         // Monochrome maps every index colour (ByLayer cyan frame, explicit
         // red) to black; the true-color line keeps its RGB by definition.
         assert!(
-            !text.contains("0 1 1 rg") && !text.contains("0 1 1 RG"),
+            !text.contains("0.0 1.0 1.0 rg") && !text.contains("0.0 1.0 1.0 RG"),
             "cyan frame must be CTB-mapped to monochrome"
         );
         assert!(
-            !text.contains("1 0 0 rg") && !text.contains("1 0 0 RG"),
+            !text.contains("1.0 0.0 0.0 rg") && !text.contains("1.0 0.0 0.0 RG"),
             "explicit red must be CTB-mapped to monochrome"
         );
         assert!(
-            text.contains("0 1 0 rg") || text.contains("0 1 0 RG"),
+            text.contains("0.0 1.0 0.0 rg") || text.contains("0.0 1.0 0.0 RG"),
             "true-color line keeps its RGB (aci 0 is not CTB-mapped)"
         );
         assert!(
-            text.contains("0 0 0 rg") || text.contains("0 0 0 RG"),
+            text.contains("0.0 0.0 0.0 rg") || text.contains("0.0 0.0 0.0 RG"),
             "monochrome strokes must plot black"
         );
 
@@ -5468,6 +6211,158 @@ mod tests {
         );
         let _ = std::fs::remove_file(&pdf);
         let _ = std::fs::remove_file(&plain);
+    }
+
+    #[test]
+    fn plot_op_applies_svg_stroke_and_explicit_plot_overrides() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,100"}));
+        let mut widths = Vec::new();
+        for scale_lineweights in [false, true] {
+            let svg = std::env::temp_dir().join(format!(
+                "ocs-stroke-options-{}-{}.svg",
+                std::process::id(),
+                scale_lineweights
+            ));
+            let response = request(
+                &mut app,
+                json!({
+                    "op":"plot",
+                    "path":svg.to_string_lossy(),
+                    "scale":"10:1",
+                    "lineweights":true,
+                    "scale_lineweights":scale_lineweights,
+                    "non_scaling_stroke":true,
+                    "shade":"2d wireframe",
+                    "paperspace_last":true,
+                    "apply_plot_styles":false
+                }),
+            );
+            assert_eq!(response["status"], "completed", "{response}");
+            let svg_text = std::fs::read_to_string(&svg).expect("SVG written");
+            let document = roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+            let path = document
+                .descendants()
+                .find(|node| {
+                    node.tag_name().name() == "path" && node.attribute("stroke") != Some("none")
+                })
+                .expect("stroked line");
+            assert_eq!(path.attribute("vector-effect"), Some("non-scaling-stroke"));
+            widths.push(
+                path.attribute("stroke-width")
+                    .expect("stroke width")
+                    .parse::<f64>()
+                    .expect("numeric stroke width"),
+            );
+            let _ = std::fs::remove_file(&svg);
+        }
+        assert!(
+            (widths[1] / widths[0] - 10.0).abs() < 0.03,
+            "scale_lineweights must apply the explicit 10:1 scale: {widths:?}"
+        );
+
+        let rejected = request(
+            &mut app,
+            json!({"op":"plot","path":"/tmp/invalid-shade.svg","shade":"not-a-mode"}),
+        );
+        assert_eq!(rejected["status"], "failed");
+        assert_eq!(rejected["code"], "invalid_value");
+    }
+
+    #[test]
+    fn plot_op_explicitly_disabled_plot_style_wins_over_requested_table() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let mut line = document::entities::Line::from_points(
+            document::types::Vector3::ZERO,
+            document::types::Vector3::new(100.0, 100.0, 0.0),
+        );
+        line.common.color = document::types::Color::Index(1);
+        app.tabs[app.active_tab]
+            .scene
+            .add_entity(document::EntityType::Line(line));
+
+        for (enabled, expected) in [(false, "#ff0000"), (true, "#000000")] {
+            let svg = std::env::temp_dir().join(format!(
+                "ocs-plot-style-enabled-{}-{}.svg",
+                std::process::id(),
+                enabled
+            ));
+            let response = request(
+                &mut app,
+                json!({
+                    "op":"plot",
+                    "path":svg.to_string_lossy(),
+                    "plot_style":"monochrome.ctb",
+                    "apply_plot_styles":enabled
+                }),
+            );
+            assert_eq!(response["status"], "completed", "{response}");
+            let svg_text = std::fs::read_to_string(&svg).expect("SVG written");
+            let document = roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+            let stroke = document
+                .descendants()
+                .find(|node| {
+                    node.tag_name().name() == "path" && node.attribute("stroke") != Some("none")
+                })
+                .and_then(|node| node.attribute("stroke"))
+                .expect("stroked line");
+            assert_eq!(stroke, expected, "apply_plot_styles={enabled}");
+            let _ = std::fs::remove_file(&svg);
+        }
+
+        // Repeat on a named layout with a stored enabled table. The explicit
+        // false must survive both setup loading and the export-level fallback.
+        let scene = &mut app.tabs[app.active_tab].scene;
+        scene.set_current_layout("Layout1".into());
+        scene.load_current_layout_state();
+        let mut paper_line = document::entities::Line::from_points(
+            document::types::Vector3::new(10.0, 10.0, 0.0),
+            document::types::Vector3::new(100.0, 100.0, 0.0),
+        );
+        paper_line.common.color = document::types::Color::Index(1);
+        scene.add_entity(document::EntityType::Line(paper_line));
+        let mut setup = scene.plot_settings_for("Layout1").expect("Layout1 setup");
+        setup.current_style_sheet = "monochrome.ctb".into();
+        setup.flags.plot_plot_styles = true;
+        assert!(scene.set_layout_plot_settings("Layout1", &setup));
+        for include_requested_table in [false, true] {
+            let svg = std::env::temp_dir().join(format!(
+                "ocs-layout-style-disabled-{}-{}.svg",
+                std::process::id(),
+                include_requested_table
+            ));
+            let response = request(
+                &mut app,
+                json!({
+                    "op":"plot",
+                    "layout":"Layout1",
+                    "path":svg.to_string_lossy(),
+                    "plot_style":if include_requested_table {
+                        json!("monochrome.ctb")
+                    } else {
+                        Value::Null
+                    },
+                    "apply_plot_styles":false
+                }),
+            );
+            assert_eq!(response["status"], "completed", "{response}");
+            let svg_text = std::fs::read_to_string(&svg).expect("SVG written");
+            let document = roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+            let stroke = document
+                .descendants()
+                .find(|node| {
+                    node.tag_name().name() == "path" && node.attribute("stroke") != Some("none")
+                })
+                .and_then(|node| node.attribute("stroke"))
+                .expect("stroked paper line");
+            assert_eq!(
+                stroke, "#ff0000",
+                "requested table={include_requested_table}"
+            );
+            let _ = std::fs::remove_file(&svg);
+        }
     }
 
     /// An unknown `entities_transform` action must come back as a clean
@@ -5688,7 +6583,7 @@ mod tests {
     #[test]
     fn a_history_step_records_nothing_when_no_request_is_routing() {
         let mut app = OpenCADStudio::new_for_test();
-        let changes = || vec![(codec::Handle::new(1), crate::scene::ChangeKind::Modified)];
+        let changes = || vec![(document::Handle::new(1), crate::scene::ChangeKind::Modified)];
         app.control.note_history_changes(changes());
         assert!(
             app.control.take_history_changes().is_none(),
@@ -5697,7 +6592,9 @@ mod tests {
         app.control.routing = true;
         app.control.note_history_changes(changes());
         assert_eq!(
-            app.control.take_history_changes().map(|changes| changes.len()),
+            app.control
+                .take_history_changes()
+                .map(|changes| changes.len()),
             Some(1)
         );
     }
@@ -5710,8 +6607,8 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
         request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
-        let first = app.control_request(json!({"op":"query","type":"Line"})).0
-            ["entities"][0]["handle"]
+        let first = app.control_request(json!({"op":"query","type":"Line"})).0["entities"][0]
+            ["handle"]
             .as_str()
             .unwrap()
             .to_string();
@@ -5765,7 +6662,10 @@ mod tests {
             &mut app,
             i,
             "ATTDIA_SCRIPT",
-            vec![askable("WIDTH", "Width", "100"), askable("HEIGHT", "", "20")],
+            vec![
+                askable("WIDTH", "Width", "100"),
+                askable("HEIGHT", "", "20"),
+            ],
         );
         park_insert(&mut app, i, "ATTDIA_SCRIPT");
         assert_eq!(
@@ -5805,7 +6705,9 @@ mod tests {
 
     #[test]
     fn a_declined_attribute_form_drops_the_placement() {
-        use crate::app::insert_attributes_tests::{askable, define, park_insert, placed_attributes};
+        use crate::app::insert_attributes_tests::{
+            askable, define, park_insert, placed_attributes,
+        };
         let mut app = OpenCADStudio::new_for_test();
         assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
         let i = app.active_tab;
@@ -5822,5 +6724,307 @@ mod tests {
             placed_attributes(&app, i, "ATTDIA_SHRUG").is_empty(),
             "a declined form drops the placement"
         );
+    }
+
+    #[test]
+    fn plot_op_model_defaults_to_fit_when_scale_and_fit_are_omitted() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,100"}));
+        // A previous non-fit preference must not leak into an API request whose
+        // documented default is fit when neither scale nor fit is supplied.
+        app.plot_dialog.fit_to_paper = false;
+        app.plot_dialog.scale = "1000:1".into();
+        let svg = std::env::temp_dir().join(format!("ocs-fit-default-{}.svg", std::process::id()));
+        let response = request(&mut app, json!({"op":"plot","path":svg.to_string_lossy()}));
+        assert_eq!(response["status"], "completed", "{response}");
+        let svg_text = std::fs::read_to_string(&svg).expect("SVG written");
+        let document = roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+        let root = document.root_element();
+        let view_box = root
+            .attribute("viewBox")
+            .expect("viewBox")
+            .split_whitespace()
+            .map(|v| v.parse::<f64>().unwrap())
+            .collect::<Vec<_>>();
+        let (width, height) = (view_box[2], view_box[3]);
+        let mut checked = 0;
+        for path in root
+            .descendants()
+            .filter(|node| node.tag_name().name() == "path")
+        {
+            let d = path.attribute("d").expect("path data");
+            let normalized = d.replace(['M', 'L', 'Z'], " ");
+            let coordinates = normalized
+                .split_whitespace()
+                .map(|v| v.parse::<f64>().expect("numeric path coordinate"))
+                .collect::<Vec<_>>();
+            for pair in coordinates.chunks_exact(2) {
+                assert!(
+                    pair[0] >= -0.01 && pair[0] <= width + 0.01,
+                    "x={} width={width}",
+                    pair[0]
+                );
+                assert!(
+                    pair[1] >= -0.01 && pair[1] <= height + 0.01,
+                    "y={} height={height}",
+                    pair[1]
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+        let fitted_line = svg_text
+            .lines()
+            .find(|line| line.starts_with("<path"))
+            .expect("fitted line")
+            .to_owned();
+        let _ = std::fs::remove_file(&svg);
+
+        // An explicit non-fit request must not be replaced by the default.
+        app.plot_dialog.fit_to_paper = true;
+        app.plot_dialog.scale = "1000:1".into();
+        let explicit =
+            std::env::temp_dir().join(format!("ocs-fit-explicit-{}.svg", std::process::id()));
+        let response = request(
+            &mut app,
+            json!({"op":"plot","path":explicit.to_string_lossy(),"fit":false}),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+        let explicit_text = std::fs::read_to_string(&explicit).expect("explicit SVG written");
+        let explicit_line = explicit_text
+            .lines()
+            .find(|line| line.starts_with("<path"))
+            .expect("explicit non-fit line");
+        assert_ne!(explicit_line, fitted_line);
+        let _ = std::fs::remove_file(&explicit);
+    }
+
+    /// `area:"window"` on a named layout. The request's rect is explicit and
+    /// must survive the stored page setup load: a layout's own (older or lost)
+    /// window may not swallow a field request.
+    #[test]
+    fn a_window_plot_reaches_a_named_layout() {
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        assert_eq!(
+            request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,100"}))["status"],
+            "completed"
+        );
+        let _ = app.update(Message::LayoutSwitch("Layout1".into()));
+        let _ = app.run_command_line("MSPACE");
+        let _ = app.run_command_line("ZOOM EXTENTS");
+        let _ = app.run_command_line("PSPACE");
+
+        let svg =
+            std::env::temp_dir().join(format!("ocs-layout-window-{}.svg", std::process::id()));
+        let response = request(
+            &mut app,
+            json!({
+                "op":"plot",
+                "layout":"Layout1",
+                "path":svg.to_string_lossy(),
+                "area":"window",
+                "window":[5,5,290,200]
+            }),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+        assert_eq!(response["result"]["page_sizes"], json!([[297.0, 210.0]]));
+        let svg_text = std::fs::read_to_string(&svg).expect("window SVG");
+        roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+        let clip = svg_text
+            .lines()
+            .find(|line| line.contains("clipPath") || line.contains("clip-path"))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| panic!("clip from the requested window: {svg_text}"));
+        assert!(clip.contains("width=\"285\""), "{clip}");
+        assert!(clip.contains("height=\"195\""), "{clip}");
+        roxmltree::Document::parse(&svg_text).expect("well-formed SVG");
+        assert!(
+            svg_text.lines().any(|line| line.starts_with("<path")),
+            "the viewport reaches the model content: {svg_text}"
+        );
+        let _ = std::fs::remove_file(&svg);
+    }
+    /// A BLOCK_RECORD whose stored `entity_handles` no longer resolve against
+    /// the entity table (an import that renumbered handles after the lists
+    /// were built) must not silently drop the layout's whole content: the
+    /// stored list is a hint, and ownership keeps the real viewports.
+    #[test]
+    fn a_stale_block_record_list_still_plots_layout_content() {
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        assert_eq!(
+            request(&mut app, json!({"op":"run","cmd":"LINE 0,0 100,100"}))["status"],
+            "completed"
+        );
+        let i = app.active_tab;
+        let _ = app.update(Message::LayoutSwitch("Layout1".into()));
+        let _ = app.run_command_line("MSPACE");
+        let _ = app.run_command_line("ZOOM EXTENTS");
+        let _ = app.run_command_line("PSPACE");
+
+        // The healthy layout first: the model content lands in the viewport.
+        let healthy = std::env::temp_dir().join(format!(
+            "ocs-layout-record-healthy-{}.svg",
+            std::process::id()
+        ));
+        let response = request(
+            &mut app,
+            json!({"op":"plot","layout":"Layout1","path":healthy.to_string_lossy(),"area":"layout"}),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+        let healthy_text = std::fs::read_to_string(&healthy).expect("healthy SVG");
+        assert!(
+            healthy_text.lines().any(|line| line.starts_with("<path")),
+            "the healthy viewport must carry model content: {healthy_text}"
+        );
+        let _ = std::fs::remove_file(&healthy);
+        let healthy_paths = healthy_text
+            .lines()
+            .filter(|line| line.starts_with("<path"))
+            .collect::<Vec<_>>();
+
+        // Corrupt the stored list the way the renumbering report observed:
+        // non-empty, but resolvable nowhere in the entity table. A create +
+        // delete round-trip bumps the paper cache's epoch so the plot reads
+        // the corrupted list again; the document content itself is unchanged.
+        let scene = &mut app.tabs[i].scene;
+        let viewport_owner = scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                document::EntityType::Viewport(vp) => Some(vp.common.owner_handle),
+                _ => None,
+            })
+            .expect("Layout1 carries a content viewport");
+        let record = scene
+            .document
+            .block_records
+            .iter_mut()
+            .find(|record| record.handle == viewport_owner)
+            .expect("the owning block record");
+        record.entity_handles = vec![document::Handle::new(404)];
+        let bump = request(
+            &mut app,
+            json!({"op":"entities_create","entities":[{"type":"Point","location":[900,900]}]}),
+        );
+        assert_eq!(bump["ok"], true, "{bump}");
+        let scratch = bump["result"]["handles"][0].as_str().unwrap().to_string();
+        let erased = request(
+            &mut app,
+            json!({"op":"entities_delete","handles":[scratch]}),
+        );
+        assert_eq!(erased["ok"], true, "{erased}");
+
+        let stale = std::env::temp_dir().join(format!(
+            "ocs-layout-record-stale-{}.svg",
+            std::process::id()
+        ));
+        let response = request(
+            &mut app,
+            json!({"op":"plot","layout":"Layout1","path":stale.to_string_lossy(),"area":"layout"}),
+        );
+        assert_eq!(response["status"], "completed", "{response}");
+        let stale_text = std::fs::read_to_string(&stale).expect("stale SVG");
+        let mut stale_paths = stale_text
+            .lines()
+            .filter(|line| line.starts_with("<path"))
+            .collect::<Vec<_>>();
+        let mut healthy_paths = healthy_paths;
+        healthy_paths.sort();
+        stale_paths.sort();
+        assert_eq!(
+            healthy_paths, stale_paths,
+            "the stale record list must not drop the viewport content"
+        );
+        let _ = std::fs::remove_file(&stale);
+    }
+
+    #[test]
+    fn panel_ui_automation_edits_and_resets_only_the_form() {
+        use ocs_plugin_api::dialog::{DialogControl, PanelDef};
+
+        let mut app = OpenCADStudio::new_for_test();
+        let panel_id = "cvifc.ifc_h_properties";
+        let panel = PanelDef::new(panel_id, "IFC properties")
+            .with_control(DialogControl::Number {
+                id: "SegmentLength".into(),
+                label: "SegmentLength".into(),
+                default: 100.0,
+                min: None,
+                max: None,
+                step: None,
+            })
+            .with_control(DialogControl::Button {
+                id: "apply".into(),
+                label: "Apply".into(),
+                action: Some("CVI_IFC_PANEL_APPLY".into()),
+                align_h: None,
+                width: None,
+            });
+        let mut state = crate::ui::window::plugin_panel::PluginPanelState::from_def(panel);
+        state.owner_plugin_id = Some("opencad.civil_ifc".into());
+        app.plugin_panels.insert(panel_id.into(), state);
+        let before = app.tabs[0].scene.document.clone();
+        let before_undo = app.tabs[0].history.undo_stack.len();
+
+        let response = request(
+            &mut app,
+            json!({
+                "op": "panel_input",
+                "panel_id": panel_id,
+                "control_id": "SegmentLength",
+                "text": "101.5",
+            }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(
+            app.plugin_panels[panel_id]
+                .text_values
+                .get("SegmentLength")
+                .map(String::as_str),
+            Some("101.5"),
+        );
+        assert_eq!(app.tabs[0].scene.document, before);
+        assert_eq!(app.tabs[0].history.undo_stack.len(), before_undo);
+
+        let response = request(
+            &mut app,
+            json!({
+                "op": "panel_button",
+                "panel_id": panel_id,
+                "control_id": "reset",
+            }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(
+            app.plugin_panels[panel_id]
+                .text_values
+                .get("SegmentLength")
+                .map(String::as_str),
+            Some("100"),
+        );
+        assert_eq!(
+            app.plugin_panels[panel_id].owner_plugin_id.as_deref(),
+            Some("opencad.civil_ifc"),
+        );
+        let declared_action =
+            OpenCADStudio::panel_button_action(&app.plugin_panels[panel_id].def.controls, "apply");
+        assert_eq!(declared_action.as_deref(), Some("CVI_IFC_PANEL_APPLY"));
+        assert_eq!(app.tabs[0].scene.document, before);
+        assert_eq!(app.tabs[0].history.undo_stack.len(), before_undo);
+
+        let response = request(
+            &mut app,
+            json!({
+                "op": "panel_button",
+                "panel_id": panel_id,
+                "control_id": "apply",
+            }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(app.tabs[0].scene.document, before);
+        assert_eq!(app.tabs[0].history.undo_stack.len(), before_undo);
     }
 }

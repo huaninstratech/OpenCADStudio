@@ -1,18 +1,18 @@
-use codec::entities::Ellipse;
-use kernel::geom2d::{
+use document::entities::Ellipse;
+use ocs_geom::geom2d::{
     Curve as KernelCurve, EllipseArc as KernelEllipseArc, Tolerance, Vec2 as KernelVec2,
 };
-use kernel::space::PlanarCurve;
+use ocs_geom::space::PlanarCurve;
 
 use crate::entities::curve::CurveSnap;
 use crate::t;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_prop as edit, format_area, format_length, oriented_triangle_grip, parse_f64,
     ro_prop as ro, square_grip,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::TangentGeom;
@@ -356,7 +356,7 @@ fn apply_transform(ell: &mut Ellipse, t: &EntityTransform) {
     // parameters — under rotate, scale, affine and mirror alike.
     crate::scene::view::transform::apply_standard_entity_transform(ell, t, |entity, p1, p2| {
         let normal = entity.normal;
-        codec::Entity::apply_mirror(
+        document::Entity::apply_mirror(
             entity,
             &crate::scene::view::transform::reflection_about_xy_line(p1, p2),
         );
@@ -375,14 +375,14 @@ fn apply_transform(ell: &mut Ellipse, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Ellipse {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(to_render(self))
     }
 }
 
 crate::impl_entity_basics!(Ellipse);
 
-impl crate::entities::traits::MassPropsCalc for codec::entities::Ellipse {
+impl crate::entities::traits::MassPropsCalc for document::entities::Ellipse {
     fn mass_props(&self) -> crate::entities::traits::MassProps {
         use std::f64::consts::{PI, TAU};
         let e = self;
@@ -459,7 +459,7 @@ mod grip_tests {
         e.minor_axis_ratio = ratio;
         e
     }
-    fn xy_len(v: &codec::entities::Ellipse) -> f64 {
+    fn xy_len(v: &document::entities::Ellipse) -> f64 {
         (v.major_axis.x * v.major_axis.x + v.major_axis.y * v.major_axis.y).sqrt()
     }
 
@@ -501,7 +501,7 @@ mod grip_tests {
     }
 
     #[test]
-    fn test_apply_transform_negative_scale_and_rotation() {
+    fn apply_transform_negative_scale_and_rotation() {
         let mut e = ell(10.0, 0.5);
         e.start_parameter = 0.0;
         e.end_parameter = std::f64::consts::FRAC_PI_2;
@@ -527,7 +527,7 @@ mod grip_tests {
     }
 
     #[test]
-    fn test_apply_transform_mirror() {
+    fn apply_transform_mirror() {
         let mut e = ell(10.0, 0.5);
         e.start_parameter = 0.1;
         e.end_parameter = 1.5;

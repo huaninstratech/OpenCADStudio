@@ -1,8 +1,11 @@
 name: Tests
 
 # Runs the workspace tests on every push to main and on every pull request,
-# on Linux, Windows and macOS. A separate lint job reports rustfmt and clippy
-# results without blocking merges until the existing tree has been cleaned up.
+# on Linux and Windows; macOS runs on pushes to main only, since its 7 GB
+# runner swaps through the main crate's test build (#3059). A separate lint job reports rustfmt and clippy
+# results without blocking merges until the existing tree has been cleaned up,
+# and a health job reports what each pull request does to the code-health
+# measures (docs/architecture/HEALTH.md) the same way.
 
 on:
   push:
@@ -23,9 +26,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-15]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-22.04","windows-latest"]' || '["ubuntu-22.04","windows-latest","macos-15"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The same libraries the Linux release build needs (windowing, GL,
       # fonts); the packaging tools are left out.
@@ -37,9 +40,11 @@ jobs:
             libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # The codec crate (acadrust) moved to hakanaktt/acadrust and the old
       # HakanSeven12/opencadcodec URL no longer resolves; the manifests and
@@ -53,6 +58,10 @@ jobs:
           LC_ALL: C
         run: cargo test --workspace --locked
 
+      - name: Runner memory (macOS)
+        if: always() && runner.os == 'macOS'
+        run: sysctl hw.memsize vm.swapusage
+
   lint:
     name: lint (informational)
     runs-on: ubuntu-22.04
@@ -61,7 +70,11 @@ jobs:
     # these checks report in the log without failing the job: a job-level
     # continue-on-error still shows a red check on every pull request.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The first parent of a pull request's merge commit is its base,
+          # for the list of files the pull request touches.
+          fetch-depth: 2
 
       - name: System libraries
         run: |
@@ -70,11 +83,12 @@ jobs:
             libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: cargo fmt --check
         continue-on-error: true
@@ -83,3 +97,71 @@ jobs:
       - name: cargo clippy
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked
+
+      # Reports a file built on the UI kit that gains generic iced colours or literal
+      # sizes (see src/ui/kit/mod.rs); the counts in
+      # docs/ui/audit_counts.txt only go down.
+      - name: kit audit
+        continue-on-error: true
+        run: sh docs/ui/audit_counts.sh --check
+
+      # The whole tree has too many warnings for a list to help, so the
+      # summary shows only those in the files this pull request touches.
+      - name: Warnings in the files this pull request touches
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          cargo clippy --workspace --all-targets --locked --message-format=json > "$RUNNER_TEMP/clippy.json" || true
+          cargo fmt --all -- --check -l > "$RUNNER_TEMP/fmt.txt" || true
+          git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed.txt"
+          python3 scripts/health.py lint "$RUNNER_TEMP/clippy.json" "$RUNNER_TEMP/fmt.txt" "$RUNNER_TEMP/changed.txt" --markdown >> "$GITHUB_STEP_SUMMARY"
+
+  health:
+    name: health (informational)
+    runs-on: ubuntu-22.04
+    # Compares a pull request with the commit it merges into on the source
+    # measures in docs/architecture/HEALTH.md (upward dependencies, module
+    # pairs that use each other, large files and functions, panic sites,
+    # undocumented unsafe, test functions) and lists what got better and what
+    # got worse, plus edited files that have no tests yet, in
+    # the job summary and as warnings on the lines. Like the lint job it never
+    # fails: every step carries continue-on-error.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # A pull request checks out its merge commit; its first parent is
+          # the base the report compares against.
+          fetch-depth: 2
+
+      - name: Tool tests
+        id: tool_tests
+        continue-on-error: true
+        run: |
+          python3 scripts/test_arch_check.py
+          python3 scripts/test_health.py
+
+      # The job stays green (it never fails a pull request), but a failure of
+      # the report's own tests is shown, since the report may then be wrong.
+      - name: Report a tool test failure
+        if: steps.tool_tests.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::warning::The tests of scripts/arch_check.py or scripts/health.py failed (see the Tool tests step); the report below may be wrong."
+          echo "**The report's own tests failed** (see the Tool tests step), so the report below may be wrong." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: What this pull request changes
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" HEAD^1
+          # Files with no tests as of the last release, published by the wiki
+          # job; before the first such release the list is empty.
+          curl -fsSL "https://raw.githubusercontent.com/wiki/${GITHUB_REPOSITORY}/health/untested.json" \
+            -o "$RUNNER_TEMP/untested.json" || echo "[]" > "$RUNNER_TEMP/untested.json"
+          python3 scripts/health.py diff "$RUNNER_TEMP/base" --markdown --untested "$RUNNER_TEMP/untested.json" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/health.py diff "$RUNNER_TEMP/base"
+
+      - name: Upward dependencies
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: python3 scripts/arch_check.py report --markdown >> "$GITHUB_STEP_SUMMARY"

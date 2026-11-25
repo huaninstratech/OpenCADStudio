@@ -2,7 +2,7 @@
 
 use crate::app::{Message, OpenCADStudio};
 
-fn fresh() -> OpenCADStudio {
+pub(super) fn fresh() -> OpenCADStudio {
     let mut app = OpenCADStudio::new_for_test();
     app.automation_op(r#"{"op":"new"}"#);
     // These tests drive dock controls, not the hardware warning dialog.
@@ -69,7 +69,10 @@ fn dock_app() -> OpenCADStudio {
     app.show_properties = true;
     app.show_block_palette = true;
     let i = app.active_tab;
-    app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600.0, 900.0);
+    // A 900 px workspace: the docks run its full height, the drawing-tab
+    // bar between them sits over the viewport.
+    let vp_h = 900.0 - crate::ui::style::kit_metrics::TAB_BAR_H;
+    app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600.0, vp_h);
     app.win_size = (1600.0, 900.0).into();
     app
 }
@@ -716,7 +719,8 @@ fn target_screen_x(app: &OpenCADStudio, probe: glam::DVec3) -> f64 {
     let cam = app.tabs[i].scene.camera.borrow();
     let (left, right) = app.dock_edge_insets();
     let vw = f64::from(app.win_size.0 - left - right);
-    let wpp = f64::from(2.0 * cam.ortho_size()) / 900.0;
+    let vh = app.tabs[i].scene.selection.borrow().view.vp_size.1;
+    let wpp = f64::from(2.0 * cam.ortho_size()) / f64::from(vh);
     let cam_right = (cam.rotation * glam::Vec3::X).as_dvec3();
     f64::from(left) + vw * 0.5 + (probe - cam.target).dot(cam_right) / wpp
 }
@@ -807,6 +811,64 @@ fn dock_edge_menu_adds_and_hides_pallets() {
 }
 
 #[test]
+fn edge_menu_lists_and_toggles_registered_plugin_panels() {
+    use crate::app::config::DockSide;
+    use crate::app::dock::view::MenuPanel;
+    use crate::ui::dock::{DockMsg, PanelId};
+    use crate::ui::window::plugin_panel::PluginPanelState;
+    use ocs_plugin_api::dialog::PanelDef;
+
+    let mut app = dock_app();
+    // Register exactly like the plugin-host does: numeric dock id, id and
+    // owned state; `visible` starts false until the menu (or a command)
+    // shows the pallet.
+    let panel = PanelDef::new("epl_panel", "Panel Example").with_command("EPL_OPEN");
+    let id = panel.id.clone();
+    let num = app.plugin_panel_ids.len() as u32 + 1;
+    app.plugin_panel_ids.insert(id.clone(), num);
+    app.plugin_panel_by_num.insert(num, id.clone());
+    app.plugin_panels
+        .insert(id, PluginPanelState::from_def(panel));
+
+    // A real drawing tab: the Start page hides every pallet regardless of
+    // state, which would make the checked column meaningless here.
+    let tab_index = app.active_tab;
+    app.tabs[tab_index].is_start = false;
+
+    // Built-ins first in their historical order (edit-session-gated entries
+    // are filtered out), then the plugin panel last by title.
+    let entries = app.pallet_menu_entries(DockSide::Right, &app.tabs[app.active_tab]);
+    assert_eq!(entries.len(), crate::ui::dock::PanelId::ALL.len() - 2 + 1);
+    assert!(matches!(entries[0].0, MenuPanel::Builtin(_)));
+    assert!(
+        entries[..entries.len() - 1]
+            .iter()
+            .all(|(e, _)| matches!(e, MenuPanel::Builtin(_))),
+        "plugin panels sort after every built-in"
+    );
+    let (last, checked) = entries.last().unwrap();
+    assert!(matches!(last, MenuPanel::Plugin(..)));
+    assert_eq!(last.title(), "Panel Example");
+    assert!(!checked, "not docked yet, so the row is unchecked");
+
+    // Checking the row docks the plugin panel on this edge and shows it —
+    // the generic PaletteId::Plugin plumbing, no pallet-menu special case.
+    let _ = app.on_dock(DockMsg::EdgeMenuToggle(DockSide::Right, PanelId::Plugin(num)));
+    assert!(app.plugin_panels["epl_panel"].visible);
+    assert!(matches!(
+        app.dock.location(PanelId::Plugin(num)),
+        Some((DockSide::Right, _))
+    ));
+    let entries = app.pallet_menu_entries(DockSide::Right, &app.tabs[app.active_tab]);
+    assert!(entries.last().unwrap().1, "the row is checked while shown");
+
+    // Unchecking hides it but keeps its docked place for the next show.
+    let _ = app.on_dock(DockMsg::EdgeMenuToggle(DockSide::Right, PanelId::Plugin(num)));
+    assert!(!app.plugin_panels["epl_panel"].visible);
+    assert!(app.dock.location(PanelId::Plugin(num)).is_some());
+}
+
+#[test]
 fn dock_divider_resizes_only_its_group() {
     use crate::app::config::DockSide;
     use crate::ui::dock::{DockGroup, DockMsg, PanelId};
@@ -850,7 +912,7 @@ fn headless_renderer() -> iced::Renderer {
     iced_test::futures::futures::executor::block_on(
         <iced::Renderer as iced_test::core::renderer::Headless>::new(
             iced_test::core::renderer::Settings::default(),
-            None,
+            std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
         ),
     )
     .expect("headless renderer")
@@ -1058,7 +1120,7 @@ fn docked_title_bar_double_click_floats_the_pallet_in_the_real_view() {
             iced::mouse::Button::Left,
         ));
         // The block palette's title text sits in its docked title bar.
-        let title = find_in_view(&app, "Blocks");
+        let title = find_in_view(&app, "BLOCKS");
         drive_view(
             &mut app,
             title,
@@ -1205,7 +1267,7 @@ fn hovering_a_strip_icon_reveals_an_auto_hiding_edge_in_the_real_view() {
         let mut app = dock_app();
         // Mirror the layout onto the left so the block palette's title marks
         // where the workspace starts, then auto-hide the right edge.
-        let title = find_in_view(&app, "Blocks");
+        let title = find_in_view(&app, "BLOCKS");
         let _ = app.on_dock(DockMsg::AutoCollapseToggle(PanelId::BlockPalette));
         assert!(!app.dock_edge_expanded(DockSide::Right));
         // The title bar text sits ~13 px below the workspace top; the strip's
@@ -1460,11 +1522,15 @@ fn distance_parameter_batch_starts_from_actual_palette_rows() {
                 let _ = app.update(Message::CommandSubmit);
                 assert_eq!(app.tabs[i].scene.document, before);
             }
-            // XY asks for its grip count and labels itself; Linear and Polar
-            // take the label point.
+            // XY asks for its grip count and labels itself; Polar takes the
+            // label point; Linear takes the label point and then its grip count.
             let last = if name == "xy" { "1" } else { "0.3,0.2" };
             let _ = app.update(Message::CommandInput(last.into()));
             let _ = app.update(Message::CommandSubmit);
+            if name == "linear" {
+                let _ = app.update(Message::CommandInput(String::new()));
+                let _ = app.update(Message::CommandSubmit);
+            }
             let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
             let found = crate::scene::block_distance_parameter::parameters(
                 &app.tabs[i].scene.document,
@@ -1528,8 +1594,8 @@ fn orientation_parameter_batch_starts_from_actual_palette_rows() {
     });
 }
 
-fn authoring_app() -> OpenCADStudio {
-    use codec::{
+pub(super) fn authoring_app() -> OpenCADStudio {
+    use document::{
         entities::{Insert, Line},
         types::Vector3,
         EntityType,
@@ -1577,7 +1643,7 @@ fn block_actions_palette_controls_require_compatible_parameters_and_start_comman
             "BACTION"
         );
         let _ = app.update(Message::CommandEscape);
-        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 1,0 0.5,0.3");
+        let _ = app.run_command_line("BPARAMETER LINEAR 0,0 1,0 0.5,0.3 1");
         let point = authoring_control(&app, "authoring-tool-scale-action");
         authoring_click(&mut app, point);
         assert_eq!(
@@ -1680,14 +1746,14 @@ fn block_actions_palette_controls_require_compatible_parameters_and_start_comman
             .document
             .entities_in_block("AUTHOR")
             .find_map(|e| {
-                if let codec::EntityType::Line(l) = e {
+                if let document::EntityType::Line(l) = e {
                     Some(l)
                 } else {
                     None
                 }
             })
             .unwrap();
-        assert_eq!(line.end, codec::types::Vector3::new(2., 0., 0.));
+        assert_eq!(line.end, document::types::Vector3::new(2., 0., 0.));
     });
 }
 
@@ -1807,6 +1873,76 @@ fn block_actions_array_palette_requires_distance_parameter() {
     });
 }
 
+/// The Actions tab's Lookup row asks which lookup parameter to edit and opens
+/// that parameter's table only once the choice is made.
+#[test]
+fn block_actions_lookup_palette_asks_for_the_parameter_before_the_table() {
+    with_stack(|| {
+        use crate::ui::window::authoring_palettes::Tab;
+        let mut app = authoring_app();
+        let _ = app.dispatch_command("BAUTHORPALETTE");
+        app.authoring_palette_tab = Tab::Actions;
+        let _ = app.run_command_line("BPARAMETER LOOKUP 0,0");
+        let i = app.active_tab;
+        let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+        let placed = |app: &OpenCADStudio| {
+            crate::scene::block_lookup::parameters(&app.tabs[i].scene.document, definition)
+                .into_iter()
+                .map(|(handle, _)| handle)
+                .collect::<Vec<_>>()
+        };
+        let first = placed(&app)[0];
+        let _ = app.run_command_line("BPARAMETER LOOKUP 4,0");
+        let all = placed(&app);
+        assert_eq!(all.len(), 2, "the fixture places two lookup parameters");
+        let second = *all.iter().find(|handle| **handle != first).unwrap();
+        let name = crate::scene::block_lookup::parameters(&app.tabs[i].scene.document, definition)
+            .into_iter()
+            .find(|(handle, _)| *handle == second)
+            .map(|(_, parameter)| parameter.lookup_name.clone())
+            .expect("the second lookup parameter");
+        let _ = app.dispatch_command("BACTIONBARMODE 1");
+        let point = authoring_control(&app, "authoring-tool-lookup-table");
+        authoring_click(&mut app, point);
+        assert!(
+            app.tabs[i].active_cmd.is_none(),
+            "with action bars on the row defers to the bar"
+        );
+        let _ = app.dispatch_command("BACTIONBARMODE 0");
+        let point = authoring_control(&app, "authoring-tool-lookup-table");
+        authoring_click(&mut app, point);
+        assert!(
+            app.command_line.last_error.is_none(),
+            "the row is not refused: {:?}",
+            app.command_line.last_error
+        );
+        assert!(
+            app.block_lookup.is_none(),
+            "the row asks for the parameter first"
+        );
+        let command = app.tabs[i]
+            .active_cmd
+            .as_ref()
+            .expect("the row waits for a parameter");
+        assert!(
+            command.prompt().contains("Select a parameter"),
+            "{}",
+            command.prompt()
+        );
+        let _ = app.update(Message::CommandInput(name));
+        let _ = app.update(Message::CommandSubmit);
+        let state = app
+            .block_lookup
+            .as_ref()
+            .expect("the chosen parameter's table opens");
+        assert_eq!(state.drafts.len(), 2, "both tables are listed");
+        assert_eq!(
+            state.drafts[state.selected].parameter, second,
+            "the table of the parameter that was named"
+        );
+    });
+}
+
 #[test]
 fn block_actions_rotate_flip_palette_requires_matching_parameters() {
     with_stack(|| {
@@ -1885,18 +2021,22 @@ fn block_properties_table_offers_to_discard_and_close_on_an_unusable_cell() {
             .as_ref()
             .expect("keeping editing leaves the work in place");
         assert!(!state.confirm_close, "the offer is gone");
-        assert!(state.error.is_some(), "the diagnosis stays where it was read");
+        assert!(
+            state.error.is_some(),
+            "the diagnosis stays where it was read"
+        );
         assert_eq!(state.rows[0][0], "wide");
         assert!(
             try_find_in_view(&app, "Discard & close").is_none(),
             "and the screen agrees"
         );
         let _ = app.update(Message::BlockPropertiesTable(A::Apply));
-        assert!(app
-            .block_properties_table
-            .as_ref()
-            .expect("the refusal offers the way out again")
-            .confirm_close);
+        assert!(
+            app.block_properties_table
+                .as_ref()
+                .expect("the refusal offers the way out again")
+                .confirm_close
+        );
         let _ = app.update(Message::BlockPropertiesTable(A::DiscardClose));
         assert!(app.block_properties_table.is_none());
         assert!(app.active_modal.is_none(), "the dialog actually leaves");
@@ -1937,6 +2077,15 @@ fn lookup_basepoint_palette_and_table_dialog_real_controls() {
         authoring_click(&mut app, point);
         let point = authoring_control(&app, "authoring-tool-lookup-table");
         authoring_click(&mut app, point);
+        let i = app.active_tab;
+        let definition = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+        let name = crate::scene::block_lookup::parameters(&app.tabs[i].scene.document, definition)
+            .into_iter()
+            .next()
+            .map(|(_, parameter)| parameter.lookup_name.clone())
+            .expect("the placed lookup parameter");
+        let _ = app.update(Message::CommandInput(name));
+        let _ = app.update(Message::CommandSubmit);
         assert_eq!(app.active_modal, Some(crate::app::ModalKind::BlockLookup));
         let _ = app.update(Message::BlockLookup(A::Property(0)));
         let point = find_in_view(&app, "Add Property");
@@ -2204,11 +2353,7 @@ fn block_edit_entry_dialog_answers_an_empty_name_when_ok_is_clicked() {
     let _ = app.update(Message::BlockEditPickerName(String::new()));
     assert!(app.block_edit_picker.as_ref().unwrap().error.is_none());
     assert!(
-        try_find_in_view(
-            &app,
-            "The name must be at least one character long."
-        )
-        .is_none(),
+        try_find_in_view(&app, "The name must be at least one character long.").is_none(),
         "nothing is said before the button is pressed"
     );
     let point = find_in_view(&app, "OK");
@@ -2217,7 +2362,9 @@ fn block_edit_entry_dialog_answers_an_empty_name_when_ok_is_clicked() {
         point,
         &[
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
         ],
     );
     assert_eq!(
@@ -2226,11 +2373,7 @@ fn block_edit_entry_dialog_answers_an_empty_name_when_ok_is_clicked() {
         "the click reached the dialog"
     );
     assert!(
-        try_find_in_view(
-            &app,
-            "The name must be at least one character long."
-        )
-        .is_some(),
+        try_find_in_view(&app, "The name must be at least one character long.").is_some(),
         "the reason is on screen"
     );
     assert_eq!(app.active_modal, Some(ModalKind::BlockEditPicker));
@@ -2437,22 +2580,587 @@ fn visibility_parameter_placement_starts_from_the_actual_palette_row() {
 }
 
 #[test]
-fn labelled_strip_shares_the_edge_height_between_pallets() {
+fn labelled_strip_tabs_are_as_long_as_their_names() {
     use crate::app::config::DockSide;
-    use crate::ui::dock::{DockMsg, PanelId, STRIP_CELL_H, STRIP_LABEL_MIN_H};
+    use crate::ui::dock::{DockMsg, PanelId, STRIP_CELL_H};
     let mut app = dock_app();
     app.show_browser = false;
     let _ = app.on_dock(DockMsg::EdgeMenuToggle(DockSide::Left, PanelId::Browser));
     let (icons, _) = app.dock_strip_layout(DockSide::Left);
-    assert!(icons.iter().all(|g| g.cell_h == STRIP_CELL_H));
-    let _ = app.on_dock(DockMsg::StripLabels(true));
+    assert!(icons
+        .iter()
+        .flat_map(|g| &g.cells)
+        .all(|&h| h == STRIP_CELL_H));
+    let _ = app.on_dock(DockMsg::StripNames(
+        crate::ui::dock::StripNames::IconsAndNames,
+    ));
     let (labelled, plus_top) = app.dock_strip_layout(DockSide::Left);
-    let height = app.dock_workspace_size().1;
-    assert!(labelled[0].cell_h >= STRIP_LABEL_MIN_H);
-    // The pallets fill the edge, leaving room for the + button.
-    if labelled[0].cell_h > STRIP_LABEL_MIN_H {
-        assert!(plus_top < height && plus_top > height - 60.0, "{plus_top} of {height}");
-    }
-    let _ = app.on_dock(DockMsg::StripLabels(false));
+    // A tab holds its icon and name, stacked like a tab bar: a short strip,
+    // not one that stretches down the whole edge.
+    let tabs: Vec<f32> = labelled.iter().flat_map(|g| g.cells.clone()).collect();
+    assert!(
+        tabs.iter().all(|&h| h > STRIP_CELL_H && h < 200.0),
+        "{tabs:?}"
+    );
+    assert!(plus_top < app.dock_workspace_size().1 / 2.0, "{plus_top}");
+    let _ = app.on_dock(DockMsg::StripNames(crate::ui::dock::StripNames::Icons));
     assert_eq!(app.dock_strip_layout(DockSide::Left).0, icons);
+}
+
+/// The manager sits above the authoring palettes on the right edge, as the
+/// pane does when the editor opens with both surfaces up. A panel docked last
+/// would land below whichever palette got there first.
+#[test]
+fn the_parameters_manager_docks_above_the_authoring_palettes() {
+    let mut app = authoring_app();
+    let _ = app.dispatch_command("BAUTHORPALETTE");
+    let _ = app.dispatch_command("PARAMETERS");
+    let palettes = app
+        .dock
+        .location(crate::ui::dock::PanelId::AuthoringPalettes)
+        .expect("the palettes are placed");
+    let manager = app
+        .dock
+        .location(crate::ui::dock::PanelId::ParametersManager)
+        .expect("the manager is placed");
+    assert!(app.show_authoring_palettes && app.show_parameters_manager);
+    assert_eq!(
+        palettes.0,
+        crate::app::config::DockSide::Right,
+        "the palettes dock on the right"
+    );
+    assert_eq!(
+        manager.0,
+        crate::app::config::DockSide::Right,
+        "the manager docks on the right"
+    );
+    assert!(
+        manager.1 < palettes.1,
+        "the manager is above the palettes: manager group {}, palettes group {}",
+        manager.1,
+        palettes.1
+    );
+}
+
+#[test]
+fn parameters_command_reopens_the_manager_in_clean_screen() {
+    with_stack(|| authoring_clean_screen("PARAMETERS", "PARAMETERSCLOSE", true));
+}
+
+#[test]
+fn bparameters_command_reopens_the_manager_in_clean_screen() {
+    with_stack(|| authoring_clean_screen("BPARAMETERS", "BPARAMETERSCLOSE", true));
+}
+
+#[test]
+fn authoring_palette_command_reopens_the_palettes_in_clean_screen() {
+    with_stack(|| authoring_clean_screen("BAUTHORPALETTE", "BAUTHORPALETTECLOSE", false));
+}
+
+fn authoring_clean_screen(open: &str, close: &str, manager: bool) {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, PanelId};
+    let (id, label, other, other_open) = if manager {
+        (
+            PanelId::ParametersManager,
+            "PARAMETERS MANAGER",
+            PanelId::AuthoringPalettes,
+            "BAUTHORPALETTE",
+        )
+    } else {
+        (
+            PanelId::AuthoringPalettes,
+            "AUTHORING PALETTES",
+            PanelId::ParametersManager,
+            "PARAMETERS",
+        )
+    };
+    for initially_open in [false, true] {
+        let mut app = authoring_app();
+        let i = app.active_tab;
+        let before = app.tabs[i].scene.document.clone();
+        let history = app.tabs[i].history.undo_stack.len();
+        let _ = app.dispatch_command(other_open);
+        if initially_open {
+            let _ = app.dispatch_command(open);
+            let _ = app.on_dock(DockMsg::DockTo(id, DockSide::Left));
+        }
+        let placement = app.dock.location(id);
+        assert!(try_find_in_view(&app, "Parametric").is_some());
+        let _ = app.update(Message::ToggleCleanScreen);
+        assert!(app.clean_screen);
+        assert!(try_find_in_view(&app, "Parametric").is_none());
+        assert!(!app.dock_panel_visible(id));
+        assert!(!app.dock_panel_visible(other));
+        assert!(try_find_in_view(&app, label).is_none());
+
+        let _ = app.dispatch_command(open);
+        assert!(
+            app.dock_panel_visible(id),
+            "{open} reopens its pane in clean screen (initially open: {initially_open})"
+        );
+        assert!(try_find_in_view(&app, label).is_some());
+        assert!(app.clean_screen, "opening a pane keeps clean screen active");
+        assert!(try_find_in_view(&app, "Parametric").is_none());
+        assert!(!app.dock_panel_visible(other));
+        assert!(!app.dock_panel_visible(PanelId::Properties));
+        if initially_open {
+            assert_eq!(app.dock.location(id), placement);
+        } else {
+            assert!(app.dock.is_placed(id));
+        }
+        authoring_capture(&app, &format!("cleanscreen-{open}-{initially_open}"));
+
+        let _ = app.dispatch_command(open);
+        assert!(
+            !app.dock_panel_visible(id),
+            "a visible pane still toggles off"
+        );
+        let _ = app.dispatch_command(open);
+        assert!(app.dock_panel_visible(id));
+        let _ = app.dispatch_command(other_open);
+        assert!(app.dock_panel_visible(other));
+        let _ = app.dispatch_command(close);
+        assert!(!app.dock_panel_visible(id));
+        assert!(
+            app.dock_panel_visible(other),
+            "close affects only its own pane"
+        );
+
+        let _ = app.update(Message::ToggleCleanScreen);
+        assert!(!app.clean_screen);
+        assert!(try_find_in_view(&app, "Parametric").is_some());
+        assert!(
+            !app.dock_panel_visible(id),
+            "an explicit close survives clean-screen exit"
+        );
+        assert!(app.dock_panel_visible(other));
+        assert!(app.dock_panel_visible(PanelId::Properties));
+        let _ = app.update(Message::ToggleCleanScreen);
+        assert!(!app.dock_panel_visible(id));
+        assert!(
+            !app.dock_panel_visible(other),
+            "a new clean-screen session hides reopened panes"
+        );
+        assert_eq!(app.tabs[i].scene.document, before);
+        assert_eq!(app.tabs[i].history.undo_stack.len(), history);
+        assert!(!app.block_edit_dirty(i));
+    }
+}
+
+/// #2610: a filter tree node's right-click menu, driven through the real
+/// view as the runtime does: the item clicked does its job.
+#[test]
+fn layer_tree_node_menu_items_act() {
+    use crate::ui::dock::{FloatPanel, PanelId};
+    use iced_test::core::{mouse, shell, widget, window};
+    use iced_test::runtime::user_interface::{Cache, UserInterface};
+    use iced_test::Selector;
+    let mut app = dock_app();
+    let i = app.active_tab;
+    let _ = app.run_command_line("-LAYER N ZULU ");
+    let _ = app.run_command_line("LAYERGROUP NEW GRP ZULU");
+    app.show_layers = true;
+    app.dock
+        .float(FloatPanel::new(PanelId::Layers, 50.0, 50.0, 1300.0, 700.0));
+    app.refresh_layer_counts();
+    let mut renderer = headless_renderer();
+    let mut cache = Cache::default();
+    let mut step =
+        |app: &mut OpenCADStudio, at: iced::Point, events: &[iced::Event], find: Option<&str>| {
+            let cursor = mouse::Cursor::Available(at);
+            let mut found = None;
+            for event in events {
+                let mut messages = Vec::new();
+                {
+                    let mut ui = UserInterface::build(
+                        app.view_main(),
+                        VIEW_SIZE,
+                        std::mem::take(&mut cache),
+                        &mut renderer,
+                    );
+                    let _ = ui.update(
+                        &window::Headless,
+                        &shell::Waker::noop(),
+                        std::slice::from_ref(event),
+                        cursor,
+                        &mut renderer,
+                        &mut messages,
+                    );
+                    cache = ui.into_cache();
+                }
+                for message in messages {
+                    let _ = app.update(message);
+                }
+            }
+            if let Some(label) = find {
+                let mut ui = UserInterface::build(
+                    app.view_main(),
+                    VIEW_SIZE,
+                    std::mem::take(&mut cache),
+                    &mut renderer,
+                );
+                let mut sel = Selector::find(label);
+                ui.operate(&renderer, &mut widget::operation::black_box(&mut sel));
+                if let widget::operation::Outcome::Some(Some(t)) = widget::Operation::finish(&sel) {
+                    found = t.visible_bounds().map(|b| b.center());
+                }
+                cache = ui.into_cache();
+            }
+            found
+        };
+    let node = find_in_view(&app, "GRP");
+    // The pointer comes onto the pallet first, as a real one does.
+    step(
+        &mut app,
+        node,
+        &[iced::Event::Mouse(mouse::Event::CursorMoved {
+            position: node,
+        })],
+        None,
+    );
+    // Over the pallet it may move (hover), so look again.
+    let node = find_in_view(&app, "GRP");
+    let right = [
+        iced::Event::Mouse(mouse::Event::CursorMoved { position: node }),
+        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+    ];
+    // The menu opens at the pointer; "Freeze all" is its fourth line
+    // after "Delete group", "Turn All Layers On", "Turn all off".
+    let item = step(&mut app, node, &right, Some("Freeze all")).unwrap_or(iced::Point::new(
+        node.x + 60.0,
+        node.y + 4.0 + 3.0 * 23.3 + 11.0,
+    ));
+    let left = [
+        iced::Event::Mouse(mouse::Event::CursorMoved { position: item }),
+        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+    ];
+    step(&mut app, item, &left, None);
+    let zulu = app.tabs[i]
+        .scene
+        .document
+        .layers
+        .iter()
+        .find(|l| l.name == "ZULU")
+        .unwrap()
+        .is_frozen();
+    assert!(zulu, "Freeze all froze the group's layer");
+}
+
+#[test]
+fn toolpalettes_commands_transparency_and_distinct_from_authoring_palettes() {
+    let mut app = authoring_app();
+    let i = app.active_tab;
+    let before_doc = app.tabs[i].scene.document.clone();
+    let before_history = app.tabs[i].history.undo_stack.len();
+
+    // Start an active command (e.g. LINE)
+    let _ = app.dispatch_command("LINE");
+    assert_eq!(
+        app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+        Some("LINE")
+    );
+
+    // Verify commands are transparent and do not cancel running command
+    assert!(crate::app::commands::is_transparent("TOOLPALETTES"));
+    assert!(crate::app::commands::is_transparent("TOOLPALETTESCLOSE"));
+    assert!(crate::app::commands::is_transparent("TP"));
+
+    // Dispatch TOOLPALETTES, TOOLPALETTESCLOSE and alias TP
+    let _ = app.dispatch_command("TOOLPALETTES");
+    assert_eq!(
+        app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+        Some("LINE"),
+        "TOOLPALETTES must be transparent and preserve running command"
+    );
+    assert!(app.dock_panel_visible(crate::ui::dock::PanelId::ToolPalettes));
+
+    let _ = app.dispatch_command("TOOLPALETTESCLOSE");
+    assert_eq!(
+        app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+        Some("LINE"),
+        "TOOLPALETTESCLOSE must be transparent and preserve running command"
+    );
+    assert!(!app.dock_panel_visible(crate::ui::dock::PanelId::ToolPalettes));
+
+    let _ = app.dispatch_command("TP");
+    assert_eq!(
+        app.tabs[i].active_cmd.as_ref().map(|c| c.name()),
+        Some("LINE"),
+        "TP must be transparent and preserve running command"
+    );
+    assert!(app.dock_panel_visible(crate::ui::dock::PanelId::ToolPalettes));
+
+    let _ = app.dispatch_command("TOOLPALETTESCLOSE");
+    assert!(!app.dock_panel_visible(crate::ui::dock::PanelId::ToolPalettes));
+
+    // Cancel LINE command
+    let _ = app.update(Message::CommandEscape);
+    assert!(app.tabs[i].active_cmd.is_none());
+
+    // Verify general Tool Palettes commands do NOT alter Authoring Palettes dock state
+    assert!(!app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes));
+    let _ = app.dispatch_command("TOOLPALETTES");
+    assert!(
+        !app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes),
+        "TOOLPALETTES must remain distinct from Authoring Palettes"
+    );
+    let _ = app.dispatch_command("TOOLPALETTESCLOSE");
+    assert!(
+        !app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes),
+        "TOOLPALETTESCLOSE must remain distinct from Authoring Palettes"
+    );
+
+    // Open Authoring Palettes with BAUTHORPALETTE
+    let _ = app.dispatch_command("BAUTHORPALETTE");
+    assert!(app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes));
+
+    // TOOLPALETTES / TOOLPALETTESCLOSE must not close or displace Authoring Palettes
+    let _ = app.dispatch_command("TOOLPALETTES");
+    assert!(app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes));
+    let _ = app.dispatch_command("TOOLPALETTESCLOSE");
+    assert!(app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes));
+
+    // BAUTHORPALETTECLOSE closes Authoring Palettes
+    let _ = app.dispatch_command("BAUTHORPALETTECLOSE");
+    assert!(!app.dock_panel_visible(crate::ui::dock::PanelId::AuthoringPalettes));
+
+    // Document, undo stack, and dirty state must be pristine
+    assert_eq!(app.tabs[i].scene.document, before_doc);
+    assert_eq!(app.tabs[i].history.undo_stack.len(), before_history);
+    assert!(!app.block_edit_dirty(i));
+}
+
+#[test]
+fn strip_names_reads_the_old_strip_labels_flag() {
+    use crate::ui::dock::{DockState, StripNames};
+    let read = |json: &str| serde_json::from_str::<DockState>(json).unwrap().strip_names;
+    assert_eq!(read(r#"{"strip_labels": true}"#), StripNames::IconsAndNames);
+    assert_eq!(read(r#"{"strip_labels": false}"#), StripNames::Icons);
+    assert_eq!(
+        read(r#"{"strip_names": "NamesOnly"}"#),
+        StripNames::NamesOnly
+    );
+    assert_eq!(read("{}"), StripNames::Icons, "icons by default");
+    // Saved under the new name only, and read back the same.
+    let state = DockState {
+        strip_names: StripNames::NamesOnly,
+        ..DockState::default()
+    };
+    let json = serde_json::to_string(&state).unwrap();
+    assert!(json.contains("\"strip_names\":\"NamesOnly\"") && !json.contains("strip_labels"));
+    assert_eq!(read(&json), StripNames::NamesOnly);
+}
+
+#[test]
+fn strip_layout_places_groups_and_dividers() {
+    use crate::ui::dock::{strip_hit, strip_layout, StripHit, STRIP_CELL_H};
+    use crate::ui::style::kit_metrics as km;
+    let (layout, plus_top) = strip_layout(&[(0, vec![STRIP_CELL_H; 2]), (1, vec![STRIP_CELL_H])]);
+    // The 2 px group padding sits inside the first and last cells.
+    assert_eq!(layout[0].icons_top, km::STRIP_GROUP_PAD);
+    assert_eq!(
+        layout[0].bottom(),
+        2.0 * km::STRIP_GROUP_PAD + 2.0 * STRIP_CELL_H
+    );
+    assert_eq!(layout[1].top, layout[0].bottom() + km::LINE);
+    assert_eq!(
+        plus_top,
+        layout[1].bottom() + km::LINE + km::STRIP_GROUP_PAD
+    );
+    // Centre of each cell joins its group, before or after the cell's own
+    // pallet depending on the half; the line between groups starts one.
+    let mid = layout[0].icons_top + STRIP_CELL_H * 0.75;
+    assert_eq!(
+        strip_hit(mid, &layout),
+        StripHit::Join { group: 0, index: 1 }
+    );
+    assert_eq!(
+        strip_hit(layout[1].top, &layout),
+        StripHit::NewGroup(Some(1))
+    );
+    assert_eq!(
+        strip_hit(plus_top + 50.0, &layout),
+        StripHit::NewGroup(None)
+    );
+}
+
+#[test]
+fn strip_tabs_follow_the_names_mode() {
+    use crate::ui::dock::{strip_tab_h, StripNames, STRIP_CELL_H};
+    use crate::ui::style::kit_metrics as km;
+    assert_eq!(strip_tab_h("Properties", StripNames::Icons), STRIP_CELL_H);
+    let both = strip_tab_h("Properties", StripNames::IconsAndNames);
+    let names = strip_tab_h("Properties", StripNames::NamesOnly);
+    assert_eq!(both - names, km::STRIP_ICON + km::STRIP_NAME_GAP);
+    assert!(names > 2.0 * km::STRIP_NAME_PAD + 40.0, "{names}");
+    for h in [both, names] {
+        assert_eq!(h.fract(), 0.0, "whole pixels: {h}");
+    }
+}
+
+/// A pallet dragged over either strip lands where the pointer is: the
+/// right strip mirrors the left one, measured from its own window edge.
+#[test]
+fn strip_drops_hit_the_same_cells_on_both_sides() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockGroup, DockMsg, DropTarget, PanelId, DOCK_STRIP_W, STRIP_CELL_H};
+    for side in [DockSide::Left, DockSide::Right] {
+        let mut app = dock_app();
+        app.show_browser = true;
+        app.show_layers = true;
+        let groups = vec![
+            DockGroup::stack(vec![PanelId::Properties, PanelId::Browser]),
+            DockGroup::single(PanelId::Layers),
+        ];
+        let (here, there) = match side {
+            DockSide::Left => (&mut app.dock.left, &mut app.dock.right),
+            DockSide::Right => (&mut app.dock.right, &mut app.dock.left),
+        };
+        *here = groups;
+        *there = vec![DockGroup::single(PanelId::BlockPalette)];
+        let (layout, _) = app.dock_strip_layout(side);
+        let (ww, _) = app.dock_workspace_size();
+        // The middle of the strip's light part, from its own window edge.
+        let x = match side {
+            DockSide::Left => (DOCK_STRIP_W - 1.0) / 2.0,
+            DockSide::Right => ww - (DOCK_STRIP_W - 1.0) / 2.0,
+        };
+        let _ = app.on_dock(DockMsg::IconPress(PanelId::BlockPalette));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(ww / 2.0, 300.0)));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(
+            x,
+            layout[0].icons_top + STRIP_CELL_H + 2.0,
+        )));
+        assert_eq!(
+            drag_target(&app),
+            Some(DropTarget::Join {
+                side,
+                group: 0,
+                index: 1
+            }),
+            "{side:?}"
+        );
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(x, layout[1].top)));
+        assert_eq!(
+            drag_target(&app),
+            Some(DropTarget::Edge { side, index: 1 }),
+            "{side:?}"
+        );
+    }
+}
+
+#[test]
+fn the_docks_run_up_to_the_ribbon_beside_the_drawing_tabs() {
+    with_stack(|| {
+        use crate::ui::style::kit_metrics as km;
+        let mut app = dock_app();
+        let _ = app.update(Message::TabNew);
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1200.0, 700.0);
+        let name = app.tabs[i].tab_display_name();
+        let (left, right) = app.dock_edge_insets();
+        assert!(left > 0.0 && right > 0.0);
+        // By default the tabs sit over the drawing, between the docks, and
+        // the docks are a tab bar taller than the drawing.
+        assert!(!app.file_tabs_above_docks);
+        // The viewport's height is measured whenever the view lays out.
+        let vp_h = |app: &OpenCADStudio| {
+            app.tabs[app.active_tab]
+                .scene
+                .selection
+                .borrow()
+                .view
+                .vp_size
+                .1
+        };
+        assert_eq!(app.dock_workspace_size().1, vp_h(&app) + km::TAB_BAR_H);
+        let tab = find_in_view(&app, &name);
+        assert!(tab.x > left && tab.x < VIEW_SIZE.width - right, "{tab:?}");
+        let title = find_in_view(&app, "PROPERTIES");
+        assert!(title.y < tab.y + km::TAB_BAR_H, "{title:?} beside {tab:?}");
+        // Above the palettes: the bar runs across the window, over the docks.
+        let _ = app.update(Message::DocTabsAboveDocks(true));
+        assert!(app.file_tabs_above_docks);
+        assert_eq!(app.dock_workspace_size().1, vp_h(&app));
+        let tab_above = find_in_view(&app, &name);
+        let title = find_in_view(&app, "PROPERTIES");
+        assert!(tab_above.x < tab.x, "{tab_above:?}");
+        assert!(
+            title.y > tab_above.y + km::TAB_H / 2.0,
+            "{title:?} under {tab_above:?}"
+        );
+    });
+}
+
+#[test]
+fn file_tabs_above_docks_is_saved_and_off_by_default() {
+    let cfg: crate::app::config::AppConfig = serde_json::from_str("{}").unwrap();
+    assert!(!cfg.file_tabs_above_docks);
+    let cfg = crate::app::config::AppConfig {
+        file_tabs_above_docks: true,
+        ..Default::default()
+    };
+    let back: crate::app::config::AppConfig =
+        serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+    assert!(back.file_tabs_above_docks);
+}
+
+/// A strip cell stays lit only while hovered: after a drag (which rebuilds
+/// the strip without the cell hearing the pointer leave) the mark goes;
+/// after a plain click it stays, as the pointer is still on the cell.
+#[test]
+fn docking_by_drag_leaves_no_strip_cell_lit() {
+    use crate::ui::dock::{DockMsg, PanelId};
+    let mut app = dock_app();
+    let _ = app.on_dock(DockMsg::Hover(PanelId::Properties));
+    let _ = app.on_dock(DockMsg::IconPress(PanelId::Properties));
+    let _ = app.on_dock(DockMsg::DragRelease);
+    assert_eq!(app.dock_icon_hover, Some(PanelId::Properties), "a click");
+
+    let _ = app.on_dock(DockMsg::IconPress(PanelId::Properties));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(20.0, 100.0)));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(1580.0, 120.0)));
+    let _ = app.on_dock(DockMsg::DragRelease);
+    assert_eq!(app.dock_icon_hover, None, "a drag");
+
+    let _ = app.on_dock(DockMsg::Hover(PanelId::BlockPalette));
+    let _ = app.on_dock(DockMsg::DockTo(
+        PanelId::BlockPalette,
+        crate::app::config::DockSide::Left,
+    ));
+    assert_eq!(app.dock_icon_hover, None, "docked by double-click");
+}
+
+#[test]
+fn a_group_grip_lights_only_after_its_latest_hover_rests() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::DockMsg;
+    let mut app = dock_app();
+    let grip = (DockSide::Left, 0);
+    // A timer that reports while the pointer is still there lights it.
+    let _ = app.on_dock(DockMsg::GripHover(grip.0, grip.1));
+    let first = app.dock_grip_gen;
+    let _ = app.on_dock(DockMsg::GripLit(grip.0, grip.1, first));
+    assert_eq!(app.dock_grip_lit, Some(grip));
+    // Leaving unlights it.
+    let _ = app.on_dock(DockMsg::GripHoverEnd(grip.0, grip.1));
+    assert_eq!(app.dock_grip_lit, None);
+    // Back within the delay: the first visit's timer does not light it.
+    let _ = app.on_dock(DockMsg::GripHover(grip.0, grip.1));
+    let _ = app.on_dock(DockMsg::GripLit(grip.0, grip.1, first));
+    assert_eq!(app.dock_grip_lit, None);
+    // Nor does a timer after the pointer left.
+    let second = app.dock_grip_gen;
+    let _ = app.on_dock(DockMsg::GripHoverEnd(grip.0, grip.1));
+    let _ = app.on_dock(DockMsg::GripLit(grip.0, grip.1, second));
+    assert_eq!(app.dock_grip_lit, None);
+    // Grabbing a lit grip unlights it: the drag hides the pointer leaving.
+    let _ = app.on_dock(DockMsg::GripHover(grip.0, grip.1));
+    let third = app.dock_grip_gen;
+    let _ = app.on_dock(DockMsg::GripLit(grip.0, grip.1, third));
+    let _ = app.on_dock(DockMsg::GroupGrab(grip.0, grip.1));
+    assert_eq!((app.dock_grip_hover, app.dock_grip_lit), (None, None));
 }

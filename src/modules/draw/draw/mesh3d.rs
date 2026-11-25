@@ -1,6 +1,6 @@
-use codec::entities::polygon_mesh::{PolygonMesh, PolygonMeshVertex};
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::polygon_mesh::{PolygonMesh, PolygonMeshVertex};
+use document::types::Vector3;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, DynField};
@@ -23,6 +23,12 @@ pub struct Mesh3dCommand {
     m: usize,
     n: usize,
     points: Vec<DVec3>,
+}
+
+impl Default for Mesh3dCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Mesh3dCommand {

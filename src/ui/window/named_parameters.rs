@@ -14,14 +14,14 @@
 //! undefined-reference problems across rows immediately, before Apply.
 
 use crate::app::Message;
-use crate::scene::named_parameters::ParameterTable;
 use crate::scene::Scene;
+use crate::scene::named_parameters::ParameterTable;
 use crate::t;
 use crate::ui::style::common::muted_style;
-use codec::types::Handle;
-use codec::EntityType;
+use document::EntityType;
+use document::types::Handle;
 use iced::widget::tooltip::Position as TipPos;
-use iced::widget::{button, column, container, row, scrollable, text, text_input, tooltip, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input, tooltip};
 use iced::{Background, Element, Length, Theme};
 
 /// Short "Kind handle" label for an entity without a user-facing name.
@@ -392,10 +392,12 @@ mod tests {
             ConstraintKind, ParametricRef, ParametricScope,
         };
         let mut scene = Scene::new();
-        let line = scene.add_entity(codec::EntityType::Line(codec::entities::Line::from_points(
-            codec::types::Vector3::new(0.0, 0.0, 0.0),
-            codec::types::Vector3::new(10.0, 0.0, 0.0),
-        )));
+        let line = scene.add_entity(document::EntityType::Line(
+            document::entities::Line::from_points(
+                document::types::Vector3::new(0.0, 0.0, 0.0),
+                document::types::Vector3::new(10.0, 0.0, 0.0),
+            ),
+        ));
         scene
             .parametric_constraint_set_mut(ParametricScope::ModelSpace)
             .add(
@@ -424,7 +426,7 @@ mod tests {
     #[test]
     fn entity_label_reports_erased_for_a_dangling_handle() {
         let scene = Scene::new();
-        let label = entity_label(&scene, codec::types::Handle::new(999));
+        let label = entity_label(&scene, document::types::Handle::new(999));
         assert!(label.starts_with("(erased "), "got {label}");
     }
 }

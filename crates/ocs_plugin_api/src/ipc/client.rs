@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use codec::xdata::ExtendedDataRecord;
-use codec::{Document, EntityType, Handle};
+use document::xdata::ExtendedDataRecord;
+use document::{Document, EntityType, Handle};
 use interprocess::local_socket::traits::Stream as StreamTrait;
 use interprocess::local_socket::{GenericNamespaced, Stream, ToNsName};
 
@@ -16,7 +16,9 @@ use crate::ipc::protocol::{
     HostResponse, HostToPlugin, PluginRequest, PluginResponse, PluginToHost, RunnerHandshake,
 };
 use crate::ipc::transport::{recv, send};
+use crate::scene::{PanelScene, PanelSurface, SceneRevision, SurfaceReject, SurfaceRejectCode};
 use crate::shm::{DocumentViewData, DocumentViewInfo, SharedDocumentReader};
+use crate::widget::{WidgetReject, WidgetRejectCode, WidgetRevision, WidgetSurface};
 
 /// Shared registry of active interactive commands, keyed by host-assigned id.
 pub type InteractiveRegistry = Rc<RefCell<HashMap<u64, Box<dyn InteractiveCommand>>>>;
@@ -93,6 +95,9 @@ pub struct PluginHostApi {
     /// Shared-memory document view information, lazily fetched on first
     /// `document_reader()` access.
     doc_view: RefCell<Option<DocumentViewInfo>>,
+    /// A failed document fetch left the cache degraded (P2-7): document
+    /// access keeps retrying instead of pinning an empty drawing.
+    document_fetch_failed: Cell<bool>,
 }
 
 impl PluginHostApi {
@@ -105,20 +110,96 @@ impl PluginHostApi {
             next_command_id: Cell::new(1),
             record_cache: RefCell::new(HashMap::new()),
             doc_view: RefCell::new(None),
+            document_fetch_failed: Cell::new(false),
         }
     }
 
-    fn fetch_document(&self) -> Document {
+    /// Fetch the host document snapshot. `Err` NO LONGER caches an empty
+    /// document: a transport failure would have pinned an empty cached
+    /// drawing for the plugin's whole session (P2-7) — the honest answer is
+    /// the retry-friendly degraded default below.
+    fn fetch_document(&self) -> Result<Document, String> {
         match self.client.request(PluginRequest::DocumentSnapshot) {
-            Ok(PluginResponse::Document(doc)) => *doc,
+            Ok(PluginResponse::Document(doc)) => Ok(*doc),
             Ok(other) => {
-                eprintln!("[plugin] unexpected DocumentSnapshot response: {other:?}");
-                Document::default()
+                let error = format!("unexpected DocumentSnapshot response: {other:?}");
+                eprintln!("[plugin] {error}");
+                Err(error)
             }
             Err(e) => {
-                eprintln!("[plugin] failed to fetch document snapshot: {e}");
-                Document::default()
+                let error = format!("failed to fetch document snapshot: {e}");
+                eprintln!("[plugin] {error}");
+                Err(error)
             }
+        }
+    }
+
+    /// Fetch (never cache) the CURRENT document view info from the host.
+    fn fetch_document_view(&self) -> Option<DocumentViewInfo> {
+        match self.client.request(PluginRequest::OpenDocumentView) {
+            Ok(PluginResponse::DocumentView { path, version }) => {
+                Some(DocumentViewInfo { path, version })
+            }
+            Ok(other) => {
+                eprintln!("[plugin] unexpected OpenDocumentView response: {other:?}");
+                None
+            }
+            Err(e) => {
+                eprintln!("[plugin] OpenDocumentView request failed: {e}");
+                None
+            }
+        }
+    }
+}
+
+impl PluginHostApi {
+    /// Bring the cached snapshot up to date after this plugin's own edit
+    /// (see [`snapshot_patch`](crate::ipc::snapshot_patch)): re-read the
+    /// `refreshed` entities from the host and drop the `removed` ones. Without
+    /// a usable cache there is nothing to patch; any failure drops the cache
+    /// so the next read fetches the host's truth.
+    fn patch_cache(&mut self, refreshed: &[Handle], removed: &[Handle]) {
+        if self.document_cache.get().is_none() || self.document_fetch_failed.get() {
+            self.document_cache = OnceCell::new();
+            return;
+        }
+        let fresh = if refreshed.is_empty() {
+            Some(Vec::new())
+        } else {
+            match self.client.request(PluginRequest::GetEntitiesBatch {
+                handles: refreshed.to_vec(),
+            }) {
+                Ok(PluginResponse::GetEntitiesBatchResult(Ok(list))) => Some(list),
+                _ => None,
+            }
+        };
+        let patched = match (fresh, self.document_cache.get_mut()) {
+            (Some(fresh), Some(doc)) => {
+                crate::ipc::snapshot_patch::apply_refreshed(doc, refreshed, fresh, removed)
+            }
+            _ => false,
+        };
+        if !patched {
+            self.document_cache = OnceCell::new();
+        }
+    }
+
+    /// Mirror a successful record write/removal in the cached snapshot.
+    fn patch_cached_record(
+        &mut self,
+        handle: Handle,
+        app_name: &str,
+        record: Option<ExtendedDataRecord>,
+    ) {
+        if self.document_fetch_failed.get() {
+            self.document_cache = OnceCell::new();
+            return;
+        }
+        let Some(doc) = self.document_cache.get_mut() else {
+            return;
+        };
+        if !crate::ipc::snapshot_patch::mirror_record(doc, handle, app_name, record) {
+            self.document_cache = OnceCell::new();
         }
     }
 }
@@ -129,23 +210,91 @@ impl HostApi for PluginHostApi {
     }
 
     fn document(&self) -> &Document {
-        self.document_cache.get_or_init(|| self.fetch_document())
+        if let (false, Some(doc)) = (self.document_fetch_failed.get(), self.document_cache.get()) {
+            return doc;
+        }
+        // Cache empty, or degraded: attempt one re-fetch; upgrade on success
+        // so a transient transport failure cannot strand the plugin on an
+        // empty drawing (P2-7).
+        match self.fetch_document() {
+            Ok(doc) => {
+                // Soundness: `document()` runs through `&self`, so an OCCUPIED
+                // cache (the degraded default) cannot be replaced here —
+                // `set` would silently no-op (review finding 2). Keep the
+                // degraded flag SET and keep retrying; the upgrade happens
+                // through `document_mut()` (or any mutating HostApi call,
+                // which resets the cell) as soon as the plugin mutates.
+                if self.document_cache.set(doc).is_ok() {
+                    self.document_fetch_failed.set(false);
+                } else {
+                    eprintln!(
+                        "[plugin] host document fetch succeeded but the degraded cached \
+                         snapshot is pinned; it upgrades on the next document_mut()/mutation"
+                    );
+                }
+                self.document_cache.get().expect("just initialized")
+            }
+            Err(e) => {
+                eprintln!(
+                    "[plugin] serving the previous document snapshot (degraded); the next \
+                     document() call retries: {e}"
+                );
+                if let Some(doc) = self.document_cache.get() {
+                    return doc;
+                }
+                static DEGRADED: std::sync::OnceLock<Document> = std::sync::OnceLock::new();
+                DEGRADED.get_or_init(Document::default)
+            }
+        }
     }
 
     fn document_mut(&mut self) -> &mut Document {
-        if self.document_cache.get().is_none() {
-            let doc = self.fetch_document();
-            let _ = self.document_cache.set(doc);
+        if self.document_cache.get().is_some() && !self.document_fetch_failed.get() {
+            return self.document_cache.get_mut().expect("document initialized");
+        }
+        // First fetch, or a retry after a degraded one. The &mut answer shape
+        // demands a document; a failed fetch caches the default and keeps the
+        // degraded flag so retries continue.
+        match self.fetch_document() {
+            Ok(doc) => {
+                // `self` is mutable here: a take-then-set actually REPLACES
+                // the degraded cached snapshot (the upgrade document() cannot
+                // perform). Locally made edits to the degraded doc are
+                // dropped and the replacement is loud.
+                let replaced = self.document_cache.take().is_some();
+                // Always succeeds right after take; ignore the Result instead
+                // of tripping the unused_must_use lint.
+                let _ = self.document_cache.set(doc);
+                self.document_fetch_failed.set(false);
+                if replaced {
+                    eprintln!(
+                        "[plugin] document snapshot upgraded after a degraded fetch (local \
+                         edits to the degraded snapshot were discarded)"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[plugin] document_mut on an unreachable host serves the degraded cached \
+                     default; the next document()/document_mut() call retries: {e}"
+                );
+                self.document_fetch_failed.set(true);
+                self.document_cache.get_or_init(Document::default);
+            }
         }
         self.document_cache.get_mut().expect("document initialized")
     }
 
     fn add_entity(&mut self, entity: EntityType) -> Handle {
+        let full_refresh = crate::ipc::snapshot_patch::edit_needs_full_refresh(&entity);
         match self.client.request(PluginRequest::AddEntity(entity)) {
             Ok(PluginResponse::Handle(h)) => {
-                // The cached snapshot is now stale; drop it so a later
-                // document() re-fetches the host's post-edit truth.
-                self.document_cache = OnceCell::new();
+                // Patch the cached snapshot with the host's post-edit copy.
+                if h.is_null() || full_refresh {
+                    self.document_cache = OnceCell::new();
+                } else {
+                    self.patch_cache(&[h], &[]);
+                }
                 h
             }
             Ok(other) => {
@@ -160,11 +309,19 @@ impl HostApi for PluginHostApi {
     }
 
     fn add_entities(&mut self, entities: Vec<EntityType>) -> Vec<Handle> {
+        let full_refresh = entities
+            .iter()
+            .any(crate::ipc::snapshot_patch::edit_needs_full_refresh);
         match self.client.request(PluginRequest::AddEntities(entities)) {
             Ok(PluginResponse::Handles(handles)) => {
-                // The cached snapshot is now stale; drop it so a later
-                // document() re-fetches the host's post-edit truth.
-                self.document_cache = OnceCell::new();
+                // Patch the cached snapshot with the host's post-edit copies.
+                if full_refresh {
+                    self.document_cache = OnceCell::new();
+                } else {
+                    let added: Vec<Handle> =
+                        handles.iter().copied().filter(|h| !h.is_null()).collect();
+                    self.patch_cache(&added, &[]);
+                }
                 handles
             }
             Ok(other) => {
@@ -179,12 +336,17 @@ impl HostApi for PluginHostApi {
     }
 
     fn update_entity(&mut self, entity: EntityType) -> bool {
+        let handle = entity.common().handle;
+        let full_refresh = crate::ipc::snapshot_patch::edit_needs_full_refresh(&entity);
         match self.client.request(PluginRequest::UpdateEntity(entity)) {
             Ok(PluginResponse::Bool(b)) => {
                 if b {
-                    // The cached snapshot is now stale; drop it so a later
-                    // document() re-fetches the host's post-edit truth.
-                    self.document_cache = OnceCell::new();
+                    // Patch the cached snapshot with the host's post-edit copy.
+                    if full_refresh {
+                        self.document_cache = OnceCell::new();
+                    } else {
+                        self.patch_cache(&[handle], &[]);
+                    }
                 }
                 b
             }
@@ -202,8 +364,16 @@ impl HostApi for PluginHostApi {
     fn remove_entity(&mut self, handle: Handle) -> bool {
         match self.client.request(PluginRequest::RemoveEntity { handle }) {
             Ok(PluginResponse::Bool(b)) => {
-                if b {
+                // A nested attribute is not in the cached entity store: the
+                // host removed it from its block reference.
+                let nested = self
+                    .document_cache
+                    .get()
+                    .is_some_and(|doc| doc.get_entity(handle).is_none());
+                if b && nested {
                     self.document_cache = OnceCell::new();
+                } else if b {
+                    self.patch_cache(&[], &[handle]);
                 }
                 b
             }
@@ -223,6 +393,19 @@ impl HostApi for PluginHostApi {
     }
 
     fn read_record(&self, handle: Handle, app_name: &str) -> Option<&ExtendedDataRecord> {
+        // The host answers `ReadRecord` from the entity's own XDATA, which the
+        // cached snapshot carries (kept current after this plugin's edits):
+        // answer from it when the entity is there. A scan over a large drawing
+        // otherwise costs one round trip per entity.
+        if !self.document_fetch_failed.get() {
+            if let Some(entity) = self
+                .document_cache
+                .get()
+                .and_then(|doc| doc.get_entity(handle))
+            {
+                return entity.common().extended_data.get_record(app_name);
+            }
+        }
         let key = (handle, app_name.to_string());
         {
             let cache = self.record_cache.borrow();
@@ -254,13 +437,17 @@ impl HostApi for PluginHostApi {
 
     fn write_record(&mut self, handle: Handle, record: ExtendedDataRecord) -> bool {
         let app = record.application_name.clone();
+        let mirrored = record.clone();
         match self
             .client
             .request(PluginRequest::WriteRecord { handle, record })
         {
             Ok(PluginResponse::Bool(b)) => {
                 if b {
-                    self.record_cache.borrow_mut().remove(&(handle, app));
+                    self.record_cache
+                        .borrow_mut()
+                        .remove(&(handle, app.clone()));
+                    self.patch_cached_record(handle, &app, Some(mirrored));
                 }
                 b
             }
@@ -285,6 +472,7 @@ impl HostApi for PluginHostApi {
                     self.record_cache
                         .borrow_mut()
                         .remove(&(handle, app_name.to_string()));
+                    self.patch_cached_record(handle, app_name, None);
                 }
                 b
             }
@@ -402,34 +590,40 @@ impl HostApi for PluginHostApi {
         {
             let mut view = self.doc_view.borrow_mut();
             if view.is_none() {
-                match self.client.request(PluginRequest::OpenDocumentView) {
-                    Ok(PluginResponse::DocumentView { path, version }) => {
-                        *view = Some(DocumentViewInfo { path, version });
-                    }
-                    Ok(other) => {
-                        eprintln!("[plugin] unexpected OpenDocumentView response: {other:?}");
-                    }
-                    Err(e) => {
-                        eprintln!("[plugin] OpenDocumentView request failed: {e}");
-                    }
-                }
+                *view = self.fetch_document_view();
             }
         }
-        match self.doc_view.borrow().as_ref() {
-            Some(info) => {
-                match SharedDocumentReader::<DocumentViewData>::open(Path::new(&info.path)) {
-                    Ok(reader) => Box::new(reader),
-                    Err(e) => {
+        // Two attempts: a resize moved the snapshot to a NEW path, so the
+        // cached view info goes stale; re-ask the host once before serving
+        // the empty reader. Every failure stays logged (P2-7): the caller
+        // still receives the contract answer shape.
+        for attempt in 0..2 {
+            let info = self.doc_view.borrow().clone();
+            let Some(info) = info else {
+                return Box::new(EmptyDocumentReader);
+            };
+            match SharedDocumentReader::<DocumentViewData>::open(Path::new(&info.path)) {
+                Ok(reader) => return Box::new(reader),
+                Err(e) => {
+                    eprintln!(
+                        "[plugin] failed to open document view at {}: {e}",
+                        info.path
+                    );
+                    if attempt == 0 {
+                        let refreshed = self.fetch_document_view();
                         eprintln!(
-                            "[plugin] failed to open document view at {}: {e}",
-                            info.path
+                            "[plugin] retrying the document view with refreshed view info: {}",
+                            refreshed
+                                .as_ref()
+                                .map(|v| v.path.clone())
+                                .unwrap_or_else(|| "none".to_string())
                         );
-                        Box::new(EmptyDocumentReader)
+                        *self.doc_view.borrow_mut() = refreshed;
                     }
                 }
             }
-            None => Box::new(EmptyDocumentReader),
         }
+        Box::new(EmptyDocumentReader)
     }
 
     fn document_path(&self, tab_id: u64) -> Option<std::path::PathBuf> {
@@ -482,6 +676,10 @@ impl HostApi for PluginHostApi {
         label: &str,
         entities: Vec<EntityType>,
     ) -> Result<(), String> {
+        let handles: Vec<Handle> = entities.iter().map(|e| e.common().handle).collect();
+        let full_refresh = entities
+            .iter()
+            .any(crate::ipc::snapshot_patch::edit_needs_full_refresh);
         match self
             .client
             .request(PluginRequest::UpdateEntitiesTransaction {
@@ -490,7 +688,11 @@ impl HostApi for PluginHostApi {
             }) {
             Ok(PluginResponse::EntityTransactionResult(result)) => {
                 if result.is_ok() {
-                    self.document_cache = OnceCell::new();
+                    if full_refresh {
+                        self.document_cache = OnceCell::new();
+                    } else {
+                        self.patch_cache(&handles, &[]);
+                    }
                 }
                 result
             }
@@ -802,9 +1004,11 @@ impl HostApi for PluginHostApi {
         // API v14: identity + design descriptor in, reference-only display
         // handles out. A staged write mutates the document: the cached
         // snapshot invalidates like every write path.
-        match self.client.request(PluginRequest::StagePluginClassInstance {
-            instance: instance.clone(),
-        }) {
+        match self
+            .client
+            .request(PluginRequest::StagePluginClassInstance {
+                instance: instance.clone(),
+            }) {
             Ok(PluginResponse::StagePluginClassInstanceResult(result)) => {
                 if result.is_ok() {
                     self.document_cache = OnceCell::new();
@@ -901,6 +1105,221 @@ impl HostApi for PluginHostApi {
             }
         }
     }
+
+    fn set_geo_location(
+        &mut self,
+        location: &crate::host::GeoLocation,
+    ) -> Result<crate::host::Handle, String> {
+        match self.client.request(PluginRequest::SetGeoLocation {
+            location: location.clone(),
+        }) {
+            Ok(PluginResponse::GeoLocationSet(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected SetGeoLocation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn remove_geo_location(&mut self) -> Result<bool, String> {
+        match self.client.request(PluginRequest::RemoveGeoLocation) {
+            Ok(PluginResponse::GeoLocationRemoved(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected RemoveGeoLocation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn panel_surface_publish(
+        &mut self,
+        panel_id: &str,
+        scene: PanelScene,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        match self.client.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: PanelSurface::Scene(scene),
+        }) {
+            Ok(PluginResponse::PanelSurfacePublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelSurfacePublish response: {other:?}");
+                Err(SurfaceReject {
+                    code: SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelSurfacePublish request failed: {e}");
+                Err(SurfaceReject {
+                    code: SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_widget_publish(
+        &mut self,
+        panel_id: &str,
+        surface: WidgetSurface,
+    ) -> Result<WidgetRevision, WidgetReject> {
+        match self.client.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: PanelSurface::Widgets(surface),
+        }) {
+            Ok(PluginResponse::PanelWidgetPublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected widget publish response: {other:?}");
+                Err(WidgetReject {
+                    code: WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] widget publish request failed: {e}");
+                Err(WidgetReject {
+                    code: WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_surface_patch(
+        &mut self,
+        panel_id: &str,
+        patch: crate::scene::ScenePatch,
+    ) -> Result<SceneRevision, SurfaceReject> {
+        match self.client.request(PluginRequest::PanelSurfacePatch {
+            panel_id: panel_id.to_string(),
+            patch,
+        }) {
+            Ok(PluginResponse::PanelSurfacePatchResult(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelSurfacePatch response: {other:?}");
+                Err(SurfaceReject {
+                    code: SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelSurfacePatch request failed: {e}");
+                Err(SurfaceReject {
+                    code: SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_surface_page(
+        &mut self,
+        panel_id: &str,
+        page: crate::widget::WidgetPage,
+    ) -> Result<crate::widget::WidgetRevision, WidgetReject> {
+        match self.client.request(PluginRequest::PanelSurfacePage {
+            panel_id: panel_id.to_string(),
+            page,
+        }) {
+            Ok(PluginResponse::PanelSurfacePageResult(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelSurfacePage response: {other:?}");
+                Err(WidgetReject {
+                    code: WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelSurfacePage request failed: {e}");
+                Err(WidgetReject {
+                    code: WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_table_publish(
+        &mut self,
+        panel_id: &str,
+        surface: crate::tables::TableSurface,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        match self.client.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: PanelSurface::Tables(surface),
+        }) {
+            Ok(PluginResponse::PanelTablePublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected table publish response: {other:?}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] table publish request failed: {e}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_surface_table_patch(
+        &mut self,
+        panel_id: &str,
+        patch: crate::tables::TablePatch,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        match self.client.request(PluginRequest::PanelSurfaceTablePatch {
+            panel_id: panel_id.to_string(),
+            patch,
+        }) {
+            Ok(PluginResponse::PanelTablePatchResult(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected table patch response: {other:?}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] table patch request failed: {e}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_snapshot(&self, panel_id: &str) -> Result<crate::dialog::PanelSnapshot, String> {
+        match self.client.request(PluginRequest::PanelSnapshot {
+            panel_id: panel_id.to_string(),
+        }) {
+            Ok(PluginResponse::PanelSnapshot(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected PanelSnapshot response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn validate_parametric_chain(
+        &self,
+        chain: &crate::host::ParametricChain,
+        tolerance: f64,
+    ) -> Result<(), String> {
+        // Pure validation: no document snapshot invalidation.
+        match self.client.request(PluginRequest::ValidateParametricChain {
+            chain: chain.clone(),
+            tolerance,
+        }) {
+            Ok(PluginResponse::ValidateParametricChainResult(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!(
+                "unexpected parametric validation response: {other:?}"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// Sentinel reader used when the shared-memory view could not be initialized.
@@ -924,11 +1343,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    use codec::entities::Point;
-    use codec::{EntityType, Handle};
+    use document::entities::Point;
+    use document::{EntityType, Handle};
     use interprocess::local_socket::{
-        traits::{Listener, Stream as StreamTrait},
         GenericNamespaced, ListenerOptions, Stream, ToNsName,
+        traits::{Listener, Stream as StreamTrait},
     };
 
     use crate::host::HostApi;
@@ -979,9 +1398,10 @@ mod tests {
             "out-of-process ensure_plugin_state must degrade, not panic: {:?}",
             outcome.err()
         );
-        assert!(api
-            .ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32))
-            .is_none());
+        assert!(
+            api.ensure_plugin_state_any("opencad.demo", &mut || Box::new(7u32))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1004,6 +1424,176 @@ mod tests {
         });
         api.push_info("hello host");
         peer_handle.join().unwrap();
+    }
+
+    #[test]
+    fn validate_parametric_chain_awaits_typed_responses() {
+        let (api, mut peer) = make_client();
+        let chain = crate::host::ParametricChain {
+            plane: crate::host::ParametricPlane::Plan,
+            segments: Vec::new(),
+            layer: String::new(),
+        };
+        let peer_handle = thread::spawn(move || {
+            for result in [Ok(()), Err("hard-corner seam".to_owned())] {
+                match recv::<PluginToHost>(&mut peer).unwrap() {
+                    PluginToHost::Request(req) => match *req {
+                        PluginRequest::ValidateParametricChain {
+                            chain: decoded,
+                            tolerance,
+                        } => {
+                            assert!(decoded.segments.is_empty());
+                            assert_eq!(tolerance, 1e-3);
+                        }
+                        other => panic!("unexpected: {other:?}"),
+                    },
+                    other => panic!("unexpected: {other:?}"),
+                }
+                send(
+                    &mut peer,
+                    &HostToPlugin::Response(Box::new(
+                        PluginResponse::ValidateParametricChainResult(result),
+                    )),
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(api.validate_parametric_chain(&chain, 1e-3), Ok(()));
+        assert_eq!(
+            api.validate_parametric_chain(&chain, 1e-3),
+            Err("hard-corner seam".to_owned())
+        );
+        peer_handle.join().unwrap();
+    }
+
+    /// A scripted host: answers each request with `answer` and returns the
+    /// request names in order once `count` requests were served.
+    fn serve(
+        mut peer: Stream,
+        count: usize,
+        answer: impl Fn(&PluginRequest) -> PluginResponse + Send + 'static,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..count {
+                let PluginToHost::Request(req) = recv::<PluginToHost>(&mut peer).unwrap() else {
+                    panic!("expected a request");
+                };
+                let name = format!("{req:?}");
+                seen.push(name.split([' ', '(', '{']).next().unwrap_or("").to_string());
+                send(&mut peer, &HostToPlugin::Response(Box::new(answer(&req)))).unwrap();
+            }
+            seen
+        })
+    }
+
+    fn snapshot_with_point() -> (document::Document, Handle) {
+        let mut doc = document::Document::new();
+        let _ = doc.app_ids.add(document::tables::AppId::new("CACHE_TEST"));
+        let handle = doc
+            .add_entity(EntityType::Point(Point::from_coords(1.0, 2.0, 3.0)))
+            .unwrap();
+        (doc, handle)
+    }
+
+    #[test]
+    fn an_update_patches_the_cached_snapshot_instead_of_refetching_it() {
+        let (api_doc, handle) = snapshot_with_point();
+        let mut moved = api_doc.get_entity(handle).unwrap().clone();
+        if let EntityType::Point(point) = &mut moved {
+            point.location.x = 9.0;
+        }
+        let host_copy = moved.clone();
+        let (mut api, peer) = make_client();
+        let peer = serve(peer, 3, move |req| match req {
+            PluginRequest::DocumentSnapshot => PluginResponse::Document(Box::new(api_doc.clone())),
+            PluginRequest::UpdateEntity(_) => PluginResponse::Bool(true),
+            PluginRequest::GetEntitiesBatch { handles } => {
+                assert_eq!(handles, &vec![handle]);
+                PluginResponse::GetEntitiesBatchResult(Ok(vec![Some(host_copy.clone())]))
+            }
+            other => panic!("unexpected: {other:?}"),
+        });
+        assert!(api.document().get_entity(handle).is_some());
+        assert!(api.update_entity(moved));
+        // Served from the patched snapshot: no second DocumentSnapshot.
+        let EntityType::Point(point) = api.document().get_entity(handle).unwrap().clone() else {
+            panic!("point");
+        };
+        assert_eq!(point.location.x, 9.0);
+        assert_eq!(
+            peer.join().unwrap(),
+            ["DocumentSnapshot", "UpdateEntity", "GetEntitiesBatch"]
+        );
+    }
+
+    #[test]
+    fn records_are_read_from_and_mirrored_into_the_cached_snapshot() {
+        let (api_doc, handle) = snapshot_with_point();
+        let (mut api, peer) = make_client();
+        let peer = serve(peer, 2, move |req| match req {
+            PluginRequest::DocumentSnapshot => PluginResponse::Document(Box::new(api_doc.clone())),
+            PluginRequest::WriteRecord { .. } => PluginResponse::Bool(true),
+            other => panic!("unexpected: {other:?}"),
+        });
+        let _ = api.document();
+        // No record yet: answered from the snapshot, no ReadRecord round trip.
+        assert!(api.read_record(handle, "CACHE_TEST").is_none());
+        let mut record = document::xdata::ExtendedDataRecord::new("CACHE_TEST");
+        record.add_value(document::xdata::XDataValue::String("stamp".into()));
+        assert!(api.write_record(handle, record.clone()));
+        assert_eq!(api.read_record(handle, "CACHE_TEST"), Some(&record));
+        assert_eq!(peer.join().unwrap(), ["DocumentSnapshot", "WriteRecord"]);
+    }
+
+    #[test]
+    fn a_record_of_a_new_application_refetches_the_snapshot() {
+        // The host registers an unknown application id, so the cached APPID
+        // table would be stale: the cache is dropped instead of patched.
+        let (api_doc, handle) = snapshot_with_point();
+        let (mut api, peer) = make_client();
+        let peer = serve(peer, 3, move |req| match req {
+            PluginRequest::DocumentSnapshot => PluginResponse::Document(Box::new(api_doc.clone())),
+            PluginRequest::WriteRecord { .. } => PluginResponse::Bool(true),
+            other => panic!("unexpected: {other:?}"),
+        });
+        let _ = api.document();
+        assert!(api.write_record(
+            handle,
+            document::xdata::ExtendedDataRecord::new("OTHER_APP")
+        ));
+        let _ = api.document();
+        assert_eq!(
+            peer.join().unwrap(),
+            ["DocumentSnapshot", "WriteRecord", "DocumentSnapshot"]
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_read_refetches_the_snapshot() {
+        let (api_doc, handle) = snapshot_with_point();
+        let entity = api_doc.get_entity(handle).unwrap().clone();
+        let (mut api, peer) = make_client();
+        let peer = serve(peer, 4, move |req| match req {
+            PluginRequest::DocumentSnapshot => PluginResponse::Document(Box::new(api_doc.clone())),
+            PluginRequest::UpdateEntity(_) => PluginResponse::Bool(true),
+            PluginRequest::GetEntitiesBatch { .. } => {
+                PluginResponse::GetEntitiesBatchResult(Err("busy".to_string()))
+            }
+            other => panic!("unexpected: {other:?}"),
+        });
+        let _ = api.document();
+        assert!(api.update_entity(entity));
+        let _ = api.document();
+        assert_eq!(
+            peer.join().unwrap(),
+            [
+                "DocumentSnapshot",
+                "UpdateEntity",
+                "GetEntitiesBatch",
+                "DocumentSnapshot"
+            ]
+        );
     }
 
     #[test]
@@ -1152,7 +1742,7 @@ mod tests {
             send(
                 &mut peer,
                 &HostToPlugin::Response(Box::new(PluginResponse::XRecordNames(Ok(vec![
-                    "alpha".to_owned()
+                    "alpha".to_owned(),
                 ])))),
             )
             .unwrap();

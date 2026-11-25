@@ -2,18 +2,18 @@
 //! cards with accent headings, a help button on the left and the named
 //! action on the right, like the other drawing dialogs.
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input, Space};
+use iced::widget::{Space, button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Element, Fill, Length};
 
 use crate::app::Message;
 use crate::modules::draw::draw::attdef::{
-    Justify, AFLAG_CONSTANT, AFLAG_INVISIBLE, AFLAG_LOCK, AFLAG_MULTILINE, AFLAG_PRESET,
-    AFLAG_VERIFY,
+    AFLAG_CONSTANT, AFLAG_INVISIBLE, AFLAG_LOCK, AFLAG_MULTILINE, AFLAG_PRESET, AFLAG_VERIFY,
+    Justify,
 };
 use crate::t;
 use crate::ui::style::common::muted_style;
 use crate::ui::style::form::{button_style, dialog_button, field_style};
-use crate::ui::window::pdf_dialogs::{accent_text, card_style};
+use crate::ui::window::pdf_dialogs::card_style;
 
 /// One edit in either attribute definition dialog.
 #[derive(Debug, Clone)]
@@ -80,19 +80,19 @@ pub struct AttdefDialogState {
     /// Validation message shown above the buttons.
     pub error: Option<String>,
     /// The field the Default value shows, when one was inserted.
-    pub field: Option<(String, Vec<codec::Handle>)>,
+    pub field: Option<(String, Vec<document::Handle>)>,
 }
 
 /// The Edit Attribute Definition dialog's fields.
 #[derive(Debug, Clone)]
 pub struct AttdefEditState {
-    pub handle: codec::Handle,
+    pub handle: document::Handle,
     pub tag: String,
     pub prompt: String,
     pub default: String,
     pub constant: bool,
     pub error: Option<String>,
-    pub field: Option<(String, Vec<codec::Handle>)>,
+    pub field: Option<(String, Vec<document::Handle>)>,
     /// The Default was retyped or a field inserted: the stored field is
     /// replaced on Apply.
     pub field_changed: bool,
@@ -103,17 +103,11 @@ fn msg(m: AttdefDialogMsg) -> Message {
 }
 
 fn card<'a>(title: String, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(
-        column![
-            text(title.to_uppercase()).size(10).style(accent_text),
-            content.into()
-        ]
-        .spacing(8),
-    )
-    .padding([10, 12])
-    .width(Fill)
-    .style(card_style)
-    .into()
+    container(column![text(title).size(11).style(muted_style), content.into()].spacing(8))
+        .padding([10, 12])
+        .width(Fill)
+        .style(card_style)
+        .into()
 }
 
 fn labelled<'a>(label: String, field: Element<'a, Message>, enabled: bool) -> Element<'a, Message> {
@@ -206,22 +200,22 @@ fn error_band<'a>(error: &Option<String>) -> Option<Element<'a, Message>> {
     )
 }
 
-/// The face of the buttons that take a value from the drawing.
+/// The face of the buttons that take a value from the drawing: a dotted
+/// square over a crosshair, the pick-on-screen mark.
 fn screen_pick<'a>() -> Element<'a, Message> {
-    crate::ui::icons::themed(crate::ui::icons::SNAP, 14.0)
+    crate::ui::icons::themed_success(PICK_ON_SCREEN, 14.0)
 }
+
+static PICK_ON_SCREEN: &[u8] = include_bytes!("../../../assets/icons/ui/pick_point.svg");
 
 static ICON_WARN: &[u8] = include_bytes!("../../../assets/icons/ui/warning_triangle.svg");
 
 fn footer<'a>(action: std::borrow::Cow<'static, str>, ok: AttdefDialogMsg) -> Element<'a, Message> {
     row![
-        button(text("?").size(12))
-            .on_press(msg(AttdefDialogMsg::Help))
-            .style(button_style(false))
-            .padding([5, 11]),
         Space::new().width(Fill),
-        dialog_button(t!("Cancel"), Message::CloseModal, false),
         dialog_button(action, msg(ok), true),
+        dialog_button(t!("Cancel"), Message::CloseModal, false),
+        dialog_button(t!("Help"), msg(AttdefDialogMsg::Help), false),
     ]
     .spacing(6)
     .align_y(iced::Center)
@@ -456,7 +450,7 @@ pub fn view<'a>(
         content = content.push(band);
     }
     content
-        .push(footer(t!("Define"), AttdefDialogMsg::Ok))
+        .push(footer(t!("OK"), AttdefDialogMsg::Ok))
         .spacing(10)
         .padding([10, 12])
         .width(sizing.width)
@@ -543,5 +537,92 @@ pub fn tag_error(tag: &str) -> Option<&'static str> {
         Some("The tag may not contain spaces.")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::modal::ModalSizing;
+
+    fn state() -> AttdefDialogState {
+        AttdefDialogState {
+            aflags: 0,
+            annotative: false,
+            tag: String::new(),
+            prompt: String::new(),
+            default: String::new(),
+            justify: Justify::Left,
+            style: "Standard".into(),
+            styles: vec!["Standard".into()],
+            height: "2.5000".into(),
+            rotation: "0".into(),
+            width: "0.0000".into(),
+            on_screen: true,
+            coords: ["0.0000".into(), "0.0000".into(), "0.0000".into()],
+            align_below: false,
+            can_align_below: false,
+            error: None,
+            field: None,
+        }
+    }
+
+    /// Whether `label` is laid out and in view in the dialog.
+    fn shows(state: &AttdefDialogState, label: &str) -> bool {
+        use iced_test::Selector;
+        use iced_test::core::widget;
+        use iced_test::runtime::user_interface::{Cache, UserInterface};
+        let _one = crate::headless_ui_lock();
+        let mut renderer = iced_test::futures::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        let sizing = ModalSizing {
+            width: Length::Fixed(620.0),
+            height: Length::Fixed(600.0),
+        };
+        let mut ui = UserInterface::build(
+            view(state, sizing),
+            iced::Size::new(620.0, 100_000.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut find = Selector::find(label);
+        ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+        matches!(
+            widget::Operation::finish(&find),
+            widget::operation::Outcome::Some(Some(target)) if target.visible_bounds().is_some()
+        )
+    }
+
+    #[test]
+    fn the_footer_names_the_primary_button_ok_and_puts_help_beside_cancel() {
+        let state = state();
+        assert!(shows(&state, "OK"), "the primary button reads OK");
+        assert!(shows(&state, "Cancel"));
+        assert!(
+            shows(&state, "Help"),
+            "help is a labelled button in the footer"
+        );
+        assert!(
+            !shows(&state, "Define"),
+            "the primary button no longer reads Define"
+        );
+    }
+
+    #[test]
+    fn the_group_headings_keep_their_mixed_case() {
+        let state = state();
+        assert!(
+            shows(&state, "Text Settings"),
+            "the heading is set in mixed case"
+        );
+        assert!(
+            !shows(&state, "TEXT SETTINGS"),
+            "the heading is not shouted in capitals"
+        );
     }
 }

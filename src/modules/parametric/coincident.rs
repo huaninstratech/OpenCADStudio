@@ -1,7 +1,7 @@
 //! Interactive Coincident input: ordered point/curve picks, repeated
 //! point-to-curve placement, and Coincident-only automatic inference.
 
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, CoincidentPick};
@@ -40,6 +40,12 @@ pub struct CoincidentConstraintCommand {
     picked_entity: Option<EntityType>,
 }
 
+impl Default for CoincidentConstraintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CoincidentConstraintCommand {
     pub fn new() -> Self {
         Self {
@@ -67,7 +73,7 @@ impl CoincidentConstraintCommand {
     fn picked_constraint_point(entity: &EntityType, point: DVec3) -> bool {
         crate::scene::parametric_constraints::is_parametric_point_near(
             entity,
-            codec::types::Vector3::new(point.x, point.y, point.z),
+            document::types::Vector3::new(point.x, point.y, point.z),
         )
     }
 
@@ -295,7 +301,7 @@ inventory::submit!(crate::command::CommandRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::types::Vector3;
+    use document::types::Vector3;
 
     #[test]
     fn multiple_keeps_the_first_curve_for_repeated_points() {
@@ -304,7 +310,7 @@ mod tests {
             command.on_text_input("Object"),
             Some(CmdResult::NeedPoint)
         ));
-        command.inject_picked_entity(EntityType::Line(codec::entities::Line::from_points(
+        command.inject_picked_entity(EntityType::Line(document::entities::Line::from_points(
             Vector3::ZERO,
             Vector3::UNIT_X,
         )));

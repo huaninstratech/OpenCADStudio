@@ -1,6 +1,6 @@
 use super::*;
-use codec::objects::{XRecordEntry, XRecordValue};
-use codec::{DwgReader, DwgWriter, DxfReader, DxfWriter};
+use document::objects::{XRecordEntry, XRecordValue};
+use document::{DwgReader, DwgWriter, DxfReader, DxfWriter};
 use instance::ParameterFrame;
 use std::io::Cursor;
 
@@ -33,7 +33,7 @@ fn fixture(kind: usize) -> (Document, Handle, Handle, Parameter) {
     }
     .unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -45,7 +45,7 @@ fn fixture(kind: usize) -> (Document, Handle, Handle, Parameter) {
     (doc, definition, insert, p)
 }
 
-fn record(doc: &mut Document) -> &mut codec::objects::XRecord {
+fn record(doc: &mut Document) -> &mut document::objects::XRecord {
     doc.objects
         .values_mut()
         .find_map(|object| match object {
@@ -133,7 +133,6 @@ fn block_parameter_frames_preserve_both_endpoints_and_native_metadata() {
             assert_eq!(reference.block_name, "ACTIONS");
             assert_eq!(reference.insert_point, Vector3::ZERO);
             assert_eq!(instance::current(&saved, insert, &p).unwrap(), expected.end);
-
         }
         let reset = instance::reset(&doc, insert).unwrap().unwrap();
         assert_eq!(instance::frame(&reset, insert, &p).unwrap(), initial);

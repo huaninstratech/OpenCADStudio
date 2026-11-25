@@ -69,7 +69,10 @@ impl OpenCADStudio {
                 .document
                 .get_entity(dimension)
                 .and_then(crate::entities::dimension::as_dimension),
-            Some(codec::entities::Dimension::Linear(_) | codec::entities::Dimension::Aligned(_))
+            Some(
+                document::entities::Dimension::Linear(_)
+                    | document::entities::Dimension::Aligned(_)
+            )
         );
         if !valid {
             self.command_line.push_error(
@@ -78,12 +81,12 @@ impl OpenCADStudio {
         } else if !self.reject_locked_edit(i, dimension) {
             self.push_undo_snapshot(i, "DIMJOGLINE");
             let values = point.map(|point| {
-                use codec::xdata::XDataValue;
+                use document::xdata::XDataValue;
                 vec![
                     XDataValue::Integer16(387),
                     XDataValue::Integer16(3),
                     XDataValue::Integer16(389),
-                    XDataValue::Point3D(codec::types::Vector3::new(point.x, point.y, point.z)),
+                    XDataValue::Point3D(document::types::Vector3::new(point.x, point.y, point.z)),
                 ]
             });
             crate::scene::view::dispatch::set_entity_xdata(
@@ -217,11 +220,12 @@ fn wire_segments(
 fn segment_intersection_xy(
     first: (glam::DVec3, glam::DVec3),
     second: (glam::DVec3, glam::DVec3),
+    half_gap: f64,
 ) -> Option<(glam::DVec3, glam::DVec3)> {
-    let gap = kernel::space::segment_break_gap_xy(
+    let gap = ocs_geom::space::segment_break_gap_xy(
         [first.0.to_array(), first.1.to_array()],
         [second.0.to_array(), second.1.to_array()],
-        0.25,
+        half_gap,
     )?;
     Some((
         glam::DVec3::from_array(gap[0]),
@@ -229,25 +233,43 @@ fn segment_intersection_xy(
     ))
 }
 
-fn break_object_handle(document: &codec::Document, dimension: Handle) -> Option<Handle> {
+/// The gap an automatic break cuts in `dimension`: its style's break size,
+/// scaled like the rest of the dimension.
+fn dimension_break_size(document: &document::Document, dimension: Handle) -> f64 {
+    let Some(document::EntityType::Dimension(dim)) = document.get_entity(dimension) else {
+        return 0.5;
+    };
+    let name = &dim.base().style_name;
+    let Some(style) = document
+        .dim_styles
+        .iter()
+        .find(|style| style.name.eq_ignore_ascii_case(name))
+    else {
+        return 0.5;
+    };
+    let scale = if style.dimscale > 0.0 { style.dimscale } else { 1.0 };
+    crate::scene::creation_style::dim_style_extras(document, style.handle).break_size * scale
+}
+
+fn break_object_handle(document: &document::Document, dimension: Handle) -> Option<Handle> {
     document.objects.iter().find_map(|(handle, object)| {
-        let codec::objects::ObjectType::DataObject(object) = object else {
+        let document::objects::ObjectType::DataObject(object) = object else {
             return None;
         };
-        let codec::objects::DataObjectData::BreakData(data) = &object.data else {
+        let document::objects::DataObjectData::BreakData(data) = &object.data else {
             return None;
         };
         (data.dimension_reference == dimension).then_some(*handle)
     })
 }
 
-fn remove_dimension_break_data(document: &mut codec::Document, dimension: Handle) -> bool {
+fn remove_dimension_break_data(document: &mut document::Document, dimension: Handle) -> bool {
     let handles: Vec<_> = document
         .objects
         .iter()
         .filter_map(|(handle, object)| match object {
-            codec::objects::ObjectType::DataObject(object) => match &object.data {
-                codec::objects::DataObjectData::BreakData(data)
+            document::objects::ObjectType::DataObject(object) => match &object.data {
+                document::objects::DataObjectData::BreakData(data)
                     if data.dimension_reference == dimension =>
                 {
                     Some(*handle)
@@ -264,7 +286,7 @@ fn remove_dimension_break_data(document: &mut codec::Document, dimension: Handle
         document.objects.remove(handle);
     }
     if let Some(dictionary_handle) = document.extension_dictionary_handle(dimension) {
-        if let Some(codec::objects::ObjectType::Dictionary(dictionary)) =
+        if let Some(document::objects::ObjectType::Dictionary(dictionary)) =
             document.objects.get_mut(&dictionary_handle)
         {
             dictionary.entries.retain(|(name, handle)| {
@@ -279,12 +301,12 @@ fn remove_dimension_break_data(document: &mut codec::Document, dimension: Handle
 }
 
 fn write_dimension_break_data(
-    document: &mut codec::Document,
+    document: &mut document::Document,
     dimension: Handle,
     reserved_reference: Handle,
-    references: Vec<codec::objects::BreakPointReference>,
+    references: Vec<document::objects::BreakPointReference>,
 ) -> bool {
-    use codec::objects::{BreakData, DataObject, DataObjectData, Dictionary, ObjectType};
+    use document::objects::{BreakData, DataObject, DataObjectData, Dictionary, ObjectType};
 
     if references.is_empty() {
         return remove_dimension_break_data(document, dimension);
@@ -346,16 +368,17 @@ fn break_reference(
     reference_type: i32,
     first: glam::DVec3,
     second: glam::DVec3,
-) -> codec::objects::BreakPointReference {
-    codec::objects::BreakPointReference {
+) -> document::objects::BreakPointReference {
+    document::objects::BreakPointReference {
         version: 0,
         reserved: 0,
         reference_type,
         flags: 0,
         identifier,
-        first_point: codec::types::Vector3::new(first.x, first.y, first.z),
-        second_point: codec::types::Vector3::new(second.x, second.y, second.z),
+        first_point: document::types::Vector3::new(first.x, first.y, first.z),
+        second_point: document::types::Vector3::new(second.x, second.y, second.z),
         trailing_version: 0,
+        ..Default::default()
     }
 }
 
@@ -372,7 +395,7 @@ fn apply_dimbreak(
         .filter(|handle| {
             matches!(
                 scene.document.get_entity(*handle),
-                Some(codec::EntityType::Dimension(_))
+                Some(document::EntityType::Dimension(_))
             ) && scene.locked_layer_name(*handle).is_none()
         })
         .collect();
@@ -414,11 +437,12 @@ fn apply_dimbreak(
 
     let mut pending = Vec::new();
     for dimension in &dimensions {
+        let half_gap = dimension_break_size(&scene.document, *dimension) * 0.5;
         let existing: Vec<_> = break_object_handle(&scene.document, *dimension)
             .and_then(|handle| scene.document.objects.get(&handle))
             .and_then(|object| match object {
-                codec::objects::ObjectType::DataObject(object) => match &object.data {
-                    codec::objects::DataObjectData::BreakData(data) => {
+                document::objects::ObjectType::DataObject(object) => match &object.data {
+                    document::objects::DataObjectData::BreakData(data) => {
                         Some(data.point_references.clone())
                     }
                     _ => None,
@@ -446,7 +470,7 @@ fn apply_dimbreak(
                 for dim_segment in &dimension_segments {
                     for crossing_segment in &crossing_segments {
                         if let Some(points) =
-                            segment_intersection_xy(*dim_segment, *crossing_segment)
+                            segment_intersection_xy(*dim_segment, *crossing_segment, half_gap)
                         {
                             let center = (points.0 + points.1) * 0.5;
                             if intersections.iter().all(
@@ -521,8 +545,8 @@ pub(super) fn overlapping_dimensions(scene: &crate::scene::Scene, new: Handle) -
             .get_entity(handle)
             .and_then(crate::entities::dimension::as_dimension)?;
         let (a, b) = match dimension {
-            codec::entities::Dimension::Linear(d) => (d.first_point, d.second_point),
-            codec::entities::Dimension::Aligned(d) => (d.first_point, d.second_point),
+            document::entities::Dimension::Linear(d) => (d.first_point, d.second_point),
+            document::entities::Dimension::Aligned(d) => (d.first_point, d.second_point),
             _ => return None,
         };
         let (a, b) = (along([a.x, a.y, a.z]), along([b.x, b.y, b.z]));
@@ -531,7 +555,10 @@ pub(super) fn overlapping_dimensions(scene: &crate::scene::Scene, new: Handle) -
     let Some((low, high)) = span(new) else {
         return Vec::new();
     };
-    let owner = scene.document.get_entity(new).map(|e| e.common().owner_handle);
+    let owner = scene
+        .document
+        .get_entity(new)
+        .map(|e| e.common().owner_handle);
     let line = across(definition);
     let tolerance = (high - low).abs().max(1.0) * 1.0e-9;
     scene
@@ -540,7 +567,11 @@ pub(super) fn overlapping_dimensions(scene: &crate::scene::Scene, new: Handle) -
         .map(|entity| entity.common().handle)
         .filter(|&handle| handle != new)
         .filter(|&handle| {
-            scene.document.get_entity(handle).map(|e| e.common().owner_handle) == owner
+            scene
+                .document
+                .get_entity(handle)
+                .map(|e| e.common().owner_handle)
+                == owner
         })
         .filter(|&handle| {
             let Some((other_axis, _, other_definition)) = spacing_axis(scene, handle) else {
@@ -576,7 +607,7 @@ pub(super) fn apply_dim_overlap(
                 let Some((axis, normal, definition)) = spacing_axis(scene, handle) else {
                     continue;
                 };
-                let Some(frame) = kernel::space::dimension_spacing_frame(axis, normal, definition)
+                let Some(frame) = ocs_geom::space::dimension_spacing_frame(axis, normal, definition)
                 else {
                     continue;
                 };
@@ -586,31 +617,31 @@ pub(super) fn apply_dim_overlap(
                     .get_entity(handle)
                     .and_then(crate::entities::dimension::as_dimension)
                 {
-                    Some(codec::entities::Dimension::Linear(d)) => d.first_point,
-                    Some(codec::entities::Dimension::Aligned(d)) => d.first_point,
+                    Some(document::entities::Dimension::Linear(d)) => d.first_point,
+                    Some(document::entities::Dimension::Aligned(d)) => d.first_point,
                     _ => continue,
                 };
                 let toward = (measured.x - definition[0]) * p[0]
                     + (measured.y - definition[1]) * p[1]
                     + (measured.z - definition[2]) * p[2];
                 let target = frame.coordinate + dimdli * toward.signum();
-                if let Some(codec::EntityType::Dimension(dim)) =
+                if let Some(document::EntityType::Dimension(dim)) =
                     scene.document.get_entity_mut(handle)
                 {
-                    let slide = |point: &mut codec::types::Vector3| {
-                        let moved = kernel::space::move_to_dimension_spacing(
+                    let slide = |point: &mut document::types::Vector3| {
+                        let moved = ocs_geom::space::move_to_dimension_spacing(
                             [point.x, point.y, point.z],
                             frame,
                             target,
                         );
-                        *point = codec::types::Vector3::new(moved[0], moved[1], moved[2]);
+                        *point = document::types::Vector3::new(moved[0], moved[1], moved[2]);
                     };
                     match &mut **dim {
-                        codec::entities::Dimension::Linear(d) => {
+                        document::entities::Dimension::Linear(d) => {
                             slide(&mut d.definition_point);
                             d.base.definition_point = d.definition_point;
                         }
-                        codec::entities::Dimension::Aligned(d) => {
+                        document::entities::Dimension::Aligned(d) => {
                             slide(&mut d.definition_point);
                             d.base.definition_point = d.definition_point;
                         }
@@ -634,8 +665,8 @@ pub(super) fn apply_dim_overlap(
 /// dimension line, split at every extension line origin of them all. Each
 /// piece is a new dimension made like `new`; the originals are erased.
 fn break_up_dimensions(scene: &mut crate::scene::Scene, new: Handle, others: &[Handle]) {
-    use codec::entities::Dimension;
-    use codec::types::Vector3;
+    use document::entities::Dimension;
+    use document::types::Vector3;
     let Some((axis, _, definition)) = spacing_axis(scene, new) else {
         return;
     };
@@ -711,7 +742,7 @@ fn spacing_axis(
     scene: &crate::scene::Scene,
     handle: Handle,
 ) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
-    use codec::entities::Dimension;
+    use document::entities::Dimension;
     match scene
         .document
         .get_entity(handle)
@@ -720,7 +751,11 @@ fn spacing_axis(
         Dimension::Linear(d) => Some((
             [d.rotation.cos(), d.rotation.sin(), 0.0],
             [d.base.normal.x, d.base.normal.y, d.base.normal.z],
-            [d.definition_point.x, d.definition_point.y, d.definition_point.z],
+            [
+                d.definition_point.x,
+                d.definition_point.y,
+                d.definition_point.z,
+            ],
         )),
         Dimension::Aligned(d) => Some((
             [
@@ -729,7 +764,11 @@ fn spacing_axis(
                 d.second_point.z - d.first_point.z,
             ],
             [d.base.normal.x, d.base.normal.y, d.base.normal.z],
-            [d.definition_point.x, d.definition_point.y, d.definition_point.z],
+            [
+                d.definition_point.x,
+                d.definition_point.y,
+                d.definition_point.z,
+            ],
         )),
         _ => None,
     }
@@ -751,7 +790,7 @@ fn apply_dim_distribute(
     let Some((axis, normal, definition)) = spacing_axis(scene, reference) else {
         return false;
     };
-    let Some(frame) = kernel::space::dimension_spacing_frame(axis, normal, definition) else {
+    let Some(frame) = ocs_geom::space::dimension_spacing_frame(axis, normal, definition) else {
         return false;
     };
     let p = frame.perpendicular;
@@ -805,25 +844,9 @@ fn apply_dim_distribute(
     let mut changes = Vec::new();
     for (handle, target) in targets {
         let target = target + shift;
-        if let Some(codec::EntityType::Dimension(dim)) = scene.document.get_entity_mut(handle) {
-            let slide = |point: &mut codec::types::Vector3| {
-                let moved = kernel::space::move_to_dimension_spacing(
-                    [point.x, point.y, point.z],
-                    frame,
-                    target,
-                );
-                *point = codec::types::Vector3::new(moved[0], moved[1], moved[2]);
-            };
-            match &mut **dim {
-                codec::entities::Dimension::Linear(d) => {
-                    slide(&mut d.definition_point);
-                    d.base.definition_point = d.definition_point;
-                }
-                codec::entities::Dimension::Aligned(d) => {
-                    slide(&mut d.definition_point);
-                    d.base.definition_point = d.definition_point;
-                }
-                _ => continue,
+        if let Some(document::EntityType::Dimension(dim)) = scene.document.get_entity_mut(handle) {
+            if !slide_dimension_line(dim, frame, target) {
+                continue;
             }
             scene.invalidate_dim_block_recorded(handle);
             changes.push((handle, crate::scene::ChangeKind::Modified));
@@ -835,13 +858,38 @@ fn apply_dim_distribute(
     !changes.is_empty()
 }
 
+/// Move a linear/aligned dimension line to `target` across `frame`. The text
+/// rides along by the same offset, so a placed (user-positioned) text stays
+/// with its dimension line instead of being left behind (#3102).
+fn slide_dimension_line(
+    dim: &mut document::entities::Dimension,
+    frame: ocs_geom::space::DimensionSpacingFrame,
+    target: f64,
+) -> bool {
+    use document::entities::Dimension;
+    let (Dimension::Linear(document::entities::DimensionLinear { definition_point, .. })
+    | Dimension::Aligned(document::entities::DimensionAligned { definition_point, .. })) = dim
+    else {
+        return false;
+    };
+    let p = *definition_point;
+    let moved = ocs_geom::space::move_to_dimension_spacing([p.x, p.y, p.z], frame, target);
+    let delta = document::types::Vector3::new(moved[0] - p.x, moved[1] - p.y, moved[2] - p.z);
+    *definition_point = p + delta;
+    let point = *definition_point;
+    let base = dim.base_mut();
+    base.definition_point = point;
+    base.text_middle_point = base.text_middle_point + delta;
+    true
+}
+
 fn apply_dimspace(
     scene: &mut crate::scene::Scene,
     base_h: Handle,
     others: &[Handle],
     requested_spacing: Option<f64>,
 ) -> bool {
-    use codec::entities::Dimension;
+    use document::entities::Dimension;
     let base = scene
         .document
         .get_entity(base_h)
@@ -887,7 +935,7 @@ fn apply_dimspace(
         }
         _ => return false,
     };
-    let Some(frame) = kernel::space::dimension_spacing_frame(axis, normal, definition) else {
+    let Some(frame) = ocs_geom::space::dimension_spacing_frame(axis, normal, definition) else {
         return false;
     };
 
@@ -895,27 +943,10 @@ fn apply_dimspace(
     let mut changes = Vec::new();
     for (idx, &h) in others.iter().enumerate() {
         let target = frame.coordinate + effective_spacing * (idx + 1) as f64;
-        let mut changed = false;
-        if let Some(codec::EntityType::Dimension(dim)) = scene.document.get_entity_mut(h) {
-            let slide = |p: &mut codec::types::Vector3| {
-                let point =
-                    kernel::space::move_to_dimension_spacing([p.x, p.y, p.z], frame, target);
-                *p = codec::types::Vector3::new(point[0], point[1], point[2]);
-            };
-            match &mut **dim {
-                Dimension::Linear(d) => {
-                    slide(&mut d.definition_point);
-                    d.base.definition_point = d.definition_point;
-                    changed = true;
-                }
-                Dimension::Aligned(d) => {
-                    slide(&mut d.definition_point);
-                    d.base.definition_point = d.definition_point;
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
+        let changed = match scene.document.get_entity_mut(h) {
+            Some(document::EntityType::Dimension(dim)) => slide_dimension_line(dim, frame, target),
+            _ => false,
+        };
         if changed {
             // The dimension line moved, so its baked *D block is stale — drop it
             // so the next save re-bakes it. (#181)
@@ -930,8 +961,8 @@ fn apply_dimspace(
 }
 
 fn dimension_auto_spacing(
-    document: &codec::Document,
-    dimension: &codec::entities::Dimension,
+    document: &document::Document,
+    dimension: &document::entities::Dimension,
     annotation_multiplier: f64,
 ) -> f64 {
     let style = document

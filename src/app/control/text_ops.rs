@@ -7,7 +7,7 @@
 
 use super::{failure, OpenCADStudio};
 use crate::app::Message;
-use codec::{Document, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 use iced::Task;
 use serde_json::{json, Value};
 
@@ -388,7 +388,7 @@ pub fn replace_mtext_safe(
     // Convert replacement newlines to \P for MText compatibility
     let raw_replacement = to_raw_mtext_replacement(replacement);
 
-    let mut doc = codec::entities::mtext_format::parse_mtext(raw, true);
+    let mut doc = document::entities::mtext_format::parse_mtext(raw, true);
     let mut total_replaced = 0;
 
     // First attempt: replace within individual parsed spans (preserves fine-grained formatting)
@@ -414,7 +414,7 @@ pub fn replace_mtext_safe(
     if total_replaced > 0 {
         if has_trailing_paragraph_break(raw) {
             doc.paragraphs
-                .push(codec::entities::mtext_format::MTextParagraph::new());
+                .push(document::entities::mtext_format::MTextParagraph::new());
         }
         (doc.to_mtext_string(), total_replaced)
     } else {
@@ -624,7 +624,8 @@ pub fn entity_text_info(
         }
         EntityType::MText(t) => {
             let raw = t.value.clone();
-            let plain_raw = codec::entities::mtext_format::parse_mtext(&raw, true).to_plain_text();
+            let plain_raw =
+                document::entities::mtext_format::parse_mtext(&raw, true).to_plain_text();
             let plain = decode_dxf_escapes(&plain_raw);
             let pos = [
                 t.insertion_point.x,
@@ -1591,8 +1592,7 @@ impl OpenCADStudio {
 
         if !dry_run {
             // Refresh scene caches and dirty flags
-            self.invalidate_property_targets(i, &changed_handles);
-            self.tabs[i].scene.bump_geometry();
+            self.invalidate_property_targets_or_blocks(i, &changed_handles);
             self.tabs[i].dirty = true;
             self.refresh_properties();
 
@@ -1656,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_matcher_case_and_word_boundaries() {
+    fn text_matcher_case_and_word_boundaries() {
         let tm_ci = TextMatcher::new("bar".into(), false, false, false);
         assert!(tm_ci.matches("BAROMETRE"));
         assert!(tm_ci.matches("bar"));
@@ -1679,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_matcher_accent_insensitive() {
+    fn text_matcher_accent_insensitive() {
         let tm_acc = TextMatcher::new("reservoir".into(), false, false, true);
         assert!(tm_acc.matches("RÉSERVOIR"));
         assert!(tm_acc.matches("Réservoir"));
@@ -1696,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_mtext_safe_preserves_formatting() {
+    fn replace_mtext_safe_preserves_formatting() {
         let raw = "{\\fCentury Gothic|b0|i0|c0|p34;V15-CUVE EAU NON TRAITE}";
         let matcher = TextMatcher::new("NON TRAITE".into(), false, false, false);
         let (replaced, count) = replace_mtext_safe(raw, &matcher, "NON TRAITÉE", true);
@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_mtext_multiline() {
+    fn replace_mtext_multiline() {
         // Test 1: Plain LF query matching raw \P
         let raw1 = "Loge \\Pgardien";
         let matcher1 = TextMatcher::new("Loge \ngardien".into(), false, false, true);

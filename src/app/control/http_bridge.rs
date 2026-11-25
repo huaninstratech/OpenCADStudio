@@ -22,7 +22,7 @@ use iced::futures::{channel::mpsc, Stream};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,11 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Called from `main` before the GUI boots.
 pub fn set_gui_http_port(port: u16) {
     GUI_HTTP_PORT.store(port, Ordering::SeqCst);
+}
+
+/// Whether this GUI run hosts the `--http` channel, which needs control on.
+pub(in crate::app) fn gui_http_requested() -> bool {
+    GUI_HTTP_PORT.load(Ordering::SeqCst) != 0
 }
 
 /// Called from `main` before the GUI boots for plain launches: same channel,
@@ -126,10 +131,10 @@ fn listen(
     eprintln!("OpenCADStudio GUI REST listening on http://127.0.0.1:{port}/api/v1");
     announce_http_descriptor(port);
     rest::announce_token();
-    // One thread per connection: a `getpoint` or `user_select` request stays
+    // Independent workers: a `getpoint` or `user_select` request stays
     // open until the person answers, and must not block the other reads
     // (get_selection…).
-    let clients = Arc::new(AtomicUsize::new(0));
+    let workers = crate::io::connection_workers::ConnectionWorkers::new("ocs-http", 8)?;
     // One document-id cache for the whole listener: a state read primes it,
     // later mutations address the live drawing without the caller repeating
     // the id — the same ergonomics as the headless server.
@@ -138,14 +143,9 @@ fn listen(
         // Same request/response-line shape as the native control transport:
         // disable Nagle so reply tails never wait on the peer's delayed ACK.
         let _ = stream.set_nodelay(true);
-        if clients.fetch_add(1, Ordering::SeqCst) >= 8 {
-            clients.fetch_sub(1, Ordering::SeqCst);
-            continue;
-        }
-        let clients = clients.clone();
         let sender = sender.clone();
         let document_cache = document_cache.clone();
-        std::thread::spawn(move || {
+        workers.try_execute(move || {
             let mut stream = stream;
             let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
@@ -157,7 +157,6 @@ fn listen(
                     let _ = rest::write_response(&mut stream, status, &body);
                 }
             }
-            clients.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -218,7 +217,7 @@ fn forward(
             fields,
             created,
         } => {
-            let cached = *document_cache.lock().unwrap();
+            let cached = *document_cache.lock().unwrap_or_else(|e| e.into_inner());
             let mut response = transact(sender, mutate_request(&op, &fields, cached), wait, stream);
             let code = response["code"].as_str().unwrap_or("");
             if response["ok"] == false && RETRYABLE.contains(&code) {
@@ -226,7 +225,7 @@ fn forward(
                 // and retry once, exactly like the headless server.
                 let state = transact(sender, json!({"protocol":1,"op":"state"}), wait, stream);
                 harvest(document_cache, &state);
-                let cached = *document_cache.lock().unwrap();
+                let cached = *document_cache.lock().unwrap_or_else(|e| e.into_inner());
                 response = transact(sender, mutate_request(&op, &fields, cached), wait, stream);
             }
             harvest(document_cache, &response);
@@ -402,7 +401,7 @@ fn harvest(document_cache: &Mutex<Option<u64>>, response: &Value) {
         .and_then(Value::as_u64)
         .or_else(|| response["state"]["document_id"].as_u64());
     if let Some(id) = id {
-        *document_cache.lock().unwrap() = Some(id);
+        *document_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
     }
 }
 
@@ -496,7 +495,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[app.active_tab]
             .scene
-            .select_entity(codec::Handle::new(value), false);
+            .select_entity(document::Handle::new(value), false);
 
         let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
         let bound = Arc::new(AtomicU16::new(0));
@@ -574,7 +573,7 @@ mod tests {
         let value = u64::from_str_radix(&handle, 16).unwrap();
         app.tabs[app.active_tab]
             .scene
-            .select_entity(codec::Handle::new(value), false);
+            .select_entity(document::Handle::new(value), false);
 
         let (sender, mut receiver) = mpsc::channel::<Envelope>(8);
         let bound = Arc::new(AtomicU16::new(0));
@@ -740,7 +739,7 @@ mod tests {
                     envelope.reply.send(reply);
                     app.tabs[app.active_tab]
                         .scene
-                        .select_entity(codec::Handle::new(handle_value), false);
+                        .select_entity(document::Handle::new(handle_value), false);
                     let _ = app.update(if confirm {
                         crate::app::Message::CommandFinalize
                     } else {
@@ -871,5 +870,21 @@ mod tests {
         drain(&mut app, &mut receiver, 1);
         let (status, body) = read_response(&mut select_conn);
         assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn harvest_records_the_document_through_a_poisoned_cache() {
+        let cache = Arc::new(Mutex::new(Some(1_u64)));
+        let held = Arc::clone(&cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock();
+            panic!("poison the document cache");
+        })
+        .join();
+        assert!(cache.is_poisoned());
+
+        harvest(&cache, &json!({"document_id": 7}));
+
+        assert_eq!(*cache.lock().unwrap_or_else(|e| e.into_inner()), Some(7));
     }
 }

@@ -1,5 +1,5 @@
-use codec::entities::EntityType;
-use codec::types::{Handle, Vector3};
+use document::entities::EntityType;
+use document::types::{Handle, Vector3};
 use OpenCADStudio::scene::named_parameters::DrivingValue;
 use OpenCADStudio::scene::parametric_constraints::{
     ConstraintKind, ParametricRef, ParametricScope,
@@ -7,7 +7,7 @@ use OpenCADStudio::scene::parametric_constraints::{
 use OpenCADStudio::scene::{ChangeKind, Scene};
 
 fn add_line(scene: &mut Scene, x1: f64, y1: f64, x2: f64, y2: f64) -> Handle {
-    scene.add_entity(EntityType::Line(codec::entities::Line::from_points(
+    scene.add_entity(EntityType::Line(document::entities::Line::from_points(
         Vector3::new(x1, y1, 0.0),
         Vector3::new(x2, y2, 0.0),
     )))
@@ -28,7 +28,7 @@ fn set_line_end(scene: &mut Scene, handle: Handle, end: Vector3) {
 
 fn add_circle(scene: &mut Scene, cx: f64, cy: f64, radius: f64) -> Handle {
     scene.add_entity(EntityType::Circle(
-        codec::entities::Circle::from_center_radius(Vector3::new(cx, cy, 0.0), radius),
+        document::entities::Circle::from_center_radius(Vector3::new(cx, cy, 0.0), radius),
     ))
 }
 
@@ -108,7 +108,7 @@ fn add_arc(
     end_angle: f64,
 ) -> Handle {
     scene.add_entity(EntityType::Arc(
-        codec::entities::Arc::from_center_radius_angles(
+        document::entities::Arc::from_center_radius_angles(
             Vector3::new(cx, cy, 0.0),
             radius,
             start_angle,
@@ -126,7 +126,7 @@ fn arc_geom(scene: &Scene, handle: Handle) -> (Vector3, f64) {
 
 fn add_ellipse(scene: &mut Scene, cx: f64, cy: f64, major_axis: (f64, f64), ratio: f64) -> Handle {
     scene.add_entity(EntityType::Ellipse(
-        codec::entities::Ellipse::from_center_axes(
+        document::entities::Ellipse::from_center_axes(
             Vector3::new(cx, cy, 0.0),
             Vector3::new(major_axis.0, major_axis.1, 0.0),
             ratio,
@@ -186,10 +186,10 @@ fn horizontal_constraint_levels_the_line_when_an_endpoint_moves() {
 fn horizontal_constraint_levels_a_polyline_segment() {
     let mut scene = Scene::new();
     let polyline = scene.add_entity(EntityType::LwPolyline(
-        codec::entities::LwPolyline::from_points(vec![
-            codec::types::Vector2::new(0.0, 0.0),
-            codec::types::Vector2::new(5.0, 2.0),
-            codec::types::Vector2::new(10.0, 7.0),
+        document::entities::LwPolyline::from_points(vec![
+            document::types::Vector2::new(0.0, 0.0),
+            document::types::Vector2::new(5.0, 2.0),
+            document::types::Vector2::new(10.0, 7.0),
         ]),
     ));
     scene
@@ -212,9 +212,9 @@ fn horizontal_constraint_levels_a_polyline_segment() {
 
 #[test]
 fn horizontal_constraint_does_not_flatten_a_polyline_arc_segment() {
-    let mut source = codec::entities::LwPolyline::new();
-    source.add_point_with_bulge(codec::types::Vector2::new(0.0, 0.0), 0.5);
-    source.add_point(codec::types::Vector2::new(5.0, 2.0));
+    let mut source = document::entities::LwPolyline::new();
+    source.add_point_with_bulge(document::types::Vector2::new(0.0, 0.0), 0.5);
+    source.add_point(document::types::Vector2::new(5.0, 2.0));
     let mut scene = Scene::new();
     let polyline = scene.add_entity(EntityType::LwPolyline(source));
     scene
@@ -599,7 +599,7 @@ fn copying_two_constrained_entities_carries_their_constraint_along() {
 fn a_duplicated_horizontal_constraint_is_reported_as_redundant() {
     // `solve_scope` resolves the redundant row back to the
     // `ConstraintId` a `ConflictResolverPanel` would name.
-    use kernel_constraints::diagnosis::RedundancyKind;
+    use ocs_constraints::diagnosis::RedundancyKind;
     use OpenCADStudio::scene::parametric_constraints::ConstraintKind;
 
     let mut scene = Scene::new();
@@ -636,7 +636,7 @@ fn a_duplicated_horizontal_constraint_is_reported_as_redundant() {
 
 #[test]
 fn two_conflicting_distance_targets_are_reported_as_conflicting() {
-    use kernel_constraints::diagnosis::RedundancyKind;
+    use ocs_constraints::diagnosis::RedundancyKind;
     use OpenCADStudio::scene::parametric_constraints::ConstraintKind;
 
     let mut scene = Scene::new();
@@ -797,9 +797,9 @@ fn midpoint_constraint_pulls_a_point_onto_a_lines_midpoint() {
 fn midpoint_constraint_supports_a_point_entity() {
     let mut scene = Scene::new();
     let base = add_line(&mut scene, 0.0, 0.0, 10.0, 6.0);
-    let point = scene.add_entity(EntityType::Point(codec::entities::Point::at(Vector3::new(
-        20.0, 20.0, 0.0,
-    ))));
+    let point = scene.add_entity(EntityType::Point(document::entities::Point::at(
+        Vector3::new(20.0, 20.0, 0.0),
+    )));
     scene
         .parametric_constraint_set_mut(ParametricScope::ModelSpace)
         .add(
@@ -821,7 +821,7 @@ fn midpoint_constraint_supports_a_point_entity() {
 fn coincident_constraint_supports_a_block_insertion_point() {
     let mut scene = Scene::new();
     let line = add_line(&mut scene, 0.0, 0.0, 10.0, 4.0);
-    let insert = scene.add_entity(EntityType::Insert(codec::entities::Insert::new(
+    let insert = scene.add_entity(EntityType::Insert(document::entities::Insert::new(
         "fixture",
         Vector3::new(30.0, 20.0, 0.0),
     )));
@@ -1283,7 +1283,7 @@ fn point_on_curve_constraint_keeps_a_point_within_an_arcs_sweep() {
         "point should land exactly on the arc: dist={dist} radius={radius}"
     );
     assert!(
-        kernel::geom2d::angle_within_arc(
+        ocs_geom::geom2d::angle_within_arc(
             (p.y - center.y).atan2(p.x - center.x),
             start_angle,
             end_angle,
@@ -1294,9 +1294,9 @@ fn point_on_curve_constraint_keeps_a_point_within_an_arcs_sweep() {
 
 #[test]
 fn point_on_curve_constraint_keeps_a_point_within_a_polyline_arc_segment() {
-    let mut source = codec::entities::LwPolyline::new();
-    source.add_point_with_bulge(codec::types::Vector2::new(0.0, 0.0), 1.0);
-    source.add_point(codec::types::Vector2::new(10.0, 0.0));
+    let mut source = document::entities::LwPolyline::new();
+    source.add_point_with_bulge(document::types::Vector2::new(0.0, 0.0), 1.0);
+    source.add_point(document::types::Vector2::new(10.0, 0.0));
     let mut scene = Scene::new();
     let polyline = scene.add_entity(EntityType::LwPolyline(source));
     let marker = add_line(&mut scene, 5.0, 20.0, 6.0, 20.0);
@@ -1317,7 +1317,7 @@ fn point_on_curve_constraint_keeps_a_point_within_a_polyline_arc_segment() {
     let EntityType::LwPolyline(polyline) = scene.document.get_entity(polyline).unwrap() else {
         panic!("expected a lightweight polyline");
     };
-    let arc = kernel::geom2d::BulgeArc::from_bulge(
+    let arc = ocs_geom::geom2d::BulgeArc::from_bulge(
         [
             polyline.vertices[0].location.x,
             polyline.vertices[0].location.y,
@@ -1332,7 +1332,7 @@ fn point_on_curve_constraint_keeps_a_point_within_a_polyline_arc_segment() {
     let distance = (point.x - arc.center[0]).hypot(point.y - arc.center[1]);
     assert!((distance - arc.radius).abs() < 1e-6);
     assert!(
-        kernel::geom2d::angle_within_arc(
+        ocs_geom::geom2d::angle_within_arc(
             (point.y - arc.center[1]).atan2(point.x - arc.center[0]),
             arc.start_angle,
             arc.start_angle + arc.sweep,
@@ -1464,7 +1464,7 @@ fn normal_constraint_pulls_the_line_through_the_circles_center() {
 }
 
 // Phase 5 of the same plan: an `Ellipse` registers center/focus1/minor-
-// radius (converted from opencadcodec's center + major-axis-vector + ratio
+// radius (converted from document's center + major-axis-vector + ratio
 // parametrization). Only center-based whole-entity constraints are wired
 // up so far — Concentric, CenterPoint, Fixed — mirroring how Arc started
 // at "center/radius only" in Phase 1. Axis-length constraints and
@@ -1535,7 +1535,7 @@ fn center_point_constraint_pulls_a_lines_endpoint_onto_an_ellipses_center() {
 
 #[test]
 fn a_tilted_ellipse_round_trips_through_the_solver_without_drifting() {
-    // The riskiest part of Ellipse support: converting opencadcodec's center +
+    // The riskiest part of Ellipse support: converting document's center +
     // major-axis-*vector* + minor/major ratio into `opencadkernel_constraints`'s center +
     // focus + minor-radius, then back, for a major axis that ISN'T
     // axis-aligned (an axis-aligned one wouldn't exercise the direction
@@ -1579,7 +1579,7 @@ fn concentric_constraint_does_not_reshape_the_ellipse_when_its_center_actually_m
     // ALREADY concentric with the ellipse, so Concentric's equations start
     // out satisfied and the ellipse's center never actually has to move —
     // it doesn't exercise the bug at all. Here the circle starts elsewhere,
-    // forcing a real center move, which is exactly when `kernel_constraints::geo::
+    // forcing a real center move, which is exactly when `ocs_constraints::geo::
     // Ellipse`'s absolute `focus1` point used to get left behind: `center`
     // moved to meet the circle, `focus1` didn't (nothing else referenced
     // it), so the derived major-axis direction/length and minor/major
@@ -1967,8 +1967,7 @@ fn chain_layout(
     // Signed deflection from the incoming (b - a) direction to the outgoing
     // (c - b) one.
     let u_in = (-u1.0, -u1.1);
-    let mut deflection =
-        (u2.1.atan2(u2.0)) - (u_in.1.atan2(u_in.0));
+    let mut deflection = (u2.1.atan2(u2.0)) - (u_in.1.atan2(u_in.0));
     while deflection > std::f64::consts::PI {
         deflection -= std::f64::consts::TAU;
     }
@@ -2014,7 +2013,13 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
     // Baseline: the near-side graph, held by its own first bump like the
     // flip pin's first leg.
     let near = chain_layout(a, c, b0, radius, false);
-    let line1 = add_line(&mut scene, near.line1[0].0, near.line1[0].1, near.line1[1].0, near.line1[1].1);
+    let line1 = add_line(
+        &mut scene,
+        near.line1[0].0,
+        near.line1[0].1,
+        near.line1[1].0,
+        near.line1[1].1,
+    );
     let arc = add_arc(
         &mut scene,
         near.arc_center.0,
@@ -2023,7 +2028,13 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
         near.arc_start_angle,
         near.arc_end_angle,
     );
-    let line2 = add_line(&mut scene, near.line2[0].0, near.line2[0].1, near.line2[1].0, near.line2[1].1);
+    let line2 = add_line(
+        &mut scene,
+        near.line2[0].0,
+        near.line2[0].1,
+        near.line2[1].0,
+        near.line2[1].1,
+    );
     let start_marker = add_circle(&mut scene, a.0, a.1, 2.0);
     let middle_marker = add_circle(&mut scene, b0.0, b0.1, 2.0);
     let end_marker = add_circle(&mut scene, c.0, c.1, 2.0);
@@ -2031,7 +2042,10 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
     let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
     set.add(
         ConstraintKind::Coincident,
-        vec![ParametricRef::center(start_marker), ParametricRef::point(line1, 0)],
+        vec![
+            ParametricRef::center(start_marker),
+            ParametricRef::point(line1, 0),
+        ],
         None,
     );
     set.add(
@@ -2056,7 +2070,10 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
     );
     set.add(
         ConstraintKind::Coincident,
-        vec![ParametricRef::center(end_marker), ParametricRef::point(line2, 1)],
+        vec![
+            ParametricRef::center(end_marker),
+            ParametricRef::point(line2, 1),
+        ],
         None,
     );
     let _ = set;
@@ -2115,7 +2132,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
             far.line1[1]
         );
         assert!(
-            (arc_end.x - far.line2[0].0).abs() < 1.0e-9 && (arc_end.y - far.line2[0].1).abs() < 1.0e-9,
+            (arc_end.x - far.line2[0].0).abs() < 1.0e-9
+                && (arc_end.y - far.line2[0].1).abs() < 1.0e-9,
             "construction: arc end = leg 2's start: {arc_end:?} vs {:?}",
             far.line2[0]
         );
@@ -2124,7 +2142,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
             far.line1[1].1 - far.line1[0].1,
         );
         let leg1_len = (ux * ux + uy * uy).sqrt();
-        let h1 = (ux * (far.arc_center.1 - far.line1[0].1) - uy * (far.arc_center.0 - far.line1[0].0))
+        let h1 = (ux * (far.arc_center.1 - far.line1[0].1)
+            - uy * (far.arc_center.0 - far.line1[0].0))
             / leg1_len;
         assert!(
             (h1.abs() - radius).abs() < 1.0e-9,
@@ -2135,7 +2154,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
             far.line2[1].1 - far.line2[0].1,
         );
         let leg2_len = (vx * vx + vy * vy).sqrt();
-        let h2 = (vx * (far.arc_center.1 - far.line2[0].1) - vy * (far.arc_center.0 - far.line2[0].0))
+        let h2 = (vx * (far.arc_center.1 - far.line2[0].1)
+            - vy * (far.arc_center.0 - far.line2[0].0))
             / leg2_len;
         assert!(
             (h2.abs() - radius).abs() < 1.0e-9,
@@ -2160,7 +2180,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
         );
         let body_mid = |branch: &ChainLayout| {
             // the sweep midpoint's polar direction from the arc center
-            let mid_angle = branch.arc_start_angle + (branch.arc_end_angle - branch.arc_start_angle) / 2.0;
+            let mid_angle =
+                branch.arc_start_angle + (branch.arc_end_angle - branch.arc_start_angle) / 2.0;
             (
                 branch.arc_center.0 + radius * mid_angle.cos(),
                 branch.arc_center.1 + radius * mid_angle.sin(),
@@ -2205,7 +2226,11 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
     };
     let (line1_start, line1_end) = line_endpoints(&scene, line1);
     check_held("line 1 start", (line1_start.x, line1_start.y), far.line1[0]);
-    check_held("line 1 end (the written joint)", (line1_end.x, line1_end.y), far.line1[1]);
+    check_held(
+        "line 1 end (the written joint)",
+        (line1_end.x, line1_end.y),
+        far.line1[1],
+    );
     let (arc_center, arc_radius) = arc_geom(&scene, arc);
     check_held("arc center", (arc_center.x, arc_center.y), far.arc_center);
     assert!(
@@ -2213,7 +2238,11 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
         "written radius must hold: {arc_radius}"
     );
     let (line2_start, line2_end) = line_endpoints(&scene, line2);
-    check_held("line 2 start (the written joint)", (line2_start.x, line2_start.y), far.line2[0]);
+    check_held(
+        "line 2 start (the written joint)",
+        (line2_start.x, line2_start.y),
+        far.line2[0],
+    );
     check_held("line 2 end", (line2_end.x, line2_end.y), far.line2[1]);
     // The written sweep (the complement, the far-body ordering) survives:
     // the angles are held modulo the run's 2*pi lane drifts.
@@ -2222,7 +2251,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
             Some(EntityType::Arc(a)) => (a.start_angle, a.end_angle),
             other => panic!("expected an Arc, got {other:?}"),
         };
-        let (mut written, mut read) = (far.arc_end_angle - far.arc_start_angle, angles.1 - angles.0);
+        let (mut written, mut read) =
+            (far.arc_end_angle - far.arc_start_angle, angles.1 - angles.0);
         written = written.rem_euclid(std::f64::consts::TAU);
         read = read.rem_euclid(std::f64::consts::TAU);
         assert!(
@@ -2231,17 +2261,22 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
         );
     }
     let (start_marker_center, _) = circle_geom(&scene, start_marker);
-    check_held("start marker", (start_marker_center.x, start_marker_center.y), a);
+    check_held(
+        "start marker",
+        (start_marker_center.x, start_marker_center.y),
+        a,
+    );
     let (end_marker_center, _) = circle_geom(&scene, end_marker);
     check_held("end marker", (end_marker_center.x, end_marker_center.y), c);
     let (middle_center, _) = circle_geom(&scene, middle_marker);
-    check_held("corner PI marker (refresh-positioned, unwritten)", (middle_center.x, middle_center.y), b1);
+    check_held(
+        "corner PI marker (refresh-positioned, unwritten)",
+        (middle_center.x, middle_center.y),
+        b1,
+    );
     // The bulge side: same signed cross as the construction check.
     {
-        let (sx, sy) = (
-            line1_end.x - line1_start.x,
-            line1_end.y - line1_start.y,
-        );
+        let (sx, sy) = (line1_end.x - line1_start.x, line1_end.y - line1_start.y);
         let side_now = sx * (arc_center.y - line1_start.y) - sy * (arc_center.x - line1_start.x);
         assert!(
             (side_now - {
@@ -2249,7 +2284,8 @@ fn a_crossing_far_side_write_through_the_plugin_route_is_not_displaced() {
                     far.line1[1].0 - far.line1[0].0,
                     far.line1[1].1 - far.line1[0].1,
                 );
-                sx0 * (far.arc_center.1 - far.line1[0].1) - sy0 * (far.arc_center.0 - far.line1[0].0)
+                sx0 * (far.arc_center.1 - far.line1[0].1)
+                    - sy0 * (far.arc_center.0 - far.line1[0].0)
             })
             .abs()
                 < 1.0e-6,

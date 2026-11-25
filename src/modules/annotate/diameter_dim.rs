@@ -1,6 +1,6 @@
-use codec::entities::{Dimension, DimensionDiameter};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{Dimension, DimensionDiameter};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{
@@ -35,6 +35,12 @@ pub struct DiameterDimensionCommand {
     awaiting_angle: bool,
     picked_entity: Option<EntityType>,
     source_handle: Option<Handle>,
+}
+
+impl Default for DiameterDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DiameterDimensionCommand {
@@ -128,10 +134,7 @@ impl CadCommand for DiameterDimensionCommand {
             return t!("DIMDIAMETER  Specify text angle (degrees):").into_owned();
         }
         match self.step {
-            Step::SelectObject => {
-                t!("DIMDIAMETER  Select arc or circle:")
-                    .into_owned()
-            }
+            Step::SelectObject => t!("DIMDIAMETER  Select arc or circle:").into_owned(),
             Step::DimLine(_) => {
                 t!("DIMDIAMETER  Specify dimension line location  [Mtext/Text/Angle]:").into_owned()
             }

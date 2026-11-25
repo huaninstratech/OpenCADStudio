@@ -2,7 +2,7 @@
 //! of revolution (120), tabulated cylinders (122), ruled surfaces (118) and
 //! parametric spline surfaces (114) — and the circular arcs they use.
 
-use kernel::space::{NurbsCurve3, NurbsSurface3, Vec3};
+use ocs_geom::space::{NurbsCurve3, NurbsSurface3, Vec3};
 
 /// A circular arc from `a0` to `a1` (radians, counter-clockwise round
 /// `x × y`) as a rational quadratic spline in segments of at most a quarter
@@ -67,6 +67,12 @@ pub fn revolve(
     a0: f64,
     a1: f64,
 ) -> Option<NurbsSurface3> {
+    // A revolution never needs more than one turn; a larger (or not finite)
+    // sweep would grow the spline without limit.
+    let sweep = a1 - a0;
+    if !sweep.is_finite() || sweep.abs() > std::f64::consts::TAU + 1e-9 {
+        return None;
+    }
     let o = Vec3::from(origin);
     let k = Vec3::from(axis).normalize()?;
     let mut rows = Vec::new();

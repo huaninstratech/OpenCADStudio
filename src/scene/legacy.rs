@@ -25,11 +25,11 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use codec::entities::{EntityCommon, ExtendedEntityData, LwVertex, Solid};
-use codec::objects::{ObjectType, XRecordValue};
-use codec::types::{Color, Handle, LineWeight, Vector2, Vector3};
-use codec::xdata::{ExtendedData, XDataValue};
-use codec::{CadDocument, EntityType, LwPolyline, Polyline, Text};
+use document::entities::{EntityCommon, ExtendedEntityData, LwVertex, Solid};
+use document::objects::{ObjectType, XRecordValue};
+use document::types::{Color, Handle, LineWeight, Vector2, Vector3};
+use document::xdata::{ExtendedData, XDataValue};
+use document::{CadDocument, EntityType, LwPolyline, Polyline, Text};
 
 use crate::scene::convert::proxy_graphics::{self, ProxyColor, ProxyStyle};
 
@@ -541,10 +541,10 @@ fn purge_unused_app_ids(doc: &mut CadDocument, report: &mut LegacyReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::{Line, UnknownEntity};
-    use codec::objects::{Dictionary, XRecord};
-    use codec::tables::{AppId, BlockRecord};
-    use codec::xdata::ExtendedDataRecord;
+    use document::entities::{Line, UnknownEntity};
+    use document::objects::{Dictionary, XRecord};
+    use document::tables::{AppId, BlockRecord};
+    use document::xdata::ExtendedDataRecord;
 
     fn unknown_entity(dxf: &str, graphic: Option<Vec<u8>>) -> EntityType {
         let mut entity = UnknownEntity::new(dxf);
@@ -606,6 +606,7 @@ mod tests {
                 text: "PNP-01".to_string(),
                 font: String::new(),
                 style: ProxyStyle::default(),
+                align: [0.0, 0.0],
             }],
         };
         let mut base = EntityCommon::new();

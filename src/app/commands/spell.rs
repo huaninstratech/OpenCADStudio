@@ -13,7 +13,7 @@ use crate::app::control::text_ops::{decode_dxf_escapes, replace_mtext_safe, Text
 use crate::app::{Message, OpenCADStudio};
 use crate::command::{CadCommand, CmdResult};
 use crate::ui::window::spell_dialog::{SpellFind, SpellMsg, SpellScope, SpellState};
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 use iced::Task;
 
@@ -48,10 +48,95 @@ fn with_speller<T>(language: &str, f: impl FnOnce(&SystemSpeller) -> T) -> T {
     SPELLER.with(|cell| {
         let mut cell = cell.borrow_mut();
         if cell.as_ref().is_none_or(|s| s.language() != language) {
-            *cell = Some(SystemSpeller::new((!language.is_empty()).then_some(language)));
+            *cell = Some(SystemSpeller::new(
+                (!language.is_empty()).then_some(language),
+            ));
         }
         f(cell.as_ref().expect("speller just made"))
     })
+}
+
+/// The main dictionary's suggestions for `word`, best first.
+pub(crate) fn spelling_suggestions(language: &str, word: &str) -> Vec<String> {
+    with_speller(language, |sp| sp.check_word(word, true).1)
+}
+
+/// The words of a custom dictionary file: one per line, UTF-16 or UTF-8
+/// with a byte order mark, else the system's code page.
+pub(crate) fn read_word_file(path: &str) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let text = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        encoding_rs::UTF_16BE.decode_without_bom_handling(rest).0.into_owned()
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        encoding_rs::UTF_16LE.decode_without_bom_handling(rest).0.into_owned()
+    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else {
+        String::from_utf8(bytes.clone())
+            .unwrap_or_else(|_| encoding_rs::WINDOWS_1252.decode(&bytes).0.into_owned())
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Write a custom dictionary file: UTF-16 (big-endian, with its byte order
+/// mark), one word per line.
+pub(crate) fn write_word_file(path: &str, words: &[String]) -> std::io::Result<()> {
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in words.join("\r\n").encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    std::fs::write(path, bytes)
+}
+
+/// The words the spell checker lets pass besides the main dictionary: the
+/// profile's word list and the custom dictionary in use.
+pub(crate) fn custom_words(prefs: &crate::app::settings::SpellPrefs) -> Vec<String> {
+    let mut words = prefs.custom.clone();
+    if let Some(path) = prefs.current_custom.and_then(|n| prefs.custom_files.get(n)) {
+        words.extend(read_word_file(path));
+    }
+    words
+}
+
+/// The misspelled words of `text` (one char per editor slot) as char
+/// ranges, by the main dictionary, the custom words and the options.
+pub(crate) fn misspelled(
+    text: &str,
+    prefs: &crate::app::settings::SpellPrefs,
+    custom: &[String],
+) -> Vec<(usize, usize)> {
+    let language = prefs.language.clone();
+    words(text, 0)
+        .into_iter()
+        .filter(|&(s, e)| {
+            let word = &text[s..e];
+            !skipped(word, &prefs.options)
+                && !custom.iter().any(|w| w.eq_ignore_ascii_case(word))
+                && !with_speller(&language, |sp| sp.check_word(word, false).0)
+        })
+        .map(|(s, e)| (text[..s].chars().count(), text[..e].chars().count()))
+        .collect()
+}
+
+/// The words of the custom dictionary file in use (none for the profile's
+/// own list, which SPELL keeps itself).
+fn custom_words_extra(prefs: &crate::app::settings::SpellPrefs) -> Vec<String> {
+    prefs
+        .current_custom
+        .and_then(|n| prefs.custom_files.get(n))
+        .map(|path| read_word_file(path))
+        .unwrap_or_default()
+}
+
+/// The main dictionaries offered (tag, name).
+pub(crate) fn dictionary_languages() -> Vec<(String, String)> {
+    available_languages()
 }
 
 fn available_languages() -> Vec<(String, String)> {
@@ -80,11 +165,14 @@ fn parse_handles(text: &str) -> Vec<Handle> {
 }
 
 /// The text the check reads in an object, `None` when it holds none.
-fn checked_text(entity: &EntityType, options: &crate::ui::window::spell_dialog::SpellOptions) -> Option<String> {
+fn checked_text(
+    entity: &EntityType,
+    options: &crate::ui::window::spell_dialog::SpellOptions,
+) -> Option<String> {
     match entity {
         EntityType::Text(t) => Some(decode_dxf_escapes(&t.value)),
         EntityType::MText(m) => Some(decode_dxf_escapes(
-            &codec::entities::mtext_format::parse_mtext(&m.value, true).to_plain_text(),
+            &document::entities::mtext_format::parse_mtext(&m.value, true).to_plain_text(),
         )),
         EntityType::AttributeEntity(a) if options.attributes => {
             Some(decode_dxf_escapes(a.get_value()))
@@ -188,7 +276,11 @@ impl CadCommand for SpellSelectCommand {
 impl OpenCADStudio {
     pub(super) fn dispatch_spell(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         let (verb, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
-        match verb.trim_start_matches(['_', '.']).to_ascii_uppercase().as_str() {
+        match verb
+            .trim_start_matches(['_', '.'])
+            .to_ascii_uppercase()
+            .as_str()
+        {
             // A pickfirst selection is not used: the window opens on the
             // place chosen last (Entire drawing at first), as measured.
             "SPELL" if rest.trim().is_empty() => {
@@ -270,6 +362,7 @@ impl OpenCADStudio {
         state.suggestions.clear();
         state.replacement.clear();
         let language = state.language.clone();
+        let extra = custom_words_extra(&self.spell_prefs);
         while state.cursor.0 < state.targets.len() {
             let handle = state.targets[state.cursor.0];
             let text = self.tabs[i]
@@ -283,6 +376,7 @@ impl OpenCADStudio {
                 if skipped(word, &state.options)
                     || state.ignored.iter().any(|w| w == word)
                     || state.custom.iter().any(|w| w.eq_ignore_ascii_case(word))
+                    || extra.iter().any(|w| w.eq_ignore_ascii_case(word))
                 {
                     return false;
                 }
@@ -292,7 +386,8 @@ impl OpenCADStudio {
                 Some((s, e)) => {
                     let word = text[s..e].to_string();
                     let suggestions = with_speller(&language, |sp| sp.check_word(&word, true).1);
-                    state.replacement = suggestions.first().cloned().unwrap_or_else(|| word.clone());
+                    state.replacement =
+                        suggestions.first().cloned().unwrap_or_else(|| word.clone());
                     state.suggestions = suggestions;
                     state.cursor.1 = e;
                     state.current = Some(SpellFind {
@@ -336,7 +431,12 @@ impl OpenCADStudio {
             }
             let mut out = value.to_string();
             let picked: Vec<(usize, usize)> = match nth {
-                Some(n) => hits.get(n).or_else(|| hits.first()).copied().into_iter().collect(),
+                Some(n) => hits
+                    .get(n)
+                    .or_else(|| hits.first())
+                    .copied()
+                    .into_iter()
+                    .collect(),
                 None => hits,
             };
             for (s, e) in picked.into_iter().rev() {
@@ -361,12 +461,14 @@ impl OpenCADStudio {
                 }
                 None => false,
             },
-            EntityType::AttributeDefinition(a) => {
-                replace_plain(&a.default_value).map(|v| a.default_value = v).is_some()
-            }
+            EntityType::AttributeDefinition(a) => replace_plain(&a.default_value)
+                .map(|v| a.default_value = v)
+                .is_some(),
             EntityType::Dimension(d) => {
                 let text = d.base().text.clone();
-                replace_plain(&text).map(|v| d.base_mut().text = v).is_some()
+                replace_plain(&text)
+                    .map(|v| d.base_mut().text = v)
+                    .is_some()
             }
             _ => false,
         };
@@ -422,7 +524,11 @@ impl OpenCADStudio {
                 let replacement = state.replacement.clone();
                 let cursor = (state.cursor.0, found.start);
                 let all = matches!(message, SpellMsg::ChangeAll);
-                let targets = if all { state.targets.clone() } else { vec![found.handle] };
+                let targets = if all {
+                    state.targets.clone()
+                } else {
+                    vec![found.handle]
+                };
                 // Which occurrence of the word in its text this one is.
                 let nth = TextMatcher::new(found.word.clone(), true, true, false)
                     .find_all_in(&found.text)
@@ -431,7 +537,8 @@ impl OpenCADStudio {
                 let mut undo = Vec::new();
                 for h in targets {
                     let nth = if all { None } else { nth };
-                    if let Some(entry) = self.spell_replace_in(i, h, &found.word, &replacement, nth) {
+                    if let Some(entry) = self.spell_replace_in(i, h, &found.word, &replacement, nth)
+                    {
                         undo.push(entry);
                     }
                 }
@@ -455,7 +562,11 @@ impl OpenCADStudio {
             }
             SpellMsg::AddWord => {
                 if let Some(found) = &state.current {
-                    if !state.custom.iter().any(|w| w.eq_ignore_ascii_case(&found.word)) {
+                    if !state
+                        .custom
+                        .iter()
+                        .any(|w| w.eq_ignore_ascii_case(&found.word))
+                    {
                         state.custom.push(found.word.clone());
                     }
                     self.spell_prefs.custom = state.custom.clone();

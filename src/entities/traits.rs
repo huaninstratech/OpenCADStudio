@@ -1,6 +1,6 @@
-use codec::{Document, EntityType};
+use document::{Document, EntityType};
 
-use crate::command::EntityTransform;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::RenderEntity;
 use crate::scene::convert::tess_util::FallbackGeometry;
 use crate::scene::model::object::{GripApply, GripDef, GripMenuAction, GripMenuItem, PropSection};
@@ -175,13 +175,13 @@ pub fn entity_type_name(et: &EntityType) -> &str {
     match et {
         EntityType::Point(_) => "Point",
         EntityType::Line(line)
-            if codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
+            if document::entities::CenterMarkAssociation::read(&line.common.extended_data)
                 .is_some() =>
         {
             "CenterMark"
         }
         EntityType::Line(line)
-            if codec::entities::CenterLineAssociation::read(&line.common.extended_data)
+            if document::entities::CenterLineAssociation::read(&line.common.extended_data)
                 .is_some() =>
         {
             "CenterLine"
@@ -314,7 +314,7 @@ macro_rules! impl_entity_basics {
             }
         }
         impl $crate::entities::traits::Transformable for $T {
-            fn apply_transform(&mut self, t: &$crate::command::EntityTransform) {
+            fn apply_transform(&mut self, t: &$crate::entities::transform::EntityTransform) {
                 apply_transform(self, t);
             }
         }
@@ -351,7 +351,7 @@ macro_rules! impl_entity_basics_with_text_styles {
             }
         }
         impl $crate::entities::traits::Transformable for $T {
-            fn apply_transform(&mut self, t: &$crate::command::EntityTransform) {
+            fn apply_transform(&mut self, t: &$crate::entities::transform::EntityTransform) {
                 apply_transform(self, t);
             }
         }
@@ -550,7 +550,7 @@ impl EntityTypeOps for EntityType {
             ],
             _ => {},
         );
-        // XDATA world points follow the entity, as in opencadcodec's
+        // XDATA world points follow the entity, as in document's
         // `EntityType` transforms; the verbatim record would write the old
         // values back. Section marks / view borders stay with their view.
         if !matches!(
@@ -566,6 +566,9 @@ impl EntityTypeOps for EntityType {
     }
 
     fn mass_props(&self) -> Option<MassProps> {
+        if let EntityType::Region(region) = self {
+            return Some(crate::entities::solid3d::region_mass_props(region));
+        }
         dispatch!(self,
             |e| Some(MassPropsCalc::mass_props(e)),
             [Circle, Arc, Line, LwPolyline, Ellipse],
@@ -593,9 +596,9 @@ impl EntityTypeOps for EntityType {
 #[cfg(test)]
 mod xdata_transform_tests {
     use super::*;
-    use codec::entities::Insert;
-    use codec::types::Vector3;
-    use codec::xdata::{ExtendedDataRecord, XDataValue};
+    use document::entities::Insert;
+    use document::types::Vector3;
+    use document::xdata::{ExtendedDataRecord, XDataValue};
     use glam::DVec3;
 
     fn insert_with_xdata() -> EntityType {

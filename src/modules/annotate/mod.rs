@@ -12,13 +12,13 @@ pub mod diameter_dim;
 pub mod dim_baseline;
 pub mod dim_cmd;
 pub mod dim_continue;
+pub mod dim_distribute;
 pub mod dim_inspect;
 pub mod dimbreak;
 pub mod dimedit;
-pub mod dimoverride;
 pub mod dimjogline;
+pub mod dimoverride;
 pub mod dimreassociate;
-pub mod dim_distribute;
 pub mod dimspace;
 pub mod dimtedit;
 pub mod field_cmd;
@@ -94,16 +94,37 @@ fn annotate_dimension_items() -> Vec<(&'static str, &'static str, IconKind)> {
         (linear_dim::tool().id, "Linear", linear_dim::tool().icon),
         (aligned_dim::tool().id, "Aligned", aligned_dim::tool().icon),
         (angular_dim::tool().id, "Angular", angular_dim::tool().icon),
-        (arc_length_dim::tool().id, "Arc Length", arc_length_dim::tool().icon),
+        (
+            arc_length_dim::tool().id,
+            "Arc Length",
+            arc_length_dim::tool().icon,
+        ),
         (radius_dim::tool().id, "Radius", radius_dim::tool().icon),
-        (diameter_dim::tool().id, "Diameter", diameter_dim::tool().icon),
-        (jogged_radius_dim::tool().id, "Jogged", jogged_radius_dim::tool().icon),
-        (ordinate_dim::tool().id, "Ordinate", ordinate_dim::tool().icon),
+        (
+            diameter_dim::tool().id,
+            "Diameter",
+            diameter_dim::tool().icon,
+        ),
+        (
+            jogged_radius_dim::tool().id,
+            "Jogged",
+            jogged_radius_dim::tool().icon,
+        ),
+        (
+            ordinate_dim::tool().id,
+            "Ordinate",
+            ordinate_dim::tool().icon,
+        ),
     ]
 }
 
 /// A small Dimensions-panel button running `command`.
-fn dim_tool(id: &'static str, label: &'static str, icon: &'static [u8], command: &str) -> crate::modules::ToolDef {
+fn dim_tool(
+    id: &'static str,
+    label: &'static str,
+    icon: &'static [u8],
+    command: &str,
+) -> crate::modules::ToolDef {
     crate::modules::ToolDef {
         id,
         label,
@@ -118,7 +139,11 @@ pub fn text_height_label(height: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn text_tool(id: &'static str, label: &'static str, icon: &'static [u8]) -> crate::modules::ToolDef {
+fn text_tool(
+    id: &'static str,
+    label: &'static str,
+    icon: &'static [u8],
+) -> crate::modules::ToolDef {
     crate::modules::ToolDef {
         id,
         label,
@@ -208,14 +233,44 @@ impl CadModule for AnnotateModule {
                             manager_cmd: Some("DIMSTYLE"),
                             rows: vec![
                                 vec![
-                                    dim_tool("DIMBREAK", "Break", include_bytes!("../../../assets/icons/dim_break.svg"), "DIMBREAK"),
-                                    dim_tool("DIMSPACE", "Adjust Space", include_bytes!("../../../assets/icons/dim_space.svg"), "DIMSPACE"),
-                                    dim_tool("DIMJOGLINE", "Jog Line", include_bytes!("../../../assets/icons/dim_jog.svg"), "DIMJOGLINE"),
+                                    dim_tool(
+                                        "DIMBREAK",
+                                        "Break",
+                                        include_bytes!("../../../assets/icons/dim_break.svg"),
+                                        "DIMBREAK",
+                                    ),
+                                    dim_tool(
+                                        "DIMSPACE",
+                                        "Adjust Space",
+                                        include_bytes!("../../../assets/icons/dim_space.svg"),
+                                        "DIMSPACE",
+                                    ),
+                                    dim_tool(
+                                        "DIMJOGLINE",
+                                        "Jog Line",
+                                        include_bytes!("../../../assets/icons/dim_jog.svg"),
+                                        "DIMJOGLINE",
+                                    ),
                                 ],
                                 vec![
-                                    dim_tool("DIMINSPECT", "Inspect", include_bytes!("../../../assets/icons/find.svg"), "DIMINSPECT"),
-                                    dim_tool("DIMSTYLE_APPLY", "Update", include_bytes!("../../../assets/icons/ui/refresh.svg"), r#"-DIMSTYLE ["APPLY"]"#),
-                                    dim_tool("DIMREASSOCIATE", "Reassociate", include_bytes!("../../../assets/icons/sync.svg"), "DIMREASSOCIATE"),
+                                    dim_tool(
+                                        "DIMINSPECT",
+                                        "Inspect",
+                                        include_bytes!("../../../assets/icons/find.svg"),
+                                        "DIMINSPECT",
+                                    ),
+                                    dim_tool(
+                                        "DIMSTYLE_APPLY",
+                                        "Update",
+                                        include_bytes!("../../../assets/icons/ui/refresh.svg"),
+                                        r#"-DIMSTYLE ["APPLY"]"#,
+                                    ),
+                                    dim_tool(
+                                        "DIMREASSOCIATE",
+                                        "Reassociate",
+                                        include_bytes!("../../../assets/icons/sync.svg"),
+                                        "DIMREASSOCIATE",
+                                    ),
                                 ],
                             ],
                         },
@@ -237,8 +292,16 @@ impl CadModule for AnnotateModule {
                             label: "",
                             icon: dim_continue::tool().icon,
                             items: vec![
-                                (dim_continue::tool().id, "Continue", dim_continue::tool().icon),
-                                (dim_baseline::tool().id, "Baseline", dim_baseline::tool().icon),
+                                (
+                                    dim_continue::tool().id,
+                                    "Continue",
+                                    dim_continue::tool().icon,
+                                ),
+                                (
+                                    dim_baseline::tool().id,
+                                    "Baseline",
+                                    dim_baseline::tool().icon,
+                                ),
                             ],
                             default: "DIMCONTINUE",
                         },
@@ -323,8 +386,8 @@ impl CadModule for AnnotateModule {
                             icon: revcloud::ICON,
                             items: vec![
                                 ("REVCLOUD_RECTANGULAR", "Rectangular", revcloud::ICON),
-                                ("REVCLOUD_POLYGONAL", "Polygonal", revcloud::ICON),
-                                ("REVCLOUD_FREEHAND", "Freehand", revcloud::ICON),
+                                ("REVCLOUD_POLYGONAL", "Polygonal", revcloud::ICON_POLYGONAL),
+                                ("REVCLOUD_FREEHAND", "Freehand", revcloud::ICON_FREEHAND),
                             ],
                             default: "REVCLOUD_RECTANGULAR",
                         },
@@ -334,31 +397,33 @@ impl CadModule for AnnotateModule {
                 RibbonGroup {
                     title: "Annotation Scaling",
                     tools: vec![
-                        RibbonItem::LabeledDropdown {
+                        RibbonItem::LargeDropdown {
                             id: "ANNOTATION_CURRENT_SCALE",
-                            label: "Add Current Scale",
+                            // Split button: the face runs and names the item
+                            // picked last.
+                            label: ocs_plugin_api::ribbon::FOLLOW_CHOSEN,
                             icon: crate::modules::IconKind::Svg(include_bytes!(
                                 "../../../assets/icons/add_scale.svg"
                             )),
                             items: vec![
                                 (
-                                    "OBJECTSCALE ADD",
+                                    "AIOBJECTSCALEADD",
                                     "Add Current Scale",
                                     crate::modules::IconKind::Svg(include_bytes!(
                                         "../../../assets/icons/add_scale.svg"
                                     )),
                                 ),
                                 (
-                                    "OBJECTSCALE DELETE",
+                                    "AIOBJECTSCALEREMOVE",
                                     "Delete Current Scale",
                                     crate::modules::IconKind::Svg(include_bytes!(
                                         "../../../assets/icons/add_scale.svg"
                                     )),
                                 ),
                             ],
-                            default: "OBJECTSCALE ADD",
+                            default: "AIOBJECTSCALEADD",
                         },
-                        RibbonItem::Tool(crate::modules::ToolDef {
+                        RibbonItem::LabeledTool(crate::modules::ToolDef {
                             id: "SCALELISTEDIT",
                             label: "Scale List",
                             icon: crate::modules::IconKind::Svg(include_bytes!(
@@ -368,7 +433,7 @@ impl CadModule for AnnotateModule {
                                 "SCALELISTEDIT".to_string(),
                             ),
                         }),
-                        RibbonItem::Tool(crate::modules::ToolDef {
+                        RibbonItem::LabeledTool(crate::modules::ToolDef {
                             id: "OBJECTSCALE",
                             label: "Add/Delete Scales",
                             icon: crate::modules::IconKind::Svg(include_bytes!(
@@ -376,7 +441,7 @@ impl CadModule for AnnotateModule {
                             )),
                             event: crate::modules::ModuleEvent::Command("OBJECTSCALE".to_string()),
                         }),
-                        RibbonItem::Tool(crate::modules::ToolDef {
+                        RibbonItem::LabeledTool(crate::modules::ToolDef {
                             id: "ANNORESET",
                             label: "Sync Scale Positions",
                             icon: crate::modules::IconKind::Svg(include_bytes!(

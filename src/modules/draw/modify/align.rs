@@ -11,7 +11,7 @@
 // With 3 pairs: rigid 3D placement without scaling
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, EntityTransform};
@@ -122,7 +122,7 @@ impl CadCommand for AlignCommand {
             }
             AlignState::Src2 => {
                 let pair = [self.src1.unwrap().to_array(), pt.to_array()];
-                if kernel::space::align_point_pairs(&pair, &pair, false).is_none() {
+                if ocs_geom::space::align_point_pairs(&pair, &pair, false).is_none() {
                     return CmdResult::NeedPoint;
                 }
                 self.src2 = Some(pt);
@@ -131,7 +131,7 @@ impl CadCommand for AlignCommand {
             }
             AlignState::Dst2 => {
                 let pair = [self.dst1.unwrap().to_array(), pt.to_array()];
-                if kernel::space::align_point_pairs(&pair, &pair, false).is_none() {
+                if ocs_geom::space::align_point_pairs(&pair, &pair, false).is_none() {
                     return CmdResult::NeedPoint;
                 }
                 self.dst2 = Some(pt);
@@ -144,7 +144,7 @@ impl CadCommand for AlignCommand {
                     self.src2.unwrap().to_array(),
                     pt.to_array(),
                 ];
-                if kernel::space::align_point_pairs(&frame, &frame, false).is_none() {
+                if ocs_geom::space::align_point_pairs(&frame, &frame, false).is_none() {
                     return CmdResult::NeedPoint;
                 }
                 self.src3 = Some(pt);
@@ -294,13 +294,13 @@ impl AlignCommand {
             source.push(s3.to_array());
             target.push(d3.to_array());
         }
-        let Some(matrix) = kernel::space::align_point_pairs(&source, &target, with_scale) else {
+        let Some(matrix) = ocs_geom::space::align_point_pairs(&source, &target, with_scale) else {
             return CmdResult::NeedPoint;
         };
         CmdResult::TransformSelected(
             self.handles.clone(),
-            EntityTransform::Affine(codec::types::Transform::from_matrix(
-                codec::types::Matrix4 { m: matrix },
+            EntityTransform::Affine(document::types::Transform::from_matrix(
+                document::types::Matrix4 { m: matrix },
             )),
         )
     }
@@ -354,7 +354,7 @@ mod tests {
         };
         assert_eq!(handles, vec![handle]);
         for (from, expected) in source.into_iter().zip(target) {
-            let actual = transform.apply(codec::types::Vector3::new(from.x, from.y, from.z));
+            let actual = transform.apply(document::types::Vector3::new(from.x, from.y, from.z));
             let actual = DVec3::new(actual.x, actual.y, actual.z);
             assert!(actual.abs_diff_eq(expected, 1.0e-12));
         }

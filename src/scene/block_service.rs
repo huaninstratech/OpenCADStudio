@@ -13,10 +13,10 @@
 //! callers own the app-level concerns (undo snapshots, command-line output,
 //! panel refreshes).
 
-use codec::objects::ObjectType;
-use codec::tables::BlockRecord;
-use codec::types::Handle;
-use codec::{Document, EntityType, TableEntry};
+use document::objects::ObjectType;
+use document::tables::BlockRecord;
+use document::types::Handle;
+use document::{Document, EntityType, TableEntry};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -361,7 +361,7 @@ fn collect_dictionary_tree(document: &Document, handle: Handle, out: &mut HashSe
 fn extension_dictionary(
     document: &Document,
     owner: Handle,
-) -> Option<&codec::objects::Dictionary> {
+) -> Option<&document::objects::Dictionary> {
     match document
         .extension_dictionary_handle(owner)
         .and_then(|handle| document.objects.get(&handle))?
@@ -485,6 +485,11 @@ fn erase_definition(scene: &mut Scene, stored: &str, references: &[BlockReferenc
         .filter(|h| scene.document.get_entity(*h).is_some())
         .collect();
     let erased = present.len();
+    let removed_changes: Vec<(Handle, crate::scene::ChangeKind)> = present
+        .iter()
+        .copied()
+        .map(|h| (h, crate::scene::ChangeKind::Removed))
+        .collect();
     scene.erase_entities(&present);
     // `erase_entities` honours layer locks; a member on a locked layer would
     // otherwise dangle against a record that no longer exists.
@@ -494,12 +499,14 @@ fn erase_definition(scene: &mut Scene, stored: &str, references: &[BlockReferenc
         .filter(|h| scene.document.get_entity(*h).is_some())
         .collect();
     for handle in survivors {
+        scene.remove_image_definition_reactor(handle);
         scene.document.remove_entity(handle);
+        scene.clear_derived_caches_for(handle);
     }
     scene.document.block_records.remove(stored);
     drop_orphaned_draw_order_tables(&mut scene.document);
     scene.invalidate_dependency_index();
-    scene.bump_geometry();
+    scene.bump_entities_restyled_with_block_deps(&removed_changes, &[], &[stored.to_string()]);
     erased
 }
 
@@ -571,29 +578,42 @@ pub fn rename(
     if let Some(EntityType::Block(block)) = scene.document.get_entity_mut(marker) {
         block.name = new.clone();
     }
-    repoint_name_references(scene, &stored, &new);
+    let (repointed, changed_dim_styles) = repoint_name_references(scene, &stored, &new);
     scene.invalidate_dependency_index();
-    scene.bump_geometry();
+    if !changed_dim_styles.is_empty() {
+        scene.invalidate_dim_style_dependencies_many(&changed_dim_styles);
+    }
+    scene.bump_entities_restyled_with_block_deps(&repointed, &[handle], &[stored, new]);
     Ok(handle)
 }
 
 /// Every name-based reference follows a rename: INSERTs, a dimension's
 /// picture-block name and the dimension styles' arrow-block names.
-fn repoint_name_references(scene: &mut Scene, stored: &str, new: &str) {
+fn repoint_name_references(
+    scene: &mut Scene,
+    stored: &str,
+    new: &str,
+) -> (Vec<(Handle, crate::scene::ChangeKind)>, Vec<String>) {
+    let mut repointed = Vec::new();
     for entity in scene.document.entities_mut() {
         match entity {
             EntityType::Insert(insert) if insert.block_name.eq_ignore_ascii_case(stored) => {
                 insert.block_name = new.to_owned();
+                repointed.push((insert.common.handle, crate::scene::ChangeKind::Modified));
             }
             EntityType::Dimension(dimension)
                 if dimension.base().block_name.eq_ignore_ascii_case(stored) =>
             {
+                let h = dimension.base().common.handle;
                 dimension.base_mut().block_name = new.to_owned();
+                repointed.push((h, crate::scene::ChangeKind::Modified));
             }
             _ => {}
         }
     }
+    let mut changed_dim_styles = Vec::new();
     for style in scene.document.dim_styles.iter_mut() {
+        let mut touched = false;
         for field in [
             &mut style.dimblk_name,
             &mut style.dimblk1_name,
@@ -601,15 +621,17 @@ fn repoint_name_references(scene: &mut Scene, stored: &str, new: &str) {
         ] {
             if field.eq_ignore_ascii_case(stored) {
                 *field = new.to_owned();
+                touched = true;
             }
         }
+        if touched {
+            changed_dim_styles.push(style.name.clone());
+        }
     }
+    (repointed, changed_dim_styles)
 }
 
-fn record_of<'a>(
-    document: &'a Document,
-    name: &str,
-) -> Result<&'a BlockRecord, BlockServiceError> {
+fn record_of<'a>(document: &'a Document, name: &str) -> Result<&'a BlockRecord, BlockServiceError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(BlockServiceError::InvalidName(
@@ -702,18 +724,17 @@ pub fn circular_dependency_error(container_block: &str, inserted_block: &str) ->
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
-    use codec::entities::{
+    use document::entities::{
         Block as BlockEntity, BlockEnd, Dimension, DimensionAligned, Insert, Line, MultiLeader,
         Table,
     };
-    use codec::objects::{
+    use document::objects::{
         DgnLsComponent, DgnLsComponentType, DgnLsDefinition, Dictionary, MultiLeaderStyle,
     };
-    use codec::tables::{DimStyle, LineType};
-    use codec::types::Vector3;
+    use document::tables::{DimStyle, LineType};
+    use document::types::Vector3;
 
     fn scene() -> Scene {
         Scene::new()
@@ -798,7 +819,7 @@ mod tests {
         table.block_record_handle = Some(target);
         let cell = table.cell_mut(0, 0).unwrap();
         cell.contents
-            .push(codec::entities::table::CellContent::block(target));
+            .push(document::entities::table::CellContent::block(target));
         scene
             .document
             .add_entity(EntityType::Table(Box::new(table)))
@@ -806,7 +827,7 @@ mod tests {
 
         // A multi-leader's block content and arrowhead, by handle.
         let mut leader = MultiLeader::new();
-        leader.content_type = codec::entities::LeaderContentType::Block;
+        leader.content_type = document::entities::LeaderContentType::Block;
         leader.context.has_block_contents = true;
         leader.block_content_handle = Some(target);
         leader.arrowhead_handle = Some(target);

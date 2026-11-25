@@ -4,6 +4,7 @@
 //! for DOM `dragover`/`drop` events, reads each dropped drawing's bytes, and
 //! queues them for the 50 ms control poll to open through the web-picker flow.
 
+use ocs_save::is_drawing_name;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -135,7 +136,7 @@ pub async fn open_dropped(
     // name, and the registry — not the absent filesystem — is what
     // re-resolves that reference when its host is reopened or reloaded.
     super::xref::register_source(&name, std::sync::Arc::new(bytes.clone()));
-    progress.set(crate::app::OPEN_PHASE_READING, 500, 1, 2);
+    progress.set(crate::io::OPEN_PHASE_READING, 500, 1, 2);
     let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
     let size_bytes = bytes.len() as u64;
     let result = super::load_web_bytes(&name, &bytes, progress, false, "", None).await;
@@ -143,7 +144,8 @@ pub async fn open_dropped(
         .as_ref()
         .err()
         .is_some_and(|error| error.recovery_available);
-    let cache_bytes = result.is_ok().then(|| std::sync::Arc::clone(&bytes));
+    let cache_bytes = (result.is_ok() && !super::host_bridge::is_embed_mode())
+        .then(|| std::sync::Arc::clone(&bytes));
     crate::io::WebOpenOutcome {
         name,
         size_bytes,
@@ -262,21 +264,6 @@ pub fn install() {
         INSTALLED.store(false, Ordering::SeqCst);
     }
 }
-
-fn is_drawing_name(name: &str) -> bool {
-    // Same convention as the worker's reader dispatch (`rsplit('.').next()`):
-    // a dot-less name is its own extension, so a file literally named
-    // "DWG"/"dxf" parses and must not be filtered out here.
-    matches!(
-        name.rsplit('.')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "dwg" | "dxf"
-    )
-}
-
 /// The decodable raster set matches the IMAGE picker's filter (and the `image`
 /// crate features the app builds with: png/jpeg/bmp/tiff/webp/gif) — anything
 /// else would queue bytes that can only ever fail to decode.

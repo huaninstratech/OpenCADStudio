@@ -18,8 +18,9 @@ fn visibility_set_row_keeps_every_object_visible_in_the_first_state() {
     feed(&mut app, "0,0");
     feed(&mut app, "");
 
-    let parameter = crate::scene::block_visibility::parameter(&app.tabs[i].scene.document, definition)
-        .expect("the row authors the visibility parameter");
+    let parameter =
+        crate::scene::block_visibility::parameter(&app.tabs[i].scene.document, definition)
+            .expect("the row authors the visibility parameter");
     assert!(
         !parameter.all_blocks.is_empty(),
         "the state set has to carry the definition's objects before it can show them"
@@ -94,7 +95,59 @@ fn a_member_drawn_after_the_graph_reaches_the_visibility_copy_tagged() {
     assert!(
         tag.values
             .iter()
-            .any(|value| matches!(value, codec::xdata::XDataValue::Handle(handle) if *handle == late.common.handle)),
+            .any(|value| matches!(value, document::xdata::XDataValue::Handle(handle) if *handle == late.common.handle)),
+        "and the tag names the object it sits on: {tag:?}"
+    );
+}
+
+/// A definition that already carries an evaluation graph still has its members
+/// tagged when a visibility parameter joins it: preparing tags only a new
+/// graph, so a member drawn after the graph carries no tag until the
+/// visibility parameter adds one, and would otherwise enter the state set
+/// untagged.
+#[test]
+fn a_visibility_parameter_tags_a_member_the_existing_graph_has_not_tagged() {
+    let (mut app, reference) = fixture();
+    begin(&mut app, reference);
+    let _ = app.run_command_line("BPARAMETER POINT 2,3 4,5");
+    let _ = app.run_command_line("LINE 20,20 24,20");
+    let i = app.active_tab;
+    let late = app.tabs[i]
+        .scene
+        .document
+        .entities()
+        .find(|entity| {
+            matches!(entity, EntityType::Line(line)
+                if (line.start.x, line.start.y, line.end.x, line.end.y) == (20., 20., 24., 20.))
+        })
+        .map(|entity| entity.common().handle)
+        .expect("the member drawn after the graph is in the definition");
+    assert!(
+        app.tabs[i]
+            .scene
+            .document
+            .get_entity(late)
+            .unwrap()
+            .common()
+            .extended_data
+            .get_record("AcDbBlockRepETag")
+            .is_none(),
+        "the point parameter's graph leaves the later member untagged"
+    );
+    let _ = app.run_command_line("BPARAMETER VISIBILITY 8,8");
+    let tag = app.tabs[i]
+        .scene
+        .document
+        .get_entity(late)
+        .unwrap()
+        .common()
+        .extended_data
+        .get_record("AcDbBlockRepETag")
+        .expect("the visibility parameter tags the members the existing graph covers");
+    assert!(
+        tag.values.iter().any(
+            |value| matches!(value, document::xdata::XDataValue::Handle(handle) if *handle == late)
+        ),
         "and the tag names the object it sits on: {tag:?}"
     );
 }

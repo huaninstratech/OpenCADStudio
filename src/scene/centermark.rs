@@ -1,8 +1,8 @@
 use super::*;
-use codec::entities::{CenterMarkAssociation, CenterMarkSource, CenterMarkSourceKind};
-use codec::types::Vector3;
+use document::entities::{CenterMarkAssociation, CenterMarkSource, CenterMarkSourceKind};
+use document::types::Vector3;
 use glam::DVec3;
-use kernel::geom2d::{closest_point, Arc as KernelArc, BulgeArc, Curve};
+use ocs_geom::geom2d::{closest_point, Arc as KernelArc, BulgeArc, Curve};
 
 fn vector(point: DVec3) -> Vector3 {
     Vector3::new(point.x, point.y, point.z)
@@ -170,7 +170,7 @@ pub(crate) fn picked_mark_source(
 }
 
 fn resolve_source(
-    document: &codec::Document,
+    document: &document::Document,
     source: &CenterMarkSource,
 ) -> Option<(DVec3, f64, DVec3, DVec3)> {
     let entity = document.get_entity(source.handle)?;
@@ -336,7 +336,7 @@ fn apply_source_geometry(
     }
 }
 
-pub(crate) fn update_carrier(line: &mut codec::Line, association: &CenterMarkAssociation) {
+pub(crate) fn update_carrier(line: &mut document::Line, association: &CenterMarkAssociation) {
     let segments = mark_segments(association);
     let horizontal = segments
         .first()
@@ -381,9 +381,7 @@ impl Scene {
         };
         update_carrier(line, &association);
         // The mark now points at `source_handle`; drop the indexed edge.
-        self.associative_centermark_source_cache
-            .borrow_mut()
-            .take();
+        self.associative_centermark_source_cache.borrow_mut().take();
         self.bump_entities(&[(target, ChangeKind::Modified)]);
         true
     }
@@ -396,11 +394,7 @@ impl Scene {
         &self,
         changed: &rustc_hash::FxHashSet<Handle>,
     ) -> Vec<Handle> {
-        if self
-            .associative_centermark_source_cache
-            .borrow()
-            .is_none()
-        {
+        if self.associative_centermark_source_cache.borrow().is_none() {
             let mut index: HashMap<Handle, Vec<Handle>> = HashMap::default();
             for entity in self.document.entities() {
                 let EntityType::Line(line) = entity else {
@@ -550,9 +544,7 @@ impl Scene {
             // The association flags just changed. Drop the index; the bump
             // below re-indexes from the new xdata (an all-disassociated bump
             // rebuilds an empty index and refreshes nothing).
-            self.associative_centermark_source_cache
-                .borrow_mut()
-                .take();
+            self.associative_centermark_source_cache.borrow_mut().take();
             let changes: Vec<_> = candidates
                 .iter()
                 .map(|(handle, _)| (*handle, ChangeKind::Modified))
@@ -578,7 +570,8 @@ pub(crate) fn entity_has_center_association(entity: &EntityType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::{Circle, Line};
+    use document::entities::{Circle, Line};
+    use document::Document;
 
     fn source_circle() -> EntityType {
         EntityType::Circle(Circle::from_center_radius(
@@ -610,10 +603,8 @@ mod tests {
             show_extensions: false,
             associated: true,
         };
-        let mut line = Line::from_points(
-            Vector3::new(9.5, 10.0, 0.0),
-            Vector3::new(10.5, 10.0, 0.0),
-        );
+        let mut line =
+            Line::from_points(Vector3::new(9.5, 10.0, 0.0), Vector3::new(10.5, 10.0, 0.0));
         association.write(&mut line.common.extended_data);
         EntityType::Line(line)
     }
@@ -622,7 +613,10 @@ mod tests {
         let Some(EntityType::Line(line)) = scene.document.get_entity(handle) else {
             panic!("carrier is not a line");
         };
-        assert!((line.start.y - line.end.y).abs() < 1e-9, "carrier not horizontal");
+        assert!(
+            (line.start.y - line.end.y).abs() < 1e-9,
+            "carrier not horizontal"
+        );
         line.start.y
     }
 
@@ -673,5 +667,38 @@ mod tests {
         scene.bump_entities(&[(source, ChangeKind::Modified)]);
         assert!((carrier_y(&scene, pasted) - 20.0).abs() < 1e-9);
         assert!((carrier_y(&scene, early) - 20.0).abs() < 1e-9);
+    }
+
+    /// The cross is the part of a mark a user snaps to, so the wire that
+    /// carries it must keep the mark's key vertices and segment tangents.
+    #[test]
+    fn a_marks_cross_wire_keeps_the_snaps_and_vertices() {
+        let mut document = Document::new();
+        let source = document.add_entity(source_circle()).unwrap_or(Handle::NULL);
+        let entity = carrier(source);
+        let wires = crate::scene::tessellate_entity(
+            &document,
+            &HashSet::default(),
+            None,
+            [0.0, 0.0, 0.0, 1.0],
+            1.0,
+            None,
+            &entity,
+            None,
+            None,
+            None,
+            None,
+            &HashSet::default(),
+        );
+        let cross = wires.last().expect("the mark draws a cross wire");
+        assert!(
+            cross.key_vertices.contains(&[10.0, 10.0, 0.0]),
+            "the centre stays a snap vertex: {:?}",
+            cross.key_vertices
+        );
+        assert!(
+            !cross.tangent_geoms.is_empty(),
+            "each cross segment keeps its tangent"
+        );
     }
 }

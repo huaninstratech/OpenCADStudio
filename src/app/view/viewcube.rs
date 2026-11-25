@@ -5,11 +5,11 @@ use iced::{Background, Border, Element, Theme};
 
 // ── Render-mode picker ──────────────────────────────────────────────────────
 
-/// Top-left viewport control bar: a single dark chip holding (optionally) the
-/// horizontal/vertical split buttons, the render-mode picker, and the grid /
-/// grid-snap toggles. `include_split` is off for paper-space viewports, which
-/// have no model-tile splitting. Grid / snap reflect the active viewport's
-/// state and emit `ToggleGrid` / `ToggleGridSnap`.
+// Top-left viewport control bar: a single dark chip holding (optionally) the
+// horizontal/vertical split buttons, the render-mode picker, and the grid /
+// grid-snap toggles. `include_split` is off for paper-space viewports, which
+// have no model-tile splitting. Grid / snap reflect the active viewport's
+// state and emit `ToggleGrid` / `ToggleGridSnap`.
 // ── ViewCube navigation controls (home / roll / nudge / UCS) ───────────────
 
 /// Place `el` at pixel offset (x, y) inside a fill layer (top-left origin).
@@ -48,7 +48,9 @@ fn vc_btn<'a>(content: Element<'a, Message>, size: f32, msg: Message) -> Element
 
 /// Overlay of home / roll / nudge controls sized to the whole nav region, so
 /// the caller can position it exactly like the cube hit area.
-pub(super) fn viewcube_nav_controls<'a>(viewport: Option<codec::Handle>) -> Element<'a, Message> {
+pub(super) fn viewcube_nav_controls<'a>(
+    viewport: Option<document::Handle>,
+) -> Element<'a, Message> {
     use crate::scene::NudgeDir;
     use crate::ui::icons;
     let r = VIEWCUBE_REGION_PX;
@@ -184,7 +186,7 @@ pub(super) fn viewcube_ucs_picker<'a>(
                     ..Default::default()
                 },
                 text_color: palette.background.base.text,
-                placeholder_color: palette.background.base.text.scale_alpha(0.68),
+                placeholder_color: crate::ui::style::readable::hint_text(theme),
                 handle_color: palette.background.base.text,
             }
         })

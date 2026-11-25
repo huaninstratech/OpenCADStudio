@@ -2,7 +2,7 @@
 use super::*;
 
 impl Scene {
-    pub(super) fn paper_viewport_handles(&self) -> (Handle, Handle, Arc<Vec<Handle>>) {
+    pub(crate) fn paper_viewport_handles(&self) -> (Handle, Handle, Arc<Vec<Handle>>) {
         {
             let cache = self.paper_viewport_cache.borrow();
             if let Some(cache) = cache.get(&self.current_layout) {
@@ -26,28 +26,36 @@ impl Scene {
                     !Self::is_sheet_viewport(&self.document, vp)
                 }
         };
-        let content = if let Some(block) = self
+        // The block record's owned list keeps the drawing's stored order on a
+        // healthy layout, but it is a hint, never the sole source: an import
+        // whose assigned handles no longer match the stored list (or one holding
+        // handles the entity table cannot resolve) must not silently drop the
+        // layout's whole content. Union the resolving list entries with the same
+        // ownership scan the empty-list path already used.
+        let record = self
             .document
             .block_records
             .iter()
-            .find(|block| block.handle == layout_block)
-            .filter(|block| !block.entity_handles.is_empty())
-        {
-            block
-                .entity_handles
-                .iter()
-                .copied()
-                .filter(|handle| is_content(*handle))
-                .collect()
-        } else {
-            self.document
-                .entities()
-                .filter_map(|entity| {
-                    let handle = entity.common().handle;
-                    is_content(handle).then_some(handle)
-                })
-                .collect()
-        };
+            .find(|block| block.handle == layout_block);
+        let record_list = record
+            .map(|block| block.entity_handles.as_slice())
+            .unwrap_or(&[]);
+        let record_unresolved = record_list
+            .iter()
+            .any(|handle| self.document.get_entity(*handle).is_none());
+        let mut content: Vec<Handle> = record_list
+            .iter()
+            .copied()
+            .filter(|handle| is_content(*handle))
+            .collect();
+        if record.is_none() || record_unresolved || content.is_empty() {
+            for entity in self.document.entities() {
+                let handle = entity.common().handle;
+                if is_content(handle) && !content.contains(&handle) {
+                    content.push(handle);
+                }
+            }
+        }
         let content = Arc::new(content);
         self.paper_viewport_cache.borrow_mut().insert(
             self.current_layout.clone(),
@@ -93,7 +101,7 @@ impl Scene {
         if !self.any_viewport_grid_on() {
             return Vec::new();
         }
-        self.active_viewports(vw, vh, codec::entities::ViewportRenderMode::Wireframe2D)
+        self.active_viewports(vw, vh, document::entities::ViewportRenderMode::Wireframe2D)
             .into_iter()
             .filter(|inst| inst.grid_on)
             .map(|inst| (inst.screen_rect, inst.camera, inst.handle))
@@ -113,7 +121,7 @@ impl Scene {
         &self,
         canvas_w: f32,
         canvas_h: f32,
-        model_mode: codec::entities::ViewportRenderMode,
+        model_mode: document::entities::ViewportRenderMode,
     ) -> Vec<ViewportInstance> {
         if self.current_layout == "Model" {
             let tiles = self.model_tiles.borrow();
@@ -183,7 +191,7 @@ impl Scene {
                 height: canvas_h,
             },
             camera: sheet_cam,
-            render_mode: codec::entities::ViewportRenderMode::Wireframe2D,
+            render_mode: document::entities::ViewportRenderMode::Wireframe2D,
             active: false,
             grid_on: sheet_grid_on,
             paper_sheet: true,
@@ -192,7 +200,13 @@ impl Scene {
             let Some(EntityType::Viewport(vp)) = self.document.get_entity(handle) else {
                 continue;
             };
-            if !vp.is_on() || self.entity_temporarily_hidden(handle) {
+            // A grip drag hides only the frame (the overlay redraws it); the
+            // document viewport already follows the drag, so keep its model
+            // contents live instead of blanking them until release (#3100).
+            if !vp.is_on()
+                || (self.entity_temporarily_hidden(handle)
+                    && !self.preview_hidden.contains(&handle))
+            {
                 continue;
             }
             let h = vp.common.handle;
@@ -267,7 +281,7 @@ impl Scene {
                     && self.category_cache_valid(
                         cache.epoch,
                         super::CACHE_CATEGORY_IMAGE,
-                        |handle| self.images.contains_key(&handle),
+                        |handle| self.is_image_entity(handle),
                     )
                 {
                     Some((
@@ -423,14 +437,11 @@ impl Scene {
         // never changes within a build.
         let layer_walk = self.render_space_layer_walk(layout_block, None);
         let layer_hidden = |layer: &str| {
-            self.document
-                .layers
-                .get(layer)
-                .is_some_and(|l| {
-                    l.flags.off
-                        || l.flags.frozen
-                        || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
-                })
+            self.document.layers.get(layer).is_some_and(|l| {
+                l.flags.off
+                    || l.flags.frozen
+                    || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
+            })
         };
         let mut models: Vec<HatchModel> = Vec::new();
         let annotation_scale_handle = self.paper_annotation_scale_handle();
@@ -554,14 +565,11 @@ impl Scene {
         // foreign blocks / plot passes resolve to `None` and stay complete.
         let layer_walk = self.render_space_layer_walk(block, None);
         let layer_hidden = |layer: &str| {
-            self.document
-                .layers
-                .get(layer)
-                .is_some_and(|l| {
-                    l.flags.off
-                        || l.flags.frozen
-                        || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
-                })
+            self.document.layers.get(layer).is_some_and(|l| {
+                l.flags.off
+                    || l.flags.frozen
+                    || layer_walk.is_some_and(|walk| !walk.contains(&l.handle))
+            })
         };
         let layer_plottable = |layer: &str| {
             self.document
@@ -616,6 +624,7 @@ impl Scene {
                 }
                 _ => model.clone(),
             };
+            hatch.entity = Some(handle);
             // Resolve against the sheet, like the block-child fills below, not
             // the screen: in Model the screen is dark, so colour 7 / ByBlock
             // fills stayed white and vanished on the white page.
@@ -638,6 +647,7 @@ impl Scene {
                 if let Some(mut backdrop) = self.hatch_backdrop(dxf, &hatch, fill_style, None) {
                     backdrop.color = view::render::adapt_to_bg(backdrop.color, self.paper_bg_color);
                     backdrop.name = hatch.name.clone();
+                    backdrop.entity = Some(handle);
                     models.push(backdrop);
                 }
                 if let model::hatch_model::HatchPattern::Pattern(_) = &hatch.pattern {
@@ -715,7 +725,152 @@ impl Scene {
     /// Build a Camera oriented and scaled to match a paper-space Viewport entity.
     /// Used by `active_viewports` to render model-space content through each
     /// content viewport's own view direction and scale.
-    pub(super) fn camera_for_viewport(&self, vp_handle: Handle) -> Option<view::camera::Camera> {
+    pub(crate) fn camera_for_viewport(&self, vp_handle: Handle) -> Option<view::camera::Camera> {
+        let mut camera = self.viewport_view_camera(vp_handle)?;
+        // The view decides where the camera looks; its depth range must still
+        // hold the whole model. Sized from the view height alone (64 times
+        // it, around the target), a viewport whose target sits far above or
+        // below the geometry lost it: a top view with its target 808 above
+        // the drawing and a view height under 12.6 showed nothing, although
+        // a view straight down sees the drawing wherever the target is.
+        if let Some((min, max)) = self.model_space_extents() {
+            camera.fit_depth_to_bounds_f64(min.as_dvec3(), max.as_dvec3());
+        }
+        // DVIEW Clip: the planes sit at their distance from the target,
+        // positive toward the eye. A front plane "at eye" clips at the eye.
+        if let Some(EntityType::Viewport(vp)) = self.document.get_entity(vp_handle) {
+            let distance = camera.distance;
+            let front = vp.status.front_clipping.then(|| {
+                if vp.status.front_clip_not_at_eye {
+                    distance - vp.front_clip_z as f32
+                } else {
+                    0.0
+                }
+            });
+            let back = vp
+                .status
+                .back_clipping
+                .then(|| distance - vp.back_clip_z as f32);
+            camera.clip_depth = (front, back);
+        }
+        Some(camera)
+    }
+
+    /// How the model is seen through the viewports of the sheet in view: the
+    /// scale of the one that shows it largest (model units per pixel) and
+    /// the plan rectangle of the model that those in sight show, each for
+    /// the part of it that is in sight. No rectangle when one of them does
+    /// not look straight down; `None` when none is in sight.
+    ///
+    /// A raster has one part drawn again at the scale of the view, of
+    /// `REGION_SIDE` pixels at most. When what the viewports show together
+    /// is longer than that at the scale of the one that shows the model
+    /// largest, say a whole plan beside a detail of it, the rectangle is that
+    /// one's alone: the detail is drawn at its scale, and the plan is left
+    /// to the whole raster.
+    pub(super) fn sheet_model_view(&self) -> Option<(f32, Option<[f64; 4]>)> {
+        let sheet_per_pixel = f64::from(self.layout_world_per_pixel()?);
+        let in_sight = self.layout_plan_view_rect();
+        let mut finest: Option<f64> = None;
+        let mut finest_shows: Option<[f64; 4]> = None;
+        let mut shown: Option<[f64; 4]> = None;
+        let mut all_plan = true;
+        for &handle in self.layout_content_viewports().iter() {
+            let Some(EntityType::Viewport(vp)) = self.document.get_entity(handle) else {
+                continue;
+            };
+            if !vp.is_on() || vp.width <= 0.0 || vp.height <= 0.0 {
+                continue;
+            }
+            // The viewport on the sheet, and the part of it in sight.
+            let frame = [
+                vp.center.x - vp.width * 0.5,
+                vp.center.y - vp.height * 0.5,
+                vp.center.x + vp.width * 0.5,
+                vp.center.y + vp.height * 0.5,
+            ];
+            let part = match in_sight {
+                Some(view) => [
+                    frame[0].max(view[0]),
+                    frame[1].max(view[1]),
+                    frame[2].min(view[2]),
+                    frame[3].min(view[3]),
+                ],
+                None => frame,
+            };
+            if part[0] >= part[2] || part[1] >= part[3] {
+                continue;
+            }
+            let Some(camera) = self.viewport_view_camera(handle) else {
+                continue;
+            };
+            if !matches!(camera.projection, view::camera::Projection::Orthographic) {
+                continue;
+            }
+            let model_per_sheet = 2.0 * f64::from(camera.ortho_size()) / vp.height;
+            if !(model_per_sheet.is_finite() && model_per_sheet > 0.0) {
+                continue;
+            }
+            let per_pixel = sheet_per_pixel * model_per_sheet;
+            let leads = finest.is_none_or(|finest| per_pixel < finest);
+            if leads {
+                finest = Some(per_pixel);
+                finest_shows = None;
+            }
+            let Some(model) = Self::plan_rect_of(&camera, vp.width / vp.height) else {
+                all_plan = false;
+                continue;
+            };
+            // A view that is not turned shows the model in step with the
+            // sheet, so the part in sight is the same part of its rectangle;
+            // a turned one is taken whole.
+            let straight = (camera.rotation * glam::Vec3::X).x > 0.9999;
+            let model = if straight {
+                let along = |at: f64, from: f64, to: f64, low: f64, high: f64| {
+                    low + (at - from) / (to - from) * (high - low)
+                };
+                [
+                    along(part[0], frame[0], frame[2], model[0], model[2]),
+                    along(part[1], frame[1], frame[3], model[1], model[3]),
+                    along(part[2], frame[0], frame[2], model[0], model[2]),
+                    along(part[3], frame[1], frame[3], model[1], model[3]),
+                ]
+            } else {
+                model
+            };
+            if leads {
+                finest_shows = Some(model);
+            }
+            shown = Some(match shown {
+                Some(have) => [
+                    have[0].min(model[0]),
+                    have[1].min(model[1]),
+                    have[2].max(model[2]),
+                    have[3].max(model[3]),
+                ],
+                None => model,
+            });
+        }
+        let finest = finest?;
+        if !(finest.is_finite() && finest > 0.0) {
+            return None;
+        }
+        let together = shown.filter(|_| all_plan);
+        let too_long = together.is_some_and(|all| {
+            (all[2] - all[0]).max(all[3] - all[1]) / finest
+                > crate::scene::model::pdf_raster::REGION_SIDE
+        });
+        let rect = if too_long {
+            finest_shows.or(together)
+        } else {
+            together
+        };
+        Some((finest as f32, rect))
+    }
+
+    /// The camera a floating viewport's view (or its auto-fit) aims, before
+    /// its depth range is sized to the model.
+    fn viewport_view_camera(&self, vp_handle: Handle) -> Option<view::camera::Camera> {
         let vp = match self.document.get_entity(vp_handle) {
             Some(EntityType::Viewport(vp)) => vp,
             _ => return None,
@@ -790,7 +945,7 @@ impl Scene {
         if let Some(cam) = self.camera_from_view_mode(
             vp.view_direction,
             vp.view_target,
-            codec::types::Vector2 {
+            document::types::Vector2 {
                 x: vp.view_center.x,
                 y: vp.view_center.y,
             },
@@ -804,7 +959,7 @@ impl Scene {
             }
             let half_h = saved_h * 0.5;
             let half_w = half_h * aspect_d;
-            let (tx, ty) = (cam.target.x as f64, cam.target.y as f64);
+            let (tx, ty) = (cam.target.x, cam.target.y);
             // Prefer the true model bounds; fall back to the median cluster box.
             let (bx0, by0, bx1, by1) = full_bounds.unwrap_or((
                 cx - cluster_half,
@@ -823,7 +978,7 @@ impl Scene {
 
         // Auto-fit: aim at the content cluster centre, drop the stale view_center.
         let fit_h = cluster_half * 2.0 * 1.05;
-        let tgt = codec::types::Vector3 {
+        let tgt = document::types::Vector3 {
             x: cx,
             y: cy,
             z: vp.view_target.z,
@@ -831,7 +986,7 @@ impl Scene {
         self.camera_from_view_mode(
             vp.view_direction,
             tgt,
-            codec::types::Vector2::ZERO,
+            document::types::Vector2::ZERO,
             fit_h,
             vp.twist_angle,
             vp.status.perspective,
@@ -855,17 +1010,131 @@ impl Scene {
         // annotation geometry to view_height rebuilt the entire model on every
         // wheel tick whenever the drawing contained one annotative object.
         // Explicit viewport annotation-scale changes still rebuild the resident
-        // set; PSLTSCALE is a viewport GPU uniform.
+        // set; PSLTSCALE is a viewport GPU uniform, except for complex linetypes,
+        // which rebuild once when the zoom settles.
         let frozen: HSet<Handle> = self.viewport_hidden_handles(vp_handle);
 
         let scale_handle = self.viewport_scale_handle(vp_handle);
-        self.resident_wires_for(
+        self.viewport_complex_lt
+            .set(self.viewport_complex_lt_factor(vp_handle, false));
+        let wires = self.resident_wires_for(
             self.model_space_block_handle(),
             Some(self.viewport_annotation_multiplier(vp_handle)),
             scale_handle,
             Some(&frozen),
             Some(vp_handle),
-        )
+        );
+        self.viewport_complex_lt.set(None);
+        self.without_viewport_frozen_members(wires, &frozen)
+    }
+
+    /// `wires` without the block lines on a layer the viewport freezes.
+    ///
+    /// The resident set leaves out the objects on those layers, but a block
+    /// reference is drawn from definitions shared by every viewport, so the
+    /// lines its members draw on a frozen layer came along. Each such line
+    /// knows the layer it shows on (`effective_layer`); a copy of a block
+    /// drawn as a stub is expanded only when its definition holds one.
+    fn without_viewport_frozen_members(
+        &self,
+        wires: Arc<Vec<WireModel>>,
+        frozen: &rustc_hash::FxHashSet<Handle>,
+    ) -> Arc<Vec<WireModel>> {
+        if frozen.is_empty() {
+            return wires;
+        }
+        // One result for each resident set, named by its address beside the
+        // frozen layers. By the frozen layers alone, two viewports freezing the
+        // same ones at different scales, each with a resident set of its own,
+        // replaced each other's result on every frame: both were made again
+        // each time, and the first had lost its wires before it was drawn.
+        let key = (
+            Arc::as_ptr(&wires) as usize,
+            Self::frozen_layers_sig(frozen),
+        );
+        if let Some((source, kept)) = self.viewport_frozen_member_cache.borrow().get(&key) {
+            if source
+                .upgrade()
+                .is_some_and(|source| Arc::ptr_eq(&source, &wires))
+            {
+                return kept.clone().unwrap_or(wires);
+            }
+        }
+        let layer_frozen = |layer: &str| {
+            !crate::scene::view::render::is_effective_layer_zero(layer)
+                && self
+                    .document
+                    .layers
+                    .get(layer)
+                    .is_some_and(|record| frozen.contains(&record.handle))
+        };
+        // `None`: no block line to leave out, the set is drawn as it is. The
+        // set itself is not kept here: an edit patches it in place only while
+        // the scene alone holds it (#358).
+        let kept =
+            crate::scene::model::instance_model::without_layers(&wires, layer_frozen).map(Arc::new);
+        let mut cache = self.viewport_frozen_member_cache.borrow_mut();
+        // A set that was replaced takes its result along.
+        cache.retain(|_, (source, _)| source.strong_count() > 0);
+        cache.insert(key, (Arc::downgrade(&wires), kept.clone()));
+        kept.unwrap_or(wires)
+    }
+
+    /// PSLTSCALE's factor on linetypes in a viewport: 1 / viewport scale, which
+    /// keeps a pattern at its length on the sheet. `None` when it doesn't apply.
+    pub(super) fn viewport_psltscale_factor(&self, vp_handle: Handle) -> Option<f32> {
+        if !self.document.header.paper_space_linetype_scaling {
+            return None;
+        }
+        let Some(EntityType::Viewport(vp)) = self.document.get_entity(vp_handle) else {
+            return None;
+        };
+        let scale = vp_effective_scale(vp.custom_scale, vp.view_height, vp.height);
+        (scale.is_finite() && scale > 1e-9).then(|| (1.0 / scale) as f32)
+    }
+
+    /// The factor a viewport's complex linetypes are baked at. Their dashes and
+    /// glyphs are geometry, so a new factor means a new resident set: it follows
+    /// the viewport's scale only once the view has stopped moving, unless
+    /// `settle` asks for the current one. A drawing with no complex linetype gets
+    /// `None`, which leaves its resident set alone.
+    pub(super) fn viewport_complex_lt_factor(
+        &self,
+        vp_handle: Handle,
+        settle: bool,
+    ) -> Option<f32> {
+        if !crate::io::linetypes::defines_complex_lt(&self.document) {
+            return None;
+        }
+        let current = self.viewport_psltscale_factor(vp_handle)?;
+        let mut baked = self.viewport_complex_lt_baked.borrow_mut();
+        match baked.get(&vp_handle) {
+            Some(&factor) if factor == current || (!settle && self.navigating_lod()) => {
+                Some(factor)
+            }
+            _ => {
+                baked.insert(vp_handle, current);
+                // Hit-testing reads the projected copy of the old set.
+                self.paper_projected_cache.borrow_mut().remove(&vp_handle);
+                Some(current)
+            }
+        }
+    }
+
+    /// The factor on complex linetypes for a tessellation pass: the viewport's
+    /// PSLTSCALE factor, else 1 for any other viewport content.
+    pub(super) fn viewport_lt_for(&self, anno_scale_override: Option<f32>) -> Option<f32> {
+        self.viewport_complex_lt
+            .get()
+            .or(anno_scale_override.map(|_| 1.0))
+    }
+
+    /// Part of the resident memo's guard: what the memo holds is baked at this
+    /// factor.
+    pub(super) fn viewport_complex_lt_guard(&self) -> u64 {
+        self.viewport_complex_lt
+            .get()
+            .map_or(0, |factor| (factor.to_bits() as u64 + 1).rotate_left(31))
     }
 
     /// Resident model wires for a paper content viewport. Just the unified

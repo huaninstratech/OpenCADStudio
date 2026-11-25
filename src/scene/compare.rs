@@ -5,7 +5,7 @@
 //! the other — unless both drawings still give it the same handle (a
 //! revision of one file), when it shows as modified with both states.
 
-use codec::{Document, Handle};
+use document::{Document, Handle};
 use glam::DVec3;
 use rustc_hash::FxHashMap;
 
@@ -112,7 +112,7 @@ fn wires_by_entity(scene: &Scene) -> FxHashMap<Handle, Vec<WireModel>> {
 
 fn point(wire: &WireModel, index: usize) -> DVec3 {
     let high = wire.points[index];
-    let low = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
+    let low = wire.points_low.get(index).unwrap_or([0.0; 3]);
     DVec3::new(
         f64::from(high[0]) + f64::from(low[0]),
         f64::from(high[1]) + f64::from(low[1]),
@@ -169,7 +169,12 @@ fn extent(wires: &[WireModel]) -> Option<(DVec3, DVec3)> {
 }
 
 fn rgba([r, g, b]: [u8; 3], alpha: f32) -> [f32; 4] {
-    [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, alpha]
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        alpha,
+    ]
 }
 
 /// Compare `current` with the drawing `other`, in the space `current`
@@ -235,7 +240,13 @@ pub fn compare(current: &Scene, other: Document, settings: CompareSettings) -> C
             }
         };
         if let Some(bounds) = bounds {
-            differences.push(Difference { change, object, layer, handle, bounds });
+            differences.push(Difference {
+                change,
+                object,
+                layer,
+                handle,
+                bounds,
+            });
         }
     }
     for handle in only_there {
@@ -258,15 +269,8 @@ pub fn compare(current: &Scene, other: Document, settings: CompareSettings) -> C
         b.bounds
             .1
             .y
-            .partial_cmp(&a.bounds.1.y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.bounds
-                    .0
-                    .x
-                    .partial_cmp(&b.bounds.0.x)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&a.bounds.1.y)
+            .then(a.bounds.0.x.total_cmp(&b.bounds.0.x))
     });
     let count = |change| differences.iter().filter(|d| d.change == change).count();
     Comparison {

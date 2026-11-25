@@ -1,4 +1,4 @@
-use codec::{entities::Circle, types::Vector3, EntityType};
+use document::{entities::Circle, types::Vector3, EntityType};
 use glam::DVec3;
 use OpenCADStudio::command::WorkingPlane;
 use OpenCADStudio::scene::{model::presspull_model, Scene};
@@ -31,9 +31,9 @@ fn area_picks_follow_exact_curves_and_keep_holes() {
         assert!(loops
             .iter()
             .flatten()
-            .all(|curve| !matches!(curve, kernel::geom2d::Curve::Line(_))));
+            .all(|curve| !matches!(curve, ocs_geom::geom2d::Curve::Line(_))));
         let body = presspull_model::extrusion_body(&entity, [0.0, 0.0, 10.0]).unwrap();
-        assert!(body.validate().is_empty());
+        assert!(ocs_solid::model::check(&body).is_empty());
     }
     let outside = DVec3::new(1001.0 * angle.cos(), 1001.0 * angle.sin(), 0.0);
     assert!(

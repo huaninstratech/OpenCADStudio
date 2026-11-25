@@ -1,8 +1,8 @@
-use codec::entities::{Insert, Line};
-use codec::objects::{Dictionary, DictionaryWithDefault, ObjectType, SpatialFilter};
-use codec::tables::BlockRecord;
-use codec::types::{Matrix4, Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{Insert, Line};
+use document::objects::{Dictionary, DictionaryWithDefault, ObjectType, SpatialFilter};
+use document::tables::BlockRecord;
+use document::types::{Matrix4, Vector2, Vector3};
+use document::EntityType;
 use OpenCADStudio::scene::pick::xclip::{insert_spatial_filter, world_clip_polygon_for_transform};
 use OpenCADStudio::scene::Scene;
 
@@ -89,7 +89,7 @@ fn xclip_in_paper_and_viewport() {
 }
 
 #[test]
-fn test_xclip_extension_dictionary_resolution() {
+fn xclip_extension_dictionary_resolution() {
     let mut scene = Scene::new();
     let block_name = "TEST_EXT_DICT";
     let br_h = scene.document.allocate_handle();
@@ -145,7 +145,7 @@ fn test_xclip_extension_dictionary_resolution() {
 }
 
 #[test]
-fn test_xclip_inverse_block_transform_used_as_stored() {
+fn xclip_inverse_block_transform_used_as_stored() {
     // The codec decodes the on-disk column-major 4x3 layout into row-major
     // `Matrix4`, so the stored transform is used as-is: insert at (200, 150),
     // inverse is translation (-200, -150, 0).
@@ -176,7 +176,7 @@ fn test_xclip_inverse_block_transform_used_as_stored() {
 }
 
 #[test]
-fn test_xclip_multiple_inserts_same_block_different_clips() {
+fn xclip_multiple_inserts_same_block_different_clips() {
     let mut scene = Scene::new();
     let block_name = "FLOOR_PLAN_MAIN";
     let br_h = scene.document.allocate_handle();

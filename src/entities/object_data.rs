@@ -5,11 +5,11 @@
 //! OCS is the selected entity's semantic/property view, while the evaluated
 //! entity geometry continues through the normal render pipeline.
 
-use codec::objects::{
+use document::objects::{
     AssociativeData, BlockEvalValue, DynamicBlockData, ObjectType, SolidHistoryNodeBase,
     SolidHistoryOperation,
 };
-use codec::{Document, EntityType, Handle};
+use document::{Document, EntityType, Handle};
 
 use crate::scene::model::object::{PropSection, PropValue, Property};
 
@@ -39,16 +39,16 @@ pub fn build_cache(document: &Document) -> ObjectDataCache {
             ObjectType::Associative(_) => associative_objects.push(*handle),
             ObjectType::GeoData(_) => geo_objects.push(*handle),
             ObjectType::ClassObject(value) => match &value.data {
-                codec::objects::ClassObjectData::LightList(list) => {
+                document::objects::ClassObjectData::LightList(list) => {
                     ordered_lights.extend(list.lights.iter().map(|entry| entry.handle));
                 }
-                codec::objects::ClassObjectData::Sun(_) => sun_objects.push(*handle),
-                codec::objects::ClassObjectData::RenderEnvironment(_) => {
+                document::objects::ClassObjectData::Sun(_) => sun_objects.push(*handle),
+                document::objects::ClassObjectData::RenderEnvironment(_) => {
                     render_environments.push(*handle);
                 }
-                codec::objects::ClassObjectData::RenderSettings(_)
-                | codec::objects::ClassObjectData::MentalRayRenderSettings(_)
-                | codec::objects::ClassObjectData::RapidRtRenderSettings(_) => {
+                document::objects::ClassObjectData::RenderSettings(_)
+                | document::objects::ClassObjectData::MentalRayRenderSettings(_)
+                | document::objects::ClassObjectData::RapidRtRenderSettings(_) => {
                     render_settings.push(*handle);
                 }
                 _ => {}
@@ -97,6 +97,67 @@ pub fn sun_objects(cache: &ObjectDataCache) -> &[Handle] {
 
 pub fn geo_objects(cache: &ObjectDataCache) -> &[Handle] {
     &cache.geo_objects
+}
+
+/// A GEODATA's coordinate system for the status bar: its name, and the
+/// details its tooltip lists (#2686).
+pub fn geo_system_label(geo: &document::objects::GeoData) -> (String, String) {
+    let name = coordinate_system_name(&geo.coordinate_system_definition)
+        .or_else(|| coordinate_system_name(&geo.coordinate_system_wkt))
+        .unwrap_or_else(|| crate::t!("Unnamed").into_owned());
+    let kind = match geo.coordinate_type {
+        1 => crate::t!("Local grid"),
+        2 => crate::t!("Projected grid"),
+        3 => crate::t!("Geographic"),
+        _ => crate::t!("Unknown"),
+    };
+    let r = geo.reference_point;
+    let d = geo.design_point;
+    let details = format!(
+        "{}\n{}: {name}\n{}: {kind}\n{}: {:.6}, {:.6}\n{}: {:.4}, {:.4}",
+        crate::t!("GIS Coordinates"),
+        crate::t!("Coordinate system"),
+        crate::t!("Type"),
+        crate::t!("Reference point"),
+        r.x,
+        r.y,
+        crate::t!("Design point"),
+        d.x,
+        d.y,
+    );
+    (name, details)
+}
+
+/// The name a coordinate system definition gives itself: the `id` of a
+/// MapGuide XML `...CoordinateSystem` element, else the first quoted name of
+/// a WKT (`PROJCS["name"`, `GEOGCS["name"`).
+fn coordinate_system_name(definition: &str) -> Option<String> {
+    let text = definition.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let quoted = |rest: &str, quote: char| {
+        let rest = rest.strip_prefix(quote)?;
+        let end = rest.find(quote)?;
+        Some(rest[..end].trim().to_string()).filter(|s| !s.is_empty())
+    };
+    if text.starts_with('<') {
+        let mut at = 0;
+        while let Some(found) = text[at..].find("CoordinateSystem") {
+            let start = at + found;
+            let tag_end = text[start..].find('>').map_or(text.len(), |e| start + e);
+            if let Some(id) = text[start..tag_end].find("id=") {
+                let rest = &text[start + id + 3..tag_end];
+                if let Some(name) = quoted(rest, '"').or_else(|| quoted(rest, '\'')) {
+                    return Some(name);
+                }
+            }
+            at = start + "CoordinateSystem".len();
+        }
+        return None;
+    }
+    let open = text.find('[')?;
+    quoted(&text[open + 1..], '"')
 }
 
 pub fn render_environments(cache: &ObjectDataCache) -> &[Handle] {
@@ -215,21 +276,21 @@ fn history_base_text(base: &SolidHistoryNodeBase) -> String {
     )
 }
 
-fn embedded_name(value: Option<&codec::entities::EmbeddedEntity>) -> &'static str {
+fn embedded_name(value: Option<&document::entities::EmbeddedEntity>) -> &'static str {
     match value {
-        Some(codec::entities::EmbeddedEntity::Point(_)) => "Point",
-        Some(codec::entities::EmbeddedEntity::Line(_)) => "Line",
-        Some(codec::entities::EmbeddedEntity::Arc(_)) => "Arc",
-        Some(codec::entities::EmbeddedEntity::Circle(_)) => "Circle",
-        Some(codec::entities::EmbeddedEntity::Ellipse(_)) => "Ellipse",
-        Some(codec::entities::EmbeddedEntity::Spline(_)) => "Spline",
-        Some(codec::entities::EmbeddedEntity::LwPolyline(_)) => "Polyline",
+        Some(document::entities::EmbeddedEntity::Point(_)) => "Point",
+        Some(document::entities::EmbeddedEntity::Line(_)) => "Line",
+        Some(document::entities::EmbeddedEntity::Arc(_)) => "Arc",
+        Some(document::entities::EmbeddedEntity::Circle(_)) => "Circle",
+        Some(document::entities::EmbeddedEntity::Ellipse(_)) => "Ellipse",
+        Some(document::entities::EmbeddedEntity::Spline(_)) => "Spline",
+        Some(document::entities::EmbeddedEntity::LwPolyline(_)) => "Polyline",
         // A 2D / 3D polyline profile the modeler keeps as a wire body.
-        Some(codec::entities::EmbeddedEntity::Body { .. }) => "Polyline",
-        Some(codec::entities::EmbeddedEntity::Region(_)) => "Region",
-        Some(codec::entities::EmbeddedEntity::Ray(_)) => "Ray",
-        Some(codec::entities::EmbeddedEntity::XLine(_)) => "XLine",
-        Some(codec::entities::EmbeddedEntity::Unknown { .. }) => "Unknown",
+        Some(document::entities::EmbeddedEntity::Body { .. }) => "Polyline",
+        Some(document::entities::EmbeddedEntity::Region(_)) => "Region",
+        Some(document::entities::EmbeddedEntity::Ray(_)) => "Ray",
+        Some(document::entities::EmbeddedEntity::XLine(_)) => "XLine",
+        Some(document::entities::EmbeddedEntity::Unknown { .. }) => "Unknown",
         None => "None",
     }
 }
@@ -949,8 +1010,8 @@ where
     result
 }
 
-fn class_object_section(data: &codec::objects::ClassObjectData) -> Option<PropSection> {
-    use codec::objects::ClassObjectData;
+fn class_object_section(data: &document::objects::ClassObjectData) -> Option<PropSection> {
+    use document::objects::ClassObjectData;
 
     let section = match data {
         ClassObjectData::Empty => return None,
@@ -2005,8 +2066,8 @@ fn class_object_section(data: &codec::objects::ClassObjectData) -> Option<PropSe
     Some(section)
 }
 
-fn semantic_property_text(value: &codec::objects::SemanticPropertyValue) -> String {
-    use codec::objects::SemanticPropertyValue;
+fn semantic_property_text(value: &document::objects::SemanticPropertyValue) -> String {
+    use document::objects::SemanticPropertyValue;
     match value {
         SemanticPropertyValue::Text(value) => preview_text(value, 512),
         SemanticPropertyValue::Bool(value) => value.to_string(),
@@ -2021,7 +2082,7 @@ fn semantic_property_text(value: &codec::objects::SemanticPropertyValue) -> Stri
 }
 
 fn auxiliary_object_property(object: &ObjectType) -> Option<Property> {
-    use codec::objects::DataObjectData;
+    use document::objects::DataObjectData;
 
     let (label, value) = match object {
         ObjectType::TableContent(table) => (
@@ -2191,7 +2252,7 @@ fn auxiliary_object_property(object: &ObjectType) -> Option<Property> {
 
 /// Drawing-level standard object data prepared on the file-open worker.
 fn build_document_sections(document: &Document) -> Vec<PropSection> {
-    use codec::objects::ClassObjectData;
+    use document::objects::ClassObjectData;
 
     let mut sections = vec![PropSection {
         title: "Drawing".to_string(),

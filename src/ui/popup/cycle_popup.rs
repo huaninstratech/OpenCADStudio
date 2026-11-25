@@ -11,7 +11,7 @@ use crate::app::Message;
 
 /// Row content for one overlapping candidate.
 pub struct CycleCandidate {
-    pub handle: codec::Handle,
+    pub handle: document::Handle,
     pub type_name: String,
     pub layer: String,
     /// The color the object is drawn with (layer-inherited when ByLayer).
@@ -62,7 +62,7 @@ fn clamp_col_width(labels: impl Iterator<Item = usize>, glyph_w: f32, min: f32, 
 }
 
 fn item_row(
-    handle: codec::Handle,
+    handle: document::Handle,
     type_name: String,
     layer: String,
     color: [f32; 4],
@@ -97,7 +97,7 @@ fn item_row(
                 .size(10)
                 .align_x(Horizontal::Right)
                 .style(|theme: &Theme| iced::widget::text::Style {
-                    color: Some(theme.palette().background.base.text.scale_alpha(0.72)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 })
         )
         .width(Length::Fixed(layer_w))

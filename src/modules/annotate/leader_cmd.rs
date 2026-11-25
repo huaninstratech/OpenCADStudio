@@ -9,10 +9,10 @@
 // The MText is a separate entity referenced by the leader's annotation_handle
 // (DXF group 340); editing/erasing them stays in sync via that link.
 
-use codec::entities::mtext::AttachmentPoint;
-use codec::entities::{Leader, LeaderCreationType, LeaderPathType, MText};
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::mtext::AttachmentPoint;
+use document::entities::{Leader, LeaderCreationType, LeaderPathType, MText};
+use document::types::Vector3;
+use document::EntityType;
 use glam::{DVec3, Mat4, Vec3};
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind, WorkingPlane};
@@ -429,8 +429,6 @@ fn preview_wire(pts: &[Vec3], arrow_size: f32) -> WireModel {
     WireModel {
         bg_adapt: None,
         point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
         world_width: 0.0,
         depth_override: None,
         display_visible: true,
@@ -438,29 +436,29 @@ fn preview_wire(pts: &[Vec3], arrow_size: f32) -> WireModel {
         plot_visible: true,
         fill_is_3d: false,
         fill_is_2d_solid: false,
+        solid_normal: None,
         render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
         dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
         name: "leader_preview".into(),
-        points,
-        points_low: Vec::new(),
         color: WireModel::CYAN,
         selected: false,
         pattern_length: 0.0,
         pattern: [0.0; 8],
         line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
         aci: 0,
-        key_vertices: vec![],
         aabb: WireModel::UNBOUNDED_AABB,
         plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            taper_widths: Vec::new(),
+            pattern_stations: Vec::new(),
+            text_verts: Vec::new(),
+            points,
+            points_low: Default::default(),
+            snap_pts: vec![],
+            tangent_geoms: vec![],
+            key_vertices: vec![],
+            ..crate::scene::WireGeom::default()
+        }),
         ..Default::default()
     }
 }

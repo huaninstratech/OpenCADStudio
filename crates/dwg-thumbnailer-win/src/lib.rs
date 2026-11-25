@@ -1,8 +1,8 @@
 //! Windows Explorer thumbnail handler for DWG files.
 //!
-//! Implements `IThumbnailProvider` (+ `IInitializeWithFile`) as a COM in-proc
-//! server. Explorer instantiates it for `.dwg` files, hands it the path, then
-//! calls `GetThumbnail`, which extracts the DWG's embedded preview via the
+//! Implements `IThumbnailProvider` (+ `IInitializeWithStream`) as a COM in-proc
+//! server. Explorer instantiates it for `.dwg` files in its isolated thumbnail
+//! process, hands it the file as a stream, then calls `GetThumbnail`, which extracts the DWG's embedded preview via the
 //! shared [`dwg_thumbnailer`] core and returns it as an HBITMAP.
 //!
 //! ## Build & register (on Windows, elevated)
@@ -28,16 +28,18 @@ use windows::Win32::Foundation::{
     WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl, IStream};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CLASSES_ROOT,
     KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
-use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithFile_Impl};
+use windows::Win32::UI::Shell::PropertiesSystem::{
+    IInitializeWithStream, IInitializeWithStream_Impl,
+};
 use windows::Win32::UI::Shell::{
     IThumbnailProvider, IThumbnailProvider_Impl, SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
     WTSAT_ARGB, WTS_ALPHATYPE,
@@ -64,17 +66,34 @@ extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) 
 
 // ── The provider COM object ──────────────────────────────────────────────────
 
-#[implement(IThumbnailProvider, IInitializeWithFile)]
+// Explorer loads thumbnail providers in an isolated process, where only a
+// stream initializer is offered; a path initializer is never called there.
+#[implement(IThumbnailProvider, IInitializeWithStream)]
 #[derive(Default)]
 struct DwgThumbProvider {
-    path: RefCell<Option<String>>,
+    bytes: RefCell<Option<Vec<u8>>>,
 }
 
-impl IInitializeWithFile_Impl for DwgThumbProvider_Impl {
-    fn Initialize(&self, pszfilepath: &PCWSTR, _grfmode: u32) -> windows::core::Result<()> {
-        let path = unsafe { pszfilepath.to_string() }
-            .map_err(|_| windows::core::Error::from(E_INVALIDARG))?;
-        *self.path.borrow_mut() = Some(path);
+impl IInitializeWithStream_Impl for DwgThumbProvider_Impl {
+    fn Initialize(&self, pstream: windows::core::Ref<'_, IStream>, _grfmode: u32) -> windows::core::Result<()> {
+        let stream = pstream
+            .as_ref()
+            .ok_or(windows::core::Error::from(E_INVALIDARG))?;
+        let mut bytes = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        loop {
+            let mut read = 0u32;
+            unsafe {
+                stream
+                    .Read(chunk.as_mut_ptr().cast(), chunk.len() as u32, Some(&mut read))
+                    .ok()?;
+            }
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read as usize]);
+        }
+        *self.bytes.borrow_mut() = Some(bytes);
         Ok(())
     }
 }
@@ -86,14 +105,12 @@ impl IThumbnailProvider_Impl for DwgThumbProvider_Impl {
         phbmp: *mut HBITMAP,
         pdwalpha: *mut WTS_ALPHATYPE,
     ) -> windows::core::Result<()> {
-        let path = self
-            .path
-            .borrow()
-            .clone()
+        let bytes = self.bytes.borrow();
+        let bytes = bytes.as_deref().ok_or(windows::core::Error::from(E_FAIL))?;
+        let mut img = dwg_thumbnailer::extract_bytes(bytes, cx.max(1))
             .ok_or(windows::core::Error::from(E_FAIL))?;
-        let mut img = dwg_thumbnailer::extract(std::path::Path::new(&path), cx.max(1))
-            .ok_or(windows::core::Error::from(E_FAIL))?;
-        dwg_thumbnailer::badge_dwg(&mut img); // full-width "DWG" band
+        // Explorer draws the app icon on the bottom-right corner: keep "DWG" clear of it.
+        dwg_thumbnailer::badge_dwg_clear_of(&mut img, dwg_thumbnailer::WINDOWS_TYPE_OVERLAY);
         let hbmp = unsafe { rgba_to_hbitmap(&img)? };
         unsafe {
             *phbmp = hbmp;
@@ -119,7 +136,7 @@ unsafe fn rgba_to_hbitmap(img: &dwg_thumbnailer::RgbaImage) -> windows::core::Re
         ..Default::default()
     };
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(HDC::default(), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+    let hbmp = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
     if bits.is_null() {
         return Err(E_FAIL.into());
     }
@@ -142,18 +159,18 @@ struct Factory;
 impl IClassFactory_Impl for Factory_Impl {
     fn CreateInstance(
         &self,
-        punkouter: Option<&IUnknown>,
+        punkouter: windows::core::Ref<'_, IUnknown>,
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> windows::core::Result<()> {
-        if punkouter.is_some() {
+        if !punkouter.is_null() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
         let provider: IUnknown = DwgThumbProvider::default().into();
         unsafe { provider.query(&*riid, ppvobject).ok() }
     }
 
-    fn LockServer(&self, _flock: windows::Win32::Foundation::BOOL) -> windows::core::Result<()> {
+    fn LockServer(&self, _flock: windows::core::BOOL) -> windows::core::Result<()> {
         Ok(())
     }
 }
@@ -202,7 +219,7 @@ extern "system" fn DllUnregisterServer() -> HRESULT {
 
 fn module_path() -> windows::core::Result<String> {
     let mut buf = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(SELF_HMODULE, &mut buf) };
+    let len = unsafe { GetModuleFileNameW(Some(SELF_HMODULE), &mut buf) };
     if len == 0 {
         return Err(E_FAIL.into());
     }
@@ -240,7 +257,7 @@ fn set_value(sub: &str, name: Option<&str>, value: &str) -> windows::core::Resul
         RegCreateKeyExW(
             HKEY_CLASSES_ROOT,
             PCWSTR(sub_w.as_ptr()),
-            0,
+            None,
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             KEY_WRITE,
@@ -261,7 +278,7 @@ fn set_value(sub: &str, name: Option<&str>, value: &str) -> windows::core::Resul
             name_w
                 .as_ref()
                 .map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
-            0,
+            None,
             REG_SZ,
             Some(bytes),
         )

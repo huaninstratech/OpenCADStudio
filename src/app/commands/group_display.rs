@@ -21,8 +21,11 @@ impl OpenCADStudio {
     /// selection is next made, as in the reference.
     pub(super) fn group_display_setvar(&mut self, value: Option<&str>) {
         let ask = |app: &mut Self| {
-            app.command_line.push_output(&crate::ui::command_line::value_prompt("GROUPDISPLAYMODE", &group_display_mode()
-            ));
+            app.command_line
+                .push_output(&crate::ui::command_line::value_prompt(
+                    "GROUPDISPLAYMODE",
+                    &group_display_mode(),
+                ));
             app.pending_setvar = Some("GROUPDISPLAYMODE".to_string());
         };
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -38,7 +41,7 @@ impl OpenCADStudio {
             }
             _ => {
                 self.command_line
-                    .push_error(crate::t!("Requires an integer between 0 and 2.").as_ref());
+                    .push_rejection(crate::t!("Requires an integer between 0 and 2.").as_ref());
                 ask(self);
             }
         }
@@ -47,9 +50,10 @@ impl OpenCADStudio {
 
 impl OpenCADStudio {
     /// `MATCHMODE [value]`: the properties MATCHPROP transfers, a profile
-    /// value; outside 0–262143 it is refused and asked for again.
+    /// value. Any whole number from 0 is kept as given; anything else is
+    /// refused and asked for again.
     pub(super) fn match_mode_setvar(&mut self, value: Option<&str>) {
-        use crate::entities::match_props::{match_mode, set_match_mode, MatchOpts};
+        use crate::entities::match_props::{match_mode, set_match_mode};
         let ask = |app: &mut Self| {
             let (name, current) = ("MATCHMODE", match_mode());
             app.command_line
@@ -60,17 +64,53 @@ impl OpenCADStudio {
             ask(self);
             return;
         };
-        match value.parse::<u32>() {
-            Ok(mode) if mode <= MatchOpts::ALL_BITS => {
+        // A larger whole number keeps its low 32 bits, as the reference does
+        // (4294967296 → 0, 99999999999 → 1215752191).
+        let wrapped = value
+            .parse::<u128>()
+            .ok()
+            .map(|v| (v % (1u128 << 32)) as u32);
+        match wrapped.ok_or(()) {
+            Ok(mode) => {
                 if mode != match_mode() {
                     set_match_mode(mode);
                     self.save_config();
                 }
             }
-            _ => {
-                let (min, max) = (0, MatchOpts::ALL_BITS);
+            Err(_) => {
                 self.command_line
-                    .push_error(crate::tf!("Requires an integer between {min} and {max}.").as_ref());
+                    .push_rejection(crate::t!("Requires an integer value.").as_ref());
+                ask(self);
+            }
+        }
+    }
+
+    /// `MEASUREMODE [value]`, a profile setting: 1 starts MEASUREGEOM in
+    /// quick measure (its Mode answer). Anything but 0 or 1 is refused and
+    /// asked for again.
+    pub(super) fn measure_mode_setvar(&mut self, value: Option<&str>) {
+        use crate::modules::draw::inquiry::measuregeom::{quick_default, set_quick_default};
+        let ask = |app: &mut Self| {
+            let (name, current) = ("MEASUREMODE", u8::from(quick_default()));
+            app.command_line
+                .push_output(&crate::tf!("Enter new value for {name} <{current}>:"));
+            app.pending_setvar = Some("MEASUREMODE".to_string());
+        };
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            ask(self);
+            return;
+        };
+        match value {
+            "0" | "1" => {
+                let quick = value == "1";
+                if quick != quick_default() {
+                    set_quick_default(quick);
+                    self.save_config();
+                }
+            }
+            _ => {
+                self.command_line
+                    .push_rejection(crate::t!("Requires 0 or 1 only.").as_ref());
                 ask(self);
             }
         }
@@ -100,7 +140,7 @@ impl OpenCADStudio {
             }
             _ => {
                 self.command_line
-                    .push_error(crate::t!("Requires an integer between 0 and 2.").as_ref());
+                    .push_rejection(crate::t!("Requires an integer between 0 and 2.").as_ref());
                 ask(self);
             }
         }

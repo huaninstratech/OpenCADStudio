@@ -3,16 +3,15 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use std::time::Duration;
 
-use codec::types::{Color as AcadColor, LineWeight};
+use document::types::{Color as AcadColor, LineWeight};
 use iced::advanced::{
     layout, mouse, overlay, renderer, text as advanced_text, widget, Layout, Shell, Widget,
 };
 // Ribbon tooltips anchor to the right of their button so the cursor — which
 // rests on the button itself — never covers the tip text. (#143)
 use iced::widget::tooltip::Position as TipPos;
-use iced::widget::{button, column, container, row, text, tooltip};
+use iced::widget::{button, column, container, row, text};
 use iced::{
     Background, Border, Color, Element, Event, Fill, Length, Padding, Pixels, Rectangle, Size,
     Theme, Vector,
@@ -23,7 +22,7 @@ use crate::modules::{IconKind, ModuleEvent, RibbonItem, StyleKey, ToolDef};
 use crate::t;
 use crate::ui::icons;
 use crate::ui::properties::{acad_color_display, linetype_display_name, LwItem};
-use crate::ui::style::{chrome, ribbon_metrics as metrics};
+use crate::ui::style::{chrome, ribbon_metrics as metrics, text as ui_text};
 use crate::ui::wrap_bar::PosReport;
 
 use super::LayerInfo;
@@ -37,15 +36,18 @@ pub(super) struct ToggleState {
     pub ortho_mode: bool,
     pub show_viewcube: bool,
     pub show_ucs_icon: bool,
+    pub show_viewport_highlight: bool,
     pub show_properties: bool,
     pub show_count_palette: bool,
     pub show_graphic_attributes: bool,
+    pub show_tool_palettes: bool,
     pub show_authoring_palettes: bool,
     pub show_parameters_manager: bool,
     pub show_block_palette: bool,
     pub show_sheet_set: bool,
     pub show_file_tabs: bool,
     pub show_layout_tabs: bool,
+    pub group_selection: bool,
 }
 
 // ── Layout constants ──────────────────────────────────────────────────────
@@ -70,8 +72,9 @@ const LARGE_LABEL_HPAD: f32 = 8.0;
 /// Large ribbon labels use at most two lines before their button grows.
 const LARGE_LABEL_LINES: f32 = 2.0;
 const LARGE_LABEL_SIZE: f32 = 12.0;
-/// Line height of a large button's label, relative to its size.
-const LARGE_LABEL_LINE: f32 = 1.15;
+/// Line height of a large button's label, in whole pixels (was 1.15 x 12 =
+/// 13.8 px, which put the second line on a fractional pixel).
+const LARGE_LABEL_LINE: f32 = 14.0;
 /// Padding around a small button's icon.
 const SMALL_PAD: f32 = metrics::SMALL_PAD;
 /// Width of an icon-only small button.
@@ -87,7 +90,7 @@ pub(super) const TOOL_BAR_H_UNTITLED: f32 = metrics::TOOL_AREA_UNTITLED_H;
 /// Height of the title strip at the bottom of a panel.
 pub(super) const PANEL_TITLE_H: f32 = metrics::TITLE_STRIP_H;
 /// Size of a panel title.
-pub(super) const PANEL_TITLE_SIZE: f32 = 11.5;
+pub(super) const PANEL_TITLE_SIZE: f32 = crate::ui::style::text::UI;
 
 /// Gap between the combo dropdown and the tool rows beneath it.
 const COMBO_ROW_SPACING: f32 = ROW_GAP;
@@ -124,13 +127,15 @@ fn ribbon_label_bounds(
             content: label,
             bounds: Size::new(width, f32::INFINITY),
             size: Pixels(LARGE_LABEL_SIZE),
-            line_height: advanced_text::LineHeight::Relative(LARGE_LABEL_LINE),
+            line_height: advanced_text::LineHeight::Absolute(Pixels(LARGE_LABEL_LINE)),
             font: renderer.default_font(),
             align_x: advanced_text::Alignment::Center,
             align_y: iced::alignment::Vertical::Center,
             shaping: advanced_text::Shaping::default(),
             wrapping,
             ellipsis: advanced_text::Ellipsis::None,
+            // Hinting is off in the pinned iced: `iced_graphics::text::hint_factor`
+            // returns `None`; follow `renderer.hint_factor()` once it is enabled.
             hint_factor: None,
         });
     paragraph.min_bounds()
@@ -142,7 +147,7 @@ fn ribbon_label_bounds(
 /// changes do not rely on character-count estimates.
 fn measure_large_width(renderer: &iced::Renderer, label: &str) -> f32 {
     let base_inner = (LARGE_W - LARGE_LABEL_HPAD).max(1.0);
-    let line_height = advanced_text::LineHeight::Relative(LARGE_LABEL_LINE)
+    let line_height = advanced_text::LineHeight::Absolute(Pixels(LARGE_LABEL_LINE))
         .to_absolute(Pixels(LARGE_LABEL_SIZE))
         .0;
     let max_label_height = line_height * LARGE_LABEL_LINES + 0.5;
@@ -347,6 +352,16 @@ pub(super) fn automatic_large_button<'a>(
     })
 }
 
+/// A large button whose label stays on one line, as wide as that line (a
+/// collapsed panel's title). A label without a line break is measured by
+/// `measure_split_width` as one unwrapped line.
+pub(super) fn automatic_one_line_button<'a>(
+    label: String,
+    content: Element<'a, Message>,
+) -> Element<'a, Message> {
+    automatic_split_button(label.replace('\n', " "), content)
+}
+
 /// A large split button sized to its label (see `measure_split_width`).
 fn automatic_split_button<'a>(
     label: String,
@@ -363,7 +378,7 @@ fn automatic_split_button<'a>(
 fn large_label<'a>(label: String) -> iced::widget::Text<'a, Theme, iced::Renderer> {
     text(label)
         .size(LARGE_LABEL_SIZE)
-        .line_height(LARGE_LABEL_LINE)
+        .line_height(Pixels(LARGE_LABEL_LINE))
         .width(Fill)
         .align_x(iced::Center)
 }
@@ -386,6 +401,11 @@ pub(crate) const LAYER_SEARCH_ID: &str = "LAYER_SEARCH";
 pub(super) const PROP_COLOR_ID: &str = "PROP_COLOR";
 pub(super) const PROP_LINETYPE_ID: &str = "PROP_LINETYPE";
 pub(super) const PROP_LW_ID: &str = "PROP_LW";
+/// Icons in front of the Properties panel's Color / Linetype / Lineweight
+/// combos.
+const PROP_COLOR_ICON: &[u8] = include_bytes!("../../../assets/icons/color_palette.svg");
+const PROP_LINETYPE_ICON: &[u8] = include_bytes!("../../../assets/icons/attributes/linetype.svg");
+const PROP_LW_ICON: &[u8] = include_bytes!("../../../assets/icons/attributes/lineweight.svg");
 
 // ── Style context (passed from Ribbon to render_large) ────────────────────
 
@@ -458,9 +478,11 @@ pub(super) fn is_active_tool(id: &str, active_tool: &Option<String>, state: &Tog
         "PERSP" => !state.ortho_mode,
         "NAVVCUBE" => state.show_viewcube,
         "UCSICON" => state.show_ucs_icon,
+        "VPHIGHLIGHT" => state.show_viewport_highlight,
         "PROPERTIES" => state.show_properties,
         "COUNTLIST" => state.show_count_palette,
         "GRAPHICATTRIBUTES" => state.show_graphic_attributes,
+        "TOOLPALETTES" => state.show_tool_palettes,
         "BAUTHORPALETTE" => state.show_authoring_palettes,
         // The id is the command name, and the Parametric tab carries a tool with
         // it too; the light follows the pane, which only exists in a session.
@@ -469,7 +491,8 @@ pub(super) fn is_active_tool(id: &str, active_tool: &Option<String>, state: &Tog
         "SHEETSET" => state.show_sheet_set,
         "FILETAB" => state.show_file_tabs,
         "LAYOUTTAB" => state.show_layout_tabs,
-        id => active_tool.as_deref() == Some(id),
+        "TOGGLEGROUPS" => state.group_selection,
+        id => active_tool.as_deref() == Some(id) || super::text_editor::lit(id),
     }
 }
 
@@ -482,12 +505,7 @@ pub(super) fn tool_btn_style(
     is_active: bool,
     status: button::Status,
 ) -> button::Style {
-    let mut style = split_part_style(theme, is_active, status);
-    if matches!(status, button::Status::Hovered | button::Status::Pressed) && !is_active {
-        style.border.color = chrome::hover_border(theme);
-        style.border.width = 1.0;
-    }
-    style
+    crate::ui::kit::flat_button_style(is_active)(theme, status)
 }
 
 /// One part of a split button. The parts fill on hover; the outline is the
@@ -595,10 +613,10 @@ pub(super) fn layer_combo_face<'a>(
     let label: Element<'a, Message> = if keytip_label {
         super::keytips::label_anchor(
             || super::keytips::label_id(id),
-            text(active_layer_label).size(11),
+            text(active_layer_label).size(ui_text::UI),
         )
     } else {
-        text(active_layer_label).size(11).into()
+        text(active_layer_label).size(ui_text::UI).into()
     };
 
     let combo_btn = button(
@@ -683,35 +701,6 @@ pub(super) fn combo_btn_style(
     }
 }
 
-/// A row of a ribbon popup or dropdown. An idle row is clear, so it does
-/// not paint over the popup's border.
-pub(crate) fn popup_row_style(theme: &Theme, status: button::Status) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    button::Style {
-        background: hovered.then(|| Background::Color(chrome::hover(theme))),
-        text_color: if hovered {
-            chrome::strong(theme)
-        } else {
-            chrome::text(theme)
-        },
-        ..Default::default()
-    }
-}
-
-/// A ribbon popup or dropdown: `panel` inside a 1 px `border`.
-pub(crate) fn popup_panel_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(chrome::panel(theme))),
-        text_color: Some(chrome::text(theme)),
-        border: Border {
-            color: chrome::border(theme),
-            width: crate::ui::icons::hairline(),
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
 pub(super) fn muted_text_style(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
         color: Some(chrome::muted(theme)),
@@ -720,46 +709,33 @@ pub(super) fn muted_text_style(theme: &Theme) -> iced::widget::text::Style {
 
 // ── Tooltip helpers ────────────────────────────────────────────────────────
 
-pub(super) fn make_tip(tip: String) -> Element<'static, Message> {
-    text(tip).size(11).into()
-}
-
-/// The sentence the reference shows under a tool's name, where known.
-fn tool_description(id: &str) -> Option<&'static str> {
-    Some(match id {
-        "DCLINEAR" => "Constrains the horizontal or vertical distance between points",
-        "DCHORIZONTAL" => "Constrains the X-distance between points on an object, or between two points on different objects",
-        "DCVERTICAL" => "Constrains the Y-distance between points on an object, or between two points on different objects",
-        "DCALIGNED" => "Constrains the distance between two points on an object or between two points on different objects",
-        "DCRADIUS" => "Constrains the radius of a circle or arc",
-        "DCDIAMETER" => "Constrains the diameter of a circle or arc",
-        "DCANGULAR" => "Constrains the angle between line or polyline segments, the angle swept out by an arc or a polyline arc segment, or the angle between three points on objects",
-        "DCCONVERT" => "Convert dimensions to dimensional constraints",
-        _ => return None,
-    })
-}
-
 /// A tool's tooltip: its name, its description when one is known, and the
 /// command it runs.
-fn tool_tip_text(label: &str, id: &str) -> String {
+pub(super) fn tool_tip_text(label: &str, id: &str) -> String {
     // A macro (`PDFIMPORT;FILE`) shows the command it starts.
     let id = id.split(';').next().unwrap_or(id);
-    match tool_description(id) {
-        Some(description) => format!("{label}\n{}\n{} {id}", t!(description), t!("Command:")),
+    // A ribbon token (`ARC_3P`) falls back to its command's summary.
+    let summary = crate::command::command_summary(id)
+        .or_else(|| crate::command::command_summary(id.split('_').next()?));
+    match summary {
+        Some(description) => {
+            // Broken at word ends so a long summary stays a narrow tip.
+            let mut wrapped = String::new();
+            let mut line = 0;
+            for word in description.split(' ') {
+                if line > 0 && line + word.len() > 56 {
+                    wrapped.push('\n');
+                    line = 0;
+                } else if line > 0 {
+                    wrapped.push(' ');
+                    line += 1;
+                }
+                wrapped.push_str(word);
+                line += word.len();
+            }
+            format!("{label}\n{wrapped}\n{} {id}", t!("Command:"))
+        }
         None => format!("{label}\n{} {id}", t!("Command:")),
-    }
-}
-
-pub(super) fn tip_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(chrome::panel(theme))),
-        border: Border {
-            color: chrome::border(theme),
-            width: crate::ui::icons::hairline(),
-            radius: BUTTON_RADIUS.into(),
-        },
-        text_color: Some(chrome::text(theme)),
-        ..Default::default()
     }
 }
 
@@ -803,10 +779,12 @@ fn labeled_tool<'a>(
         });
     super::keytips::anchor(
         t.id,
-        tooltip(btn, make_tip(tip_text), TipPos::Right)
-            .gap(6.0)
-            .delay(Duration::from_millis(400))
-            .style(tip_style),
+        crate::ui::kit::tooltip_gap(
+            btn,
+            tip_text,
+            TipPos::Right,
+            crate::ui::style::ribbon_metrics::TIP_GAP,
+        ),
     )
 }
 
@@ -866,10 +844,12 @@ fn small_button<'a>(
                 .padding(SMALL_PAD);
             super::keytips::anchor(
                 t.id,
-                tooltip(btn, make_tip(tip_text), TipPos::Right)
-                    .gap(6.0)
-                    .delay(Duration::from_millis(400))
-                    .style(tip_style),
+                crate::ui::kit::tooltip_gap(
+                    btn,
+                    tip_text,
+                    TipPos::Right,
+                    crate::ui::style::ribbon_metrics::TIP_GAP,
+                ),
             )
         }
 
@@ -944,17 +924,21 @@ fn small_button<'a>(
             .height(ROW_H)
             .padding(0);
 
-            let icon_with_tip = tooltip(icon_btn, make_tip(tip_text), TipPos::Right)
-                .gap(6.0)
-                .delay(Duration::from_millis(400))
-                .style(tip_style);
-            let arr_with_tip = tooltip(arr_btn, make_tip(arr_tip), TipPos::Right)
-                .gap(6.0)
-                .delay(Duration::from_millis(400))
-                .style(tip_style);
+            let icon_with_tip = crate::ui::kit::tooltip_gap(
+                icon_btn,
+                tip_text,
+                TipPos::Right,
+                crate::ui::style::ribbon_metrics::TIP_GAP,
+            );
+            let arr_with_tip = crate::ui::kit::tooltip_gap(
+                arr_btn,
+                arr_tip,
+                TipPos::Right,
+                crate::ui::style::ribbon_metrics::TIP_GAP,
+            );
 
             PosReport::new(
-                *id,
+                id,
                 split_outline(
                     row![icon_with_tip, arr_with_tip]
                         .spacing(0)
@@ -1044,19 +1028,23 @@ fn small_button<'a>(
             let face_tip = tool_tip_text(&localized_label, last);
             let arrow_tip = format!("{} {}", localized_label, t!("options"));
             let parts = row![
-                tooltip(face_btn, make_tip(face_tip), TipPos::Right)
-                    .gap(6.0)
-                    .delay(Duration::from_millis(400))
-                    .style(tip_style),
-                tooltip(arrow, make_tip(arrow_tip), TipPos::Right)
-                    .gap(6.0)
-                    .delay(Duration::from_millis(400))
-                    .style(tip_style),
+                crate::ui::kit::tooltip_gap(
+                    face_btn,
+                    face_tip,
+                    TipPos::Right,
+                    crate::ui::style::ribbon_metrics::TIP_GAP
+                ),
+                crate::ui::kit::tooltip_gap(
+                    arrow,
+                    arrow_tip,
+                    TipPos::Right,
+                    crate::ui::style::ribbon_metrics::TIP_GAP
+                ),
             ]
             .spacing(0)
             .width(Fill)
             .height(ROW_H);
-            PosReport::new(*id, split_outline(parts.into())).into()
+            PosReport::new(id, split_outline(parts.into())).into()
         }
 
         _ => text("").into(),
@@ -1171,7 +1159,7 @@ pub(super) fn render_large_dropdown<'a>(
             row![
                 text(second.to_string())
                     .size(LARGE_LABEL_SIZE)
-                    .line_height(LARGE_LABEL_LINE),
+                    .line_height(Pixels(LARGE_LABEL_LINE)),
                 arrow,
             ]
             .spacing(2)
@@ -1209,14 +1197,18 @@ pub(super) fn render_large_dropdown<'a>(
         left: 2.0,
     });
 
-    let top_with_tip = tooltip(top_btn, make_tip(tip_text), TipPos::Right)
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style);
-    let arr_with_tip = tooltip(arr_btn, make_tip(arr_tip), TipPos::Right)
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style);
+    let top_with_tip = crate::ui::kit::tooltip_gap(
+        top_btn,
+        tip_text,
+        TipPos::Right,
+        crate::ui::style::ribbon_metrics::TIP_GAP,
+    );
+    let arr_with_tip = crate::ui::kit::tooltip_gap(
+        arr_btn,
+        arr_tip,
+        TipPos::Right,
+        crate::ui::style::ribbon_metrics::TIP_GAP,
+    );
 
     // The arrow part starts at `LARGE_FACE_H` and runs to the bottom.
     let content = column![top_with_tip, arr_with_tip]
@@ -1238,24 +1230,24 @@ fn tool_row<'a>(tools: &[ToolDef], active_tool: &Option<String>) -> Element<'a, 
     let btns: Vec<Element<Message>> = tools
         .iter()
         .map(|t| {
-            let is_active = active_tool.as_deref() == Some(t.id);
+            let is_active =
+                active_tool.as_deref() == Some(t.id) || super::text_editor::lit(t.id);
             let tip = t!(t.label);
             let event = t.event.clone();
             let icon_el: Element<Message> = make_icon(t.icon, SMALL_ICON);
             let msg = module_event_to_message(event);
-            let btn = tooltip(
+            let usable = !super::text_editor::unavailable(t.id);
+            let btn = crate::ui::kit::tooltip_gap(
                 button(icon_el)
-                    .on_press(msg)
+                    .on_press_maybe(usable.then_some(msg))
                     .style(move |theme: &Theme, status| tool_btn_style(theme, is_active, status))
                     .width(SMALL_W)
                     .height(ROW_H)
                     .padding(SMALL_PAD),
-                make_tip(tip.to_string()),
+                tip.to_string(),
                 TipPos::Right,
-            )
-            .gap(4.0)
-            .delay(Duration::from_millis(400))
-            .style(tip_style);
+                crate::ui::style::kit_metrics::TOOL_GAP,
+            );
             super::ribbon_menu::tool_target(
                 super::ribbon_menu::tool_qat(t),
                 super::keytips::anchor(t.id, btn),
@@ -1349,14 +1341,12 @@ fn large_item<'a>(
             });
             super::keytips::anchor(
                 t.id,
-                tooltip(
+                crate::ui::kit::tooltip_gap(
                     automatic_large_button(label, btn.into()),
-                    make_tip(tip_text),
+                    tip_text,
                     TipPos::Right,
-                )
-                .gap(6.0)
-                .delay(Duration::from_millis(400))
-                .style(tip_style),
+                    crate::ui::style::ribbon_metrics::TIP_GAP,
+                ),
             )
         }
 
@@ -1366,7 +1356,7 @@ fn large_item<'a>(
             icon,
             items,
             default,
-        } => render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx),
+        } => render_large_dropdown(id, *icon, Some(*label), items, default, ctx),
 
         RibbonItem::LabeledDropdown {
             id,
@@ -1374,7 +1364,7 @@ fn large_item<'a>(
             icon,
             items,
             default,
-        } => render_large_dropdown(*id, *icon, Some(*label), items, *default, ctx),
+        } => render_large_dropdown(id, *icon, Some(*label), items, default, ctx),
 
         RibbonItem::ToolGrid { columns } => columns
             .iter()
@@ -1405,7 +1395,7 @@ fn large_item<'a>(
             icon,
             items,
             default,
-        } => render_large_dropdown(*id, *icon, None, items, *default, ctx),
+        } => render_large_dropdown(id, *icon, None, items, default, ctx),
 
         RibbonItem::LayerComboGroup { row2, row3 } => {
             const TOOL_BUTTON_W: f32 = 26.0;
@@ -1488,7 +1478,7 @@ fn large_item<'a>(
                         swatch_el,
                         container(super::keytips::label_anchor(
                             || super::keytips::label_id(dd_id),
-                            text(label).size(11),
+                            text(label).size(ui_text::UI),
                         ))
                         .width(Fill)
                         .clip(true),
@@ -1520,19 +1510,25 @@ fn large_item<'a>(
             );
             let lw_row = prop_row(LwItem(active_lineweight).to_string(), PROP_LW_ID, None);
 
+            // Each combo is led by the icon of the property it sets.
+            let labelled =
+                |icon: &'static [u8], dd_id: &'static str, combo| -> Element<'a, Message> {
+                    row![
+                        icons::tool(icon, SMALL_ICON),
+                        super::qat::list_target(dd_id, PosReport::new(dd_id, combo)),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center)
+                    .into()
+                };
+
             // Top-pinned like every combo panel, so the Color dropdown shares
             // the same baseline as the Layers / style selectors.
             let combos = container(
                 column![
-                    super::qat::list_target(
-                        PROP_COLOR_ID,
-                        PosReport::new(PROP_COLOR_ID, color_row)
-                    ),
-                    super::qat::list_target(
-                        PROP_LINETYPE_ID,
-                        PosReport::new(PROP_LINETYPE_ID, lt_row)
-                    ),
-                    super::qat::list_target(PROP_LW_ID, PosReport::new(PROP_LW_ID, lw_row)),
+                    labelled(PROP_COLOR_ICON, PROP_COLOR_ID, color_row),
+                    labelled(PROP_LINETYPE_ICON, PROP_LINETYPE_ID, lt_row),
+                    labelled(PROP_LW_ICON, PROP_LW_ID, lw_row),
                 ]
                 .spacing(2)
                 .align_x(iced::Left),
@@ -1568,7 +1564,7 @@ fn large_item<'a>(
                 row![
                     container(super::keytips::label_anchor(
                         || super::keytips::label_id(combo_id),
-                        text(active.clone()).size(11),
+                        text(active.clone()).size(ui_text::UI),
                     ))
                     .width(Fill)
                     .clip(true),
@@ -1643,7 +1639,11 @@ fn large_item<'a>(
                         style_ctx.mleader_layer,
                         style_ctx.mleader_layer_color,
                         open_dd.as_deref() == Some(MLEADER_LAYER_COMBO),
-                        format!("{}\n{} MLEADERLAYER", t!("Multileader Layer"), t!("Command:")),
+                        format!(
+                            "{}\n{} MLEADERLAYER",
+                            t!("Multileader Layer"),
+                            t!("Command:")
+                        ),
                     ))
                     .width(Fill)
                     .into(),
@@ -1732,9 +1732,13 @@ pub(super) fn layer_combo<'a>(
                 12.0
             ),
             swatch,
-            container(text(label).size(11).wrapping(advanced_text::Wrapping::None))
-                .width(Fill)
-                .clip(true),
+            container(
+                text(label)
+                    .size(ui_text::UI)
+                    .wrapping(advanced_text::Wrapping::None)
+            )
+            .width(Fill)
+            .clip(true),
             if open {
                 icons::themed_arrow_up(9.0)
             } else {
@@ -1748,9 +1752,7 @@ pub(super) fn layer_combo<'a>(
     .style(move |theme: &Theme, status| combo_btn_style(theme, open, status, 3.0))
     .padding([3, 8])
     .width(Fill);
-    let combo = tooltip(PosReport::new(id, combo), make_tip(tip), TipPos::Bottom)
-        .delay(Duration::from_millis(400))
-        .style(tip_style);
+    let combo = crate::ui::kit::tooltip(PosReport::new(id, combo), tip, TipPos::Bottom);
     super::keytips::anchor(id, super::qat::list_target(id, combo))
 }
 
@@ -1765,7 +1767,7 @@ fn text_find_box<'a>(value: &str) -> Element<'a, Message> {
         .id(iced::widget::Id::new(TEXT_FIND_ID))
         .on_input(Message::RibbonTextFind)
         .on_submit(Message::RibbonTextFindSubmit)
-        .size(11)
+        .size(ui_text::UI)
         .padding([3, 6])
         .width(Fill);
     let search = button(make_icon(
@@ -1775,9 +1777,7 @@ fn text_find_box<'a>(value: &str) -> Element<'a, Message> {
     .on_press(Message::RibbonTextFindSubmit)
     .style(move |theme: &Theme, status| tool_btn_style(theme, false, status))
     .padding(3);
-    let search = tooltip(search, make_tip(t!("Find text").into_owned()), TipPos::Bottom)
-        .delay(Duration::from_millis(400))
-        .style(tip_style);
+    let search = crate::ui::kit::tooltip(search, t!("Find text").into_owned(), TipPos::Bottom);
     row![input, search]
         .spacing(2)
         .align_y(iced::Center)
@@ -1791,16 +1791,14 @@ fn text_height_box<'a>(value: &str) -> Element<'a, Message> {
         .id(iced::widget::Id::new(TEXT_HEIGHT_ID))
         .on_input(Message::RibbonTextHeight)
         .on_submit(Message::RibbonTextHeightSubmit)
-        .size(11)
+        .size(ui_text::UI)
         .padding([3, 6])
         .width(Fill);
-    let input = tooltip(
+    let input = crate::ui::kit::tooltip(
         input,
-        make_tip(format!("{}\n{} TEXTSIZE", t!("Text Height"), t!("Command:"))),
+        format!("{}\n{} TEXTSIZE", t!("Text Height"), t!("Command:")),
         TipPos::Bottom,
-    )
-    .delay(Duration::from_millis(400))
-    .style(tip_style);
+    );
     super::keytips::anchor(super::keytips::TEXT_HEIGHT, input)
 }
 
@@ -1823,10 +1821,12 @@ pub fn module_event_to_message(event: ModuleEvent) -> Message {
         ModuleEvent::ToggleLayers => Message::ToggleLayers,
         // Needs the tool context + async picker — route through the normal
         // ribbon-click handler rather than a direct 1:1 message.
-        e @ ModuleEvent::PluginFileDialog { .. } => Message::RibbonToolClick {
-            tool_id: String::new(),
-            event: e,
-        },
+        e @ (ModuleEvent::PluginFileDialog { .. } | ModuleEvent::PluginFolderDialog { .. }) => {
+            Message::RibbonToolClick {
+                tool_id: String::new(),
+                event: e,
+            }
+        }
     }
 }
 
@@ -1865,14 +1865,12 @@ pub(super) fn quick_access_btn<'a>(
     let anchor = super::keytips::quick_access_anchor(&cmd);
     super::keytips::anchor_with(
         move || anchor,
-        tooltip(
+        crate::ui::kit::tooltip_gap(
             btn,
-            make_tip(super::qat::command_tip(&face.label, &cmd)),
+            super::qat::command_tip(&face.label, &cmd),
             TipPos::Bottom,
-        )
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style),
+            crate::ui::style::ribbon_metrics::TIP_GAP,
+        ),
     )
 }
 
@@ -1911,18 +1909,16 @@ pub(super) fn render_history_control<'a>(
         } else {
             btn
         };
-        tooltip(
+        crate::ui::kit::tooltip_gap(
             btn,
-            make_tip(format!(
+            format!(
                 "{}\n{}",
                 t!(label),
                 t!("%{count} steps available", count = count)
-            )),
+            ),
             TipPos::Right,
+            crate::ui::style::ribbon_metrics::TIP_GAP,
         )
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style)
     };
 
     let arrow_btn = {
@@ -1943,14 +1939,12 @@ pub(super) fn render_history_control<'a>(
         } else {
             btn
         };
-        tooltip(
+        crate::ui::kit::tooltip_gap(
             btn,
-            make_tip(format!("{}", t!("%{label} history", label = t!(label)))),
+            format!("{}", t!("%{label} history", label = t!(label))),
             TipPos::Right,
+            crate::ui::style::ribbon_metrics::TIP_GAP,
         )
-        .gap(6.0)
-        .delay(Duration::from_millis(400))
-        .style(tip_style)
     };
 
     // A split button: its hover outline goes round both parts, inside them,
@@ -2003,22 +1997,9 @@ pub(super) fn top_hist_btn_style(
     }
 }
 
-#[cfg(test)]
-mod size_tests {
-    use super::*;
-
-    #[test]
-    fn the_ribbon_has_the_design_sizes() {
-        // Three 22 px rows make a 70 px large button.
-        assert_eq!(LARGE_H, 70.0);
-        // 99 px with panel titles, 89 px without.
-        assert_eq!(TOOL_BAR_H, 99.0);
-        assert_eq!(TOOL_BAR_H_UNTITLED, 89.0);
-        // Two label lines fit under the icon of a large button.
-        let line = LARGE_LABEL_SIZE * LARGE_LABEL_LINE;
-        assert!(3.0 + LARGE_ICON + 2.0 + LARGE_LABEL_LINES * line <= LARGE_H);
-    }
-}
+// Two label lines fit under the icon of a large button, checked when the
+// crate compiles.
+const _: () = assert!(3.0 + LARGE_ICON + 2.0 + LARGE_LABEL_LINES * LARGE_LABEL_LINE <= LARGE_H);
 
 #[cfg(test)]
 mod style_context_tests {

@@ -20,8 +20,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::entities::{EntityType, Line};
-use codec::types::Vector3;
+use document::entities::{EntityType, Line};
+use document::types::Vector3;
 use OpenCADStudio::scene::Scene;
 
 const LINES: usize = 100_000;
@@ -71,7 +71,9 @@ fn main() {
         }
         let per_call_ms = started.elapsed().as_secs_f64() * 1000.0 / ITERATIONS as f64;
         best = best.min(per_call_ms);
-        println!("navigation_selection_bounds: run {run} {ITERATIONS} calls: {per_call_ms:.4} ms/call");
+        println!(
+            "navigation_selection_bounds: run {run} {ITERATIONS} calls: {per_call_ms:.4} ms/call"
+        );
     }
 
     assert_eq!(scene.document.entities().count(), LINES);

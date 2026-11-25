@@ -1,12 +1,12 @@
-use codec::entities::{Ole2Frame, OleObjectType};
+use document::entities::{Ole2Frame, OleObjectType};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{center_grip, edit_prop as edit, ro_prop as ro, square_grip};
-use crate::t;
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::SnapHint;
+use crate::t;
 
 fn to_render(ole: &Ole2Frame) -> RenderEntity {
     let x0 = ole.upper_left_corner.x;
@@ -122,7 +122,7 @@ pub(crate) fn hidden(ole: &Ole2Frame) -> bool {
 
 /// OLEFRAME of the drawing: 0 no frame, 1 frame shown and plotted, 2 frame
 /// shown but not plotted (the default).
-pub(crate) fn frame_mode(document: &codec::Document) -> i16 {
+pub(crate) fn frame_mode(document: &document::Document) -> i16 {
     crate::io::drawing_variable(document, "OLEFRAME")
         .and_then(|value| value.trim().parse::<i16>().ok())
         .filter(|value| (0..=2).contains(value))
@@ -235,7 +235,10 @@ fn properties(ole: &Ole2Frame) -> Vec<PropSection> {
 
 fn apply_geom_prop(ole: &mut Ole2Frame, field: &str, value: &str) {
     if field == "ole_plot_quality" {
-        if let Some(index) = plot_quality_labels().iter().position(|label| label == value) {
+        if let Some(index) = plot_quality_labels()
+            .iter()
+            .position(|label| label == value)
+        {
             ole.lock_aspect = index as u8;
         } else if let Ok(index) = value.trim().parse::<u8>() {
             ole.lock_aspect = index.min(2);
@@ -264,18 +267,18 @@ fn apply_geom_prop(ole: &mut Ole2Frame, field: &str, value: &str) {
 fn apply_grip(ole: &mut Ole2Frame, grip_id: usize, apply: GripApply) {
     match (grip_id, apply) {
         (0, GripApply::Absolute(p)) => {
-            ole.upper_left_corner.x = p.x as f64;
-            ole.upper_left_corner.y = p.y as f64;
+            ole.upper_left_corner.x = p.x;
+            ole.upper_left_corner.y = p.y;
         }
         (1, GripApply::Absolute(p)) => {
-            ole.lower_right_corner.x = p.x as f64;
-            ole.lower_right_corner.y = p.y as f64;
+            ole.lower_right_corner.x = p.x;
+            ole.lower_right_corner.y = p.y;
         }
         (2, GripApply::Translate(d)) => {
-            ole.upper_left_corner.x += d.x as f64;
-            ole.upper_left_corner.y += d.y as f64;
-            ole.lower_right_corner.x += d.x as f64;
-            ole.lower_right_corner.y += d.y as f64;
+            ole.upper_left_corner.x += d.x;
+            ole.upper_left_corner.y += d.y;
+            ole.lower_right_corner.x += d.x;
+            ole.lower_right_corner.y += d.y;
         }
         _ => {}
     }
@@ -284,29 +287,29 @@ fn apply_grip(ole: &mut Ole2Frame, grip_id: usize, apply: GripApply) {
 fn apply_transform(ole: &mut Ole2Frame, t: &EntityTransform) {
     match t {
         EntityTransform::Translate(d) => {
-            ole.upper_left_corner.x += d.x as f64;
-            ole.upper_left_corner.y += d.y as f64;
-            ole.upper_left_corner.z += d.z as f64;
-            ole.lower_right_corner.x += d.x as f64;
-            ole.lower_right_corner.y += d.y as f64;
-            ole.lower_right_corner.z += d.z as f64;
+            ole.upper_left_corner.x += d.x;
+            ole.upper_left_corner.y += d.y;
+            ole.upper_left_corner.z += d.z;
+            ole.lower_right_corner.x += d.x;
+            ole.lower_right_corner.y += d.y;
+            ole.lower_right_corner.z += d.z;
         }
         EntityTransform::Scale { center, factor } => {
-            let scale = |v: f64, c: f64| c + (v - c) * (*factor as f64);
-            ole.upper_left_corner.x = scale(ole.upper_left_corner.x, center.x as f64);
-            ole.upper_left_corner.y = scale(ole.upper_left_corner.y, center.y as f64);
-            ole.lower_right_corner.x = scale(ole.lower_right_corner.x, center.x as f64);
-            ole.lower_right_corner.y = scale(ole.lower_right_corner.y, center.y as f64);
+            let scale = |v: f64, c: f64| c + (v - c) * *factor;
+            ole.upper_left_corner.x = scale(ole.upper_left_corner.x, center.x);
+            ole.upper_left_corner.y = scale(ole.upper_left_corner.y, center.y);
+            ole.lower_right_corner.x = scale(ole.lower_right_corner.x, center.x);
+            ole.lower_right_corner.y = scale(ole.lower_right_corner.y, center.y);
         }
         EntityTransform::Affine(transform) => {
-            codec::Entity::apply_transform(ole, transform);
+            document::Entity::apply_transform(ole, transform);
         }
         _ => {}
     }
 }
 
 impl RenderConvertible for Ole2Frame {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         if hidden(self) {
             return None;
         }

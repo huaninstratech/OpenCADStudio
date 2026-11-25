@@ -1,6 +1,6 @@
-use codec::entities::acis::{SabReader, SatBody, SatDocument};
-use codec::entities::{Body, Region, Solid3D, Surface};
-use kernel::brep::Body as KernelBody;
+use document::entities::acis::{SabReader, SatDocument};
+use document::entities::{Body, Region, Solid3D, Surface};
+use ocs_solid::model::Brep;
 
 use crate::scene::model::mesh_model::{MeshLodSet, MeshModel};
 
@@ -24,62 +24,12 @@ fn tessellate_acis(
     )
 }
 
-pub(crate) fn body_transform(
-    sat: &SatDocument,
-    body_record: usize,
-) -> Result<Option<([f64; 9], [f64; 3], f64)>, ()> {
-    let body = SatBody::from_record(sat.record(body_record).ok_or(())?).ok_or(())?;
-    let Some(transform_record) = body.transform().index() else {
-        return Ok(None);
-    };
-    let transform = sat.record(transform_record).ok_or(())?;
-    if transform.entity_type != "transform" {
-        return Err(());
-    }
-    let mut values = Vec::with_capacity(13);
-    for token in &transform.tokens {
-        if values.len() >= 13 {
-            break;
-        }
-        if let Some((components, len)) = token.coordinate_components() {
-            values.extend_from_slice(&components[..len]);
-        } else if let Some(value) = token.as_float() {
-            values.push(value);
-        } else if let Some(value) = token.as_integer() {
-            values.push(value as f64);
-        } else if let Some(text) = token.as_string() {
-            for word in text.split_ascii_whitespace() {
-                let Ok(value) = word.parse::<f64>() else {
-                    break;
-                };
-                values.push(value);
-                if values.len() >= 13 {
-                    break;
-                }
-            }
-        }
-    }
-    (values.len() >= 13 && values[..13].iter().all(|value| value.is_finite()) && values[12] > 0.0)
-        .then(|| {
-            (
-                [
-                    values[0], values[1], values[2], values[3], values[4], values[5], values[6],
-                    values[7], values[8],
-                ],
-                [values[9], values[10], values[11]],
-                values[12],
-            )
-        })
-        .map(Some)
-        .ok_or(())
-}
-
 pub(crate) fn finalize_mesh(
     name: String,
     verts: Vec<[f64; 3]>,
     normals: Vec<[f32; 3]>,
     indices: Vec<u32>,
-    triangle_material_handles: Vec<Option<codec::Handle>>,
+    triangle_material_handles: Vec<Option<document::Handle>>,
     triangle_colors: Vec<Option<[f32; 4]>>,
     color: [f32; 4],
     xform: Option<([f64; 9], [f64; 3], f64)>,
@@ -155,29 +105,37 @@ fn parse_acis(
     })
 }
 
-pub fn kernel_body(solid: &Solid3D) -> Option<KernelBody> {
-    kernel_acis_body(&solid.acis_data)
+/// A 3DSOLID's ACIS data as a Solidcore record.
+pub fn solid_record(solid: &Solid3D) -> Option<Brep> {
+    acis_record(&solid.acis_data)
 }
 
-pub fn kernel_region_body(region: &Region) -> Option<KernelBody> {
-    kernel_acis_body(&region.acis_data)
+/// A REGION's ACIS data as a Solidcore record.
+pub fn region_record(region: &Region) -> Option<Brep> {
+    acis_record(&region.acis_data)
 }
 
-pub fn kernel_surface_body(surface: &Surface) -> Option<KernelBody> {
-    kernel_acis_body(&surface.acis_data)
+/// A SURFACE's ACIS data as a Solidcore record.
+pub fn surface_record(surface: &Surface) -> Option<Brep> {
+    acis_record(&surface.acis_data)
 }
 
-pub(crate) fn kernel_acis_body(acis: &codec::entities::AcisData) -> Option<KernelBody> {
-    let sat = parse_acis(|| acis.parse(), acis.is_binary, &acis.sab_data)?;
-    let (mut bodies, loss) = kernel::acis::lift(&sat);
+/// An object's ACIS data as a document, from its text or its binary form.
+pub(crate) fn acis_document(acis: &document::entities::AcisData) -> Option<SatDocument> {
+    parse_acis(|| acis.parse(), acis.is_binary, &acis.sab_data)
+}
+
+/// ACIS data holding one body, read whole, as a Solidcore record (placed by its transform).
+pub(crate) fn acis_record(acis: &document::entities::AcisData) -> Option<Brep> {
+    let sat = acis_document(acis)?;
+    let (mut bodies, loss) = ocs_solid::lift(&sat);
     if !loss.is_empty() || bodies.len() != 1 {
         return None;
     }
-    // The kernel's lift already applies the body's transform record.
-    bodies.pop()
+    bodies.pop().map(|body| body.brep)
 }
 
-fn remap_acis_material_bindings(set: &mut MeshLodSet, acis: &codec::entities::AcisData) {
+fn remap_acis_material_bindings(set: &mut MeshLodSet, acis: &document::entities::AcisData) {
     for lod in &mut set.lods {
         for handle in lod.triangle_material_handles.iter_mut().flatten() {
             let reference = handle.value() as i32;
@@ -200,7 +158,7 @@ fn finish(
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
     planar_isolines: Option<bool>,
-    acis: &codec::entities::AcisData,
+    acis: &document::entities::AcisData,
 ) -> Option<MeshLodSet> {
     let mut set = tessellate_acis(
         &sat,
@@ -264,7 +222,7 @@ pub fn tessellate_body(
 }
 
 pub fn tessellate_surface(
-    surface: &codec::entities::Surface,
+    surface: &document::entities::Surface,
     color: [f32; 4],
     facet_res: f64,
     chordal_deflection: Option<f64>,

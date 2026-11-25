@@ -50,7 +50,7 @@ fn state(
         conditions,
         editing_condition,
         scope: QSelectScope::CurrentSpace,
-        available_types: vec!["Line".into()],
+        available_types: vec![("Line".into(), 5)],
         available_properties: Vec::new(),
         candidate_count: 5,
         type_filter: Some("Line".into()),
@@ -58,14 +58,25 @@ fn state(
         operator,
         value: value.into(),
         mode: QSelectMode::Include,
-        append: false,
+        result: crate::app::QSelectResult::New,
         error: None,
+        live_count: 0,
+        live_by_type: Vec::new(),
+        show: false,
+        value_counts: Vec::new(),
+        sample: None,
     }
 }
 
 #[test]
 fn empty_scope_is_reported_before_any_condition_error() {
-    let state = state(Vec::new(), None, Some(number_property()), QSelectOp::Eq, "abc");
+    let state = state(
+        Vec::new(),
+        None,
+        Some(number_property()),
+        QSelectOp::Eq,
+        "abc",
+    );
     assert_eq!(
         state.validation_error(0),
         Some(crate::t!("No objects are available in this scope.").into_owned())
@@ -83,21 +94,31 @@ fn apply_is_blocked_while_a_condition_edit_is_open() {
     );
     assert_eq!(
         state.validation_error(5),
-        Some(
-            crate::t!("Update or cancel the condition edit before applying.").into_owned()
-        )
+        Some(crate::t!("Update or cancel the condition edit before applying.").into_owned())
     );
 }
 
 #[test]
 fn empty_condition_list_validates_the_draft() {
-    let invalid = state(Vec::new(), None, Some(number_property()), QSelectOp::Eq, "abc");
+    let invalid = state(
+        Vec::new(),
+        None,
+        Some(number_property()),
+        QSelectOp::Eq,
+        "abc",
+    );
     assert_eq!(
         invalid.validation_error(5),
         Some(crate::t!("Enter a valid number.").into_owned())
     );
 
-    let valid = state(Vec::new(), None, Some(number_property()), QSelectOp::Eq, "2");
+    let valid = state(
+        Vec::new(),
+        None,
+        Some(number_property()),
+        QSelectOp::Eq,
+        "2",
+    );
     assert_eq!(valid.validation_error(5), None);
 }
 
@@ -132,11 +153,29 @@ fn borrowed_rule_pins_each_branch() {
     let cases = [
         (Some("Line"), Some(&text), QSelectOp::Eq, "", None),
         (Some("Line"), Some(&text), QSelectOp::Any, "", None),
-        (Some("Line"), Some(&number), QSelectOp::Eq, "abc", enter_number.clone()),
+        (
+            Some("Line"),
+            Some(&number),
+            QSelectOp::Eq,
+            "abc",
+            enter_number.clone(),
+        ),
         (Some("Line"), Some(&number), QSelectOp::Eq, "2", None),
         (Some("Line"), Some(&number), QSelectOp::Gt, "2", None),
-        (Some("Line"), Some(&text), QSelectOp::Gt, "x", needs_number.clone()),
-        (Some("Line"), Some(&choice), QSelectOp::Eq, "", choose_value.clone()),
+        (
+            Some("Line"),
+            Some(&text),
+            QSelectOp::Gt,
+            "x",
+            needs_number.clone(),
+        ),
+        (
+            Some("Line"),
+            Some(&choice),
+            QSelectOp::Eq,
+            "",
+            choose_value.clone(),
+        ),
         (Some("Line"), Some(&choice), QSelectOp::Eq, "Dashed", None),
         (Some("Line"), None, QSelectOp::Eq, "", None),
         (None, None, QSelectOp::Eq, "", choose_filter.clone()),

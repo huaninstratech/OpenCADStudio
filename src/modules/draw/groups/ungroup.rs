@@ -14,13 +14,19 @@ pub fn tool() -> ToolDef {
 // ── CadCommand implementation ─────────────────────────────────────────────
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
 use crate::scene::model::wire_model::WireModel;
 
 pub struct UngroupCommand;
+
+impl Default for UngroupCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UngroupCommand {
     pub fn new() -> Self {

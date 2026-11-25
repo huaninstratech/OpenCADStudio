@@ -4,7 +4,7 @@
 //! session settings (lock what is outside the working set, give clashing
 //! named objects of an external reference unique names).
 
-use iced::widget::{button, column, container, row, text, toggler, Space};
+use iced::widget::{Space, button, column, container, row, text, toggler};
 use iced::{Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -35,7 +35,7 @@ fn msg(m: RefEditDialogMsg) -> Message {
 pub struct RefEditLevel {
     /// The reference's handle: the picked object for level 0, the
     /// definition-owned reference below it.
-    pub insert: codec::Handle,
+    pub insert: document::Handle,
     pub name: String,
     /// The definition's preview.
     pub wires: Vec<WireModel>,
@@ -47,7 +47,7 @@ pub struct RefEditLevel {
 }
 
 pub struct RefEditDialogState {
-    pub top: codec::Handle,
+    pub top: document::Handle,
     /// The picked chain, outermost first.
     pub chain: Vec<crate::modules::draw::modify::refedit::ChainLevel>,
     pub levels: Vec<RefEditLevel>,
@@ -144,9 +144,11 @@ pub fn view<'a>(
         }
         chips = chips.push(level_chip(&level.name, index, index == state.level));
     }
-    let mut about = column![text(crate::tr!("ref-edit", "dialog-chain-hint"))
-        .size(11)
-        .style(muted_style)]
+    let mut about = column![
+        text(crate::tr!("ref-edit", "dialog-chain-hint"))
+            .size(11)
+            .style(muted_style)
+    ]
     .spacing(4);
     if let Some(path) = current.and_then(|l| l.xref_path.as_deref()) {
         // A long path keeps its end, where the file name is.

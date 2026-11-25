@@ -97,6 +97,7 @@ impl BlockTextInstance {
     }
 }
 
+#[derive(Clone)]
 pub struct TextGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub vertex_count: u32,
@@ -106,6 +107,7 @@ pub struct TextGpu {
 /// one source: the range of its glyph vertices and the range of instances that
 /// place it. A drawing with thousands of text-bearing blocks otherwise paid
 /// two buffer allocations per source on every upload.
+#[derive(Clone)]
 pub struct BlockTextGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub instance_buffer: wgpu::Buffer,
@@ -132,12 +134,7 @@ struct BlockTextBatch {
 }
 
 impl BlockTextBatch {
-    fn flush(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        out: &mut Vec<BlockTextGpu>,
-    ) {
+    fn flush(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, out: &mut Vec<BlockTextGpu>) {
         if self.draws.is_empty() {
             return;
         }
@@ -295,6 +292,13 @@ pub struct TextAtlasGpu {
 }
 
 impl TextAtlasGpu {
+    pub(super) fn counted_gpu_bytes<'a>(
+        &'a self,
+        counter: &mut super::gpu_memory::ResourceCounter<'a>,
+    ) -> u64 {
+        counter.texture(&self._texture)
+    }
+
     /// Device bytes this atlas holds. `R8`, so one byte per texel.
     pub fn gpu_bytes(&self) -> u64 {
         u64::from(self._texture.width()) * u64::from(self._texture.height())

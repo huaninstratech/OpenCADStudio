@@ -1,6 +1,6 @@
 use super::*;
 use crate::scene::{block_distance_parameter as distance, block_point_parameter as point, Scene};
-use codec::{DwgReader, DwgWriter, DxfReader, DxfWriter};
+use document::{DwgReader, DwgWriter, DxfReader, DxfWriter};
 use std::io::Cursor;
 
 #[test]
@@ -13,7 +13,7 @@ fn rotation_table_angles_match_across_pi_wrap() {
 
 #[test]
 fn angular_value_sets_wrap_and_choose_the_nearest_periodic_value() {
-    use codec::objects::BlockParameterValueSet;
+    use document::objects::BlockParameterValueSet;
     let quarter = std::f64::consts::FRAC_PI_2;
     let mut set = BlockParameterValueSet {
         flags: 3,
@@ -32,7 +32,7 @@ fn angular_value_sets_wrap_and_choose_the_nearest_periodic_value() {
 
 #[test]
 fn signed_value_set_increments_preserve_negative_axis_values() {
-    let set = codec::objects::BlockParameterValueSet {
+    let set = document::objects::BlockParameterValueSet {
         flags: 4,
         increment: 2.0,
         ..Default::default()
@@ -47,11 +47,11 @@ pub(super) fn fixture() -> (Document, Handle, Vec<Handle>) {
         "ACTIONS",
         Vector3::ZERO,
         vec![
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::UNIT_X,
                 Vector3::new(2., 0., 0.),
             )),
-            EntityType::Circle(codec::entities::Circle::from_center_radius(
+            EntityType::Circle(document::entities::Circle::from_center_radius(
                 Vector3::new(4., 3., 0.),
                 2.,
             )),
@@ -149,13 +149,13 @@ fn block_actions_rotate_flip_saved_values_compose_copy_and_roundtrip() {
     create(&mut doc, def, Kind::Rotate, r, &[targets[0]], DVec3::ZERO).unwrap();
     create(&mut doc, def, Kind::Flip, f, &[targets[0]], DVec3::ZERO).unwrap();
     let a = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let b = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(30., 0., 0.),
         )))
@@ -208,7 +208,7 @@ fn block_actions_rotate_flip_saved_values_compose_copy_and_roundtrip() {
         scene.document = next;
         let c = scene.copy_entities(
             &[a],
-            &crate::command::EntityTransform::Translate(DVec3::new(40., 0., 0.)),
+            &crate::entities::transform::EntityTransform::Translate(DVec3::new(40., 0., 0.)),
         )[0];
         let next = instance::evaluate_value(&scene.document, c, f, Value::Flip(false))
             .unwrap()
@@ -250,7 +250,7 @@ fn block_actions_evaluate_stretch_with_relocated_flip_reflection_line() {
     .unwrap();
     create(&mut doc, def, Kind::Flip, flip, &targets, DVec3::ZERO).unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -270,22 +270,35 @@ fn block_actions_evaluate_stretch_with_relocated_flip_reflection_line() {
     }
     let key = flip_p.id.to_string();
     let h = doc.allocate_handle();
-    let mut r = codec::objects::XRecord::named(&key);
+    let mut r = document::objects::XRecord::named(&key);
     r.handle = h;
     r.owner = owner;
     r.reactors.push(owner);
-    r.cloning_flags = codec::objects::DictionaryCloningFlags::KeepExisting;
+    r.cloning_flags = document::objects::DictionaryCloningFlags::KeepExisting;
     let shifted_base = flip_p.base + DVec3::new(25., 10., 0.);
     let shifted_end = flip_p.end + DVec3::new(25., 10., 0.);
     r.entries = vec![
-        codec::objects::XRecordEntry::int32(1071, 0),
-        codec::objects::XRecordEntry::int32(1071, 0),
-        codec::objects::XRecordEntry::int16(70, 25),
-        codec::objects::XRecordEntry::int16(70, 104),
-        codec::objects::XRecordEntry::new(10, codec::objects::XRecordValue::Point3D(shifted_base.x, shifted_base.y, shifted_base.z)),
-        codec::objects::XRecordEntry::new(10, codec::objects::XRecordValue::Point3D(shifted_end.x, shifted_end.y, shifted_end.z)),
-        codec::objects::XRecordEntry::new(10, codec::objects::XRecordValue::Point3D(0., 0., -1.)),
-        codec::objects::XRecordEntry::int16(70, 0),
+        document::objects::XRecordEntry::int32(1071, 0),
+        document::objects::XRecordEntry::int32(1071, 0),
+        document::objects::XRecordEntry::int16(70, 25),
+        document::objects::XRecordEntry::int16(70, 104),
+        document::objects::XRecordEntry::new(
+            10,
+            document::objects::XRecordValue::Point3D(
+                shifted_base.x,
+                shifted_base.y,
+                shifted_base.z,
+            ),
+        ),
+        document::objects::XRecordEntry::new(
+            10,
+            document::objects::XRecordValue::Point3D(shifted_end.x, shifted_end.y, shifted_end.z),
+        ),
+        document::objects::XRecordEntry::new(
+            10,
+            document::objects::XRecordValue::Point3D(0., 0., -1.),
+        ),
+        document::objects::XRecordEntry::int16(70, 0),
     ];
     doc.objects.insert(h, ObjectType::XRecord(r));
     if let Some(ObjectType::Dictionary(d)) = doc.objects.get_mut(&owner) {
@@ -304,9 +317,17 @@ fn block_actions_evaluate_stretch_with_relocated_flip_reflection_line() {
         .expect("Stretch evaluation must succeed despite relocated flip parameter")
         .expect("Evaluation should change the document");
 
-    let EntityType::Insert(i) = evaluated.get_entity(insert).unwrap() else { panic!() };
-    let line_h = evaluated.block_records.get(&i.block_name).unwrap().entity_handles[0];
-    let EntityType::Line(l) = evaluated.get_entity(line_h).unwrap() else { panic!() };
+    let EntityType::Insert(i) = evaluated.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let line_h = evaluated
+        .block_records
+        .get(&i.block_name)
+        .unwrap()
+        .entity_handles[0];
+    let EntityType::Line(l) = evaluated.get_entity(line_h).unwrap() else {
+        panic!()
+    };
     assert_eq!(l.end, Vector3::new(12., 0., 0.));
 
     let flipped_doc = instance::evaluate_value(&evaluated, insert, flip, Value::Flip(true))
@@ -555,7 +576,7 @@ fn block_actions_saved_xy_polar_cache_metadata_and_rejections() {
         .unwrap();
         create(&mut doc, def, Kind::Move, p, &[handles[0]], DVec3::ZERO).unwrap();
         let a = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
@@ -578,7 +599,7 @@ fn block_actions_saved_xy_polar_cache_metadata_and_rejections() {
                 _ => None,
             })
             .unwrap();
-        r.entries.push(codec::objects::XRecordEntry::string(
+        r.entries.push(document::objects::XRecordEntry::string(
             1,
             "retain opaque metadata",
         ));
@@ -613,13 +634,13 @@ fn block_actions_saved_references_independent_absolute_and_roundtrip() {
     create(&mut doc, def, Kind::Scale, p, &[handles[1]], DVec3::ZERO).unwrap();
     create(&mut doc, def, Kind::Move, q, &[handles[0]], DVec3::ZERO).unwrap();
     let a = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let b = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(30., 0., 0.),
         )))
@@ -704,7 +725,7 @@ fn block_actions_saved_references_independent_absolute_and_roundtrip() {
         scene.document = next.clone();
         let c = scene.copy_entities(
             &[a],
-            &crate::command::EntityTransform::Translate(DVec3::new(40., 0., 0.)),
+            &crate::entities::transform::EntityTransform::Translate(DVec3::new(40., 0., 0.)),
         )[0];
         let copy = instance::evaluate(&scene.document, c, q, DVec3::new(7., 8., 0.))
             .unwrap()
@@ -833,13 +854,13 @@ fn block_reset_restores_values_geometry_and_table_state_without_changing_other_r
     )
     .unwrap();
     let a = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let b = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(30., 0., 0.),
         )))
@@ -968,11 +989,11 @@ fn block_actions_reframe_moves_markers_and_retains_targets_and_connections() {
 
 fn stretch_fixture() -> (Document, Handle, Vec<Handle>, Handle, Handle) {
     let mut scene = Scene::new();
-    let mut poly = codec::entities::LwPolyline::from_points(vec![
-        codec::types::Vector2::new(0., 1.),
-        codec::types::Vector2::new(10., 1.),
-        codec::types::Vector2::new(10., 3.),
-        codec::types::Vector2::new(0., 3.),
+    let mut poly = document::entities::LwPolyline::from_points(vec![
+        document::types::Vector2::new(0., 1.),
+        document::types::Vector2::new(10., 1.),
+        document::types::Vector2::new(10., 3.),
+        document::types::Vector2::new(0., 3.),
     ]);
     poly.is_closed = true;
     poly.vertices[0].bulge = 0.2;
@@ -980,12 +1001,12 @@ fn stretch_fixture() -> (Document, Handle, Vec<Handle>, Handle, Handle) {
         "STRETCH",
         Vector3::ZERO,
         vec![
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::ZERO,
                 Vector3::new(10., 0., 0.),
             )),
             EntityType::LwPolyline(poly),
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::new(20., 0., 0.),
                 Vector3::new(21., 0., 0.),
             )),
@@ -1013,7 +1034,7 @@ fn polar_stretch_fixture() -> (Document, Handle, Vec<Handle>, Handle, Handle) {
     scene.define_block_raw(
         "POLAR_STRETCH",
         Vector3::ZERO,
-        vec![EntityType::Line(codec::entities::Line::from_points(
+        vec![EntityType::Line(document::entities::Line::from_points(
             Vector3::UNIT_X,
             Vector3::new(2., 0., 0.),
         ))],
@@ -1072,7 +1093,7 @@ fn polar_stretch_evaluates_test_block_and_saved_reference() {
 
     let mut source = baseline.clone();
     let insert = source
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "POLAR_STRETCH",
             Vector3::ZERO,
         )))
@@ -1106,11 +1127,11 @@ fn polar_stretch_retarget_rebinds_vertices_and_roundtrips() {
         "POLAR_RETARGET",
         Vector3::ZERO,
         vec![
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::UNIT_X,
                 Vector3::new(2., 0., 0.),
             )),
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::new(4., 0., 0.),
                 Vector3::new(5., 0., 0.),
             )),
@@ -1223,16 +1244,147 @@ fn block_actions_stretch_frozen_vertices_polyline_and_whole_objects_roundtrip() 
 }
 
 #[test]
+fn block_actions_stretch_legacy_polyline_vertices_and_solid_corners() {
+    use document::entities::{Insert, Polyline2D, Solid, Vertex2D};
+
+    let a = Vector3::ZERO;
+    let b = Vector3::new(10., 0., 0.);
+    let c = Vector3::new(0., 4., 0.);
+    let d = Vector3::new(10., 4., 0.);
+    let mut polyline = Polyline2D::new();
+    for point in [a, b, d] {
+        polyline.add_vertex(Vertex2D::new(point));
+    }
+    polyline.vertices[0].bulge = 0.2;
+    let mut scene = Scene::new();
+    scene.define_block_raw(
+        "PLANAR_STRETCH",
+        a,
+        vec![
+            EntityType::Polyline2D(polyline),
+            EntityType::Solid(Solid::new(a, b, c, d)),
+        ],
+    );
+    let mut doc = scene.document;
+    let block = doc.block_records.get("PLANAR_STRETCH").unwrap();
+    let (def, targets) = (block.handle, block.entity_handles.clone());
+    let parameter = distance::create(&mut doc, def, distance::Kind::Linear, a, b, b).unwrap();
+    create_with_frame(
+        &mut doc,
+        def,
+        Kind::Stretch,
+        parameter,
+        &targets,
+        DVec3::ZERO,
+        Some([DVec3::new(9., -1., 0.), DVec3::new(11., 5., 0.)]),
+    )
+    .unwrap();
+    let insert = doc
+        .add_entity(EntityType::Insert(Insert::new("PLANAR_STRETCH", a)))
+        .unwrap();
+    let result = instance::evaluate(&doc, insert, parameter, DVec3::new(20., 0., 0.))
+        .unwrap()
+        .unwrap();
+    let reopened = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&result).unwrap()))
+        .read()
+        .unwrap();
+    for drawing in [&result, &reopened] {
+        let EntityType::Insert(reference) = drawing.get_entity(insert).unwrap() else {
+            panic!()
+        };
+        let members = &drawing
+            .block_records
+            .get(&reference.block_name)
+            .unwrap()
+            .entity_handles;
+        let EntityType::Polyline2D(polyline) = drawing.get_entity(members[0]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            polyline
+                .vertices
+                .iter()
+                .map(|v| v.location.x)
+                .collect::<Vec<_>>(),
+            [0., 20., 20.]
+        );
+        assert!((polyline.vertices[0].bulge - 0.1).abs() < 1e-8);
+        let EntityType::Solid(solid) = drawing.get_entity(members[1]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(solid.first_corner, a);
+        assert_eq!(solid.third_corner, c);
+        assert_eq!(solid.second_corner, Vector3::new(20., 0., 0.));
+        assert_eq!(solid.fourth_corner, Vector3::new(20., 4., 0.));
+    }
+    assert_eq!(result.get_entity(targets[0]), doc.get_entity(targets[0]));
+    assert_eq!(result.get_entity(targets[1]), doc.get_entity(targets[1]));
+}
+
+#[test]
+fn block_actions_stretch_native_basepoint_binding_moves_the_reference_insertion_point() {
+    let (mut doc, def, _, parameter, action) = stretch_fixture();
+    let basepoint = crate::scene::block_basepoint::create(&mut doc, def, Vector3::ZERO).unwrap();
+    let (_, native) = crate::scene::block_basepoint::parameter(&doc, def).unwrap();
+    let node = native.parameter.parameter.element.eval.node_id;
+    let Some(ObjectType::DynamicBlock(object)) = doc.objects.get_mut(&action) else {
+        panic!()
+    };
+    let DynamicBlockData::StretchAction(action) = &mut object.data else {
+        panic!()
+    };
+    action.action.dependencies.push(basepoint);
+    action.action.action_ids.push(node);
+    action.codes.push(document::objects::BlockStretchCode {
+        code: node,
+        indexes: vec![0],
+    });
+    let insert = doc
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
+            "STRETCH",
+            Vector3::new(40., 0., 0.),
+        )))
+        .unwrap();
+    for length in [18., 22., 10.] {
+        doc = instance::evaluate(&doc, insert, parameter, DVec3::new(length, 0., 0.))
+            .unwrap()
+            .unwrap();
+        let EntityType::Insert(reference) = doc.get_entity(insert).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            reference.insert_point,
+            Vector3::new(40. + length - 10., 0., 0.)
+        );
+        assert_eq!(
+            crate::scene::render_graph::block_base_point(&doc, &reference.block_name),
+            Vector3::new(length - 10., 0., 0.),
+        );
+        assert_eq!(
+            crate::scene::render_graph::block_base_point(&doc, "STRETCH"),
+            Vector3::ZERO,
+        );
+        assert_eq!(
+            crate::scene::render_graph::insert_transform(&doc, reference).apply(Vector3::ZERO),
+            Vector3::new(40., 0., 0.),
+        );
+        doc = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&doc).unwrap()))
+            .read()
+            .unwrap();
+    }
+}
+
+#[test]
 fn block_actions_stretch_saved_reference_independence_copy_and_reopen() {
     let (mut doc, def, handles, p, _) = stretch_fixture();
     let a = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "STRETCH",
             Vector3::ZERO,
         )))
         .unwrap();
     let b = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "STRETCH",
             Vector3::new(40., 0., 0.),
         )))
@@ -1247,7 +1399,7 @@ fn block_actions_stretch_saved_reference_independence_copy_and_reopen() {
     scene.document = doc;
     let c = scene.copy_entities(
         &[a],
-        &crate::command::EntityTransform::Translate(DVec3::new(60., 0., 0.)),
+        &crate::entities::transform::EntityTransform::Translate(DVec3::new(60., 0., 0.)),
     )[0];
     let mut doc = scene.document;
     let EntityType::Insert(ins) = doc.get_entity(a).unwrap() else {
@@ -1574,13 +1726,13 @@ fn block_actions_retarget_refresh_resets_old_targets_and_keeps_each_reference_va
     let p = linear(&mut doc, def);
     let a = create(&mut doc, def, Kind::Move, p, &targets[..1], DVec3::ZERO).unwrap();
     let first = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let second = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(40., 0., 0.),
         )))
@@ -1595,7 +1747,7 @@ fn block_actions_retarget_refresh_resets_old_targets_and_keeps_each_reference_va
     scene.document = doc;
     let copied = scene.copy_entities(
         &[first],
-        &crate::command::EntityTransform::Translate(DVec3::new(80., 0., 0.)),
+        &crate::entities::transform::EntityTransform::Translate(DVec3::new(80., 0., 0.)),
     )[0];
     let mut doc = scene.document;
     let original_line = doc.get_entity(targets[0]).unwrap().clone();
@@ -1684,7 +1836,7 @@ fn block_actions_topology_identity_reorder_add_delete_type_and_native_roundtrip(
     let p = linear(&mut doc, def);
     create(&mut doc, def, Kind::Move, p, &targets[..1], DVec3::ZERO).unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -1710,7 +1862,7 @@ fn block_actions_topology_identity_reorder_add_delete_type_and_native_roundtrip(
         .entity_handles
         .retain(|h| *h != targets[1]);
     let mut line =
-        codec::entities::Line::from_points(Vector3::new(20., 0., 0.), Vector3::new(21., 0., 0.));
+        document::entities::Line::from_points(Vector3::new(20., 0., 0.), Vector3::new(21., 0., 0.));
     line.common.owner_handle = def;
     let new = doc.add_entity(EntityType::Line(line)).unwrap();
     authoring::tag_members(&mut doc, def);
@@ -1733,7 +1885,7 @@ fn block_actions_topology_identity_reorder_add_delete_type_and_native_roundtrip(
     assert_eq!(start(&doc, members[1]), Vector3::new(3., 0., 0.));
     assert!(doc.get_entity(old[1]).is_none());
     let mut changed = doc.clone();
-    let mut circle = codec::entities::Circle::from_center_radius(Vector3::new(6., 6., 0.), 1.);
+    let mut circle = document::entities::Circle::from_center_radius(Vector3::new(6., 6., 0.), 1.);
     circle.common = changed.get_entity(new).unwrap().common().clone();
     *changed.get_entity_mut(new).unwrap() = EntityType::Circle(circle);
     let changed = instance::refresh_after_edit(&changed, &doc, def).unwrap();
@@ -1766,12 +1918,12 @@ fn block_actions_topology_identity_reorder_add_delete_type_and_native_roundtrip(
 
 #[test]
 fn block_actions_topology_copy_tags_and_extension_dictionary_do_not_share() {
-    use codec::objects::XRecord;
+    use document::objects::XRecord;
     let (mut doc, def, targets) = fixture();
     let p = linear(&mut doc, def);
     create(&mut doc, def, Kind::Move, p, &targets[..1], DVec3::ZERO).unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -1845,13 +1997,13 @@ fn block_actions_topology_preserves_visibility_choice_after_discriminator_delete
     visibility::set_visible(&mut doc, visibility, 1, &targets[1..], false);
     visibility::finish_editing(&mut doc, def);
     let first = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let second = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(40., 0., 0.),
         )))
@@ -1871,7 +2023,7 @@ fn block_actions_topology_preserves_visibility_choice_after_discriminator_delete
         .entity_handles
         .retain(|h| *h != targets[1]);
     let mut entity =
-        codec::entities::Line::from_points(Vector3::new(20., 0., 0.), Vector3::new(21., 0., 0.));
+        document::entities::Line::from_points(Vector3::new(20., 0., 0.), Vector3::new(21., 0., 0.));
     entity.common.owner_handle = def;
     let new = doc.add_entity(EntityType::Line(entity)).unwrap();
     visibility::set_visible(&mut doc, visibility, 0, &[new], false);
@@ -1901,7 +2053,7 @@ fn block_actions_topology_nested_insert_attribute_handles_remain_independent() {
     let p = linear(&mut doc, def);
     create(&mut doc, def, Kind::Move, p, &targets[..1], DVec3::ZERO).unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -1914,14 +2066,14 @@ fn block_actions_topology_nested_insert_attribute_handles_remain_independent() {
     scene.define_block_raw(
         "CHILD",
         Vector3::ZERO,
-        vec![EntityType::Line(codec::entities::Line::from_points(
+        vec![EntityType::Line(document::entities::Line::from_points(
             Vector3::ZERO,
             Vector3::UNIT_Y,
         ))],
     );
-    let mut child = codec::entities::Insert::new("CHILD", Vector3::new(20., 0., 0.));
+    let mut child = document::entities::Insert::new("CHILD", Vector3::new(20., 0., 0.));
     child.common.owner_handle = def;
-    let mut attribute = codec::entities::AttributeEntity::new("TAG".into(), "value".into());
+    let mut attribute = document::entities::AttributeEntity::new("TAG".into(), "value".into());
     attribute.common.handle = scene.document.allocate_handle();
     child.attributes.push(attribute);
     child.seqend_handle = Some(scene.document.allocate_handle());
@@ -2206,13 +2358,13 @@ fn block_actions_array_saved_references_independent_copy_and_roundtrip() {
     create_array(&mut doc, def, p, &[targets[0]], DVec3::ZERO, 2.0, 1.0).unwrap();
 
     let a = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
         .unwrap();
     let b = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::new(100., 0., 0.),
         )))
@@ -2388,7 +2540,7 @@ fn block_action_overrides_evaluate_and_roundtrip_without_accumulation() {
                 .clone();
             let mut source = reopened.clone();
             let reference = source
-                .add_entity(EntityType::Insert(codec::entities::Insert::new(
+                .add_entity(EntityType::Insert(document::entities::Insert::new(
                     name,
                     Vector3::ZERO,
                 )))
@@ -2424,7 +2576,7 @@ fn block_action_overrides_evaluate_and_roundtrip_without_accumulation() {
 
 #[test]
 fn block_stretch_supports_curves_points_and_text_with_native_vertex_membership() {
-    use codec::entities::{Arc, Circle, Ellipse, MText, Point, Text};
+    use document::entities::{Arc, Circle, Ellipse, MText, Point, Text};
     let mut text = Text::new();
     text.insertion_point = Vector3::new(-2., 0., 0.);
     text.normal = Vector3::new(0., 0., -1.);
@@ -2560,7 +2712,7 @@ fn block_polygon_stretch_frames_bind_concave_regions_and_replace_atomically() {
     scene.define_block_raw(
         "POLYGON_FRAME",
         Vector3::ZERO,
-        vec![EntityType::Line(codec::entities::Line::from_points(
+        vec![EntityType::Line(document::entities::Line::from_points(
             Vector3::new(0.5, 3., 0.),
             Vector3::new(3., 3., 0.),
         ))],
@@ -2681,19 +2833,19 @@ fn polar_stretch_rotates_and_extends_separate_selections_with_native_overrides()
         "POLAR_GROUPS",
         Vector3::ZERO,
         vec![
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::ZERO,
                 Vector3::new(10., 0., 0.),
             )),
-            EntityType::Line(codec::entities::Line::from_points(
+            EntityType::Line(document::entities::Line::from_points(
                 Vector3::new(1., 1., 0.),
                 Vector3::new(2., 1., 0.),
             )),
-            EntityType::Circle(codec::entities::Circle::from_center_radius(
+            EntityType::Circle(document::entities::Circle::from_center_radius(
                 Vector3::new(10., 2., 0.),
                 1.,
             )),
-            EntityType::Point(codec::entities::Point::from_coords(4., 4., 0.)),
+            EntityType::Point(document::entities::Point::from_coords(4., 4., 0.)),
         ],
     );
     let record = scene.document.block_records.get("POLAR_GROUPS").unwrap();
@@ -2778,7 +2930,7 @@ fn polar_stretch_rotates_and_extends_separate_selections_with_native_overrides()
         }
         let mut source = reopened.clone();
         let insert = source
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "POLAR_GROUPS",
                 Vector3::ZERO,
             )))
@@ -2878,13 +3030,13 @@ fn block_actions_independent_bases_evaluate_save_reset_and_isolate_references() 
         }
         assert!(options::set_base(&mut doc, Handle::NULL, action, false, None).is_err());
         let a = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
             .unwrap();
         let b = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::new(30., 0., 0.),
             )))
@@ -3105,7 +3257,7 @@ fn block_parameters_without_grips_remain_evaluable_and_roundtrip() {
         assert_eq!(all_parameters(&doc, def).len(), 1);
         assert_eq!(all_parameters(&doc, def)[0].grip, Handle::NULL);
         let insert = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
@@ -3374,11 +3526,22 @@ fn array_and_scale_use_the_authored_order_after_reload() {
     let (mut doc, def, handles) = fixture();
     let parameter = linear(&mut doc, def);
     let scale = add_action(&mut doc, def, parameter, handles[1], Kind::Scale);
-    let array = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 10., 1.)
+    let array = create_array(
+        &mut doc,
+        def,
+        parameter,
+        &[handles[1]],
+        DVec3::ZERO,
+        10.,
+        1.,
+    )
+    .unwrap();
+    let insert = doc
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
+            "ACTIONS",
+            Vector3::ZERO,
+        )))
         .unwrap();
-    let insert = doc.add_entity(EntityType::Insert(codec::entities::Insert::new(
-        "ACTIONS", Vector3::ZERO,
-    ))).unwrap();
     for (head, next, expected) in [
         (scale, array, [8., 18., 28.]),
         (array, scale, [8., 28., 48.]),
@@ -3388,13 +3551,16 @@ fn array_and_scale_use_the_authored_order_after_reload() {
         assert!(super::chain::set_by_name(&mut authored, def, head, &name).unwrap());
         for extension in ["dwg", "dxf"] {
             let bytes = crate::io::save_to_bytes(&authored, extension, authored.version).unwrap();
-            let reopened = crate::io::load_bytes(&format!("array-chain.{extension}"), bytes).unwrap();
+            let reopened =
+                crate::io::load_bytes(&format!("array-chain.{extension}"), bytes).unwrap();
             let evaluated = instance::evaluate(&reopened, insert, parameter, DVec3::X * 20.)
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let EntityType::Insert(reference) = evaluated.get_entity(insert).unwrap() else {
                 panic!()
             };
-            let mut positions: Vec<_> = evaluated.entities_in_block(&reference.block_name)
+            let mut positions: Vec<_> = evaluated
+                .entities_in_block(&reference.block_name)
                 .filter_map(|entity| match entity {
                     EntityType::Circle(circle) => {
                         assert_eq!(circle.center.y, 6.);
@@ -3402,12 +3568,23 @@ fn array_and_scale_use_the_authored_order_after_reload() {
                         Some(circle.center.x)
                     }
                     _ => None,
-                }).collect();
+                })
+                .collect();
             positions.sort_by(f64::total_cmp);
             assert_eq!(positions, expected);
             let refreshed = instance::refresh(&evaluated, def).unwrap();
-            assert_eq!(refreshed.block_records.get(&reference.block_name).unwrap().entity_handles,
-                evaluated.block_records.get(&reference.block_name).unwrap().entity_handles);
+            assert_eq!(
+                refreshed
+                    .block_records
+                    .get(&reference.block_name)
+                    .unwrap()
+                    .entity_handles,
+                evaluated
+                    .block_records
+                    .get(&reference.block_name)
+                    .unwrap()
+                    .entity_handles
+            );
         }
     }
 }
@@ -3428,7 +3605,10 @@ fn a_chain_refuses_an_unnamed_node_and_can_join_an_existing_sequence() {
     assert!(super::chain::set(&mut doc, def, move_action, Some(scale_action)).unwrap());
     let extra = add_action(&mut doc, def, parameter, member, Kind::Move);
     assert!(super::chain::set(&mut doc, def, extra, Some(scale_action)).unwrap());
-    assert_eq!(drive(&mut doc, def, parameter, member), (DVec3::new(48., 6., 0.), 4.));
+    assert_eq!(
+        drive(&mut doc, def, parameter, member),
+        (DVec3::new(48., 6., 0.), 4.)
+    );
 }
 
 #[test]
@@ -3445,7 +3625,10 @@ fn stretch_and_scale_follow_the_authored_order_with_frozen_vertices() {
         let mut authored = doc.clone();
         let name = action_object(&authored, next).element.name.clone();
         assert!(super::chain::set_by_name(&mut authored, def, head, &name).unwrap());
-        assert_eq!(action_object(&authored, stretch).action_ids.first(), Some(&driver));
+        assert_eq!(
+            action_object(&authored, stretch).action_ids.first(),
+            Some(&driver)
+        );
         let mut evaluated = authored.clone();
         evaluate(&mut evaluated, &authored, def, parameter, DVec3::X * 20.).unwrap();
         let EntityType::Line(line) = evaluated.get_entity(targets[0]).unwrap() else {
@@ -3547,8 +3730,8 @@ fn a_retained_loop_releases_its_exits_in_order_before_their_join() {
     chain_after(&mut doc, move_exit, join);
     for extension in ["dwg", "dxf"] {
         let bytes = crate::io::save_to_bytes(&doc, extension, doc.version).unwrap();
-        let mut reopened = crate::io::load_bytes(&format!("cycle-exits.{extension}"), bytes)
-            .unwrap();
+        let mut reopened =
+            crate::io::load_bytes(&format!("cycle-exits.{extension}"), bytes).unwrap();
         assert_eq!(
             drive(&mut reopened, def, parameter, member),
             (DVec3::new(88., 6., 0.), 4.)
@@ -3596,10 +3779,9 @@ fn two_chains_join_before_applying_their_shared_follow_up_once() {
 fn nested_arrays_reserve_the_full_copy_budget_atomically() {
     let (mut doc, def, handles) = fixture();
     let parameter = linear(&mut doc, def);
-    let first = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 1., 1.)
-        .unwrap();
-    let second = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 2., 1.)
-        .unwrap();
+    let first = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 1., 1.).unwrap();
+    let second =
+        create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 2., 1.).unwrap();
     chain_after(&mut doc, first, second);
     let baseline = doc.clone();
     assert_eq!(
@@ -3621,7 +3803,8 @@ fn retained_follow_up_branches_run_in_list_order_after_reload() {
     chain_names(&mut doc, head, &[second, first, second]);
     for extension in ["dwg", "dxf"] {
         let bytes = crate::io::save_to_bytes(&doc, extension, doc.version).unwrap();
-        let mut saved = crate::io::load_bytes(&format!("branched-chain.{extension}"), bytes).unwrap();
+        let mut saved =
+            crate::io::load_bytes(&format!("branched-chain.{extension}"), bytes).unwrap();
         assert_eq!(
             drive(&mut saved, def, parameter, handles[1]),
             (DVec3::new(38., 6., 0.), 4.)
@@ -3662,8 +3845,8 @@ fn action_follow_up_list_preserves_literal_names_and_retained_metadata() {
     assert_eq!(super::chain::labels(&doc, def, head).unwrap(), names);
     for extension in ["dwg", "dxf"] {
         let bytes = crate::io::save_to_bytes(&doc, extension, doc.version).unwrap();
-        let mut saved = crate::io::load_bytes(&format!("authored-branches.{extension}"), bytes)
-            .unwrap();
+        let mut saved =
+            crate::io::load_bytes(&format!("authored-branches.{extension}"), bytes).unwrap();
         assert_eq!(action_object(&saved, head).action_ids, expected);
         assert!(!super::chain::set_by_name(&mut saved, def, head, &input).unwrap());
         assert!(super::chain::set_by_name(&mut saved, def, head, "[]").unwrap());
@@ -3675,17 +3858,25 @@ fn action_follow_up_list_preserves_literal_names_and_retained_metadata() {
 fn a_named_array_of_an_array_passes_every_copy_to_its_follow_up_once() {
     let (mut doc, def, handles) = fixture();
     let parameter = linear(&mut doc, def);
-    let first = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 5., 1.)
-        .unwrap();
-    let second = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 10., 1.)
-        .unwrap();
+    let first = create_array(&mut doc, def, parameter, &[handles[1]], DVec3::ZERO, 5., 1.).unwrap();
+    let second = create_array(
+        &mut doc,
+        def,
+        parameter,
+        &[handles[1]],
+        DVec3::ZERO,
+        10.,
+        1.,
+    )
+    .unwrap();
     let scale = add_action(&mut doc, def, parameter, handles[1], Kind::Scale);
     chain_after(&mut doc, first, second);
     chain_after(&mut doc, second, scale);
     let baseline = doc.clone();
     evaluate(&mut doc, &baseline, def, parameter, DVec3::X * 20.).unwrap();
     let mut ids = std::collections::BTreeSet::new();
-    let mut positions: Vec<_> = doc.entities_in_block("ACTIONS")
+    let mut positions: Vec<_> = doc
+        .entities_in_block("ACTIONS")
         .filter_map(|entity| match entity {
             EntityType::Circle(circle) => {
                 assert!(ids.insert(authoring::element_id(entity).unwrap()));
@@ -3694,33 +3885,49 @@ fn a_named_array_of_an_array_passes_every_copy_to_its_follow_up_once() {
                 Some(circle.center.x)
             }
             _ => None,
-        }).collect();
+        })
+        .collect();
     positions.sort_by(f64::total_cmp);
-    assert_eq!(positions, [8., 18., 28., 28., 38., 38., 48., 48., 48., 58., 58., 68., 68., 78., 88.]);
+    assert_eq!(
+        positions,
+        [8., 18., 28., 28., 38., 38., 48., 48., 48., 58., 58., 68., 68., 78., 88.]
+    );
 }
 
 #[test]
 fn polar_stretch_and_move_follow_the_authored_order_after_reload() {
     let (mut doc, def, targets, parameter, polar) = polar_stretch_fixture();
     let movement = add_action(&mut doc, def, parameter, targets[0], Kind::Move);
-    let insert = doc.add_entity(EntityType::Insert(codec::entities::Insert::new(
-        "POLAR_STRETCH", Vector3::ZERO,
-    ))).unwrap();
+    let insert = doc
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
+            "POLAR_STRETCH",
+            Vector3::ZERO,
+        )))
+        .unwrap();
     for (head, next, expected_y) in [(polar, movement, 11.), (movement, polar, -9.)] {
         let mut authored = doc.clone();
         let name = action_object(&authored, next).element.name.clone();
         assert!(super::chain::set_by_name(&mut authored, def, head, &name).unwrap());
         for extension in ["dwg", "dxf"] {
             let bytes = crate::io::save_to_bytes(&authored, extension, authored.version).unwrap();
-            let reopened = crate::io::load_bytes(&format!("polar-chain.{extension}"), bytes).unwrap();
+            let reopened =
+                crate::io::load_bytes(&format!("polar-chain.{extension}"), bytes).unwrap();
             let changed = instance::evaluate(&reopened, insert, parameter, DVec3::Y * 10.)
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let EntityType::Insert(reference) = changed.get_entity(insert).unwrap() else {
                 panic!()
             };
-            let line = changed.entities_in_block(&reference.block_name).find_map(|e| {
-                if let EntityType::Line(line) = e { Some(line) } else { None }
-            }).unwrap();
+            let line = changed
+                .entities_in_block(&reference.block_name)
+                .find_map(|e| {
+                    if let EntityType::Line(line) = e {
+                        Some(line)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
             assert!(v(line.start).distance(DVec3::new(-10., expected_y, 0.)) < 1e-8);
         }
     }
@@ -3885,12 +4092,14 @@ fn inactive_flip_with_retained_action_targets_does_not_block_other_parameters() 
         drive(&mut doc, def, parameter, member),
         (DVec3::new(28., 6., 0.), 4.)
     );
+    // Another action carries no frame: an active Flip keeps the link and
+    // flips its member.
     let mut active = baseline.clone();
+    assert!(evaluate_value(&mut active, &baseline, def, flip, Value::Flip(true)).unwrap());
     assert_eq!(
-        evaluate_value(&mut active, &baseline, def, flip, Value::Flip(true)).unwrap_err(),
-        "This action targets another parameter or an unsupported native object."
+        action_object_mut(&mut active, flip_action).dependencies,
+        action_object_mut(&mut baseline.clone(), flip_action).dependencies
     );
-    assert_eq!(active, baseline);
 }
 
 #[test]
@@ -3923,13 +4132,13 @@ fn flip_linear_frames_survive_reload_and_remain_reference_local() {
             .dependencies
             .extend([linear, move_action]);
         let first = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
             .unwrap();
         let other = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::UNIT_X * 40.,
             )))
@@ -4076,7 +4285,7 @@ fn flip_does_not_drop_unmanaged_parameter_targets() {
         .dependencies
         .push(linear);
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -4117,7 +4326,7 @@ fn active_flip_transports_linked_parameter_and_action_frames() {
         .dependencies
         .extend([linear, move_action]);
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -4205,7 +4414,7 @@ fn single_flip_transports_relocated_linear_grip_offsets() {
     )
     .unwrap();
     let insert = doc
-        .add_entity(EntityType::Insert(codec::entities::Insert::new(
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
             "ACTIONS",
             Vector3::ZERO,
         )))
@@ -4236,7 +4445,10 @@ fn single_flip_transports_relocated_linear_grip_offsets() {
         .unwrap()
         .unwrap();
     assert_eq!(offset(&unflipped), DVec3::Y * 2.);
-    assert_eq!(instance::frame(&unflipped, insert, &parameter).unwrap().end, DVec3::X * 15.);
+    assert_eq!(
+        instance::frame(&unflipped, insert, &parameter).unwrap().end,
+        DVec3::X * 15.
+    );
 }
 
 #[test]
@@ -4289,13 +4501,13 @@ fn flip_uses_active_axis_after_incoming_moves_without_losing_linear_edits() {
             .unwrap();
             action_object_mut(&mut doc, move_axis).dependencies = vec![flip];
             let first = doc
-                .add_entity(EntityType::Insert(codec::entities::Insert::new(
+                .add_entity(EntityType::Insert(document::entities::Insert::new(
                     "ACTIONS",
                     Vector3::ZERO,
                 )))
                 .unwrap();
             let other = doc
-                .add_entity(EntityType::Insert(codec::entities::Insert::new(
+                .add_entity(EntityType::Insert(document::entities::Insert::new(
                     "ACTIONS",
                     Vector3::UNIT_X * 40.,
                 )))
@@ -4451,7 +4663,7 @@ fn linked_linear_flip_coexists_with_an_independent_geometry_flip() {
         )
         .unwrap();
         let insert = doc
-            .add_entity(EntityType::Insert(codec::entities::Insert::new(
+            .add_entity(EntityType::Insert(document::entities::Insert::new(
                 "ACTIONS",
                 Vector3::ZERO,
             )))
@@ -4556,4 +4768,95 @@ fn linked_linear_flip_coexists_with_an_independent_geometry_flip() {
             }
         }
     }
+}
+
+#[test]
+fn dependent_scale_accumulates_base_edits_and_survives_refresh() {
+    let (mut doc, def, handles) = fixture();
+    let parameter = linear(&mut doc, def);
+    let _scale = add_action(&mut doc, def, parameter, handles[1], Kind::Scale);
+    let insert = doc
+        .add_entity(EntityType::Insert(document::entities::Insert::new(
+            "ACTIONS",
+            Vector3::ZERO,
+        )))
+        .unwrap();
+
+    // Edit 1: Move base outward to -10, end remains 10 (dist=20, 2x scale)
+    let edit1 = instance::evaluate_frame(
+        &doc,
+        insert,
+        parameter,
+        instance::ParameterFrame {
+            base: DVec3::new(-10., 0., 0.),
+            end: DVec3::new(10., 0., 0.),
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    let EntityType::Insert(ins1) = edit1.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let c1 = edit1
+        .entities_in_block(&ins1.block_name)
+        .find_map(|e| {
+            if let EntityType::Circle(c) = e {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    // Center was (4,3). Scaled by 2 => (8,6). Transformed by action_base (10) => (18, 6).
+    assert_eq!(c1.center, Vector3::new(18., 6., 0.));
+    assert_eq!(c1.radius, 4.);
+
+    // Edit 2: Move base outward again to -20, end remains 10 (dist=30, 3x scale)
+    let edit2 = instance::evaluate_frame(
+        &edit1,
+        insert,
+        parameter,
+        instance::ParameterFrame {
+            base: DVec3::new(-20., 0., 0.),
+            end: DVec3::new(10., 0., 0.),
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    let EntityType::Insert(ins2) = edit2.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let c2 = edit2
+        .entities_in_block(&ins2.block_name)
+        .find_map(|e| {
+            if let EntityType::Circle(c) = e {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    // Center was (4,3). Scaled by 3 => (12,9). Transformed by accumulated action_base (25) => (37, 9).
+    assert_eq!(c2.center, Vector3::new(37., 9., 0.));
+    assert_eq!(c2.radius, 6.);
+
+    // Refresh: Definition refresh reconstructs from definition baseline and must preserve accumulated action base!
+    let refreshed = instance::refresh_after_edit(&edit2, &edit1, def).unwrap();
+    let EntityType::Insert(ins_ref) = refreshed.get_entity(insert).unwrap() else {
+        panic!()
+    };
+    let c_ref = refreshed
+        .entities_in_block(&ins_ref.block_name)
+        .find_map(|e| {
+            if let EntityType::Circle(c) = e {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(c_ref.center, Vector3::new(37., 9., 0.));
+    assert_eq!(c_ref.radius, 6.);
 }

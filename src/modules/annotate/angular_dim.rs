@@ -1,7 +1,7 @@
-use codec::entities::{Dimension, DimensionAngular2Ln, DimensionAngular3Pt};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
-use kernel::geom2d::{
+use document::entities::{Dimension, DimensionAngular2Ln, DimensionAngular3Pt};
+use document::types::{Handle, Vector3};
+use document::EntityType;
+use ocs_geom::geom2d::{
     closest_point, line_line, Arc as KernelArc, BulgeArc, Curve as KernelCurve, Line as KernelLine,
 };
 
@@ -117,6 +117,12 @@ pub struct AngularDimensionCommand {
     angle_origin: Option<DVec3>,
     awaiting_quadrant: bool,
     quadrant_lock: Option<(f64, f64)>,
+}
+
+impl Default for AngularDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AngularDimensionCommand {
@@ -341,6 +347,11 @@ impl CadCommand for AngularDimensionCommand {
 
     fn name(&self) -> &'static str {
         "DIMANGULAR"
+    }
+
+    /// A dimension's point prompts refuse unusable input this way (measured).
+    fn point_rejection(&self) -> Option<String> {
+        Some(t!("Invalid point input.").into_owned())
     }
 
     fn prompt(&self) -> String {
@@ -863,6 +874,40 @@ impl CadCommand for AngularDimensionCommand {
     }
 }
 
+/// What MEASUREGEOM's Angle reads from a picked object: a line (or a
+/// straight polyline segment), an arc (or an arc segment) with its sweep in
+/// degrees, or a circle.
+pub(crate) enum PickedShape {
+    Line { direction: DVec3 },
+    Arc { sweep: f64 },
+    Circle { center: DVec3 },
+}
+
+/// The line, arc or circle under `click`, as DIMANGULAR picks it.
+pub(crate) fn picked_shape(entity: &EntityType, click: DVec3) -> Option<PickedShape> {
+    Some(match picked_curve(entity, click)? {
+        PickedCurve::Line { start, end, .. } => PickedShape::Line {
+            direction: (end - start).normalize(),
+        },
+        PickedCurve::Arc {
+            center,
+            first,
+            second,
+            normal,
+            ..
+        } => {
+            // Counter-clockwise about the normal from the start to the end.
+            let (a, b) = (first - center, second - center);
+            let mut sweep = a.cross(b).dot(normal).atan2(a.dot(b)).to_degrees();
+            if sweep <= 0.0 {
+                sweep += 360.0;
+            }
+            PickedShape::Arc { sweep }
+        }
+        PickedCurve::Circle { center, .. } => PickedShape::Circle { center },
+    })
+}
+
 fn picked_curve(entity: &EntityType, click: DVec3) -> Option<PickedCurve> {
     let point = |value: Vector3| DVec3::new(value.x, value.y, value.z);
     let normal = |value: Vector3| DVec3::new(value.x, value.y, value.z);
@@ -1043,6 +1088,14 @@ fn polyline_segment(
         });
     }
     let center = BulgeArc::from_bulge(first, second, bulge)?.center;
+    // An arc runs counter-clockwise from its first point to its second; a
+    // clockwise segment (negative bulge) runs the other way along the
+    // polyline, so its ends swap.
+    let (first_world, second_world, refs) = if bulge < 0.0 {
+        (second_world, first_world, [refs[1], refs[0]])
+    } else {
+        (first_world, second_world, refs)
+    };
     Some(PickedCurve::Arc {
         center: to_world(center),
         first: first_world,
@@ -1206,13 +1259,13 @@ fn angular_preview_with_frame(
     let second_end = vertex + DVec3::new(end.cos(), end.sin(), 0.0) * radius;
     let mut points = vec![first, first_end, nan(), second, second_end, nan()];
     points.extend(
-        kernel::geom2d::tessellate::arc(
+        ocs_geom::geom2d::tessellate::arc(
             [vertex.x, vertex.y],
             radius,
             start,
             end,
             vertex.z,
-            kernel::geom2d::tessellate::DEFAULT_SEGMENTS_PER_RADIAN,
+            ocs_geom::geom2d::tessellate::DEFAULT_SEGMENTS_PER_RADIAN,
         )
         .into_iter()
         .map(DVec3::from_array),

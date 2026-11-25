@@ -4,7 +4,7 @@
 //! click, the driver maps it to a `ParametricRef` and re-prompts on a miss,
 //! the way the reference does.
 
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, CoincidentPick};
@@ -18,6 +18,12 @@ enum Step {
 
 pub struct FixConstraintCommand {
     step: Step,
+}
+
+impl Default for FixConstraintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FixConstraintCommand {

@@ -1,10 +1,10 @@
 // DIVIDE and MEASURE place points or block references along a curve.
 
-use codec::entities::{Insert, Point as PointEnt};
-use codec::types::Vector3;
-use codec::{Entity, EntityType, Handle};
+use document::entities::{Insert, Point as PointEnt};
+use document::types::Vector3;
+use document::{Entity, EntityType, Handle};
 use glam::DVec3;
-use kernel::space::PlanarCurve;
+use ocs_geom::space::PlanarCurve;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, CurveMarker, WorkingPlane};
 use crate::entities::curve::{entity_curve, entity_spatial_measurement};
@@ -31,6 +31,12 @@ pub struct CurveMarkerCommand<const MEASURE: bool> {
 
 pub type DivideCommand = CurveMarkerCommand<false>;
 pub type MeasureCommand = CurveMarkerCommand<true>;
+
+impl<const MEASURE: bool> Default for CurveMarkerCommand<MEASURE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<const MEASURE: bool> CurveMarkerCommand<MEASURE> {
     pub fn new() -> Self {
@@ -203,7 +209,7 @@ impl<const MEASURE: bool> CadCommand for CurveMarkerCommand<MEASURE> {
         }
         let origin = self.value_origin?;
         let distance =
-            kernel::space::Vec3::from(cursor.to_array()).distance(origin.to_array().into());
+            ocs_geom::space::Vec3::from(cursor.to_array()).distance(origin.to_array().into());
         (distance.is_finite() && distance > 0.0).then_some(distance)
     }
 
@@ -312,7 +318,7 @@ fn make_marker(
 
 enum MeasuredCurve {
     Planar(PlanarCurve),
-    Spatial(kernel::space::ArcLengthCurve3),
+    Spatial(ocs_geom::space::ArcLengthCurve3),
 }
 
 impl MeasuredCurve {
@@ -365,7 +371,7 @@ inventory::submit!(crate::command::CommandRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::{Circle, Line};
+    use document::entities::{Circle, Line};
 
     fn point(entity: &EntityType) -> DVec3 {
         let EntityType::Point(point) = entity else {

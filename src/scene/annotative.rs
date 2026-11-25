@@ -4,19 +4,50 @@
 //! tessellation bake (which scales annotative content by the current annotation
 //! scale) must agree on *which* entities are annotative — so that logic lives
 //! here, once. An entity is annotative if it carries a per-object annotation
-//! context, legacy annotative XDATA, or an entity-level annotative flag. Text
+//! context, legacy annotative XDATA, or an entity-level annotative flag, unless
+//! an explicit object or block-definition flag disables annotation scaling. Text
 //! style state is consulted while creating an object and when an explicit
 //! annotation-style update is requested; changing a style alone does not
 //! retroactively scale existing text.
 
-use codec::entities::{EntityCommon, EntityType};
-use codec::objects::{
+use document::entities::{EntityCommon, EntityType};
+use document::objects::{
     Dictionary, DimContext, DimSubtype, EmbeddedMTextContext, HatchLoopContext, HatchScaleContext,
     MTextAttributeContext, MTextContext, ObjectContextData, ObjectContextKind, ObjectType,
 };
-use codec::types::{Vector2, Vector3};
-use codec::{Document, Handle};
+use document::types::{Vector2, Vector3};
+use document::{Document, Handle};
 use std::borrow::Cow;
+
+static SELECTION_ANNO_DISPLAY: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(1);
+static ANNO_MONITOR: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(-2);
+
+/// SELECTIONANNODISPLAY, a profile setting: 1 shows a selected annotative
+/// object's other scale representations dimmed, 0 hides them.
+pub(crate) fn selection_anno_display() -> i16 {
+    SELECTION_ANNO_DISPLAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_selection_anno_display(value: i16) {
+    SELECTION_ANNO_DISPLAY.store(value.clamp(0, 1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// ANNOMONITOR, a profile setting.
+pub(crate) fn anno_monitor() -> i16 {
+    ANNO_MONITOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_anno_monitor(value: i16) {
+    ANNO_MONITOR.store(value.clamp(-2, 2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// MSLTSCALE: whether model-space linetypes follow the annotation scale. A
+/// drawing that doesn't store the variable gets its default, on.
+pub fn model_linetypes_follow_annotation(doc: &Document) -> bool {
+    doc.drawing_variable("MSLTSCALE")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        != Some(0)
+}
 
 /// Resolve a handle to a `Dictionary` object, if it is one.
 pub fn as_dict(doc: &Document, handle: Handle) -> Option<&Dictionary> {
@@ -98,8 +129,17 @@ pub fn set_entity_annotative(doc: &mut Document, handle: Handle, want: bool) {
 /// The object's own annotative flag, which other programs read before its
 /// annotation contexts: `AnnotativeData { 1, on }`.
 fn set_annotative_marker(doc: &mut Document, handle: Handle, on: bool) {
-    use codec::xdata::XDataValue;
-    let values = on.then(|| {
+    crate::scene::view::dispatch::set_entity_xdata(
+        doc,
+        handle,
+        "AcadAnnotative",
+        annotative_marker(on),
+    );
+}
+
+fn annotative_marker(on: bool) -> Option<Vec<document::xdata::XDataValue>> {
+    use document::xdata::XDataValue;
+    on.then(|| {
         vec![
             XDataValue::String("AnnotativeData".into()),
             XDataValue::ControlString("{".into()),
@@ -107,8 +147,40 @@ fn set_annotative_marker(doc: &mut Document, handle: Handle, on: bool) {
             XDataValue::Integer16(1),
             XDataValue::ControlString("}".into()),
         ]
-    });
-    crate::scene::view::dispatch::set_entity_xdata(doc, handle, "AcadAnnotative", values);
+    })
+}
+
+/// Make an INSERT's attribute annotative or not, as the attribute editor's
+/// Annotative box does: the flag and the object's own marker. The attribute
+/// keeps its height, the paper height at the current scale.
+pub(crate) fn set_attribute_annotative(
+    doc: &mut Document,
+    insert: Handle,
+    index: usize,
+    want: bool,
+) {
+    if !doc.app_ids.contains("AcadAnnotative") {
+        let mut a = document::tables::AppId::new("AcadAnnotative");
+        a.handle = doc.allocate_handle();
+        let _ = doc.app_ids.add(a);
+    }
+    let app_handle = doc.app_ids.get("AcadAnnotative").map(|a| a.handle.value());
+    if let Some(EntityType::Insert(ins)) = doc.get_entity_mut(insert) {
+        if let Some(attribute) = ins.attributes.get_mut(index) {
+            attribute.flags.annotative = want;
+            // Turned off, the marker stays and says so: `{ 1, 0 }`.
+            let mut marker = annotative_marker(true);
+            if let Some(values) = marker.as_mut() {
+                values[3] = document::xdata::XDataValue::Integer16(i16::from(want));
+            }
+            crate::scene::view::dispatch::replace_xdata_record(
+                &mut attribute.common,
+                "AcadAnnotative",
+                app_handle,
+                marker,
+            );
+        }
+    }
 }
 
 /// Derive the per-scale context payload for an entity from its current
@@ -116,9 +188,9 @@ fn set_annotative_marker(doc: &mut Document, handle: Handle, on: bool) {
 /// for entity types that do not carry a per-object annotation context.
 fn dimension_context_for(
     doc: &Document,
-    dimension: &codec::entities::Dimension,
+    dimension: &document::entities::Dimension,
 ) -> Option<DimContext> {
-    use codec::entities::Dimension;
+    use document::entities::Dimension;
 
     let subtype = match dimension {
         Dimension::Aligned(dim) => DimSubtype::Aligned {
@@ -176,7 +248,7 @@ fn dimension_context_for(
     })
 }
 
-fn mtext_context_for(m: &codec::entities::MText) -> MTextContext {
+fn mtext_context_for(m: &document::entities::MText) -> MTextContext {
     MTextContext {
         attachment: m.attachment_point as i32,
         x_axis_dir: m
@@ -188,7 +260,7 @@ fn mtext_context_for(m: &codec::entities::MText) -> MTextContext {
         extents_width: m.extents_width,
         extents_height: m.extents_height,
         column_type: m.column_data.column_type as i32,
-        columns: (m.column_data.column_type != 0).then(|| codec::objects::MTextColumns {
+        columns: (m.column_data.column_type != 0).then(|| document::objects::MTextColumns {
             num_heights: m.column_data.column_count,
             width: m.column_data.width,
             gutter: m.column_data.gutter,
@@ -204,7 +276,7 @@ fn attribute_context_for(
     alignment: Vector3,
     rotation: f64,
     horizontal_mode: i16,
-    embedded: Option<&codec::entities::MText>,
+    embedded: Option<&document::entities::MText>,
     scale: Handle,
 ) -> MTextAttributeContext {
     MTextAttributeContext {
@@ -292,7 +364,7 @@ fn context_kind_for(
         )),
         EntityType::Leader(leader) => Some((
             "ACDB_LEADEROBJECTCONTEXTDATA_CLASS",
-            ObjectContextKind::Leader(codec::objects::LeaderContext {
+            ObjectContextKind::Leader(document::objects::LeaderContext {
                 points: leader.vertices.clone(),
                 x_direction: leader.horizontal_direction,
                 annotation_enabled: !leader.annotation_handle.is_null(),
@@ -340,7 +412,7 @@ pub fn supports_annotation_context(entity: &EntityType) -> bool {
         | EntityType::Tolerance(_)
         | EntityType::Hatch(_) => true,
         EntityType::Dimension(dimension) => {
-            !matches!(&**dimension, codec::entities::Dimension::Arc(_))
+            !matches!(&**dimension, document::entities::Dimension::Arc(_))
         }
         _ => false,
     }
@@ -358,7 +430,7 @@ fn register_context_class(doc: &mut Document, dxf_name: &str) {
         "ACDB_FCFOBJECTCONTEXTDATA_CLASS" => "AcDbFcfObjectContextData",
         _ => return,
     };
-    use codec::classes::{DxfClass, ProxyFlags};
+    use document::classes::{DxfClass, ProxyFlags};
     let proxy_flags = ProxyFlags(
         ProxyFlags::ERASE_ALLOWED.0
             | ProxyFlags::CLONING_ALLOWED.0
@@ -482,9 +554,9 @@ pub fn create_annotation_context(
 /// each annotation scale as its own object (e.g. a block insert per scale on a
 /// "0 @ <scale>" layer); only the current scale's representation should draw.
 ///
-/// False for non-annotative objects (no per-object context — the vast
-/// majority) and for objects whose contexts include the current scale. Gated
-/// on an extension dictionary so non-annotative entities skip the lookup.
+/// False for non-annotative objects, including disabled objects with obsolete
+/// contexts, and for objects whose contexts include the current scale. Gated
+/// on an extension dictionary so most non-annotative entities skip the lookup.
 pub fn annotative_offscale_for(
     doc: &Document,
     common: &EntityCommon,
@@ -501,8 +573,16 @@ pub fn annotative_offscale_for(
     {
         return false;
     }
+    if explicit_annotation_flag(doc, common) == Some(false) {
+        return false;
+    }
     let scales = object_scale_memberships(doc, common.handle);
     if scales.is_empty() {
+        return false;
+    }
+    // The filter is about what a viewport shows of the model. An object drawn
+    // directly on a sheet stays, whichever scales it has.
+    if owned_by_paper_layout(doc, common) {
         return false;
     }
     match scale_handle {
@@ -512,6 +592,13 @@ pub fn annotative_offscale_for(
             .any(|(name, _)| name.eq_ignore_ascii_case(&doc.header.current_annotation_scale)),
     }
 }
+fn owned_by_paper_layout(doc: &Document, common: &EntityCommon) -> bool {
+    doc.block_records
+        .iter()
+        .find(|record| record.handle == common.owner_handle)
+        .is_some_and(|record| record.name.to_ascii_uppercase().starts_with("*PAPER_SPACE"))
+}
+
 pub(crate) fn annotation_scale_handles_for_entity(
     doc: &Document,
     entity_handle: Handle,
@@ -534,7 +621,7 @@ pub fn scale_handle_by_name(doc: &Document, name: &str) -> Option<Handle> {
         })
 }
 
-pub fn ensure_scale_object(doc: &mut Document, source: &codec::objects::Scale) -> Handle {
+pub fn ensure_scale_object(doc: &mut Document, source: &document::objects::Scale) -> Handle {
     if let Some(handle) = scale_handle_by_name(doc, &source.name) {
         return handle;
     }
@@ -622,11 +709,62 @@ pub fn remove_annotation_context_for_scale(
         set_entity_annotative(doc, entity, false);
         return true;
     }
+    let removed_default = match doc.objects.get(&leaf_h) {
+        Some(ObjectType::ObjectContextData(leaf)) if leaf.is_default => Some(leaf.scale),
+        _ => None,
+    };
     doc.objects.remove(&leaf_h);
     if let Some(ObjectType::Dictionary(coll)) = doc.objects.get_mut(&coll_h) {
         coll.entries.retain(|(_, h)| *h != leaf_h);
     }
+    // The object's own data is its default representation's. When that one
+    // goes, the first remaining representation becomes the default and the
+    // object takes its placement and size.
+    if let Some(old_scale) = removed_default {
+        promote_default_context(doc, entity, coll_h, old_scale);
+    }
     true
+}
+
+fn promote_default_context(doc: &mut Document, entity: Handle, coll_h: Handle, old_scale: Handle) {
+    let Some(next) = as_dict(doc, coll_h).and_then(|c| c.entries.first().map(|(_, h)| *h)) else {
+        return;
+    };
+    let new_scale = match doc.objects.get_mut(&next) {
+        Some(ObjectType::ObjectContextData(leaf)) => {
+            leaf.is_default = true;
+            leaf.scale
+        }
+        _ => return,
+    };
+    let inverse = |doc: &Document, scale: Handle| match doc.objects.get(&scale) {
+        Some(ObjectType::Scale(scale)) => Some(scale.inverse_factor()),
+        _ => None,
+    };
+    let ratio = match (inverse(doc, new_scale), inverse(doc, old_scale)) {
+        (Some(new), Some(old))
+            if old.abs() > 1e-12 && (new / old).is_finite() && new / old > 0.0 =>
+        {
+            new / old
+        }
+        _ => 1.0,
+    };
+    let Some(current) = doc.get_entity(entity) else {
+        return;
+    };
+    let mut placed = entity_for_annotation_context(doc, current, Some(new_scale)).into_owned();
+    match &mut placed {
+        EntityType::Text(text) => text.height *= ratio,
+        EntityType::MText(mtext) => {
+            mtext.height *= ratio;
+            mtext.rectangle_width *= ratio;
+        }
+        EntityType::AttributeDefinition(attribute) => attribute.height *= ratio,
+        _ => {}
+    }
+    if let Some(slot) = doc.get_entity_mut(entity) {
+        *slot = placed;
+    }
 }
 
 /// Resolve an entity's `ACDB_ANNOTATIONSCALES` collection dictionary handle, if
@@ -635,7 +773,11 @@ fn annotation_scales_dict(doc: &Document, entity: Handle) -> Option<Handle> {
     let xd = doc
         .get_entity(entity)
         .and_then(|e| e.common().xdictionary_handle)?;
-    let mgr = as_dict(doc, xd).and_then(|d| d.get("AcDbContextDataManager"))?;
+    annotation_scales_in_xdictionary(doc, xd)
+}
+
+fn annotation_scales_in_xdictionary(doc: &Document, xdictionary: Handle) -> Option<Handle> {
+    let mgr = as_dict(doc, xdictionary).and_then(|d| d.get("AcDbContextDataManager"))?;
     as_dict(doc, mgr).and_then(|d| d.get("ACDB_ANNOTATIONSCALES"))
 }
 
@@ -648,8 +790,25 @@ pub fn active_object_context_for_scale(
     entity: Handle,
     scale_handle: Option<Handle>,
 ) -> Option<&ObjectContextData> {
-    let coll_h = annotation_scales_dict(doc, entity)?;
-    let coll = as_dict(doc, coll_h)?;
+    // An entity with no scale representations has no context, whatever its
+    // flag says. Ask for them first: the flag of a block reference needs a
+    // search for its definition, and this runs for each entity of a pass.
+    let collection = annotation_scales_dict(doc, entity)?;
+    if doc
+        .get_entity(entity)
+        .is_some_and(|entity| explicit_annotation_flag(doc, entity.common()) == Some(false))
+    {
+        return None;
+    }
+    active_context_in(doc, collection, scale_handle)
+}
+
+fn active_context_in(
+    doc: &Document,
+    collection: Handle,
+    scale_handle: Option<Handle>,
+) -> Option<&ObjectContextData> {
+    let coll = as_dict(doc, collection)?;
     let mut default = None;
     let mut first = None;
     for (_, leaf_h) in &coll.entries {
@@ -777,8 +936,16 @@ pub fn text_context_ratio(
     handle: Handle,
     scale_handle: Option<Handle>,
 ) -> Option<f64> {
-    let coll = as_dict(doc, annotation_scales_dict(doc, handle)?)?;
-    let active = active_object_context_for_scale(doc, handle, scale_handle)?;
+    context_ratio_in(doc, annotation_scales_dict(doc, handle)?, scale_handle)
+}
+
+fn context_ratio_in(
+    doc: &Document,
+    collection: Handle,
+    scale_handle: Option<Handle>,
+) -> Option<f64> {
+    let coll = as_dict(doc, collection)?;
+    let active = active_context_in(doc, collection, scale_handle)?;
     let native = coll
         .entries
         .iter()
@@ -800,8 +967,8 @@ pub fn text_context_ratio(
     (relative.is_finite() && relative > 0.0).then_some(relative)
 }
 
-fn text_horizontal(value: i16) -> codec::entities::TextHorizontalAlignment {
-    use codec::entities::TextHorizontalAlignment;
+fn text_horizontal(value: i16) -> document::entities::TextHorizontalAlignment {
+    use document::entities::TextHorizontalAlignment;
     match value {
         1 => TextHorizontalAlignment::Center,
         2 => TextHorizontalAlignment::Right,
@@ -812,8 +979,8 @@ fn text_horizontal(value: i16) -> codec::entities::TextHorizontalAlignment {
     }
 }
 
-fn mtext_attachment(value: i32) -> codec::entities::AttachmentPoint {
-    use codec::entities::AttachmentPoint;
+fn mtext_attachment(value: i32) -> document::entities::AttachmentPoint {
+    use document::entities::AttachmentPoint;
     match value {
         2 => AttachmentPoint::TopCenter,
         3 => AttachmentPoint::TopRight,
@@ -827,7 +994,7 @@ fn mtext_attachment(value: i32) -> codec::entities::AttachmentPoint {
     }
 }
 
-fn apply_mtext_context(entity: &mut codec::entities::MText, context: &MTextContext) {
+fn apply_mtext_context(entity: &mut document::entities::MText, context: &MTextContext) {
     entity.attachment_point = mtext_attachment(context.attachment);
     entity.insertion_point = context.insertion;
     entity.rectangle_width = context.rect_width;
@@ -852,12 +1019,12 @@ fn apply_mtext_context(entity: &mut codec::entities::MText, context: &MTextConte
 }
 
 fn apply_dimension_context(
-    dimension: &mut codec::entities::Dimension,
-    context: &codec::objects::DimContext,
+    dimension: &mut document::entities::Dimension,
+    context: &document::objects::DimContext,
     doc: &Document,
 ) {
-    use codec::entities::Dimension;
-    use codec::objects::DimSubtype;
+    use document::entities::Dimension;
+    use document::objects::DimSubtype;
 
     {
         let base = dimension.base_mut();
@@ -892,7 +1059,7 @@ fn apply_dimension_context(
                 ov::set_on_common(
                     common,
                     code,
-                    Some(codec::xdata::XDataValue::Integer16(value as i16)),
+                    Some(document::xdata::XDataValue::Integer16(value as i16)),
                 );
             }
         }
@@ -958,9 +1125,9 @@ fn apply_attribute_context(
     insertion_point: &mut Vector3,
     alignment_point: &mut Vector3,
     rotation: &mut f64,
-    horizontal_alignment: &mut codec::entities::HorizontalAlignment,
-    embedded_mtext: &mut Option<Box<codec::entities::MText>>,
-    context: &codec::objects::MTextAttributeContext,
+    horizontal_alignment: &mut document::entities::HorizontalAlignment,
+    embedded_mtext: &mut Option<Box<document::entities::MText>>,
+    context: &document::objects::MTextAttributeContext,
 ) {
     insertion_point.x = context.insertion.x;
     insertion_point.y = context.insertion.y;
@@ -968,7 +1135,7 @@ fn apply_attribute_context(
     alignment_point.y = context.alignment.y;
     *rotation = context.rotation;
     *horizontal_alignment =
-        codec::entities::HorizontalAlignment::from_value(context.horizontal_mode);
+        document::entities::HorizontalAlignment::from_value(context.horizontal_mode);
     if context.enable_context {
         if let (Some(embedded), Some(mtext)) = (&context.context, embedded_mtext.as_mut()) {
             apply_mtext_context(mtext, &embedded.mtext);
@@ -976,7 +1143,192 @@ fn apply_attribute_context(
     }
 }
 
-fn apply_hatch_context(hatch: &mut codec::entities::Hatch, context: &HatchScaleContext) {
+/// Place an INSERT's attribute for an annotation scale (the displayed one when
+/// `None`): the position of that scale's representation, and the stored height
+/// at the ratio to the default representation, as annotative text draws. An
+/// ATTRIB is part of its INSERT rather than a document entity, so its scale data
+/// is found from its own extension dictionary. `false` leaves it untouched: it
+/// has no representations.
+pub(crate) fn place_attribute_for_annotation_scale(
+    doc: &Document,
+    attribute: &mut document::entities::AttributeEntity,
+    scale_handle: Option<Handle>,
+) -> bool {
+    if explicit_annotation_flag(doc, &attribute.common) == Some(false) {
+        return false;
+    }
+    let Some(collection) = attribute
+        .common
+        .xdictionary_handle
+        .and_then(|xdictionary| annotation_scales_in_xdictionary(doc, xdictionary))
+    else {
+        return false;
+    };
+    let Some(ObjectContextData {
+        kind: ObjectContextKind::MTextAttribute(context),
+        ..
+    }) = active_context_in(doc, collection, scale_handle)
+    else {
+        return false;
+    };
+    apply_attribute_context(
+        &mut attribute.insertion_point,
+        &mut attribute.alignment_point,
+        &mut attribute.rotation,
+        &mut attribute.horizontal_alignment,
+        &mut attribute.embedded_mtext,
+        context,
+    );
+    let ratio = context_ratio_in(doc, collection, scale_handle).unwrap_or(1.0);
+    attribute.height *= ratio;
+    if let Some(mtext) = attribute.embedded_mtext.as_mut() {
+        mtext.height *= ratio;
+        if !context.enable_context || context.context.is_none() {
+            mtext.rectangle_width *= ratio;
+        }
+    }
+    true
+}
+
+/// Move the stored representations of an INSERT-owned ATTRIB with its grip.
+/// The ATTRIB is not a top-level document entity, so the normal entity
+/// context synchronization cannot reach these leaves.
+pub(crate) fn translate_insert_attribute_contexts(
+    doc: &mut Document,
+    attribute: &document::entities::AttributeEntity,
+    delta: glam::DVec3,
+) -> bool {
+    let mut changed = false;
+    for handle in insert_attribute_context_handles(doc, attribute) {
+        let Some(ObjectType::ObjectContextData(leaf)) = doc.objects.get_mut(&handle) else {
+            continue;
+        };
+        let ObjectContextKind::MTextAttribute(context) = &mut leaf.kind else {
+            continue;
+        };
+        context.insertion.x += delta.x;
+        context.insertion.y += delta.y;
+        context.alignment.x += delta.x;
+        context.alignment.y += delta.y;
+        if let Some(embedded) = context.context.as_mut() {
+            embedded.mtext.insertion.x += delta.x;
+            embedded.mtext.insertion.y += delta.y;
+            embedded.mtext.insertion.z += delta.z;
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Carry every annotation-scale representation of each INSERT-owned ATTRIB
+/// through the same MOVE/ROTATE/SCALE/MIRROR transform as the reference.
+/// These attributes are inline on the INSERT, so the top-level entity context
+/// walker cannot see their individual dictionaries.
+pub(crate) fn transform_insert_attribute_contexts(
+    doc: &mut Document,
+    attributes_before: &[document::entities::AttributeEntity],
+    transform: &crate::entities::transform::EntityTransform,
+) -> bool {
+    let mut changed = false;
+    for attribute in attributes_before {
+        for handle in insert_attribute_context_handles(doc, attribute) {
+            let scale = match doc.objects.get(&handle) {
+                Some(ObjectType::ObjectContextData(leaf)) => leaf.scale,
+                _ => continue,
+            };
+            let mut placed = attribute.clone();
+            if !place_attribute_for_annotation_scale(doc, &mut placed, Some(scale)) {
+                continue;
+            }
+            let mut entity = EntityType::AttributeEntity(placed);
+            crate::scene::view::dispatch::apply_transform(&mut entity, transform);
+            let EntityType::AttributeEntity(transformed) = entity else {
+                continue;
+            };
+            let Some(ObjectType::ObjectContextData(leaf)) = doc.objects.get_mut(&handle) else {
+                continue;
+            };
+            let ObjectContextKind::MTextAttribute(context) = &mut leaf.kind else {
+                continue;
+            };
+            context.horizontal_mode = transformed.horizontal_alignment.to_value();
+            context.rotation = transformed.rotation;
+            context.insertion =
+                Vector2::new(transformed.insertion_point.x, transformed.insertion_point.y);
+            context.alignment =
+                Vector2::new(transformed.alignment_point.x, transformed.alignment_point.y);
+            if let (Some(embedded), Some(mtext)) =
+                (&mut context.context, &transformed.embedded_mtext)
+            {
+                sync_mtext_context(&mut embedded.mtext, mtext);
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn insert_attribute_context_handles(
+    doc: &Document,
+    attribute: &document::entities::AttributeEntity,
+) -> Vec<Handle> {
+    if explicit_annotation_flag(doc, &attribute.common) == Some(false) {
+        return Vec::new();
+    }
+    attribute
+        .common
+        .xdictionary_handle
+        .and_then(|xdictionary| annotation_scales_in_xdictionary(doc, xdictionary))
+        .and_then(|collection| as_dict(doc, collection))
+        .map(|collection| {
+            collection
+                .entries
+                .iter()
+                .map(|(_, handle)| *handle)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Capture the context leaves changed by a transform or grip edit. INSERT
+/// attributes have their own dictionaries in addition to the INSERT's tree.
+pub(crate) fn annotation_context_objects_for_entity(
+    doc: &Document,
+    entity: &EntityType,
+) -> Vec<(Handle, ObjectType)> {
+    let mut seen = std::collections::HashSet::new();
+    let entity_handles: Vec<Handle> = annotation_scales_dict(doc, entity.common().handle)
+        .and_then(|collection| as_dict(doc, collection))
+        .map(|collection| {
+            collection
+                .entries
+                .iter()
+                .map(|(_, handle)| *handle)
+                .collect()
+        })
+        .unwrap_or_default();
+    let attribute_handles: Vec<Handle> = match entity {
+        EntityType::Insert(insert) => insert
+            .attributes
+            .iter()
+            .flat_map(|attribute| insert_attribute_context_handles(doc, attribute))
+            .collect(),
+        _ => Vec::new(),
+    };
+    attribute_handles
+        .into_iter()
+        .chain(entity_handles)
+        .filter(|handle| seen.insert(*handle))
+        .filter_map(|handle| {
+            doc.objects
+                .get(&handle)
+                .cloned()
+                .map(|object| (handle, object))
+        })
+        .collect()
+}
+
+fn apply_hatch_context(hatch: &mut document::entities::Hatch, context: &HatchScaleContext) {
     hatch.pattern.lines.clone_from(&context.pattern_lines);
     hatch.pattern_scale = context.pattern_scale;
     for line in &mut hatch.pattern.lines {
@@ -989,20 +1341,21 @@ fn apply_hatch_context(hatch: &mut codec::entities::Hatch, context: &HatchScaleC
         .iter()
         .enumerate()
         .map(|(index, loop_data)| {
-            let flags = codec::entities::BoundaryPathFlags::from_bits(loop_data.loop_type as u32);
+            let flags =
+                document::entities::BoundaryPathFlags::from_bits(loop_data.loop_type as u32);
             let mut path = if loop_data.supports_context {
                 base_paths.get(index).cloned()
             } else {
                 loop_data.boundary.clone()
             }
-            .unwrap_or_else(|| codec::entities::BoundaryPath::with_flags(flags));
+            .unwrap_or_else(|| document::entities::BoundaryPath::with_flags(flags));
             path.flags = flags;
             path
         })
         .collect();
 }
 
-fn sync_hatch_loops(loops: &mut Vec<HatchLoopContext>, paths: &[codec::entities::BoundaryPath]) {
+fn sync_hatch_loops(loops: &mut Vec<HatchLoopContext>, paths: &[document::entities::BoundaryPath]) {
     let previous = std::mem::take(loops);
     *loops = paths
         .iter()
@@ -1124,7 +1477,7 @@ pub fn entity_for_annotation_context<'a>(
     Cow::Owned(placed)
 }
 
-fn sync_mtext_context(context: &mut MTextContext, entity: &codec::entities::MText) {
+fn sync_mtext_context(context: &mut MTextContext, entity: &document::entities::MText) {
     context.attachment = entity.attachment_point as i32;
     context.x_axis_dir = entity
         .dwg_x_direction
@@ -1140,7 +1493,7 @@ fn sync_mtext_context(context: &mut MTextContext, entity: &codec::entities::MTex
     } else {
         let columns = context
             .columns
-            .get_or_insert_with(|| codec::objects::MTextColumns {
+            .get_or_insert_with(|| document::objects::MTextColumns {
                 num_heights: 0,
                 width: 0.0,
                 gutter: 0.0,
@@ -1158,12 +1511,12 @@ fn sync_mtext_context(context: &mut MTextContext, entity: &codec::entities::MTex
 }
 
 fn sync_dimension_context(
-    context: &mut codec::objects::DimContext,
-    dimension: &codec::entities::Dimension,
+    context: &mut document::objects::DimContext,
+    dimension: &document::entities::Dimension,
     block_handle: Option<Handle>,
 ) {
-    use codec::entities::Dimension;
-    use codec::objects::DimSubtype;
+    use document::entities::Dimension;
+    use document::objects::DimSubtype;
 
     let base = dimension.base();
     context.def_pt = Vector2::new(base.text_middle_point.x, base.text_middle_point.y);
@@ -1277,12 +1630,12 @@ pub fn sync_annotation_context_from_entity(
             },
         ) => {
             *horizontal_mode = match text.horizontal_alignment {
-                codec::entities::TextHorizontalAlignment::Left => 0,
-                codec::entities::TextHorizontalAlignment::Center => 1,
-                codec::entities::TextHorizontalAlignment::Right => 2,
-                codec::entities::TextHorizontalAlignment::Aligned => 3,
-                codec::entities::TextHorizontalAlignment::Middle => 4,
-                codec::entities::TextHorizontalAlignment::Fit => 5,
+                document::entities::TextHorizontalAlignment::Left => 0,
+                document::entities::TextHorizontalAlignment::Center => 1,
+                document::entities::TextHorizontalAlignment::Right => 2,
+                document::entities::TextHorizontalAlignment::Aligned => 3,
+                document::entities::TextHorizontalAlignment::Middle => 4,
+                document::entities::TextHorizontalAlignment::Fit => 5,
             };
             *rotation = text.rotation;
             *insertion = Vector2::new(text.insertion_point.x, text.insertion_point.y);
@@ -1380,7 +1733,7 @@ pub fn translate_annotation_contexts(
     transform_annotation_contexts(
         doc,
         entity_handle,
-        &crate::command::EntityTransform::Translate(delta),
+        &crate::entities::transform::EntityTransform::Translate(delta),
     )
 }
 
@@ -1390,7 +1743,7 @@ pub fn translate_annotation_contexts(
 pub fn transform_annotation_contexts(
     doc: &mut Document,
     entity_handle: Handle,
-    t: &crate::command::EntityTransform,
+    t: &crate::entities::transform::EntityTransform,
 ) -> bool {
     let Some(base_entity) = doc.get_entity(entity_handle).cloned() else {
         return false;
@@ -1421,7 +1774,7 @@ pub fn transform_annotation_contexts(
         // while the complete per-segment list is a separate persisted field.
         if let (
             EntityType::MultiLeader(mleader),
-            crate::command::EntityTransform::Translate(delta),
+            crate::entities::transform::EntityTransform::Translate(delta),
         ) = (&mut placed, t)
         {
             let offset = Vector3::new(delta.x, delta.y, delta.z);
@@ -1533,6 +1886,56 @@ pub fn text_style_is_annotative(doc: &Document, name: &str) -> bool {
         .is_some_and(|s| s.annotative)
 }
 
+/// Whether the text style with this handle matches its text orientation to
+/// the layout: its `AcadAnnoPO` flag.
+pub fn text_style_orientation(doc: &Document, handle: Handle) -> bool {
+    doc.object_xdata(handle)
+        .and_then(|data| data.get_record("AcadAnnoPO"))
+        .is_some_and(|record| {
+            record.values.iter().any(|value| {
+                matches!(value, document::xdata::XDataValue::Integer16(n) if *n != 0)
+            })
+        })
+}
+
+/// Set or clear the text style's `AcadAnnoPO` flag.
+pub fn set_text_style_orientation(doc: &mut Document, handle: Handle, on: bool) {
+    if on == text_style_orientation(doc, handle) {
+        return;
+    }
+    if on {
+        crate::scene::block_metadata::ensure_application(doc, "AcadAnnoPO");
+        let mut record = document::xdata::ExtendedDataRecord::new("AcadAnnoPO");
+        record.values = vec![document::xdata::XDataValue::Integer16(1)];
+        doc.set_object_xdata_record(handle, record);
+    } else {
+        doc.remove_object_xdata_record(handle, "AcadAnnoPO");
+    }
+}
+
+/// A new text of the annotative style `name` that matches its orientation to
+/// the layout takes the same `AcadAnnoPO` flag.
+pub fn apply_style_orientation(doc: &mut Document, handle: Handle, style: &str) {
+    let Some(style) = doc
+        .text_styles
+        .iter()
+        .find(|s| name_matches(&s.name, style))
+        .filter(|s| s.annotative)
+        .map(|s| s.handle)
+    else {
+        return;
+    };
+    if text_style_orientation(doc, style) {
+        crate::scene::block_metadata::ensure_application(doc, "AcadAnnoPO");
+        crate::scene::view::dispatch::set_entity_xdata(
+            doc,
+            handle,
+            "AcadAnnoPO",
+            Some(vec![document::xdata::XDataValue::Integer16(1)]),
+        );
+    }
+}
+
 pub fn dim_style_is_annotative(doc: &Document, name: &str) -> bool {
     doc.dim_styles
         .iter()
@@ -1592,7 +1995,7 @@ fn has_context_manager(doc: &Document, common: &EntityCommon) -> bool {
 /// Whether a MULTILEADER participates in annotation scaling through its
 /// per-object context or entity flag. A later style edit is applied only by an
 /// explicit style update, so it cannot retroactively change existing objects.
-pub fn mleader_is_annotative(doc: &Document, mleader: &codec::entities::MultiLeader) -> bool {
+pub fn mleader_is_annotative(doc: &Document, mleader: &document::entities::MultiLeader) -> bool {
     has_context_manager(doc, &mleader.common) || mleader.enable_annotation_scale
 }
 
@@ -1620,10 +2023,10 @@ pub fn annotation_style_is_annotative(doc: &Document, entity: &EntityType) -> bo
 }
 
 pub fn apply_mleader_style(
-    entity: &mut codec::entities::MultiLeader,
-    style: &codec::objects::MultiLeaderStyle,
+    entity: &mut document::entities::MultiLeader,
+    style: &document::objects::MultiLeaderStyle,
 ) {
-    use codec::entities::MultiLeaderPropertyOverrideFlags as F;
+    use document::entities::MultiLeaderPropertyOverrideFlags as F;
 
     let flags = entity.property_override_flags;
     entity.style_handle = Some(style.handle);
@@ -1732,11 +2135,11 @@ pub fn apply_mleader_style(
     entity.context.block_content_scale = entity.block_scale;
     entity.enable_annotation_scale = style.is_annotative;
     match entity.content_type {
-        codec::entities::LeaderContentType::MText => {
+        document::entities::LeaderContentType::MText => {
             entity.context.has_text_contents = true;
             entity.context.has_block_contents = false;
         }
-        codec::entities::LeaderContentType::Block => {
+        document::entities::LeaderContentType::Block => {
             entity.context.has_text_contents = false;
             entity.context.has_block_contents = entity.block_content_handle.is_some();
             entity.context.block_content_location = entity.context.content_base_point;
@@ -1752,7 +2155,7 @@ pub fn apply_mleader_style(
         }
         root.text_attachment_direction = entity.text_attachment_direction;
         for line in &mut root.lines {
-            use codec::entities::LeaderLinePropertyOverrideFlags as F;
+            use document::entities::LeaderLinePropertyOverrideFlags as F;
             if !line.override_flags.contains(F::PATH_TYPE) {
                 line.path_type = entity.path_type;
             }
@@ -1775,11 +2178,11 @@ pub fn apply_mleader_style(
     }
 }
 fn apply_mleader_style_at_display_scale(
-    entity: &mut codec::entities::MultiLeader,
-    style: &codec::objects::MultiLeaderStyle,
+    entity: &mut document::entities::MultiLeader,
+    style: &document::objects::MultiLeaderStyle,
     display_scale: f64,
 ) {
-    use codec::entities::MultiLeaderPropertyOverrideFlags as F;
+    use document::entities::MultiLeaderPropertyOverrideFlags as F;
 
     let old_scale = entity.context.scale_factor.max(1.0e-12);
     let landing_gap = entity.context.landing_gap / old_scale;
@@ -1826,7 +2229,7 @@ fn apply_mleader_style_at_display_scale(
 pub fn apply_mleader_style_to_object(
     doc: &mut Document,
     handle: Handle,
-    style: &codec::objects::MultiLeaderStyle,
+    style: &document::objects::MultiLeaderStyle,
 ) -> bool {
     let Some(EntityType::MultiLeader(original)) = doc.get_entity(handle).cloned() else {
         return false;
@@ -1908,7 +2311,7 @@ pub fn update_entity_from_annotation_style(
     enum StyleUpdate {
         Text { annotative: bool, height: f64 },
         Dimension { annotative: bool },
-        MultiLeader(codec::objects::MultiLeaderStyle),
+        MultiLeader(document::objects::MultiLeaderStyle),
         ContextOnly,
     }
 
@@ -2027,36 +2430,89 @@ pub fn update_entity_from_annotation_style(
     true
 }
 
-/// Whether the block definition `name` is annotative: its block record
-/// carries `AcadAnnotative` (`AnnotativeData { 1 1 }`), or, in drawings an
-/// earlier build wrote, its BLOCK entity does.
-pub fn block_is_annotative(doc: &Document, name: &str) -> bool {
-    let Some(br) = doc.block_records.get(name) else {
-        return false;
-    };
-    let flag = |record: &codec::xdata::ExtendedDataRecord| {
-        record
+fn annotation_flag(data: &document::xdata::ExtendedData) -> Option<bool> {
+    data.get_record("AcadAnnotative")?
+        .values
+        .iter()
+        .filter_map(|value| match value {
+            document::xdata::XDataValue::Integer16(value) => Some(*value != 0),
+            _ => None,
+        })
+        .next_back()
+}
+
+fn definition_annotation_flag(doc: &Document, br: &document::tables::BlockRecord) -> Option<bool> {
+    doc.object_xdata(br.handle)
+        .and_then(annotation_flag)
+        .or_else(|| {
+            doc.get_entity(br.block_entity_handle)
+                .and_then(|block| annotation_flag(&block.common().extended_data))
+        })
+}
+
+fn block_annotation_flag(doc: &Document, name: &str) -> Option<bool> {
+    let br = doc.block_records.get(name)?;
+    definition_annotation_flag(doc, br).or_else(|| {
+        // Evaluated anonymous blocks inherit the named definition's flag.
+        // Keep "absent" distinct from an explicit off: old contexts alone
+        // are still supported when neither definition stores a flag.
+        let source = doc
+            .object_xdata(br.handle)?
+            .get_record("AcDbBlockRepBTag")?
             .values
             .iter()
-            .filter_map(|value| match value {
-                codec::xdata::XDataValue::Integer16(value) => Some(*value),
+            .find_map(|value| match value {
+                document::xdata::XDataValue::Handle(handle) if !handle.is_null() => Some(*handle),
                 _ => None,
-            })
-            .last()
-            .is_some_and(|value| value != 0)
-    };
-    if let Some(record) = doc
-        .object_xdata(br.handle)
-        .and_then(|xdata| xdata.get_record("AcadAnnotative"))
-    {
-        return flag(record);
-    }
-    doc.get_entity(br.block_entity_handle).is_some_and(|block| {
-        block
-            .common()
-            .extended_data
-            .get_record("AcadAnnotative")
-            .is_some_and(flag)
+            })?;
+        doc.block_records
+            .iter()
+            .find(|record| record.handle == source)
+            .and_then(|record| definition_annotation_flag(doc, record))
+    })
+}
+
+/// Whether the block definition is annotative, including the named source of
+/// an evaluated dynamic representation and legacy flags on its BLOCK marker.
+pub fn block_is_annotative(doc: &Document, name: &str) -> bool {
+    block_annotation_flag(doc, name).unwrap_or(false)
+}
+
+fn insert_annotation_flag(doc: &Document, insert: &document::entities::Insert) -> Option<bool> {
+    #[cfg(test)]
+    INSERT_FLAG_LOOKUPS.with(|count| count.set(count.get() + 1));
+    block_annotation_flag(doc, &insert.block_name).or_else(|| {
+        // Some files link the source only through per-reference RepData.
+        let source = doc.dynamic_definition_for_insert(insert.common.handle)?;
+        doc.block_records
+            .iter()
+            .find(|record| record.handle == source)
+            .and_then(|record| definition_annotation_flag(doc, record))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread asked for the annotation flag of a block
+    /// reference's definition (`insert_annotation_flag`).
+    pub(crate) static INSERT_FLAG_LOOKUPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Explicit flags outrank retained context dictionaries. Attributes without
+/// their own flag also stop using obsolete contexts when their INSERT's
+/// definition has annotation scaling disabled.
+fn explicit_annotation_flag(doc: &Document, common: &EntityCommon) -> Option<bool> {
+    annotation_flag(&common.extended_data).or_else(|| {
+        if let Some(EntityType::Insert(insert)) = doc.get_entity(common.handle) {
+            return insert_annotation_flag(doc, insert);
+        }
+        if let Some(EntityType::Insert(insert)) = doc.get_entity(common.owner_handle) {
+            return annotation_flag(&insert.common.extended_data)
+                .or_else(|| insert_annotation_flag(doc, insert))
+                .filter(|flag| !flag);
+        }
+        None
     })
 }
 
@@ -2078,24 +2534,12 @@ pub fn is_annotative(doc: &Document, entity: &EntityType) -> bool {
     }
 }
 
-/// Whether an object carries its own annotative state: a per-object
-/// annotation context or an annotative XDATA marker. Its style does not count.
+/// Whether an object participates in annotation scaling. Explicit object and
+/// effective block-definition flags outrank contexts; text styles do not count.
 pub fn object_is_annotative(doc: &Document, common: &EntityCommon) -> bool {
     let xd = &common.extended_data;
-    // The object's own flag wins: a context left behind after annotative was
-    // switched off is stored with the flag at 0.
-    let standard_marker = xd.get_record("AcadAnnotative").and_then(|record| {
-        record
-            .values
-            .iter()
-            .filter_map(|value| match value {
-                codec::xdata::XDataValue::Integer16(value) => Some(*value),
-                _ => None,
-            })
-            .last()
-    });
-    if let Some(flag) = standard_marker {
-        return flag != 0;
+    if let Some(flag) = explicit_annotation_flag(doc, common) {
+        return flag;
     }
     // Per-object annotation context (works regardless of style).
     has_context_manager(doc, common)

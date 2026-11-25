@@ -1,11 +1,13 @@
 //! Ordered reference evaluation for coupled Flip selections.
 use super::instance::ParameterFrame;
 use super::*;
-use codec::xdata::XDataValue as X;
+use document::xdata::XDataValue as X;
 use std::collections::{BTreeMap, BTreeSet};
 mod recovery;
 pub(super) const INPUTS: &str = "OCS_BLOCK_INPUT_FRAMES";
 pub(super) const FRAME_ERROR: &str = "The block parameter frame is unavailable.";
+const SELECTION_ERROR: &str =
+    "Select all objects driven by the linked parameters and ensure their actions precede the Flip.";
 
 /// Native action nodes follow their selected Linear parameter. Geometry stays
 /// explicit so a parameter pick cannot silently expand the reflection.
@@ -67,7 +69,40 @@ pub(super) fn validate_authored_selection(
     {
         return Ok(());
     }
-    Err("Select all objects driven by the linked parameters and ensure their actions precede the Flip.")
+    Err(SELECTION_ERROR)
+}
+
+/// Refuse edits that leave a previously supported coupling in the graph
+/// without an evaluation plan. Removing the last coupling is allowed.
+pub(super) fn preserve_authored_selection(
+    before: &Document,
+    after: &Document,
+    def: Handle,
+) -> Result<(), &'static str> {
+    if !actions(before, def).iter().any(|(_, action, kind, _)| {
+        *kind == Kind::Flip
+            && action
+                .dependencies
+                .iter()
+                .any(|h| before.get_entity(*h).is_none())
+    }) {
+        return Ok(());
+    }
+    let Some(previous) = Plan::for_rebuild(before, def) else {
+        return Ok(());
+    };
+    let remains_linked = actions(after, def).iter().any(|(_, action, kind, _)| {
+        *kind == Kind::Flip
+            && previous.steps.iter().any(|step| {
+                step.targets
+                    .iter()
+                    .any(|target| action.dependencies.contains(target))
+            })
+    });
+    if remains_linked && Plan::for_rebuild(after, def).is_none() {
+        return Err(SELECTION_ERROR);
+    }
+    Ok(())
 }
 
 struct Step {
@@ -75,6 +110,53 @@ struct Step {
     axis: Handle,
     targets: BTreeSet<Handle>,
 }
+
+fn perpendicular(first: ParameterFrame, second: ParameterFrame) -> bool {
+    (first.end - first.base)
+        .try_normalize()
+        .zip((second.end - second.base).try_normalize())
+        .is_some_and(|(a, b)| a.dot(b).abs() <= 1e-8)
+}
+
+/// A linked dependent Scale uses the reflected pivot. Evaluating it just
+/// before the reflecting actions is equivalent and keeps the pivot canonical.
+pub(super) fn order_linked_scales(
+    doc: &Document,
+    definition: Handle,
+    actions: &[(Handle, &BlockAction, Kind, i32)],
+    managed_flips: &[Handle],
+    order: &mut [usize],
+) {
+    if managed_flips.is_empty() {
+        return;
+    }
+    let parameters = all_parameters(doc, definition);
+    for index in 1..order.len() {
+        let (handle, scale, kind, owner) = actions[order[index]];
+        if kind != Kind::Scale || !options::base(doc, handle).is_some_and(|base| base.dependent) {
+            continue;
+        }
+        let Some(parameter) = parameters.iter().find(|p| p.id == owner) else {
+            continue;
+        };
+        let mut position = index;
+        while position > 0 {
+            let (handle, flip, _, _) = actions[order[position - 1]];
+            if !managed_flips.contains(&handle)
+                || !flip.action_ids.contains(&owner)
+                || !flip.dependencies.contains(&parameter.handle)
+                || scale.dependencies.iter().any(|target| {
+                    doc.get_entity(*target).is_some() && !flip.dependencies.contains(target)
+                })
+            {
+                break;
+            }
+            order.swap(position - 1, position);
+            position -= 1;
+        }
+    }
+}
+
 pub(in crate::scene) struct Plan {
     steps: Vec<Step>,
     parameters: Vec<Parameter>,
@@ -108,7 +190,13 @@ impl Plan {
         {
             return None;
         }
-        let order = chain_order(doc, def, &all).ok()?;
+        let mut order = chain_order(doc, def, &all).ok()?;
+        let flips: Vec<_> = all
+            .iter()
+            .filter(|entry| entry.2 == Kind::Flip)
+            .map(|entry| entry.0)
+            .collect();
+        order_linked_scales(doc, def, &all, &flips, &mut order);
         let mut steps = Vec::new();
         for index in order.iter().copied() {
             let (handle, action, kind, owner) = &all[index];
@@ -186,8 +274,21 @@ impl Plan {
                 if geometry.is_empty() {
                     continue;
                 }
-                if matches!(k, Kind::Array | Kind::Flip)
-                    || !action.dependencies.contains(h)
+                if *k == Kind::Flip {
+                    // Native reciprocal Flips may name each other's parameters.
+                    // With perpendicular axes each reflection preserves the
+                    // other axis as a line, so geometry order stays valid.
+                    if action.action_ids.contains(id)
+                        && linked.action_ids.contains(owner)
+                        && linked.dependencies.contains(&axis.handle)
+                        && geometry.iter().all(|d| action.dependencies.contains(d))
+                    {
+                        continue;
+                    }
+                    return None;
+                }
+                if *k == Kind::Array
+                    || !(action.dependencies.contains(h) || action.action_ids.contains(id))
                     || order.iter().position(|i| *i == other_index)?
                         >= order.iter().position(|i| *i == index)?
                     || geometry.iter().any(|d| !action.dependencies.contains(d))
@@ -201,18 +302,7 @@ impl Plan {
                 targets,
             });
         }
-        // An axis may be selected by a later Flip. Selecting a future axis
-        // requires another ordering model and is refused here.
-        for (index, step) in steps.iter().enumerate() {
-            if steps
-                .iter()
-                .skip(index + 1)
-                .any(|later| step.targets.contains(&later.axis))
-            {
-                return None;
-            }
-        }
-        steps
+        let plan = steps
             .iter()
             .any(|step| !step.targets.is_empty())
             .then_some(Self {
@@ -220,7 +310,37 @@ impl Plan {
                 parameters,
                 legacy: None,
                 keep_cache: true,
-            })
+            })?;
+        plan.validate_axes(|handle| {
+            plan.parameters
+                .iter()
+                .find(|p| p.handle == handle)
+                .map(|p| ParameterFrame {
+                    base: p.base,
+                    end: p.end,
+                })
+        })
+        .ok()?;
+        Some(plan)
+    }
+
+    fn validate_axes(
+        &self,
+        frame: impl Fn(Handle) -> Option<ParameterFrame>,
+    ) -> Result<(), &'static str> {
+        for (index, step) in self.steps.iter().enumerate() {
+            for later in &self.steps[index + 1..] {
+                if step.targets.contains(&later.axis)
+                    && !perpendicular(
+                        frame(step.axis).ok_or(FRAME_ERROR)?,
+                        frame(later.axis).ok_or(FRAME_ERROR)?,
+                    )
+                {
+                    return Err(FRAME_ERROR);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn for_rebuild(doc: &Document, def: Handle) -> Option<Self> {
@@ -308,6 +428,7 @@ impl Plan {
         states: &[bool],
         axes: &BTreeMap<Handle, ParameterFrame>,
     ) -> Result<Value, &'static str> {
+        self.validate_axes(|axis| axes.get(&axis).copied())?;
         for (step, active) in self.steps.iter().zip(states).rev() {
             if *active && step.targets.contains(&parameter) {
                 let axis = *axes.get(&step.axis).ok_or(FRAME_ERROR)?;
@@ -390,6 +511,7 @@ impl Plan {
         canonical: &BTreeMap<Handle, ParameterFrame>,
         active: &BTreeMap<Handle, ParameterFrame>,
     ) -> Result<BTreeMap<Handle, ParameterFrame>, &'static str> {
+        self.validate_axes(|axis| active.get(&axis).or_else(|| canonical.get(&axis)).copied())?;
         let mut frames = canonical.clone();
         for (step, enabled) in self.steps.iter().zip(states) {
             if !*enabled {
@@ -474,11 +596,13 @@ impl Plan {
         let actions: Vec<_> = self.steps.iter().map(|s| s.action).collect();
         let mut active = BTreeMap::new();
         let mut canonical = frames.clone();
+        let action_bases = instance::load_action_bases(doc, insert, def)?;
         let resolved = super::rebuild_framed_with_flips(
             evaluated,
             baseline,
             def,
             &canonical,
+            Some(&action_bases),
             Some(previous),
             &actions,
             Some(&mut active),
@@ -494,6 +618,7 @@ impl Plan {
         let visible = self.display_frames(&states, &canonical, &active)?;
         let mut result = instance::materialize(doc, insert, def, evaluated)?;
         instance::save_resolved_frames(&mut result, &self.parameters, insert, &visible)?;
+        instance::save_action_bases(&mut result, insert, def, &action_bases)?;
         if self.keep_cache {
             self.write(&mut result, insert, &canonical);
         } else {
@@ -683,10 +808,17 @@ impl Plan {
             }
             (frames, Some(previous_frames))
         } else {
-            (
-                self.load_canonical(doc, &mut evaluated, insert, false)?,
-                None,
-            )
+            let frames = if !self.steps.is_empty()
+                && self.read(doc, insert)?.is_none()
+                && Self::exit(before, def).is_ok()
+            {
+                // The previous definition had geometry-only Flips. Its
+                // native frames are inputs to the newly linked actions.
+                instance::load_frames(before, &mut evaluated, insert, &self.parameters)?
+            } else {
+                self.load_canonical(doc, &mut evaluated, insert, false)?
+            };
+            (frames, None)
         };
         let reference = cleaned.as_ref().unwrap_or(doc);
         let previous_frames = previous_frames.as_ref().unwrap_or(&frames);
@@ -814,8 +946,22 @@ impl Plan {
             let f = frames.get_mut(&parameter).ok_or(FRAME_ERROR)?;
             base_changed = f.base.distance(base) > 1e-10;
             f.base = base;
+            f.end = end;
             input = Value::Point(end);
+        } else if let Value::Point(end) = input {
+            if let Some(f) = frames.get_mut(&parameter) {
+                f.end = end;
+            }
         }
+        let action_bases = instance::update_action_bases(
+            doc,
+            insert,
+            def,
+            &self.parameters,
+            &previous,
+            &frames,
+            parameter,
+        )?;
         let mut resolved = BTreeMap::new();
         let mut active = BTreeMap::new();
         let actions: Vec<_> = self.steps.iter().map(|s| s.action).collect();
@@ -826,6 +972,7 @@ impl Plan {
             parameter,
             input,
             &frames,
+            Some(&action_bases),
             base_changed,
             &previous,
             &mut resolved,
@@ -852,6 +999,7 @@ impl Plan {
             instance::materialize(doc, insert, def, &staged)?
         };
         instance::save_resolved_frames(&mut result, &self.parameters, insert, &visible)?;
+        instance::save_action_bases(&mut result, insert, def, &action_bases)?;
         if selected.flip {
             instance::save(
                 &mut result,

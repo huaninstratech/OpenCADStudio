@@ -3,8 +3,8 @@ use super::block_actions::{self as actions, instance::ParameterFrame};
 use super::block_authoring::{self as authoring, graph};
 use super::block_parameter_properties::{self as properties};
 use super::model::object::BlockParameterComponent as Component;
-use codec::objects::{DynamicBlockData as Data, ObjectType};
-use codec::{Document, EntityType, Handle};
+use document::objects::{DynamicBlockData as Data, ObjectType};
+use document::{Document, EntityType, Handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -42,7 +42,15 @@ pub struct Row {
     pub numeric: bool,
     pub show: bool,
     pub order: String,
+    /// Whether the row's `Order` cell names a parameter rank the manager writes
+    /// back. A lookup, a visibility parameter and an attribute are not a
+    /// parameter object of the definition, so their order cell stays as printed.
+    pub order_writable: bool,
     pub description: String,
+    /// Whether the row's `Description` cell names parameter text the manager
+    /// writes back. A lookup, a visibility parameter and an attribute name no
+    /// parameter component, so their description cell stays as printed.
+    pub description_writable: bool,
 }
 
 fn writable(parameter: &actions::Parameter, component: Component) -> bool {
@@ -110,8 +118,10 @@ fn parameter_rows(doc: &Document, definition: Handle) -> Vec<Row> {
                 type_name,
                 numeric: writable(&p, field.component),
                 show: field.show,
-                order: String::new(),
+                order: order_text(doc, p.handle),
+                order_writable: true,
                 description: field.description.to_owned(),
+                description_writable: description_field(p.polar, p.xy, field.component).is_some(),
             });
         }
     }
@@ -124,7 +134,7 @@ fn parameter_rows(doc: &Document, definition: Handle) -> Vec<Row> {
                 Data::LookupParameter(p) => Some((
                     "Lookup",
                     p.parameter.parameter.show_properties,
-                    p.lookup_name.clone(),
+                    p.parameter.parameter.element.name.clone(),
                 )),
                 _ => None,
             },
@@ -138,11 +148,7 @@ fn parameter_rows(doc: &Document, definition: Handle) -> Vec<Row> {
         };
         // Rows are keyed by name, and the list sorts case-insensitively, so a
         // lookup that differs only in case from a parameter is the same row.
-        if name.is_empty()
-            || rows
-                .iter()
-                .any(|row| row.name.eq_ignore_ascii_case(&name))
-        {
+        if name.is_empty() || rows.iter().any(|row| row.name.eq_ignore_ascii_case(&name)) {
             continue;
         }
         rows.push(Row {
@@ -154,7 +160,9 @@ fn parameter_rows(doc: &Document, definition: Handle) -> Vec<Row> {
             numeric: false,
             show,
             order: String::new(),
+            order_writable: false,
             description: String::new(),
+            description_writable: false,
         });
     }
     rows
@@ -177,7 +185,9 @@ fn attribute_rows(doc: &Document, definition: Handle) -> Vec<Row> {
             numeric: false,
             show: true,
             order: String::new(),
+            order_writable: false,
             description: String::new(),
+            description_writable: false,
         })
         .collect()
 }
@@ -201,6 +211,40 @@ pub fn rows(doc: &Document, definition: Handle) -> Vec<Row> {
         (a.group.rank(), a.name.to_lowercase()).cmp(&(b.group.rank(), b.name.to_lowercase()))
     });
     rows
+}
+
+/// Which rows the funnel filter keeps. `All` lists everything; the other
+/// keeps the rows another parameter's expression names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    All,
+    UsedInExpressions,
+}
+
+impl FilterMode {
+    pub const ALL: [Self; 2] = [Self::All, Self::UsedInExpressions];
+
+    /// The name the footer prints for this filter.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::UsedInExpressions => "All Used in Expressions",
+        }
+    }
+
+    /// The wording the funnel menu gives this filter.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::All => "Display All Parameters",
+            Self::UsedInExpressions => "Display Parameters Used in Expressions",
+        }
+    }
+}
+
+impl std::fmt::Display for FilterMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Wildcard match for the filter field: `*` stands for any run of characters.
@@ -231,22 +275,55 @@ fn wildcard(pattern: &str, text: &str) -> bool {
     pi == pattern.len()
 }
 
+/// Whether `name` appears in `text` as a whole identifier, so a parameter named
+/// `Distance1` is not found inside `X Distance10`.
+fn names_identifier(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let text = text.as_bytes();
+    let name = name.as_bytes();
+    if name.len() > text.len() {
+        return false;
+    }
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    (0..=text.len().saturating_sub(name.len())).any(|at| {
+        let end = at + name.len();
+        text[at..end].eq_ignore_ascii_case(name)
+            && (at == 0 || !word(text[at - 1]))
+            && (end == text.len() || !word(text[end]))
+    })
+}
+
+fn used_in_expressions(row: &Row, rows: &[Row]) -> bool {
+    rows.iter()
+        .filter(|other| other.name != row.name)
+        .any(|other| names_identifier(&other.expression, &row.name))
+}
+
 /// The filter field holds a name pattern (`*` lists all); the search field
-/// narrows the rows that pattern left by a case-insensitive name substring.
+/// narrows the rows that pattern left by a case-insensitive name substring. The
+/// funnel mode narrows either by the other parameters' expressions.
 pub fn matches(row: &Row, filter: &str, search: &str) -> bool {
     let listed = matches!(filter.trim(), "" | "*") || wildcard(filter.trim(), &row.name);
     let query = search.trim().to_lowercase();
     listed && (query.is_empty() || row.name.to_lowercase().contains(&query))
 }
 
-pub(crate) fn displayed<'a>(rows: &'a [Row], filter: &str, search: &str) -> Vec<&'a Row> {
+pub(crate) fn displayed<'a>(
+    rows: &'a [Row],
+    mode: FilterMode,
+    filter: &str,
+    search: &str,
+) -> Vec<&'a Row> {
     rows.iter()
         .filter(|row| matches(row, filter, search))
+        .filter(|row| mode == FilterMode::All || used_in_expressions(row, rows))
         .collect()
 }
 
-pub fn footer(total: usize, shown: usize) -> String {
-    format!("All: {shown} of {total} parameters displayed")
+pub fn footer(mode: FilterMode, total: usize, shown: usize) -> String {
+    format!("{}: {shown} of {total} parameters displayed", mode.label())
 }
 
 /// Where a row points: the parameter object it names, and the component whose
@@ -338,8 +415,104 @@ pub fn write_number(
         definition,
         parameter,
         Part::End,
-        codec::types::Vector3::new(at.x, at.y, at.z),
+        document::types::Vector3::new(at.x, at.y, at.z),
     )
+}
+
+const ORDER_RECORD: &str = "OPENCAD_PARAMETERS_MANAGER";
+const ORDER_CODE: i32 = 90;
+/// A row that names no parameter object has nowhere to keep a rank.
+pub const NO_ORDER: &str = "This row has no order to edit.";
+
+/// The rank a parameter keeps beside its own object, or `None` while unranked.
+fn stored_order(doc: &Document, parameter: Handle) -> Option<i32> {
+    doc.xrecord(parameter, ORDER_RECORD)?.get_i32(ORDER_CODE)
+}
+
+fn order_text(doc: &Document, parameter: Handle) -> String {
+    stored_order(doc, parameter).map_or_else(String::new, |rank| rank.to_string())
+}
+
+/// Write a row's rank onto the parameter it names. The rank belongs to the
+/// parameter as a whole, so both rows of a polar or XY parameter print the same
+/// number, and it is kept in the parameter's own extension dictionary so it
+/// travels with the drawing. An empty cell clears the rank.
+pub fn write_order(
+    doc: &mut Document,
+    definition: Handle,
+    parameter: Handle,
+    text: &str,
+) -> Result<bool, &'static str> {
+    actions::all_parameters(doc, definition)
+        .into_iter()
+        .find(|p| p.handle == parameter)
+        .ok_or(NO_ORDER)?;
+    let text = text.trim();
+    let rank = if text.is_empty() {
+        None
+    } else {
+        Some(
+            text.parse::<i32>()
+                .map_err(|_| "Specify a whole-number parameter order.")?,
+        )
+    };
+    if stored_order(doc, parameter) == rank {
+        return Ok(false);
+    }
+    let record = doc.ensure_xrecord(parameter, ORDER_RECORD);
+    let dictionary = doc.extension_dictionary_handle(parameter).ok_or(NO_ORDER)?;
+    if let Some(ObjectType::XRecord(record)) = doc.objects.get_mut(&record) {
+        record.remove_by_code(ORDER_CODE);
+        if let Some(rank) = rank {
+            record.add_int32(ORDER_CODE, rank);
+        }
+    }
+    // The writers emit an object's extension dictionary from the object itself,
+    // so the parameter has to name the dictionary it now owns.
+    if let Some(ObjectType::DynamicBlock(object)) = doc.objects.get_mut(&parameter) {
+        object.xdictionary_handle = Some(dictionary);
+    }
+    Ok(true)
+}
+
+const NO_DESCRIPTION: &str = "This row has no description to edit.";
+
+/// The text field a component prints, or `None` when the component has no
+/// description of its own. The manager's writable flag and the writer both read
+/// this mapping, so a row that offers a field is a row that can write it.
+fn description_field(
+    polar: bool,
+    xy: bool,
+    component: Component,
+) -> Option<super::block_authoring::metadata::Field> {
+    use super::block_authoring::metadata::Field;
+    match component {
+        Component::Angle if polar => Some(Field::SecondaryDescription),
+        Component::Y if xy => Some(Field::SecondaryDescription),
+        Component::X | Component::Y | Component::Distance | Component::Angle | Component::Flip => {
+            Some(Field::Description)
+        }
+        _ => None,
+    }
+}
+
+/// Write a row's description into the parameter text it prints. A polar
+/// parameter keeps its angle text apart from its distance text, and an XY
+/// parameter keeps each axis label apart, so the component selects the field.
+pub fn write_description(
+    doc: &mut Document,
+    definition: Handle,
+    parameter: Handle,
+    component: Component,
+    text: &str,
+) -> Result<bool, &'static str> {
+    use super::block_authoring::metadata;
+    let authored = actions::all_parameters(doc, definition)
+        .into_iter()
+        .find(|p| p.handle == parameter)
+        .ok_or(NO_DESCRIPTION)?;
+    let field = description_field(authored.polar, authored.xy, component).ok_or(NO_DESCRIPTION)?;
+    metadata::set_text(doc, definition, parameter, field, text)
 }
 
 /// Flip whether the parameter shows its own values, as the row's `Show` cell

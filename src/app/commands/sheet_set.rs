@@ -7,11 +7,11 @@ use crate::command::{CadCommand, CmdOption, CmdResult};
 use crate::scene::model::wire_model::WireModel;
 use crate::ui::window::sheet_set::{
     BlockList, Category, FieldId, Form, FormKind, FoundLayout, ImportRead, ImportRow, MenuAction,
-    Placing, PropRow, Properties, RowKey, SelectBlock, SheetSetMsg, SheetStatus, SsDialog,
-    TemplatePick, ViewAction, Wizard, WizardMsg,
+    NewSheetWrite, Placing, PropRow, Properties, RowKey, SelectBlock, SheetSetMsg, SheetStatus,
+    SsDialog, TemplatePick, ViewAction, Wizard, WizardMsg,
 };
-use codec::entities::Entity as _;
-use codec::sheet_set::{
+use document::entities::Entity as _;
+use document::sheet_set::{
     self as ss, ComponentKind, LayoutReference, SheetSetData, SheetSetDatabase,
 };
 use glam::DVec3;
@@ -29,12 +29,12 @@ pub(super) const SHEET_SET_SYSVARS: &[&str] = &[
 ];
 
 /// Paper-space layouts of a drawing in tab order: name and handle (hex).
-fn paper_layouts(doc: &codec::Document) -> Vec<(String, String)> {
+fn paper_layouts(doc: &document::Document) -> Vec<(String, String)> {
     let mut layouts: Vec<(i16, String, String)> = doc
         .objects
         .values()
         .filter_map(|o| match o {
-            codec::objects::ObjectType::Layout(l) if !l.name.eq_ignore_ascii_case("Model") => {
+            document::objects::ObjectType::Layout(l) if !l.name.eq_ignore_ascii_case("Model") => {
                 Some((
                     l.tab_order,
                     l.name.clone(),
@@ -278,16 +278,16 @@ impl CadCommand for SheetSetPlaceCommand {
 
 /// A model view to place: centre (world), width, height, target, direction.
 struct ModelView {
-    center: codec::types::Vector3,
+    center: document::types::Vector3,
     width: f64,
     height: f64,
-    target: codec::types::Vector3,
-    direction: codec::types::Vector3,
+    target: document::types::Vector3,
+    direction: document::types::Vector3,
 }
 
 /// Named view `view` of a model drawing, or its extents.
-fn model_view(doc: &codec::Document, view: Option<&str>) -> Option<ModelView> {
-    use codec::types::Vector3;
+fn model_view(doc: &document::Document, view: Option<&str>) -> Option<ModelView> {
+    use document::types::Vector3;
     if let Some(name) = view {
         let v = doc
             .views
@@ -298,8 +298,8 @@ fn model_view(doc: &codec::Document, view: Option<&str>) -> Option<ModelView> {
             center: Vector3::new(c.x, c.y, c.z),
             width: v.width.abs().max(1e-6),
             height: v.height.abs().max(1e-6),
-            target: v.target.clone(),
-            direction: v.direction.clone(),
+            target: v.target,
+            direction: v.direction,
         });
     }
     let (lo, hi) = (
@@ -343,6 +343,23 @@ fn prompts_for_template(db: &SheetSetDatabase, component: &str) -> bool {
         }
     }
     false
+}
+
+/// Place on Sheet's reference to model drawing `drawing`, by a relative path.
+fn view_reference(drawing: &str) -> crate::modules::insert::xattach::XrefAttachRequest {
+    crate::modules::insert::xattach::XrefAttachRequest {
+        path: drawing.to_string(),
+        overlay: false,
+        path_type: crate::io::xref_model::Pathtype::Relative,
+    }
+}
+
+/// Reads a reference's drawing (stored path, folder it resolves against).
+type ReferenceReader = fn(&str, &Path) -> crate::io::xref::XrefRead;
+
+/// Read a reference's drawing (run on a worker thread).
+fn read_reference(raw: &str, base: &Path) -> crate::io::xref::XrefRead {
+    crate::io::xref::read_xref_file(raw, base, None)
 }
 
 /// A drawing's paper-space layouts and sheet link, for Import (run on a
@@ -436,6 +453,96 @@ fn scan_folder(path: &Path) -> Vec<FoundLayout> {
         }
     }
     found
+}
+
+/// `work` on a worker, with a panic in it as its error ("`context` failed:
+/// ..."), so that a form whose drawing is written comes back with it.
+fn caught<T>(context: &str, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+            let detail = crate::app::update::panic_detail(payload);
+            Err(crate::tf!("{context} failed: {detail}").into_owned())
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = context;
+        work()
+    }
+}
+
+/// Writes a New Sheet drawing; its layout handle, or why not.
+type SheetWriter = fn(&NewSheetWrite) -> Result<String, String>;
+
+/// Write a New Sheet drawing: layout `template` of its drawing (a new
+/// drawing's first layout when there is none, or it cannot be read), alone
+/// and renamed, with the sheet link; its layout handle (run on a worker
+/// thread).
+fn write_new_sheet(w: &NewSheetWrite) -> Result<String, String> {
+    let mut scene = crate::scene::Scene::new();
+    let source_layout = match w.template.as_ref().and_then(|(file, name)| {
+        crate::io::load_file(Path::new(file))
+            .ok()
+            .map(|d| (d, name.clone()))
+    }) {
+        Some((doc, name)) => {
+            scene.document = doc;
+            name
+        }
+        None => {
+            scene.populate_new_drawing_defaults();
+            paper_layouts(&scene.document)
+                .into_iter()
+                .next()
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "Layout1".into())
+        }
+    };
+    for (name, _) in paper_layouts(&scene.document) {
+        if !name.eq_ignore_ascii_case(&source_layout) {
+            scene.delete_layout(&name);
+        }
+    }
+    scene.rename_layout(&source_layout, &w.layout_name);
+    let handle = paper_layouts(&scene.document)
+        .into_iter()
+        .find(|(n, _)| *n == w.layout_name)
+        .map(|(_, h)| h)
+        .unwrap_or_default();
+    scene.document.set_sheet_set_data(&SheetSetData {
+        layout_handle: handle.to_lowercase(),
+        layout_name: w.layout_name.clone(),
+        sheet_dwg_name: w.file.clone(),
+        sheet_set_file_name: ss::native_path(&w.dst),
+        sheet_set_version: w.version,
+        update_count: 1,
+        update_time: utc_stamp(),
+    });
+    crate::entities::field::stamp_save_dates(&mut scene.document);
+    crate::io::save(&scene.document, &w.path).map_err(|e| format!("{}: {e}", w.file))?;
+    Ok(handle)
+}
+
+/// Renames a layout in a closed drawing and saves it (path, layout, new
+/// name, `.bak` first).
+type RenameWriter = fn(&Path, &str, &str, bool) -> Result<(), String>;
+
+/// Rename layout `from` to `to` in the closed drawing at `path`, and its
+/// sheet link, and save it back whole; its previous file is kept as `.bak`
+/// when `backup`, as a save over it does (run on a worker thread).
+fn write_renamed_layout(path: &Path, from: &str, to: &str, backup: bool) -> Result<(), String> {
+    let mut scene = crate::scene::Scene::new();
+    scene.document = crate::io::load_file(path).map_err(|e| e.to_string())?;
+    scene.rename_layout(from, to);
+    if let Some(mut link) = scene.document.sheet_set_data() {
+        link.layout_name = to.to_string();
+        scene.document.set_sheet_set_data(&link);
+    }
+    if backup {
+        crate::io::write_backup(path);
+    }
+    crate::io::save(&scene.document, path).map_err(|e| e.to_string())
 }
 
 /// Rename & Renumber: layout and file names follow the options.
@@ -623,7 +730,7 @@ impl OpenCADStudio {
                     None => ask(self, name),
                     Some(v) => match v.parse::<i32>() {
                         Ok(n) if !(min..=max).contains(&n) => {
-                            self.command_line.push_error(&if max == 1 {
+                            self.command_line.push_rejection(&if max == 1 {
                                 crate::t!("Requires 0 or 1").into_owned()
                             } else {
                                 crate::tf!("Requires an integer between {min} and {max}.")
@@ -632,7 +739,7 @@ impl OpenCADStudio {
                             ask(self, name);
                         }
                         Err(_) => {
-                            self.command_line.push_error(&crate::tf!(
+                            self.command_line.push_rejection(&crate::tf!(
                                 "Requires an integer between {min} and {max}."
                             ));
                             ask(self, name);
@@ -914,8 +1021,15 @@ impl OpenCADStudio {
                 }
                 Err(e) => self.command_line.push_error(&format!("{path}: {e}")),
             },
-            SheetSetMsg::Previous => self.rename_step(false),
-            SheetSetMsg::Next => self.rename_step(true),
+            SheetSetMsg::Previous => return self.rename_step(false),
+            SheetSetMsg::Next => return self.rename_step(true),
+            SheetSetMsg::SheetWritten(f, write, written) => {
+                return self.finish_new_sheet(*f, *write, written)
+            }
+            SheetSetMsg::RenameWritten(f, step, written) => match written {
+                Ok(()) => return self.apply_rename(*f, step, true, write_renamed_layout),
+                Err(e) => return self.form_error(*f, e),
+            },
             SheetSetMsg::ViewsByCategory(v) => self.sheet_set.by_category = v,
             SheetSetMsg::NewCategory => self.open_category(None),
             SheetSetMsg::CategoryProperties(id) => self.open_category(Some(id)),
@@ -1023,6 +1137,9 @@ impl OpenCADStudio {
                 self.sheet_set.open_drawings.insert(ss::path_key(&path));
             }
             SheetSetMsg::PlaceOnSheet(path, view) => return self.start_place_view(path, view),
+            SheetSetMsg::ViewReferenceRead(path, view, host, read) => {
+                return self.start_place_view_with(path, view, Some((host, read)), read_reference)
+            }
             SheetSetMsg::ViewMenu(id, action) => {
                 self.sheet_set.submenu = None;
                 return self.view_menu(id, action);
@@ -1693,11 +1810,34 @@ impl OpenCADStudio {
         self.active_modal = Some(crate::app::ModalKind::SheetSet);
     }
 
+    /// A form back in its dialog with error `e`; on the command line when
+    /// another dialog opened while a worker wrote its drawing.
+    fn form_error(&mut self, f: Form, e: String) -> Task<Message> {
+        if self.sheet_set.dialog.is_none() {
+            self.sheet_set.dialog = Some(SsDialog::Form(Form {
+                error: Some(e),
+                ..f
+            }));
+        } else {
+            self.command_line.push_error(&e);
+        }
+        Task::none()
+    }
+
     /// Rename & Renumber: number and title into the set, and the layout and
-    /// drawing file renamed when they changed.
-    fn apply_rename(&mut self, f: &Form) -> Result<(), String> {
+    /// drawing file renamed when they changed; then `step`: OK (`None`)
+    /// closes the dialog, Previous / Next (`Some(forward)`) go to that
+    /// sheet. A closed drawing's layout is renamed in its file on a worker
+    /// first (`writer`; `written` once it is).
+    fn apply_rename(
+        &mut self,
+        f: Form,
+        step: Option<bool>,
+        written: bool,
+        writer: RenameWriter,
+    ) -> Task<Message> {
         let Some(db) = self.sheet_set.sets.get(f.set) else {
-            return Ok(());
+            return self.rename_done(f, step);
         };
         let old = db
             .layout_reference(&f.component, "Layout")
@@ -1718,12 +1858,14 @@ impl OpenCADStudio {
         let open_tab = self.tab_showing(Path::new(&old.file_name));
         if file_changed {
             if open_tab.is_some() {
-                return Err(
+                return self.form_error(
+                    f,
                     crate::t!("The drawing is open; close it to rename its file.").into_owned(),
                 );
             }
             if Path::new(&new_file).exists() {
-                return Err(crate::tf!("{} already exists.", new_file).into_owned());
+                let e = crate::tf!("{} already exists.", new_file).into_owned();
+                return self.form_error(f, e);
             }
         }
         if layout_changed {
@@ -1741,29 +1883,34 @@ impl OpenCADStudio {
                     }
                     self.tabs[k].dirty = true;
                 }
-                None => {
-                    // The closed drawing is read and written back whole: its
-                    // previous file is kept as `.bak`, as a save over it does.
-                    let path = Path::new(&old.file_name);
-                    let mut scene = crate::scene::Scene::new();
-                    scene.document = crate::io::load_file(path).map_err(|e| e.to_string())?;
-                    scene.rename_layout(&old.name, &new_layout);
-                    if let Some(mut link) = scene.document.sheet_set_data() {
-                        link.layout_name = new_layout.clone();
-                        scene.document.set_sheet_set_data(&link);
-                    }
-                    if self.backup_on_save {
-                        crate::io::write_backup(path);
-                    }
-                    crate::io::save(&scene.document, path).map_err(|e| e.to_string())?;
+                // The closed drawing is read and written back on a worker;
+                // this runs again when it is written.
+                None if !written => {
+                    let path = PathBuf::from(&old.file_name);
+                    let (from, to, backup) = (old.name.clone(), new_layout, self.backup_on_save);
+                    let context = crate::t!("Rename & Renumber Sheet").into_owned();
+                    return crate::app::update::background_task(
+                        context.clone(),
+                        move || caught(&context, || writer(&path, &from, &to, backup)),
+                        move |written| {
+                            Message::SheetSet(SheetSetMsg::RenameWritten(
+                                Box::new(f),
+                                step,
+                                written,
+                            ))
+                        },
+                    );
                 }
+                None => {}
             }
         }
         if file_changed {
-            std::fs::rename(&old.file_name, &new_file).map_err(|e| e.to_string())?;
+            if let Err(e) = std::fs::rename(&old.file_name, &new_file) {
+                return self.form_error(f, e.to_string());
+            }
         }
         let Some(db) = self.sheet_set.sets.get_mut(f.set) else {
-            return Ok(());
+            return self.rename_done(f, step);
         };
         if let Some(el) = db.find_mut(&f.component) {
             el.set_prop("Number", f.number.trim());
@@ -1780,17 +1927,17 @@ impl OpenCADStudio {
                 },
             );
         }
-        Ok(())
+        self.rename_done(f, step)
     }
 
     /// Rename & Renumber < Previous / Next >: apply, then the neighbouring sheet.
-    fn rename_step(&mut self, forward: bool) {
+    fn rename_step(&mut self, forward: bool) -> Task<Message> {
         let Some(SsDialog::Form(f)) = self.sheet_set.dialog.take() else {
-            return;
+            return Task::none();
         };
         if f.kind == FormKind::RenameView {
             let Some(db) = self.sheet_set.sets.get_mut(f.set) else {
-                return;
+                return Task::none();
             };
             if let Some(el) = db.find_mut(&f.component) {
                 if f.number.trim().is_empty() {
@@ -1819,19 +1966,22 @@ impl OpenCADStudio {
                 Some(form) => self.sheet_set.dialog = Some(SsDialog::Form(form)),
                 None => self.close_active_modal(),
             }
-            return;
+            return Task::none();
         }
-        if let Err(e) = self.apply_rename(&f) {
-            self.sheet_set.dialog = Some(SsDialog::Form(Form {
-                error: Some(e),
-                ..f
-            }));
-            return;
-        }
+        self.apply_rename(f, Some(forward), false, write_renamed_layout)
+    }
+
+    /// Rename & Renumber applied: OK (`step` `None`) closes the dialog;
+    /// Previous / Next go to that sheet.
+    fn rename_done(&mut self, f: Form, step: Option<bool>) -> Task<Message> {
         self.sheet_set.current = Some(f.set);
         self.save_current_sheet_set();
+        let Some(forward) = step else {
+            self.close_active_modal();
+            return Task::none();
+        };
         let Some(db) = self.sheet_set.sets.get(f.set) else {
-            return;
+            return Task::none();
         };
         let ids: Vec<String> = db.sheets().iter().map(|s| s.id().to_string()).collect();
         let k = ids.iter().position(|i| *i == f.component).unwrap_or(0);
@@ -1842,13 +1992,14 @@ impl OpenCADStudio {
         };
         let Some(id) = ids.get(next) else {
             self.close_active_modal();
-            return;
+            return Task::none();
         };
         let mut form = rename_form(db, f.set, id);
         form.rename = f.rename;
         follow_rename(&mut form);
         self.sheet_set.selected = Some(id.clone());
         self.sheet_set.dialog = Some(SsDialog::Form(form));
+        Task::none()
     }
 
     /// The View Category dialog for a new (`None`) or existing category.
@@ -1950,7 +2101,7 @@ impl OpenCADStudio {
         &mut self,
         path: &str,
         then: SheetSetMsg,
-    ) -> Result<std::sync::Arc<codec::Document>, Task<Message>> {
+    ) -> Result<std::sync::Arc<document::Document>, Task<Message>> {
         if let Some(doc) = self.sheet_set.drawings.get(path) {
             return Ok(doc);
         }
@@ -1978,14 +2129,14 @@ impl OpenCADStudio {
         scene.document = std::sync::Arc::try_unwrap(doc).unwrap_or_else(|doc| (*doc).clone());
         let wires = if name.is_empty() {
             let model = scene.document.header.model_space_block_handle;
-            let entities: Vec<codec::EntityType> = scene
+            let entities: Vec<document::EntityType> = scene
                 .document
                 .entities()
                 .filter(|e| e.common().owner_handle == model)
                 .filter(|e| {
                     !matches!(
                         e,
-                        codec::EntityType::Block(_) | codec::EntityType::BlockEnd(_)
+                        document::EntityType::Block(_) | document::EntityType::BlockEnd(_)
                     )
                 })
                 .take(20_000)
@@ -2073,8 +2224,20 @@ impl OpenCADStudio {
 
     /// Place on Sheet: only on a sheet of this set open at its layout.
     /// The model drawing and the set's view label block drawing are read
-    /// first.
+    /// first, then the model drawing for its reference.
     fn start_place_view(&mut self, drawing: String, view: Option<String>) -> Task<Message> {
+        self.start_place_view_with(drawing, view, None, read_reference)
+    }
+
+    /// [`Self::start_place_view`] with the reference read so far (for the
+    /// sheet drawing at its path), and the reader of the reference.
+    fn start_place_view_with(
+        &mut self,
+        drawing: String,
+        view: Option<String>,
+        read: Option<(Option<PathBuf>, Box<crate::io::xref::XrefRead>)>,
+        reader: ReferenceReader,
+    ) -> Task<Message> {
         if self.tabs[self.active_tab]
             .scene
             .current_layout
@@ -2113,12 +2276,51 @@ impl OpenCADStudio {
                 .push_error(crate::tf!("{}: no view to place.", drawing).as_ref());
             return Task::none();
         };
+        // The reference is read on a worker, for this sheet drawing; a
+        // reference already in the sheet reads nothing.
+        let i = self.active_tab;
+        let host = self.tabs[i].current_path.clone();
+        let read = match read {
+            Some((read_host, read)) if read_host == host => Some(read),
+            _ if crate::modules::insert::xattach::existing_reference(
+                &self.tabs[i].scene,
+                &crate::modules::insert::xattach::path_to_block_name(&drawing),
+            )
+            .is_some() =>
+            {
+                None
+            }
+            _ => {
+                let request = view_reference(&drawing);
+                let (raw, base) =
+                    crate::modules::insert::xattach::xref_read_inputs(&request, host.as_deref());
+                // No folder to resolve against: nothing to read, as before.
+                match base {
+                    None => None,
+                    Some(base) => {
+                        return crate::app::update::background_task(
+                            crate::t!("Place on Sheet"),
+                            move || reader(&raw, &base),
+                            move |read| {
+                                Message::SheetSet(SheetSetMsg::ViewReferenceRead(
+                                    drawing,
+                                    view,
+                                    host,
+                                    Box::new(read),
+                                ))
+                            },
+                        )
+                    }
+                }
+            }
+        };
         self.start_placing(
             Placing::View {
                 set,
                 sheet,
                 drawing,
                 view,
+                read,
             },
             size,
         );
@@ -2239,7 +2441,7 @@ impl OpenCADStudio {
         i: usize,
         file: &str,
         name: &str,
-        at: codec::types::Vector3,
+        at: document::types::Vector3,
         view: &str,
         sheet: &str,
         set: usize,
@@ -2249,9 +2451,9 @@ impl OpenCADStudio {
                 .push_error(crate::tf!("{}: cannot be read.", file).as_ref());
             return;
         };
-        let probe = codec::EntityType::Insert(codec::entities::Insert::new(
+        let probe = document::EntityType::Insert(document::entities::Insert::new(
             name.to_string(),
-            codec::types::Vector3::ZERO,
+            document::types::Vector3::ZERO,
         ));
         let deps = crate::app::ClipboardDeps::capture(&source, std::slice::from_ref(&probe));
         self.merge_dependencies(i, &deps);
@@ -2269,30 +2471,30 @@ impl OpenCADStudio {
             .unwrap_or(source.header.insertion_units);
         let host = self.tabs[i].scene.document.header.insertion_units;
         let k = crate::app::properties::insert_unit_scale(host, units).unwrap_or(1.0);
-        let mut insert = codec::entities::Insert::new(name.to_string(), at).with_scale(k, k, k);
+        let mut insert = document::entities::Insert::new(name.to_string(), at).with_scale(k, k, k);
         let doc = &self.tabs[i].scene.document;
         let transform = crate::scene::render_graph::insert_transform(doc, &insert);
-        let attdefs: Vec<codec::entities::AttributeDefinition> = doc
+        let attdefs: Vec<document::entities::AttributeDefinition> = doc
             .block_records
             .get(name)
             .map(|br| {
                 br.entity_handles
                     .iter()
                     .filter_map(|h| match doc.get_entity(*h) {
-                        Some(codec::EntityType::AttributeDefinition(d)) => Some(d.clone()),
+                        Some(document::EntityType::AttributeDefinition(d)) => Some(d.clone()),
                         _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
         for d in &attdefs {
-            let mut a = codec::entities::AttributeEntity::from_definition(d, None);
+            let mut a = document::entities::AttributeEntity::from_definition(d, None);
             a.apply_transform(&transform);
             insert.attributes.push(a);
         }
         let handle = self.tabs[i]
             .scene
-            .add_entity(codec::EntityType::Insert(insert));
+            .add_entity(document::EntityType::Insert(insert));
         let Some(db) = self.sheet_set.sets.get(set) else {
             return;
         };
@@ -2313,7 +2515,7 @@ impl OpenCADStudio {
     /// The insertion point was picked: place the view (xref, viewport, paper
     /// named view, view label, sheet view record) or the block.
     fn place_at(&mut self, i: usize, x: f64, y: f64, scale: f64) {
-        use codec::types::Vector3;
+        use document::types::Vector3;
         let Some(placing) = self.sheet_set.placing.take() else {
             return;
         };
@@ -2333,6 +2535,7 @@ impl OpenCADStudio {
                 sheet,
                 drawing,
                 view,
+                read,
             } => {
                 let Some(mv) = self
                     .sheet_set
@@ -2348,49 +2551,47 @@ impl OpenCADStudio {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default()
                 });
-                // The model drawing is attached to the sheet's model space.
+                // The model drawing is attached to the sheet's model space,
+                // from the worker's read.
                 let host = self.tabs[i].current_path.clone();
-                let request = crate::modules::insert::xattach::XrefAttachRequest {
-                    path: drawing.clone(),
-                    overlay: false,
-                    path_type: crate::io::xref_model::Pathtype::Relative,
-                };
+                let request = view_reference(&drawing);
                 let scene = &mut self.tabs[i].scene;
-                let xref = crate::modules::insert::xattach::prepare_xref_definition(
+                let xref = crate::modules::insert::xattach::prepare_named_xref_definition_with(
                     scene,
                     &request,
                     host.as_deref(),
+                    &crate::modules::insert::xattach::path_to_block_name(&request.path),
+                    read.map(|read| *read),
                 );
                 let model = scene.document.header.model_space_block_handle;
                 let inserted = scene.document.entities().any(|e| {
-                    e.common().owner_handle == model && matches!(e, codec::EntityType::Insert(ins) if ins.block_name.eq_ignore_ascii_case(&xref))
+                    e.common().owner_handle == model && matches!(e, document::EntityType::Insert(ins) if ins.block_name.eq_ignore_ascii_case(&xref))
                 });
                 if !inserted {
                     let saved = std::mem::replace(&mut scene.current_layout, "Model".to_string());
-                    scene.add_entity(codec::EntityType::Insert(codec::entities::Insert::new(
-                        xref,
-                        Vector3::ZERO,
-                    )));
+                    scene.add_entity(document::EntityType::Insert(
+                        document::entities::Insert::new(xref, Vector3::ZERO),
+                    ));
                     scene.current_layout = saved;
                 }
                 // The viewport: lower-left corner at the point, the view at the scale.
                 let (w, h) = (mv.width * scale, mv.height * scale);
-                let mut vp = codec::entities::Viewport::new();
+                let mut vp = document::entities::Viewport::new();
                 vp.center = Vector3::new(x + w / 2.0, y + h / 2.0, 0.0);
                 vp.width = w;
                 vp.height = h;
                 vp.id = scene.next_viewport_id();
-                vp.view_target = mv.target.clone();
-                vp.view_direction = mv.direction.clone();
+                vp.view_target = mv.target;
+                vp.view_direction = mv.direction;
                 // ponytail: plan views only (the DCS offset is the world XY
                 // offset); a twisted or 3D view needs the view basis here.
                 vp.view_center =
                     Vector3::new(mv.center.x - mv.target.x, mv.center.y - mv.target.y, 0.0);
                 vp.view_height = mv.height;
                 vp.custom_scale = scale;
-                scene.add_entity(codec::EntityType::Viewport(Box::new(vp)));
+                scene.add_entity(document::EntityType::Viewport(Box::new(vp)));
                 // A paper-space named view of the same name frames it.
-                let mut named = codec::tables::View::new(title.as_str());
+                let mut named = document::tables::View::new(title.as_str());
                 named.handle = scene.document.allocate_handle();
                 named.paper_space = true;
                 named.center = Vector3::new(x + w / 2.0, y + h / 2.0, 0.0);
@@ -2773,13 +2974,7 @@ impl OpenCADStudio {
             return Task::none();
         };
         match f.kind {
-            FormKind::Rename => {
-                if let Err(e) = self.apply_rename(&f) {
-                    f.error = Some(e);
-                    self.sheet_set.dialog = Some(SsDialog::Form(f));
-                    return Task::none();
-                }
-            }
+            FormKind::Rename => return self.apply_rename(f, None, false, write_renamed_layout),
             FormKind::NewSubset => {
                 let name = f.title.trim().to_string();
                 if name.is_empty() {
@@ -2859,12 +3054,13 @@ impl OpenCADStudio {
     /// "Number Title", from the sheet creation template (a new drawing's
     /// Layout1 when the set names none); then the sheet and its layout
     /// reference, and the drawing opens at it.
-    fn create_sheet(&mut self, mut f: Form) -> Task<Message> {
-        let fail = |app: &mut Self, mut f: Form, e: String| {
-            f.error = Some(e);
-            app.sheet_set.dialog = Some(SsDialog::Form(f));
-            Task::none()
-        };
+    fn create_sheet(&mut self, f: Form) -> Task<Message> {
+        self.create_sheet_with(f, write_new_sheet)
+    }
+
+    /// [`Self::create_sheet`] with the writer of the sheet drawing.
+    fn create_sheet_with(&mut self, mut f: Form, writer: SheetWriter) -> Task<Message> {
+        let fail = |app: &mut Self, f: Form, e: String| app.form_error(f, e);
         let title = f.title.trim().to_string();
         if title.is_empty() {
             return fail(
@@ -2907,57 +3103,52 @@ impl OpenCADStudio {
                 .get(f.set)
                 .and_then(|db| template_of(db, &f.component)),
         };
-        let mut scene = crate::scene::Scene::new();
-        let source_layout = match template.as_ref().and_then(|t| {
-            crate::io::load_file(Path::new(&t.file_name))
-                .ok()
-                .map(|d| (d, t.name.clone()))
-        }) {
-            Some((doc, name)) => {
-                scene.document = doc;
-                name
-            }
-            None => {
-                scene.populate_new_drawing_defaults();
-                paper_layouts(&scene.document)
-                    .into_iter()
-                    .next()
-                    .map(|(n, _)| n)
-                    .unwrap_or_else(|| "Layout1".into())
-            }
-        };
-        for (name, _) in paper_layouts(&scene.document) {
-            if !name.eq_ignore_ascii_case(&source_layout) {
-                scene.delete_layout(&name);
-            }
-        }
-        scene.rename_layout(&source_layout, &layout_name);
-        let handle = paper_layouts(&scene.document)
-            .into_iter()
-            .find(|(n, _)| *n == layout_name)
-            .map(|(_, h)| h)
-            .unwrap_or_default();
         f.number = f.number.trim().to_string();
         let Some(db) = self.sheet_set.sets.get(f.set) else {
             return Task::none();
         };
-        // The drawing is saved first: a failed save leaves no sheet in the set.
-        // It records the revision the set's next write counts up to.
-        let dst = db.path.clone().unwrap_or_default();
-        let file = ss::native_path(&path.to_string_lossy());
-        scene.document.set_sheet_set_data(&SheetSetData {
-            layout_handle: handle.to_lowercase(),
-            layout_name: layout_name.clone(),
-            sheet_dwg_name: file.clone(),
-            sheet_set_file_name: ss::native_path(&dst),
-            sheet_set_version: db.file_revision() + 1,
-            update_count: 1,
-            update_time: utc_stamp(),
-        });
-        crate::entities::field::stamp_save_dates(&mut scene.document);
-        if let Err(e) = crate::io::save(&scene.document, &path) {
-            return fail(self, f, format!("{file}: {e}"));
-        }
+        // The drawing is written first, on a worker: a failed save leaves no
+        // sheet in the set. It records the revision the set's next write
+        // counts up to.
+        let write = NewSheetWrite {
+            file: ss::native_path(&path.to_string_lossy()),
+            path,
+            template: template.map(|t| (t.file_name, t.name)),
+            layout_name,
+            dst: db.path.clone().unwrap_or_default(),
+            version: db.file_revision() + 1,
+        };
+        let context = crate::t!("New Sheet").into_owned();
+        crate::app::update::background_task(
+            context.clone(),
+            {
+                let write = write.clone();
+                move || caught(&context, || writer(&write))
+            },
+            move |written| {
+                Message::SheetSet(SheetSetMsg::SheetWritten(
+                    Box::new(f),
+                    Box::new(write),
+                    written,
+                ))
+            },
+        )
+    }
+
+    /// New Sheet: the drawing is written (its layout handle, or why not);
+    /// the sheet and its layout reference join the set, and the drawing
+    /// opens at it.
+    fn finish_new_sheet(
+        &mut self,
+        f: Form,
+        write: NewSheetWrite,
+        written: Result<String, String>,
+    ) -> Task<Message> {
+        let handle = match written {
+            Ok(handle) => handle,
+            Err(e) => return self.form_error(f, e),
+        };
+        let title = f.title.trim().to_string();
         let Some(db) = self.sheet_set.sets.get_mut(f.set) else {
             return Task::none();
         };
@@ -2968,13 +3159,13 @@ impl OpenCADStudio {
             &sheet,
             "Layout",
             &LayoutReference {
-                file_name: file,
-                name: layout_name,
+                file_name: write.file,
+                name: write.layout_name,
                 handle,
             },
         );
-        if let Err(e) = write_set(db, &dst) {
-            self.command_line.push_error(&format!("{dst}: {e}"));
+        if let Err(e) = write_set(db, &write.dst) {
+            self.command_line.push_error(&format!("{}: {e}", write.dst));
         }
         // "Open in drawing editor" (off by default) opens the new sheet.
         self.close_active_modal();
@@ -2987,6 +3178,10 @@ impl OpenCADStudio {
         Task::none()
     }
 }
+
+#[cfg(test)]
+#[path = "sheet_set_write_tests.rs"]
+mod sheet_set_write_tests;
 
 /// The default folder for new sheet set data: the user's Documents folder,
 /// else the home folder.
@@ -3324,4 +3519,204 @@ fn refresh_sheet_fields(scene: &mut crate::scene::Scene) -> bool {
         scene.bump_entities(&changes);
     }
     !changes.is_empty()
+}
+
+#[cfg(test)]
+mod place_view_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A sheet set action through the automation protocol, its tasks driven.
+    fn sheet(app: &mut OpenCADStudio, value: &str) -> serde_json::Value {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let state = app.control_state();
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let req = json!({
+            "protocol": 1,
+            "document_id": state["document_id"].clone(),
+            "revision": state["revision"].clone(),
+            "client_id": "test",
+            "request_id": format!("place-{id}"),
+            "op": "action",
+            "name": "sheet_set",
+            "value": value,
+        });
+        app.automation_op(&req.to_string())
+    }
+
+    /// An app with a saved model drawing (one line, 10 by 5) and an open
+    /// sheet of a new set at its layout; the model drawing's path.
+    fn sheet_and_model(stem: &str) -> (OpenCADStudio, String) {
+        let dir = std::env::temp_dir().join(format!("ocs-ss-place-{stem}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let folder = dir.display().to_string().replace('\\', "/");
+        let model = format!("{folder}/model.dwg");
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,5"}"#);
+        let _ = app.automation_op(&format!(r#"{{"op":"save","path":"{model}"}}"#));
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let _ = sheet(&mut app, "new");
+        let _ = sheet(&mut app, "existing=0");
+        let _ = sheet(&mut app, "name=PLACESET");
+        let _ = sheet(&mut app, &format!("folder={folder}"));
+        let _ = sheet(&mut app, "ok");
+        let _ = sheet(&mut app, "menu=new_sheet:set");
+        let _ = sheet(&mut app, "number=A-1");
+        let _ = sheet(&mut app, "title=Plan");
+        let _ = sheet(&mut app, &format!("folder={folder}"));
+        let _ = sheet(&mut app, "open_after=1");
+        let _ = sheet(&mut app, "ok");
+        assert!(
+            app.current_sheet().is_some(),
+            "the new sheet is open at its layout"
+        );
+        // The model drawing is read for its size before the reference.
+        let task = app
+            .drawing_or_read(&model, SheetSetMsg::Refresh)
+            .expect_err("not read yet");
+        app.drive_headless_task(task).unwrap();
+        (app, model)
+    }
+
+    /// The entities that the sheet's reference to `model.dwg` holds (`None`:
+    /// no such reference).
+    fn reference_content(app: &OpenCADStudio) -> Option<usize> {
+        let scene = &app.tabs[app.active_tab].scene;
+        let record = scene
+            .document
+            .block_records
+            .iter()
+            .find(|r| r.flags.is_xref && r.name.eq_ignore_ascii_case("model"))?;
+        let block = record.handle;
+        Some(
+            scene
+                .document
+                .entities()
+                .filter(|e| e.common().owner_handle == block)
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        document::EntityType::Block(_) | document::EntityType::BlockEnd(_)
+                    )
+                })
+                .count(),
+        )
+    }
+
+    /// Pick the view's insertion point at the origin.
+    fn pick(app: &mut OpenCADStudio) {
+        let task = app.feed_active_cmd("0,0");
+        app.drive_headless_task(task).unwrap();
+    }
+
+    /// The reference is read on a worker before the insertion point is
+    /// asked for; the pick then reads no file.
+    #[test]
+    fn the_view_reference_is_read_on_a_worker() {
+        let _sets = crate::entities::field::sheet_sets_one_at_a_time();
+        let (mut app, model) = sheet_and_model("worker");
+        let task = app.on_sheet_set(SheetSetMsg::PlaceOnSheet(model.clone(), None));
+        assert!(
+            app.sheet_set.placing.is_none(),
+            "no point prompt during the read"
+        );
+        let message = OpenCADStudio::first_task_message(task);
+        assert!(
+            matches!(
+                &message,
+                Message::SheetSet(SheetSetMsg::ViewReferenceRead(path, None, _, _)) if *path == model
+            ),
+            "{message:?}"
+        );
+        // The file is no drawing before the result arrives (at its old time,
+        // so the cached model drawing stays): the pick uses the read.
+        let time = std::fs::metadata(&model).unwrap().modified().unwrap();
+        std::fs::write(&model, b"not a drawing").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&model)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let _ = app.update(message);
+        assert!(
+            app.sheet_set.placing.is_some(),
+            "the point prompt after the read"
+        );
+        pick(&mut app);
+        assert_eq!(
+            reference_content(&app),
+            Some(1),
+            "the reference holds the line"
+        );
+    }
+
+    /// A reader panic is caught on the worker: no point prompt, no reference.
+    #[test]
+    fn a_view_reference_reader_panic_keeps_the_app() {
+        let _sets = crate::entities::field::sheet_sets_one_at_a_time();
+        let (mut app, model) = sheet_and_model("panic");
+        let task = app.start_place_view_with(model, None, None, |_, _| {
+            panic!("reader panic in the view reference read")
+        });
+        let message = OpenCADStudio::first_task_message(task);
+        assert!(
+            matches!(message, Message::BackgroundTaskFailed { .. }),
+            "{message:?}"
+        );
+        let _ = app.update(message);
+        assert!(app.sheet_set.placing.is_none(), "no point prompt");
+        assert_eq!(reference_content(&app), None, "no reference");
+    }
+
+    /// A read for another sheet drawing is not used: the reference is read
+    /// again, for the sheet that is open.
+    #[test]
+    fn a_view_reference_read_for_another_sheet_is_read_again() {
+        let _sets = crate::entities::field::sheet_sets_one_at_a_time();
+        let (mut app, model) = sheet_and_model("other");
+        let other = Some(PathBuf::from("/elsewhere/other-sheet.dwg"));
+        let stale = crate::io::xref::read_xref_file("model.dwg", Path::new("/elsewhere"), None);
+        let task = app.on_sheet_set(SheetSetMsg::ViewReferenceRead(
+            model.clone(),
+            None,
+            other.clone(),
+            Box::new(stale),
+        ));
+        assert!(
+            app.sheet_set.placing.is_none(),
+            "no point prompt with that read"
+        );
+        let message = OpenCADStudio::first_task_message(task);
+        let Message::SheetSet(SheetSetMsg::ViewReferenceRead(_, _, host, _)) = &message else {
+            panic!("{message:?}");
+        };
+        assert_eq!(
+            *host, app.tabs[app.active_tab].current_path,
+            "read for the open sheet"
+        );
+        let _ = app.update(message);
+        pick(&mut app);
+        assert_eq!(
+            reference_content(&app),
+            Some(1),
+            "the reference holds the line"
+        );
+    }
+
+    /// A second view of a drawing the sheet references already reads
+    /// nothing: its point prompt comes at once.
+    #[test]
+    fn a_second_view_of_a_referenced_drawing_reads_nothing() {
+        let _sets = crate::entities::field::sheet_sets_one_at_a_time();
+        let (mut app, model) = sheet_and_model("second");
+        let task = app.on_sheet_set(SheetSetMsg::PlaceOnSheet(model.clone(), None));
+        app.drive_headless_task(task).unwrap();
+        pick(&mut app);
+        assert_eq!(reference_content(&app), Some(1));
+        let _ = app.on_sheet_set(SheetSetMsg::PlaceOnSheet(model, None));
+        assert!(app.sheet_set.placing.is_some(), "the point prompt at once");
+    }
 }

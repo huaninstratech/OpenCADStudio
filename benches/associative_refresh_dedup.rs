@@ -28,10 +28,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use codec::entities::{
+use document::entities::{
     CenterLineAssociation, CenterLineSource, CenterLineSourceKind, EntityType, Line,
 };
-use codec::types::{Handle, Vector3};
+use document::types::{Handle, Vector3};
 use OpenCADStudio::scene::{ChangeKind, Scene};
 
 const CARRIERS: usize = 6_000;
@@ -40,10 +40,7 @@ const RUNS: usize = 3;
 const WARMUP: usize = 1;
 
 fn line_at(y: f64) -> Line {
-    Line::from_points(
-        Vector3::new(0.0, y, 0.0),
-        Vector3::new(100.0, y, 0.0),
-    )
+    Line::from_points(Vector3::new(0.0, y, 0.0), Vector3::new(100.0, y, 0.0))
 }
 
 fn association(first: Handle, second: Handle, y: f64) -> CenterLineAssociation {

@@ -142,17 +142,21 @@ impl EditLease {
     pub fn acquire(path: &Path) -> Result<Self, EditLeaseError> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let lock_path = sidecar_path(&canonical);
-        let mut sidecar = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                EditLeaseError::Unavailable(format!(
-                    "Could not create edit lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        // Its name starts with a dot, which hides it on Linux and macOS;
+        // Windows hides it by attribute (#2671).
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.attributes(windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN);
+        }
+        let mut sidecar = options.open(&lock_path).map_err(|error| {
+            EditLeaseError::Unavailable(format!(
+                "Could not create edit lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
 
         match sidecar.try_lock() {
             Ok(()) => {}
@@ -214,6 +218,18 @@ impl EditLease {
     /// Clone the leased drawing handle for a worker.
     pub fn reader(&self) -> std::io::Result<Option<File>> {
         self.drawing.as_ref().map(File::try_clone).transpose()
+    }
+
+    /// Hand the drawing handle itself to a save. A network share refuses to
+    /// replace a file that still has an open handle (os error 5, #3636), so
+    /// the save verifies through it and drops it before the replace;
+    /// [`Self::refresh_drawing_lock`] locks the drawing again afterwards.
+    pub fn take_reader(&mut self) -> Option<File> {
+        self.drawing.take()
+    }
+
+    pub fn holds_drawing(&self) -> bool {
+        self.drawing.is_some()
     }
 
     /// Atomic save replaces the path with a new file object. Move the platform

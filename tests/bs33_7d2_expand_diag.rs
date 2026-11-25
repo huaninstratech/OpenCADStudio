@@ -1,9 +1,9 @@
 // Diag: expand INSERT 7D2 (block "Unknown-530909461-13 - 8299") and report
 // where its content actually is, and how its TEXT wires order against the
 // WIPEOUT fill wires (draw order = visibility vs the wipeout).
-use codec::entities::Insert;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::Insert;
+use document::types::Vector3;
+use document::EntityType;
 use OpenCADStudio::io::load_bytes_finalized;
 use OpenCADStudio::scene::cache::block_cache::{expand_insert, BlockCache};
 use OpenCADStudio::scene::view::render::InheritStyle;
@@ -20,7 +20,7 @@ fn bs33_insert_7d2_content_and_order() {
     let (doc, _) = load_bytes_finalized(&path, bytes).expect("load");
     let mut scene = OpenCADStudio::scene::Scene::new();
     scene.document = doc;
-    let handle = codec::Handle::new(0x7D2);
+    let handle = document::Handle::new(0x7D2);
     let entity = scene
         .document
         .get_entity(handle)

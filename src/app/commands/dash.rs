@@ -6,6 +6,13 @@
 
 use super::*;
 use crate::command::{PromptAnswers, PromptFlow, PromptStep, ScriptPromptCommand};
+
+/// A translated line without Fluent's isolation marks around its values.
+macro_rules! trp {
+    ($($arg:tt)*) => {
+        crate::i18n::plain(crate::tr!($($arg)*))
+    };
+}
 use crate::io::xref_model::wildcard_match;
 
 /// Run a flow written as straight-line prompts (`?` returns the step).
@@ -17,7 +24,17 @@ fn flow(
 
 /// The finished answers as the `-NAME [...]` line the dispatcher runs.
 fn run(name: &str, args: &[&str]) -> Result<PromptStep, PromptStep> {
-    Ok(PromptStep::Run(format!("{name} {}", serde_json::json!(args))))
+    Ok(PromptStep::Run(format!(
+        "{name} {}",
+        serde_json::json!(args)
+    )))
+}
+
+/// A `.lin`-style list of lengths, such as `1.5,-0.25,0,-0.75`.
+fn parse_linetype_pattern(text: &str) -> Option<Vec<f64>> {
+    text.split(',')
+        .map(|length| length.trim().parse::<f64>().ok())
+        .collect()
 }
 
 /// `name` matches one of the comma-separated, wildcard-capable `list`.
@@ -26,6 +43,91 @@ fn listed(name: &str, list: &str) -> bool {
         .map(str::trim)
         .filter(|pattern| !pattern.is_empty())
         .any(|pattern| wildcard_match(name, pattern))
+}
+
+/// Split a command line into words, keeping a `"double quoted"` run (which may
+/// be empty or hold spaces) as one word without its quotes.
+pub(super) fn split_quoted(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quoted = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                word.get_or_insert_with(String::new);
+            }
+            c if c.is_whitespace() && !quoted => words.extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
+const LINETYPE_OPTIONS: [(&str, &str); 9] = [
+    ("?", "?"),
+    ("Create", "CREATE"),
+    ("Delete", "DELETE"),
+    ("Export", "EXPORT"),
+    ("Load", "LOAD"),
+    ("RELoad", "RELOAD"),
+    ("Rename", "RENAME"),
+    ("SAve", "SAVE"),
+    ("Set", "SET"),
+];
+
+fn linetype_flow() -> PromptFlow {
+    flow(|q| {
+        let option = q.keyword(
+            crate::t!(
+                "-LINETYPE  Enter an option [?/Create/Delete/Export/Load/RELoad/Rename/SAve/Set]:"
+            )
+            .into_owned(),
+            None,
+            &LINETYPE_OPTIONS,
+        )?;
+        if matches!(option, "?" | "LOAD" | "RELOAD") {
+            return run("-LINETYPE", &[option]);
+        }
+        if option == "EXPORT" {
+            let names = q.text(
+                crate::t!("-LINETYPE  Enter linetype names to export <*>:").into_owned(),
+                Some("*".into()),
+            )?;
+            let file = q.text(
+                crate::t!("-LINETYPE  Enter file to write:").into_owned(),
+                None,
+            )?;
+            return run("-LINETYPE", &[option, &names, &file]);
+        }
+        let name = q.text(
+            crate::t!("-LINETYPE  Enter linetype name:").into_owned(),
+            None,
+        )?;
+        match option {
+            "CREATE" => {
+                let description = q.text(
+                    crate::t!("-LINETYPE  Enter description <none>:").into_owned(),
+                    Some(String::new()),
+                )?;
+                let pattern = q.text(
+                    crate::t!("-LINETYPE  Enter pattern, for example 1.5,-0.25,0,-0.75:")
+                        .into_owned(),
+                    None,
+                )?;
+                run("-LINETYPE", &[option, &name, &description, &pattern])
+            }
+            "RENAME" => {
+                let new = q.text(
+                    crate::t!("-LINETYPE  Enter new linetype name:").into_owned(),
+                    None,
+                )?;
+                run("-LINETYPE", &[option, &name, &new])
+            }
+            _ => run("-LINETYPE", &[option, &name]),
+        }
+    })
 }
 
 const LAYER_OPTIONS: [(&str, &str); 19] = [
@@ -62,8 +164,11 @@ fn layer_flow(current: String) -> PromptFlow {
         )?;
         let current_list = |q: &mut PromptAnswers| {
             q.text(
-                crate::t!("-LAYER  Enter name list of layer(s) <%{name}>:", name = current)
-                    .into_owned(),
+                crate::t!(
+                    "-LAYER  Enter name list of layer(s) <%{name}>:",
+                    name = current
+                )
+                .into_owned(),
                 Some(current.clone()),
             )
         };
@@ -95,8 +200,14 @@ fn layer_flow(current: String) -> PromptFlow {
                 run("-LAYER", &[option, &names])
             }
             "RENAME" => {
-                let old = q.text(crate::t!("-LAYER  Enter old layer name:").into_owned(), None)?;
-                let new = q.text(crate::t!("-LAYER  Enter new layer name:").into_owned(), None)?;
+                let old = q.text(
+                    crate::t!("-LAYER  Enter old layer name:").into_owned(),
+                    None,
+                )?;
+                let new = q.text(
+                    crate::t!("-LAYER  Enter new layer name:").into_owned(),
+                    None,
+                )?;
                 run("-LAYER", &[option, &old, &new])
             }
             "COLOR" => {
@@ -106,7 +217,7 @@ fn layer_flow(current: String) -> PromptFlow {
                 )?;
                 if !matches!(
                     crate::ui::window::attman_dialog::parse_color(&color),
-                    Some(codec::types::Color::Index(_))
+                    Some(document::types::Color::Index(_))
                 ) {
                     return Err(PromptStep::Retry("Invalid input."));
                 }
@@ -226,7 +337,7 @@ fn purge_flow() -> PromptFlow {
             None,
             &PURGE_TYPES,
         )?;
-        if matches!(kind, "REGAPPS" | "ZEROLENGTH" | "EMPTYTEXT" | "ORPHANED") {
+        if matches!(kind, "ZEROLENGTH" | "EMPTYTEXT" | "ORPHANED") {
             return run("-PURGE", &[kind, "*"]);
         }
         let names = q.text(
@@ -245,75 +356,172 @@ fn purge_flow() -> PromptFlow {
 #[derive(Clone)]
 struct StyleDefaults {
     name: String,
+    /// The font as the font prompt offers it: the TrueType family, or the
+    /// SHX file (with its big font after a comma).
     font: String,
     height: f64,
     width: f64,
     oblique: f64,
+    annotative: bool,
+    orientation: bool,
+    /// The font is a TrueType family.
+    true_type: bool,
 }
 
-fn style_flow(current: String, styles: Vec<StyleDefaults>) -> PromptFlow {
+/// What -STYLE knows before it asks: the styles, the fonts it can find and
+/// the drawing's precisions.
+#[derive(Clone)]
+struct StyleFlowContext {
+    current: String,
+    styles: Vec<StyleDefaults>,
+    /// The fonts a typed name is looked up in (lower case): stroke font
+    /// stems and TrueType families.
+    fonts: Vec<String>,
+    angle_places: usize,
+}
+
+/// `name` names a font -STYLE can use: a known stroke font (with or without
+/// `.shx`, a big font after a comma) or an installed TrueType family or file.
+fn style_font_available(fonts: &[String], name: &str) -> bool {
+    let font = name.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
+    let stem = font
+        .strip_suffix(".shx")
+        .or_else(|| font.strip_suffix(".ttf"))
+        .unwrap_or(&font);
+    !stem.is_empty() && fonts.iter().any(|known| known == stem || *known == font)
+}
+
+/// A Yes/No answer whose refusal is "Yes or No, please."
+fn style_yes_no(q: &mut PromptAnswers, prompt: String, default: bool) -> Result<bool, PromptStep> {
+    match q.yes_no(prompt, default) {
+        Err(PromptStep::Retry(_)) => Err(PromptStep::Retry("Yes or No, please.")),
+        other => other,
+    }
+}
+
+fn style_flow(context: StyleFlowContext) -> PromptFlow {
     flow(move |q| {
+        let current = &context.current;
         let name = q.text(
-            crate::t!("-STYLE  Enter name of text style or [?] <%{name}>:", name = current)
-                .into_owned(),
+            trp!("text-style", "cmd-name", name = current.clone()),
             Some(current.clone()),
         )?;
         if name == "?" {
-            return Ok(PromptStep::Run("STYLE LIST".into()));
+            let pattern = q.text(trp!("text-style", "cmd-list"), Some("*".into()))?;
+            return run("-STYLE", &["?", &pattern]);
         }
-        let base = styles
+        let existing = context
+            .styles
             .iter()
             .find(|style| style.name.eq_ignore_ascii_case(&name))
-            .or_else(|| styles.iter().find(|style| style.name == current))
-            .cloned()
-            .unwrap_or(StyleDefaults {
-                name: String::new(),
-                font: "txt.shx".into(),
-                height: 0.0,
-                width: 1.0,
-                oblique: 0.0,
-            });
+            .cloned();
+        let base = existing.clone().unwrap_or(StyleDefaults {
+            name: String::new(),
+            font: "txt".into(),
+            height: 0.0,
+            width: 1.0,
+            oblique: 0.0,
+            annotative: false,
+            orientation: false,
+            true_type: false,
+        });
+        // The name's answer: a new style, or an existing one with its
+        // TrueType face named.
+        let info = match &existing {
+            None => trp!("text-style", "info-new"),
+            Some(style) if style.true_type => format!(
+                "{}{}",
+                trp!("text-style", "info-existing"),
+                trp!("text-style", "info-full-font", font = style.font.clone())
+            ),
+            Some(_) => trp!("text-style", "info-existing"),
+        };
         let font = q.text(
-            crate::t!(
-                "-STYLE  Specify full font name or font filename (TTF or SHX) <%{font}>:",
-                font = base.font
-            )
-            .into_owned(),
+            format!(
+                "{info}
+{}",
+                trp!("text-style", "cmd-font", font = base.font.clone())
+            ),
             Some(base.font.clone()),
         )?;
-        let height = q.number(
-            crate::t!("-STYLE  Specify height of text <%{value}>:", value = base.height)
-                .into_owned(),
-            base.height,
+        if !style_font_available(&context.fonts, &font) {
+            return run("-STYLE", &["FONT_MISSING"]);
+        }
+        // Annotative is an option of the height prompt, which is asked again
+        // after it.
+        let mut annotative = base.annotative;
+        let mut orientation = base.orientation;
+        let height = loop {
+            let answer = q.text(
+                trp!("text-style", "cmd-height", value = format!("{:.4}", base.height)),
+                Some(base.height.to_string()),
+            )?;
+            let answer = answer.trim();
+            if answer.eq_ignore_ascii_case("A") || answer.eq_ignore_ascii_case("ANNOTATIVE") {
+                annotative = style_yes_no(q, trp!("text-style", "cmd-annotative"), true)?;
+                orientation = annotative
+                    && style_yes_no(q, trp!("text-style", "cmd-orientation"), false)?;
+                continue;
+            }
+            match answer.parse::<f64>().ok().filter(|v| v.is_finite()) {
+                None => {
+                    return Err(PromptStep::Retry(
+                        "Requires numeric distance, two points, or option keyword.",
+                    ))
+                }
+                Some(value) if value < 0.0 => {
+                    return Err(PromptStep::Retry("Value must be positive."))
+                }
+                Some(value) => break value,
+            }
+        };
+        let width = q.text(
+            trp!("text-style", "cmd-width", value = format!("{:.4}", base.width)),
+            Some(base.width.to_string()),
         )?;
-        let width = q.number(
-            crate::t!("-STYLE  Specify width factor <%{value}>:", value = base.width).into_owned(),
-            base.width,
+        let width = match width.trim().parse::<f64>().ok().filter(|v| v.is_finite()) {
+            None => return Err(PromptStep::Retry("Requires numeric value.")),
+            Some(value) if value <= 0.0 => {
+                return Err(PromptStep::Retry("Value must be positive and nonzero."))
+            }
+            Some(value) if !(0.01..=100.0).contains(&value) => {
+                return Err(PromptStep::Retry("Width factor out of range (0.01 to 100.0)."))
+            }
+            Some(value) => value,
+        };
+        let oblique = q.text(
+            trp!(
+                "text-style",
+                "cmd-oblique",
+                value = format!("{:.*}", context.angle_places, base.oblique)
+            ),
+            Some(base.oblique.to_string()),
         )?;
-        let oblique = q.number(
-            crate::t!("-STYLE  Specify obliquing angle <%{value}>:", value = base.oblique)
-                .into_owned(),
-            base.oblique,
-        )?;
-        let backwards = q.yes_no(
+        let oblique = match oblique.trim().parse::<f64>().ok().filter(|v| v.is_finite()) {
+            None => return Err(PromptStep::Retry("Requires valid numeric angle or two points.")),
+            Some(value) if value.abs() > 85.0 => {
+                return Err(PromptStep::Retry("Obliquing angle too large."))
+            }
+            Some(value) => value,
+        };
+        let backwards = style_yes_no(
+            q,
             crate::t!("-STYLE  Display text backwards? [Yes/No] <No>:").into_owned(),
             false,
         )?;
-        let upside_down = q.yes_no(
+        let upside_down = style_yes_no(
+            q,
             crate::t!("-STYLE  Display text upside-down? [Yes/No] <No>:").into_owned(),
             false,
         )?;
         // Only shape fonts can stand vertically, so only they ask.
         let vertical = shape_font(&font)
-            && q.yes_no(
-                crate::t!("-STYLE  Vertically? [Yes/No] <No>:").into_owned(),
-                false,
-            )?;
+            && style_yes_no(q, trp!("text-style", "cmd-vertical"), false)?;
         let flag = |on: bool| if on { "Y" } else { "N" };
         run(
             "-STYLE",
             &[
-                &name,
+                existing.as_ref().map_or(name.trim(), |style| style.name.as_str()),
                 &font,
                 &height.to_string(),
                 &width.to_string(),
@@ -321,23 +529,26 @@ fn style_flow(current: String, styles: Vec<StyleDefaults>) -> PromptFlow {
                 flag(backwards),
                 flag(upside_down),
                 flag(vertical),
+                flag(annotative),
+                flag(orientation),
             ],
         )
     })
 }
 
-/// A font named without an extension is a shape font (`romans` →
-/// `romans.shx`), as a reference script expects.
 fn shape_font(font: &str) -> bool {
-    let lower = font.to_ascii_lowercase();
-    lower.ends_with(".shx") || !lower.contains('.')
+    let font = font.split(',').next().unwrap_or("").trim();
+    matches!(
+        crate::ui::font_picker::FontChoice::of_name(font),
+        crate::ui::font_picker::FontChoice::Stroke(_)
+    ) || (!font.contains('.') && !crate::scene::text::sysfont::has_family(font))
 }
 
 fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
     flow(move |q| {
         let option = q.keyword(
             crate::t!(
-                "-DIMSTYLE  Enter a dimension style option [ANnotative/Save/Restore/STatus/Variables/Apply/?] <Restore>:"
+                "-DIMSTYLE  Enter a dimension style option [ANnotative/Save/Restore/STatus/Variables/Compare/Rename/Delete/Apply/?] <Restore>:"
             )
             .into_owned(),
             Some("RESTORE"),
@@ -347,6 +558,9 @@ fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
                 ("Restore", "RESTORE"),
                 ("STatus", "STATUS"),
                 ("Variables", "VARIABLES"),
+                ("Compare", "COMPARE"),
+                ("Rename", "RENAME"),
+                ("Delete", "DELETE"),
                 ("Apply", "APPLY"),
                 ("?", "?"),
             ],
@@ -360,8 +574,7 @@ fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
                     true,
                 )?;
                 let name = q.text(
-                    crate::t!("-DIMSTYLE  Enter name for new dimension style or [?]:")
-                        .into_owned(),
+                    crate::t!("-DIMSTYLE  Enter name for new dimension style or [?]:").into_owned(),
                     None,
                 )?;
                 if name == "?" {
@@ -375,14 +588,15 @@ fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
             "APPLY" => run("-DIMSTYLE", &["APPLY"]),
             "SAVE" => {
                 let name = q.text(
-                    crate::t!("-DIMSTYLE  Enter name for new dimension style or [?]:")
-                        .into_owned(),
+                    crate::t!("-DIMSTYLE  Enter name for new dimension style or [?]:").into_owned(),
                     None,
                 )?;
                 if name == "?" {
                     return run("-DIMSTYLE", &["?", "*"]);
                 }
-                if existing.iter().any(|style| style.eq_ignore_ascii_case(&name))
+                if existing
+                    .iter()
+                    .any(|style| style.eq_ignore_ascii_case(&name))
                     && !q.yes_no(
                         crate::t!(
                             "-DIMSTYLE  That name is already in use, redefine it? [Yes/No] <No>:"
@@ -397,8 +611,10 @@ fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
             }
             "RESTORE" => {
                 let name = q.text(
-                    crate::t!("-DIMSTYLE  Enter a dimension style name, [?] or <select dimension>:")
-                        .into_owned(),
+                    crate::t!(
+                        "-DIMSTYLE  Enter a dimension style name, [?] or <select dimension>:"
+                    )
+                    .into_owned(),
                     Some(String::new()),
                 )?;
                 if name == "?" {
@@ -423,7 +639,61 @@ fn dimstyle_flow(current: String, existing: Vec<String>) -> PromptFlow {
                 }
                 run("-DIMSTYLE", &[option, &name])
             }
+            "RENAME" => {
+                let old = q.text(
+                    crate::t!("-DIMSTYLE  Enter the dimension style name to rename:")
+                        .into_owned(),
+                    None,
+                )?;
+                if old == "?" {
+                    return run("-DIMSTYLE", &["?", "*"]);
+                }
+                let new_name = q.text(
+                    crate::t!("-DIMSTYLE  Enter the new name for the style:")
+                        .into_owned(),
+                    None,
+                )?;
+                run("-DIMSTYLE", &[option, &old, &new_name])
+            }
+            "DELETE" => {
+                let name = q.text(
+                    crate::t!("-DIMSTYLE  Enter the dimension style name to delete:")
+                        .into_owned(),
+                    None,
+                )?;
+                if name == "?" {
+                    return run("-DIMSTYLE", &["?", "*"]);
+                }
+                if !q.yes_no(
+                    crate::tf!("-DIMSTYLE  Delete style '{}'? [Yes/No] <No>:", name)
+                        .into_owned(),
+                    false,
+                )? {
+                    return Ok(PromptStep::Finish);
+                }
+                run("-DIMSTYLE", &[option, &name])
+            }
             "STATUS" => run("-DIMSTYLE", &["VARIABLES", &current]),
+            "COMPARE" => {
+                let name = q.text(
+                    crate::t!(
+                        "-DIMSTYLE  Compare styles, first name or [?]:"
+                    )
+                    .into_owned(),
+                    None,
+                )?;
+                if name == "?" {
+                    return run("-DIMSTYLE", &["?", "*"]);
+                }
+                let other = q.text(
+                    crate::t!(
+                        "-DIMSTYLE  Compare styles, the second name:"
+                    )
+                    .into_owned(),
+                    None,
+                )?;
+                run("-DIMSTYLE", &[option, &name, &other])
+            }
             _ => {
                 let names = q.text(
                     crate::t!("-DIMSTYLE  Enter dimension style(s) to list <*>:").into_owned(),
@@ -461,8 +731,11 @@ fn layout_flow(current: String, next: String) -> PromptFlow {
                 let source = named(q, "-LAYOUT  Enter name of layout to copy <%{name}>:")?;
                 let copy = format!("{source} (2)");
                 let name = q.text(
-                    crate::t!("-LAYOUT  Enter layout name for copy <%{name}>:", name = copy)
-                        .into_owned(),
+                    crate::t!(
+                        "-LAYOUT  Enter layout name for copy <%{name}>:",
+                        name = copy
+                    )
+                    .into_owned(),
                     Some(copy.clone()),
                 )?;
                 run("-LAYOUT", &[option, &source, &name])
@@ -481,7 +754,10 @@ fn layout_flow(current: String, next: String) -> PromptFlow {
             }
             "RENAME" => {
                 let old = named(q, "-LAYOUT  Enter layout to rename <%{name}>:")?;
-                let new = q.text(crate::t!("-LAYOUT  Enter new layout name:").into_owned(), None)?;
+                let new = q.text(
+                    crate::t!("-LAYOUT  Enter new layout name:").into_owned(),
+                    None,
+                )?;
                 run("-LAYOUT", &[option, &old, &new])
             }
             "SET" => {
@@ -524,8 +800,11 @@ fn plot_flow(d: PlotDefaults) -> PromptFlow {
             )?;
         }
         let device = q.text(
-            crate::t!("-PLOT  Enter an output device name <%{name}>:", name = "PDF")
-                .into_owned(),
+            crate::t!(
+                "-PLOT  Enter an output device name <%{name}>:",
+                name = "PDF"
+            )
+            .into_owned(),
             Some("PDF".into()),
         )?;
         if detailed {
@@ -612,7 +891,11 @@ fn plot_flow(d: PlotDefaults) -> PromptFlow {
                 req.insert("fit".into(), true.into());
             } else {
                 let scale = scale.replace('=', ":");
-                let ratio = if scale.contains(':') { scale } else { format!("1:{scale}") };
+                let ratio = if scale.contains(':') {
+                    scale
+                } else {
+                    format!("1:{scale}")
+                };
                 req.insert("scale".into(), ratio.into());
             }
             let offset = q.text(
@@ -684,7 +967,13 @@ fn plot_flow(d: PlotDefaults) -> PromptFlow {
         if to_file {
             let safe: String = layout
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
             let file = format!("{}-{safe}.{ext}", d.stem);
             let path = q.text(
@@ -703,7 +992,10 @@ fn plot_flow(d: PlotDefaults) -> PromptFlow {
         )? {
             return Ok(PromptStep::Finish);
         }
-        Ok(PromptStep::Run(format!("-PLOT {}", serde_json::Value::Object(req))))
+        Ok(PromptStep::Run(format!(
+            "-PLOT {}",
+            serde_json::Value::Object(req)
+        )))
     })
 }
 
@@ -718,6 +1010,11 @@ impl OpenCADStudio {
     /// they start the prompt sequence; with the answers they finish it.
     pub(super) fn dispatch_dash(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         let (verb, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let verb = if verb.eq_ignore_ascii_case("-LINETYPE") {
+            "-LINETYPE"
+        } else {
+            verb
+        };
         let start = |app: &mut Self, command: ScriptPromptCommand| {
             app.command_line.push_info(&command.prompt());
             app.command_line.set_step_options(command.options());
@@ -732,18 +1029,54 @@ impl OpenCADStudio {
                     task = self.dash_layer(i, &args);
                 }
                 // -LAYER keeps asking for options until an empty Enter.
-                let current = self.tabs[i].scene.document.header.current_layer_name.clone();
-                start(self, ScriptPromptCommand::new("-LAYER", layer_flow(current)));
+                let current = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .current_layer_name
+                    .clone();
+                start(
+                    self,
+                    ScriptPromptCommand::new("-LAYER", layer_flow(current)),
+                );
+            }
+            "-LINETYPE" if rest.is_empty() => {
+                start(self, ScriptPromptCommand::new("-LINETYPE", linetype_flow()))
+            }
+            "-LINETYPE" => {
+                // A prompt run arrives as a JSON array, a typed line as words.
+                let args: Vec<String> =
+                    serde_json::from_str(rest).unwrap_or_else(|_| split_quoted(rest));
+                task = self.dash_linetype(i, &args);
             }
             "-PURGE" if rest.is_empty() => {
                 start(self, ScriptPromptCommand::new("-PURGE", purge_flow()))
             }
             "-PURGE" => {
-                if matches!(arg(0), "ALL" | "BLOCKS" | "LAYERS" | "LINETYPES" | "STYLES") {
+                if matches!(
+                    arg(0),
+                    "ALL"
+                        | "BLOCKS"
+                        | "LAYERS"
+                        | "LINETYPES"
+                        | "STYLES"
+                        | "DIMSTYLES"
+                        | "MLEADERSTYLES"
+                        | "TABLESTYLES"
+                        | "MLINESTYLES"
+                        | "GROUPS"
+                        | "MATERIALS"
+                        | "REGAPPS"
+                        | "ZEROLENGTH"
+                        | "EMPTYTEXT"
+                ) {
                     return Some(self.dispatch_command(&format!("PURGE {} {}", arg(0), arg(1))));
                 }
-                // ponytail: only the tables the inline PURGE knows are purged;
-                // the rest answer so a script keeps going.
+                // ponytail: detail view, plot and visual styles,
+                // shapes and orphaned data are not purged: their users are
+                // not all known to the drawing model (raw passthrough data
+                // can name them), so removing one could break the file. They
+                // answer so a script keeps going.
                 self.command_line
                     .push_output(crate::tf!("PURGE: {} are not purged yet.", arg(0)).as_ref());
             }
@@ -755,18 +1088,49 @@ impl OpenCADStudio {
                     .filter(|style| !style.name.is_empty())
                     .map(|style| StyleDefaults {
                         name: style.name.clone(),
-                        font: if style.font_file.is_empty() {
-                            style.true_type_font.clone()
-                        } else {
+                        font: if !style.true_type_font.trim().is_empty() {
+                            style.true_type_font.trim().to_string()
+                        } else if style.big_font_file.trim().is_empty() {
                             style.font_file.clone()
+                        } else {
+                            format!("{},{}", style.font_file, style.big_font_file)
                         },
                         height: style.height,
                         width: style.width_factor,
                         oblique: style.oblique_angle.to_degrees(),
+                        annotative: style.annotative,
+                        true_type: !style.true_type_font.trim().is_empty(),
+                        orientation: crate::scene::annotative::text_style_orientation(
+                            doc,
+                            style.handle,
+                        ),
                     })
                     .collect();
-                let current = doc.header.current_text_style_name.clone();
-                start(self, ScriptPromptCommand::new("-STYLE", style_flow(current, styles)));
+                let fonts = crate::ui::font_picker::catalogue(doc, false)
+                    .into_iter()
+                    .filter(|entry| entry.missing.is_none())
+                    .map(|entry| match entry.choice {
+                        crate::ui::font_picker::FontChoice::Stroke(file) => {
+                            let file = file.to_ascii_lowercase();
+                            file.strip_suffix(".shx").unwrap_or(&file).to_string()
+                        }
+                        crate::ui::font_picker::FontChoice::TrueType(family) => {
+                            family.to_ascii_lowercase()
+                        }
+                        crate::ui::font_picker::FontChoice::StyleDefault => String::new(),
+                    })
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                let context = StyleFlowContext {
+                    current: doc.header.current_text_style_name.clone(),
+                    styles,
+                    fonts,
+                    angle_places: doc.header.angular_unit_precision.clamp(0, 8) as usize,
+                };
+                start(
+                    self,
+                    ScriptPromptCommand::new("-STYLE", style_flow(context)),
+                );
             }
             "-STYLE" => self.dash_style(i, &args),
             "-DIMSTYLE" if rest.is_empty() => {
@@ -792,7 +1156,10 @@ impl OpenCADStudio {
             "-LAYOUT" if rest.is_empty() => {
                 let current = self.tabs[i].scene.current_layout.clone();
                 let next = Self::next_layout_name(&self.tabs[i].scene.layout_names());
-                start(self, ScriptPromptCommand::new("-LAYOUT", layout_flow(current, next)));
+                start(
+                    self,
+                    ScriptPromptCommand::new("-LAYOUT", layout_flow(current, next)),
+                );
             }
             "-LAYOUT" => return Some(self.dash_layout(i, &args)),
             // The web plots through the PLOT dialog's download.
@@ -843,7 +1210,7 @@ impl OpenCADStudio {
         i: usize,
         label: &str,
         names: &[String],
-        edit: impl Fn(&mut codec::tables::Layer),
+        edit: impl Fn(&mut document::tables::Layer),
     ) {
         if names.is_empty() {
             return;
@@ -875,7 +1242,7 @@ impl OpenCADStudio {
         }
         let undo = self.begin_layer_undo(i, "LAYER NEW", &new);
         for name in &new {
-            let mut layer = codec::tables::Layer::new(name);
+            let mut layer = document::tables::Layer::new(name);
             // A layer needs a real handle or a DWG save drops it (#67).
             layer.handle = self.tabs[i].scene.document.allocate_handle();
             let _ = self.tabs[i].scene.document.layers.add(layer);
@@ -887,9 +1254,268 @@ impl OpenCADStudio {
         self.refresh_layer_panel();
     }
 
+    /// The answers of `-LINETYPE`. List, Load and Set are the `LINETYPE`
+    /// options; Create, Delete and Rename go through the linetype service.
+    fn dash_linetype(&mut self, i: usize, args: &[String]) -> Task<Message> {
+        use crate::scene::linetype_service as service;
+        let usage = |app: &mut Self| {
+            app.command_line.push_info(
+                crate::t!("Usage: -LINETYPE CREATE <name> [description] <pattern> | RENAME <old> <new> | DELETE <name> | EXPORT <names> <file> | SAVE <name> | RELOAD | LIST | LOAD | SET <name>").as_ref(),
+            );
+        };
+        let option = args.first().map(|s| s.to_uppercase()).unwrap_or_default();
+        let arg = |n: usize| args.get(n).map(String::as_str).unwrap_or("");
+        let report = |app: &mut Self, error: service::LinetypeError| {
+            app.command_line.push_error(&format!("-LINETYPE: {error}"));
+        };
+        match (option.as_str(), args.len()) {
+            ("?" | "LIST", 1) => return self.dispatch_command("LINETYPE LIST"),
+            ("L" | "LOAD", 1) => return self.dispatch_command("LINETYPE LOAD"),
+            ("E" | "EXPORT", 3) => self.dash_linetype_export(i, arg(1), arg(2), false),
+            ("SA" | "SAVE", 2) => self.dash_linetype_save(i, arg(1)),
+            ("REL" | "RELOAD", 1) => self.dash_linetype_reload(),
+            ("S" | "SET", 2) => {
+                return self.dispatch_command(&format!("LINETYPE SET \"{}\"", arg(1)));
+            }
+            ("C" | "CREATE", 3 | 4) => {
+                let (description, pattern_text) = if args.len() == 4 {
+                    (arg(2), arg(3))
+                } else {
+                    ("", arg(2))
+                };
+                let Some(pattern) = parse_linetype_pattern(pattern_text) else {
+                    self.command_line.push_error(
+                        crate::tf!("-LINETYPE: \"{pattern_text}\" is not a list of lengths.")
+                            .as_ref(),
+                    );
+                    return Task::none();
+                };
+                let document = &self.tabs[i].scene.document;
+                match service::plan_create(document, arg(1), description, &pattern) {
+                    Err(error) => report(self, error),
+                    Ok(linetype) => {
+                        let name = linetype.name.clone();
+                        self.push_undo_snapshot(i, "LINETYPE");
+                        match service::apply_create(&mut self.tabs[i].scene.document, linetype) {
+                            Err(error) => {
+                                self.discard_last_undo_entry(i);
+                                report(self, error);
+                            }
+                            Ok(_) => {
+                                self.command_line.push_output(
+                                    crate::tf!("Linetype \"{name}\" created.").as_ref(),
+                                );
+                                self.finish_linetype_change(i, &[name]);
+                            }
+                        }
+                    }
+                }
+            }
+            ("R" | "RENAME", 3) => {
+                let document = &self.tabs[i].scene.document;
+                match service::plan_rename(document, arg(1), arg(2)) {
+                    Err(error) => report(self, error),
+                    Ok(rename) => {
+                        self.push_undo_snapshot(i, "LINETYPE");
+                        match service::apply_rename(&mut self.tabs[i].scene.document, &rename) {
+                            Err(error) => {
+                                self.discard_last_undo_entry(i);
+                                report(self, error);
+                            }
+                            Ok(_) => {
+                                let (old, new) = (rename.old, rename.new);
+                                self.command_line.push_output(
+                                    crate::tf!("Linetype \"{old}\" renamed to \"{new}\".").as_ref(),
+                                );
+                                self.finish_linetype_change(i, &[old, new]);
+                            }
+                        }
+                    }
+                }
+            }
+            ("D" | "DELETE", 2) => {
+                let document = &self.tabs[i].scene.document;
+                match service::plan_delete(document, arg(1)) {
+                    Err(error) => report(self, error),
+                    Ok(linetype) => {
+                        self.push_undo_snapshot(i, "LINETYPE");
+                        service::apply_delete(&mut self.tabs[i].scene.document, &linetype);
+                        let name = linetype.name;
+                        self.command_line
+                            .push_output(crate::tf!("Linetype \"{name}\" deleted.").as_ref());
+                        self.finish_linetype_change(i, &[name]);
+                    }
+                }
+            }
+            _ => usage(self),
+        }
+        Task::none()
+    }
+
+    /// Whether this build can reach a folder; says so when it cannot.
+    fn linetype_files_available(&mut self) -> bool {
+        let available = !cfg!(target_arch = "wasm32");
+        if !available {
+            self.command_line.push_error(
+                crate::t!("-LINETYPE: this option needs the desktop program.").as_ref(),
+            );
+        }
+        available
+    }
+
+    /// One line per reason for what was left out, and for what other programs
+    /// may refuse in what was written.
+    fn report_lin_output(&mut self, output: &crate::io::linetypes::writer::LinOutput) {
+        fn grouped<R: Copy + PartialEq>(items: &[(String, R)]) -> Vec<(R, String)> {
+            let mut groups: Vec<(R, Vec<&str>)> = Vec::new();
+            for (name, reason) in items {
+                match groups.iter_mut().find(|(known, _)| known == reason) {
+                    Some((_, names)) => names.push(name),
+                    None => groups.push((*reason, vec![name])),
+                }
+            }
+            groups
+                .into_iter()
+                .map(|(reason, names)| (reason, names.join(", ")))
+                .collect()
+        }
+        for (reason, names) in grouped(&output.skipped) {
+            let reason = reason.label();
+            self.command_line
+                .push_info(crate::tf!("Skipped {names}: {reason}.").as_ref());
+        }
+        for (warning, names) in grouped(&output.warnings) {
+            let warning = warning.label();
+            self.command_line
+                .push_info(crate::tf!("Warning: other programs may refuse {names}: {warning}.").as_ref());
+        }
+    }
+
+    /// `overwrite` only when the user already agreed to replace the file (the
+    /// save dialog asks); a typed path never replaces an existing file.
+    pub(in crate::app) fn dash_linetype_export(
+        &mut self,
+        i: usize,
+        names: &str,
+        file: &str,
+        overwrite: bool,
+    ) {
+        use crate::io::linetypes::writer;
+        if !self.linetype_files_available() {
+            return;
+        }
+        let mut path = std::path::PathBuf::from(file);
+        if path.extension().is_none() {
+            path.set_extension("lin");
+        }
+        let shown = path.display().to_string();
+        if !overwrite && path.exists() {
+            self.command_line.push_error(
+                crate::tf!("-LINETYPE: {shown} already exists. Choose another file name.")
+                    .as_ref(),
+            );
+            return;
+        }
+        let document = &self.tabs[i].scene.document;
+        let wanted: Vec<_> = document
+            .line_types
+            .iter()
+            .filter(|linetype| listed(&linetype.name, names))
+            .collect();
+        let output = writer::write_linetypes(document, wanted);
+        self.report_lin_output(&output);
+        if output.written.is_empty() {
+            self.command_line.push_error(
+                crate::t!("-LINETYPE: none of the named linetypes can be written.").as_ref(),
+            );
+            return;
+        }
+        match writer::write_atomic(&path, &output.text) {
+            Ok(()) => {
+                let count = output.written.len();
+                self.command_line
+                    .push_output(crate::tf!("Wrote {count} linetype(s) to {shown}.").as_ref());
+            }
+            Err(reason) => self
+                .command_line
+                .push_error(crate::tf!("-LINETYPE: could not write {shown}: {reason}").as_ref()),
+        }
+    }
+
+    pub(in crate::app) fn dash_linetype_save(&mut self, i: usize, name: &str) {
+        use crate::io::linetypes::{catalog_has, writer};
+        if !self.linetype_files_available() {
+            return;
+        }
+        let Some(path) = writer::library_path() else {
+            self.command_line.push_error(
+                crate::t!("-LINETYPE: this option needs the desktop program.").as_ref(),
+            );
+            return;
+        };
+        let document = &self.tabs[i].scene.document;
+        match writer::save_definition(&path, document, name, catalog_has) {
+            Ok(output) => {
+                self.report_lin_output(&output);
+                self.command_line
+                    .push_output(crate::tf!("Linetype \"{name}\" saved to your library.").as_ref());
+                self.refresh_linetype_catalog();
+            }
+            Err(writer::SaveError::NotFound) => {
+                let error = crate::scene::linetype_service::LinetypeError::NotFound(name.into());
+                self.command_line.push_error(&format!("-LINETYPE: {error}"));
+            }
+            Err(writer::SaveError::Skipped(reason)) => {
+                let reason = reason.label();
+                self.command_line.push_error(
+                    crate::tf!("-LINETYPE: \"{name}\" cannot be saved: {reason}.").as_ref(),
+                );
+            }
+            Err(writer::SaveError::Reserved) => self.command_line.push_error(
+                crate::tf!("-LINETYPE: the built-in catalog or another library file already defines \"{name}\".").as_ref(),
+            ),
+            Err(writer::SaveError::Io(reason)) => {
+                let shown = path.display().to_string();
+                self.command_line.push_error(
+                    crate::tf!("-LINETYPE: could not write {shown}: {reason}").as_ref(),
+                );
+            }
+        }
+    }
+
+    pub(in crate::app) fn dash_linetype_reload(&mut self) {
+        if !self.linetype_files_available() {
+            return;
+        }
+        self.refresh_linetype_catalog();
+        self.command_line
+            .push_output(crate::t!("Linetype library reloaded.").as_ref());
+    }
+
+    /// Reread the library, and redraw what might have used the old catalog.
+    fn refresh_linetype_catalog(&mut self) {
+        crate::io::linetypes::refresh_catalog();
+        for tab in &mut self.tabs {
+            tab.scene.bump_geometry();
+        }
+        self.sync_ribbon_layers();
+    }
+
+    fn finish_linetype_change(&mut self, i: usize, names: &[String]) {
+        self.tabs[i].dirty = true;
+        self.tabs[i].scene.invalidate_linetype_dependencies(names);
+        self.sync_ribbon_layers();
+        self.sync_ribbon_from_selection();
+    }
+
     fn dash_layer(&mut self, i: usize, args: &[String]) -> Task<Message> {
         let arg = |n: usize| args.get(n).cloned().unwrap_or_default();
-        let current = self.tabs[i].scene.document.header.current_layer_name.clone();
+        let current = self.tabs[i]
+            .scene
+            .document
+            .header
+            .current_layer_name
+            .clone();
         match arg(0).as_str() {
             "?" => {
                 let info: Vec<String> = self.tabs[i]
@@ -930,7 +1556,8 @@ impl OpenCADStudio {
             }
             "NEW" => self.create_layers(i, &arg(1)),
             "RENAME" => {
-                return self.dispatch_command(&format!("RENAME LAYER {} {}", arg(1), arg(2)))
+                // Direct call: a name with spaces must not be re-split as text.
+                self.rename_named_object(i, "LAYER", &arg(1), &arg(2));
             }
             "COLOR" => {
                 let names = self.listed_layers(i, &arg(2));
@@ -985,7 +1612,7 @@ impl OpenCADStudio {
                         .push_error(crate::t!("LAYER: transparency must be 0-100.").as_ref());
                     return Task::none();
                 }
-                let transparency = codec::types::Transparency::from_percent(percent / 100.0);
+                let transparency = document::types::Transparency::from_percent(percent / 100.0);
                 let names = self.listed_layers(i, &arg(2));
                 self.edit_layers(i, "LAYER TRANSPARENCY", &names, move |layer| {
                     layer.transparency = transparency
@@ -1000,27 +1627,28 @@ impl OpenCADStudio {
             }
             "MATERIAL" => {
                 let name = arg(1);
-                let material = if name.is_empty() || name.eq_ignore_ascii_case("BYLAYER") {
-                    codec::Handle::NULL
-                } else {
-                    let found = self.tabs[i].scene.document.objects.iter().find_map(
-                        |(handle, object)| match object {
-                            codec::objects::ObjectType::Material(m)
-                                if m.name.eq_ignore_ascii_case(&name) =>
-                            {
-                                Some(*handle)
-                            }
-                            _ => None,
-                        },
-                    );
-                    let Some(handle) = found else {
-                        self.command_line.push_error(
-                            crate::tf!("LAYER: material '{}' not found.", name).as_ref(),
+                let material =
+                    if name.is_empty() || name.eq_ignore_ascii_case("BYLAYER") {
+                        document::Handle::NULL
+                    } else {
+                        let found = self.tabs[i].scene.document.objects.iter().find_map(
+                            |(handle, object)| match object {
+                                document::objects::ObjectType::Material(m)
+                                    if m.name.eq_ignore_ascii_case(&name) =>
+                                {
+                                    Some(*handle)
+                                }
+                                _ => None,
+                            },
                         );
-                        return Task::none();
+                        let Some(handle) = found else {
+                            self.command_line.push_error(
+                                crate::tf!("LAYER: material '{}' not found.", name).as_ref(),
+                            );
+                            return Task::none();
+                        };
+                        handle
                     };
-                    handle
-                };
                 let names = self.listed_layers(i, &arg(2));
                 self.edit_layers(i, "LAYER MATERIAL", &names, move |layer| {
                     layer.material = material
@@ -1049,18 +1677,21 @@ impl OpenCADStudio {
                 let mut names = self.listed_layers(i, &arg(1));
                 if option == "FREEZE" && names.contains(&current) {
                     self.command_line.push_error(
-                        crate::tf!("Cannot freeze layer \"{}\". It is the CURRENT layer.", current)
-                            .as_ref(),
+                        crate::tf!(
+                            "Cannot freeze layer \"{}\". It is the CURRENT layer.",
+                            current
+                        )
+                        .as_ref(),
                     );
                     names.retain(|name| name != &current);
                 }
-                let edit: fn(&mut codec::tables::Layer) = match option {
-                    "ON" => codec::tables::Layer::turn_on,
-                    "OFF" => codec::tables::Layer::turn_off,
-                    "FREEZE" => codec::tables::Layer::freeze,
-                    "THAW" => codec::tables::Layer::thaw,
-                    "LOCK" => codec::tables::Layer::lock,
-                    _ => codec::tables::Layer::unlock,
+                let edit: fn(&mut document::tables::Layer) = match option {
+                    "ON" => document::tables::Layer::turn_on,
+                    "OFF" => document::tables::Layer::turn_off,
+                    "FREEZE" => document::tables::Layer::freeze,
+                    "THAW" => document::tables::Layer::thaw,
+                    "LOCK" => document::tables::Layer::lock,
+                    _ => document::tables::Layer::unlock,
                 };
                 let label = format!("LAYER {option}");
                 self.edit_layers(i, &label, &names, edit);
@@ -1070,37 +1701,166 @@ impl OpenCADStudio {
     }
 
     fn dash_style(&mut self, i: usize, args: &[String]) {
-        let [name, font, height, width, oblique, backwards, upside_down, vertical] =
-            std::array::from_fn(|n| args.get(n).cloned().unwrap_or_default());
-        let undo = self.begin_text_style_undo(i, "STYLE", std::slice::from_ref(&name));
+        let arg = |n: usize| args.get(n).cloned().unwrap_or_default();
+        // A style is set with ten arguments; the list and the missing font
+        // take fewer, so no style name is mistaken for them.
+        match (arg(0).as_str(), args.len()) {
+            ("?", 2 | 3) => {
+                self.list_text_styles(i, &arg(1), arg(2).parse().unwrap_or(0));
+                return;
+            }
+            ("FONT_MISSING", 1) => {
+                self.command_line
+                    .push_output(&trp!("text-style", "font-missing"));
+                return;
+            }
+            _ => {}
+        }
+        let [name, font, height, width, oblique, backwards, upside_down, vertical, annotative, orientation] =
+            std::array::from_fn(|n| arg(n));
+        // The style, its orientation flag and the current style are one undo
+        // step.
+        let before = self.capture_style_state(false);
+        let dirty_before = self.tabs[i].dirty;
         let doc = &mut self.tabs[i].scene.document;
         if doc.text_styles.get(&name).is_none() {
-            let mut style = codec::tables::TextStyle::new(&name);
+            let mut style = document::tables::TextStyle::new(&name);
             style.handle = doc.allocate_handle();
             let _ = doc.text_styles.add(style);
         }
+        let mut handle = document::Handle::NULL;
         if let Some(style) = doc.text_styles.get_mut(&name) {
-            let font = if font.contains('.') {
-                font
-            } else {
-                format!("{font}.shx")
+            handle = style.handle;
+            // The font as the dialog sets it: a TrueType family keeps its
+            // face file, a stroke font its SHX file and big font.
+            let mut draft = crate::app::text_style_draft::TextStyleDraft::load(style);
+            let (main, big) = match font.split_once(',') {
+                Some((main, big)) => (main.trim(), Some(big.trim())),
+                None => (font.trim(), None),
             };
+            match crate::ui::font_picker::FontChoice::of_name(main) {
+                crate::ui::font_picker::FontChoice::TrueType(family)
+                    if !shape_font(main) =>
+                {
+                    draft.pick_system_font(
+                        crate::scene::text::sysfont::canonical_family_name(&family)
+                            .unwrap_or(family),
+                    )
+                }
+                _ => {
+                    draft.pick_stroke_font(crate::ui::font_picker::stroke_file(main));
+                    draft.style.big_font_file = big
+                        .filter(|big| !big.is_empty())
+                        .map(crate::ui::font_picker::stroke_file)
+                        .unwrap_or_default();
+                }
+            }
+            *style = draft.resolved();
             style.is_shape_file = false;
-            style.true_type_font.clear();
-            style.font_file = font;
             style.height = height.parse().unwrap_or(0.0);
             style.width_factor = width.parse().unwrap_or(1.0);
             style.oblique_angle = oblique.parse::<f64>().unwrap_or(0.0).to_radians();
             style.flags.backward = backwards == "Y";
             style.flags.upside_down = upside_down == "Y";
             style.is_vertical = vertical == "Y";
+            style.annotative = annotative == "Y";
         }
+        crate::scene::annotative::set_text_style_orientation(
+            doc,
+            handle,
+            annotative == "Y" && orientation == "Y",
+        );
+        doc.header.current_text_style_name = name.clone();
         self.tabs[i].dirty = true;
         self.tabs[i].scene.invalidate_text_style_dependencies(&name);
-        self.commit_text_style_undo(i, undo);
+        let after = self.capture_style_state(false);
+        self.commit_style_undo(i, before, after, Vec::new(), dirty_before, None);
         let _ = self.on_ribbon_style_changed(crate::modules::StyleKey::TextStyle, name.clone());
         self.command_line
-            .push_output(crate::tf!("{} is now the current text style.", name).as_ref());
+            .push_output(&trp!("text-style", "now-current", name = name));
+    }
+
+    /// -STYLE `?`: the styles matching `pattern`, then the current style,
+    /// from line `from` on. The list stops every 22 lines (even inside a
+    /// style's lines) at "Press ENTER to continue:", whose answer lists on.
+    fn list_text_styles(&mut self, i: usize, pattern: &str, from: usize) {
+        let doc = &self.tabs[i].scene.document;
+        let mut styles: Vec<&document::tables::TextStyle> = doc
+            .text_styles
+            .iter()
+            .filter(|style| !style.name.is_empty() && listed(&style.name, pattern))
+            .collect();
+        styles.sort_by_key(|style| style.name.to_lowercase());
+        let mut lines = vec![trp!("text-style", "list-title")];
+        for style in styles {
+            let head = trp!("text-style", "list-name", name = style.name.clone());
+            let pad = 26usize.saturating_sub(head.chars().count()).max(2);
+            let font = if style.true_type_font.trim().is_empty() {
+                let files = if style.big_font_file.trim().is_empty() {
+                    style.font_file.clone()
+                } else {
+                    format!("{}, {}", style.font_file, style.big_font_file)
+                };
+                trp!("text-style", "list-files", files = files)
+            } else {
+                trp!(
+                    "text-style",
+                    "list-typeface",
+                    face = style.true_type_font.trim().to_string()
+                )
+            };
+            lines.push(format!("{head}{}{font}", " ".repeat(pad)));
+            let places = doc.header.angular_unit_precision.clamp(0, 8) as usize;
+            lines.push(trp!(
+                "text-style",
+                "list-values",
+                height = format!("{:.4}", style.height),
+                width = format!("{:.4}", style.width_factor),
+                oblique = format!("{:.*}", places, style.oblique_angle.to_degrees())
+            ));
+            let mut generation = Vec::new();
+            if style.flags.backward {
+                generation.push(trp!("text-style", "gen-backwards"));
+            }
+            if style.flags.upside_down {
+                generation.push(trp!("text-style", "gen-upside-down"));
+            }
+            if style.is_vertical {
+                generation.push(trp!("text-style", "gen-vertical"));
+            }
+            if generation.is_empty() {
+                generation.push(trp!("text-style", "gen-normal"));
+            }
+            lines.push(trp!(
+                "text-style",
+                "list-generation",
+                generation = generation.join(", ")
+            ));
+        }
+        lines.push(trp!(
+            "text-style",
+            "current",
+            name = doc.header.current_text_style_name.clone()
+        ));
+        const PAGE: usize = 22;
+        let end = (from + PAGE).min(lines.len());
+        for line in lines.get(from..end).unwrap_or_default() {
+            self.command_line.push_output(line);
+        }
+        if end < lines.len() {
+            let pattern = pattern.to_string();
+            let next = end.to_string();
+            let command = ScriptPromptCommand::new(
+                "-STYLE",
+                flow(move |q| {
+                    q.text(trp!("text-style", "cmd-press-enter"), Some(String::new()))?;
+                    run("-STYLE", &["?", &pattern, &next])
+                }),
+            );
+            self.command_line.push_info(&command.prompt());
+            self.command_line.set_step_options(command.options());
+            self.tabs[i].active_cmd = Some(Box::new(command));
+        }
     }
 
     /// "Current dimension style: X   Annotative: No".
@@ -1108,7 +1868,11 @@ impl OpenCADStudio {
         let doc = &self.tabs[i].scene.document;
         let current = doc.header.current_dimstyle_name.clone();
         let annotative = crate::scene::annotative::dim_style_is_annotative(doc, &current);
-        let yes_no = if annotative { crate::t!("Yes") } else { crate::t!("No") };
+        let yes_no = if annotative {
+            crate::t!("Yes")
+        } else {
+            crate::t!("No")
+        };
         self.command_line.push_info(
             crate::t!(
                 "-DIMSTYLE  Current dimension style: %{name}   Annotative: %{annotative}",
@@ -1147,11 +1911,11 @@ impl OpenCADStudio {
             }
             "APPLY_PICKED" => {
                 let scene = &self.tabs[i].scene;
-                let handles: Vec<codec::Handle> = scene
+                let handles: Vec<document::Handle> = scene
                     .selected_entities()
                     .into_iter()
                     .filter(|(handle, entity)| {
-                        matches!(entity, codec::EntityType::Dimension(_))
+                        matches!(entity, document::EntityType::Dimension(_))
                             && !scene.is_layer_locked(*handle)
                     })
                     .map(|(handle, _)| handle)
@@ -1163,7 +1927,7 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "DIMSTYLE APPLY");
                 for &handle in &handles {
                     let doc = &mut self.tabs[i].scene.document;
-                    if let Some(codec::EntityType::Dimension(dimension)) =
+                    if let Some(document::EntityType::Dimension(dimension)) =
                         doc.get_entity_mut(handle)
                     {
                         dimension.base_mut().style_name = current.clone();
@@ -1192,7 +1956,7 @@ impl OpenCADStudio {
                     .selected_entities()
                     .into_iter()
                     .find_map(|(_, entity)| match entity {
-                        codec::EntityType::Dimension(dimension) => {
+                        document::EntityType::Dimension(dimension) => {
                             Some(dimension.base().style_name.clone())
                         }
                         _ => None,
@@ -1249,44 +2013,368 @@ impl OpenCADStudio {
                         .push_error(crate::tf!("DIMSTYLE: '{}' not found.", name).as_ref()),
                 }
             }
+            "RENAME" => {
+                let new_name = arg(2);
+                if new_name.trim().is_empty() {
+                    self.command_line.push_info(
+                        crate::t!("Usage: -DIMSTYLE RENAME <old> <new>").as_ref(),
+                    );
+                    return;
+                }
+                let Some(old_name) = self
+                    .tabs[i]
+                    .scene
+                    .document
+                    .dim_styles
+                    .iter()
+                    .find(|style| style.name.eq_ignore_ascii_case(&name))
+                    .map(|style| style.name.clone())
+                else {
+                    self.command_line.push_error(
+                        crate::tf!("DIMSTYLE: '{}' not found.", name).as_ref(),
+                    );
+                    return;
+                };
+                if self
+                    .tabs[i]
+                    .scene
+                    .document
+                    .dim_styles
+                    .iter()
+                    .any(|style| style.name.eq_ignore_ascii_case(&new_name))
+                {
+                    self.command_line.push_error(
+                        crate::tf!("DIMSTYLE: '{}' is already in use.", new_name).as_ref(),
+                    );
+                    return;
+                }
+                // Whole-document snapshot: the table rekey and the restyle of
+                // the dimensions using the style land in one undo step.
+                self.push_undo_snapshot(i, "DIMSTYLE RENAME");
+                match self
+                    .tabs[i]
+                    .scene
+                    .document
+                    .dim_styles
+                    .rename(&old_name, new_name.clone())
+                {
+                    Ok(()) => {
+                        let restyle: Vec<document::Handle> = self.tabs[i]
+                            .scene
+                            .document
+                            .entities()
+                            .filter_map(|entity| match entity {
+                                document::EntityType::Dimension(dimension)
+                                    if dimension.base().style_name.eq_ignore_ascii_case(&old_name) =>
+                                {
+                                    Some(dimension.base().common.handle)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let mut restyled = 0usize;
+                        for handle in &restyle {
+                            if let Some(document::EntityType::Dimension(dimension)) =
+                                self.tabs[i].scene.document.get_entity_mut(*handle)
+                            {
+                                dimension.base_mut().style_name = new_name.clone();
+                                restyled += 1;
+                            }
+                            self.tabs[i].scene.invalidate_dim_block_recorded(*handle);
+                        }
+                        if self.tabs[i]
+                            .scene
+                            .document
+                            .header
+                            .current_dimstyle_name
+                            .eq_ignore_ascii_case(&old_name)
+                        {
+                            let _ = self.on_ribbon_style_changed(
+                                crate::modules::StyleKey::DimStyle,
+                                new_name.clone(),
+                            );
+                        }
+                        self.tabs[i].dirty = true;
+                        self.tabs[i].scene.invalidate_dim_style_dependencies(&old_name);
+                        self.tabs[i].scene.invalidate_dim_style_dependencies(&new_name);
+                        self.command_line.push_output(
+                            crate::tf!(
+                                "DIMSTYLE: '{}' renamed to '{}'{}.",
+                                old_name,
+                                new_name,
+                                if restyled > 0 {
+                                    format!(", {restyled} dimension(s) restyled")
+                                } else {
+                                    String::new()
+                                }
+                            )
+                            .as_ref(),
+                        );
+                    }
+                    Err(error) => {
+                        self.command_line.push_error(
+                            crate::tf!("DIMSTYLE: {}.", error).as_ref(),
+                        );
+                    }
+                }
+                return;
+            }
+            "DELETE" => {
+                let Some(style_name) = self
+                    .tabs[i]
+                    .scene
+                    .document
+                    .dim_styles
+                    .iter()
+                    .find(|style| style.name.eq_ignore_ascii_case(&name))
+                    .map(|style| style.name.clone())
+                else {
+                    self.command_line.push_error(
+                        crate::tf!("DIMSTYLE: '{}' not found.", name).as_ref(),
+                    );
+                    return;
+                };
+                let current = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .current_dimstyle_name
+                    .clone();
+                if style_name.eq_ignore_ascii_case(&current) {
+                    self.command_line.push_error(
+                        crate::tf!(
+                            "DIMSTYLE: '{}' is the current style and cannot be deleted.",
+                            current
+                        )
+                        .as_ref(),
+                    );
+                    return;
+                }
+                let in_use = self.tabs[i]
+                    .scene
+                    .document
+                    .entities()
+                    .filter(|entity| {
+                        matches!(entity, document::EntityType::Dimension(dimension)
+                            if dimension.base().style_name.eq_ignore_ascii_case(&style_name))
+                    })
+                    .count();
+                if in_use > 0 {
+                    self.command_line.push_error(
+                        crate::tf!(
+                            "DIMSTYLE: '{}' is used by {} dimension(s); delete those first.",
+                            style_name,
+                            in_use
+                        )
+                        .as_ref(),
+                    );
+                    return;
+                }
+                let pending = self.begin_dim_style_undo(
+                    i,
+                    "DIMSTYLE DELETE",
+                    std::slice::from_ref(&style_name),
+                );
+                let _ = self.tabs[i].scene.document.dim_styles.remove(&style_name);
+                self.commit_dim_style_undo(i, pending);
+                self.tabs[i].dirty = true;
+                self.tabs[i].scene.invalidate_dim_style_dependencies(&style_name);
+                let _ =
+                    self.on_ribbon_style_changed(crate::modules::StyleKey::DimStyle, current);
+                self.command_line.push_output(
+                    crate::tf!("DIMSTYLE: '{}' deleted.", style_name).as_ref(),
+                );
+                return;
+            }
             "VARIABLES" => {
+                if args.len() >= 4 {
+                    // Write form: VARIABLES <style> <var> <value>. The value
+                    // goes through the shared variable table: name lookup,
+                    // per-variable validation and an undo step.
+                    let variable = arg(2).to_ascii_uppercase();
+                    let Some(style_name) = self
+                        .tabs[i]
+                        .scene
+                        .document
+                        .dim_styles
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(&name))
+                        .map(|s| s.name.clone())
+                    else {
+                        self.command_line.push_error(
+                            crate::tf!("DIMSTYLE: '{}' not found.", name).as_ref(),
+                        );
+                        return;
+                    };
+                    let pending = self.begin_dim_style_undo(
+                        i,
+                        "DIMSTYLE VARIABLES",
+                        std::slice::from_ref(&style_name),
+                    );
+                    let result = {
+                        let doc = &mut self.tabs[i].scene.document;
+                        // Owned lookup tables: the closures that resolve block
+                        // and text-style names hold nothing borrowed from the
+                        // document, so the style table can be borrowed mutably.
+                        let block_names: std::collections::HashMap<String, (document::Handle, String)> =
+                            doc.block_records
+                                .iter()
+                                .map(|record| (record.name.to_lowercase(), (record.handle, record.name.clone())))
+                                .collect();
+                        let text_style_names: std::collections::HashMap<String, (document::Handle, String)> =
+                            doc.text_styles
+                                .iter()
+                                .map(|ts| (ts.name.to_lowercase(), (ts.handle, ts.name.clone())))
+                                .collect();
+                        let resolve_block = move |text: &str| block_names.get(&text.to_lowercase()).cloned();
+                        let resolve_style = move |text: &str| text_style_names.get(&text.to_lowercase()).cloned();
+                        match doc.dim_styles.get_mut(&style_name) {
+                            Some(s) => Some(crate::app::dim_variables::set(
+                                s,
+                                &variable,
+                                arg(3).trim(),
+                                &resolve_block,
+                                &resolve_style,
+                            )),
+                            None => None,
+                        }
+                    };
+                    match result {
+                        Some(Ok((_old, new_value))) => {
+                            self.commit_dim_style_undo(i, pending);
+                            self.tabs[i].dirty = true;
+                            self.tabs[i].scene.invalidate_dim_style_dependencies(&style_name);
+                            let _ = self.on_ribbon_style_changed(
+                                crate::modules::StyleKey::DimStyle,
+                                style_name.clone(),
+                            );
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "DIMSTYLE: {} = {} in '{}'.",
+                                    variable,
+                                    new_value,
+                                    style_name
+                                )
+                                .as_ref(),
+                            );
+                        }
+                        Some(Err(reason)) => {
+                            self.commit_dim_style_undo(i, pending);
+                            self.command_line.push_error(
+                                crate::tf!("DIMSTYLE: {}.", reason).as_ref(),
+                            );
+                        }
+                        None => {
+                            self.commit_dim_style_undo(i, pending);
+                            self.command_line.push_error(
+                                crate::tf!("DIMSTYLE: '{}' not found.", style_name).as_ref(),
+                            );
+                        }
+                    }
+                    return;
+                }
                 let doc = &self.tabs[i].scene.document;
                 let Some(s) = doc.dim_styles.get(&name) else {
                     self.command_line
                         .push_error(crate::tf!("DIMSTYLE: '{}' not found.", name).as_ref());
                     return;
                 };
-                let lines: Vec<String> = [
-                    ("DIMASZ", s.dimasz),
-                    ("DIMCEN", s.dimcen),
-                    ("DIMDLE", s.dimdle),
-                    ("DIMDLI", s.dimdli),
-                    ("DIMEXE", s.dimexe),
-                    ("DIMEXO", s.dimexo),
-                    ("DIMGAP", s.dimgap),
-                    ("DIMLFAC", s.dimlfac),
-                    ("DIMSCALE", s.dimscale),
-                    ("DIMTSZ", s.dimtsz),
-                    ("DIMTVP", s.dimtvp),
-                    ("DIMTXT", s.dimtxt),
-                ]
-                .iter()
-                .map(|(var, value)| format!("{var:<10}{value:.4}"))
-                .chain(std::iter::once(format!("{:<10}{}", "DIMTXSTY", s.dimtxsty)))
-                .collect();
                 self.command_line.push_output(&s.name.clone());
-                for line in lines {
+                for line in crate::app::dim_variables::dump(s) {
                     self.command_line.push_output(&line);
                 }
             }
+            "COMPARE" => {
+                let first_name = name.clone();
+                let second_name = arg(2);
+                if second_name.is_empty() {
+                    self.command_line.push_info(
+                        crate::t!("Usage: -DIMSTYLE COMPARE <first> <second>").as_ref(),
+                    );
+                    return;
+                }
+                let doc = &self.tabs[i].scene.document;
+                let Some(first) = doc
+                    .dim_styles
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&first_name))
+                    .cloned()
+                else {
+                    self.command_line.push_error(
+                        crate::tf!("DIMSTYLE: '{}' not found.", first_name).as_ref(),
+                    );
+                    return;
+                };
+                let Some(second) = doc
+                    .dim_styles
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&second_name))
+                    .cloned()
+                else {
+                    self.command_line.push_error(
+                        crate::tf!("DIMSTYLE: '{}' not found.", second_name).as_ref(),
+                    );
+                    return;
+                };
+                let fields: Vec<(&str, String, String)> = crate::app::dim_variables::DIM_VARIABLES
+                    .iter()
+                    .map(|variable| {
+                        (
+                            variable.name,
+                            crate::app::dim_variables::get(&first, variable.name)
+                                .unwrap_or_default(),
+                            crate::app::dim_variables::get(&second, variable.name)
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let mut differences = 0;
+                for (var, first, second) in fields {
+                    if first != second {
+                        differences += 1;
+                        self.command_line.push_output(
+                            crate::tf!(
+                                "{} {} vs {}",
+                                var,
+                                first,
+                                second
+                            )
+                            .as_ref(),
+                        );
+                    }
+                }
+                if differences == 0 {
+                    self.command_line.push_output(
+                        crate::tf!(
+                            "DIMSTYLE: '{}' and '{}' are identical.",
+                            first.name,
+                            second.name
+                        )
+                        .as_ref(),
+                    );
+                }
+                return;
+            }
             _ => {
+                let current = self.tabs[i]
+                    .scene
+                    .document
+                    .header
+                    .current_dimstyle_name
+                    .clone();
                 let names: Vec<String> = self.tabs[i]
                     .scene
                     .document
                     .dim_styles
                     .iter()
                     .filter(|style| listed(&style.name, &name))
-                    .map(|style| style.name.clone())
+                    .map(|style| {
+                        if style.name.eq_ignore_ascii_case(&current) {
+                            format!("{} (current)", style.name)
+                        } else {
+                            style.name.clone()
+                        }
+                    })
                     .collect();
                 self.command_line
                     .push_output(crate::tf!("DimStyles: {}", names.join(", ")).as_ref());
@@ -1298,7 +2386,12 @@ impl OpenCADStudio {
         let arg = |n: usize| args.get(n).cloned().unwrap_or_default();
         let layouts = self.tabs[i].scene.layout_names();
         // Layout names are matched without case, as typed in scripts.
-        let find = |name: &str| layouts.iter().find(|l| l.eq_ignore_ascii_case(name)).cloned();
+        let find = |name: &str| {
+            layouts
+                .iter()
+                .find(|l| l.eq_ignore_ascii_case(name))
+                .cloned()
+        };
         let missing = |app: &mut Self, name: &str| {
             app.command_line
                 .push_error(crate::tf!("Layout '{}' does not exist", name).as_ref());
@@ -1374,15 +2467,21 @@ mod tests {
             "-RENAME LA TMP1 KEEP",
         ] {
             let _ = app.update(Message::ScriptLine(line.into()));
-            assert!(app.tabs[app.active_tab].active_cmd.is_none(), "{line} still asks");
+            assert!(
+                app.tabs[app.active_tab].active_cmd.is_none(),
+                "{line} still asks"
+            );
         }
         let doc = &app.tabs[app.active_tab].scene.document;
         let layer = doc.layers.get("SCANTEST").expect("-LAYER Make");
-        assert_eq!(layer.color, codec::types::Color::Index(1));
+        assert_eq!(layer.color, document::types::Color::Index(1));
         assert_eq!(doc.header.current_layer_name, "SCANTEST");
         assert!(doc.layers.get("KEEP").is_some_and(|l| l.flags.off));
         assert!(doc.layers.get("TMP2").is_none(), "-PURGE by name");
-        assert_eq!(doc.text_styles.get("ROMANS").unwrap().font_file, "romans.shx");
+        assert_eq!(
+            doc.text_styles.get("ROMANS").unwrap().font_file,
+            "romans.shx"
+        );
         assert_eq!(doc.header.current_text_style_name, "ROMANS");
     }
 }

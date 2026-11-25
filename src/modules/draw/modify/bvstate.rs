@@ -4,7 +4,7 @@
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
 use crate::scene::block_visibility::NewStateVisibility;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 /// Separates the fields of the `_BVSTATE` step the command hands over.
@@ -160,9 +160,7 @@ impl CadCommand for BvStateCommand {
                     "S" | "SHOW" => Self::done(&["NEW", name, "SHOW"]),
                     "H" | "HIDE" => Self::done(&["NEW", name, "HIDE"]),
                     "" | "K" | "KEEP" => Self::done(&["NEW", name]),
-                    _ => CmdResult::ReportError(
-                        crate::t!("Invalid option keyword.").into_owned(),
-                    ),
+                    _ => CmdResult::ReportError(crate::t!("Invalid option keyword.").into_owned()),
                 })
             }
             Step::SetName => {

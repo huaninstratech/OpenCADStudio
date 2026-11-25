@@ -27,12 +27,12 @@ pub struct DimOverrideCommand {
     /// The variable whose value is asked, and the value Enter keeps.
     pending: Option<(String, VarKind, String)>,
     /// The current dimension style, whose values are the defaults.
-    style: Option<codec::tables::DimStyle>,
+    style: Option<document::tables::DimStyle>,
     named: NamedValues,
 }
 
 impl DimOverrideCommand {
-    pub fn new(style: Option<codec::tables::DimStyle>, named: NamedValues) -> Self {
+    pub fn new(style: Option<document::tables::DimStyle>, named: NamedValues) -> Self {
         Self {
             vars: Vec::new(),
             pending: None,
@@ -86,7 +86,7 @@ impl DimOverrideCommand {
                 Some(t!("Requires numeric distance or two points.").into_owned())
             }
             (_, None) => Some(t!("DIMOVERRIDE: invalid value for this variable.").into_owned()),
-            (_, Some(codec::xdata::XDataValue::Real(number)))
+            (_, Some(document::xdata::XDataValue::Real(number)))
                 if number <= 0.0 && matches!(name, "DIMASZ" | "DIMTXT" | "DIMTSZ") =>
             {
                 (number < 0.0).then(|| t!("Value must be positive.").into_owned())
@@ -108,10 +108,11 @@ impl CadCommand for DimOverrideCommand {
                     .into_owned()
             }
             None => t!("DIMOVERRIDE  Enter dimension variable name to override:").into_owned(),
-            Some((_, _, current)) => crate::tf!(
-                "DIMOVERRIDE  Enter new value for dimension variable <{current}>:"
-            )
-            .into_owned(),
+            // The reference names no variable here: "dimension variable".
+            Some((_, _, current)) => format!(
+                "DIMOVERRIDE  {}",
+                crate::ui::command_line::value_prompt(t!("dimension variable").as_ref(), current)
+            ),
         }
     }
 
@@ -170,9 +171,9 @@ impl CadCommand for DimOverrideCommand {
                 self.pending = Some((upper, kind, current));
                 CmdResult::NeedPoint
             }
-            None => CmdResult::ReportError(
-                crate::tf!("Variable \"{upper}\" not found.").into_owned(),
-            ),
+            None => {
+                CmdResult::ReportError(crate::tf!("Variable \"{upper}\" not found.").into_owned())
+            }
         })
     }
 
@@ -203,7 +204,7 @@ impl CadCommand for DimOverrideCommand {
 }
 
 /// Parse a `NAME=value;…` list into record pairs; the error names the first bad entry.
-pub fn parse_spec(spec: &str) -> Result<Vec<(i16, codec::xdata::XDataValue)>, String> {
+pub fn parse_spec(spec: &str) -> Result<Vec<(i16, document::xdata::XDataValue)>, String> {
     spec.split(';')
         .filter(|entry| !entry.trim().is_empty())
         .map(|entry| {
@@ -215,4 +216,6 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(i16, codec::xdata::XDataValue)>, St
         .collect()
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMOVERRIDE"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["DIMOVERRIDE"]
+});

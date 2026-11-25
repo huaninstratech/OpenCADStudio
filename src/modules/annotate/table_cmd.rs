@@ -4,10 +4,10 @@
 // data rows. The command remembers its previous settings and supports either a
 // fixed insertion point or a two-corner sizing window.
 
-use codec::entities::table::{CellRange, CellStyle, CellStylePropertyFlags};
-use codec::entities::TableBuilder;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::table::{CellRange, CellStyle, CellStylePropertyFlags};
+use document::entities::TableBuilder;
+use document::types::Vector3;
+use document::EntityType;
 use glam::DVec3;
 use std::sync::Mutex;
 
@@ -89,13 +89,20 @@ pub fn session() -> std::sync::MutexGuard<'static, TableDefaults> {
 /// Row heights of a table: a row is `lines` lines of its text — four thirds
 /// of the text height each — plus the style's top and bottom margins.
 pub fn row_heights(
-    style: Option<&codec::objects::TableStyle>,
+    style: Option<&document::objects::TableStyle>,
     title: bool,
     header: bool,
     data_rows: usize,
     lines: usize,
 ) -> Vec<f64> {
-    row_heights_for(style, ["Title", "Header", "Data"], title, header, data_rows, lines)
+    row_heights_for(
+        style,
+        ["Title", "Header", "Data"],
+        title,
+        header,
+        data_rows,
+        lines,
+    )
 }
 
 /// Row heights of a table whose first, second and other rows take the
@@ -103,7 +110,7 @@ pub fn row_heights(
 /// row is `lines` lines of its cell style's text plus its top and bottom
 /// margins.
 pub fn row_heights_for(
-    style: Option<&codec::objects::TableStyle>,
+    style: Option<&document::objects::TableStyle>,
     names: [&str; 3],
     title: bool,
     header: bool,
@@ -116,7 +123,9 @@ pub fn row_heights_for(
             Some(s) => match s.cell_style(&cell_style_name(names[slot])) {
                 Some(cell) => (
                     cell.cell_style.content_format.text_height,
-                    cell.cell_style.margins().map_or(s.vertical_margin, |(_, v)| v),
+                    cell.cell_style
+                        .margins()
+                        .map_or(s.vertical_margin, |(_, v)| v),
                 ),
                 None => (
                     [
@@ -145,11 +154,11 @@ pub fn row_heights_for(
 /// the title, header and data cell styles; others are user cell styles.
 pub fn cell_style_name(name: &str) -> String {
     if name.eq_ignore_ascii_case("Title") {
-        codec::objects::TITLE_CELL_STYLE.to_string()
+        document::objects::TITLE_CELL_STYLE.to_string()
     } else if name.eq_ignore_ascii_case("Header") {
-        codec::objects::HEADER_CELL_STYLE.to_string()
+        document::objects::HEADER_CELL_STYLE.to_string()
     } else if name.eq_ignore_ascii_case("Data") {
-        codec::objects::DATA_CELL_STYLE.to_string()
+        document::objects::DATA_CELL_STYLE.to_string()
     } else {
         name.to_string()
     }
@@ -159,10 +168,10 @@ pub fn cell_style_name(name: &str) -> String {
 #[derive(Clone)]
 pub struct StyleChoice {
     pub name: String,
-    pub handle: codec::Handle,
-    pub style: codec::objects::TableStyle,
+    pub handle: document::Handle,
+    pub style: document::objects::TableStyle,
     /// The style's starting table, if it has one.
-    pub template: Option<codec::entities::Table>,
+    pub template: Option<document::entities::Table>,
 }
 
 /// What a table made from a style's starting table takes from it (the
@@ -231,34 +240,85 @@ fn template_option(options: &mut TemplateOptions, index: usize) -> &mut bool {
 }
 
 /// An empty, unmerged cell with the cell style of `cell`.
-fn blank_cell_like(cell: &codec::entities::table::TableCell) -> codec::entities::table::TableCell {
-    let mut blank = codec::entities::table::TableCell::new();
+fn blank_cell_like(
+    cell: &document::entities::table::TableCell,
+) -> document::entities::table::TableCell {
+    let mut blank = document::entities::table::TableCell::new();
     blank.style_id = cell.style_id;
     blank.style = cell.style.clone();
     blank
+}
+
+/// A table that holds `cells`, a data row for each row of them: the columns
+/// and row heights TABLE gives a new table of `style`, every row in the Data
+/// cell style — cells that come from somewhere else bring no title or
+/// header of their own.
+pub fn data_table(
+    style: Option<&StyleChoice>,
+    cells: &[Vec<String>],
+    column_width: f64,
+) -> document::entities::Table {
+    let columns = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let heights = row_heights_for(
+        style.map(|choice| &choice.style),
+        ["Data"; 3],
+        false,
+        false,
+        cells.len().max(1),
+        1,
+    );
+    let mut table = TableBuilder::new(heights.len(), columns).build();
+    for column in &mut table.columns {
+        column.width = column_width;
+    }
+    table.table_style_handle = style.map(|choice| choice.handle);
+    let data = style.and_then(|choice| {
+        choice
+            .style
+            .cell_style(&cell_style_name("Data"))
+            .map(|cell| cell.id)
+    });
+    for (row, height) in table.rows.iter_mut().zip(&heights) {
+        row.height = *height;
+        match (data, style) {
+            // The row names its cell style; the style draws it.
+            (Some(id), _) => {
+                row.style_id = id;
+                row.style = None;
+            }
+            (None, Some(choice)) => row.style = Some(selected_row_style(&choice.style, "Data")),
+            (None, None) => {}
+        }
+    }
+    for (row, texts) in cells.iter().enumerate() {
+        for (column, text) in texts.iter().enumerate() {
+            table.set_cell_text(row, column, text);
+        }
+    }
+    table
 }
 
 /// A table made from a style's starting table: its rows, columns, merges
 /// and sizes, the cell contents `options` keep, and `extra_rows` /
 /// `extra_columns` more rows and columns like its last ones.
 pub fn table_from_template(
-    template: &codec::entities::Table,
-    style: &codec::objects::TableStyle,
-    style_handle: codec::Handle,
+    template: &document::entities::Table,
+    style: &document::objects::TableStyle,
+    style_handle: document::Handle,
     options: TemplateOptions,
     extra_rows: usize,
     extra_columns: usize,
-) -> codec::entities::Table {
-    use codec::entities::table::TableCellContentType;
+) -> document::entities::Table {
+    use document::entities::table::TableCellContentType;
     let mut table = template.clone();
-    table.common = codec::entities::EntityCommon::default();
+    table.common = document::entities::EntityCommon::default();
     table.table_style_handle = Some(style_handle);
     table.block_record_handle = None;
     table.block_name.clear();
     let class_of = |id: i32| {
         style
             .cell_style_by_id(id)
-            .map_or(codec::objects::CELL_CLASS_DATA, |cell| cell.style_type)
+            .map_or(document::objects::CELL_CLASS_DATA, |cell| cell.style_type)
     };
     for row in &mut table.rows {
         let row_class = class_of(row.style_id);
@@ -271,7 +331,7 @@ pub fn table_from_template(
             } else {
                 row_class
             };
-            let keep_text = if class == codec::objects::CELL_CLASS_LABEL {
+            let keep_text = if class == document::objects::CELL_CLASS_LABEL {
                 options.label_text
             } else {
                 options.data_text
@@ -332,7 +392,6 @@ pub fn table_from_template(
     table
 }
 
-
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
     Columns,
@@ -340,9 +399,15 @@ enum Step {
     Insertion,
     FirstCorner,
     SecondCorner(DVec3),
-    StyleName { window: bool },
-    Width { window: bool },
-    Height { window: bool },
+    StyleName {
+        window: bool,
+    },
+    Width {
+        window: bool,
+    },
+    Height {
+        window: bool,
+    },
     LinkName,
     /// "from Style": place the style's starting table.
     FromStyle,
@@ -361,7 +426,7 @@ pub struct TableCommand {
     command: &'static str,
     style: Option<StyleChoice>,
     styles: Vec<StyleChoice>,
-    links: Vec<(String, codec::Handle)>,
+    links: Vec<(String, document::Handle)>,
     /// None: Auto (window mode fills the window with it).
     columns: Option<usize>,
     data_rows: Option<usize>,
@@ -378,7 +443,7 @@ pub struct TableCommand {
     extra_columns: usize,
 }
 
-fn cell_style_from_row(style: &codec::objects::RowCellStyle) -> CellStyle {
+fn cell_style_from_row(style: &document::objects::RowCellStyle) -> CellStyle {
     let mut result = CellStyle::new();
     result.property_flags = CellStylePropertyFlags::DATA_TYPE
         | CellStylePropertyFlags::DATA_FORMAT
@@ -400,7 +465,10 @@ fn cell_style_from_row(style: &codec::objects::RowCellStyle) -> CellStyle {
     result
 }
 
-pub(crate) fn selected_row_style(table_style: &codec::objects::TableStyle, name: &str) -> CellStyle {
+pub(crate) fn selected_row_style(
+    table_style: &document::objects::TableStyle,
+    name: &str,
+) -> CellStyle {
     let style = if name.eq_ignore_ascii_case("Title") {
         &table_style.title_row_style
     } else if name.eq_ignore_ascii_case("Header") {
@@ -486,7 +554,9 @@ impl TableCommand {
 
     /// The styles whose starting table "from Style" can place.
     fn template_styles(&self) -> impl Iterator<Item = &StyleChoice> {
-        self.styles.iter().filter(|choice| choice.template.is_some())
+        self.styles
+            .iter()
+            .filter(|choice| choice.template.is_some())
     }
 
     /// -TABLE: every setting on the command line, starting from the ones
@@ -494,7 +564,7 @@ impl TableCommand {
     pub fn command_line(
         style: Option<StyleChoice>,
         styles: Vec<StyleChoice>,
-        links: Vec<(String, codec::Handle)>,
+        links: Vec<(String, document::Handle)>,
         metric: bool,
     ) -> Self {
         let defaults = *session();
@@ -571,8 +641,14 @@ impl TableCommand {
         let style = self.style.as_ref().map(|choice| &choice.style);
         let Some(second) = second else {
             let widths = vec![self.cell_width; self.columns.unwrap_or(1)];
-            let heights =
-                row_heights_for(style, self.row_names(), title, header, self.data_rows.unwrap_or(1), self.row_lines);
+            let heights = row_heights_for(
+                style,
+                self.row_names(),
+                title,
+                header,
+                self.data_rows.unwrap_or(1),
+                self.row_lines,
+            );
             return (first, widths, heights);
         };
         let second = self.plane.to_local(second);
@@ -598,11 +674,19 @@ impl TableCommand {
             }
             // Else as many data rows as fit, at least one.
             None => {
-                let one = row_heights_for(style, self.row_names(), title, header, 1, self.row_lines);
+                let one =
+                    row_heights_for(style, self.row_names(), title, header, 1, self.row_lines);
                 let data = *one.last().unwrap_or(&1.0);
                 let labels: f64 = one[..one.len() - 1].iter().sum();
                 let count = ((height - labels) / data + 1.0e-9).floor().max(1.0) as usize;
-                row_heights_for(style, self.row_names(), title, header, count, self.row_lines)
+                row_heights_for(
+                    style,
+                    self.row_names(),
+                    title,
+                    header,
+                    count,
+                    self.row_lines,
+                )
             }
         };
         (first, widths, heights)
@@ -678,18 +762,20 @@ impl TableCommand {
         if self.dash() {
             self.remember();
         }
-        // Like the dialog's table, the new one opens its first cell.
-        CmdResult::CommitAndEditText(self.build_table(first, second))
+        // The table is placed and the command ends; a double click or
+        // TABLEDIT edits a cell when the user wants to.
+        CmdResult::CommitAndExit(self.build_table(first, second))
     }
 
     fn preview_grid(&self, first: DVec3, second: Option<DVec3>) -> WireModel {
         let (point, widths, heights) = self.layout(first, second);
         let point = self.plane.to_world(point);
-        self.grid_wire(point, &widths, &heights)
+        self.grid_wire(point, &widths, &heights, self.title_header().0)
     }
 
-    /// The outline grid of a table at `point` (world).
-    fn grid_wire(&self, point: DVec3, widths: &[f64], heights: &[f64]) -> WireModel {
+    /// The outline grid of a table at `point` (world); with `title` the
+    /// first row is one cell across the table, as the placed title is.
+    fn grid_wire(&self, point: DVec3, widths: &[f64], heights: &[f64], title: bool) -> WireModel {
         let point = self.plane.to_local(point);
         let width: f64 = widths.iter().sum();
         let height: f64 = heights.iter().sum();
@@ -699,28 +785,42 @@ impl TableCommand {
                 .as_vec3()
                 .to_array()
         };
-        let mut points = Vec::with_capacity((widths.len() + heights.len() + 2) * 2);
+        let mut points = Vec::with_capacity((widths.len() + heights.len() + 2) * 3);
+        let title_height = if title {
+            heights.first().copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let mut x = 0.0;
-        for column in std::iter::once(0.0).chain(widths.iter().copied()) {
+        for (index, column) in std::iter::once(0.0)
+            .chain(widths.iter().copied())
+            .enumerate()
+        {
             x += column;
-            points.push(world(x, 0.0));
+            let inner = index > 0 && index < widths.len();
+            points.push(world(x, if inner { -title_height } else { 0.0 }));
             points.push(world(x, -height));
+            points.push([f32::NAN; 3]); // each line on its own
         }
         let mut y = 0.0;
         for row in std::iter::once(0.0).chain(heights.iter().copied()) {
             y -= row;
             points.push(world(0.0, y));
             points.push(world(width, y));
+            points.push([f32::NAN; 3]);
         }
         WireModel {
             name: "table_preview".into(),
-            points,
             color: WireModel::CYAN,
             line_weight_px: 1.0,
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
             display_visible: true,
             plot_visible: true,
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                points,
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         }
     }
@@ -999,8 +1099,10 @@ impl CadCommand for TableCommand {
             }
             Step::FromStyleName => {
                 if input == "?" {
-                    let names: Vec<&str> =
-                        self.template_styles().map(|choice| choice.name.as_str()).collect();
+                    let names: Vec<&str> = self
+                        .template_styles()
+                        .map(|choice| choice.name.as_str())
+                        .collect();
                     return Some(CmdResult::ReportMeasurement(format!(
                         "{}\n-----------------\n{}",
                         t!("Table Style Name"),
@@ -1125,7 +1227,14 @@ impl CadCommand for TableCommand {
                 };
                 let widths: Vec<f64> = table.columns.iter().map(|c| c.width).collect();
                 let heights: Vec<f64> = table.rows.iter().map(|r| r.height).collect();
-                Some(self.grid_wire(point, &widths, &heights))
+                let title = widths.len() > 1
+                    && table.merged_ranges.iter().any(|r| {
+                        r.top_row == 0
+                            && r.bottom_row == 0
+                            && r.left_col == 0
+                            && r.right_col + 1 >= widths.len()
+                    });
+                Some(self.grid_wire(point, &widths, &heights, title))
             }
             Step::Insertion => Some(self.preview_grid(point, None)),
             Step::SecondCorner(first) => Some(self.preview_grid(first, Some(point))),
@@ -1155,7 +1264,7 @@ impl CadCommand for TableTemplatePickCommand {
         true
     }
 
-    fn on_entity_pick(&mut self, handle: codec::Handle, _pt: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: document::Handle, _pt: DVec3) -> CmdResult {
         if handle.is_null() {
             return CmdResult::NeedPoint;
         }
@@ -1175,7 +1284,9 @@ impl CadCommand for TableTemplatePickCommand {
     }
 }
 
-inventory::submit!(crate::command::CommandRegistration { names: &["TABLE", "-TABLE"] });
+inventory::submit!(crate::command::CommandRegistration {
+    names: &["TABLE", "-TABLE"]
+});
 
 /// A table cell resolved from a pick: grid coordinates plus whether its
 /// content is locked against editing.
@@ -1203,7 +1314,7 @@ pub(crate) enum TableCellEditStart {
 
 impl TableCellHit {
     /// Flat cell index, matching the Properties palette ordering.
-    pub fn index(&self, table: &codec::entities::Table) -> usize {
+    pub fn index(&self, table: &document::entities::Table) -> usize {
         self.row * table.column_count() + self.column
     }
 }
@@ -1214,8 +1325,8 @@ impl TableCellHit {
 /// object the table references, when the caller has the document at hand;
 /// the table's embedded base style covers the common fallbacks.
 pub(crate) fn table_cell_at(
-    table: &codec::entities::Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table: &document::entities::Table,
+    table_style: Option<&document::objects::TableStyle>,
     click_world: DVec3,
 ) -> Option<TableCellHit> {
     let horizontal = glam::DVec3::new(
@@ -1257,6 +1368,11 @@ pub(crate) fn table_cell_at(
             Some(*offset)
         })
         .position(|end| y <= end)?;
+    // A merged cell is one cell: a pick anywhere inside its span edits the
+    // owner, never a hidden covered cell underneath it (the in-place editor
+    // already widens, and a scripted TABLEDIT must reach the same cell).
+    let (row, column, _, _) =
+        crate::entities::table::widen_to_merged(table, (row, column, row, column));
     Some(TableCellHit {
         row,
         column,
@@ -1268,8 +1384,8 @@ pub(crate) fn table_cell_at(
 /// away from the cell's edges: a pick near a grid line takes the table, one
 /// inside a cell takes the cell.
 pub(crate) fn table_cell_inside(
-    table: &codec::entities::Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table: &document::entities::Table,
+    table_style: Option<&document::objects::TableStyle>,
     point: DVec3,
     margin: f64,
 ) -> Option<(usize, usize)> {
@@ -1304,8 +1420,8 @@ pub(crate) fn table_cell_inside(
 }
 
 /// True when the cell's content may not be edited (locked or read-only).
-pub(crate) fn cell_locked(table: &codec::entities::Table, row: usize, column: usize) -> bool {
-    use codec::entities::table::CellStateFlags;
+pub(crate) fn cell_locked(table: &document::entities::Table, row: usize, column: usize) -> bool {
+    use document::entities::table::CellStateFlags;
     table.cell(row, column).is_some_and(|cell| {
         cell.state
             .intersects(CellStateFlags::CONTENT_LOCKED | CellStateFlags::CONTENT_READ_ONLY)
@@ -1341,7 +1457,7 @@ impl CadCommand for TableditCommand {
 
     fn on_point(&mut self, point: DVec3) -> CmdResult {
         CmdResult::EditTableCell {
-            handle: codec::Handle::NULL,
+            handle: document::Handle::NULL,
             point,
         }
     }
@@ -1354,20 +1470,20 @@ impl CadCommand for TableditCommand {
 }
 
 inventory::submit!(crate::command::CommandRegistration {
-    names: &["TABLEDIT"]
+    names: &["TABLEDIT", "-TABLEDIT"]
 });
 
 pub struct TableCellEditCommand {
-    handle: codec::Handle,
-    table: codec::entities::Table,
+    handle: document::Handle,
+    table: document::entities::Table,
     row: usize,
     column: usize,
 }
 
 impl TableCellEditCommand {
     pub fn new(
-        handle: codec::Handle,
-        table: &codec::entities::Table,
+        handle: document::Handle,
+        table: &document::entities::Table,
         row: usize,
         column: usize,
     ) -> Self {
@@ -1387,13 +1503,14 @@ impl TableCellEditCommand {
     }
 
     fn set_value_type(&mut self, data_type: i32, unit_type: i32, picture: &str) {
-        use codec::entities::table::CellStylePropertyFlags as P;
         use crate::entities::table::{cell_data_category, cell_data_kind, CELL_DATA_CATEGORIES};
+        use document::entities::table::CellStylePropertyFlags as P;
         // A cell whose type turns into a number aligns Top Right, whatever
         // its table style's alignment (measured with Top Center, Middle
         // Left, Bottom Center, Top Left, Middle Right, Bottom Left); an
         // alignment set on the cell itself stays.
-        let before = cell_data_kind(&self.table, self.row, self.column).map(|(kind, _)| CELL_DATA_CATEGORIES[kind].0);
+        let before = cell_data_kind(&self.table, self.row, self.column)
+            .map(|(kind, _)| CELL_DATA_CATEGORIES[kind].0);
         let after = cell_data_category(data_type, unit_type);
         let own_alignment = self
             .table
@@ -1404,8 +1521,11 @@ impl TableCellEditCommand {
             .is_some_and(|style| style.sets(P::ALIGNMENT));
         let right = (before != Some(after)
             && !own_alignment
-            && matches!(after, "Whole Number" | "Decimal Number" | "Currency" | "Percentage"))
-            .then_some(3);
+            && matches!(
+                after,
+                "Whole Number" | "Decimal Number" | "Currency" | "Percentage"
+            ))
+        .then_some(3);
         if let Some(cell) = self.table.cell_mut(self.row, self.column) {
             if let Some(alignment) = right {
                 let style = cell.style.get_or_insert_with(Default::default);
@@ -1427,7 +1547,7 @@ impl TableCellEditCommand {
 }
 
 impl CadCommand for TableCellEditCommand {
-    fn table_cell(&self) -> Option<(codec::Handle, usize, usize)> {
+    fn table_cell(&self) -> Option<(document::Handle, usize, usize)> {
         Some((self.handle, self.row, self.column))
     }
 
@@ -1462,7 +1582,7 @@ impl CadCommand for TableCellEditCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
-        use codec::entities::table::CellStateFlags;
+        use document::entities::table::CellStateFlags;
         // Typed text sets a General cell's type, or a number cell's picture.
         if let Some((data_type, unit_type, picture)) =
             crate::entities::table::typed_entry_type(&self.table, self.row, self.column, text)
@@ -1505,11 +1625,11 @@ mod tabledit_tests {
     //! shortcut and the TABLEDIT pick, so its grid math is pinned here.
     //! `Table::new` seeds 2.5-unit columns and 0.25-unit rows with the
     //! default orientation (horizontal +X, flow down).
-    use super::{table_cell_at, TableCellEditCommand, TableCellHit, TableditCommand};
+    use super::{table_cell_at, TableCellEditCommand, TableCellHit, TableCommand, TableditCommand};
     use crate::command::{CadCommand, CmdResult};
-    use codec::entities::table::CellStateFlags;
-    use codec::entities::Table;
-    use codec::types::Vector3;
+    use document::entities::table::CellStateFlags;
+    use document::entities::Table;
+    use document::types::Vector3;
     use glam::DVec3;
 
     fn table_2x2() -> Table {
@@ -1584,12 +1704,75 @@ mod tabledit_tests {
     }
 
     #[test]
+    fn table_preview_draws_only_the_grid_lines() {
+        let names = ["Title", "Header", "Data"];
+        let cmd = TableCommand::configured(None, Some(3), Some(2), 2.5, 1, false, true, names);
+        let wire = cmd.preview_grid(DVec3::ZERO, None);
+        // Every line is two points closed by a break: no line joins the next.
+        assert_eq!(wire.points.len() % 3, 0);
+        for line in wire.points.chunks(3) {
+            assert!(line[0][0].is_finite() && line[1][0].is_finite());
+            assert!(line[2][0].is_nan(), "lines must not join: {line:?}");
+            assert!(
+                line[0][0] == line[1][0] || line[0][1] == line[1][1],
+                "diagonal {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_preview_shows_the_title_row_as_one_cell() {
+        let names = ["Title", "Header", "Data"];
+        let cmd = TableCommand::configured(None, Some(3), Some(2), 2.5, 1, false, true, names);
+        assert!(cmd.title_header().0, "a new table starts with a title row");
+        let wire = cmd.preview_grid(DVec3::ZERO, None);
+        let verticals: Vec<_> = wire
+            .points
+            .chunks(3)
+            .filter(|l| l[0][0] == l[1][0])
+            .collect();
+        let (left, right) = (verticals[0][0][0], verticals[verticals.len() - 1][0][0]);
+        assert_eq!(verticals.len(), 4, "3 columns: 4 vertical lines");
+        for line in &verticals {
+            let top = line[0][1].max(line[1][1]);
+            if line[0][0] == left || line[0][0] == right {
+                assert_eq!(top, 0.0, "the outline reaches the top: {line:?}");
+            } else {
+                assert!(
+                    top < 0.0,
+                    "an inner column line must stop under the title: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placing_a_table_ends_without_opening_a_cell() {
+        let names = ["Title", "Header", "Data"];
+        let mut cmd = TableCommand::configured(None, Some(3), Some(2), 2.5, 1, false, true, names);
+        match cmd.on_point(DVec3::new(10.0, 20.0, 0.0)) {
+            CmdResult::CommitAndExit(document::EntityType::Table(t)) => {
+                assert_eq!(t.column_count(), 3)
+            }
+            CmdResult::CommitAndEditText(_) => panic!("the new table must not open a cell editor"),
+            _ => panic!("expected the table to be committed"),
+        }
+        // the window (two corners) form too
+        let mut cmd = TableCommand::configured(None, Some(3), Some(2), 2.5, 1, true, true, names);
+        let _ = cmd.on_point(DVec3::ZERO);
+        assert!(matches!(
+            cmd.on_point(DVec3::new(9.0, -6.0, 0.0)),
+            CmdResult::CommitAndExit(_)
+        ));
+    }
+
+    #[test]
     fn tabledit_point_hands_point_to_host() {
         let mut cmd = TableditCommand::new();
         assert!(!cmd.needs_entity_pick());
         match cmd.on_point(DVec3::new(1.0, 2.0, 0.0)) {
             CmdResult::EditTableCell { handle, point } => {
-                assert_eq!(handle, codec::Handle::NULL);
+                assert_eq!(handle, document::Handle::NULL);
                 assert_eq!(point, DVec3::new(1.0, 2.0, 0.0));
             }
             _ => panic!("expected EditTableCell"),
@@ -1601,7 +1784,7 @@ mod tabledit_tests {
     #[test]
     fn table_cell_edit_formats_newlines() {
         let table = table_2x2();
-        let handle = codec::Handle::new(42);
+        let handle = document::Handle::new(42);
         let mut edit_cmd = TableCellEditCommand::new(handle, &table, 0, 0);
         let result = edit_cmd
             .on_text_input("Line1/nLine2\\nLine3\nLine4")
@@ -1609,7 +1792,7 @@ mod tabledit_tests {
         match result {
             CmdResult::ReplaceMany(repl, _) => {
                 assert_eq!(repl.len(), 1);
-                if let codec::EntityType::Table(t) = &repl[0].1[0] {
+                if let document::EntityType::Table(t) = &repl[0].1[0] {
                     assert_eq!(t.cell_text(0, 0).unwrap(), "Line1\\PLine2\\PLine3\\PLine4");
                 } else {
                     panic!("expected Table entity");

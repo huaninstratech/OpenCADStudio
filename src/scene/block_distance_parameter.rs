@@ -1,13 +1,13 @@
 //! Native Linear, Polar and XY parameter authoring with one end grip.
 use super::block_authoring::{self as authoring, *};
-use codec::objects::{
+use document::objects::{
     BlockConnection, BlockElement, BlockEvalValue, BlockGrip, BlockGripExpression,
     BlockLinearParameter, BlockOrientedGrip, BlockParameter, BlockParameterProperty,
     BlockParameterValueSet, BlockPolarParameter, BlockTwoPointParameter, BlockXYParameter,
     DynamicBlockData, ObjectType,
 };
-use codec::types::{Transform, Vector3};
-use codec::{Document, Handle};
+use document::types::{Transform, Vector3};
+use document::{Document, Handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -99,8 +99,9 @@ pub(crate) struct Parameter<'a> {
 fn graph_handle(document: &Document, definition: Handle) -> Option<Handle> {
     match document
         .objects
-        .get(&super::block_authoring::definition_dictionary(document, definition)?)?
-    {
+        .get(&super::block_authoring::definition_dictionary(
+            document, definition,
+        )?)? {
         ObjectType::Dictionary(dictionary) => dictionary.get("ACAD_ENHANCEDBLOCK"),
         _ => None,
     }
@@ -315,6 +316,34 @@ pub(crate) fn set_xy_value_sets(
         xy.y_value_set = set.record();
     }
     Ok(())
+}
+
+/// Writes a Linear parameter's base location: whether its datum sits midway
+/// between the definition points instead of at the start point.
+pub(crate) fn set_base_location(
+    document: &mut Document,
+    definition: Handle,
+    handle: Handle,
+    midpoint: bool,
+) -> Result<bool, &'static str> {
+    if !parameters(document, definition)
+        .iter()
+        .any(|p| p.handle == handle && p.kind == Kind::Linear)
+    {
+        return Err("Select a Linear parameter in the active block definition.");
+    }
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&handle) else {
+        unreachable!()
+    };
+    let DynamicBlockData::LinearParameter(parameter) = &mut object.data else {
+        unreachable!()
+    };
+    let value = if midpoint { 1 } else { 0 };
+    if parameter.parameter.parameter_base_location == value {
+        return Ok(false);
+    }
+    parameter.parameter.parameter_base_location = value;
+    Ok(true)
 }
 
 /// Creates a parameter with the placement answers a Linear command collected.
@@ -585,11 +614,7 @@ pub(crate) fn graphic(parameter: &Parameter<'_>) -> Graphic {
     result
 }
 
-pub(crate) fn reframe(
-    document: &mut Document,
-    definition: Handle,
-    transform: &Transform,
-) -> usize {
+pub(crate) fn reframe(document: &mut Document, definition: Handle, transform: &Transform) -> usize {
     let Some(graph) = graph_handle(document, definition) else {
         return 0;
     };
@@ -686,7 +711,7 @@ pub(crate) fn reframe(
 mod tests {
     use super::*;
     use crate::scene::{block_point_parameter, block_visibility, Scene};
-    use codec::{entities::Line, EntityType};
+    use document::{entities::Line, EntityType};
 
     pub(super) fn fixture() -> (Scene, Handle) {
         let mut scene = Scene::new();
@@ -705,6 +730,30 @@ mod tests {
             .unwrap()
             .handle;
         (scene, definition)
+    }
+
+    #[test]
+    fn the_first_parameter_tags_the_members_the_definition_already_holds() {
+        let (mut scene, definition) = fixture();
+        let member = members(&scene.document, definition)[0];
+        assert_eq!(
+            authoring::element_id(scene.document.get_entity(member).unwrap()),
+            None,
+            "a plain definition carries no element tags"
+        );
+        create(
+            &mut scene.document,
+            definition,
+            Kind::Linear,
+            Vector3::ZERO,
+            Vector3::new(5.0, 0.0, 0.0),
+            Vector3::new(2.5, 1.0, 0.0),
+        )
+        .unwrap();
+        assert!(
+            authoring::element_id(scene.document.get_entity(member).unwrap()).is_some(),
+            "creating the graph must tag the geometry the definition already holds"
+        );
     }
 
     fn append_batch(document: &mut Document, definition: Handle) -> Vec<Handle> {
@@ -806,6 +855,18 @@ mod tests {
                 assert_eq!(scene.document.objects.get(handle), Some(object));
             }
         }
+        let (ObjectType::DynamicBlock(old), ObjectType::DynamicBlock(new)) =
+            (&before.objects[&graph], &scene.document.objects[&graph])
+        else {
+            panic!("Expected authoring graphs")
+        };
+        let (DynamicBlockData::EvaluationGraph(old), DynamicBlockData::EvaluationGraph(new)) =
+            (&old.data, &new.data)
+        else {
+            panic!("Expected evaluation graph data")
+        };
+        assert_eq!(&new.nodes[..old.nodes.len()], &old.nodes);
+        assert_eq!(&new.edges[..old.edges.len()], &old.edges);
         assert_native(&scene.document, &handles);
         for extension in ["dwg", "dxf"] {
             let bytes =
@@ -1016,65 +1077,6 @@ mod tests {
         scene.block_edit_block = None;
         let (_, max) = scene.visible_block_bounds(definition).unwrap();
         assert!(max.x <= 1.0 && max.y < 1.0);
-    }
-
-    #[test]
-    #[ignore = "requires OCS_DYNAMIC_BLOCK_FIXTURES with local DWG fixtures"]
-    fn distance_parameter_fixture_batch_roundtrips() {
-        use sha2::{Digest, Sha256};
-        let directory = std::env::var_os("OCS_DYNAMIC_BLOCK_FIXTURES").expect("fixture directory");
-        let mut paths = std::fs::read_dir(directory)
-            .unwrap()
-            .map(|p| p.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg")))
-            .collect::<Vec<_>>();
-        paths.sort();
-        assert_eq!(paths.len(), 17);
-        for path in paths {
-            let bytes = std::fs::read(&path).unwrap();
-            let checksum = Sha256::digest(&bytes);
-            let filename = path.file_name().unwrap().to_string_lossy();
-            let mut document = crate::io::load_bytes(&filename, bytes).unwrap();
-            let definition = document
-                .block_records
-                .iter()
-                .map(|b| b.handle)
-                .find(|h| authoring::graph(&document, *h).is_ok_and(|g| g.is_some()))
-                .expect("editable existing graph");
-            let graph = graph_handle(&document, definition).unwrap();
-            let before = document.clone();
-            let handles = append_batch(&mut document, definition);
-            for (h, o) in &before.objects {
-                if *h != graph {
-                    assert_eq!(
-                        document.objects.get(h),
-                        Some(o),
-                        "{filename}: preserved {h}"
-                    );
-                }
-            }
-            if let (ObjectType::DynamicBlock(old), ObjectType::DynamicBlock(new)) =
-                (&before.objects[&graph], &document.objects[&graph])
-            {
-                if let (
-                    DynamicBlockData::EvaluationGraph(old),
-                    DynamicBlockData::EvaluationGraph(new),
-                ) = (&old.data, &new.data)
-                {
-                    assert_eq!(&new.nodes[..old.nodes.len()], &old.nodes);
-                    assert_eq!(&new.edges[..old.edges.len()], &old.edges);
-                }
-            }
-            for extension in ["dwg", "dxf"] {
-                let bytes =
-                    crate::io::save_to_bytes(&document, extension, document.version).unwrap();
-                let read = crate::io::load_bytes(&format!("batch.{extension}"), bytes).unwrap();
-                assert_native(&read, &handles);
-                assert!(authoring::graph(&read, definition).is_ok());
-            }
-            assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()), checksum);
-            eprintln!("{filename}: Linear/Polar/XY appended to existing graph; DWG/DXF passed; original objects/checksum preserved");
-        }
     }
 }
 

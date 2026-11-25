@@ -1,7 +1,7 @@
-use codec::objects::BlockVisibilityParameter;
-use codec::Handle;
+use document::Handle;
+use document::objects::BlockVisibilityParameter;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, Space,
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Element, Fill};
 

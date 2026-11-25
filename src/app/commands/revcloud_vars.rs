@@ -32,7 +32,7 @@ impl OpenCADStudio {
             ),
             _ => return false,
         };
-        let prompt = crate::ui::command_line::value_prompt(&name, &current);
+        let prompt = crate::ui::command_line::value_prompt(name, &current);
         let second_prompt = || crate::tr!("revcloud-cmd", "second-point");
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             if first_point.is_some() {
@@ -61,7 +61,8 @@ impl OpenCADStudio {
                     if name == "REVCLOUDGRIPS" {
                         revcloud::set_grips_on(on);
                         // The grips of selected clouds follow at once.
-                        self.tabs[i].scene.bump_geometry();
+                        self.tabs[i].scene.bump_selection();
+                        self.refresh_selected_grips();
                     } else {
                         revcloud::set_arc_variance(on);
                     }
@@ -71,13 +72,19 @@ impl OpenCADStudio {
             },
             _ => {
                 let length = match first_point {
-                    Some(first) => typed_point(value, Some(first)).map(|second| first.distance(second)),
-                    None => value.parse::<f64>().ok().filter(|length| length.is_finite()),
+                    Some(first) => {
+                        typed_point(value, Some(first)).map(|second| first.distance(second))
+                    }
+                    None => value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|length| length.is_finite()),
                 };
                 if let (None, None, Some(first)) = (first_point, length, typed_point(value, None)) {
                     // A point starts a length measured between two points.
                     self.command_line.push_output(&second_prompt());
-                    self.pending_setvar = Some(format!("{name}@{},{},{}", first.x, first.y, first.z));
+                    self.pending_setvar =
+                        Some(format!("{name}@{},{},{}", first.x, first.y, first.z));
                     return true;
                 }
                 match length {
@@ -96,11 +103,12 @@ impl OpenCADStudio {
         };
         match refused {
             Some(message) => {
-                self.command_line.push_error(&message);
+                self.command_line.push_rejection(&message);
                 match first_point {
                     Some(first) => {
                         self.command_line.push_output(&second_prompt());
-                        self.pending_setvar = Some(format!("{name}@{},{},{}", first.x, first.y, first.z));
+                        self.pending_setvar =
+                            Some(format!("{name}@{},{},{}", first.x, first.y, first.z));
                     }
                     None => {
                         self.command_line.push_output(&prompt);

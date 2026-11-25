@@ -1,17 +1,17 @@
 //! Native Lookup parameter and property-table authoring.
 use super::block_authoring::graph;
 use super::block_authoring::{self as authoring, *};
-use codec::objects::{
+use document::objects::{
     BlockAction, BlockElement, BlockEvalValue, BlockGrip, BlockGripExpression, BlockLookupAction,
     BlockLookupColumn, BlockLookupParameter, BlockOnePointParameter, BlockParameter,
     DynamicBlockData, ObjectType,
 };
-use codec::{
+use document::{
     types::{Transform, Vector3},
     Document, Handle,
 };
-mod reference;
 mod expressions;
+mod reference;
 pub(crate) use expressions::validate_with_properties;
 #[cfg(test)]
 mod tests;
@@ -98,7 +98,7 @@ pub(crate) fn create(
     let parameter = BlockLookupParameter {
         parameter: BlockOnePointParameter {
             parameter: BlockParameter {
-                element: element(0, "Lookup"),
+                element: element(0, &name),
                 show_properties: true,
                 chain_actions: false,
             },
@@ -373,10 +373,10 @@ fn evaluate_row_context(
         return Err("The selected Lookup row is unavailable.");
     }
     if baseline.is_some() {
-        let Some(codec::EntityType::Insert(reference)) = document.get_entity(insert) else {
+        let Some(document::EntityType::Insert(reference)) = document.get_entity(insert) else {
             return Err("Select a test reference.");
         };
-        if document.entities().any(|e| matches!(e, codec::EntityType::Insert(other) if other.common.handle != insert
+        if document.entities().any(|e| matches!(e, document::EntityType::Insert(other) if other.common.handle != insert
             && (other.block_name == reference.block_name || document.dynamic_definition_for_insert(other.common.handle) == Some(definition)))) {
             return Err("Test actions with one reference in Test Block. Remove the extra references or reopen Test Block.");
         }
@@ -408,7 +408,14 @@ fn evaluate_row_context(
         .map(|p| (p.handle, frames[&p.handle].end))
         .collect();
     let actual = expressions::actual_inputs(document, baseline, definition, insert, &table)?;
-    let resolved = expressions::row(baseline.unwrap_or(document), definition, &table, row, &actual, true)?;
+    let resolved = expressions::row(
+        baseline.unwrap_or(document),
+        definition,
+        &table,
+        row,
+        &actual,
+        true,
+    )?;
     let mut endpoints = std::collections::BTreeMap::new();
     for (column, property) in table.columns.iter().enumerate() {
         if property.lookup_property {
@@ -430,7 +437,9 @@ fn evaluate_row_context(
         if !(is_distance && (parameter.linear || parameter.polar) || is_angle && parameter.polar) {
             return Err("This Lookup input property is unsupported.");
         }
-        let value = resolved[column].as_ref().map(|(_, value)| *value)
+        let value = resolved[column]
+            .as_ref()
+            .map(|(_, value)| *value)
             .filter(|value| value.is_finite() && (!is_distance || *value > 1e-9))
             .ok_or("The selected Lookup row has an invalid parameter value.")?;
         let endpoint = if let Some(endpoint) = endpoints.get_mut(&parameter.id) {
@@ -500,15 +509,25 @@ fn evaluate_row_context(
             previous,
         )?
     } else {
+        let action_bases =
+            super::block_actions::instance::load_action_bases(document, insert, definition)
+                .unwrap_or_default();
         let resolved_frames = super::block_actions::rebuild_framed(
             &mut evaluated,
             baseline.unwrap_or(document),
             definition,
             &frames,
+            Some(&action_bases),
             Some(previous),
         )?;
         let mut result =
             super::block_actions::instance::materialize(document, insert, definition, &evaluated)?;
+        super::block_actions::instance::save_action_bases(
+            &mut result,
+            insert,
+            definition,
+            &action_bases,
+        )?;
         for parameter in &parameters {
             if let Some(frame) = resolved_frames.get(&parameter.handle) {
                 super::block_actions::instance::save_frame(&mut result, insert, parameter, *frame)?;
@@ -651,8 +670,7 @@ pub(crate) fn validate(
     let cols = table.columns.len();
     if rows == 0
         || rows > 1000
-        || cols < 2
-        || cols > 64
+        || !(2..=64).contains(&cols)
         || table.column_count != cols as i32
         || table.expressions.len() != rows * cols
     {
@@ -732,7 +750,12 @@ fn apply_table_inner(
     let mut edited = without_blank_rows(&edited);
     let previous = table(document, definition, parameter).map_err(str::to_string)?;
     validate(&edited, previous.as_ref().map(|(_, t)| t))?;
-    expressions::validate_context(document, definition, &edited, previous.as_ref().map(|(_, t)| t))?;
+    expressions::validate_context(
+        document,
+        definition,
+        &edited,
+        previous.as_ref().map(|(_, t)| t),
+    )?;
     let lookups = parameters(document, definition);
     let primary = lookups
         .iter()
@@ -822,11 +845,7 @@ fn apply_table_inner(
     }
     Ok(handle)
 }
-pub(crate) fn reframe(
-    document: &mut Document,
-    definition: Handle,
-    transform: &Transform,
-) -> usize {
+pub(crate) fn reframe(document: &mut Document, definition: Handle, transform: &Transform) -> usize {
     let Some(graph) = graph_handle(document, definition) else {
         return 0;
     };

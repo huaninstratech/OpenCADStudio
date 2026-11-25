@@ -1,8 +1,8 @@
-use codec::entities::{Dimension, DimensionArc};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{Dimension, DimensionArc};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 use glam::DVec3;
-use kernel::geom2d::tessellate::{arc, DEFAULT_SEGMENTS_PER_RADIAN};
+use ocs_geom::geom2d::tessellate::{arc, DEFAULT_SEGMENTS_PER_RADIAN};
 
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionAssociationSource,
@@ -15,7 +15,7 @@ use crate::scene::dimension_assoc::{
 };
 use crate::scene::model::wire_model::WireModel;
 
-pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/dim_angular.svg"));
+pub const ICON: IconKind = IconKind::Svg(include_bytes!("../../../assets/icons/dim_arc.svg"));
 
 pub fn tool() -> ToolDef {
     ToolDef {
@@ -180,6 +180,12 @@ pub struct ArcLengthDimensionCommand {
     leader_enabled: bool,
 }
 
+impl Default for ArcLengthDimensionCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcLengthDimensionCommand {
     pub fn new() -> Self {
         Self {
@@ -284,8 +290,7 @@ impl CadCommand for ArcLengthDimensionCommand {
         }
         match self.step {
             Step::SelectObject => {
-                crate::t!("DIMARC  Select arc or polyline arc segment:")
-                    .into_owned()
+                crate::t!("DIMARC  Select arc or polyline arc segment:").into_owned()
             }
             Step::DimLine(selection) => {
                 let leader_option = if selection.sweep() > std::f64::consts::FRAC_PI_2 {

@@ -9,11 +9,11 @@
 // piece of a NURBS circle into a piece of a parabola — a change that looks
 // fine until it is measured.
 
-use codec::entities::Spline;
-use codec::types::Vector3;
-use codec::Handle;
-use kernel::geom2d::{NurbsCurve, Parameterization};
-use kernel::space::Plane;
+use document::entities::Spline;
+use document::types::Vector3;
+use document::Handle;
+use ocs_geom::geom2d::{NurbsCurve, Parameterization};
+use ocs_geom::space::Plane;
 
 /// The drawing plane a spline sits on.
 ///
@@ -30,7 +30,7 @@ fn elevation(spl: &Spline) -> f64 {
 
 // ── Conversion ─────────────────────────────────────────────────────────────
 
-/// Convert an opencadcodec `Spline` to a kernel `NurbsCurve`, weights included.
+/// Convert a document `Spline` to a kernel `NurbsCurve`, weights included.
 ///
 /// A SPLINE is stored one of two ways and both turn up: a control polygon the
 /// curve approaches, or fit points it must pass through with optional end
@@ -68,14 +68,42 @@ fn spline_to_nurbs_with(
     vector: impl Fn(&Vector3) -> [f64; 2],
 ) -> Option<NurbsCurve> {
     let degree = (spl.degree.max(1)) as usize;
-    let control_points: Vec<[f64; 2]> = spl.control_points.iter().map(&point).collect();
-    let weights = (!spl.weights.is_empty()).then(|| spl.weights.clone());
+    let (control_points, knots, weights) =
+        if let Some((points, knots, weights)) = crate::entities::spline::unwrapped_periodic(spl) {
+            let projected = points
+                .into_iter()
+                .map(|[x, y, z]| point(&Vector3::new(x, y, z)))
+                .collect();
+            (projected, knots, Some(weights))
+        } else {
+            (
+                spl.control_points.iter().map(&point).collect(),
+                spl.knots.clone(),
+                (!spl.weights.is_empty()).then(|| spl.weights.clone()),
+            )
+        };
 
-    if let Some(curve) = NurbsCurve::new(degree, control_points, spl.knots.clone(), weights) {
+    if let Some(curve) = NurbsCurve::new(degree, control_points, knots, weights) {
         return Some(curve);
     }
 
     // No usable control polygon, so this is a fit-point spline.
+    if spl.fit_tolerance > 0.0 && !spl.flags.periodic {
+        // Fitted within a tolerance: the shared spatial fit, read in the
+        // plane. Projecting the control points projects the curve.
+        let curve = crate::entities::spline::fit_nurbs3(spl)?;
+        let projected = curve
+            .control_points()
+            .iter()
+            .map(|p| point(&Vector3::new(p[0], p[1], p[2])))
+            .collect();
+        return NurbsCurve::new(
+            curve.degree(),
+            projected,
+            curve.knots().to_vec(),
+            Some(curve.weights().to_vec()),
+        );
+    }
     let mut fit: Vec<[f64; 2]> = spl.fit_points.iter().map(&point).collect();
     let parameterization = match spl.knot_parameterization {
         2 => Parameterization::Uniform,
@@ -107,7 +135,7 @@ fn spline_to_nurbs_with(
     NurbsCurve::interpolate(&fit, start_tangent, end_tangent, parameterization)
 }
 
-/// Rebuild an opencadcodec `Spline` from a kernel curve.
+/// Rebuild a document `Spline` from a kernel curve.
 ///
 /// The `template` supplies entity common data and the Z elevation; splines
 /// here are planar, so the kernel's 2D points are lifted back onto it.
@@ -207,4 +235,38 @@ pub fn spline_pts_wire(spl: &Spline) -> Vec<[f32; 3]> {
         .iter()
         .map(|p| [p[0] as f32, p[1] as f32, elev])
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_periodic_spline_matches_explicit_basis() {
+        let mut compact = Spline::new();
+        compact.degree = 2;
+        compact.flags.closed = true;
+        compact.flags.periodic = true;
+        compact.flags.rational = true;
+        compact.control_points = vec![
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(3.0, 1.0, 0.0),
+            Vector3::new(2.0, 4.0, 0.0),
+        ];
+        compact.weights = vec![1.0, 2.0, 0.5];
+        compact.knots = vec![0.0, 1.0, 3.0, 4.0];
+
+        let mut full = compact.clone();
+        full.control_points
+            .extend_from_slice(&compact.control_points[..2]);
+        full.weights.extend_from_slice(&compact.weights[..2]);
+        full.knots = vec![-3.0, -1.0, 0.0, 1.0, 3.0, 4.0, 5.0, 7.0];
+
+        let actual = spline_to_nurbs(&compact).unwrap();
+        let expected = spline_to_nurbs(&full).unwrap();
+        assert_eq!(actual.domain(), (0.0, 4.0));
+        for knot in [0.0, 0.5, 1.0, 2.0, 3.0, 3.5, 4.0] {
+            assert_eq!(actual.point_at_knot(knot), expected.point_at_knot(knot));
+        }
+    }
 }

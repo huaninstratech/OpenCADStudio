@@ -2,18 +2,18 @@
 
 use std::any::Any;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use codec::xdata::ExtendedDataRecord;
-use codec::{Document, EntityType, Handle};
+use document::xdata::ExtendedDataRecord;
+use document::{Document, EntityType, Handle};
+use interprocess::TryClone;
 use interprocess::local_socket::traits::Stream as StreamTrait;
 use interprocess::local_socket::{GenericNamespaced, Stream, ToNsName};
-use interprocess::TryClone;
 
 use crate::host::{
     DocumentReader, ExecutionResult, HostApi, HostNotification, HostSettingValue,
@@ -22,7 +22,7 @@ use crate::host::{
 use crate::ipc::protocol::{
     HostRequest, HostResponse, PluginRequest, PluginResponse, RunnerHandshake,
 };
-use crate::ipc::transport::{recv, send, TransportError};
+use crate::ipc::transport::{TransportError, recv, send};
 use crate::ipc::v4::protocol::{
     HostToPluginV4, NotificationEnvelope, PluginToHostV4, V4_PROTOCOL_VERSION,
 };
@@ -36,7 +36,15 @@ const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Bounded queue of host→plugin notifications delivered to the plugin runner
 /// loop and/or `HostApi::try_recv_notification`.
-type NotificationQueue = mpsc::Receiver<(Option<u64>, HostNotification)>;
+///
+/// A shared deque instead of an `mpsc::sync_channel` so the reader can give
+/// latest-wins priority to selection-change notifications: the firetest
+/// diag round (-08..-13, 2026-11-14) showed an op-driven load flood can park
+/// a `SelectionChangedV4` message behind hundreds of stale Document/Drawing
+/// events for the whole poll window, so the plugin's panel refresh never saw
+/// the selection change. The deque lets the reader coalesce and front-place
+/// those messages; see the enqueue site in `reader_thread`.
+type NotificationQueue = VecDeque<(Option<u64>, HostNotification)>;
 
 /// Shared state between the plugin main thread, the reader thread, and any
 /// cloned `V4PluginHostApi` proxies.
@@ -89,7 +97,6 @@ impl V4Client {
             )))
         })?;
 
-        let (notify_tx, notify_rx) = mpsc::sync_channel(notify_queue_size());
         let (runner_tx, runner_rx) = mpsc::channel();
 
         let shared = Arc::new(Shared {
@@ -99,12 +106,17 @@ impl V4Client {
         });
 
         let shared_for_reader = Arc::clone(&shared);
-        let notifications = Arc::new(Mutex::new(notify_rx));
-        std::thread::spawn(move || reader_thread(reader, shared_for_reader, notify_tx, runner_tx));
+        let notifications = Arc::new(Mutex::new(
+            VecDeque::<(Option<u64>, HostNotification)>::new(),
+        ));
+        let notifications_for_loop = Arc::clone(&notifications);
+        std::thread::spawn(move || {
+            reader_thread(reader, shared_for_reader, runner_tx, notifications)
+        });
 
         Ok(Self {
             shared,
-            notifications,
+            notifications: notifications_for_loop,
             runner_queue: runner_rx,
         })
     }
@@ -125,11 +137,8 @@ impl V4Client {
 
     /// Non-blocking poll for host-to-plugin notifications.
     pub fn try_recv_notification(&self) -> Option<(Option<u64>, HostNotification)> {
-        self.notifications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_recv()
-            .ok()
+        let mut queue = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
+        queue.pop_front()
     }
 
     /// Send a plugin response for a host request.
@@ -201,8 +210,8 @@ fn notify_queue_size() -> usize {
 fn reader_thread(
     mut reader: Stream,
     shared: Arc<Shared>,
-    notify_tx: mpsc::SyncSender<(Option<u64>, HostNotification)>,
     runner_tx: mpsc::Sender<RunnerFrame>,
+    notifications: Arc<Mutex<NotificationQueue>>,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut last_drop_log: Option<Instant> = None;
@@ -221,10 +230,27 @@ fn reader_thread(
                     }
                 }
                 Ok(HostToPluginV4::Notification(envelope)) => {
-                    if notify_tx
-                        .try_send((envelope.command_id, envelope.payload))
-                        .is_err()
-                    {
+                    let is_sel4 = matches!(
+                        &envelope.payload,
+                        HostNotification::SelectionChangedV4 { .. }
+                    );
+                    let mut queue = notifications.lock().unwrap_or_else(|e| e.into_inner());
+                    if is_sel4 {
+                        // Latest-wins, head-priority: a selection change is
+                        // superseded by any newer one, and a refresh only needs
+                        // the current selection (the handler re-reads it from
+                        // the host). Without this, an op-driven load flood can
+                        // park the message behind hundreds of stale
+                        // Document/Drawing events and the panel refresh misses
+                        // the poll window (2026-11-14 firetest diag).
+                        queue.retain(|(_, n)| {
+                            !matches!(n, HostNotification::SelectionChangedV4 { .. })
+                        });
+                        queue.push_front((envelope.command_id, envelope.payload));
+                    } else if queue.len() >= notify_queue_size() {
+                        // Full: drop the newest (this one), as a bounded
+                        // channel's `try_send` does; the queued items, a
+                        // fronted selection change among them, stay.
                         let now = Instant::now();
                         let should_log = last_drop_log
                             .map(|t| now.duration_since(t) >= DROP_LOG_INTERVAL)
@@ -233,6 +259,8 @@ fn reader_thread(
                             eprintln!("[plugin] V4 notification queue full; dropping newest");
                             last_drop_log = Some(now);
                         }
+                    } else {
+                        queue.push_back((envelope.command_id, envelope.payload));
                     }
                 }
                 Ok(HostToPluginV4::Request { id, payload }) => {
@@ -303,6 +331,51 @@ impl V4PluginHostApi {
         req: PluginRequest,
     ) -> Result<PluginResponse, crate::ipc::transport::TransportError> {
         send_plugin_request(&self.shared, self.tab_id_cache.get(), req)
+    }
+
+    /// Bring the cached snapshot up to date after this plugin's own edit
+    /// (see [`snapshot_patch`](crate::ipc::snapshot_patch)): re-read the
+    /// `refreshed` entities from the host and drop the `removed` ones. Without
+    /// a cache there is nothing to patch; any failure drops the cache so the
+    /// next read fetches the host's truth.
+    fn patch_cache(&mut self, refreshed: &[Handle], removed: &[Handle]) {
+        if self.document_cache.get().is_none() {
+            return;
+        }
+        let fresh = if refreshed.is_empty() {
+            Some(Vec::new())
+        } else {
+            match self.request(PluginRequest::GetEntitiesBatch {
+                handles: refreshed.to_vec(),
+            }) {
+                Ok(PluginResponse::GetEntitiesBatchResult(Ok(list))) => Some(list),
+                _ => None,
+            }
+        };
+        let patched = match (fresh, self.document_cache.get_mut()) {
+            (Some(fresh), Some(doc)) => {
+                crate::ipc::snapshot_patch::apply_refreshed(doc, refreshed, fresh, removed)
+            }
+            _ => false,
+        };
+        if !patched {
+            self.document_cache = OnceCell::new();
+        }
+    }
+
+    /// Mirror a successful record write/removal in the cached snapshot.
+    fn patch_cached_record(
+        &mut self,
+        handle: Handle,
+        app_name: &str,
+        record: Option<ExtendedDataRecord>,
+    ) {
+        let Some(doc) = self.document_cache.get_mut() else {
+            return;
+        };
+        if !crate::ipc::snapshot_patch::mirror_record(doc, handle, app_name, record) {
+            self.document_cache = OnceCell::new();
+        }
     }
 
     fn fetch_document(&self) -> Document {
@@ -397,9 +470,15 @@ impl HostApi for V4PluginHostApi {
     }
 
     fn add_entity(&mut self, entity: EntityType) -> Handle {
+        let full_refresh = crate::ipc::snapshot_patch::edit_needs_full_refresh(&entity);
         match self.request(PluginRequest::AddEntity(entity)) {
             Ok(PluginResponse::Handle(h)) => {
-                self.document_cache = OnceCell::new();
+                // Patch the cached snapshot with the host's post-edit copy.
+                if h.is_null() || full_refresh {
+                    self.document_cache = OnceCell::new();
+                } else {
+                    self.patch_cache(&[h], &[]);
+                }
                 h
             }
             Ok(other) => {
@@ -414,9 +493,19 @@ impl HostApi for V4PluginHostApi {
     }
 
     fn add_entities(&mut self, entities: Vec<EntityType>) -> Vec<Handle> {
+        let full_refresh = entities
+            .iter()
+            .any(crate::ipc::snapshot_patch::edit_needs_full_refresh);
         match self.request(PluginRequest::AddEntities(entities)) {
             Ok(PluginResponse::Handles(handles)) => {
-                self.document_cache = OnceCell::new();
+                // Patch the cached snapshot with the host's post-edit copies.
+                if full_refresh {
+                    self.document_cache = OnceCell::new();
+                } else {
+                    let added: Vec<Handle> =
+                        handles.iter().copied().filter(|h| !h.is_null()).collect();
+                    self.patch_cache(&added, &[]);
+                }
                 handles
             }
             Ok(other) => {
@@ -431,10 +520,17 @@ impl HostApi for V4PluginHostApi {
     }
 
     fn update_entity(&mut self, entity: EntityType) -> bool {
+        let handle = entity.common().handle;
+        let full_refresh = crate::ipc::snapshot_patch::edit_needs_full_refresh(&entity);
         match self.request(PluginRequest::UpdateEntity(entity)) {
             Ok(PluginResponse::Bool(b)) => {
                 if b {
-                    self.document_cache = OnceCell::new();
+                    // Patch the cached snapshot with the host's post-edit copy.
+                    if full_refresh {
+                        self.document_cache = OnceCell::new();
+                    } else {
+                        self.patch_cache(&[handle], &[]);
+                    }
                 }
                 b
             }
@@ -452,8 +548,16 @@ impl HostApi for V4PluginHostApi {
     fn remove_entity(&mut self, handle: Handle) -> bool {
         match self.request(PluginRequest::RemoveEntity { handle }) {
             Ok(PluginResponse::Bool(b)) => {
-                if b {
+                // A nested attribute is not in the cached entity store: the
+                // host removed it from its block reference.
+                let nested = self
+                    .document_cache
+                    .get()
+                    .is_some_and(|doc| doc.get_entity(handle).is_none());
+                if b && nested {
                     self.document_cache = OnceCell::new();
+                } else if b {
+                    self.patch_cache(&[], &[handle]);
                 }
                 b
             }
@@ -473,6 +577,17 @@ impl HostApi for V4PluginHostApi {
     }
 
     fn read_record(&self, handle: Handle, app_name: &str) -> Option<&ExtendedDataRecord> {
+        // The host answers `ReadRecord` from the entity's own XDATA, which the
+        // cached snapshot carries (kept current after this plugin's edits):
+        // answer from it when the entity is there. A scan over a large drawing
+        // otherwise costs one round trip per entity.
+        if let Some(entity) = self
+            .document_cache
+            .get()
+            .and_then(|doc| doc.get_entity(handle))
+        {
+            return entity.common().extended_data.get_record(app_name);
+        }
         let key = (handle, app_name.to_string());
         {
             let cache = self.record_cache.borrow();
@@ -502,10 +617,14 @@ impl HostApi for V4PluginHostApi {
 
     fn write_record(&mut self, handle: Handle, record: ExtendedDataRecord) -> bool {
         let app = record.application_name.clone();
+        let mirrored = record.clone();
         match self.request(PluginRequest::WriteRecord { handle, record }) {
             Ok(PluginResponse::Bool(b)) => {
                 if b {
-                    self.record_cache.borrow_mut().remove(&(handle, app));
+                    self.record_cache
+                        .borrow_mut()
+                        .remove(&(handle, app.clone()));
+                    self.patch_cached_record(handle, &app, Some(mirrored));
                 }
                 b
             }
@@ -530,6 +649,7 @@ impl HostApi for V4PluginHostApi {
                     self.record_cache
                         .borrow_mut()
                         .remove(&(handle, app_name.to_string()));
+                    self.patch_cached_record(handle, app_name, None);
                 }
                 b
             }
@@ -673,11 +793,8 @@ impl HostApi for V4PluginHostApi {
     }
 
     fn try_recv_notification(&mut self) -> Option<(Option<u64>, HostNotification)> {
-        self.notifications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_recv()
-            .ok()
+        let mut queue = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
+        queue.pop_front()
     }
 
     fn plugin_request_sender(&self) -> Option<Box<dyn PluginRequestSender>> {
@@ -792,13 +909,21 @@ impl HostApi for V4PluginHostApi {
         label: &str,
         entities: Vec<EntityType>,
     ) -> Result<(), String> {
+        let handles: Vec<Handle> = entities.iter().map(|e| e.common().handle).collect();
+        let full_refresh = entities
+            .iter()
+            .any(crate::ipc::snapshot_patch::edit_needs_full_refresh);
         match self.request(PluginRequest::UpdateEntitiesTransaction {
             label: label.to_owned(),
             entities,
         }) {
             Ok(PluginResponse::EntityTransactionResult(result)) => {
                 if result.is_ok() {
-                    self.document_cache = OnceCell::new();
+                    if full_refresh {
+                        self.document_cache = OnceCell::new();
+                    } else {
+                        self.patch_cache(&handles, &[]);
+                    }
                 }
                 result
             }
@@ -811,7 +936,14 @@ impl HostApi for V4PluginHostApi {
     fn selection(&self) -> Vec<Handle> {
         match self.request(PluginRequest::GetSelection) {
             Ok(PluginResponse::Selection(handles)) => handles,
-            _ => Vec::new(),
+            _ => {
+                // P2-7 honesty: the frozen legacy answer shape keeps the
+                // empty selection, but the failure is never silent.
+                eprintln!(
+                    "[plugin] GetSelection failed or was unexpected; serving an empty selection"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -1073,8 +1205,8 @@ impl HostApi for V4PluginHostApi {
 
     fn entities_batch(
         &self,
-        handles: &[codec::Handle],
-    ) -> Result<Vec<Option<codec::EntityType>>, String> {
+        handles: &[document::Handle],
+    ) -> Result<Vec<Option<document::EntityType>>, String> {
         // API v12: per-entity reads — refresh passes never need to re-clone
         // the invalidated document snapshot after writes.
         match self.request(PluginRequest::GetEntitiesBatch {
@@ -1118,7 +1250,7 @@ impl HostApi for V4PluginHostApi {
     fn update_xrecords(
         &mut self,
         updates: &[crate::host::XRecordUpdate],
-    ) -> Result<Vec<Result<codec::Handle, String>>, String> {
+    ) -> Result<Vec<Result<document::Handle, String>>, String> {
         // API v13: one frame (one undo composition) replaces the whole
         // per-record write loop.
         match self.request(PluginRequest::UpdateXRecords {
@@ -1273,6 +1405,87 @@ impl HostApi for V4PluginHostApi {
         }
     }
 
+    fn panel_surface_publish(
+        &mut self,
+        panel_id: &str,
+        scene: crate::scene::PanelScene,
+    ) -> Result<crate::scene::SceneRevision, crate::scene::SurfaceReject> {
+        match self.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: crate::scene::PanelSurface::Scene(scene),
+        }) {
+            Ok(PluginResponse::PanelSurfacePublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelSurfacePublish response: {other:?}");
+                Err(crate::scene::SurfaceReject {
+                    code: crate::scene::SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelSurfacePublish request failed: {e}");
+                Err(crate::scene::SurfaceReject {
+                    code: crate::scene::SurfaceRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_widget_publish(
+        &mut self,
+        panel_id: &str,
+        surface: crate::widget::WidgetSurface,
+    ) -> Result<crate::widget::WidgetRevision, crate::widget::WidgetReject> {
+        match self.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: crate::scene::PanelSurface::Widgets(surface),
+        }) {
+            Ok(PluginResponse::PanelWidgetPublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelWidgetPublish response: {other:?}");
+                Err(crate::widget::WidgetReject {
+                    code: crate::widget::WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelWidgetPublish request failed: {e}");
+                Err(crate::widget::WidgetReject {
+                    code: crate::widget::WidgetRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
+    fn panel_table_publish(
+        &mut self,
+        panel_id: &str,
+        surface: crate::tables::TableSurface,
+    ) -> Result<crate::tables::TableRevision, crate::tables::TableReject> {
+        match self.request(PluginRequest::PanelSurfacePublish {
+            panel_id: panel_id.to_string(),
+            surface: crate::scene::PanelSurface::Tables(surface),
+        }) {
+            Ok(PluginResponse::PanelTablePublished(result)) => result,
+            Ok(other) => {
+                eprintln!("[plugin] unexpected PanelTablePublish response: {other:?}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+            Err(e) => {
+                eprintln!("[plugin] PanelTablePublish request failed: {e}");
+                Err(crate::tables::TableReject {
+                    code: crate::tables::TableRejectCode::Unattached,
+                    current_revision: None,
+                })
+            }
+        }
+    }
+
     fn update_panel(
         &mut self,
         panel_id: &str,
@@ -1308,6 +1521,40 @@ impl HostApi for V4PluginHostApi {
                 eprintln!("[plugin] TogglePanel request failed: {e}");
                 false
             }
+        }
+    }
+
+    fn set_geo_location(
+        &mut self,
+        location: &crate::host::GeoLocation,
+    ) -> Result<crate::host::Handle, String> {
+        match self.request(PluginRequest::SetGeoLocation {
+            location: location.clone(),
+        }) {
+            Ok(PluginResponse::GeoLocationSet(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected SetGeoLocation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn remove_geo_location(&mut self) -> Result<bool, String> {
+        match self.request(PluginRequest::RemoveGeoLocation) {
+            Ok(PluginResponse::GeoLocationRemoved(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected RemoveGeoLocation response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn panel_snapshot(&self, panel_id: &str) -> Result<crate::dialog::PanelSnapshot, String> {
+        match self.request(PluginRequest::PanelSnapshot {
+            panel_id: panel_id.to_string(),
+        }) {
+            Ok(PluginResponse::PanelSnapshot(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!("unexpected PanelSnapshot response: {other:?}")),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -1364,6 +1611,25 @@ impl HostApi for V4PluginHostApi {
             }
         }
     }
+
+    fn validate_parametric_chain(
+        &self,
+        chain: &crate::host::ParametricChain,
+        tolerance: f64,
+    ) -> Result<(), String> {
+        // Pure validation: no document snapshot invalidation.
+        match self.request(PluginRequest::ValidateParametricChain {
+            chain: chain.clone(),
+            tolerance,
+        }) {
+            Ok(PluginResponse::ValidateParametricChainResult(result)) => result,
+            Ok(PluginResponse::Error(error)) => Err(error),
+            Ok(other) => Err(format!(
+                "unexpected parametric validation response: {other:?}"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1372,7 +1638,6 @@ impl V4Client {
     /// and starts the reader thread without performing a handshake.
     pub(crate) fn from_stream_for_test(stream: Stream) -> Self {
         let reader = stream.try_clone().expect("try_clone");
-        let (notify_tx, notify_rx) = mpsc::sync_channel(notify_queue_size());
         let (runner_tx, runner_rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             writer: Mutex::new(stream),
@@ -1380,11 +1645,16 @@ impl V4Client {
             in_flight: Mutex::new(HashMap::new()),
         });
         let shared_for_reader = Arc::clone(&shared);
-        let notifications = Arc::new(Mutex::new(notify_rx));
-        std::thread::spawn(move || reader_thread(reader, shared_for_reader, notify_tx, runner_tx));
+        let notifications = Arc::new(Mutex::new(
+            VecDeque::<(Option<u64>, HostNotification)>::new(),
+        ));
+        let notifications_for_loop = Arc::clone(&notifications);
+        std::thread::spawn(move || {
+            reader_thread(reader, shared_for_reader, runner_tx, notifications)
+        });
         Self {
             shared,
-            notifications,
+            notifications: notifications_for_loop,
             runner_queue: runner_rx,
         }
     }
@@ -1411,15 +1681,15 @@ mod tests {
     use std::thread;
 
     use interprocess::local_socket::{
-        traits::{Listener, Stream as StreamTrait},
         GenericNamespaced, ListenerOptions, Stream, ToNsName,
+        traits::{Listener, Stream as StreamTrait},
     };
 
     use super::*;
     use crate::ipc::transport::recv;
     use crate::ipc::v4::protocol::{HostToPluginV4, PluginToHostV4};
     use crate::test_lock::ENV_LOCK;
-    use codec::entities::Point;
+    use document::entities::Point;
 
     fn unique_socket_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1476,6 +1746,53 @@ mod tests {
 
         let mut api = client.plugin_host_api(0, Rc::new(RefCell::new(HashMap::new())));
         api.push_info("hello host");
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn v4_client_validate_parametric_chain_roundtrip() {
+        let (host_stream, mut runner_stream) = connect_pair();
+        let client = V4Client::from_stream_for_test(host_stream);
+        let chain = crate::host::ParametricChain {
+            plane: crate::host::ParametricPlane::Plan,
+            segments: Vec::new(),
+            layer: String::new(),
+        };
+
+        let runner = thread::spawn(move || {
+            for result in [Ok(()), Err("hard-corner seam".to_owned())] {
+                match recv::<PluginToHostV4>(&mut runner_stream).unwrap() {
+                    PluginToHostV4::Request {
+                        id,
+                        payload:
+                            PluginRequest::ValidateParametricChain {
+                                chain: decoded,
+                                tolerance,
+                            },
+                        ..
+                    } => {
+                        assert!(decoded.segments.is_empty());
+                        assert_eq!(tolerance, 1e-3);
+                        send(
+                            &mut runner_stream,
+                            &HostToPluginV4::Response {
+                                id,
+                                payload: PluginResponse::ValidateParametricChainResult(result),
+                            },
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+        });
+
+        let api = client.plugin_host_api(0, Rc::new(RefCell::new(HashMap::new())));
+        assert_eq!(api.validate_parametric_chain(&chain, 1e-3), Ok(()));
+        assert_eq!(
+            api.validate_parametric_chain(&chain, 1e-3),
+            Err("hard-corner seam".to_owned())
+        );
         runner.join().unwrap();
     }
 

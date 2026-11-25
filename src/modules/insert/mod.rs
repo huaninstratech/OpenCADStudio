@@ -187,6 +187,7 @@ impl CadModule for InsertModule {
                             items: vec![
                                 ("PDFIMPORT;FILE", "PDF Import", underlay_layers::ICON),
                                 ("DGNIMPORT", "DGN Import", underlay_layers::ICON),
+                                ("IFC2PLAN", "IFC Floor Plan", IMPORT_ICON),
                                 ("IMPORT", "Import…", IMPORT_ICON),
                             ],
                             default: "PDFIMPORT;FILE",
@@ -204,9 +205,7 @@ impl CadModule for InsertModule {
                         RibbonItem::LabeledTool(ToolDef {
                             id: "PDFSHXTEXT_SETTINGS",
                             label: "Recognition Settings",
-                            icon: IconKind::Svg(include_bytes!(
-                                "../../../assets/icons/options_tool.svg"
-                            )),
+                            icon: IconKind::Svg(crate::ui::icons::GEAR),
                             event: ModuleEvent::Command("PDFSHXTEXT;SETTINGS".to_string()),
                         }),
                         RibbonItem::LargeTool(ToolDef {
@@ -263,9 +262,7 @@ impl CadModule for InsertModule {
                         RibbonItem::LabeledTool(
                             crate::modules::annotate::data_link::download_tool(),
                         ),
-                        RibbonItem::LabeledTool(
-                            crate::modules::annotate::data_link::upload_tool(),
-                        ),
+                        RibbonItem::LabeledTool(crate::modules::annotate::data_link::upload_tool()),
                         RibbonItem::LabeledTool(ToolDef {
                             label: "Extract Data",
                             ..crate::modules::annotate::data_extract::tool()

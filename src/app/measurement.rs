@@ -252,7 +252,7 @@ mod measurement_tests {
 
     #[test]
     fn measurement_radius_and_lines_real_entity_injection() {
-        use codec::{
+        use document::{
             entities::{Circle, Line},
             types::Vector3,
             EntityType,
@@ -279,7 +279,6 @@ mod measurement_tests {
         assert!(app.tabs[i].active_cmd.is_none());
         assert!(app.measurement_readout(i).unwrap().text.contains("Radius"));
         let _ = app.dispatch_command("MEASUREANGLE");
-        let _ = app.feed_command(StepInput::Text("LINES".into()));
         let _ = app.feed_command(StepInput::EntityPick(first, DVec3::X));
         let _ = app.feed_command(StepInput::EntityPick(second, DVec3::Y));
         assert!(app.tabs[i].active_cmd.is_none());

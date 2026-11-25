@@ -1,9 +1,10 @@
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
-use kernel::space::polygon;
+use ocs_geom::space::polygon;
 
 use crate::command::{
     AreaPreviewRegion, AreaPreviewSource, CadCommand, CmdOption, CmdResult, SelectionEntity,
+    WorkingPlane,
 };
 use crate::entities::curve::entity_curve;
 use crate::entities::traits::EntityTypeOps;
@@ -35,6 +36,14 @@ pub struct AreaCommand {
     preview_regions: Vec<AreaPreviewRegion>,
     total_area: f64,
     total_perimeter: f64,
+    /// Picked points are measured in this plane (the current UCS XY).
+    plane: WorkingPlane,
+}
+
+impl Default for AreaCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AreaCommand {
@@ -48,7 +57,20 @@ impl AreaCommand {
             preview_regions: Vec::new(),
             total_area: 0.0,
             total_perimeter: 0.0,
+            plane: WorkingPlane::default(),
         }
+    }
+
+    /// Area and perimeter of picked points, measured in a plane parallel to
+    /// `plane`. Snapped corners can sit at different elevations (survey
+    /// linework carries heights); the measured area is the outline seen in
+    /// the working plane, not a skew ring through space.
+    pub(crate) fn plane_measurement(plane: WorkingPlane, points: &[DVec3]) -> AreaMeasurement {
+        let flat: Vec<DVec3> = points
+            .iter()
+            .map(|point| plane.to_local(*point).truncate().extend(0.0))
+            .collect();
+        Self::point_measurement(&flat, true)
     }
 
     fn option(label: String, keyword: &str) -> CmdOption {
@@ -332,6 +354,10 @@ impl CadCommand for AreaCommand {
         CmdResult::NeedPoint
     }
 
+    fn set_working_plane(&mut self, plane: WorkingPlane) {
+        self.plane = plane;
+    }
+
     fn on_point(&mut self, point: DVec3) -> CmdResult {
         if self.objects_gathering {
             return CmdResult::NeedPoint;
@@ -365,7 +391,7 @@ impl CadCommand for AreaCommand {
         if self.points.len() < 3 {
             return CmdResult::Cancel;
         }
-        let measurement = Self::point_measurement(&self.points, true);
+        let measurement = Self::plane_measurement(self.plane, &self.points);
         if self.mode != AreaMode::Single {
             self.preview_regions.push(AreaPreviewRegion {
                 source: AreaPreviewSource::Boundary(
@@ -390,7 +416,7 @@ impl CadCommand for AreaCommand {
             }
             let mut points = self.points.clone();
             points.push(cursor);
-            Self::point_measurement(&points, true)
+            Self::plane_measurement(self.plane, &points)
         };
         if self.mode == AreaMode::Single {
             Some(Self::result_message(measurement))
@@ -504,7 +530,7 @@ mod measurement_tests {
         command.on_text_input("OBJECTS");
         let circle = |radius| SelectionEntity {
             handle: Handle::new(1),
-            entity: EntityType::Circle(codec::Circle::from_coords(0.0, 0.0, 0.0, radius)),
+            entity: EntityType::Circle(document::Circle::from_coords(0.0, 0.0, 0.0, radius)),
             surface_area: None,
         };
         command.inject_selection_entities(vec![circle(2.0)]);

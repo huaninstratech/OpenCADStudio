@@ -1,12 +1,12 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod graphics;
 pub(crate) mod spacemouse;
+use crate::app::Message;
 use crate::app::config::UiThemeConfig;
 use crate::app::settings;
 use crate::app::settings::{CursorType, RightClickMode};
-use crate::app::Message;
 use crate::ui::style::form::{dialog_button, dialog_button_styled_opt};
-use iced::widget::{button, column, container, row, scrollable, slider, text, text_input, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, slider, text, text_input};
 use iced::{Background, Border, Element, Fill, Theme};
 use std::fmt;
 
@@ -47,6 +47,10 @@ pub struct AppPrefs {
     pub savetime_min: i32,
     /// ISAVEBAK: keep a `.bak` when overwriting.
     pub backup_on_save: bool,
+    /// Offer to download missing `.shx` fonts when a drawing opens.
+    pub check_missing_fonts: bool,
+    /// ETRANSMIT/ARCHIVE: preserve, structured-by-type, or flat layout.
+    pub transmittal_layout: crate::io::transmit::TransmittalLayout,
     /// TEXTFILL: fill TrueType glyphs rather than drawing them hollow.
     pub textfill: bool,
     /// CLIPROMPTLINES: prompt lines shown above the command window.
@@ -62,6 +66,10 @@ pub struct AppPrefs {
     pub show_menu_bar: bool,
     /// The ribbon shows (RIBBON / RIBBONCLOSE).
     pub show_ribbon: bool,
+    /// The ribbon's tabs and panels sit in its middle.
+    pub ribbon_centered: bool,
+    /// The mouse wheel over the ribbon steps through its tabs.
+    pub ribbon_wheel_tabs: bool,
     /// HPASSOC: new hatches follow their boundary objects.
     pub hatch_associative: bool,
     /// ZOOMWHEEL: reverse the mouse-wheel zoom direction.
@@ -70,6 +78,8 @@ pub struct AppPrefs {
     pub navigation_style: crate::app::settings::NavigationStyle,
     /// Scroll pans and Ctrl+scroll zooms (touchpads).
     pub touchpad_pan: bool,
+    /// The numeric keypad's decimal key always types a decimal point.
+    pub keypad_decimal_point: bool,
     /// Interface scale in percent.
     pub ui_scale_percent: u16,
     /// ZOOMFACTOR. The slider sets the range the system variable has; the
@@ -89,6 +99,8 @@ pub struct AppPrefs {
     pub annotation_scale_modelspace: bool,
     /// Polar tracking increment in degrees.
     pub polar_increment_deg: f32,
+    /// The AutoSnap Magnet: the crosshairs lock onto an object snap point.
+    pub autosnap_magnet: bool,
     /// NAVVCUBE: show the navigation cube.
     pub show_viewcube: bool,
     /// UCSICON: show the UCS icon.
@@ -151,6 +163,8 @@ pub struct Folders {
     pub plot_styles_moved: bool,
     /// The user's support files folder, when one is chosen.
     pub support: Option<String>,
+    /// Where NEW looks for drawing templates.
+    pub templates: Option<String>,
 }
 
 /// Values read from the current drawing's header rather than from preferences.
@@ -179,9 +193,6 @@ pub struct DrawingPrefs {
 /// The Selection-card settings that live on `UserSettings` rather than on the
 /// model-space theme.
 ///
-/// Gathered into one value instead of four more positional parameters: the
-/// function already takes seventeen, and `pick_add` / `pick_drag_rect` are two
-/// adjacent `bool`s that would swap silently at the call site.
 #[derive(Clone, Copy)]
 pub struct SelectionPrefs {
     /// PICKBOX, 0..=50.
@@ -190,8 +201,9 @@ pub struct SelectionPrefs {
     pub aperture: i32,
     /// PICKADD: true = a click adds to the selection.
     pub pick_add: bool,
-    /// PICKDRAG: true = press-drag draws a rectangle instead of a lasso.
-    pub pick_drag_rect: bool,
+    pub pick_drag_mode: u8,
+    pub pick_auto: u8,
+    pub pick_first: bool,
     /// GRIPOBJLIMIT, 0..=32767; 0 = no limit.
     pub grip_object_limit: i32,
     /// Selection cycling: a click where objects overlap opens a picker.
@@ -231,7 +243,7 @@ fn color_swatch<'a>(target: crate::app::UiColor, [r, g, b]: [u8; 3]) -> Element<
     button(swatch)
         .on_press(Message::OpenColorWindow(
             crate::app::ColorPickTarget::Interface(target),
-            codec::types::Color::Rgb { r, g, b },
+            document::types::Color::Rgb { r, g, b },
         ))
         .padding(0)
         .style(button::text)
@@ -267,6 +279,7 @@ pub fn view_window<'a>(
     command_text_color: Option<[u8; 3]>,
     command_text_color_input: &'a str,
     lineweight_display_scale: i32,
+    lineweight_display: bool,
     model_space: &'a crate::app::config::ModelSpaceThemeConfig,
     model_bg_input: &'a str,
     paper_bg_input: &'a str,
@@ -391,9 +404,9 @@ pub fn view_window<'a>(
             text(crate::tr!("options", "language-label"))
                 .size(12)
                 .width(150),
-            crate::ui::dropdown_list::pick_list(selected_language, language_options, |choice| choice
-                .label
-                .clone(),)
+            crate::ui::dropdown_list::pick_list(selected_language, language_options, |choice| {
+                choice.label.clone()
+            },)
             .on_select(|choice| Message::LanguageChanged(choice.value))
             .width(sizing.width),
         ]
@@ -459,6 +472,25 @@ pub fn view_window<'a>(
     ]
     .spacing(0)
     .width(sizing.width);
+
+    let transmittal_layout_options = vec![
+        Labelled {
+            value: crate::io::transmit::TransmittalLayout::Preserve,
+            label: crate::tr!("options", "transmittal-layout-preserve"),
+        },
+        Labelled {
+            value: crate::io::transmit::TransmittalLayout::Structured,
+            label: crate::tr!("options", "transmittal-layout-structured"),
+        },
+        Labelled {
+            value: crate::io::transmit::TransmittalLayout::Flat,
+            label: crate::tr!("options", "transmittal-layout-flat"),
+        },
+    ];
+    let selected_transmittal_layout = transmittal_layout_options
+        .iter()
+        .find(|choice| choice.value == prefs.transmittal_layout)
+        .cloned();
 
     // Saving preferences, gathered onto one page. The format and the file
     // association were on General, which had become a page of three unrelated
@@ -562,6 +594,36 @@ pub fn view_window<'a>(
         ]
         .spacing(8)
         .align_y(iced::Center),
+        Space::new().height(8),
+        row![
+            iced::widget::checkbox(prefs.check_missing_fonts)
+                .on_toggle(Message::CheckMissingFontsChanged)
+                .size(15),
+            text(crate::t!("Missing fonts")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(14),
+        row![
+            text(crate::tr!("options", "transmittal-layout-label"))
+                .size(12)
+                .width(150),
+            crate::ui::dropdown_list::pick_list(
+                selected_transmittal_layout,
+                transmittal_layout_options,
+                |choice: &Labelled<crate::io::transmit::TransmittalLayout>| choice.label.clone(),
+            )
+            .on_select(|choice: Labelled<crate::io::transmit::TransmittalLayout>| {
+                Message::TransmittalLayoutChanged(choice.value)
+            })
+            .width(Fill),
+        ]
+        .spacing(12)
+        .align_y(iced::Center),
+        Space::new().height(6),
+        text(crate::tr!("options", "transmittal-layout-help"))
+            .size(11)
+            .width(sizing.width),
     ]
     .spacing(0)
     .width(sizing.width);
@@ -681,9 +743,11 @@ pub fn view_window<'a>(
             text(crate::tr!("options", "theme-label"))
                 .size(12)
                 .width(150),
-            crate::ui::dropdown_list::pick_list(selected_theme, theme_options, |choice| choice.label.clone(),)
-                .on_select(|choice| Message::OptionsThemeChanged(choice.value))
-                .width(sizing.width),
+            crate::ui::dropdown_list::pick_list(selected_theme, theme_options, |choice| choice
+                .label
+                .clone(),)
+            .on_select(|choice| Message::OptionsThemeChanged(choice.value))
+            .width(sizing.width),
         ]
         .spacing(12)
         .align_y(iced::Center),
@@ -700,9 +764,10 @@ pub fn view_window<'a>(
             text(crate::t!("Interface scale")).size(12).width(150),
             crate::ui::dropdown_list::pick_list(
                 Some(format!("{}%", prefs.ui_scale_percent)),
-                [75u16, 100, 125, 150, 175, 200]
+                (75u16..=200)
+                    .step_by(5)
                     .map(|p| format!("{p}%"))
-                    .to_vec(),
+                    .collect::<Vec<_>>(),
                 |label: &String| label.clone(),
             )
             .on_select(|label: String| {
@@ -725,9 +790,11 @@ pub fn view_window<'a>(
         Space::new().height(10),
         row![
             text(crate::t!("Canvas mode")).size(12).width(140),
-            crate::ui::dropdown_list::pick_list(selected_mode, mode_options, |choice| choice.label.clone(),)
-                .on_select(|choice| Message::ModelSpaceModeChanged(choice.value))
-                .width(Fill),
+            crate::ui::dropdown_list::pick_list(selected_mode, mode_options, |choice| choice
+                .label
+                .clone(),)
+            .on_select(|choice| Message::ModelSpaceModeChanged(choice.value))
+            .width(Fill),
         ]
         .spacing(10)
         .align_y(iced::Center),
@@ -880,6 +947,17 @@ pub fn view_window<'a>(
         .push(Space::new().height(10))
         .push(
             row![
+                iced::widget::checkbox(lineweight_display)
+                    .on_toggle(|_| Message::ToggleLineweightDisplay)
+                    .size(15),
+                text(crate::t!("Show Lineweight")).size(12),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .push(Space::new().height(10))
+        .push(
+            row![
                 text(crate::t!("Model display scale")).size(12).width(140),
                 slider(
                     25..=200,
@@ -932,6 +1010,28 @@ pub fn view_window<'a>(
                     .on_toggle(Message::RibbonVisibleChanged)
                     .size(15),
                 text(crate::t!("Show the ribbon (RIBBON / RIBBONCLOSE)")).size(12),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .push(Space::new().height(8))
+        .push(
+            row![
+                iced::widget::checkbox(prefs.ribbon_centered)
+                    .on_toggle(Message::RibbonCenteredChanged)
+                    .size(15),
+                text(crate::tr!("ribbon-menu", "center-ribbon")).size(12),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .push(Space::new().height(8))
+        .push(
+            row![
+                iced::widget::checkbox(prefs.ribbon_wheel_tabs)
+                    .on_toggle(Message::RibbonWheelTabsChanged)
+                    .size(15),
+                text(crate::tr!("ribbon-menu", "wheel-switches-tabs")).size(12),
             ]
             .spacing(8)
             .align_y(iced::Center),
@@ -1099,13 +1199,54 @@ pub fn view_window<'a>(
         .align_y(iced::Center),
         Space::new().height(10),
         row![
-            iced::widget::checkbox(selection.pick_drag_rect)
-                .on_toggle(Message::PickDragRectToggled)
+            iced::widget::checkbox(selection.pick_first)
+                .on_toggle(Message::PickFirstToggled)
                 .size(15),
-            text(crate::t!(
-                "Press and drag draws a rectangle instead of a lasso (PICKDRAG)"
-            ))
-            .size(12),
+            text(crate::t!("Noun/Verb Selection (PICKFIRST)")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(10),
+        row![
+            iced::widget::checkbox(selection.pick_auto & 1 != 0)
+                .on_toggle(|checked| Message::PickAutoBitToggled(1, checked))
+                .size(15),
+            text(crate::t!("Implied Windowing (PICKAUTO)")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(10),
+        row![
+            iced::widget::checkbox(selection.pick_auto & 2 != 0)
+                .on_toggle(|checked| Message::PickAutoBitToggled(2, checked))
+                .size(15),
+            text(crate::t!("Allow Press and Drag on Object")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(10),
+        row![
+            iced::widget::checkbox(selection.pick_auto & 4 != 0)
+                .on_toggle(|checked| Message::PickAutoBitToggled(4, checked))
+                .size(15),
+            text(crate::t!("Allow Press and Drag for Lasso")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(10),
+        row![
+            text(crate::t!("Window Selection Method (PICKDRAG)")).size(12),
+            crate::ui::dropdown_list::pick_list(
+                Some(selection.pick_drag_mode),
+                vec![0_u8, 1, 2],
+                |mode| match mode {
+                    0 => crate::t!("Two clicks").into_owned(),
+                    1 => crate::t!("Press and drag").into_owned(),
+                    _ => crate::t!("Two clicks or drag").into_owned(),
+                },
+            )
+            .on_select(Message::PickDragModeChanged)
+            .width(Fill),
         ]
         .spacing(8)
         .align_y(iced::Center),
@@ -1114,7 +1255,7 @@ pub fn view_window<'a>(
             iced::widget::checkbox(selection.selection_cycling)
                 .on_toggle(Message::SelectionCyclingChanged)
                 .size(15),
-            text(crate::t!("Clicking overlapping objects opens a picker")).size(12),
+            text(crate::t!("Selection Cycling")).size(12),
         ]
         .spacing(8)
         .align_y(iced::Center),
@@ -1425,6 +1566,18 @@ pub fn view_window<'a>(
         ]
         .spacing(8)
         .align_y(iced::Center),
+        Space::new().height(8),
+        row![
+            iced::widget::checkbox(prefs.keypad_decimal_point)
+                .on_toggle(Message::KeypadDecimalPointChanged)
+                .size(15),
+            text(crate::t!(
+                "Numeric keypad: the decimal key always types a point (off: the layout's character, so a comma separates coordinates)"
+            ))
+            .size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
         Space::new().height(12),
         row![
             text(crate::t!("Zoom factor")).size(12).width(150),
@@ -1568,7 +1721,7 @@ pub fn view_window<'a>(
         ))
         .size(11)
         .width(sizing.width),
-                
+
         Space::new().height(24),
         // ── Quad cursor menu ─────────────────────────────────────────────
         // docs/quad-menu.md §3.7: the master switch, the four QUADDISPLAY
@@ -1817,6 +1970,21 @@ pub fn view_window<'a>(
         ]
         .spacing(10)
         .align_y(iced::Center),
+        Space::new().height(14),
+        row![
+            iced::widget::checkbox(prefs.autosnap_magnet)
+                .on_toggle(Message::AutoSnapMagnetChanged)
+                .size(15),
+            text(crate::t!("Magnet")).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        Space::new().height(6),
+        text(crate::t!(
+            "The crosshairs lock onto the object snap point while its marker shows (AUTOSNAP)."
+        ))
+        .size(11)
+        .width(sizing.width),
         Space::new().height(24),
         text(crate::t!("Snap and Grid")).size(15),
         Space::new().height(10),
@@ -2118,6 +2286,12 @@ pub fn view_window<'a>(
             folders.color_books.clone(),
             None,
         ),
+        Space::new().height(12),
+        folder_row(
+            crate::t!("Drawing templates"),
+            folders.templates.clone(),
+            None,
+        ),
         Space::new().height(16),
         text(crate::t!("Default template for new drawings")).size(12),
         Space::new().height(4),
@@ -2154,7 +2328,7 @@ pub fn view_window<'a>(
     // before the list of pages is complete.
     let tab_button = |label, tab| {
         let selected = active_tab == tab;
-        button(text(label).size(12.5))
+        button(text(label).size(crate::ui::style::text::UI_LARGE))
             .on_press(Message::OptionsTabChanged(tab))
             .padding([7, 12])
             .width(Fill)

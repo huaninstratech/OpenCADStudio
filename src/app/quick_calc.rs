@@ -45,7 +45,10 @@ pub(super) fn sysvars(tab: &DocumentTab) -> SysVars {
         ("dimscale", n(h.dim_scale)),
         ("mirrtext", n(f64::from(u8::from(h.mirror_text)))),
         ("osmode", n(f64::from(h.object_snap_mode))),
-        ("matchmode", n(f64::from(crate::entities::match_props::match_mode()))),
+        (
+            "matchmode",
+            n(f64::from(crate::entities::match_props::match_mode())),
+        ),
         ("userr1", n(h.user_real1)),
         ("userr2", n(h.user_real2)),
         ("userr3", n(h.user_real3)),
@@ -138,6 +141,21 @@ impl OpenCADStudio {
     fn quick_calc_context(&self) -> CalcContext {
         let tab = &self.tabs[self.active_tab];
         self.quick_calc.context(base_unit(tab), Some(sysvars(tab)))
+    }
+
+    /// A numeric Properties entry as the value it stands for: the
+    /// QuickCalc engine's number when it reads the whole entry
+    /// (`sqrt(2)*$w`, `r2d(atan(1))`, `ans`), else the arithmetic and
+    /// embedded-expression evaluation every typed field shares.
+    pub(in crate::app) fn property_expression_value(&self, raw: &str) -> String {
+        if crate::app::expr_eval::eval_number(raw.trim()).is_none() {
+            if let Ok(crate::app::calc::Value::Number(n)) =
+                crate::app::calc::value_of(raw, &self.quick_calc_context())
+            {
+                return format!("{n}");
+            }
+        }
+        crate::app::expr_eval::eval_to_string(raw)
     }
 
     /// QUICKCALC / QC: show the pallet (docked on the right the first time)
@@ -506,6 +524,16 @@ mod tests {
     fn floats_tall_enough_for_the_keypad() {
         let app = app();
         let float_height = crate::ui::window::quick_calc::float_height();
+        // The workspace is the viewport plus the drawing-tab bar beside
+        // the docks.
+        let tabs = app.dock_workspace_size().1
+            - app.tabs[app.active_tab]
+                .scene
+                .selection
+                .borrow()
+                .view
+                .vp_size
+                .1;
         let workspace = |h: f32| {
             app.tabs[app.active_tab]
                 .scene
@@ -513,7 +541,7 @@ mod tests {
                 .borrow_mut()
                 .view
                 .vp_size
-                .1 = h;
+                .1 = h - tabs;
         };
         // A short workspace: other pallets float at 60 % of it.
         workspace(700.0);

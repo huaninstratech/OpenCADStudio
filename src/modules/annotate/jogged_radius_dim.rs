@@ -1,6 +1,6 @@
-use codec::entities::{Dimension, DimensionLargeRadial};
-use codec::types::{Handle, Vector3};
-use codec::EntityType;
+use document::entities::{Dimension, DimensionLargeRadial};
+use document::types::{Handle, Vector3};
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{
@@ -163,9 +163,7 @@ impl CadCommand for JoggedRadiusDimensionCommand {
             return t!("DIMJOGGED  Specify text angle (degrees):").into_owned();
         }
         match self.step {
-            Step::SelectObject => {
-                t!("DIMJOGGED  Select arc or circle:").into_owned()
-            }
+            Step::SelectObject => t!("DIMJOGGED  Select arc or circle:").into_owned(),
             Step::OverrideCenter(_) => {
                 t!("DIMJOGGED  Specify center location override:").into_owned()
             }

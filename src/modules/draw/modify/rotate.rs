@@ -10,9 +10,9 @@
 //   the applied rotation is new-angle - reference-angle.
 
 use crate::t;
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
-use kernel::geom2d::{self, Curve as KernelCurve};
+use ocs_geom::geom2d::{self, Curve as KernelCurve};
 
 use crate::command::{CadCommand, CmdResult, DynField, EntityTransform, WorkingPlane};
 use crate::modules::draw::defaults;
@@ -67,6 +67,8 @@ pub struct RotateCommand {
     spatial: bool,
     /// The plane is the one square to the chosen axis, not the UCS.
     axis_chosen: bool,
+    /// The Copy option: rotate a duplicate and leave the source in place.
+    copy: bool,
 }
 
 impl RotateCommand {
@@ -79,6 +81,7 @@ impl RotateCommand {
             plane: WorkingPlane::default(),
             spatial: false,
             axis_chosen: false,
+            copy: false,
         }
     }
 
@@ -111,14 +114,16 @@ impl RotateCommand {
 
     fn commit(&self, center: DVec3, angle_rad: f64) -> CmdResult {
         defaults::set_rotate_angle(angle_rad.to_degrees());
-        CmdResult::TransformSelected(
-            self.handles.clone(),
-            EntityTransform::Rotate {
-                center,
-                axis: self.plane.z,
-                angle_rad,
-            },
-        )
+        let transform = EntityTransform::Rotate {
+            center,
+            axis: self.plane.z,
+            angle_rad,
+        };
+        if self.copy {
+            CmdResult::CopySelectedAndExit(self.handles.clone(), transform)
+        } else {
+            CmdResult::TransformSelected(self.handles.clone(), transform)
+        }
     }
 
     fn angle_arc(center: [f64; 2], radius: f64, angle: f64) -> Option<(geom2d::Arc, bool)> {
@@ -192,6 +197,12 @@ impl CadCommand for RotateCommand {
         }
     }
 
+    fn point_rejection(&self) -> Option<String> {
+        matches!(self.step, Step::Angle { .. }).then(|| {
+            t!("Requires valid numeric angle, second point, or option keyword.").into_owned()
+        })
+    }
+
     fn prompt(&self) -> String {
         match &self.step {
             Step::Center if self.spatial => t!(
@@ -210,11 +221,19 @@ impl CadCommand for RotateCommand {
             }
             Step::Angle { .. } if self.spatial => {
                 let a = format!("{:.4}", self.default_angle);
-                t!("3DROTATE  Specify rotation angle  <%{a}>:", a = a).into_owned()
+                t!(
+                    "3DROTATE  Specify rotation angle or [Copy/Reference]  <%{a}>:",
+                    a = a
+                )
+                .into_owned()
             }
             Step::Angle { .. } => {
                 let a = format!("{:.4}", self.default_angle);
-                t!("ROTATE  Specify rotation angle  <%{a}>:", a = a).into_owned()
+                t!(
+                    "ROTATE  Specify rotation angle or [Copy/Reference]  <%{a}>:",
+                    a = a
+                )
+                .into_owned()
             }
             Step::RefFirst { .. } => {
                 t!("ROTATE  Specify first reference point or type reference angle:").into_owned()
@@ -233,7 +252,10 @@ impl CadCommand for RotateCommand {
             Step::Axis { .. } => ["X", "Y", "Z"]
                 .map(|axis| CmdOption::new(axis, axis))
                 .to_vec(),
-            Step::Angle { .. } => vec![CmdOption::new(t!("Reference").as_ref(), "R")],
+            Step::Angle { .. } => vec![
+                CmdOption::new(t!("Copy").as_ref(), "C"),
+                CmdOption::new(t!("Reference").as_ref(), "R"),
+            ],
             _ => vec![],
         }
     }
@@ -282,6 +304,25 @@ impl CadCommand for RotateCommand {
         }
     }
 
+    /// Picks go through here so the host can take [`Self::resolved_anchor`].
+    fn on_point_with_tangent(
+        &mut self,
+        pt: DVec3,
+        _tangent: Option<crate::command::TangentObject>,
+    ) -> Option<CmdResult> {
+        Some(self.on_point(pt))
+    }
+
+    /// The new angle is measured from the base point, so Ortho and Polar
+    /// must run from there, not from the second reference point just
+    /// picked (#3331).
+    fn resolved_anchor(&self) -> Option<DVec3> {
+        match self.step {
+            Step::Angle { center } | Step::RefNew { center, .. } => Some(center),
+            _ => None,
+        }
+    }
+
     fn on_enter(&mut self) -> CmdResult {
         // The axis defaults to the UCS Z.
         if let Step::Axis { center } = &self.step {
@@ -315,6 +356,10 @@ impl CadCommand for RotateCommand {
             Step::Angle { center } => {
                 let center = *center;
                 let low = t.to_ascii_lowercase();
+                if low == "c" || low == "copy" {
+                    self.copy = true;
+                    return Some(CmdResult::NeedPoint);
+                }
                 if low == "r" || low == "reference" {
                     self.step = Step::RefFirst { center };
                     return Some(CmdResult::NeedPoint);
@@ -326,13 +371,14 @@ impl CadCommand for RotateCommand {
             }
             Step::RefFirst { center } => {
                 let center = *center;
-                let ref_angle = crate::entities::common::parse_typed_angle(t)?;
+                // Reference and new angles are directions: ANGBASE/ANGDIR apply.
+                let ref_angle = crate::entities::common::parse_typed_direction(t)?;
                 self.step = Step::RefNew { center, ref_angle };
                 Some(CmdResult::NeedPoint)
             }
             Step::RefNew { center, ref_angle } => {
                 let (center, ref_angle) = (*center, *ref_angle);
-                let new_angle = crate::entities::common::parse_typed_angle(t)?;
+                let new_angle = crate::entities::common::parse_typed_direction(t)?;
                 Some(self.commit(center, new_angle - ref_angle))
             }
             Step::Center | Step::RefSecond { .. } => None,
@@ -411,15 +457,28 @@ impl CadCommand for RotateCommand {
     }
 
     fn dyn_commit_as_text(&self) -> bool {
-        matches!(self.step, Step::Angle { .. } | Step::RefFirst { .. })
+        matches!(
+            self.step,
+            Step::Angle { .. } | Step::RefFirst { .. } | Step::RefNew { .. }
+        )
+    }
+
+    /// Reference's new angle is absolute: a typed 90 means 90°, whichever
+    /// side of the center the cursor sits on (#3331).
+    fn dyn_auto_sign_angle(&self) -> bool {
+        !matches!(self.step, Step::RefNew { .. })
     }
 
     fn dyn_live_value(&self, cursor: DVec3) -> Option<f64> {
         match self.step {
-            Step::Angle { center } | Step::RefNew { center, .. } => self
+            Step::Angle { center } => self
                 .plane
                 .angle(center, cursor)
                 .map(|angle| crate::command::dyn_display_angle_deg(angle as f32) as f64),
+            Step::RefNew { center, .. } => self
+                .plane
+                .angle(center, cursor)
+                .map(|angle| angle.rem_euclid(std::f64::consts::TAU).to_degrees()),
             _ => None,
         }
     }

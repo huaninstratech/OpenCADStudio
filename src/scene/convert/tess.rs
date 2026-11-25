@@ -1,17 +1,18 @@
 // Auto-split from scene/mod.rs. Pure text-move; behaviour unchanged.
 use super::super::*;
+use crate::scene::model::wire_model::DashClosure;
 
 /// Dim an already-bg-adapted colour toward the background when the entity's
 /// layer is locked, so locked objects read as non-editable (they stay visible
 /// and snappable). No-op for unlocked layers.
 fn fade_if_locked(
-    document: &codec::Document,
+    document: &document::Document,
     e: &EntityType,
     color: [f32; 4],
     bg: [f32; 4],
 ) -> [f32; 4] {
     if view::render::layer_locked(document, e) {
-        crate::scene::cache::block_cache::fade_toward_bg(color, bg)
+        crate::scene::cache::block_cache::layer_lock_fade(color, bg)
     } else {
         color
     }
@@ -21,33 +22,307 @@ fn fade_if_locked(
 /// break wherever its linetype restarts (every vertex when PLINEGEN is off) —
 /// the path `tessellate` splits into one wire per arc segment plus one wire of
 /// the straight segments. `None` for any other entity or render form.
-fn polyline_lt_path(document: &codec::Document, e: &EntityType) -> Option<Vec<[f64; 3]>> {
+///
+/// Also says how the pattern closes around that path, and for a wide polyline
+/// gives its band width at each point of the path.
+pub(crate) fn polyline_lt_path(
+    document: &document::Document,
+    e: &EntityType,
+) -> Option<(Vec<[f64; 3]>, DashClosure, Option<Vec<f32>>)> {
     use convert::acad_to_render::RenderObject;
     if !matches!(e, EntityType::LwPolyline(_) | EntityType::Polyline2D(_)) {
         return None;
     }
-    match convert::acad_to_render::convert(e, document)?.object {
-        RenderObject::Lines(points) | RenderObject::SegmentedLines(points) => Some(points),
+    let rendered = convert::acad_to_render::convert(e, document)?;
+    match rendered.object {
+        RenderObject::Lines(points) | RenderObject::SegmentedLines(points) => {
+            let closure = convert::tessellate::dash_closure_of(
+                e,
+                &rendered.key_vertices,
+                points.iter().copied(),
+            );
+            let width = convert::tessellate::polyline_band_width(e, document.header.fill_mode);
+            let band = (width > 0.0).then(|| vec![width; points.len()]);
+            Some((points, closure, band))
+        }
+        RenderObject::TaperedLines(points, widths) => {
+            let plinegen = match e {
+                EntityType::LwPolyline(polyline) => polyline.plinegen,
+                EntityType::Polyline2D(polyline) => {
+                    polyline.flags.bits()
+                        & document::entities::PolylineFlags::LINETYPE_CONTINUOUS.bits()
+                        != 0
+                }
+                _ => false,
+            };
+            let (points, widths) = if plinegen {
+                (points, widths)
+            } else {
+                restart_at_vertices(&points, &widths, &rendered.key_vertices)
+            };
+            // A step in width breaks the band, and no fit goes round a break.
+            let closure = if points.iter().any(|p| p[0].is_nan()) {
+                DashClosure::Open
+            } else {
+                convert::tessellate::dash_closure_of(
+                    e,
+                    &rendered.key_vertices,
+                    points.iter().copied(),
+                )
+            };
+            Some((points, closure, Some(widths)))
+        }
         _ => None,
     }
 }
 
-#[derive(Clone, Copy)]
-struct BlockObjectStyle {
+/// Break a tapered band's path at each interior vertex, where PLINEGEN off
+/// restarts the linetype. A taper draws as one wire, so its path has no break
+/// there unless the width steps.
+fn restart_at_vertices(
+    points: &[[f64; 3]],
+    widths: &[f32],
+    key_vertices: &[[f64; 3]],
+) -> (Vec<[f64; 3]>, Vec<f32>) {
+    let interior = key_vertices
+        .get(1..key_vertices.len().saturating_sub(1))
+        .unwrap_or_default();
+    let mut next = 0;
+    let mut out_points = Vec::with_capacity(points.len() + 2 * interior.len());
+    let mut out_widths = Vec::with_capacity(points.len() + 2 * interior.len());
+    for (index, (&point, &width)) in points.iter().zip(widths).enumerate() {
+        out_points.push(point);
+        out_widths.push(width);
+        let at_vertex = interior
+            .get(next)
+            .is_some_and(|vertex| (0..3).all(|axis| (point[axis] - vertex[axis]).abs() < 1e-6));
+        if at_vertex {
+            next += 1;
+            if points
+                .get(index + 1)
+                .is_some_and(|after| !after[0].is_nan())
+            {
+                out_points.extend([[f64::NAN; 3], point]);
+                out_widths.extend([0.0, width]);
+            }
+        }
+    }
+    (out_points, out_widths)
+}
+
+/// The annotation ratio a complex linetype bakes in. It is walked on the CPU,
+/// so it never sees the wire shader's model-space `linetype_scale` uniform:
+/// outside a viewport `anno_scale` is 1/CANNOSCALEVALUE in the Model layout and
+/// 1.0 on a paper sheet, exactly when the shader applies it, and MSLTSCALE turns
+/// it off in both.
+pub(crate) fn complex_linetype_anno(
+    document: &document::Document,
+    anno_scale: f32,
+    viewport_lt: Option<f32>,
+) -> f32 {
+    if let Some(factor) = viewport_lt {
+        return factor;
+    }
+    if anno_scale.is_finite()
+        && anno_scale > 1e-9
+        && crate::scene::annotative::model_linetypes_follow_annotation(document)
+    {
+        anno_scale
+    } else {
+        1.0
+    }
+}
+
+/// Walk a complex linetype along an absolute path. A NaN break starts the
+/// pattern over (PLINEGEN off: at every vertex), and each run is end-aligned on
+/// its own length, the "A" alignment: it begins and ends with a dash, and a run
+/// shorter than one pattern is drawn solid.
+///
+/// `None` when there is nothing to walk (pattern blow-up guard, or a path with
+/// no length): the caller draws the path some other way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walk_complex_linetype(
+    name: &str,
+    path: &[[f64; 3]],
+    linetype: &crate::io::linetypes::ComplexLt,
+    scale: f32,
+    closure: DashClosure,
     color: [f32; 4],
-    aci: u8,
-    pattern_length: f32,
-    pattern: [f32; 8],
+    selected: bool,
     line_weight_px: f32,
-    layer: view::render::InheritStyle,
+    band: Option<&[f32]>,
+) -> Option<Vec<WireModel>> {
+    let band = band.filter(|band| band.len() == path.len());
+    // A closed path takes its pattern from its own start: for a polyline the
+    // walk goes round from the second vertex, back to it.
+    let rotated: Vec<[f64; 3]>;
+    let rotated_band: Option<Vec<f32>>;
+    let (path, closed, band) = match closure {
+        DashClosure::Open => (path, false, band),
+        DashClosure::Curve => (path, true, band),
+        DashClosure::Polyline { start } => {
+            let start = (start as usize).min(path.len().saturating_sub(1));
+            rotated = path[start..]
+                .iter()
+                .chain(path.iter().skip(1).take(start))
+                .copied()
+                .collect();
+            rotated_band = band.map(|band| {
+                band[start..]
+                    .iter()
+                    .chain(band.iter().skip(1).take(start))
+                    .copied()
+                    .collect::<Vec<f32>>()
+            });
+            (rotated.as_slice(), true, rotated_band.as_deref())
+        }
+    };
+    // A polyline's runs are walked one by one, each under the per-run repeat
+    // cap, so the whole path is checked here: past the budget, draw it solid.
+    let total: f64 = path
+        .split(|p| p[0].is_nan())
+        .map(|run| {
+            run.windows(2)
+                .map(|w| {
+                    let d = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+                })
+                .sum::<f64>()
+        })
+        .sum();
+    if text::complex_lt::exceeds_repeat_budget(linetype, scale, total) {
+        return None;
+    }
+    let mut wires = Vec::new();
+    let mut next_run = 0;
+    for run in path.split(|p| p[0].is_nan()) {
+        let run_band = band.map(|band| &band[next_run..next_run + run.len()]);
+        next_run += run.len() + 1;
+        let length: f64 = run
+            .windows(2)
+            .map(|w| {
+                let d = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            })
+            .sum();
+        if length <= 1e-9 {
+            continue;
+        }
+        // Walk the dash / glyph layout in a local frame so `apply_along`'s f32
+        // math stays precise, then lift each wire back to world DS.
+        let origin = run[0];
+        let local: Vec<[f32; 3]> = run
+            .iter()
+            .map(|a| {
+                [
+                    (a[0] - origin[0]) as f32,
+                    (a[1] - origin[1]) as f32,
+                    (a[2] - origin[2]) as f32,
+                ]
+            })
+            .collect();
+        let mut run_wires = if closed {
+            text::complex_lt::apply_closed(
+                name,
+                &local,
+                linetype,
+                scale,
+                color,
+                selected,
+                line_weight_px,
+                run_band,
+            )
+        } else {
+            text::complex_lt::apply_along(
+                name,
+                &local,
+                linetype,
+                scale,
+                color,
+                selected,
+                line_weight_px,
+                Some(length as f32),
+                run_band,
+            )
+        };
+        if run_wires.is_empty() {
+            return None;
+        }
+        for wire in &mut run_wires {
+            convert::tessellate::shift_wire_to_world(wire, origin);
+        }
+        wires.append(&mut run_wires);
+    }
+    (!wires.is_empty()).then_some(wires)
+}
+
+/// An MLINE element's wire as drawn: its complex linetype walked along it, the
+/// wire as it is otherwise.
+fn walk_mline_element(
+    document: &document::Document,
+    layer: &str,
+    wire: WireModel,
+    scale: f32,
+    viewport: Option<Handle>,
+) -> Vec<WireModel> {
+    let linetype = wire.element_linetype.as_deref().and_then(|element| {
+        crate::io::linetypes::resolve_complex_lt(
+            document,
+            crate::entities::mline::element_linetype_name(document, layer, element, viewport),
+        )
+    });
+    let Some(linetype) = linetype else {
+        return vec![wire];
+    };
+    let path: Vec<[f64; 3]> = (0..wire.points.len())
+        .map(|index| {
+            let p = wire.points[index];
+            let low = wire.points_low.get(index).unwrap_or([0.0; 3]);
+            [
+                p[0] as f64 + low[0] as f64,
+                p[1] as f64 + low[1] as f64,
+                p[2] as f64 + low[2] as f64,
+            ]
+        })
+        .collect();
+    let Some(mut pieces) = walk_complex_linetype(
+        &wire.name,
+        &path,
+        &linetype,
+        scale,
+        DashClosure::Open,
+        wire.color,
+        wire.selected,
+        wire.line_weight_px,
+        None,
+    ) else {
+        return vec![wire];
+    };
+    for piece in &mut pieces {
+        piece.aci = wire.aci;
+    }
+    // The element's first wire carries the entity's snaps and vertices.
+    pieces[0].snap_pts = wire.snap_pts.clone();
+    pieces[0].key_vertices = wire.key_vertices.clone();
+    pieces
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BlockObjectStyle {
+    pub(crate) color: [f32; 4],
+    aci: u8,
+    pub(crate) pattern_length: f32,
+    pub(crate) pattern: [f32; 8],
+    pub(crate) line_weight_px: f32,
+    pub(crate) layer: view::render::InheritStyle,
     layer_aci: u8,
-    layer_plottable: bool,
+    pub(crate) layer_plottable: bool,
 }
 
 pub(crate) struct ExpandedBlockObject {
     pub(crate) wires: Vec<WireModel>,
-    style: BlockObjectStyle,
-    is_xref: bool,
+    pub(crate) style: BlockObjectStyle,
+    pub(crate) is_xref: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -55,38 +330,40 @@ pub(crate) struct BlockObjectOptions {
     pub(crate) suppress_root_points: bool,
     pub(crate) apply_xclip: bool,
     pub(crate) scale_policy: crate::scene::BlockScalePolicy,
+    /// The ratio from [`complex_linetype_anno`]. `None` draws at drawing length.
+    pub(crate) complex_lt_anno: Option<f32>,
 }
 
 fn block_object_style(
-    document: &codec::Document,
-    insert: &codec::entities::Insert,
+    document: &document::Document,
+    insert: &document::entities::Insert,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
 ) -> BlockObjectStyle {
-    let entity = EntityType::Insert(insert.clone());
+    let common = &insert.common;
     let (color, pattern_length, pattern, line_weight_px, aci) =
-        view::render::render_style_for_viewport(document, &entity, active_viewport);
+        view::render::render_style_for_common_viewport(document, common, active_viewport);
+    let (pattern_length, pattern) =
+        view::render::insert_pattern_for_children(common, pattern_length, pattern);
     let mut layer =
-        view::render::layer_render_style_viewport(document, &insert.common.layer, active_viewport);
+        view::render::layer_render_style_viewport(document, &common.layer, active_viewport);
+    let layer_record = document.layers.get(&common.layer);
+    let locked = layer_record.is_some_and(|l| l.is_locked());
     layer.color = view::render::adapt_to_bg(layer.color, bg_color);
-    if view::render::layer_locked(document, &entity) {
+    if locked {
         layer.color = crate::scene::cache::block_cache::fade_toward_bg(layer.color, bg_color);
     }
-    let layer_aci = document
-        .layers
-        .get(&insert.common.layer)
+    let layer_aci = layer_record
         .and_then(|layer| match &layer.color {
-            codec::types::Color::Index(index) => Some(*index),
+            document::types::Color::Index(index) => Some(*index),
             _ => None,
         })
         .unwrap_or(0);
-    let layer_plottable = document
-        .layers
-        .get(&insert.common.layer)
-        .map(|layer| layer.is_plottable)
-        .unwrap_or(true);
-    let color = view::render::adapt_to_bg(color, bg_color);
-    let color = fade_if_locked(document, &entity, color, bg_color);
+    let layer_plottable = layer_record.map(|layer| layer.is_plottable).unwrap_or(true);
+    let mut color = view::render::adapt_to_bg(color, bg_color);
+    if locked {
+        color = crate::scene::cache::block_cache::fade_toward_bg(color, bg_color);
+    }
     BlockObjectStyle {
         color,
         aci,
@@ -101,8 +378,8 @@ fn block_object_style(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_block_object(
-    document: &codec::Document,
-    insert: &codec::entities::Insert,
+    document: &document::Document,
+    insert: &document::entities::Insert,
     owner: Handle,
     selected: bool,
     active_viewport: Option<Handle>,
@@ -117,11 +394,12 @@ pub(crate) fn expand_block_object(
 ) -> ExpandedBlockObject {
     let style = block_object_style(document, insert, active_viewport, bg_color);
     let fallback_depths = rustc_hash::FxHashMap::default();
-    let fallback_cache;
-    let cache = match block_cache {
-        Some(cache) if cache.defn(&insert.block_name).is_some() => cache,
-        _ => {
-            fallback_cache = cache::block_cache::BlockCache::build_for_block(
+    let mut fallback_cache = None;
+    let resolved = block_cache.and_then(|cache| cache.defn(&insert.block_name).map(|d| (cache, d)));
+    let (cache, defn) = match resolved {
+        Some(pair) => pair,
+        None => {
+            let built = cache::block_cache::BlockCache::build_for_block(
                 document,
                 &insert.block_name,
                 anno_scale,
@@ -131,17 +409,22 @@ pub(crate) fn expand_block_object(
                 active_viewport,
                 &fallback_depths,
             );
-            &fallback_cache
+            let cache_ref = fallback_cache.insert(built);
+            let Some(defn) = cache_ref.defn(&insert.block_name) else {
+                return ExpandedBlockObject {
+                    wires: Vec::new(),
+                    style,
+                    is_xref: false,
+                };
+            };
+            (cache_ref as &cache::block_cache::BlockCache, defn)
         }
     };
-    let is_xref = document
-        .block_records
-        .get(&insert.block_name)
-        .map(|record| record.flags.is_xref || record.flags.is_xref_overlay)
-        .unwrap_or(false);
-    let mut wires = cache::block_cache::expand_insert(
+    let is_xref = defn.is_xref;
+    let mut wires = cache::block_cache::expand_insert_with_defn(
         document,
         cache,
+        defn,
         insert,
         owner,
         style.color,
@@ -161,6 +444,7 @@ pub(crate) fn expand_block_object(
         anno_scale,
         options.scale_policy,
         options.suppress_root_points,
+        options.complex_lt_anno.unwrap_or(1.0),
     )
     .unwrap_or_default();
 
@@ -222,10 +506,10 @@ pub(crate) fn expand_block_object(
 /// `None` when any link is missing (DXF files, older DWGs) — the caller then
 /// falls back to a geometric heuristic.
 fn section_arrow_dir_from_views(
-    document: &codec::Document,
-    s: &codec::entities::SectionSymbol,
+    document: &document::Document,
+    s: &document::entities::SectionSymbol,
 ) -> Option<[f64; 2]> {
-    use codec::types::Handle as AHandle;
+    use document::types::Handle as AHandle;
     if s.view_rep_handle.is_null() {
         return None;
     }
@@ -303,9 +587,9 @@ fn section_arrow_dir_from_views(
 ///   ([`section_arrow_dir_from_views`]); only when that chain is unavailable
 ///   does it fall back to the 90°-CCW rotation of END-A→END-B.
 fn section_symbol_wires(
-    document: &codec::Document,
-    s: &codec::entities::SectionSymbol,
-    style: Option<&codec::entities::SectionViewStyle>,
+    document: &document::Document,
+    s: &document::entities::SectionSymbol,
+    style: Option<&document::entities::SectionViewStyle>,
     h: Handle,
     color: [f32; 4],
     sel: bool,
@@ -356,7 +640,7 @@ fn section_symbol_wires(
     let arrow_kind = match style {
         Some(st) if st.arrow_start_handle != 0 => arrow_from_block(
             document,
-            codec::types::Handle::from(st.arrow_start_handle),
+            document::types::Handle::from(st.arrow_start_handle),
             arrow_size as f32,
         ),
         _ => ArrowKind::Triangle {
@@ -467,7 +751,7 @@ fn section_symbol_wires(
     // Lines (ticks + shafts + glyphs): a fill-free wire so the strokes render.
     let (lp, lp_low) = convert::tessellate::points_to_ds(lines);
     let mut lw = WireModel::solid(h.value().to_string(), lp, color, sel);
-    lw.points_low = lp_low;
+    lw.points_low = lp_low.into();
     lw.line_weight_px = lw_px;
     wires.push(lw);
     // Filled arrowheads: a separate wire carrying only triangles.
@@ -496,7 +780,7 @@ struct ProxyInherit {
 /// resolve against its sub-entity layer (ByLayer) or the proxy entity itself
 /// (ByBlock); primitives sharing a style share one wire.
 fn proxy_preview_wires(
-    document: &codec::Document,
+    document: &document::Document,
     e: &EntityType,
     dec: &convert::proxy_graphics::Decoded,
     own: ProxyInherit,
@@ -533,14 +817,14 @@ fn proxy_preview_wires(
             ProxyColor::ByBlock => (own.color, own.aci),
             ProxyColor::ByLayer => {
                 let aci = match document.layers.get(layer_name).map(|l| &l.color) {
-                    Some(codec::types::Color::Index(i)) => *i,
+                    Some(document::types::Color::Index(i)) => *i,
                     _ => 0,
                 };
                 (show(layer.color), aci)
             }
             ProxyColor::Aci(a) => (
                 show(convert::tess_util::aci_to_rgba(
-                    &codec::types::Color::Index(a),
+                    &document::types::Color::Index(a),
                 )),
                 a,
             ),
@@ -573,7 +857,7 @@ fn proxy_preview_wires(
                 }),
         };
         let lw_px = match style.lineweight {
-            w if w >= 0 => view::render::lineweight_to_px(&codec::types::LineWeight::Value(w)),
+            w if w >= 0 => view::render::lineweight_to_px(&document::types::LineWeight::Value(w)),
             -1 if style.layer.is_some() => layer.lw_px,
             _ => own.line_weight_px,
         };
@@ -583,7 +867,7 @@ fn proxy_preview_wires(
         let (color, aci, pattern_length, pattern, lw_px) = resolve(style);
         let (pts, pts_low) = convert::tessellate::points_to_ds(lines);
         let mut w = WireModel::solid(name.clone(), pts, color, sel);
-        w.points_low = pts_low;
+        w.points_low = pts_low.into();
         let (tris, tris_low) = convert::tessellate::points_to_ds(tris);
         w.fill_tris = tris;
         w.fill_tris_low = tris_low;
@@ -615,22 +899,35 @@ fn proxy_preview_wires(
         } else {
             1.0
         };
+        // Lay out unrotated, shift by the alignment, then turn.
         let (strokes, _) = crate::scene::text::lff::tessellate_text_ex(
             [0.0, 0.0],
             t.height as f32,
-            t.rotation as f32,
+            0.0,
             width as f32,
             t.oblique as f32,
             font,
             &t.text,
         );
+        let (min_x, max_x) = strokes
+            .iter()
+            .flatten()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        let shift_x = if min_x <= max_x {
+            -(min_x as f64 + t.align[0] * (max_x - min_x) as f64)
+        } else {
+            0.0
+        };
+        let shift_y = -t.align[1] * t.height;
+        let (sin, cos) = t.rotation.sin_cos();
         for stroke in strokes.iter().filter(|s| s.len() >= 2) {
             let run: Vec<[f64; 3]> = stroke
                 .iter()
                 .map(|&[x, y]| {
+                    let (x, y) = (x as f64 + shift_x, y as f64 + shift_y);
                     [
-                        t.position[0] + x as f64,
-                        t.position[1] + y as f64,
+                        t.position[0] + x * cos - y * sin,
+                        t.position[1] + x * sin + y * cos,
                         t.position[2],
                     ]
                 })
@@ -671,7 +968,7 @@ fn proxy_preview_wires(
 /// (so DIMCLRT / DIMSTYLE colours win over the synthetic Text's defaults).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tessellate_entity_dim_text(
-    document: &codec::Document,
+    document: &document::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -693,7 +990,7 @@ pub(crate) fn tessellate_entity_dim_text(
         None,
         view_aabb,
         world_per_pixel,
-        false,
+        None,
         reference_only,
     );
     for w in &mut wires {
@@ -709,7 +1006,7 @@ pub(crate) fn tessellate_entity_dim_text(
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tessellate_entity(
-    document: &codec::Document,
+    document: &document::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -719,7 +1016,7 @@ pub(crate) fn tessellate_entity(
     block_cache: Option<&cache::block_cache::BlockCache>,
     view_aabb: Option<[f32; 4]>,
     world_per_pixel: Option<f32>,
-    paper_space: bool,
+    viewport_lt: Option<f32>,
     reference_only: &HashSet<Handle>,
 ) -> Vec<WireModel> {
     let mut wires = tessellate_entity_inner(
@@ -733,7 +1030,7 @@ pub(crate) fn tessellate_entity(
         block_cache,
         view_aabb,
         world_per_pixel,
-        paper_space,
+        viewport_lt,
         reference_only,
     );
 
@@ -769,7 +1066,7 @@ pub(crate) fn tessellate_entity(
 }
 #[allow(clippy::too_many_arguments)]
 fn tessellate_entity_inner(
-    document: &codec::Document,
+    document: &document::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -782,10 +1079,11 @@ fn tessellate_entity_inner(
     view_aabb: Option<[f32; 4]>,
     // World units per screen pixel for LOD culling. `None` = no LOD.
     world_per_pixel: Option<f32>,
-    // True only when tessellating content shown inside a paper-space viewport.
-    // Retained through recursive INSERT expansion; PSLTSCALE itself is applied
-    // by the viewport's GPU uniform so it never changes resident wire content.
-    _paper_space: bool,
+    // `Some` only when tessellating content shown inside a paper-space viewport:
+    // the factor on a complex linetype's pattern there. PSLTSCALE reaches plain
+    // dashes through the viewport's GPU uniform, but a complex linetype's dashes
+    // and glyphs are baked, so they take it here.
+    viewport_lt: Option<f32>,
     // The scene's reference-only designation set (API v9): drives the
     // `WireModel::reference_only` stamp for dimensions' synthesis paths that
     // bypass the wrapper's post-stamp.
@@ -799,6 +1097,9 @@ fn tessellate_entity_inner(
     let e = contextual.as_ref();
     let h = e.common().handle;
     let sel = selected.contains(&h);
+    // A linetype follows the annotation scale whether or not its object is
+    // annotative, so it reads the scale as it came in.
+    let linetype_anno = anno_scale;
     // Per-object annotation contexts store each representation relative to the
     // native/default scale. Resolve that ratio once before TEXT/MTEXT,
     // DIMENSION, and MULTILEADER reach their independent tessellation paths.
@@ -988,13 +1289,52 @@ fn tessellate_entity_inner(
             .as_deref()
             .map(std::borrow::Cow::Borrowed),
         EntityType::Extended(entity) => match &entity.data {
-            codec::entities::ExtendedEntityData::Proxy(proxy) => {
+            document::entities::ExtendedEntityData::Proxy(proxy) => {
                 Some(std::borrow::Cow::Owned(proxy.graphics.data()))
             }
+            // Arch objects the codec names but does not draw (walls, doors,
+            // windows…) still carry the preview their application cached.
+            document::entities::ExtendedEntityData::Arch(_) => e
+                .common()
+                .graphic_data
+                .as_deref()
+                .map(std::borrow::Cow::Borrowed),
             _ => None,
         },
         _ => None,
     };
+    // ── Civil 3D objects ─────────────────────────────────────────────────────
+    //
+    // The display cache Civil 3D saved, when it kept one, is what the object
+    // draws, styles applied; draw it as a proxy below. Otherwise the cache is
+    // a placeholder (the class name and a box) and the object is rebuilt from
+    // its record, styled by its Civil 3D style; a class not decoded draws
+    // nothing.
+    if let EntityType::Extended(entity) = e {
+        if let document::entities::ExtendedEntityData::Arch(data) = &entity.data {
+            if data.civil_kind().is_some() && !proxy_blob.as_deref().is_some_and(civil_drawn_cache) {
+                let Some(dec) = crate::entities::civil::decoded(data, e.common().handle.value(), document) else {
+                    return Vec::new();
+                };
+                let inherited = ProxyInherit {
+                    color: entity_color,
+                    aci,
+                    pattern_length,
+                    pattern,
+                    line_weight_px,
+                };
+                return proxy_preview_wires(
+                    document,
+                    e,
+                    &dec,
+                    inherited,
+                    active_viewport,
+                    bg_color,
+                    sel,
+                );
+            }
+        }
+    }
     if let Some(blob) = proxy_blob {
         let dec = convert::proxy_graphics::decode(blob.as_ref());
         let inherited = ProxyInherit {
@@ -1060,8 +1400,6 @@ fn tessellate_entity_inner(
         return vec![WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -1069,29 +1407,35 @@ fn tessellate_entity_inner(
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris,
-            pick_tris_low,
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: h.value().to_string(),
-            points,
-            points_low: Vec::new(),
             color: WireModel::SELECTED,
             selected: sel,
             aci: 0,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
-            key_vertices: vec![[x0, y0, 0.0], [x1, y1, 0.0]],
             aabb: [x0 as f32, y0 as f32, x1 as f32, y1 as f32],
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
-
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                text_verts: Vec::new(),
+                points,
+                points_low: Default::default(),
+                snap_pts: vec![],
+                tangent_geoms: vec![],
+                key_vertices: vec![[x0, y0, 0.0], [x1, y1, 0.0]],
+                surfaces: crate::scene::model::wire_model::WireSurfaces {
+                    pick_tris,
+                    pick_tris_low,
+                    ..Default::default()
+                }
+                .into_optional(),
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         }];
     }
@@ -1120,6 +1464,11 @@ fn tessellate_entity_inner(
                 BlockObjectOptions {
                     suppress_root_points: block_use.suppress_root_points,
                     scale_policy: block_use.scale_policy,
+                    complex_lt_anno: Some(complex_linetype_anno(
+                        document,
+                        linetype_anno,
+                        viewport_lt,
+                    )),
                     ..BlockObjectOptions::default()
                 },
             )
@@ -1183,6 +1532,7 @@ fn tessellate_entity_inner(
             view_aabb,
             world_per_pixel,
             bg_color,
+            complex_linetype_anno(document, linetype_anno, viewport_lt),
         );
         for w in &mut wires {
             w.aci = aci;
@@ -1228,6 +1578,11 @@ fn tessellate_entity_inner(
                 pslt_factor,
                 BlockObjectOptions {
                     scale_policy: block_use.scale_policy,
+                    complex_lt_anno: Some(complex_linetype_anno(
+                        document,
+                        linetype_anno,
+                        viewport_lt,
+                    )),
                     ..BlockObjectOptions::default()
                 },
             )
@@ -1275,6 +1630,11 @@ fn tessellate_entity_inner(
                     pslt_factor,
                     BlockObjectOptions {
                         scale_policy: block_use.scale_policy,
+                        complex_lt_anno: Some(complex_linetype_anno(
+                            document,
+                            linetype_anno,
+                            viewport_lt,
+                        )),
                         ..BlockObjectOptions::default()
                     },
                 )
@@ -1295,13 +1655,11 @@ fn tessellate_entity_inner(
 
     if let EntityType::Insert(ins) = e {
         // `insert_point` is in the OCS of `normal`.
-        let w = codec::types::Matrix3::arbitrary_axis(ins.normal) * ins.insert_point;
+        let w = document::types::Matrix3::arbitrary_axis(ins.normal) * ins.insert_point;
         let ip = glam::DVec3::new(w.x, w.y, w.z);
         let marker = WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -1309,29 +1667,29 @@ fn tessellate_entity_inner(
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: h.value().to_string(),
-            points: vec![],
-            points_low: Vec::new(),
             color: entity_color,
             selected: sel,
             aci: 0,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: vec![(ip, model::wire_model::SnapHint::Insertion)],
-            tangent_geoms: vec![],
-            key_vertices: vec![],
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
-
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                text_verts: Vec::new(),
+                points: vec![],
+                points_low: Default::default(),
+                snap_pts: vec![(ip, model::wire_model::SnapHint::Insertion)],
+                tangent_geoms: vec![],
+                key_vertices: vec![],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         };
 
@@ -1350,6 +1708,7 @@ fn tessellate_entity_inner(
             pslt_factor,
             BlockObjectOptions {
                 apply_xclip: true,
+                complex_lt_anno: Some(complex_linetype_anno(document, linetype_anno, viewport_lt)),
                 ..BlockObjectOptions::default()
             },
         );
@@ -1373,6 +1732,7 @@ fn tessellate_entity_inner(
             is_xref,
             pslt_factor,
             anno_scale,
+            annotation_scale_handle,
         );
         wires.push(marker);
         return wires;
@@ -1422,6 +1782,33 @@ fn tessellate_entity_inner(
             b.set_fixed_screen_width(2.0);
         }
     }
+    // An MLINE element draws in this viewport as the line it explodes to, on
+    // the background and locked layer the entity's own colour adapts to.
+    if let (EntityType::MLine(mline), false) = (e, sel) {
+        for b in &mut bases {
+            let (Some(color), Some(linetype)) = (b.element_color, b.element_linetype.as_deref())
+            else {
+                continue;
+            };
+            let (color, pattern_length, pattern, element_aci) =
+                crate::entities::mline::element_style(
+                    document,
+                    mline,
+                    color,
+                    linetype,
+                    active_viewport,
+                );
+            b.color = fade_if_locked(
+                document,
+                e,
+                view::render::adapt_to_bg(color, bg_color),
+                bg_color,
+            );
+            b.pattern_length = pattern_length;
+            b.pattern = pattern;
+            b.aci = element_aci;
+        }
+    }
     // PDF underlay geometry: hidden, unplotted wires that object snaps
     // (nearest, intersection, perpendicular, centre) find, beside the page
     // frame — one per segment or circle, so they intersect each other.
@@ -1429,7 +1816,7 @@ fn tessellate_entity_inner(
         for piece in crate::scene::model::pdf_vector::underlay_snap_geometry(underlay, document) {
             let (points, points_low) = convert::tessellate::points_to_ds(piece.points);
             let mut wire = WireModel::solid(h.value().to_string(), points, entity_color, sel);
-            wire.points_low = points_low;
+            wire.points_low = points_low.into();
             wire.display_visible = false;
             wire.plot_visible = false;
             // Snaps find it; a click on the page does not select the underlay.
@@ -1463,6 +1850,30 @@ fn tessellate_entity_inner(
         }
     }
 
+    // An MLINE's linetypes are its elements': its own plays no part.
+    if let EntityType::MLine(mline) = e {
+        if bases.iter().any(|wire| wire.element_linetype.is_some()) && !sel {
+            let scale = (lt_scale
+                * pslt_factor
+                * complex_linetype_anno(document, linetype_anno, viewport_lt))
+            .max(1e-4);
+            let mut walked = Vec::with_capacity(bases.len());
+            for wire in bases {
+                walked.extend(walk_mline_element(
+                    document,
+                    &mline.common.layer,
+                    wire,
+                    scale,
+                    active_viewport,
+                ));
+            }
+            bases = walked;
+            for wire in &mut bases {
+                set_wire_aabb(wire, aabb);
+            }
+        }
+    }
+
     // A hidden mask frame remains selectable and appears while selected, but
     // contributes no visible line work during normal display. The interior
     // pick triangles remain intact.
@@ -1470,82 +1881,71 @@ fn tessellate_entity_inner(
     // path along its tangent. A polyline with arc segments tessellates to one
     // wire per arc plus one wire of its straight segments, so it walks its own
     // ordered path (`polyline_lt_path`); every other entity is one wire.
-    if let Some(clt) = crate::io::linetypes::resolve_complex_lt(document, lt_name) {
+    let own_complex = (!matches!(e, EntityType::MLine(_)))
+        .then(|| crate::io::linetypes::resolve_complex_lt(document, lt_name))
+        .flatten();
+    if let Some(clt) = own_complex {
+        let complex_lt_anno = complex_linetype_anno(document, linetype_anno, viewport_lt);
         if let Some(base) = bases.first() {
             // `base.points` is the double-single HIGH half; at UTM coordinates
             // (−1.2M) that alone quantises to ~0.1, which jitters the complex
             // linetype's shapes and dashes. Reconstruct the absolute f64 path
             // (high + low).
-            let path = polyline_lt_path(document, e).unwrap_or_else(|| {
-                base.points
+            let (path, closure, band) = polyline_lt_path(document, e).unwrap_or_else(|| {
+                let path = base
+                    .points
                     .iter()
                     .enumerate()
                     .map(|(i, p)| {
                         if p[0].is_nan() {
                             return [f64::NAN; 3];
                         }
-                        let l = base.points_low.get(i).copied().unwrap_or([0.0; 3]);
+                        let l = base.points_low.get(i).unwrap_or([0.0; 3]);
                         [
                             p[0] as f64 + l[0] as f64,
                             p[1] as f64 + l[1] as f64,
                             p[2] as f64 + l[2] as f64,
                         ]
                     })
-                    .collect()
-            });
-            // A NaN break starts the pattern over (PLINEGEN off: at every
-            // vertex), and each run is end-aligned on its own length, the
-            // "A" alignment: it begins and ends with a dash, and a run shorter
-            // than one pattern is drawn solid.
-            let mut wires = Vec::new();
-            let mut walked = true;
-            for run in path.split(|p| p[0].is_nan()) {
-                let length: f64 = run
-                    .windows(2)
-                    .map(|w| {
-                        let d = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
-                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-                    })
-                    .sum();
-                if length <= 1e-9 {
-                    continue;
-                }
-                // Walk the dash / glyph layout in a local frame so
-                // `apply_along`'s f32 math stays precise, then lift each wire
-                // back to world DS.
-                let origin = run[0];
-                let local: Vec<[f32; 3]> = run
-                    .iter()
-                    .map(|a| {
-                        [
-                            (a[0] - origin[0]) as f32,
-                            (a[1] - origin[1]) as f32,
-                            (a[2] - origin[2]) as f32,
-                        ]
-                    })
                     .collect();
-                let mut run_wires = text::complex_lt::apply_along(
-                    &base.name,
-                    &local,
-                    &clt,
-                    (lt_scale * pslt_factor).max(1e-4),
-                    entity_color,
-                    sel,
-                    base.line_weight_px,
-                    Some(length as f32),
-                );
-                // Nothing to walk (pattern blow-up guard): draw the base wires.
-                if run_wires.is_empty() {
-                    walked = false;
-                    break;
+                (path, base.dash_closure, None)
+            });
+            // Nothing to walk (pattern blow-up guard): draw the base wires.
+            if let Some(mut wires) = walk_complex_linetype(
+                &base.name,
+                &path,
+                &clt,
+                (lt_scale * pslt_factor * complex_lt_anno).max(1e-4),
+                closure,
+                entity_color,
+                sel,
+                base.line_weight_px,
+                band.as_deref(),
+            ) {
+                for wire in &mut wires {
+                    // Each hairline batch has its own extent. The box index
+                    // groups these under the entity for whole-object selection.
+                    let box_hint = if !wire.points.is_empty()
+                        && wire.world_width == 0.0
+                        && wire.taper_widths.is_empty()
+                        && wire.text_verts.is_empty()
+                    {
+                        WireModel::UNBOUNDED_AABB
+                    } else {
+                        aabb
+                    };
+                    set_wire_aabb(wire, box_hint);
                 }
-                for w in &mut run_wires {
-                    convert::tessellate::shift_wire_to_world(w, origin);
-                    set_wire_aabb(w, aabb);
+                // Dashes and gaps don't change where a wide band picks.
+                if let (Some(first), Some(picks)) = (
+                    wires.first_mut(),
+                    bases.iter().find(|wire| !wire.pick_tris.is_empty()),
+                ) {
+                    first.pick_tris = picks.pick_tris.clone();
+                    first.pick_tris_low = picks.pick_tris_low.clone();
+                    let box_hint = first.aabb;
+                    set_wire_aabb(first, box_hint);
                 }
-                wires.append(&mut run_wires);
-            }
-            if walked && !wires.is_empty() {
                 return wires;
             }
         }
@@ -1671,16 +2071,16 @@ fn tessellate_entity_inner(
     bases
 }
 
-/// Build the 4 OBB corners (CCW: bl, br, tr, tl) of a Text / MText entity
-/// in its **native frame** — for top-level entities this is world coords,
-/// for block-defn subs it's block-local. No offset/transform applied.
-/// Width is approximated from glyph height × character count (TEXT) or
-/// from `rectangle_width` (MTEXT). Returns `None` for non-text entities.
-///
-/// `mtext_lines_override` lets the caller plug in a wrap-aware line count
-/// (from `text_support::mtext_line_count`). Without it, MText's OBB
-/// height collapses to a single line when the file omits `rectangle_height`,
-/// which makes downstream per-line LOD math degenerate.
+// Build the 4 OBB corners (CCW: bl, br, tr, tl) of a Text / MText entity
+// in its **native frame** — for top-level entities this is world coords,
+// for block-defn subs it's block-local. No offset/transform applied.
+// Width is approximated from glyph height × character count (TEXT) or
+// from `rectangle_width` (MTEXT). Returns `None` for non-text entities.
+//
+// `mtext_lines_override` lets the caller plug in a wrap-aware line count
+// (from `text_support::mtext_line_count`). Without it, MText's OBB
+// height collapses to a single line when the file omits `rectangle_height`,
+// which makes downstream per-line LOD math degenerate.
 
 /// Build a "low-LOD stub" wire for an entity that would otherwise be culled
 /// to nothing — the entity's AABB diagonal as a 2-point segment, plus the
@@ -1710,8 +2110,6 @@ fn lod_stub_wire(
     WireModel {
         bg_adapt: None,
         point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
         world_width: 0.0,
         depth_override: None,
         display_visible: true,
@@ -1719,34 +2117,34 @@ fn lod_stub_wire(
         plot_visible: true,
         fill_is_3d: false,
         fill_is_2d_solid: false,
+        solid_normal: None,
         render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
         dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
         name,
-        // Diagonal of the entity's 3D AABB so depth tests against
-        // shaded / hidden-line geometry are correct — the stub doesn't
-        // flatten to z=0 and pop in front of objects that sit at a
-        // different elevation. 2D entities (text fallbacks) pass
-        // z_min = z_max = 0 to keep the historical behaviour.
-        points: vec![[ax, ay, z_min], [bx, by, z_max]],
-        points_low: Vec::new(),
         color: stored_color,
         selected,
         aci,
         pattern_length: 0.0,
         pattern: [0.0; 8],
         line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        key_vertices: vec![[cx as f64, cy as f64, cz as f64]],
         aabb,
         plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            taper_widths: Vec::new(),
+            pattern_stations: Vec::new(),
+            text_verts: Vec::new(),
+            // Diagonal of the entity's 3D AABB so depth tests against
+            // shaded / hidden-line geometry are correct — the stub doesn't
+            // flatten to z=0 and pop in front of objects that sit at a
+            // different elevation. 2D entities (text fallbacks) pass
+            // z_min = z_max = 0 to keep the historical behaviour.
+            points: vec![[ax, ay, z_min], [bx, by, z_max]],
+            points_low: Default::default(),
+            snap_pts: vec![],
+            tangent_geoms: vec![],
+            key_vertices: vec![[cx as f64, cy as f64, cz as f64]],
+            ..crate::scene::WireGeom::default()
+        }),
         ..Default::default()
     }
 }
@@ -1809,8 +2207,6 @@ fn lod_stub_wire_3d(
     WireModel {
         bg_adapt: None,
         point_marker: None,
-        taper_widths: Vec::new(),
-        pattern_stations: Vec::new(),
         world_width: 0.0,
         depth_override: None,
         display_visible: true,
@@ -1818,32 +2214,32 @@ fn lod_stub_wire_3d(
         plot_visible: true,
         fill_is_3d: false,
         fill_is_2d_solid: false,
+        solid_normal: None,
         render_instance: None,
-        pick_tris: Vec::new(),
-        pick_tris_low: Vec::new(),
         dash_from_start: false,
-        dash_align_end: None,
-        text_verts: Vec::new(),
         name,
-        points,
-        points_low: Vec::new(),
         color: stored_color,
         selected,
         aci,
         pattern_length: 0.0,
         pattern: [0.0; 8],
         line_weight_px: 1.0,
-        snap_pts: vec![],
-        tangent_geoms: vec![],
-        // No `key_vertices` — Face3DGpu requires 4 corners to emit a
-        // fill quad, and we don't want this stub painted as a solid
-        // face. The wire pass still draws its 12 edges.
-        key_vertices: vec![],
         aabb,
         plinegen: true,
-        fill_tris: vec![],
-        fill_tris_low: Vec::new(),
-
+        geom: std::sync::Arc::new(crate::scene::WireGeom {
+            taper_widths: Vec::new(),
+            pattern_stations: Vec::new(),
+            text_verts: Vec::new(),
+            points,
+            points_low: Default::default(),
+            snap_pts: vec![],
+            tangent_geoms: vec![],
+            // No `key_vertices` — Face3DGpu requires 4 corners to emit a
+            // fill quad, and we don't want this stub painted as a solid
+            // face. The wire pass still draws its 12 edges.
+            key_vertices: vec![],
+            ..crate::scene::WireGeom::default()
+        }),
         ..Default::default()
     }
 }
@@ -1863,7 +2259,7 @@ pub(crate) fn wire_points_aabb(w: &WireModel) -> [f32; 4] {
     let mut max = [f32::NEG_INFINITY; 2];
     let mut any = false;
     for (i, p) in w.points.iter().enumerate() {
-        let lo = w.points_low.get(i).copied().unwrap_or([0.0; 3]);
+        let lo = w.points_low.get(i).unwrap_or([0.0; 3]);
         let (x, y) = (p[0] + lo[0], p[1] + lo[1]);
         if x.is_finite() && y.is_finite() {
             min[0] = min[0].min(x);
@@ -1883,7 +2279,7 @@ pub(crate) fn wire_points_aabb(w: &WireModel) -> [f32; 4] {
 /// Assign `entity_box` as `w`'s cullable box, widened to cover the wire's
 /// actual tessellated geometry and pick-only geometry.
 ///
-/// `entity_aabb`'s box comes from opencadcodec's `bounding_box()`, which for a
+/// `entity_aabb`'s box comes from document's `bounding_box()`, which for a
 /// polyline is often the box of its stored vertices — it may know nothing about
 /// bulge arcs between them, the band a width paints around them, or the wall a
 /// thickness extrudes. Hit-testing rejects on this box before it looks at the
@@ -1911,7 +2307,7 @@ pub(crate) fn set_wire_aabb(w: &mut WireModel, entity_box: [f32; 4]) {
     };
 
     for (i, &p) in w.points.iter().enumerate() {
-        extend(p, w.points_low.get(i).copied().unwrap_or([0.0; 3]));
+        extend(p, w.points_low.get(i).unwrap_or([0.0; 3]));
     }
     for (i, &p) in w.pick_tris.iter().enumerate() {
         extend(p, w.pick_tris_low.get(i).copied().unwrap_or([0.0; 3]));
@@ -1937,31 +2333,36 @@ pub(crate) fn set_wire_aabb(w: &mut WireModel, entity_box: [f32; 4]) {
     w.aabb = out;
 }
 
-pub(crate) fn entity_bounds(e: &codec::EntityType) -> ([f64; 3], [f64; 3]) {
-    if let codec::EntityType::Region(region) = e {
+pub(crate) fn entity_bounds(e: &document::EntityType) -> ([f64; 3], [f64; 3]) {
+    if let document::EntityType::Region(region) = e {
         if region.wires.is_empty() {
-            if let Some(bounds) = super::solid3d_tess::kernel_region_body(region)
-                .and_then(|body| kernel::brep::body_bounds(&body))
+            if let Some(bounds) = super::solid3d_tess::region_record(region)
+                .and_then(|body| ocs_solid::model::aabb(&body))
             {
                 return (bounds.min, bounds.max);
             }
         }
     }
-    if let codec::EntityType::Line(line) = e {
+    if let document::EntityType::Line(line) = e {
         if let Some(association) =
-            codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
+            document::entities::CenterMarkAssociation::read(&line.common.extended_data)
         {
             return crate::scene::centermark::mark_bounds(&association);
         }
     }
-    if let codec::EntityType::Solid(solid) = e {
+    if let document::EntityType::Solid(solid) = e {
         if let Some(bounds) = crate::entities::solid::wcs_bounds(solid) {
             return (bounds.min, bounds.max);
         }
     }
-    if let codec::EntityType::Spline(spline) = e {
+    if let document::EntityType::Spline(spline) = e {
         if let Some(bounds) = crate::entities::spline::fit_geometry_bounds(spline) {
             return (bounds.min, bounds.max);
+        }
+    }
+    if let document::EntityType::Ellipse(ellipse) = e {
+        if let Some(bounds) = ellipse_bounds(ellipse) {
+            return bounds;
         }
     }
     let bounds = e.as_entity().bounding_box();
@@ -1971,20 +2372,102 @@ pub(crate) fn entity_bounds(e: &codec::EntityType) -> ([f64; 3], [f64; 3]) {
     )
 }
 
+/// Tight WCS box of an ellipse or elliptical arc: the swept endpoints plus
+/// every axis-extreme parameter inside the sweep. The generic
+/// `bounding_box()` uses the major radius on both axes.
+fn ellipse_bounds(el: &document::entities::Ellipse) -> Option<([f64; 3], [f64; 3])> {
+    let (c, a, n) = (el.center, el.major_axis, el.normal);
+    let r = el.minor_axis_ratio;
+    // A stored normal need not be unit length; the minor axis must be.
+    let len = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+    if !(len > 0.0) {
+        return None;
+    }
+    let n = document::types::Vector3::new(n.x / len, n.y / len, n.z / len);
+    // Minor axis = normal x major, scaled by the ratio.
+    let b = [
+        (n.y * a.z - n.z * a.y) * r,
+        (n.z * a.x - n.x * a.z) * r,
+        (n.x * a.y - n.y * a.x) * r,
+    ];
+    let a = [a.x, a.y, a.z];
+    if !(a.iter().chain(b.iter()).all(|v| v.is_finite())) || a == [0.0; 3] {
+        return None;
+    }
+    let tau = std::f64::consts::TAU;
+    let start = el.start_parameter;
+    let mut sweep = (el.end_parameter - start).rem_euclid(tau);
+    if sweep <= 1e-12 {
+        sweep = tau;
+    }
+    let mut params = vec![start, start + sweep];
+    for k in 0..3 {
+        // d/dt (a cos t + b sin t) = 0  ->  t = atan2(b, a) (+ pi)
+        let t0 = b[k].atan2(a[k]);
+        for t in [t0, t0 + std::f64::consts::PI] {
+            let off = (t - start).rem_euclid(tau);
+            if off <= sweep {
+                params.push(start + off);
+            }
+        }
+    }
+    let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    let cc = [c.x, c.y, c.z];
+    for t in params {
+        let (ct, st) = (t.cos(), t.sin());
+        for k in 0..3 {
+            let v = cc[k] + a[k] * ct + b[k] * st;
+            min[k] = min[k].min(v);
+            max[k] = max[k].max(v);
+        }
+    }
+    Some((min, max))
+}
+
+#[cfg(test)]
+mod ellipse_bounds_tests {
+    use super::*;
+
+    fn ellipse(start: f64, end: f64) -> document::EntityType {
+        let mut el = document::entities::Ellipse::default();
+        el.center = document::types::Vector3::new(0.0, 0.0, 0.0);
+        el.major_axis = document::types::Vector3::new(10.0, 0.0, 0.0);
+        el.normal = document::types::Vector3::new(0.0, 0.0, 1.0);
+        el.minor_axis_ratio = 0.3;
+        el.start_parameter = start;
+        el.end_parameter = end;
+        document::EntityType::Ellipse(el)
+    }
+
+    #[test]
+    fn full_ellipse_uses_minor_axis() {
+        let (min, max) = entity_bounds(&ellipse(0.0, std::f64::consts::TAU));
+        assert!((min[0] + 10.0).abs() < 1e-9 && (max[0] - 10.0).abs() < 1e-9);
+        assert!((min[1] + 3.0).abs() < 1e-9 && (max[1] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quarter_arc_covers_only_its_sweep() {
+        let (min, max) = entity_bounds(&ellipse(0.0, std::f64::consts::FRAC_PI_2));
+        assert!(min[0].abs() < 1e-9 && (max[0] - 10.0).abs() < 1e-9);
+        assert!(min[1].abs() < 1e-9 && (max[1] - 3.0).abs() < 1e-9);
+    }
+}
+
 /// [`entity_bounds`] with the document, for entities whose extent is not
 /// stored on the entity: an underlay spans its page (or its clip), and a block
 /// reference spans what its definition draws once the reference transform is
 /// applied to it.
 pub(crate) fn entity_bounds_in(
-    document: &codec::Document,
-    e: &codec::EntityType,
+    document: &document::Document,
+    e: &document::EntityType,
 ) -> ([f64; 3], [f64; 3]) {
-    if let codec::EntityType::Underlay(underlay) = e {
+    if let document::EntityType::Underlay(underlay) = e {
         if let Some(bounds) = crate::entities::underlay::world_bounds(underlay, document) {
             return bounds;
         }
     }
-    if let codec::EntityType::Insert(insert) = e {
+    if let document::EntityType::Insert(insert) = e {
         if let Some(bounds) = crate::app::helpers::insert_world_bounds(document, insert) {
             return (
                 [bounds.min.x, bounds.min.y, bounds.min.z],
@@ -1996,8 +2479,8 @@ pub(crate) fn entity_bounds_in(
 }
 
 /// [`entity_aabb`] with the document (see [`entity_bounds_in`]).
-pub(crate) fn entity_aabb_in(document: &codec::Document, e: &codec::EntityType) -> [f32; 4] {
-    if let codec::EntityType::Underlay(underlay) = e {
+pub(crate) fn entity_aabb_in(document: &document::Document, e: &document::EntityType) -> [f32; 4] {
+    if let document::EntityType::Underlay(underlay) = e {
         if let Some((min, max)) = crate::entities::underlay::world_bounds(underlay, document) {
             return [min[0] as f32, min[1] as f32, max[0] as f32, max[1] as f32];
         }
@@ -2005,7 +2488,7 @@ pub(crate) fn entity_aabb_in(document: &codec::Document, e: &codec::EntityType) 
     entity_aabb(e)
 }
 
-pub(crate) fn entity_aabb(e: &codec::EntityType) -> [f32; 4] {
+pub(crate) fn entity_aabb(e: &document::EntityType) -> [f32; 4] {
     let (min, max) = entity_bounds(e);
     let min_x = min[0] as f32;
     let min_y = min[1] as f32;
@@ -2027,7 +2510,7 @@ pub(crate) fn entity_aabb(e: &codec::EntityType) -> [f32; 4] {
 /// (which `entity_aabb` collapses to `UNBOUNDED_AABB`). Quadtree
 /// indexing uses this so changing `world_offset` doesn't invalidate
 /// the index.
-pub(crate) fn entity_world_aabb_f64(e: &codec::EntityType) -> Option<[f64; 4]> {
+pub(crate) fn entity_world_aabb_f64(e: &document::EntityType) -> Option<[f64; 4]> {
     let (min, max) = entity_bounds(e);
     let (xmin, ymin, xmax, ymax) = (min[0], min[1], max[0], max[1]);
     if xmin == xmax && ymin == ymax {
@@ -2043,12 +2526,108 @@ pub(crate) fn entity_world_aabb_f64(e: &codec::EntityType) -> Option<[f64; 4]> {
 /// `Viewport` are sized only after extra transformation; tessellation
 /// already handles them via dedicated code paths. `Block`/`BlockEnd`
 /// are block-defn sentinels with no geometry.
-pub(crate) fn is_unindexable_entity(e: &codec::EntityType) -> bool {
-    use codec::EntityType as E;
+pub(crate) fn is_unindexable_entity(e: &document::EntityType) -> bool {
+    use document::EntityType as E;
     matches!(
         e,
         E::Insert(_) | E::Viewport(_) | E::Block(_) | E::BlockEnd(_)
     )
+}
+
+/// Whether a Civil 3D display cache holds what the object draws rather than
+/// a placeholder: a drawn cache opens with its layer, a placeholder with the
+/// class name as text (record 36).
+pub(crate) fn civil_drawn_cache(blob: &[u8]) -> bool {
+    // An 8-byte header, then records of `u32 size, u32 type, payload`.
+    blob.get(12..16).is_some_and(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]) != 36)
+}
+
+#[cfg(test)]
+mod civil_proxy_tests {
+    use super::*;
+    use document::classes::arch::{ArchEntityData, ArchKind};
+    use document::entities::{EntityCommon, ExtendedEntity, ExtendedEntityData, ProxyGraphicRecord, ProxyGraphics};
+
+    fn boxed(dxf_name: &str, placeholder: bool, document: &mut document::Document) -> EntityType {
+        let mut data = Vec::new();
+        let corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.4], [0.0, 0.4], [0.0, 0.0]];
+        data.extend_from_slice(&(corners.len() as u32).to_le_bytes());
+        for [x, y] in corners {
+            for v in [x, y, 0.0f64] {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let polyline = ProxyGraphicRecord::Unknown { record_type: 6, data };
+        // A placeholder opens with the class name; a drawn cache with its
+        // layer (record 16).
+        let records = if placeholder {
+            let name = document::entities::ProxyUnicodeText {
+                position: document::types::Vector3::new(0.0, 0.0, 0.0),
+                normal: document::types::Vector3::new(0.0, 0.0, 1.0),
+                direction: document::types::Vector3::new(1.0, 0.0, 0.0),
+                height: 0.2,
+                width_factor: 1.0,
+                oblique_angle: 0.0,
+                text: dxf_name.into(),
+            };
+            vec![ProxyGraphicRecord::UnicodeText(name), polyline, ProxyGraphicRecord::FillOff]
+        } else {
+            vec![ProxyGraphicRecord::Unknown { record_type: 16, data: 0u32.to_le_bytes().to_vec() }, polyline]
+        };
+        let mut common = EntityCommon::default();
+        common.handle = document.allocate_handle();
+        common.layer = "0".into();
+        assert!(common.set_proxy_graphics(&ProxyGraphics { records }));
+        EntityType::Extended(Box::new(ExtendedEntity {
+            common,
+            data: ExtendedEntityData::Arch(ArchEntityData {
+                dxf_name: dxf_name.into(),
+                cpp_class_name: String::new(),
+                kind: ArchKind::Other,
+                profiles: Vec::new(),
+                dwg_type_code: 0,
+                dwg_handle_bits: 0,
+                dwg_source_version: None,
+                raw_dwg_data: None,
+                raw_dxf_codes: None,
+                fields: Vec::new(),
+                preview: Vec::new(),
+            }),
+        }))
+    }
+
+    fn wires(document: &document::Document, entity: &EntityType) -> Vec<WireModel> {
+        tessellate_entity(
+            document,
+            &HashSet::default(),
+            None,
+            [0.0, 0.0, 0.0, 1.0],
+            1.0,
+            None,
+            entity,
+            None,
+            None,
+            None,
+            None,
+            &HashSet::default(),
+        )
+    }
+
+    /// A Civil 3D object draws the display cache Civil 3D saved, decoded
+    /// class or not, but never a placeholder cache (class name and box at
+    /// the origin).
+    #[test]
+    fn civil_drawn_cache_is_drawn_and_placeholder_is_not() {
+        let mut document = document::Document::new();
+        for class in ["AECC_PARCEL", "AECC_ALIGNMENT"] {
+            let placeholder = boxed(class, true, &mut document);
+            let drawn = boxed(class, false, &mut document);
+            assert!(wires(&document, &placeholder).is_empty(), "{class}");
+            assert!(wires(&document, &drawn).iter().any(|w| !w.points.is_empty()), "{class}");
+        }
+        let wall = boxed("AEC_WALL", true, &mut document);
+        assert!(wires(&document, &wall).iter().any(|w| !w.points.is_empty()));
+    }
 }
 
 #[cfg(test)]
@@ -2057,8 +2636,8 @@ mod viewport_colour_tests {
 
     #[test]
     fn inactive_viewport_frame_uses_entity_and_layer_colour() {
-        use codec::types::Color;
-        let mut document = codec::Document::new();
+        use document::types::Color;
+        let mut document = document::Document::new();
         document.layers.get_mut("0").unwrap().color = Color::Rgb {
             r: 51,
             g: 102,
@@ -2076,7 +2655,7 @@ mod viewport_colour_tests {
                     [0.6, 0.2, 0.4, 1.0],
                 ),
             ] {
-                let mut viewport = codec::entities::Viewport::new();
+                let mut viewport = document::entities::Viewport::new();
                 viewport.id = 2;
                 viewport.common.handle = document.allocate_handle();
                 viewport.common.color = color;
@@ -2093,7 +2672,7 @@ mod viewport_colour_tests {
                     None,
                     None,
                     None,
-                    false,
+                    None,
                     &HashSet::default(),
                 );
                 assert!(!wires.is_empty());

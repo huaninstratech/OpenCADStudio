@@ -3,18 +3,19 @@
 //! as the drawing draws the style, and where the style is used (#2413). In a
 //! narrow window the two columns stack, the Apply summary first.
 
-use crate::app::text_style_users::{TextKind, Usage};
+use crate::app::text_style_users::Usage;
 use crate::app::{Message, StyleKind};
 use crate::t;
 use crate::ui::font_picker::{FaceStyle, FontChoice, FontPickerState};
 use crate::ui::style::common::muted_style;
 use crate::ui::style::editor_table::{danger_input_style, danger_text_style};
 use crate::ui::style::form::field_style;
-use crate::ui::style::style_manager::{EditorComparison, StyleRow};
+use crate::ui::style::style_manager::StyleRow;
 use iced::widget::{
-    canvas, checkbox, column, container, responsive, row, scrollable, text, text_input, Space,
+    canvas, checkbox, column, container, mouse_area, responsive, row, scrollable, stack, text,
+    text_input, Space,
 };
-use iced::{mouse, Element, Length, Point, Rectangle, Theme};
+use iced::{mouse, Background, Element, Length, Point, Rectangle, Theme};
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -48,6 +49,7 @@ pub struct TextStyleView<'a> {
     pub invalid_fields: usize,
     pub use_big_font: bool,
     pub font_picker: &'a FontPickerState,
+    pub bigfont_picker: &'a FontPickerState,
     /// What the last font switch turned off.
     pub turned_off: Option<String>,
     /// What Apply does to every changed style.
@@ -61,8 +63,90 @@ pub struct TextStyleView<'a> {
     pub upside_down: bool,
     pub vertical: bool,
     pub annotative: bool,
+    /// "Match text orientation to layout", offered with Annotative on.
+    pub orientation: bool,
+    /// The window holds a change Apply would write.
+    pub modified: bool,
     pub rename_active: Option<&'a str>,
     pub rename_buf: &'a str,
+    /// A question or notice over the window.
+    pub card: Option<&'a Card>,
+    /// The style whose actions (right click) show under it.
+    pub context: Option<&'a str>,
+}
+
+/// What a question about unsaved changes was asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pending {
+    Select(String),
+    SetCurrent,
+    New,
+    Copy,
+    Delete,
+    Rename(String),
+    Close,
+}
+
+/// Why a name was refused.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NameNotice {
+    Empty,
+    Exists(String),
+    UnsupportedCharacters,
+}
+
+/// A card over the text style window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Card {
+    /// New: the name being typed, and a refusal over it.
+    New {
+        name: String,
+        notice: Option<NameNotice>,
+    },
+    /// A refused rename.
+    Name(NameNotice),
+    /// Delete the named style?
+    DeleteAsk(String),
+    /// The selected style is used by texts and stays.
+    InUse,
+    /// The selected style changed: keep the changes before going on?
+    Modified(Pending),
+}
+
+/// What a card's controls send.
+#[derive(Debug, Clone)]
+pub enum CardMsg {
+    NewName(String),
+    NewOk,
+    NewCancel,
+    NoticeClose,
+    DeleteAnswer(bool),
+    ModifiedAnswer(bool),
+}
+
+/// The characters a style name may not hold.
+pub const UNSUPPORTED_NAME_CHARACTERS: &str = "\\ < > / ? \" : ; * | , = `";
+
+/// Why `name` (as typed) cannot name a style; `exists` tells whether the
+/// trimmed name is taken.
+pub fn name_notice(name: &str, exists: impl Fn(&str) -> bool) -> Option<NameNotice> {
+    let trimmed = name.trim();
+    if name.is_empty() {
+        Some(NameNotice::Empty)
+    } else if trimmed.is_empty()
+        || trimmed.chars().any(|c| {
+            matches!(
+                c,
+                '\\' | '<' | '>' | '/' | '?' | '"' | ':' | ';' | '*' | '|' | ',' | '=' | '`'
+            )
+        })
+    {
+        Some(NameNotice::UnsupportedCharacters)
+    } else if exists(trimmed) {
+        Some(NameNotice::Exists(trimmed.to_string()))
+    } else {
+        None
+    }
 }
 
 /// What Apply changes: each changed style's name with its lines, and how many
@@ -238,23 +322,23 @@ fn labelled_row<'a>(
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     row![
-        text(label).size(11).style(muted_style).width(LABEL_W),
-        control.into()
+        text(label).size(11).width(LABEL_W),
+        container(control.into()).width(Length::Fill)
     ]
     .spacing(8)
     .align_y(iced::Center)
     .into()
 }
 
-const LABEL_W: f32 = 110.0;
+const LABEL_W: f32 = 80.0;
 
-/// A line of guidance under a control, lined up with the controls.
+/// A line of guidance under a control.
 fn hint<'a>(line: Cow<'static, str>) -> Element<'a, Message> {
-    row![
-        Space::new().width(LABEL_W + 8.0),
-        text(line).size(10).style(muted_style).width(Length::Fill)
-    ]
-    .into()
+    text(line)
+        .size(10)
+        .style(muted_style)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A number field. With an `error` it turns red and the reason shows under
@@ -269,7 +353,7 @@ fn number_row<'a>(
     was: Option<String>,
 ) -> Element<'a, Message> {
     let control: Element<'a, Message> = if read_only {
-        crate::ui::read_only::field(value, 11.0, Length::Fixed(110.0))
+        crate::ui::read_only::field(value, 11.0, Length::Fill)
     } else {
         text_input(placeholder, value)
             .on_input(move |value| Message::TextStyleEdit { field, value })
@@ -279,31 +363,29 @@ fn number_row<'a>(
                 field_style
             })
             .size(11)
-            .width(110)
+            .width(Length::Fill)
             .into()
     };
-    let mut line = row![control].spacing(8).align_y(iced::Center);
-    if let Some(value) = was.filter(|_| error.is_none()) {
-        line = line.push(
+    let line = labelled_row(label, control);
+    let note = match (error, was) {
+        (Some(error), _) => Some(
+            text(error)
+                .size(10)
+                .style(danger_text_style)
+                .width(Length::Fill),
+        ),
+        (None, Some(value)) => Some(
             text(crate::tf!("Modified · was {value}"))
                 .size(10)
-                .style(primary_style),
-        );
-    }
-    let line = labelled_row(label, line);
-    match error {
-        Some(error) => column![
-            line,
-            row![
-                Space::new().width(LABEL_W + 8.0),
-                text(error)
-                    .size(10)
-                    .style(danger_text_style)
-                    .width(Length::Fill)
-            ]
-        ]
-        .spacing(3)
-        .into(),
+                .style(primary_style)
+                .width(Length::Fill),
+        ),
+        (None, None) => None,
+    };
+    match note {
+        Some(note) => column![line, row![Space::new().width(LABEL_W + 8.0), note]]
+            .spacing(3)
+            .into(),
         None => line,
     }
 }
@@ -324,27 +406,44 @@ fn toggle<'a>(
     }
 }
 
-/// A titled, framed group of rows.
-fn group<'a>(title: Cow<'static, str>, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
-    container(
-        column![
-            text(title).size(11).style(primary_style),
-            column(rows).spacing(8)
-        ]
-        .spacing(8),
+/// A switch shown as a chip.
+fn toggle_chip<'a>(
+    label: Cow<'static, str>,
+    value: bool,
+    field: &'static str,
+    read_only: bool,
+) -> Element<'a, Message> {
+    crate::ui::window::pdf_dialogs::chip_enabled(
+        label.into_owned(),
+        value,
+        Message::TextStyleToggle(field),
+        !read_only,
     )
-    .padding([10, 12])
-    .width(Length::Fill)
-    .style(container::bordered_box)
-    .into()
 }
 
-fn caption<'a>(title: Cow<'static, str>) -> Element<'a, Message> {
-    text(title).size(10).style(muted_style).into()
+/// A titled card of rows.
+fn group<'a>(title: Cow<'static, str>, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    crate::ui::window::pdf_dialogs::card(title.into_owned(), column(rows).spacing(8))
 }
 
-/// The style's name and status, the comparison, and the three groups.
-fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
+/// A fixed badge: what differs, how many texts use the style.
+fn info_chip<'a>(label: String) -> Element<'a, Message> {
+    container(text(label).size(11))
+        .padding([5, 10])
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(theme.palette().background.weak.color)),
+            border: iced::Border {
+                color: theme.palette().background.neutral.color,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The setting cards: font, size and effects.
+fn properties<'a>(v: &TextStyleView<'a>) -> Vec<Element<'a, Message>> {
     let ttf = !v.ttf_buf.trim().is_empty();
     let face = FaceStyle::of(v.bold, v.italic);
     let face_style: Element<'a, Message> = if ttf && !v.read_only {
@@ -355,35 +454,34 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
         )
         .on_select(Message::TextStyleFaceStyle)
         .text_size(11)
-        .width(140)
+        .width(Length::Fill)
         .into()
     } else if ttf {
-        crate::ui::read_only::field(&face.to_string(), 11.0, Length::Fixed(140.0))
+        crate::ui::read_only::field(&face.to_string(), 11.0, Length::Fill)
     } else {
         // A stroke font has no bold or italic face.
-        row![
-            crate::ui::read_only::field(&face.to_string(), 11.0, Length::Fixed(140.0)),
+        column![
+            crate::ui::read_only::field(&face.to_string(), 11.0, Length::Fill),
             text(t!("TrueType fonts only")).size(10).style(muted_style),
         ]
-        .spacing(8)
-        .align_y(iced::Center)
+        .spacing(3)
         .into()
     };
     let mut font_rows = vec![labelled_row(
-                t!("Font"),
-                crate::ui::font_picker::view(crate::ui::font_picker::FontPicker {
-                    state: v.font_picker,
-                    selected: if ttf {
-                        FontChoice::TrueType(v.ttf_buf.to_string())
-                    } else {
-                        FontChoice::Stroke(v.font_buf.to_string())
-                    },
-                    file: v.font_buf.to_string(),
-                    width: Length::Fixed(300.0),
-                    read_only: v.read_only,
-                    on_event: Message::TextStyleFont,
-                }),
-            )];
+        t!("Name"),
+        crate::ui::font_picker::view(crate::ui::font_picker::FontPicker {
+            state: v.font_picker,
+            selected: if ttf {
+                FontChoice::TrueType(v.ttf_buf.to_string())
+            } else {
+                FontChoice::Stroke(v.font_buf.to_string())
+            },
+            file: v.font_buf.to_string(),
+            width: Length::Fill,
+            read_only: v.read_only,
+            on_event: Message::TextStyleFont,
+        }),
+    )];
     if let Some(turned_off) = &v.turned_off {
         font_rows.push(
             container(text(turned_off.clone()).size(11))
@@ -394,23 +492,27 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
         );
     }
     font_rows.extend([
-            labelled_row(t!("Font style"), face_style),
-            toggle(
-                t!("Use SHX Big Font"),
-                v.use_big_font,
-                "use_big_font",
-                v.read_only || ttf,
-            ),
-            number_row(
-                t!("Big Font file"),
-                "",
-                v.bigfont_buf,
-                "bigfont",
-                v.read_only || !v.use_big_font,
-                None,
-                None,
-            ),
-        ]);
+        labelled_row(t!("Style"), face_style),
+        toggle(
+            t!("Use SHX Big Font"),
+            v.use_big_font,
+            "use_big_font",
+            v.read_only || ttf,
+        ),
+    ]);
+    if v.use_big_font {
+        font_rows.push(labelled_row(
+            t!("Big Font file"),
+            crate::ui::font_picker::view(crate::ui::font_picker::FontPicker {
+                state: v.bigfont_picker,
+                selected: FontChoice::Stroke(v.bigfont_buf.to_string()),
+                file: v.bigfont_buf.to_string(),
+                width: Length::Fill,
+                read_only: v.read_only,
+                on_event: Message::TextStyleBigFont,
+            }),
+        ));
+    }
     let font = group(t!("Font"), font_rows);
     let size = group(
         t!("Size"),
@@ -419,7 +521,7 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
                 if v.annotative {
                     t!("Paper text height")
                 } else {
-                    t!("Fixed height")
+                    t!("Height")
                 },
                 "0",
                 v.height_buf,
@@ -430,14 +532,23 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
             ),
             hint(t!("0 = the height is asked for when the text is placed.")),
             toggle(t!("Annotative"), v.annotative, "annotative", v.read_only),
-            hint(t!("On: the height above is the paper height.")),
+            row![
+                Space::new().width(18),
+                toggle(
+                    crate::tr!("text-style", "orientation").into(),
+                    v.orientation,
+                    "orientation",
+                    v.read_only || !v.annotative,
+                ),
+            ]
+            .into(),
         ],
     );
     let effects = group(
         t!("Effects"),
         vec![
             number_row(
-                t!("Width factor"),
+                t!("Width"),
                 "1",
                 v.width_buf,
                 "width",
@@ -446,7 +557,7 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
                 v.width_was.clone(),
             ),
             number_row(
-                t!("Oblique angle"),
+                t!("Oblique"),
                 "0",
                 v.oblique_buf,
                 "oblique",
@@ -455,61 +566,17 @@ fn properties<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
                 v.oblique_was.clone(),
             ),
             row![
-                toggle(t!("Backward"), v.backward, "backward", v.read_only),
-                toggle(t!("Upside down"), v.upside_down, "upside_down", v.read_only),
-                toggle(t!("Vertical"), v.vertical, "vertical", v.read_only || ttf),
+                toggle_chip(t!("Backward"), v.backward, "backward", v.read_only),
+                toggle_chip(t!("Upside down"), v.upside_down, "upside_down", v.read_only),
+                toggle_chip(t!("Vertical"), v.vertical, "vertical", v.read_only || ttf),
             ]
-            .spacing(18)
-            .into(),
-            text(t!(
-                "Backward and Upside down affect single-line text and attributes, not MTEXT."
-            ))
-            .size(10)
-            .style(muted_style)
+            .spacing(6)
+            .wrap()
+            .vertical_spacing(6)
             .into(),
         ],
     );
-    let count = v.usage.kinds.iter().map(|(_, count)| count).sum::<usize>();
-    let mut status = if v.read_only {
-        t!("Referenced style · Read only")
-    } else if v.selected.eq_ignore_ascii_case(v.current) {
-        t!("Current style")
-    } else if count > 0 {
-        t!("Used in drawing")
-    } else {
-        t!("Available style")
-    }
-    .into_owned();
-    match count {
-        0 => {}
-        1 => status = format!("{status} · {}", t!("used by 1 text")),
-        count => status = format!("{status} · {}", crate::tf!("used by {count} texts")),
-    }
-    let summary = if v.comparison_sections.is_empty() {
-        t!("No differences").into_owned()
-    } else {
-        format!("{}: {}", t!("Different"), v.comparison_sections.join(", "))
-    };
-    column![
-        row![
-            text(v.selected.to_string()).size(15).style(primary_style),
-            text(status).size(10).style(muted_style),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::End),
-        crate::ui::style::style_manager::comparison_row(Some(EditorComparison {
-            selected: v.compare_name.clone(),
-            options: v.compare_opts.clone(),
-            summary,
-            on_select: Message::TextStyleDialogCompare,
-        })),
-        font,
-        size,
-        effects,
-    ]
-    .spacing(10)
-    .width(Length::Fill)
-    .into()
+    vec![font, size, effects]
 }
 
 /// What Apply does to every changed style and its texts, framed; nothing
@@ -583,73 +650,75 @@ fn note_style(theme: &Theme) -> container::Style {
     }
 }
 
-/// The preview with its sample text field, and where the style is used.
-fn preview_and_usage<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
-    // The caption wraps under the drawing: a long font name stays inside.
-    let preview = container(column![
+/// The top card: the style's name and the comparison, the preview, the
+/// sample text and what differs / how many texts use the style.
+fn preview_card<'a>(v: &TextStyleView<'a>) -> Element<'a, Message> {
+    use crate::ui::window::pdf_dialogs::{accent_text, well_style};
+    let count = v.usage.kinds.iter().map(|(_, count)| count).sum::<usize>();
+    let status = if v.read_only {
+        t!("Referenced style · Read only")
+    } else if v.selected.eq_ignore_ascii_case(v.current) {
+        t!("Current style")
+    } else if count > 0 {
+        t!("Used in drawing")
+    } else {
+        t!("Available style")
+    };
+    let mut head = row![
+        text(v.selected.to_uppercase()).size(11).style(accent_text),
+        text(status).size(10).style(muted_style),
+        Space::new().width(Length::Fill),
+    ]
+    .spacing(10)
+    .align_y(iced::Center);
+    if !v.compare_opts.is_empty() {
+        head = head.push(text(t!("Compare with")).size(11)).push(
+            crate::ui::dropdown_list::pick_list(
+                Some(v.compare_name.clone()),
+                v.compare_opts.clone(),
+                |value| value.to_string(),
+            )
+            .on_select(Message::TextStyleDialogCompare)
+            .text_size(11)
+            .width(150),
+        );
+    }
+    let preview = container(
         canvas(PreviewCanvas {
             outline: outline(&v.preview),
         })
         .width(Length::Fill)
         .height(110),
-        text(v.preview.caption.clone())
-            .size(10)
-            .style(muted_style)
-            .width(Length::Fill),
-    ])
-    .padding(iced::Padding::ZERO.bottom(6).left(10).right(10))
+    )
+    .padding([5, 10])
     .width(Length::Fill)
-    .style(container::bordered_box);
+    .style(well_style);
     let sample = text_input(default_sample(v.use_big_font), v.sample)
         .on_input(Message::TextStyleSample)
         .style(field_style)
-        .size(11);
-    let kind_label = |kind: TextKind| match kind {
-        TextKind::Text => t!("Single-line text"),
-        TextKind::MText => t!("MTEXT"),
-        TextKind::AttributeDefinition => t!("Attribute definitions"),
-        TextKind::Attribute => t!("Attributes"),
+        .size(11)
+        .width(Length::Fill);
+    let difference = if v.compare_opts.is_empty() {
+        None
+    } else if v.comparison_sections.is_empty() {
+        Some(t!("No differences").into_owned())
+    } else {
+        Some(format!(
+            "{}: {}",
+            t!("Different"),
+            v.comparison_sections.join(", ")
+        ))
     };
-    let mut usage = column![].spacing(3);
-    for (kind, count) in &v.usage.kinds {
-        usage = usage.push(row![
-            text(kind_label(*kind)).size(11).width(Length::Fill),
-            text(count.to_string()).size(11),
-        ]);
+    let mut line = row![sample].spacing(8).align_y(iced::Center);
+    if let Some(difference) = difference {
+        line = line.push(info_chip(difference));
     }
-    if v.usage.kinds.is_empty() {
-        usage = usage.push(
-            text(t!("No texts use this style."))
-                .size(11)
-                .style(muted_style),
-        );
-    } else if v.usage.in_blocks > 0 {
-        let count = v.usage.in_blocks;
-        let blocks = v.usage.blocks;
-        usage = usage.push(
-            text(if blocks == 1 {
-                crate::tf!("{count} of them inside 1 block definition.")
-            } else {
-                crate::tf!("{count} of them inside {blocks} block definitions.")
-            })
-            .size(10)
-            .style(muted_style),
-        );
-    }
-    column![
-        caption(t!("Preview")),
-        preview,
-        caption(t!("Sample text")),
-        sample,
-        caption(t!("Texts using this style")),
-        container(usage)
-            .padding([8, 10])
-            .width(Length::Fill)
-            .style(container::bordered_box),
-    ]
-    .spacing(6)
-    .width(Length::Fill)
-    .into()
+    let line = line.push(info_chip(crate::tr!("text-style", "used-count", count = count)));
+    container(column![head, preview, line].spacing(8))
+        .padding([12, 14])
+        .width(Length::Fill)
+        .style(crate::ui::window::pdf_dialogs::card_style)
+        .into()
 }
 
 /// Below this width the two columns stack and the toolbar shows its icons
@@ -660,8 +729,200 @@ pub fn view_window<'a>(
     v: TextStyleView<'a>,
     sizing: crate::ui::modal::ModalSizing,
 ) -> Element<'a, Message> {
-    responsive(move |size| layout(&v, sizing, size)).into()
+    let card = v.card.cloned();
+    let window: Element<'a, Message> = responsive(move |size| layout(&v, sizing, size)).into();
+    let Some(card) = card else {
+        return window;
+    };
+    let (panel, dismiss) = card_view(card);
+    stack([
+        window,
+        mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(
+                        theme.palette().background.strongest.color.scale_alpha(0.55),
+                    )),
+                    ..Default::default()
+                }),
+        )
+        .on_press(dismiss)
+        .into(),
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into(),
+    ])
+    .into()
 }
+
+fn card_msg(message: CardMsg) -> Message {
+    Message::TextStyleCard(message)
+}
+
+const WARN: &[u8] = include_bytes!("../../../assets/icons/ui/warning_triangle.svg");
+
+/// A warning icon beside a title and its detail.
+fn notice_lines<'a>(title: String, detail: Option<String>) -> Element<'a, Message> {
+    let mut lines = column![text(title).size(13)].spacing(6);
+    if let Some(detail) = detail {
+        lines = lines.push(text(detail).size(11).style(muted_style));
+    }
+    row![crate::ui::icons::semantic(WARN, 20.0), lines]
+        .spacing(12)
+        .align_y(iced::Alignment::Start)
+        .into()
+}
+
+pub(crate) fn name_notice_lines<'a>(notice: &NameNotice) -> Element<'a, Message> {
+    let (title, detail) = match notice {
+        NameNotice::Empty => (crate::tr!("text-style", "name-empty"), None),
+        NameNotice::Exists(name) => (
+            crate::i18n::plain(crate::tr!("text-style", "name-exists", name = name.clone())),
+            Some(crate::tr!("text-style", "name-exists-detail")),
+        ),
+        NameNotice::UnsupportedCharacters => (
+            crate::tr!("text-style", "name-chars"),
+            Some(format!(
+                "{}\n{UNSUPPORTED_NAME_CHARACTERS}",
+                crate::tr!("text-style", "name-chars-detail")
+            )),
+        ),
+    };
+    notice_lines(title, detail)
+}
+
+fn close_row<'a>() -> Element<'a, Message> {
+    row![
+        Space::new().width(Length::Fill),
+        crate::ui::style::form::dialog_button(
+            crate::tr!("text-style", "close"),
+            card_msg(CardMsg::NoticeClose),
+            true
+        ),
+    ]
+    .into()
+}
+
+/// The card's panel and what a click beside it does.
+fn card_view<'a>(card: Card) -> (Element<'a, Message>, Message) {
+    use crate::ui::style::form::dialog_button;
+    use crate::ui::style::mleaderstyle::panel;
+    match card {
+        Card::New { name, notice } => {
+            if let Some(notice) = notice {
+                let body = column![name_notice_lines(&notice), close_row()].spacing(14);
+                return (panel(body.into(), 420.0), card_msg(CardMsg::NoticeClose));
+            }
+            let field = text_input("", &name)
+                .id(iced::widget::Id::new(NEW_NAME_ID))
+                .on_input(|value| card_msg(CardMsg::NewName(value)))
+                .on_submit(card_msg(CardMsg::NewOk))
+                .size(12)
+                .padding([5, 8])
+                .style(field_style)
+                .width(Length::Fill);
+            let body = column![
+                text(crate::tr!("text-style", "new-title"))
+                    .size(13)
+                    .style(crate::ui::window::pdf_dialogs::accent_text),
+                column![
+                    text(crate::tr!("text-style", "style-name"))
+                        .size(11)
+                        .style(muted_style),
+                    field
+                ]
+                .spacing(4),
+                row![
+                    Space::new().width(Length::Fill),
+                    dialog_button(
+                        crate::tr!("text-style", "cancel"),
+                        card_msg(CardMsg::NewCancel),
+                        false
+                    ),
+                    dialog_button(crate::tr!("text-style", "ok"), card_msg(CardMsg::NewOk), true),
+                ]
+                .spacing(6),
+            ]
+            .spacing(12);
+            (panel(body.into(), 380.0), card_msg(CardMsg::NewCancel))
+        }
+        Card::Name(notice) => {
+            let body = column![name_notice_lines(&notice), close_row()].spacing(14);
+            (panel(body.into(), 420.0), card_msg(CardMsg::NoticeClose))
+        }
+        Card::InUse => {
+            let body = column![
+                notice_lines(crate::tr!("text-style", "in-use"), None),
+                close_row()
+            ]
+            .spacing(14);
+            (panel(body.into(), 380.0), card_msg(CardMsg::NoticeClose))
+        }
+        Card::DeleteAsk(name) => {
+            let body = column![
+                text(crate::tr!("text-style", "delete-title"))
+                    .size(13)
+                    .style(crate::ui::window::pdf_dialogs::accent_text),
+                notice_lines(crate::i18n::plain(crate::tr!("text-style", "delete-ask", name = name)), None),
+                row![
+                    Space::new().width(Length::Fill),
+                    dialog_button(
+                        crate::tr!("text-style", "cancel"),
+                        card_msg(CardMsg::DeleteAnswer(false)),
+                        false
+                    ),
+                    dialog_button(
+                        crate::tr!("text-style", "ok"),
+                        card_msg(CardMsg::DeleteAnswer(true)),
+                        true
+                    ),
+                ]
+                .spacing(6),
+            ]
+            .spacing(14);
+            (
+                panel(body.into(), 380.0),
+                card_msg(CardMsg::DeleteAnswer(false)),
+            )
+        }
+        Card::Modified(_) => {
+            let body = column![
+                notice_lines(
+                    crate::tr!("text-style", "modified"),
+                    Some(crate::tr!("text-style", "modified-ask"))
+                ),
+                row![
+                    Space::new().width(Length::Fill),
+                    dialog_button(
+                        crate::tr!("text-style", "yes"),
+                        card_msg(CardMsg::ModifiedAnswer(true)),
+                        true
+                    ),
+                    dialog_button(
+                        crate::tr!("text-style", "no"),
+                        card_msg(CardMsg::ModifiedAnswer(false)),
+                        false
+                    ),
+                ]
+                .spacing(6),
+            ]
+            .spacing(14);
+            (
+                panel(body.into(), 400.0),
+                card_msg(CardMsg::NoticeClose),
+            )
+        }
+    }
+}
+
+/// The New card's name field, focused and selected when it opens.
+pub const NEW_NAME_ID: &str = "text-style-new-name";
+
 
 /// The tallest the Apply summary's list of styles grows before it scrolls,
 /// for a window `height` tall: the preview and "Where used" keep their room.
@@ -677,31 +938,27 @@ fn layout<'a>(
     let width = size.width;
     let narrow = width < STACK_BELOW;
     let summary_height = summary_height(size.height);
-    let pane = |content: Element<'a, Message>| {
-        scrollable(container(content).padding([12, 14]))
-            .width(Length::Fill)
-            .height(Length::Fill)
-    };
-    let editor: Element<'a, Message> = if narrow {
-        let mut stack = column![].spacing(12);
-        if let Some(summary) = apply_summary(v, summary_height) {
-            stack = stack.push(summary);
-        }
-        pane(stack.push(properties(v)).push(preview_and_usage(v)).into()).into()
+    // The top card, what Apply does, then the three setting cards side by
+    // side (one under another when the window is narrow).
+    let cards = properties(v);
+    let mut stack = column![preview_card(v)].spacing(12);
+    if let Some(summary) = apply_summary(v, summary_height) {
+        stack = stack.push(summary);
+    }
+    let stack = if narrow {
+        cards.into_iter().fold(stack, |stack, card| stack.push(card))
     } else {
-        let mut side = column![].spacing(12);
-        if let Some(summary) = apply_summary(v, summary_height) {
-            side = side.push(summary);
-        }
-        let side = side.push(preview_and_usage(v));
-        row![
-            pane(properties(v)),
-            crate::ui::style::style_manager::vsep(Length::Fill),
-            container(pane(side.into())).width(320),
-        ]
-        .height(Length::Fill)
-        .into()
+        stack.push(
+            row(cards.into_iter().map(|card| container(card).width(Length::Fill).into()))
+                .spacing(12),
+        )
     };
+    let editor: Element<'a, Message> = scrollable(
+        container(stack).padding(iced::Padding::ZERO.right(12)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into();
     crate::ui::style::style_manager::view(crate::ui::style::style_manager::Scaffold {
         sizing,
         kind: StyleKind::Text,
@@ -718,6 +975,8 @@ fn layout<'a>(
         on_set_current: Message::TextStyleDialogSetCurrent,
         on_apply: Message::TextStyleApply,
         read_only: v.read_only,
+        locked_keeps_actions: false,
+        on_list_scroll: None,
         in_use_filter: Some((v.in_use_only, Message::TextStyleInUseFilter)),
         apply_blocked: match v.invalid_fields {
             0 => None,
@@ -726,6 +985,37 @@ fn layout<'a>(
         },
         rows: Some(&v.rows),
         compact: narrow,
+        apply_pending: v.modified,
+        delete_in_use: true,
+        on_context: Some(Message::TextStyleContext),
+        context_menu: v.context.map(|name| {
+            // Standard and the current style cannot be deleted.
+            let deletable =
+                !name.eq_ignore_ascii_case("Standard") && name != v.current && !v.read_only;
+            (
+                name,
+                vec![
+                    (
+                        std::borrow::Cow::Owned(crate::tr!("text-style", "menu-set-current")),
+                        Some(Message::TextStyleDialogSetCurrent),
+                    ),
+                    (
+                        std::borrow::Cow::Owned(crate::tr!("text-style", "menu-rename")),
+                        Some(Message::StyleRenameStart(
+                            crate::app::StyleKind::Text,
+                            name.to_string(),
+                        )),
+                    ),
+                    (
+                        std::borrow::Cow::Owned(crate::tr!("text-style", "menu-delete")),
+                        deletable.then_some(Message::TextStyleDialogDelete),
+                    ),
+                ],
+            )
+        }),
+        list: None,
+        extra_actions: Vec::new(),
+        list_title: Some(Cow::Owned(crate::tr!("text-style", "styles-title"))),
         editor,
     })
 }

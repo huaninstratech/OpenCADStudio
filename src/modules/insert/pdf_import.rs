@@ -15,12 +15,12 @@
 // (other fills solid hatches), text runs MTEXT in a "PDF <font>" style and
 // raster images PNG files referenced by IMAGE objects.
 
-use codec::entities::{
+use document::entities::{
     Arc, AttachmentPoint, BoundaryEdge, BoundaryPath, Circle, Hatch, LwPolyline, MText,
     PolylineEdge, Solid, Spline, Underlay, UnderlayType,
 };
-use codec::types::{Color, Handle, LineWeight, Vector2, Vector3};
-use codec::EntityType;
+use document::types::{Color, Handle, LineWeight, Vector2, Vector3};
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
@@ -250,11 +250,72 @@ enum Step {
     Mode,
     // The File option on the command line (-PDFIMPORT, or FILEDIA 0).
     FileName,
+    /// The file named at the prompt is read off the UI thread.
+    Reading,
     Page,
     PageList,
     Insertion,
     Scale,
     Rotation,
+}
+
+/// The file a name typed at the -PDFIMPORT prompt names: a name without
+/// an extension is a .pdf file.
+fn prompt_file_path(typed: &str) -> String {
+    if std::path::Path::new(typed).extension().is_none() {
+        format!("{typed}.pdf")
+    } else {
+        typed.to_string()
+    }
+}
+
+/// What the read of a file named at the -PDFIMPORT file name prompt found.
+#[derive(Debug, Clone)]
+pub enum PdfPromptRead {
+    /// The file cannot be read: the error to report.
+    Error(String),
+    /// The file needs a password first.
+    Password {
+        stage: crate::scene::model::pdf_password::Stage,
+        remembered: bool,
+    },
+    /// The number of pages, and the notice when a password supplied
+    /// earlier opened the file.
+    Pages {
+        pages: usize,
+        notice: Option<String>,
+    },
+}
+
+/// The read of a file named at the -PDFIMPORT prompt: the file, the check
+/// that it can be opened, the password it needs, and its pages.
+pub fn read_for_prompt(path: &str) -> PdfPromptRead {
+    use crate::scene::model::pdf_password::{gate, remembered_notice, Gate};
+    let shown = crate::entities::underlay::display_path(path);
+    let Ok(bytes) = std::fs::read(path) else {
+        return PdfPromptRead::Error(format!("File {shown} does not exist."));
+    };
+    // A damaged file is repaired only when it still has its trailer (the
+    // `trailer` dictionary or a cross-reference stream); a cut-off one
+    // cannot be opened.
+    // ponytail: byte search; a compressed stream holding these bytes
+    // would pass the test.
+    let has = |key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
+    if !has(b"trailer") && !has(b"/XRef") {
+        return PdfPromptRead::Error(UNREADABLE_FILE.to_string());
+    }
+    crate::scene::model::pdf_raster::register_source(path, std::sync::Arc::new(bytes));
+    let notice = match gate(path, true) {
+        Gate::Open => None,
+        Gate::Remembered => Some(remembered_notice(path)),
+        Gate::Ask { stage, remembered } => {
+            return PdfPromptRead::Password { stage, remembered };
+        }
+    };
+    match crate::scene::model::pdf_raster::page_count(path).filter(|&pages| pages > 0) {
+        Some(pages) => PdfPromptRead::Pages { pages, notice },
+        None => PdfPromptRead::Error(UNREADABLE_FILE.to_string()),
+    }
 }
 
 /// What a file name that is no readable PDF (damaged, empty, not a PDF)
@@ -290,6 +351,8 @@ pub struct PdfImportCommand {
     dash: bool,
     file: PdfFileImport,
     pages: usize,
+    /// The file read off the UI thread, and the text typed for it.
+    reading: Option<(String, String)>,
 }
 
 impl PdfImportCommand {
@@ -319,6 +382,7 @@ impl PdfImportCommand {
                 insertion: DVec3::ZERO,
             },
             pages: 0,
+            reading: None,
         }
     }
 
@@ -345,39 +409,31 @@ impl PdfImportCommand {
         if typed.is_empty() {
             return CmdResult::ReportError("Filename cannot be blank".to_string());
         }
-        // A name without an extension is a .pdf file.
-        let path = if std::path::Path::new(typed).extension().is_none() {
-            format!("{typed}.pdf")
-        } else {
-            typed.to_string()
-        };
-        let shown = crate::entities::underlay::display_path(&path);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return CmdResult::ReportError(format!("File {shown} does not exist."));
-        };
-        // A damaged file is repaired only when it still has its trailer (the
-        // `trailer` dictionary or a cross-reference stream); a cut-off one
-        // cannot be opened.
-        // ponytail: byte search; a compressed stream holding these bytes
-        // would pass the test.
-        let has = |key: &[u8]| bytes.windows(key.len()).any(|w| w == key);
-        if !has(b"trailer") && !has(b"/XRef") {
-            return CmdResult::ReportError(UNREADABLE_FILE.to_string());
+        let path = prompt_file_path(typed);
+        self.step = Step::Reading;
+        self.reading = Some((path.clone(), text.to_string()));
+        CmdResult::ReadPdfForImport(path)
+    }
+
+    /// The command goes on with what the read of the file named at the
+    /// prompt found: the page prompt, the password, or the error.
+    fn take_read(&mut self, path: &str, input: &str, read: PdfPromptRead) -> CmdResult {
+        match read {
+            PdfPromptRead::Error(error) => CmdResult::ReportError(error),
+            PdfPromptRead::Password { stage, remembered } => CmdResult::PdfPassword {
+                path: path.to_string(),
+                input: input.to_string(),
+                stage,
+                remembered,
+                attach: false,
+            },
+            PdfPromptRead::Pages { pages, notice } => {
+                self.pages = pages;
+                self.file.path = path.to_string();
+                self.step = Step::Page;
+                notice.map_or(CmdResult::NeedPoint, CmdResult::ReportMeasurement)
+            }
         }
-        crate::scene::model::pdf_raster::register_source(&path, std::sync::Arc::new(bytes));
-        let notice = match crate::scene::model::pdf_password::prompt_gate(&path, text, false) {
-            Ok(notice) => notice,
-            Err(ask) => return ask,
-        };
-        let Some(pages) =
-            crate::scene::model::pdf_raster::page_count(&path).filter(|&pages| pages > 0)
-        else {
-            return CmdResult::ReportError(UNREADABLE_FILE.to_string());
-        };
-        self.pages = pages;
-        self.file.path = path;
-        self.step = Step::Page;
-        notice.map_or(CmdResult::NeedPoint, CmdResult::ReportMeasurement)
     }
 
     fn page(&mut self, text: &str) -> CmdResult {
@@ -498,6 +554,7 @@ impl CadCommand for PdfImportCommand {
                 "Keep, Detach or Unload PDF underlay? [Keep/Detach/Unload] <Unload>:".to_string()
             }
             Step::FileName => "Enter filename for PDF import:".to_string(),
+            Step::Reading => "Reading the file…".to_string(),
             Step::Page => "Enter page number or [?] <1>:".to_string(),
             Step::PageList => "Enter page to list <*>:".to_string(),
             Step::Insertion => "Specify insertion point <0,0>:".to_string(),
@@ -527,7 +584,7 @@ impl CadCommand for PdfImportCommand {
     fn input_kind(&self) -> InputKind {
         match self.step {
             Step::Mode | Step::Page | Step::PageList => InputKind::SingleToken,
-            Step::FileName => InputKind::FreeText,
+            Step::FileName | Step::Reading => InputKind::FreeText,
             _ => InputKind::Point,
         }
     }
@@ -616,6 +673,8 @@ impl CadCommand for PdfImportCommand {
             }
             Step::Mode => self.mode_choice(&token),
             Step::FileName => self.file_name(text),
+            // Input waits until the read ends.
+            Step::Reading => CmdResult::NeedPoint,
             Step::Page => self.page(text),
             Step::PageList => self.page_list(text),
             Step::Scale => match token.parse::<f64>() {
@@ -649,12 +708,27 @@ impl CadCommand for PdfImportCommand {
             Step::Mode => self.mode_choice(""),
             Step::Opposite => CmdResult::NeedPoint,
             Step::FileName => self.file_name(""),
+            Step::Reading => CmdResult::NeedPoint,
             Step::Page => self.page(""),
             Step::PageList => self.page_list(""),
             Step::Insertion => self.on_point(DVec3::ZERO),
             Step::Scale => self.scale(1.0),
             Step::Rotation => self.rotation(0.0),
         }
+    }
+
+    fn waits_for_read(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    fn on_pdf_import_read(&mut self, path: &str, read: PdfPromptRead) -> Option<CmdResult> {
+        // `reading` is set only with the Reading step, and taken here.
+        if self.reading.as_ref().map(|(p, _)| p.as_str()) != Some(path) {
+            return None;
+        }
+        let (path, input) = self.reading.take()?;
+        self.step = Step::FileName;
+        Some(self.take_read(&path, &input, read))
     }
 
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
@@ -690,7 +764,7 @@ impl CadCommand for PdfImportCommand {
 
 /// What an import adds: objects, and the layers and text styles they use
 /// (name, colour / font file), created when missing.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ImportResult {
     pub entities: Vec<EntityType>,
     pub layers: Vec<(String, Color)>,
@@ -834,6 +908,7 @@ impl LayerNaming {
 
 /// An image the import places: its pixels go to a PNG file named by the
 /// caller, then a raster image at `insertion` spanning `u` × `v` per pixel.
+#[derive(Clone, Debug)]
 pub struct ImageImport {
     pub rgba: Vec<u8>,
     pub width: u32,
@@ -944,24 +1019,26 @@ fn run_strokes(sp: &SubPath, close: Option<SubClose>) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut points: Vec<[f64; 2]> = Vec::new();
     let mut bulges: Vec<f64> = Vec::new();
-    let flush = |points: &mut Vec<[f64; 2]>,
-                 bulges: &mut Vec<f64>,
-                 out: &mut Vec<Piece>,
-                 closed: bool| {
-        if points.len() == 1 {
-            // Only zero-length segments: a line from the point to itself.
-            out.push(Piece::Run(vec![points[0], points[0]], vec![0.0, 0.0], false));
-        } else if points.len() > 1 {
-            bulges.push(0.0);
-            out.push(Piece::Run(
-                std::mem::take(points),
-                std::mem::take(bulges),
-                closed,
-            ));
-        }
-        points.clear();
-        bulges.clear();
-    };
+    let flush =
+        |points: &mut Vec<[f64; 2]>, bulges: &mut Vec<f64>, out: &mut Vec<Piece>, closed: bool| {
+            if points.len() == 1 {
+                // Only zero-length segments: a line from the point to itself.
+                out.push(Piece::Run(
+                    vec![points[0], points[0]],
+                    vec![0.0, 0.0],
+                    false,
+                ));
+            } else if points.len() > 1 {
+                bulges.push(0.0);
+                out.push(Piece::Run(
+                    std::mem::take(points),
+                    std::mem::take(bulges),
+                    closed,
+                ));
+            }
+            points.clear();
+            bulges.clear();
+        };
     for seg in segments {
         let bulge = match seg {
             Segment::Line(..) => Some(0.0),
@@ -1236,7 +1313,13 @@ fn curve_of(points: &[[f64; 2]], bulges: &[f64], closed: bool, z: f64) -> Option
                 .iter()
                 .all(|p| ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() <= ARC_TOLERANCE * r);
             if on {
-                return Some(arc(c, r, points[0], points[n - 1], sweep_sign(points, c) > 0.0));
+                return Some(arc(
+                    c,
+                    r,
+                    points[0],
+                    points[n - 1],
+                    sweep_sign(points, c) > 0.0,
+                ));
             }
         }
     }
@@ -1290,7 +1373,7 @@ fn curve_of(points: &[[f64; 2]], bulges: &[f64], closed: bool, z: f64) -> Option
     if end <= start {
         end += TAU;
     }
-    let mut ellipse = codec::entities::Ellipse::from_center_axes(
+    let mut ellipse = document::entities::Ellipse::from_center_axes(
         Vector3::new(e.center[0], e.center[1], z),
         Vector3::new(e.major[0] * e.a, e.major[1] * e.a, 0.0),
         e.b / e.a,
@@ -1324,16 +1407,21 @@ fn join_strokes(strokes: Vec<Stroke>, join: bool) -> Vec<Stroke> {
     let cell = |p: [f64; 2]| ((p[0] / 1e-7).floor() as i64, (p[1] / 1e-7).floor() as i64);
     let mut ends: rustc_hash::FxHashMap<(i64, i64), Vec<usize>> = Default::default();
     for (index, stroke) in open.iter().enumerate() {
-        for p in [stroke.points[0], *stroke.points.last().expect("strokes have points")] {
+        for p in [
+            stroke.points[0],
+            *stroke.points.last().expect("strokes have points"),
+        ] {
             ends.entry(cell(p)).or_default().push(index);
         }
     }
     let mut open: Vec<Option<Stroke>> = open.into_iter().map(Some).collect();
     // The earliest drawn unused stroke of the chain's kind with an end at `p`.
     let find = |open: &[Option<Stroke>], chain: &Stroke, p: [f64; 2]| {
+        // A coordinate too far out for a cell saturates to the last one,
+        // so the neighbours are taken without going past it.
         let (cx, cy) = cell(p);
-        (cx - 1..=cx + 1)
-            .flat_map(|x| (cy - 1..=cy + 1).map(move |y| (x, y)))
+        (cx.saturating_sub(1)..=cx.saturating_add(1))
+            .flat_map(|x| (cy.saturating_sub(1)..=cy.saturating_add(1)).map(move |y| (x, y)))
             .filter_map(|key| ends.get(&key))
             .flatten()
             .copied()
@@ -1537,7 +1625,7 @@ pub fn convert(
         }
         color
     };
-    let fill_transparency = codec::types::Transparency::from_alpha_value(0x0200_007F);
+    let fill_transparency = document::types::Transparency::from_alpha_value(0x0200_007F);
     // A mirrored placement turns arcs the other way.
     let turn = (underlay.x_scale * underlay.y_scale).signum();
     let mut strokes: Vec<Stroke> = Vec::new();
@@ -1664,11 +1752,15 @@ pub fn convert(
                 // Arial stands in for a font no installed family answers
                 // to; once a style of its name maps to Arial, its runs are
                 // 0.72 of their size.
-                let arial_style = result.text_styles.iter().chain(&naming.styles).any(
-                    |(name, file)| {
-                        name.eq_ignore_ascii_case(&style) && file.eq_ignore_ascii_case("arial.ttf")
-                    },
-                );
+                let arial_style =
+                    result
+                        .text_styles
+                        .iter()
+                        .chain(&naming.styles)
+                        .any(|(name, file)| {
+                            name.eq_ignore_ascii_case(&style)
+                                && file.eq_ignore_ascii_case("arial.ttf")
+                        });
                 let ratio = match capital_a_height(&text.font) {
                     Some(ratio) => ratio,
                     None if arial_style => 0.72,
@@ -2215,3 +2307,6 @@ fn fill_entities(
 inventory::submit!(crate::command::CommandRegistration {
     names: &["PDFIMPORT", "-PDFIMPORT"]
 });
+
+#[cfg(test)]
+mod tests;

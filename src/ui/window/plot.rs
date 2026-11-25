@@ -14,7 +14,7 @@ use crate::ui::style::common::muted_style;
 use crate::ui::style::form;
 use crate::ui::style::form::{hdivider, vseparator as vsep};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, row, scrollable, text, text_input, Space,
+    Space, button, checkbox, column, container, mouse_area, row, scrollable, text, text_input,
 };
 use iced::{Background, Border, Element, Fit, Length, Theme};
 use std::borrow::Cow;
@@ -24,6 +24,7 @@ use std::fmt;
 pub const OUT_DEFAULT: &str = "System default printer";
 pub const OUT_PDF: &str = "Save to PDF file…";
 pub const OUT_SVG: &str = "Save to SVG file…";
+pub const OUT_DWF: &str = "Save to DWF file…";
 
 /// Top-of-list entries: no page setup (defaults + PDF), and the last-used
 /// settings captured when the dialog opened.
@@ -88,8 +89,18 @@ impl fmt::Display for PlotChoice {
 
 #[cfg(test)]
 mod tests {
-    use super::{CustomPaperDraft, CustomPaperError, PlotChoice};
-    use crate::io::paper_catalog::{resolve, Margins, PaperUnits};
+    use super::{CustomPaperDraft, CustomPaperError, PlotChoice, PlotDialogState};
+    use crate::io::paper_catalog::{Margins, PaperUnits, resolve};
+
+    #[test]
+    fn non_scaling_stroke_defaults_off_and_copies_with_plot_preferences() {
+        let mut source = PlotDialogState::default();
+        assert!(!source.non_scaling_stroke);
+        source.non_scaling_stroke = true;
+        let mut restored = PlotDialogState::default();
+        restored.copy_settings_from(&source);
+        assert!(restored.non_scaling_stroke);
+    }
 
     #[test]
     fn custom_sheet_draft_validates_and_builds() {
@@ -145,6 +156,26 @@ mod tests {
     }
 
     #[test]
+    fn text_as_outlines_defaults_off_and_copies_with_plot_preferences() {
+        let mut source = PlotDialogState::default();
+        assert!(!source.text_as_outlines);
+        source.text_as_outlines = true;
+        let mut restored = PlotDialogState::default();
+        restored.copy_settings_from(&source);
+        assert!(restored.text_as_outlines);
+    }
+
+    #[test]
+    fn geopdf_defaults_off_and_copies_with_plot_preferences() {
+        let mut source = PlotDialogState::default();
+        assert!(!source.geopdf);
+        source.geopdf = true;
+        let mut restored = PlotDialogState::default();
+        restored.copy_settings_from(&source);
+        assert!(restored.geopdf);
+    }
+
+    #[test]
     fn named_view_display_preserves_the_saved_plot_area() {
         let name = "Plan: north";
         let choice = PlotChoice::localized(format!("View: {name}"));
@@ -173,6 +204,16 @@ pub enum PlotFlag {
     Transparency,
     PaperspaceLast,
     Stamp,
+    /// SVG only: emit glyph paths instead of visible font-dependent text.
+    TextAsOutlines,
+    /// SVG only: preserve stroke widths under subsequent SVG transforms.
+    NonScalingStroke,
+    /// SVG only: tag each drawn item with its drawing layer (`data-layer`),
+    /// letting SVG consumers toggle layers dynamically.
+    LayerAttributes,
+    /// PDF file only: register an orthographic model-space plot frame in ISO
+    /// GeoPDF metadata. Never affects preview or ordinary printing.
+    GeoPdf,
     /// Hidden-line removal for paper-space objects (the page setup's
     /// "plot hidden" flag).
     HidePaperspace,
@@ -189,13 +230,13 @@ pub struct PageSetupImportDraft {
     pub file: String,
     /// Each setup with whether it is ticked for import. The settings are
     /// carried along so the source file is read once.
-    pub setups: Vec<(String, codec::objects::PlotSettings, bool)>,
+    pub setups: Vec<(String, document::objects::PlotSettings, bool)>,
     /// Why the file gave nothing, when it did not.
     pub error: Option<String>,
 }
 
 impl PageSetupImportDraft {
-    pub fn selected(&self) -> impl Iterator<Item = (&str, &codec::objects::PlotSettings)> {
+    pub fn selected(&self) -> impl Iterator<Item = (&str, &document::objects::PlotSettings)> {
         self.setups
             .iter()
             .filter(|(_, _, on)| *on)
@@ -209,7 +250,7 @@ pub enum PageSetupImportMsg {
     /// Ask for the drawing to import from.
     Pick,
     /// The drawing was read (or could not be): its name and page setups.
-    Loaded(Result<(String, Vec<(String, codec::objects::PlotSettings)>), String>),
+    Loaded(Result<(String, Vec<(String, document::objects::PlotSettings)>), String>),
     /// Tick or untick one setup.
     Toggle(String),
     /// Tick or untick every setup.
@@ -517,6 +558,16 @@ pub struct PlotDialogState {
     /// drawing's page setup, which only knows printers and PDF drivers.
     #[serde(default)]
     pub file_svg: bool,
+    /// File output is DWF (the DWF6 ePlot device); wins over `file_svg`.
+    #[serde(default)]
+    pub file_dwf: bool,
+    /// SVG-only text representation; an app preference, not a page-setup field.
+    #[serde(default)]
+    pub text_as_outlines: bool,
+    pub layer_attributes: bool,
+    /// PDF-only ISO geospatial metadata for an eligible model plot frame.
+    #[serde(default)]
+    pub geopdf: bool,
     pub paper: String,
     #[serde(skip)]
     pub paper_width_mm: f64,
@@ -563,6 +614,10 @@ pub struct PlotDialogState {
     pub stamp: bool,
     /// Hidden-line removal for paper-space objects.
     pub hide_paperspace: bool,
+    /// SVG plots: keep stroke widths constant under downstream transforms
+    /// (e.g. web-map layers); off by default, PDF and printing ignore it.
+    #[serde(default)]
+    pub non_scaling_stroke: bool,
     /// Sending a plot also writes the dialog into the layout, the way a
     /// page setup is expected to remember the last plot.
     pub save_to_layout: bool,
@@ -633,6 +688,11 @@ impl Default for PlotDialogState {
             raster_dpi: String::new(),
             vector_dpi: String::new(),
             file_svg: false,
+            file_dwf: false,
+            text_as_outlines: false,
+            non_scaling_stroke: false,
+            layer_attributes: false,
+            geopdf: false,
             paper: paper_catalog::default_paper().canonical.to_string(),
             paper_width_mm: 297.0,
             paper_height_mm: 210.0,
@@ -690,6 +750,11 @@ impl PlotDialogState {
         self.printer = o.printer.clone();
         self.to_file = o.to_file;
         self.file_svg = o.file_svg;
+        self.file_dwf = o.file_dwf;
+        self.text_as_outlines = o.text_as_outlines;
+        self.non_scaling_stroke = o.non_scaling_stroke;
+        self.layer_attributes = o.layer_attributes;
+        self.geopdf = o.geopdf;
         self.paper = o.paper.clone();
         self.paper_width_mm = o.paper_width_mm;
         self.paper_height_mm = o.paper_height_mm;
@@ -1198,6 +1263,7 @@ fn output_choices(printers: &[String]) -> Vec<PlotChoice> {
         out.extend(printers.iter().cloned().map(PlotChoice::raw));
         out.push(PlotChoice::localized(OUT_PDF));
         out.push(PlotChoice::localized(OUT_SVG));
+        out.push(PlotChoice::localized(OUT_DWF));
         out
     }
 }
@@ -1219,7 +1285,9 @@ pub fn view_window(
         t!("Apply")
     } else if to_file {
         // The web build writes PDF whatever a stored dialog state says.
-        if s.file_svg && cfg!(not(target_arch = "wasm32")) {
+        if s.file_dwf && cfg!(not(target_arch = "wasm32")) {
+            t!("Export DWF")
+        } else if s.file_svg && cfg!(not(target_arch = "wasm32")) {
             t!("Export SVG")
         } else {
             t!("Export PDF")
@@ -1373,7 +1441,9 @@ pub fn view_window(
     }
     let printer_sel = if to_file {
         Some(PlotChoice::localized(
-            if s.file_svg && cfg!(not(target_arch = "wasm32")) {
+            if s.file_dwf && cfg!(not(target_arch = "wasm32")) {
+                OUT_DWF
+            } else if s.file_svg && cfg!(not(target_arch = "wasm32")) {
                 OUT_SVG
             } else {
                 OUT_PDF
@@ -1475,9 +1545,23 @@ pub fn view_window(
         ];
         let folder_choice = folders.get(s.output_folder as usize).cloned();
         let name_choice = names.get(s.output_name as usize).cloned();
+        let raster_hint = crate::tr!("plot", "dpi-hint-native");
+        let vector_hint = crate::tr!("plot", "dpi-hint-full");
         let dpi = row![
-            field_row(crate::tr!("plot", "raster-dpi").into(), &s.raster_dpi, PlotDlgMsg::RasterDpi, 60),
-            field_row(crate::tr!("plot", "vector-dpi").into(), &s.vector_dpi, PlotDlgMsg::VectorDpi, 60),
+            form::labeled_field_hint(
+                crate::tr!("plot", "raster-dpi").into(),
+                &s.raster_dpi,
+                &raster_hint,
+                |v| Message::PlotDlg(PlotDlgMsg::RasterDpi(v)),
+                60.0,
+            ),
+            form::labeled_field_hint(
+                crate::tr!("plot", "vector-dpi").into(),
+                &s.vector_dpi,
+                &vector_hint,
+                |v| Message::PlotDlg(PlotDlgMsg::VectorDpi(v)),
+                60.0,
+            ),
         ]
         .spacing(8);
         let name_row = drop_row(
@@ -1772,16 +1856,7 @@ pub fn view_window(
             section_label(t!("Shaded viewport options")),
             drop_row(
                 t!("Shade plot"),
-                choices(&[
-                    "As displayed",
-                    "2D Wireframe",
-                    "3D Wireframe",
-                    "Hidden Line",
-                    "Flat Shaded",
-                    "Gouraud Shaded",
-                    "Flat Shaded + Edges",
-                    "Gouraud Shaded + Edges",
-                ]),
+                choices(crate::io::plot::SHADE_PLOT_MODES),
                 Some(PlotChoice::localized(s.shade.clone())),
                 PlotDlgMsg::Shade,
                 width,
@@ -1806,6 +1881,49 @@ pub fn view_window(
                 Space::new().height(0).into()
             }
         };
+    let svg_layer_option: Element<'_, Message> =
+        if to_file && s.file_svg && cfg!(not(target_arch = "wasm32")) {
+            check(
+                crate::tr!("plot", "layer-attributes").into(),
+                s.layer_attributes,
+                PlotFlag::LayerAttributes,
+            )
+        } else {
+            Space::new().height(0).into()
+        };
+    let svg_text_option: Element<'_, Message> =
+        if to_file && s.file_svg && cfg!(not(target_arch = "wasm32")) {
+            check(
+                crate::tr!("plot", "text-as-outlines").into(),
+                s.text_as_outlines,
+                PlotFlag::TextAsOutlines,
+            )
+        } else {
+            Space::new().height(0).into()
+        };
+    let svg_stroke_option: Element<'_, Message> =
+        if to_file && s.file_svg && cfg!(not(target_arch = "wasm32")) {
+            check(
+                crate::tr!("plot", "non-scaling-strokes").into(),
+                s.non_scaling_stroke,
+                PlotFlag::NonScalingStroke,
+            )
+        } else {
+            Space::new().height(0).into()
+        };
+    let pdf_geopdf_option: Element<'_, Message> = if to_file
+        && (!(s.file_svg || s.file_dwf) || cfg!(target_arch = "wasm32"))
+        && !s.paper_space
+        && s.area != "Layout"
+    {
+        check(
+            crate::tr!("plot", "geopdf").into(),
+            s.geopdf,
+            PlotFlag::GeoPdf,
+        )
+    } else {
+        Space::new().height(0).into()
+    };
     let options_panel = panel(
         column![
             section_label(t!("Plot options")),
@@ -1841,6 +1959,10 @@ pub fn view_window(
                         s.merge_lines,
                         PlotFlag::MergeLines
                     ),
+                    pdf_geopdf_option,
+                    svg_layer_option,
+                    svg_text_option,
+                    svg_stroke_option,
                     check(t!("Plot stamp"), s.stamp, PlotFlag::Stamp),
                     check(
                         t!("Save changes to layout"),
@@ -1943,6 +2065,116 @@ mod sidebar_layout_tests {
     use iced::advanced::widget::{self, Operation};
 
     #[test]
+    fn svg_only_checkboxes_are_visible_only_for_svg_file_output() {
+        let _lock = crate::headless_ui_lock();
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        let mut visible = |state: &PlotDialogState, label: &str| {
+            let mut ui = iced_test::runtime::user_interface::UserInterface::build(
+                view_window(state, false, crate::ui::modal::ModalSizing::FILL),
+                iced::Size::new(1100.0, 800.0),
+                iced_test::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut find = iced_test::Selector::find(label);
+            ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+            matches!(
+                widget::Operation::finish(&find),
+                widget::operation::Outcome::Some(Some(target))
+                    if target.visible_bounds().is_some()
+            )
+        };
+
+        for label in ["Text as outlines", "Non-scaling strokes"] {
+            let mut state = PlotDialogState::default();
+            assert!(!visible(&state, label), "printer output hides {label}");
+            state.to_file = true;
+            assert!(!visible(&state, label), "PDF output hides {label}");
+            state.file_svg = true;
+            assert!(visible(&state, label), "SVG output shows {label}");
+        }
+    }
+
+    #[test]
+    fn geopdf_checkbox_is_visible_only_for_model_pdf_file_output() {
+        let _lock = crate::headless_ui_lock();
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        let mut visible = |state: &PlotDialogState| {
+            let mut ui = iced_test::runtime::user_interface::UserInterface::build(
+                view_window(state, false, crate::ui::modal::ModalSizing::FILL),
+                iced::Size::new(1100.0, 800.0),
+                iced_test::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut find = iced_test::Selector::find("Geospatial PDF (GeoPDF)");
+            ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+            matches!(
+                widget::Operation::finish(&find),
+                widget::operation::Outcome::Some(Some(target))
+                    if target.visible_bounds().is_some()
+            )
+        };
+
+        let mut state = PlotDialogState::default();
+        assert!(!visible(&state), "printer output hides GeoPDF");
+        state.to_file = true;
+        assert!(visible(&state), "model PDF output shows GeoPDF");
+        state.file_svg = true;
+        assert!(!visible(&state), "SVG output hides GeoPDF");
+        state.file_svg = false;
+        state.paper_space = true;
+        assert!(!visible(&state), "paper space hides GeoPDF");
+        state.paper_space = false;
+        state.area = "Layout".into();
+        assert!(!visible(&state), "Layout area hides GeoPDF");
+    }
+
+    #[test]
+    fn layer_attributes_checkbox_is_visible_only_for_svg_file_output() {
+        let _lock = crate::headless_ui_lock();
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        let mut visible = |state: &PlotDialogState| {
+            let mut ui = iced_test::runtime::user_interface::UserInterface::build(
+                view_window(state, false, crate::ui::modal::ModalSizing::FILL),
+                iced::Size::new(1100.0, 800.0),
+                iced_test::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            let mut find = iced_test::Selector::find("Layer data attributes");
+            ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+            matches!(
+                widget::Operation::finish(&find),
+                widget::operation::Outcome::Some(Some(target))
+                    if target.visible_bounds().is_some()
+            )
+        };
+
+        let mut state = PlotDialogState::default();
+        assert!(!visible(&state), "printer output hides the SVG option");
+        state.to_file = true;
+        assert!(!visible(&state), "PDF output hides the SVG option");
+        state.file_svg = true;
+        assert!(visible(&state), "SVG output shows the option");
+    }
+
+    #[test]
     fn page_setup_scrollbar_viewport_fills_sidebar_width() {
         struct ScrollBounds(Vec<iced::Rectangle>);
         impl Operation for ScrollBounds {
@@ -1964,7 +2196,7 @@ mod sidebar_layout_tests {
         let mut renderer = iced::futures::executor::block_on(
             <iced::Renderer as iced_test::core::renderer::Headless>::new(
                 iced_test::core::renderer::Settings::default(),
-                None,
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
             ),
         )
         .expect("headless renderer");

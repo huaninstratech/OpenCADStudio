@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codec::Document;
+use document::Document;
 
 /// The community folder's GitHub contents API (lists name + download URL).
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +34,7 @@ pub fn fonts_folder() -> Option<PathBuf> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_fonts_folder(folder: Option<PathBuf>) {
     *FONTS_FOLDER.write().unwrap_or_else(|e| e.into_inner()) = folder;
+    forget_font_paths();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +59,7 @@ pub fn support_folder() -> Option<PathBuf> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_support_folder(folder: Option<PathBuf>) {
     *SUPPORT_FOLDER.write().unwrap_or_else(|e| e.into_inner()) = folder;
+    forget_font_paths();
 }
 
 /// Local store for fonts downloaded from the community repository. Text
@@ -183,8 +185,7 @@ pub fn shx_file_missing(file: &str, base: Option<&Path>) -> bool {
         || !file.to_ascii_lowercase().ends_with(".shx")
         || crate::io::linetypes::is_bundled_shape_file(file)
         || crate::scene::text::lff::is_builtin(file)
-        || crate::io::resolve_image_file(file, base).is_some()
-        || local_font_file(file).is_some())
+        || crate::io::linetypes::find_shape_file(file, base).is_some())
 }
 
 /// The `.shx` files in the downloaded-fonts folder and the support folder,
@@ -207,19 +208,96 @@ pub fn folder_shx_fonts() -> Vec<String> {
 /// A font file previously downloaded into the local fonts directory, matched
 /// case-insensitively by file name.
 pub fn local_font_file(name: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    FOLDER_SEARCHES.with(|count| count.set(count.get() + 1));
     let file = name.rsplit(['/', '\\']).next()?;
     let lower = file.to_ascii_lowercase();
-    fonts_dir().into_iter().chain(support_folder()).find_map(|dir| {
-        let direct = dir.join(file);
-        if direct.is_file() {
-            return Some(direct);
+    fonts_dir()
+        .into_iter()
+        .chain(support_folder())
+        .find_map(|dir| {
+            let direct = dir.join(file);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            std::fs::read_dir(&dir)
+                .ok()?
+                .filter_map(|entry| entry.ok())
+                .find(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase() == lower)
+                .map(|entry| entry.path())
+        })
+}
+
+/// AutoCAD-style transmittal font folders visible to a drawing at `base`.
+/// Drawing-local `Fonts/` wins, followed by ancestor `Fonts/` folders up to the
+/// package root. This covers flat `xref/` and arbitrary preserved hierarchies;
+/// no ancestor's ordinary files are searched, only its `Fonts` directory.
+pub(crate) fn packaged_font_dirs(base: Option<&Path>) -> Vec<PathBuf> {
+    base.into_iter()
+        .flat_map(Path::ancestors)
+        .map(|dir| dir.join("Fonts"))
+        .collect()
+}
+
+/// How long a font file lookup is remembered.
+const FONT_PATH_MEMORY: std::time::Duration = std::time::Duration::from_secs(2);
+
+type FontPaths =
+    std::collections::HashMap<(String, Option<PathBuf>), (iced::time::Instant, Option<String>)>;
+
+fn font_paths() -> &'static std::sync::RwLock<FontPaths> {
+    static PATHS: std::sync::OnceLock<std::sync::RwLock<FontPaths>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(Default::default)
+}
+
+/// Where the font file `name` is on disk: as stored or next to the drawing
+/// (`base` is its folder), then in the fonts and support folders.
+///
+/// Every text asks this for its style's font, and a file that is not there
+/// costs a listing of both folders. The answer is remembered for two seconds,
+/// so the texts of a drawing share one search while it opens or is redrawn,
+/// and a font copied in by hand is found on the redraw after. It is forgotten
+/// at once when the folders change or a font is downloaded.
+pub fn font_file_path(name: &str, base: Option<&Path>) -> Option<String> {
+    let key = (name.to_string(), base.map(Path::to_path_buf));
+    if let Some((found_at, found)) = font_paths()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        if found_at.elapsed() < FONT_PATH_MEMORY {
+            return found.clone();
         }
-        std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .find(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase() == lower)
-            .map(|entry| entry.path())
-    })
+    }
+    let found = crate::io::linetypes::find_shape_file(name, base);
+    font_paths()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (iced::time::Instant::now(), found.clone()));
+    found
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn forget_font_paths() {
+    #[cfg(test)]
+    let _not_counting = KEEP_FONT_PATHS.read().unwrap_or_else(|e| e.into_inner());
+    font_paths()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Held by a test while it counts font folder searches. Every test that
+/// builds an app applies its settings, which set the font folders and forget
+/// the lookups; they wait here so the count sees only the test's own work.
+#[cfg(test)]
+pub(crate) static KEEP_FONT_PATHS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has searched the font folders.
+    pub(crate) static FOLDER_SEARCHES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// List the community folder through the GitHub contents API.
@@ -326,6 +404,7 @@ pub fn download_fonts(
             .map_err(|e| format!("Could not save {}: {e}", dest.display()))?;
         downloaded.push((file.to_string(), dest));
     }
+    forget_font_paths();
     Ok(downloaded)
 }
 
@@ -405,13 +484,15 @@ mod tests {
         std::fs::write(dir.join("exists.shx"), b"stub").unwrap();
         let mut doc = Document::new();
         let mk = |name: &str, file: &str| {
-            let mut style = codec::TextStyle::new(name);
+            let mut style = document::TextStyle::new(name);
             style.font_file = file.into();
             style
         };
         let _ = doc.text_styles.add(mk("A", "MISSING1.shx"));
         let _ = doc.text_styles.add(mk("B", "missing1.SHX"));
         let _ = doc.text_styles.add(mk("C", "exists.shx"));
+        // A differently-cased reference resolves to that same sibling (#2804).
+        let _ = doc.text_styles.add(mk("F", "EXISTS.SHX"));
         doc.source_path = Some(dir.join("drawing.dwg").to_string_lossy().into_owned());
         // Fonts with a built-in stroke equivalent are not missing (#2156).
         let _ = doc.text_styles.add(mk("D", "romans.shx"));
@@ -419,6 +500,42 @@ mod tests {
         let missing = missing_shx_fonts(&doc);
         assert_eq!(missing, vec!["MISSING1.shx".to_string()]);
         let _ = std::fs::remove_file(dir.join("exists.shx"));
+    }
+
+    #[test]
+    fn transmittal_fonts_resolve_from_root_and_xref_drawings() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocs-transmittal-font-lookup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fonts = dir.join("Fonts");
+        let xrefs = dir.join("xref/discipline");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::create_dir_all(&xrefs).unwrap();
+        std::fs::write(fonts.join("Package-Custom.shx"), b"shape").unwrap();
+
+        let resolved = font_file_path("package-custom.SHX", Some(&dir)).unwrap();
+        let expected = fonts
+            .join("Package-Custom.shx")
+            .to_string_lossy()
+            .into_owned();
+        // Windows resolves the direct path with the query's casing, while the
+        // Linux fallback scan returns the directory entry's casing.
+        assert!(resolved.eq_ignore_ascii_case(&expected), "{resolved}");
+        assert_eq!(
+            font_file_path("Package-Custom.shx", Some(&xrefs)),
+            Some(
+                fonts
+                    .join("Package-Custom.shx")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -430,20 +547,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vntime.shx"), b"stub").unwrap();
         let mut doc = Document::new();
-        let mut style = codec::TextStyle::new("A");
+        let mut style = document::TextStyle::new("A");
         style.font_file = "CRO_ROM.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = codec::TextStyle::new("B");
+        let mut style = document::TextStyle::new("B");
         style.font_file = "cro_rom.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = codec::TextStyle::new("C");
+        let mut style = document::TextStyle::new("C");
         style.font_file = "vntime.shx".into();
         let _ = doc.text_styles.add(style);
-        let mut style = codec::TextStyle::new("D");
+        let mut style = document::TextStyle::new("D");
         style.font_file = "also_gone.shx".into();
         style.xref_dependent = true;
         let _ = doc.text_styles.add(style);
-        let mut style = codec::TextStyle::new("E");
+        let mut style = document::TextStyle::new("E");
         style.font_file = String::new();
         style.true_type_font = "Arial".into();
         let _ = doc.text_styles.add(style);

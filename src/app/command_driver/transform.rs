@@ -7,7 +7,10 @@ impl OpenCADStudio {
         transform: crate::command::EntityTransform,
     ) -> Option<Task<Message>> {
         let i = self.active_tab;
-        handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+        handles.retain(|handle| {
+            !self.tabs[i].scene.is_layer_locked(*handle)
+                && !self.tabs[i].scene.native_edit_disabled(*handle)
+        });
         if handles.is_empty() {
             self.tabs[i].active_cmd = None;
             return Some(Task::none());
@@ -17,7 +20,10 @@ impl OpenCADStudio {
             handles = self.tabs[i]
                 .scene
                 .parametric_connected_handles(scope, &handles, false);
-            handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+            handles.retain(|handle| {
+                !self.tabs[i].scene.is_layer_locked(*handle)
+                    && !self.tabs[i].scene.native_edit_disabled(*handle)
+            });
         }
         // A fixed object stays where it is and the command says why, rather
         // than moving the rest of the selection and letting the solve pull it
@@ -36,7 +42,18 @@ impl OpenCADStudio {
         // A translation carries its complete connected constraint
         // component so each member keeps its own dimensions. Other
         // transforms retain their selected-object behavior.
-        let pending = self.begin_undo(i, label, handles.len(), true);
+        // Scaling a table rebuilds its picture block and its membership.
+        let table_scale = matches!(
+            transform,
+            crate::command::EntityTransform::Scale { .. }
+                | crate::command::EntityTransform::Affine(_)
+        ) && handles.iter().any(|h| {
+            matches!(
+                self.tabs[i].scene.document.get_entity(*h),
+                Some(document::EntityType::Table(_))
+            )
+        });
+        let pending = self.begin_undo(i, label, handles.len(), !table_scale);
         let handles = self.tabs[i]
             .scene
             .transform_picked_segments(&handles, &transform);
@@ -60,7 +77,10 @@ impl OpenCADStudio {
         transform: crate::command::EntityTransform,
     ) -> Option<Task<Message>> {
         let i = self.active_tab;
-        handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+        handles.retain(|handle| {
+            !self.tabs[i].scene.is_layer_locked(*handle)
+                && !self.tabs[i].scene.native_edit_disabled(*handle)
+        });
         if handles.is_empty() {
             return Some(Task::none());
         }
@@ -99,7 +119,10 @@ impl OpenCADStudio {
         else {
             unreachable!("router only routes the matching variant");
         };
-        handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+        handles.retain(|handle| {
+            !self.tabs[i].scene.is_layer_locked(*handle)
+                && !self.tabs[i].scene.native_edit_disabled(*handle)
+        });
         if handles.is_empty() {
             self.tabs[i].active_cmd = None;
             self.tabs[i].snap_result = None;
@@ -222,12 +245,16 @@ impl OpenCADStudio {
                             win_min.x, win_min.y, win_max.x, win_max.y,
                         ])
                         .into_iter()
-                        .filter(|&handle| !scene.is_layer_locked(handle)),
+                        .filter(|&handle| {
+                            !scene.is_layer_locked(handle) && !scene.native_edit_disabled(handle)
+                        }),
                 );
             }
         }
 
-        handles.retain(|handle| !removed_handles.contains(handle));
+        handles.retain(|handle| {
+            !removed_handles.contains(handle) && !self.tabs[i].scene.native_edit_disabled(*handle)
+        });
         handles.sort_unstable_by_key(|handle| handle.value());
         handles.dedup();
 
@@ -263,7 +290,7 @@ impl OpenCADStudio {
                 // A viewport has no key vertices: its corners are what stretches.
                 let viewport_hit = matches!(
                     self.tabs[i].scene.document.get_entity(handle),
-                    Some(codec::EntityType::Viewport(vp))
+                    Some(document::EntityType::Viewport(vp))
                         if crate::entities::viewport::stretch_corners(vp)
                             .into_iter()
                             .any(&active_point)
@@ -346,7 +373,10 @@ impl OpenCADStudio {
         delta: glam::DVec3,
     ) -> Option<Task<Message>> {
         let i = self.active_tab;
-        handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
+        handles.retain(|handle| {
+            !self.tabs[i].scene.is_layer_locked(*handle)
+                && !self.tabs[i].scene.native_edit_disabled(*handle)
+        });
         if handles.is_empty() {
             self.tabs[i].active_cmd = None;
             return Some(Task::none());
@@ -366,7 +396,7 @@ impl OpenCADStudio {
         let structural = handles.iter().any(|handle| {
             matches!(
                 self.tabs[i].scene.document.get_entity(*handle),
-                Some(codec::EntityType::Dimension(_))
+                Some(document::EntityType::Dimension(_))
             )
         });
         let pending = self.begin_undo(i, "STRETCH", handles.len(), !structural);
@@ -376,7 +406,7 @@ impl OpenCADStudio {
 
         // Dimensions whose points moved — their baked *D block is
         // stale afterwards and must be dropped (see #398 / #372).
-        let mut stretched_dims: Vec<codec::Handle> = Vec::new();
+        let mut stretched_dims: Vec<document::Handle> = Vec::new();
         for handle in &handles {
             // Subtract only this entity's explicitly removed vertices. The same
             // predicate gates preview, geometry mutation and inferred constraints.
@@ -394,7 +424,7 @@ impl OpenCADStudio {
             if let Some(entity) = before.as_deref() {
                 use crate::scene::parametric_constraints::ParametricRef;
                 match entity {
-                    codec::EntityType::Line(line) => {
+                    document::EntityType::Line(line) => {
                         if in_win(line.start.x, line.start.y) {
                             driven_refs.push(ParametricRef::point(*handle, 0));
                         }
@@ -402,7 +432,7 @@ impl OpenCADStudio {
                             driven_refs.push(ParametricRef::point(*handle, 1));
                         }
                     }
-                    codec::EntityType::LwPolyline(polyline) => {
+                    document::EntityType::LwPolyline(polyline) => {
                         if let Some(world) = crate::entities::curve::lwpolyline_world_xy(polyline) {
                             for (index, vertex) in world.vertices.iter().enumerate() {
                                 if in_win(vertex.location.x, vertex.location.y) {
@@ -411,19 +441,19 @@ impl OpenCADStudio {
                             }
                         }
                     }
-                    codec::EntityType::Polyline2D(polyline) => {
+                    document::EntityType::Polyline2D(polyline) => {
                         for (index, vertex) in polyline.vertices.iter().enumerate() {
                             if in_win(vertex.location.x, vertex.location.y) {
                                 driven_refs.push(ParametricRef::point(*handle, index as i32));
                             }
                         }
                     }
-                    codec::EntityType::Circle(circle)
+                    document::EntityType::Circle(circle)
                         if in_win(circle.center.x, circle.center.y) =>
                     {
                         driven_refs.push(ParametricRef::center(*handle));
                     }
-                    codec::EntityType::Arc(arc) if in_win(arc.center.x, arc.center.y) => {
+                    document::EntityType::Arc(arc) if in_win(arc.center.x, arc.center.y) => {
                         driven_refs.push(ParametricRef::center(*handle));
                     }
                     _ => {}
@@ -439,7 +469,7 @@ impl OpenCADStudio {
                 &excluded_points,
                 delta,
             );
-            if stretched && matches!(entity, codec::EntityType::Dimension(_)) {
+            if stretched && matches!(entity, document::EntityType::Dimension(_)) {
                 stretched_dims.push(*handle);
             }
             if stretched {
@@ -493,7 +523,7 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod stretch_window_feedback_tests {
     use crate::app::OpenCADStudio;
-    use codec::{EntityType, Handle};
+    use document::{EntityType, Handle};
     use glam::DVec3;
 
     /// A 20x10 viewport centred on (10, 5).
@@ -501,8 +531,8 @@ mod stretch_window_feedback_tests {
         let mut app = OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
         let i = app.active_tab;
-        let mut viewport = codec::entities::Viewport::default();
-        viewport.center = codec::types::Vector3::new(10.0, 5.0, 0.0);
+        let mut viewport = document::entities::Viewport::default();
+        viewport.center = document::types::Vector3::new(10.0, 5.0, 0.0);
         viewport.width = 20.0;
         viewport.height = 10.0;
         let handle = app.tabs[i]
@@ -553,5 +583,75 @@ mod stretch_window_feedback_tests {
             Vec::new(),
         );
         assert!(!app.tabs[i].scene.selected.contains(&handle));
+    }
+}
+
+#[cfg(test)]
+mod selectable_custom_tests {
+    use crate::app::OpenCADStudio;
+    use document::entities::{Line, LwPolyline, LwVertex};
+    use document::types::Vector3;
+    use document::xdata::{ExtendedDataRecord, XDataValue};
+    use document::EntityType;
+    use glam::DVec3;
+
+    fn selectable_custom(entity: &mut EntityType) {
+        let mut stamp = ExtendedDataRecord::new("CVIFC-CLASS:LINE");
+        stamp.add_value(XDataValue::Integer32(1));
+        stamp.add_value(XDataValue::String(String::new()));
+        stamp.add_value(XDataValue::Integer32(1));
+        entity.common_mut().extended_data.add_record(stamp);
+    }
+
+    #[test]
+    fn copy_and_explode_skip_selectable_custom_entities() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let mut custom = EntityType::Line(Line::from_points(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(10.0, 0.0, 0.0),
+        ));
+        selectable_custom(&mut custom);
+        let custom = app.tabs[i].scene.add_entity(custom);
+        let plain = app.tabs[i]
+            .scene
+            .add_entity(EntityType::Line(Line::from_points(
+                Vector3::new(0.0, 2.0, 0.0),
+                Vector3::new(10.0, 2.0, 0.0),
+            )));
+        app.handle_copy_selected(
+            vec![custom, plain],
+            crate::command::EntityTransform::Translate(DVec3::new(0.0, 5.0, 0.0)),
+        );
+        assert_eq!(app.tabs[i].scene.document.entities().count(), 3);
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .entities()
+                .filter(|entity| crate::plugin::entity_labels::native_edit_disabled(entity))
+                .count(),
+            1,
+            "COPY never clones the custom façade"
+        );
+
+        let mut polyline = LwPolyline::new();
+        polyline.vertices = vec![
+            LwVertex::from_coords(0.0, 0.0),
+            LwVertex::from_coords(10.0, 0.0),
+        ];
+        let mut custom_polyline = EntityType::LwPolyline(polyline);
+        selectable_custom(&mut custom_polyline);
+        let custom_polyline = app.tabs[i].scene.add_entity(custom_polyline);
+        let count = app.tabs[i].scene.document.entities().count();
+        app.tabs[i].scene.deselect_all();
+        app.tabs[i].scene.select_entity(custom_polyline, true);
+        let _ = app.run_command_line("EXPLODE");
+        assert_eq!(app.tabs[i].scene.document.entities().count(), count);
+        assert!(matches!(
+            app.tabs[i].scene.document.get_entity(custom_polyline),
+            Some(EntityType::LwPolyline(_))
+        ));
     }
 }

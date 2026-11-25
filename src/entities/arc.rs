@@ -1,12 +1,12 @@
 use crate::t;
-use codec::entities::Arc;
+use document::entities::Arc;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_angle_prop as edit_angle, edit_prop as edit, format_angle, format_area,
     format_decimal, format_length, parse_f64, ro_prop as ro, square_grip,
 };
 use crate::entities::traits::RenderConvertible;
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{extrusion_wall_tris, RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 use crate::scene::model::wire_model::TangentGeom;
@@ -132,7 +132,7 @@ pub(crate) fn refit_grips(arc: &mut Arc, original: &Arc, edits: &[(usize, glam::
     let Some(c) = plane.project(points[2].to_array()) else {
         return false;
     };
-    let Some(fit) = kernel::geom2d::arc_through_points(a, b, c) else {
+    let Some(fit) = ocs_geom::geom2d::arc_through_points(a, b, c) else {
         return false;
     };
 
@@ -210,11 +210,27 @@ fn properties(arc: &Arc) -> Vec<PropSection> {
                 "total_angle",
                 format_angle(total_angle.to_radians()),
             ),
-            ro(t!("Arc length").as_ref(), "arc_length", format_length(arc_length)),
+            ro(
+                t!("Arc length").as_ref(),
+                "arc_length",
+                format_length(arc_length),
+            ),
             ro(t!("Area").as_ref(), "area", format_area(area)),
-            ro(t!("Normal X").as_ref(), "normal_x", format_decimal(arc.normal.x)),
-            ro(t!("Normal Y").as_ref(), "normal_y", format_decimal(arc.normal.y)),
-            ro(t!("Normal Z").as_ref(), "normal_z", format_decimal(arc.normal.z)),
+            ro(
+                t!("Normal X").as_ref(),
+                "normal_x",
+                format_decimal(arc.normal.x),
+            ),
+            ro(
+                t!("Normal Y").as_ref(),
+                "normal_y",
+                format_decimal(arc.normal.y),
+            ),
+            ro(
+                t!("Normal Z").as_ref(),
+                "normal_z",
+                format_decimal(arc.normal.z),
+            ),
         ],
     }]
 }
@@ -277,15 +293,16 @@ fn apply_grip(arc: &mut Arc, grip_id: usize, apply: GripApply) {
 }
 
 fn apply_transform(arc: &mut Arc, t: &EntityTransform) {
-    crate::scene::view::transform::apply_standard_entity_transform(arc, t, |entity, p1, p2| {
+    let normal = arc.normal;
+    crate::scene::view::transform::apply_ocs_entity_transform(arc, t, normal, |entity, p1, p2| {
         crate::scene::view::transform::reflect_xy_point(
             &mut entity.center.x,
             &mut entity.center.y,
             p1,
             p2,
         );
-        let dx = (p2.x - p1.x) as f64;
-        let dy = (p2.y - p1.y) as f64;
+        let dx = p2.x - p1.x;
+        let dy = p2.y - p1.y;
         let line_angle = dy.atan2(dx);
         let tmp = entity.start_angle;
         entity.start_angle = 2.0 * line_angle - entity.end_angle;
@@ -294,7 +311,7 @@ fn apply_transform(arc: &mut Arc, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Arc {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         Some(to_render(self))
     }
 }
@@ -369,7 +386,7 @@ impl crate::entities::traits::Grippable for Arc {
         point: glam::DVec3,
     ) -> Option<f64> {
         use crate::scene::model::object::GripMenuAction as A;
-        use kernel::geom2d::{Circle as KernelCircle, Curve as KernelCurve, Vec2};
+        use ocs_geom::geom2d::{Circle as KernelCircle, Curve as KernelCurve, Vec2};
         if self.radius <= 1.0e-9 {
             return None;
         }
@@ -470,7 +487,7 @@ impl crate::entities::traits::Transformable for Arc {
     }
 }
 
-impl crate::entities::traits::MassPropsCalc for codec::entities::Arc {
+impl crate::entities::traits::MassPropsCalc for document::entities::Arc {
     fn mass_props(&self) -> crate::entities::traits::MassProps {
         let curve = crate::entities::curve::arc_curve(self);
         let area = curve.curve.chord_closed_area().unwrap_or(0.0).abs();
@@ -497,8 +514,8 @@ mod tests {
     #[test]
     fn midpoint_grip_drives_radius_and_arc_length_in_entity_plane() {
         let mut arc = Arc::default();
-        arc.center = codec::types::Vector3::new(1.0, 2.0, 3.0);
-        arc.normal = codec::types::Vector3::new(0.0, 1.0, 0.0);
+        arc.center = document::types::Vector3::new(1.0, 2.0, 3.0);
+        arc.normal = document::types::Vector3::new(0.0, 1.0, 0.0);
         arc.radius = 2.0;
         arc.start_angle = 0.0;
         arc.end_angle = std::f64::consts::FRAC_PI_2;

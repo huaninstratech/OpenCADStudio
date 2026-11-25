@@ -7,13 +7,21 @@ build = "build.rs"
 default-run = "OpenCADStudio"
 autotests = false
 
+[features]
+# Opt-in release audit helpers; has no effect in the application executable.
+performance-audit = []
+
 [workspace]
 members = [
+    "crates/ocs_solid",
     "crates/ocs_plugin_api",
     "crates/ocs_save",
     "crates/ocs_web_worker",
     "crates/dwg-thumbnailer",
     "crates/dwg-thumbnailer-win",
+    "crates/step-export",
+    "crates/ocs_geom",
+    "crates/ocs_constraints",
 ]
 
 [target.'cfg(windows)'.build-dependencies]
@@ -22,10 +30,10 @@ winresource = "0.1"
 [dependencies]
 serde_json = "1"
 # Offline validation of the same contracts published to automation clients.
-jsonschema = { version = "0.49", default-features = false }
+jsonschema = { version = "0.63", default-features = false }
 serde = { version = "1", features = ["derive"] }
-calamine = "0.36.1"
-base64 = "0.22"
+calamine = "0.38.0"
+base64 = "0.23"
 semver = "1"
 url = "2"
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["image", "svg", "advanced", "canvas", "smol", "markdown"] }
@@ -33,14 +41,27 @@ iced_runtime = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab
 iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
 iced_aw = { git = "https://github.com/HakanSeven12/iced_aw.git", branch = "agent/fix-iced-fonts", features = ["menu", "context_menu", "drop_down", "number_input"] }
 bytemuck = { version = "1.25", features = ["derive"] }
-glam = { version = "0.33", features = ["bytemuck"] }
-rfd = "0.17"
+glam = { version = "0.34", features = ["bytemuck"] }
+rfd = "0.18"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-codec = { package = "opencaddocument", git = "https://github.com/HakanSeven12/opencaddocument.git", rev = "a4ee642", features = ["serde"] }
-kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "b8475df", features = ["acis", "offset"] }
-kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "b8475df" }
+svgtypes = "0.16"
+document = { package = "opencaddocument", git = "https://github.com/HakanSeven12/opencaddocument.git", rev = "1db213a7babde93b64a4887fd6ba441f0177b00d", features = ["serde", "mline-pilot"] }
+# 2D curve algebra, the B-rep model and the constraint solver (from
+# opencadkernel); the operations on solids are Solidcore's.
+ocs_geom = { path = "crates/ocs_geom" }
+ocs_constraints = { path = "crates/ocs_constraints" }
+solidcore = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+solidcore-ops = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+solidcore-convert = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+solidcore-tess = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+solidcore-step = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+ocs_solid = { path = "crates/ocs_solid" }
+# Solidcore's record model (B-rep, STEP exchange structure); the STEP writer
+# is vendored with OCS changes (Apache-2.0; see crates/step-export/VENDORED.md).
+solidcore-record = { git = "https://github.com/tangency-labs/solidcore.git", rev = "e261b7d" }
+step-export = { path = "crates/step-export" }
 graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "5e4dc20" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 # Shared SAVE serialization dispatch + web-worker wire format: one
@@ -52,54 +73,71 @@ flate2 = "1"
 # also appear in the IMAGE picker filter (io::pick_image_file) and the web
 # drop filter (io::web_drop::is_image_name).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp", "gif"] }
-hayro = "0.7.1"
+hayro = "0.9.0"
 kurbo = "0.13"
+# Pure-Rust CRS resolution and projection for document GEODATA. The embedded
+# EPSG data runs on native and wasm; the WKT parser is native-only (below).
+proj4rs = { version = "0.3", default-features = false, features = ["crs-definitions", "wasm-strict"] }
+crs-definitions = "0.6"
 # DWF/DWFx packages, their XPS pages and DWF/DGN underlay rasters.
-zip = { version = "8", default-features = false, features = ["deflate"] }
-roxmltree = "0.20"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
+encoding_rs = "0.8"
 tiny-skia = "0.11"
 # PDF writer shared by desktop export and the web export/preview/print path.
-printpdf = { version = "0.9.1", default-features = false, features = ["images"] }
-# TrueType subsetting for searchable PDF text (same version printpdf itself
-# uses, so no new binary enters the lockfile). Same feature set as printpdf's
-# own allsorts use (pure-Rust flate backend) — the defaults would drag in the
-# libz-sys C dependency. Pure Rust, so the web build embeds
+printpdf = { version = "0.12", default-features = false, features = ["images"] }
+# Direct access to the page dictionaries and classic-xref serializer used for
+# opt-in, full-precision GeoPDF metadata (same version printpdf already uses).
+lopdf = { version = "0.47.0", default-features = false }
+# TrueType subsetting for searchable PDF text: allsorts-azul, the allsorts
+# build printpdf itself uses, so no new binary enters the lockfile. Same
+# feature set as printpdf's own use (pure-Rust flate backend) — the defaults
+# would drag in the libz-sys C dependency. Pure Rust, so the web build embeds
 # the same subsets.
-allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
-# Rasterises assets/logo.svg into the window icon at startup, so the taskbar
-# icon comes from the same file every other build target does. Already in the
-# tree behind iced's svg feature; named here only to use it directly.
-resvg = { version = "0.45", default-features = false }
+allsorts = { package = "allsorts-azul", version = "0.17.4", default-features = false, features = ["flate2_rust"] }
+# Rasterises SVG assets and off-screen captures via tiny-skia, including embedded
+# raster images (`gif`, `image-webp`, `zune-jpeg`, and PNG via `tiny-skia`).
+resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
 i18n-embed = { version = "0.16", features = ["fluent-system"] }
 i18n-embed-fl = "0.10"
 rust-embed = "8"
 inventory = "0.3"
 rustc-hash = "2"
-sha2 = "0.10"
+sha2 = "0.11"
+ifc-lite-core = "=30.0.0"
+ifc-lite-geometry = "=30.0.0"
+ifc-lite-processing = "=30.0.0"
 # Encrypted PDF owner-password checks (already in the tree through other crates).
-md-5 = "0.10"
-aes = "0.8"
+md-5 = "0.11"
+aes = "0.9"
 fontdb = "0.23"
 ttf-parser = "0.25"
 # TrueType interpreter for hint-reliant ("tricky") fonts such as DFKai-SB and
 # MingLiU, whose raw outlines are missing strokes. Already in the tree (hayro).
-skrifa = "0.42.1"
-cosmic-text = "0.15"
+skrifa = "0.50"
+cosmic-text = "0.19"
 unicode-bidi = "0.3"
 lyon_tessellation = "1.0.20"
-pollster = "0.4"
+pollster = "1"
+lru = { version = "0.19", default-features = false }
 
 [dev-dependencies]
 fluent-syntax = "0.12"
 iced_test = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
-naga = { version = "27", features = ["wgsl-in"] }
+naga = { version = "29", features = ["wgsl-in"] }
+pretty_assertions = "1.4"
+rstest = "0.29"
+serial_test = "4.0"
+tempfile = "3.27"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-libloading = "0.8"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Globalization", "Win32_Security_Authentication_Identity", "Win32_UI_Controls_Dialogs"] }
+libloading = "0.9"
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Globalization", "Win32_Security_Authentication_Identity", "Win32_UI_Controls_Dialogs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "settings", "wayland"] }
+# The X11 CLIPBOARD selection, for the SVG a copy puts there (#2018).
+x11rb = "0.14"
+ashpd = { version = "0.14.3", default-features = false, features = ["async-io", "settings", "wayland"] }
 
 # For `src/bin/ocs_launcher.rs` only (the .app's real CFBundleExecutable,
 # see that file for why) — already in the tree transitively via winit, pinned
@@ -113,25 +151,57 @@ block2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString", "NSObject", "NSNotification", "NSThread", "NSEnumerator"] }
 
 [patch.crates-io]
-iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
-iced_widget = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+iced_core = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_widget = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+
+# The pinned iced revision plus upstream 478c363df: a mesh clipped out of its
+# layer did not advance the index offset, so every later mesh in that layer
+# was drawn with the wrong indices (stale glyph outlines left across the top
+# of the window by rotated canvas text, #3063), and upstream b54f2c59: the
+# event loop no longer spins on a stale redraw deadline (#3418); upstream
+# bc9182e6/be79a169 (fix-strict-gles): no arrays in the triangle gradient
+# shader, which strict GLES drivers and WebGL on Mali rejected (#2608, #3587).
+# Drop when iced is bumped past all of them.
+[patch."https://github.com/iced-rs/iced.git"]
+iced = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_core = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_debug = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_futures = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_graphics = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_program = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_renderer = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_runtime = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_selector = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_test = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_tiny_skia = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_wgpu = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_widget = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
+iced_winit = { git = "https://github.com/HakanSeven12/iced.git", rev = "ba4ef4c495d16493a599a58fb8f2448fc9fc5a89" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-getrandom = "0.3"
+mimalloc = { version = "0.1", default-features = false }
+getrandom = "0.4"
 ocs_plugin_api = { path = "crates/ocs_plugin_api", features = ["host"] }
 bincode = "1.3"
-meshopt = "0.6.2"
+meshopt = "0.7"
 i18n-embed = { version = "0.16", features = ["desktop-requester"] }
 rayon = "1"
 open = "5"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
+# Text inside SVG images (plugin charts: `DialogControl::Svg`). iced's `svg`
+# feature leaves usvg without text shaping, so every <text> was dropped. Named
+# here only to switch the renderer's `svg-text` feature on (wgpu and tiny-skia).
+iced_renderer = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["svg-text"] }
+# WKT to PROJ for GEODATA without an EPSG authority. Native-only: on wasm the
+# crate always exports its own `main`, which breaks linking the web app.
+proj4wkt = { version = "0.2", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ocs_plugin_api = { path = "crates/ocs_plugin_api" }
 i18n-embed = { version = "0.16", features = ["web-sys-requester"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 console_error_panic_hook = "0.1"
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -282,6 +352,10 @@ name = "step_tokenizer"
 harness = false
 
 [[bench]]
+name = "model_import"
+harness = false
+
+[[bench]]
 name = "properties_selection_aggregation"
 harness = false
 
@@ -361,6 +435,192 @@ harness = false
 name = "scene_pick_micro"
 harness = false
 
+[[bench]]
+name = "drawing_open_memory"
+harness = false
+
+[[bench]]
+name = "text_shaping_geometry"
+harness = false
+
+[[bench]]
+name = "text_shaping_memory"
+harness = false
+
+[[bench]]
+name = "dynamic_block_grip_preview"
+harness = false
+
+[[bench]]
+name = "dynamic_block_visibility_switch"
+harness = false
+
+[[bench]]
+name = "block_incremental_perf"
+harness = false
+
+[[bench]]
+name = "layer_refresh_idle"
+harness = false
+
+[[bench]]
+name = "wires_build_visible"
+harness = false
+
+[[bench]]
+name = "wires_rebuild_stages"
+harness = false
+
+[[bench]]
+name = "large_overlay_interaction"
+harness = false
+
+[[bench]]
+name = "stub_materialize"
+harness = false
+
+[[bench]]
+name = "blk_cache_wires_build"
+harness = false
+
+[[bench]]
+name = "cache_memory_budget"
+harness = false
+
+[[bench]]
+name = "wire_model_memory"
+harness = false
+
+[[bench]]
+name = "wire_view_culling"
+harness = false
+
+[[bench]]
+name = "save_batch_memory"
+harness = false
+
+[[bench]]
+name = "polygon_overlay_and_clip"
+harness = false
+
 [[test]]
-name = "integration"
-path = "tests/integration.rs"
+name = "active_space_roundtrip"
+path = "tests/active_space_roundtrip.rs"
+
+[[test]]
+name = "annotative_context_roundtrip"
+path = "tests/annotative_context_roundtrip.rs"
+
+[[test]]
+name = "annotative_context_synthesis"
+path = "tests/annotative_context_synthesis.rs"
+
+[[test]]
+name = "annotative_dim_picture"
+path = "tests/annotative_dim_picture.rs"
+
+[[test]]
+name = "block_hatch_export"
+path = "tests/block_hatch_export.rs"
+
+[[test]]
+name = "block_text_draw_depth"
+path = "tests/block_text_draw_depth.rs"
+
+[[test]]
+name = "dim_copy_check"
+path = "tests/dim_copy_check.rs"
+
+[[test]]
+name = "dim_leader_render_check"
+path = "tests/dim_leader_render_check.rs"
+
+[[test]]
+name = "dim_line_color_roundtrip"
+path = "tests/dim_line_color_roundtrip.rs"
+
+[[test]]
+name = "explode_regression"
+path = "tests/explode_regression.rs"
+
+[[test]]
+name = "flatten_regression"
+path = "tests/flatten_regression.rs"
+
+[[test]]
+name = "geodata_roundtrip"
+path = "tests/geodata_roundtrip.rs"
+
+[[test]]
+name = "hatch_shader_lod"
+path = "tests/hatch_shader_lod.rs"
+
+[[test]]
+name = "mesh_shader_limits"
+path = "tests/mesh_shader_limits.rs"
+
+[[test]]
+name = "page_setup_root_repair"
+path = "tests/page_setup_root_repair.rs"
+
+[[test]]
+name = "parametric_constraints_solve"
+path = "tests/parametric_constraints_solve.rs"
+
+[[test]]
+name = "pdf_export_images_check"
+path = "tests/pdf_export_images_check.rs"
+
+[[test]]
+name = "pdf_export_text_check"
+path = "tests/pdf_export_text_check.rs"
+
+[[test]]
+name = "pdf_page_tree_cycle"
+path = "tests/pdf_page_tree_cycle.rs"
+
+[[test]]
+name = "presspull_curved_boundary"
+path = "tests/presspull_curved_boundary.rs"
+
+[[test]]
+name = "scale_list_nan"
+path = "tests/scale_list_nan.rs"
+
+[[test]]
+name = "section_plane_roundtrip"
+path = "tests/section_plane_roundtrip.rs"
+
+[[test]]
+name = "text_font_rendering"
+path = "tests/text_font_rendering.rs"
+
+[[test]]
+name = "text_shader_minification"
+path = "tests/text_shader_minification.rs"
+
+[[test]]
+name = "ucs_face_plane"
+path = "tests/ucs_face_plane.rs"
+
+[[test]]
+name = "viewport_wide_polyline_plot_width"
+path = "tests/viewport_wide_polyline_plot_width.rs"
+
+[[test]]
+name = "xclip_plot_test"
+path = "tests/xclip_plot_test.rs"
+
+[[test]]
+name = "zoom_extents_coverage"
+path = "tests/zoom_extents_coverage.rs"
+
+[[test]]
+name = "zoom_extents_xline"
+path = "tests/zoom_extents_xline.rs"
+
+# These two suites share helpers, so they stay in one binary.
+[[test]]
+name = "entity_roundtrip"
+path = "tests/entity_roundtrip.rs"
+

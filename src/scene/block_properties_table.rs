@@ -1,11 +1,11 @@
 //! Native Block Properties Table authoring.
 use super::block_authoring::{self as authoring, *};
-use codec::objects::{
+use document::objects::{
     BlockElement, BlockEvalValue, BlockGrip, BlockGripExpression, BlockOnePointParameter,
     BlockParameter, BlockPropertiesTable, BlockPropertiesTableField, BlockPropertiesTableValue,
     DynamicBlockData, ObjectType,
 };
-use codec::{Document, Handle};
+use document::{Document, Handle};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Column {
@@ -511,10 +511,19 @@ fn ensure_grip(
 }
 
 /// Repair the former three-object append layout, preserving all unrelated nodes.
-pub(crate) fn repair_grip_graph(doc: &mut Document, definition: Handle, table: Handle) -> Result<bool, &'static str> {
-    let graph_handle = authoring::graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
-    let Some(ObjectType::DynamicBlock(table_object)) = doc.objects.get(&table) else { return Ok(false) };
-    let DynamicBlockData::PropertiesTable(table_data) = &table_object.data else { return Ok(false) };
+pub(crate) fn repair_grip_graph(
+    doc: &mut Document,
+    definition: Handle,
+    table: Handle,
+) -> Result<bool, &'static str> {
+    let graph_handle =
+        authoring::graph(doc, definition)?.ok_or("The authoring graph is unavailable.")?;
+    let Some(ObjectType::DynamicBlock(table_object)) = doc.objects.get(&table) else {
+        return Ok(false);
+    };
+    let DynamicBlockData::PropertiesTable(table_data) = &table_object.data else {
+        return Ok(false);
+    };
     let id = table_data.parameter.property_count;
     let grip = doc.objects.values().find_map(|object| match object {
         ObjectType::DynamicBlock(object) if object.owner == graph_handle => match &object.data {
@@ -763,7 +772,7 @@ fn handle_field(code: i32, value: Handle) -> BlockPropertiesTableField {
 mod tests {
     use super::*;
     use crate::scene::{block_distance_parameter as distance, Scene};
-    use codec::{types::Vector3, DwgReader, DwgWriter, DxfReader, DxfWriter};
+    use document::{types::Vector3, DwgReader, DwgWriter, DxfReader, DxfWriter};
     use std::io::Cursor;
 
     fn fixture() -> (Document, Handle, Vec<Column>) {

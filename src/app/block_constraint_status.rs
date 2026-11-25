@@ -31,7 +31,7 @@ impl OpenCADStudio {
                 "TOGGLE" => !self.tabs[i].scene.block_constraint_status_mode,
                 _ => {
                     self.command_line
-                        .push_error(crate::t!("BCONSTATUSMODE requires 0 or 1.").as_ref());
+                        .push_rejection(crate::t!("BCONSTATUSMODE requires 0 or 1.").as_ref());
                     return Task::none();
                 }
             };
@@ -47,7 +47,10 @@ impl OpenCADStudio {
         } else {
             let value = u8::from(self.tabs[i].scene.block_constraint_status_mode);
             self.command_line
-                .push_output(&crate::ui::command_line::value_prompt("BCONSTATUSMODE", &value));
+                .push_output(&crate::ui::command_line::value_prompt(
+                    "BCONSTATUSMODE",
+                    &value,
+                ));
             self.pending_setvar = Some("BCONSTATUSMODE".into());
         }
         Task::none()

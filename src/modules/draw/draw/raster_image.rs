@@ -13,9 +13,9 @@
 //   4. Entity is committed.
 
 use crate::t;
-use codec::entities::RasterImage;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::RasterImage;
+use document::types::Vector3;
+use document::EntityType;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
@@ -100,9 +100,9 @@ impl ImageCommand {
         );
         img.u_vector = Vector3::new(u.x, u.y, u.z);
         img.v_vector = Vector3::new(v.x, v.y, v.z);
-        img.flags = codec::entities::ImageDisplayFlags::SHOW_IMAGE
-            | codec::entities::ImageDisplayFlags::SHOW_NOT_ALIGNED
-            | codec::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY;
+        img.flags = document::entities::ImageDisplayFlags::SHOW_IMAGE
+            | document::entities::ImageDisplayFlags::SHOW_NOT_ALIGNED
+            | document::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY;
         Some(EntityType::RasterImage(img))
     }
 
@@ -123,9 +123,9 @@ impl ImageCommand {
                     world_width,
                     world_height,
                 );
-                img.flags = codec::entities::ImageDisplayFlags::SHOW_IMAGE
-                    | codec::entities::ImageDisplayFlags::SHOW_NOT_ALIGNED
-                    | codec::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY;
+                img.flags = document::entities::ImageDisplayFlags::SHOW_IMAGE
+                    | document::entities::ImageDisplayFlags::SHOW_NOT_ALIGNED
+                    | document::entities::ImageDisplayFlags::USE_CLIPPING_BOUNDARY;
                 self.plane.place_entity(EntityType::RasterImage(img))
             }
             ImageSource::Embedded(image) => {
@@ -224,8 +224,6 @@ impl CadCommand for ImageCommand {
         Some(WireModel {
             bg_adapt: None,
             point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
@@ -233,29 +231,29 @@ impl CadCommand for ImageCommand {
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
+            solid_normal: None,
             render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
             dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
             name: "image_preview".into(),
-            points: vec![p0, p1, p2, p3, p0],
-            points_low: Vec::new(),
             color: WireModel::CYAN,
             selected: false,
             pattern_length: 0.0,
             pattern: [0.0; 8],
             line_weight_px: 1.0,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
             aci: 0,
-            key_vertices: vec![],
             aabb: WireModel::UNBOUNDED_AABB,
             plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
-
+            geom: std::sync::Arc::new(crate::scene::WireGeom {
+                taper_widths: Vec::new(),
+                pattern_stations: Vec::new(),
+                text_verts: Vec::new(),
+                points: vec![p0, p1, p2, p3, p0],
+                points_low: Default::default(),
+                snap_pts: vec![],
+                tangent_geoms: vec![],
+                key_vertices: vec![],
+                ..crate::scene::WireGeom::default()
+            }),
             ..Default::default()
         })
     }

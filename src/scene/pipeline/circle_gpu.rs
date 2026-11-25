@@ -77,6 +77,7 @@ impl CircleInstance {
     }
 }
 
+#[derive(Clone)]
 pub struct CircleGpu {
     pub instance_buffer: wgpu::Buffer,
     pub instance_count: u32,
@@ -268,7 +269,8 @@ pub fn extract_circle_instance_from_geom_indexed(
     }
 
     let (ch, cl) = split_ds_xyz(center[0], center[1], center[2]);
-    let hw = wire.line_weight_px.max(1.0) * 0.5;
+    // Under half a pixel too, as in `emit_wire_packed` (#3470).
+    let hw = wire.line_weight_px.max(0.0) * 0.5;
     let pat0 = [
         wire.pattern[0],
         wire.pattern[1],
@@ -582,8 +584,8 @@ mod tests {
     }
 
     #[test]
-    fn test_donut_polyline_tessellates_to_analytical_arcs() {
-        use codec::Document;
+    fn donut_polyline_tessellates_to_analytical_arcs() {
+        use document::Document;
         let mut doc = Document::new();
         let donut = crate::modules::draw::draw::donut::make_donut(10.0, 20.0, 0.0, 10.0, 30.0);
         let h = doc.add_entity(donut).unwrap();
@@ -601,7 +603,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            None,
             &reference_only,
         );
         assert_eq!(

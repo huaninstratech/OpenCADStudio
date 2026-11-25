@@ -1,20 +1,46 @@
 use crate::t;
-use codec::entities::{Ray, XLine};
+use document::entities::{Ray, XLine};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{edit_prop as edit, format_length, ro_prop as ro, square_grip};
 use crate::entities::curve::{point_along, unit_direction};
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
 
 /// Display length used when rendering semi-infinite / infinite lines.
 const DISPLAY_EXTENT: f64 = 1_000_000.0;
 
+/// Points along `dir` from `bp`, one per decade (1, 10, ... DISPLAY_EXTENT),
+/// in the order of `sign` (+1 outward, -1 inward towards `bp`). A single
+/// segment to the far end degenerates on screen when the view is zoomed in
+/// far: the GPU expands it in f32 from ends ~1e6 units away, its sub-pixel
+/// width offset rounds away and the line vanishes. With a vertex every decade
+/// the segment under the view ends within ~10x the view's distance from the
+/// base point.
+fn decade_points(bp: [f64; 3], dir: [f64; 3], sign: f64) -> Vec<[f64; 3]> {
+    let mut steps = Vec::new();
+    let mut d = 1.0;
+    while d <= DISPLAY_EXTENT {
+        steps.push(d);
+        d *= 10.0;
+    }
+    if sign < 0.0 {
+        steps.reverse();
+    }
+    steps
+        .into_iter()
+        .map(|d| {
+            let t = sign * d;
+            [bp[0] + dir[0] * t, bp[1] + dir[1] * t, bp[2] + dir[2] * t]
+        })
+        .collect()
+}
+
 // ── Ray (semi-infinite line) ──────────────────────────────────────────────────
 
 impl RenderConvertible for Ray {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         let bp = self.base_point;
         let dir = self.direction;
         // Normalize direction to avoid f32 overflow when DXF stores
@@ -24,15 +50,12 @@ impl RenderConvertible for Ray {
             return None;
         }
         let (nx, ny, nz) = (dir.x / len, dir.y / len, dir.z / len);
-        let far: [f64; 3] = [
-            bp.x + nx * DISPLAY_EXTENT,
-            bp.y + ny * DISPLAY_EXTENT,
-            bp.z + nz * DISPLAY_EXTENT,
-        ];
         let start: [f64; 3] = [bp.x, bp.y, bp.z];
+        let mut run = vec![start];
+        run.extend(decade_points(start, [nx, ny, nz], 1.0));
         Some(RenderEntity {
             pick_tris: Vec::new(),
-            object: RenderObject::Lines(vec![start, far]),
+            object: RenderObject::Lines(run),
             snap_pts: vec![],
             tangent_geoms: vec![],
             key_vertices: vec![start],
@@ -67,20 +90,20 @@ impl Grippable for Ray {
     fn apply_grip(&mut self, grip_id: usize, apply: GripApply) {
         match (grip_id, apply) {
             (0, GripApply::Translate(d)) => {
-                self.base_point.x += d.x as f64;
-                self.base_point.y += d.y as f64;
-                self.base_point.z += d.z as f64;
+                self.base_point.x += d.x;
+                self.base_point.y += d.y;
+                self.base_point.z += d.z;
             }
             (0, GripApply::Absolute(p)) => {
-                self.base_point.x = p.x as f64;
-                self.base_point.y = p.y as f64;
-                self.base_point.z = p.z as f64;
+                self.base_point.x = p.x;
+                self.base_point.y = p.y;
+                self.base_point.z = p.z;
             }
             (1, GripApply::Absolute(p)) => {
                 // New direction = grip point - base point, normalized.
-                let dx = p.x as f64 - self.base_point.x;
-                let dy = p.y as f64 - self.base_point.y;
-                let dz = p.z as f64 - self.base_point.z;
+                let dx = p.x - self.base_point.x;
+                let dy = p.y - self.base_point.y;
+                let dz = p.z - self.base_point.z;
                 let len = (dx * dx + dy * dy + dz * dz).sqrt();
                 if len > 1e-9 {
                     self.direction.x = dx / len;
@@ -155,8 +178,8 @@ impl Transformable for Ray {
                     p2,
                 );
                 // Mirror the direction: negate the component perpendicular to mirror axis.
-                let ax = (p2.x - p1.x) as f64;
-                let ay = (p2.y - p1.y) as f64;
+                let ax = p2.x - p1.x;
+                let ay = p2.y - p1.y;
                 let len2 = ax * ax + ay * ay;
                 if len2 > 1e-12 {
                     let d = &mut entity.direction;
@@ -172,7 +195,7 @@ impl Transformable for Ray {
 // ── XLine (construction line, infinite) ──────────────────────────────────────
 
 impl RenderConvertible for XLine {
-    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &document::Document) -> Option<RenderEntity> {
         let bp = self.base_point;
         let dir = self.direction;
         let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt();
@@ -180,19 +203,14 @@ impl RenderConvertible for XLine {
             return None;
         }
         let (nx, ny, nz) = (dir.x / len, dir.y / len, dir.z / len);
-        let far_pos: [f64; 3] = [
-            bp.x + nx * DISPLAY_EXTENT,
-            bp.y + ny * DISPLAY_EXTENT,
-            bp.z + nz * DISPLAY_EXTENT,
-        ];
-        let far_neg: [f64; 3] = [
-            bp.x - nx * DISPLAY_EXTENT,
-            bp.y - ny * DISPLAY_EXTENT,
-            bp.z - nz * DISPLAY_EXTENT,
-        ];
+        let base: [f64; 3] = [bp.x, bp.y, bp.z];
+        let unit = [nx, ny, nz];
+        let mut run = decade_points(base, unit, -1.0);
+        run.push(base);
+        run.extend(decade_points(base, unit, 1.0));
         Some(RenderEntity {
             pick_tris: Vec::new(),
-            object: RenderObject::Lines(vec![far_neg, far_pos]),
+            object: RenderObject::Lines(run),
             snap_pts: vec![],
             tangent_geoms: vec![],
             key_vertices: vec![[bp.x, bp.y, bp.z]],
@@ -223,19 +241,19 @@ impl Grippable for XLine {
     fn apply_grip(&mut self, grip_id: usize, apply: GripApply) {
         match (grip_id, apply) {
             (0, GripApply::Translate(d)) => {
-                self.base_point.x += d.x as f64;
-                self.base_point.y += d.y as f64;
-                self.base_point.z += d.z as f64;
+                self.base_point.x += d.x;
+                self.base_point.y += d.y;
+                self.base_point.z += d.z;
             }
             (0, GripApply::Absolute(p)) => {
-                self.base_point.x = p.x as f64;
-                self.base_point.y = p.y as f64;
-                self.base_point.z = p.z as f64;
+                self.base_point.x = p.x;
+                self.base_point.y = p.y;
+                self.base_point.z = p.z;
             }
             (1, GripApply::Absolute(p)) => {
-                let dx = p.x as f64 - self.base_point.x;
-                let dy = p.y as f64 - self.base_point.y;
-                let dz = p.z as f64 - self.base_point.z;
+                let dx = p.x - self.base_point.x;
+                let dy = p.y - self.base_point.y;
+                let dz = p.z - self.base_point.z;
                 let len = (dx * dx + dy * dy + dz * dz).sqrt();
                 if len > 1e-9 {
                     self.direction.x = dx / len;
@@ -316,8 +334,8 @@ impl Transformable for XLine {
                     p1,
                     p2,
                 );
-                let ax = (p2.x - p1.x) as f64;
-                let ay = (p2.y - p1.y) as f64;
+                let ax = p2.x - p1.x;
+                let ay = p2.y - p1.y;
                 let len2 = ax * ax + ay * ay;
                 if len2 > 1e-12 {
                     let d = &mut entity.direction;
@@ -327,5 +345,43 @@ impl Transformable for XLine {
                 }
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod display_run_tests {
+    use super::*;
+    use document::types::Vector3;
+
+    fn run(entity: Option<RenderEntity>) -> Vec<[f64; 3]> {
+        match entity.expect("renders").object {
+            RenderObject::Lines(points) => points,
+            _ => panic!("expected a line run"),
+        }
+    }
+
+    #[test]
+    fn xline_renders_a_vertex_every_decade_both_ways() {
+        let doc = document::Document::new();
+        let xl = XLine::new(Vector3::new(700.0, 20.0, 0.0), Vector3::new(2.0, 0.0, 0.0));
+        let pts = run(xl.to_render(&doc));
+        assert_eq!(pts.len(), 15);
+        assert_eq!(pts[7], [700.0, 20.0, 0.0]);
+        assert_eq!(pts[0][0], 700.0 - DISPLAY_EXTENT);
+        assert_eq!(pts[6][0], 699.0);
+        assert_eq!(pts[8][0], 701.0);
+        assert_eq!(pts[14][0], 700.0 + DISPLAY_EXTENT);
+        assert!(pts.windows(2).all(|w| w[1][0] > w[0][0]));
+    }
+
+    #[test]
+    fn ray_renders_from_its_base_with_decade_vertices() {
+        let doc = document::Document::new();
+        let ray = Ray::new(Vector3::new(1.0, 2.0, 0.0), Vector3::new(0.0, -1.0, 0.0));
+        let pts = run(ray.to_render(&doc));
+        assert_eq!(pts.len(), 8);
+        assert_eq!(pts[0], [1.0, 2.0, 0.0]);
+        assert_eq!(pts[1], [1.0, 1.0, 0.0]);
+        assert_eq!(pts[7], [1.0, 2.0 - DISPLAY_EXTENT, 0.0]);
     }
 }

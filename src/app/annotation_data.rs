@@ -3,10 +3,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use codec::entities::{table::CellRange, TableBuilder};
-use codec::objects::{ClassObject, ClassObjectData, DataLink, DataLinkCustomData, ObjectType};
-use codec::types::{Handle, Vector3};
-use codec::{Document, EntityType};
+use document::entities::{table::CellRange, TableBuilder};
+use document::objects::{ClassObject, ClassObjectData, DataLink, DataLinkCustomData, ObjectType};
+use document::types::{Handle, Vector3};
+use document::{Document, EntityType};
 use iced::Task;
 
 use super::{Message, ModalKind, OpenCADStudio};
@@ -224,8 +224,7 @@ pub(crate) fn data_link_entries(doc: &Document) -> Vec<(String, Handle)> {
 }
 
 fn data_link_dictionary(doc: &Document) -> Option<Handle> {
-    let Some(ObjectType::Dictionary(root)) =
-        doc.objects.get(&doc.header.named_objects_dict_handle)
+    let Some(ObjectType::Dictionary(root)) = doc.objects.get(&doc.header.named_objects_dict_handle)
     else {
         return None;
     };
@@ -265,7 +264,7 @@ fn put_data_link_entry(doc: &mut Document, handle: Handle, name: &str) {
             return None;
         }
         let dictionary_handle = doc.allocate_handle();
-        let mut dictionary = codec::objects::Dictionary::new();
+        let mut dictionary = document::objects::Dictionary::new();
         dictionary.handle = dictionary_handle;
         dictionary.owner = root;
         dictionary.hard_owner = true;
@@ -476,9 +475,7 @@ fn link_details(doc: &Document, link: &DataLink) -> String {
     let sheet = sheet.unwrap_or_default();
     match (kind, range) {
         (LinkRange::NamedRange, Some(name)) => crate::tf!("Named range: {name}").into_owned(),
-        (LinkRange::CellRange, Some(cells)) => {
-            crate::tf!("Range: {sheet}!{cells}").into_owned()
-        }
+        (LinkRange::CellRange, Some(cells)) => crate::tf!("Range: {sheet}!{cells}").into_owned(),
         _ => crate::tf!("Entire sheet: {sheet}").into_owned(),
     }
 }
@@ -506,7 +503,7 @@ fn data_link_choices(doc: &Document) -> Vec<DataLinkChoice> {
     links
 }
 
-fn data_link<'a>(doc: &'a Document, handle: Handle) -> Option<&'a DataLink> {
+fn data_link(doc: &Document, handle: Handle) -> Option<&DataLink> {
     match doc.objects.get(&handle) {
         Some(ObjectType::ClassObject(object)) => match &object.data {
             ClassObjectData::DataLink(link) => Some(link),
@@ -516,7 +513,7 @@ fn data_link<'a>(doc: &'a Document, handle: Handle) -> Option<&'a DataLink> {
     }
 }
 
-fn data_link_mut<'a>(doc: &'a mut Document, handle: Handle) -> Option<&'a mut DataLink> {
+fn data_link_mut(doc: &mut Document, handle: Handle) -> Option<&mut DataLink> {
     match doc.objects.get_mut(&handle) {
         Some(ObjectType::ClassObject(object)) => match &mut object.data {
             ClassObjectData::DataLink(link) => Some(link),
@@ -549,6 +546,17 @@ fn cell_ref(text: &str) -> Option<(usize, usize)> {
 }
 
 fn crop_range(rows: Vec<Vec<String>>, range: &str) -> Result<Vec<Vec<String>>, String> {
+    crop_range_at(rows, range, (0, 0))
+}
+
+/// The cells of `range` out of `rows`, whose first cell is the cell of the
+/// sheet at `first` (row and column, from 0): the rows read from a workbook
+/// sheet start at its first used cell, which need not be A1.
+fn crop_range_at(
+    rows: Vec<Vec<String>>,
+    range: &str,
+    first: (usize, usize),
+) -> Result<Vec<Vec<String>>, String> {
     let (start, end) = range.split_once(':').unwrap_or((range, range));
     let (Some((r0, c0)), Some((r1, c1))) = (cell_ref(start), cell_ref(end)) else {
         return Err(crate::t!("Enter a valid cell range such as A1:D10.").into_owned());
@@ -559,14 +567,20 @@ fn crop_range(rows: Vec<Vec<String>>, range: &str) -> Result<Vec<Vec<String>>, S
     // column axis was not — `A1:ZZZZZZ1` parses fine and then collected one
     // String per column (~308 M slots per row, OOM). Columns past the widest
     // row are empty in every row, so clamp the window to the data width.
+    // Rows and columns before the sheet's first cell are empty in every row
+    // too: the window starts at that cell at the earliest.
     let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let c1 = c1.min(widest.saturating_sub(1));
+    let (top, left) = first;
+    let rows_from = r0.saturating_sub(top);
+    let rows_to = (r1 + 1).saturating_sub(top);
+    let columns_from = c0.saturating_sub(left);
+    let columns_to = (c1 + 1).saturating_sub(left).min(widest);
     Ok(rows
         .into_iter()
-        .skip(r0)
-        .take(r1 - r0 + 1)
+        .skip(rows_from)
+        .take(rows_to.saturating_sub(rows_from))
         .map(|row| {
-            (c0..=c1)
+            (columns_from..columns_to)
                 .map(|column| row.get(column).cloned().unwrap_or_default())
                 .collect()
         })
@@ -614,6 +628,14 @@ fn workbook_metadata_bytes(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>), S
         .map(|(name, _)| name.clone())
         .collect();
     Ok((sheets, names))
+}
+
+/// Rows of the first sheet of a workbook held in memory (no path to reopen).
+pub(crate) fn workbook_first_sheet_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>, String> {
+    use calamine::open_workbook_auto_from_rs;
+    let mut workbook =
+        open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    workbook_rows(&mut workbook, None, LinkRange::EntireSheet, None).map(|(rows, _)| rows)
 }
 
 fn named_range_target(formula: &str) -> Option<(String, String)> {
@@ -679,12 +701,19 @@ fn workbook_rows<RS: std::io::Read + std::io::Seek>(
     let data = workbook
         .worksheet_range(&selected_sheet)
         .map_err(|error| error.to_string())?;
-    Ok((
-        data.rows()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect(),
-        (!cell_range.is_empty()).then_some(cell_range),
-    ))
+    let rows: Vec<Vec<String>> = data
+        .rows()
+        .map(|row| row.iter().map(ToString::to_string).collect())
+        .collect();
+    if cell_range.is_empty() {
+        return Ok((rows, None));
+    }
+    // The sheet's rows start at its first used cell, which need not be A1:
+    // the range is taken from where the cells are on the sheet.
+    let first = data
+        .start()
+        .map_or((0, 0), |(row, column)| (row as usize, column as usize));
+    Ok((crop_range_at(rows, &cell_range, first)?, None))
 }
 
 pub(crate) fn read_tabular_file(
@@ -750,7 +779,7 @@ fn table_style_choices(doc: &Document) -> Vec<crate::modules::annotate::table_cm
                 style_copy.ensure_cell_styles(|row| {
                     row.text_style_handle
                         .or_else(|| doc.text_styles.get(&row.text_style_name).map(|s| s.handle))
-                        .unwrap_or(codec::Handle::NULL)
+                        .unwrap_or(document::Handle::NULL)
                 });
                 Some(crate::modules::annotate::table_cmd::StyleChoice {
                     name: style.name.clone(),
@@ -771,6 +800,38 @@ fn table_style_choices(doc: &Document) -> Vec<crate::modules::annotate::table_cm
     styles
 }
 
+/// The drawing's current table style, or its first one when the current
+/// name picks none.
+pub(in crate::app) fn current_table_style(
+    doc: &Document,
+) -> Option<crate::modules::annotate::table_cmd::StyleChoice> {
+    let mut styles = table_style_choices(doc);
+    let current = styles
+        .iter()
+        .position(|choice| {
+            choice
+                .name
+                .eq_ignore_ascii_case(&doc.header.current_table_style_name)
+        })
+        .unwrap_or(0);
+    (current < styles.len()).then(|| styles.swap_remove(current))
+}
+
+/// The table PASTESPEC places for `cells`: data rows in the current table
+/// style at the column width TABLE uses, as after typing the cells — text
+/// read as their data type, each row as high as its wrapped text needs.
+pub(in crate::app) fn pasted_table(
+    doc: &Document,
+    cells: &[Vec<String>],
+) -> document::entities::Table {
+    use crate::modules::annotate::table_cmd;
+    let style = current_table_style(doc);
+    let width = table_cmd::session().cell_width(doc.header.measurement == 1);
+    let mut table = table_cmd::data_table(style.as_ref(), cells, width);
+    crate::entities::table::settle_table(&mut table, doc);
+    table
+}
+
 fn table_style_handle(doc: &Document, name: &str) -> Option<Handle> {
     doc.objects
         .iter()
@@ -784,7 +845,7 @@ fn build_table(
     rows: &[Vec<String>],
     style: Option<Handle>,
     title: Option<&str>,
-) -> codec::entities::Table {
+) -> document::entities::Table {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
     let title_rows = usize::from(title.is_some_and(|value| !value.trim().is_empty()));
     let mut table = TableBuilder::new(rows.len().max(1) + title_rows, columns)
@@ -809,10 +870,7 @@ fn build_table(
 
 /// The sheet, range kind and range a link reads: from its connection string,
 /// or from the custom data older OpenCAD drawings kept them in.
-fn link_selection(
-    doc: &Document,
-    link: &DataLink,
-) -> (Option<String>, LinkRange, Option<String>) {
+fn link_selection(doc: &Document, link: &DataLink) -> (Option<String>, LinkRange, Option<String>) {
     let mut sheet = None;
     let mut kind = LinkRange::EntireSheet;
     let mut range = None;
@@ -939,7 +997,10 @@ pub(crate) fn add_extraction_link(doc: &mut Document, settings: &str) -> Handle 
     let names = data_link_entries(doc);
     let mut name = base.clone();
     let mut n = 1;
-    while names.iter().any(|(known, _)| known.eq_ignore_ascii_case(&name)) {
+    while names
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&name))
+    {
         n += 1;
         name = format!("{base} ({n})");
     }
@@ -965,8 +1026,7 @@ pub(crate) fn extraction_link_settings(doc: &Document, handle: Handle) -> Option
 
 /// Whether the link lets tables write their data back to the source.
 pub(crate) fn data_link_allows_write(doc: &Document, handle: Handle) -> bool {
-    data_link(doc, handle)
-        .is_some_and(|link| link.update_option & UPDATE_ALLOW_SOURCE_UPDATE != 0)
+    data_link(doc, handle).is_some_and(|link| link.update_option & UPDATE_ALLOW_SOURCE_UPDATE != 0)
 }
 
 fn read_link_rows(doc: &Document, link: &DataLink) -> Result<Vec<Vec<String>>, String> {
@@ -979,10 +1039,7 @@ fn read_link_rows(doc: &Document, link: &DataLink) -> Result<Vec<Vec<String>>, S
     )
 }
 
-pub(crate) fn read_data_link(
-    doc: &Document,
-    handle: Handle,
-) -> Result<Vec<Vec<String>>, String> {
+pub(crate) fn read_data_link(doc: &Document, handle: Handle) -> Result<Vec<Vec<String>>, String> {
     let link = data_link(doc, handle)
         .ok_or_else(|| crate::t!("The data link no longer exists.").into_owned())?;
     read_link_rows(doc, link)
@@ -1049,9 +1106,9 @@ fn collect_records(
         if !allowed_names.contains(&name) {
             continue;
         }
-        let values = catalog::properties(entity)
+        let values = catalog::properties(entity, doc)
             .into_iter()
-            .map(|property| (property.key, catalog::value(entity, property.key, &facts)))
+            .map(|property| (property.key, catalog::value(entity, property.key, &facts, doc)))
             .collect();
         out.push(ExtractionRecord { name, values });
     }
@@ -1142,7 +1199,7 @@ fn collect_object_catalog(
         let (name, block) = crate::app::extraction_catalog::object_name(entity);
         let entry = catalog.entry(name).or_insert((block, 0, Vec::new()));
         entry.1 += 1;
-        for property in crate::app::extraction_catalog::properties(entity) {
+        for property in crate::app::extraction_catalog::properties(entity, doc) {
             if !entry.2.iter().any(|known| known.key == property.key) {
                 entry.2.push(property);
             }
@@ -1277,10 +1334,9 @@ pub(crate) fn write_extraction_file(path: &Path, rows: &[Vec<String>]) -> Result
             + "\n")
             .into_bytes(),
         _ => {
-            return Err(crate::t!(
-                "The external file must be an .xlsx, .csv or .txt file."
+            return Err(
+                crate::t!("The external file must be an .xlsx, .csv or .txt file.").into_owned(),
             )
-            .into_owned())
         }
     };
     #[cfg(target_arch = "wasm32")]
@@ -1299,7 +1355,7 @@ pub(crate) fn write_extraction_file(path: &Path, rows: &[Vec<String>]) -> Result
 }
 
 /// A one-sheet workbook holding the rows as text cells.
-fn xlsx_bytes(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
+pub(crate) fn xlsx_bytes(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
     use std::io::Write;
     fn column_name(mut index: usize) -> String {
         let mut name = String::new();
@@ -1599,7 +1655,9 @@ fn load_extraction_settings(state: &mut DataExtractionState) -> Result<(), Strin
         }
     }
     if let Some(hidden) = set_of("hiddenCategories") {
-        state.categories.retain(|category| !hidden.contains(category));
+        state
+            .categories
+            .retain(|category| !hidden.contains(category));
         state.hidden_categories = hidden;
     }
     state.combine_identical = flag("combineIdentical", state.combine_identical);
@@ -1676,7 +1734,9 @@ fn load_extractor_settings(state: &mut DataExtractionState, value: &serde_json::
     let text_of = |key: &str, current: &str| output[key].as_str().unwrap_or(current).to_string();
     state.output_path = text_of("fileName", &state.output_path);
     state.output_file = !state.output_path.trim().is_empty();
-    state.output_table = output["ouputFlags"].as_i64().map_or(state.output_table, |f| f & 2 != 0);
+    state.output_table = output["ouputFlags"]
+        .as_i64()
+        .map_or(state.output_table, |f| f & 2 != 0);
     state.table_style = text_of("tableStyleName", &state.table_style);
     state.table_title = text_of("tableTitle", &state.table_title);
     state.title_cell_style = text_of("titleCellStyle", &state.title_cell_style);
@@ -1730,7 +1790,11 @@ impl OpenCADStudio {
         let styles = table_style_choices(doc);
         let current = styles
             .iter()
-            .find(|choice| choice.name.eq_ignore_ascii_case(&doc.header.current_table_style_name))
+            .find(|choice| {
+                choice
+                    .name
+                    .eq_ignore_ascii_case(&doc.header.current_table_style_name)
+            })
             .or(styles.first())
             .cloned();
         let links = data_link_choices(doc)
@@ -1759,7 +1823,8 @@ impl OpenCADStudio {
             .map(Handle::new)
             .and_then(|handle| data_link(doc, handle).map(|link| (handle, link)))
         else {
-            self.command_line.push_error(crate::t!("Data link not found.").as_ref());
+            self.command_line
+                .push_error(crate::t!("Data link not found.").as_ref());
             return;
         };
         let rows = match read_link_rows(doc, link) {
@@ -1772,11 +1837,44 @@ impl OpenCADStudio {
         let table = build_table(&rows, table_style_handle(doc, style.trim()), None);
         let command =
             crate::modules::annotate::data_link::DataLinkPlaceCommand::existing_from_table(
-                table, handle,
+                table, handle, "-TABLE",
             );
         self.command_line
             .push_info(&crate::command::CadCommand::prompt(&command));
         self.tabs[i].active_cmd = Some(Box::new(command));
+    }
+
+    /// PASTESPEC's Link format: read the cells a copied range was copied
+    /// from and go on as DATALINK does with a table of them — the table is
+    /// linked to those cells of the file when it is placed.
+    pub(in crate::app) fn place_linked_table(
+        &mut self,
+        source: crate::sys::clipboard_link::SourceLink,
+    ) {
+        let i = self.active_tab;
+        let rows = match read_tabular_file(
+            Path::new(&source.file),
+            Some(&source.sheet),
+            LinkRange::CellRange,
+            Some(&source.cells),
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.command_line
+                    .push_error(crate::tf!("PASTESPEC: {error}").as_ref());
+                return;
+            }
+        };
+        let table = pasted_table(&self.tabs[i].scene.document, &rows);
+        let command = crate::modules::annotate::data_link::DataLinkPlaceCommand::of_cells(
+            table,
+            &source.file,
+            &source.sheet,
+            &source.cells,
+        );
+        self.command_line.push_info(&command.prompt());
+        self.tabs[i].active_cmd = Some(Box::new(command));
+        self.push_ucs_to_cmd(i);
     }
 
     pub(super) fn open_data_link_manager(&mut self, from_table: bool) {
@@ -1947,17 +2045,21 @@ impl OpenCADStudio {
         self.table_insert.template = style.as_ref().and_then(|choice| {
             let template = choice.template.as_ref()?;
             let width = template.columns.first().map_or(0.0, |c| c.width);
-            Some((crate::entities::common::format_length(width), "1".to_string()))
+            Some((
+                crate::entities::common::format_length(width),
+                "1".to_string(),
+            ))
         });
         if self.table_insert.template.is_some() {
             self.table_insert.insertion = TableInsertion::Point;
         }
-        self.table_insert.template_options = *crate::modules::annotate::table_cmd::template_options();
+        self.table_insert.template_options =
+            *crate::modules::annotate::table_cmd::template_options();
         self.table_insert.cell_styles = style.map_or_else(Vec::new, |choice| {
             choice
                 .style
                 .cell_styles()
-                .filter(|cell| !codec::objects::is_row_cell_style(&cell.name))
+                .filter(|cell| !document::objects::is_row_cell_style(&cell.name))
                 .map(|cell| cell.name.clone())
                 .collect()
         });
@@ -2030,10 +2132,12 @@ impl OpenCADStudio {
                 table_style_handle(doc, &self.table_insert.style),
                 None,
             );
-            let command = crate::modules::annotate::data_link::DataLinkPlaceCommand::existing(
-                table,
-                choice.handle,
-            );
+            let command =
+                crate::modules::annotate::data_link::DataLinkPlaceCommand::existing_from_table(
+                    table,
+                    choice.handle,
+                    "TABLE",
+                );
             self.active_modal = None;
             self.reset_modal_geometry();
             self.command_line.push_info(&command.prompt());
@@ -2455,9 +2559,9 @@ impl OpenCADStudio {
                             cell.data_link_rows = 0;
                             cell.data_link_columns = 0;
                             cell.state.remove(
-                                codec::entities::table::CellStateFlags::LINKED
-                                    | codec::entities::table::CellStateFlags::CONTENT_LOCKED
-                                    | codec::entities::table::CellStateFlags::FORMAT_LOCKED,
+                                document::entities::table::CellStateFlags::LINKED
+                                    | document::entities::table::CellStateFlags::CONTENT_LOCKED
+                                    | document::entities::table::CellStateFlags::FORMAT_LOCKED,
                             );
                         }
                     }
@@ -2560,7 +2664,9 @@ impl OpenCADStudio {
                     self.data_extraction.hidden_categories.remove(&category);
                     self.data_extraction.categories.insert(category);
                 } else {
-                    self.data_extraction.hidden_categories.insert(category.clone());
+                    self.data_extraction
+                        .hidden_categories
+                        .insert(category.clone());
                     self.data_extraction.categories.remove(&category);
                 }
             }
@@ -2663,8 +2769,7 @@ impl OpenCADStudio {
                 }
             }
         }
-        let (properties, categories) =
-            extraction_properties(&self.data_extraction, &previous);
+        let (properties, categories) = extraction_properties(&self.data_extraction, &previous);
         self.data_extraction.categories = categories;
         self.data_extraction.properties = properties;
     }
@@ -3067,15 +3172,20 @@ impl OpenCADStudio {
     /// The extraction table: a title row (empty when no title was given),
     /// the column headers, then the data, in the chosen table and cell
     /// styles, each column as wide as its longest entry.
-    fn extraction_table(&self, rows: &[Vec<String>]) -> codec::entities::Table {
+    fn extraction_table(&self, rows: &[Vec<String>]) -> document::entities::Table {
         let state = &self.data_extraction;
         let doc = &self.tabs[self.active_tab].scene.document;
-        let style = doc.objects.iter().find_map(|(handle, object)| match object {
-            ObjectType::TableStyle(style) if style.name.eq_ignore_ascii_case(&state.table_style) => {
-                Some((*handle, style))
-            }
-            _ => None,
-        });
+        let style = doc
+            .objects
+            .iter()
+            .find_map(|(handle, object)| match object {
+                ObjectType::TableStyle(style)
+                    if style.name.eq_ignore_ascii_case(&state.table_style) =>
+                {
+                    Some((*handle, style))
+                }
+                _ => None,
+            });
         let body: Vec<Vec<String>> = if state.property_headers {
             rows.to_vec()
         } else {
@@ -3093,11 +3203,8 @@ impl OpenCADStudio {
                 (
                     rows.map(|row| row.text_height.max(1.0e-6)),
                     rows.map(|row| {
-                        crate::entities::text_support::resolve_text_style(
-                            &row.text_style_name,
-                            doc,
-                        )
-                        .font_name
+                        crate::entities::text_support::resolve_text_style(&row.text_style_name, doc)
+                            .font_name
                     }),
                     (table_style.horizontal_margin, table_style.vertical_margin),
                 )
@@ -3105,7 +3212,11 @@ impl OpenCADStudio {
             None => {
                 let font =
                     crate::entities::text_support::resolve_text_style("Standard", doc).font_name;
-                ([0.25, 0.25, 0.18], [font.clone(), font.clone(), font], (0.06, 0.06))
+                (
+                    [0.25, 0.25, 0.18],
+                    [font.clone(), font.clone(), font],
+                    (0.06, 0.06),
+                )
             }
         };
         // A text's extent: from the left of its ink or pen origin to the right
@@ -3288,6 +3399,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cell_range_reads_its_own_cells_when_the_sheet_starts_below_a1() {
+        // Nothing in row 1 or in column A: the sheet's cells start at B2.
+        let cell = |text: &str| text.to_string();
+        let sheet = vec![
+            Vec::new(),
+            vec![cell(""), cell("Mark"), cell("Qty")],
+            vec![cell(""), cell("B1"), cell("4")],
+            vec![cell(""), cell("C1"), cell("6")],
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "ocs-range-first-cell-{}-{}.xlsx",
+            std::process::id(),
+            line!()
+        ));
+        write_extraction_file(&path, &sheet).unwrap();
+        let read = |cells: &str| {
+            read_tabular_file(&path, Some("Sheet1"), LinkRange::CellRange, Some(cells))
+        };
+        let whole = read("B2:C4");
+        let lower = read("C3:C4");
+        // A range that starts above and left of the sheet's cells holds
+        // the cells it reaches.
+        let wider = read("A1:B3");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            whole,
+            Ok(vec![
+                vec![cell("Mark"), cell("Qty")],
+                vec![cell("B1"), cell("4")],
+                vec![cell("C1"), cell("6")],
+            ])
+        );
+        assert_eq!(lower, Ok(vec![vec![cell("4")], vec![cell("6")]]));
+        assert_eq!(wider, Ok(vec![vec![cell("Mark")], vec![cell("B1")]]));
+    }
+
     /// `column_index` only checks `checked_mul(26)`, so a range like
     /// `A1:ZZZZZZ1` parses fine — and `(c0..=c1)` then collects one `String`
     /// per column: ~308 M slots (~7 GB) for 6 Z's, and a `capacity overflow`
@@ -3342,6 +3490,174 @@ mod tests {
         register_extraction_document(&key, Document::new());
         assert!(extraction_document(&key.to_ascii_uppercase()).is_some());
         assert!(extraction_document("ocs-doc-other.dwg").is_none());
+    }
+
+    #[test]
+    fn block_record_attributes_are_listed_and_read() {
+        use document::entities::{AttributeDefinition, AttributeEntity, Insert, Line};
+        use document::types::Vector3;
+
+        let mut app = crate::app::OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let doc = &mut app.tabs[i].scene.document;
+
+        let mut record = document::tables::BlockRecord::new("VALVE");
+        record.handle = doc.allocate_handle();
+        let owner = record.handle;
+        doc.block_records.add(record).unwrap();
+
+        let mut line = Line::new();
+        line.start = Vector3::ZERO;
+        line.end = Vector3::new(10.0, 0.0, 0.0);
+        line.common.owner_handle = owner;
+        let line_handle = doc.add_entity(EntityType::Line(line)).unwrap();
+
+        let mut definition =
+            AttributeDefinition::new("TAG1".into(), "Tag?".into(), "DEFAULT".into());
+        definition.insertion_point = Vector3::new(15.0, 0.0, 0.0);
+        definition.alignment_point = definition.insertion_point;
+        definition.flags.constant = false;
+        definition.common.owner_handle = owner;
+        let definition_handle = doc
+            .add_entity(EntityType::AttributeDefinition(definition.clone()))
+            .unwrap();
+        // A constant tag that no instance sets: one placed instance still
+        // resolves the default.
+        let mut constant =
+            AttributeDefinition::new("SIZE".into(), "Size?".into(), "2in".into());
+        constant.insertion_point = Vector3::new(30.0, 0.0, 0.0);
+        constant.alignment_point = constant.insertion_point;
+        constant.flags.constant = true;
+        constant.common.owner_handle = owner;
+        let constant_handle = doc
+            .add_entity(EntityType::AttributeDefinition(constant.clone()))
+            .unwrap();
+        doc.block_records
+            .get_mut("VALVE")
+            .unwrap()
+            .entity_handles = vec![line_handle, definition_handle, constant_handle];
+
+        let mut insert = Insert::new("VALVE", Vector3::new(100.0, 50.0, 0.0));
+        insert
+            .attributes
+            .push(AttributeEntity::from_definition(&definition, Some("A-101".into())));
+        let insert_handle = doc.add_entity(EntityType::Insert(insert)).unwrap();
+
+        let mut records = Vec::new();
+        collect_records(
+            doc,
+            None,
+            None,
+            &std::collections::BTreeSet::from(["VALVE".to_string()]),
+            &mut records,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "VALVE");
+        let tag = records[0].values.get("Attribute.TAG1").unwrap().clone();
+        let size = records[0].values.get("Attribute.SIZE").unwrap().clone();
+        assert_eq!(tag, "A-101");
+        assert_eq!(size, "2in", "constant definitions resolve to their default");
+
+        // And the catalog exposes both tags as their own categories.
+        let catalog = crate::app::extraction_catalog::properties(
+            match doc.get_entity(insert_handle) {
+                Some(EntityType::Insert(_)) => doc.get_entity(insert_handle).unwrap(),
+                _ => panic!("the reference is there"),
+            },
+            doc,
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|property| property.key == "Attribute.TAG1" && property.category == "Attributes"),
+            "{catalog:?}"
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|property| property.key == "Attribute.SIZE" && property.category == "Attributes"),
+            "{catalog:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_block_parameters_are_listed_as_columns() {
+        use super::*;
+        use crate::scene::block_actions as actions;
+        use crate::scene::block_distance_parameter as distance;
+        use document::entities::{Insert, Line};
+        use document::types::Vector3;
+        use glam::DVec3;
+
+        let mut app = crate::app::OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let reference;
+        {
+            let doc = &mut app.tabs[i].scene.document;
+            let mut record = document::tables::BlockRecord::new("FLAG");
+            record.handle = doc.allocate_handle();
+            let owner = record.handle;
+            doc.block_records.add(record).unwrap();
+            let mut line = Line::new();
+            line.start = Vector3::ZERO;
+            line.end = Vector3::new(10.0, 0.0, 0.0);
+            line.common.owner_handle = owner;
+            let line_handle = doc.add_entity(EntityType::Line(line)).unwrap();
+            doc.block_records.get_mut("FLAG").unwrap().entity_handles = vec![line_handle];
+
+            let insert = Insert::new("FLAG", Vector3::new(100.0, 50.0, 0.0));
+            reference = doc.add_entity(EntityType::Insert(insert)).unwrap();
+        }
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+
+        let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+        // Build a distance parameter with a move action so the reference
+        // really is dynamic.
+        let source = &app.tabs[i].scene.document;
+        let member = source.block_records.get("FLAG").unwrap().entity_handles[0];
+        let parameter = distance::create(
+            &mut app.tabs[i].scene.document,
+            def,
+            distance::Kind::Linear,
+            Vector3::ZERO,
+            Vector3::new(10.0, 0.0, 0.0),
+            Vector3::UNIT_Y,
+        )
+        .unwrap();
+        let _ = actions::create(&mut app.tabs[i].scene.document, def, actions::Kind::Move, parameter, &[member], DVec3::ZERO).unwrap();
+        let p = actions::all_parameters(&app.tabs[i].scene.document, def)
+            .into_iter()
+            .find(|p| p.handle == parameter)
+            .unwrap();
+        let name = p.name.clone();
+
+        let _ = app.dispatch_command("BSAVE");
+        let _ = app.dispatch_command("BCLOSE");
+
+        let doc = &app.tabs[i].scene.document;
+        let mut records = Vec::new();
+        collect_records(
+            doc,
+            None,
+            None,
+            &std::collections::BTreeSet::from(["FLAG".to_string()]),
+            &mut records,
+        );
+        assert_eq!(records.len(), 1);
+        let dyn_value = records[0]
+            .values
+            .iter()
+            .find(|(key, _)| key.starts_with("Parameter."))
+            .map(|(_, value)| value.clone());
+        assert_eq!(
+            dyn_value,
+            Some("10".to_string()),
+            "the extraction reports the parameter value (name: {name})"
+        );
+        assert!(records[0].values.keys().any(|key| key.starts_with("Parameter.")));
+        let _ = reference;
     }
 
     #[test]

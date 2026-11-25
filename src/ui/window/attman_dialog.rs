@@ -7,10 +7,10 @@
 //! edited in a card below (Attribute / Text / Properties) and the settings
 //! are switches in the footer.
 
-use codec::entities::AttributeDefinition;
-use codec::Handle;
+use document::Handle;
+use document::entities::AttributeDefinition;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, toggler, Space,
+    Space, button, column, container, pick_list, row, scrollable, text, text_input, toggler,
 };
 use iced::{Background, Border, Color, Element, Fill, Length, Theme};
 
@@ -233,20 +233,25 @@ impl AttManState {
 
     /// Load the drafts from the selected row.
     pub fn load_drafts(&mut self) {
-        let num = |v: f64| crate::ui::window::block_palette::short(v);
+        // These fields are typed straight back into the definition, so they
+        // print plain decimals at the drawing's precision rather than the
+        // drawing's formatted unit style.
+        let units = crate::entities::common::unit_context();
+        let length = |v: f64| crate::entities::common::coordinate_text(v, units.luprec);
+        let angle = |v: f64| crate::entities::common::coordinate_text(v.to_degrees(), units.auprec);
         self.drafts = match self.selected_row() {
             Some(row) => {
                 let d = &row.def;
                 Drafts {
                     tag: d.tag.clone(),
-                    height: num(d.height),
-                    rotation: num(d.rotation.to_degrees()),
-                    width: num(d.width_factor),
-                    oblique: num(d.oblique_angle.to_degrees()),
+                    height: length(d.height),
+                    rotation: angle(d.rotation),
+                    width: length(d.width_factor),
+                    oblique: angle(d.oblique_angle),
                     boundary: d
                         .embedded_mtext
                         .as_ref()
-                        .map_or("0".into(), |m| num(m.rectangle_width)),
+                        .map_or_else(|| length(0.0), |m| length(m.rectangle_width)),
                 }
             }
             None => Drafts::default(),
@@ -353,8 +358,8 @@ pub const COLORS: [&str; 9] = [
     "ByLayer", "ByBlock", "Red", "Yellow", "Green", "Cyan", "Blue", "Magenta", "White",
 ];
 
-pub fn color_label(color: codec::types::Color) -> String {
-    use codec::types::Color as C;
+pub fn color_label(color: document::types::Color) -> String {
+    use document::types::Color as C;
     match color {
         C::ByLayer => "ByLayer".into(),
         C::ByBlock => "ByBlock".into(),
@@ -365,8 +370,8 @@ pub fn color_label(color: codec::types::Color) -> String {
     }
 }
 
-pub fn parse_color(label: &str) -> Option<codec::types::Color> {
-    use codec::types::Color as C;
+pub fn parse_color(label: &str) -> Option<document::types::Color> {
+    use document::types::Color as C;
     match COLORS
         .iter()
         .position(|c| c.eq_ignore_ascii_case(label.trim()))
@@ -389,8 +394,8 @@ const LINEWEIGHTS: [i16; 24] = [
     211,
 ];
 
-pub fn lineweight_label(lw: codec::types::LineWeight) -> String {
-    use codec::types::LineWeight as L;
+pub fn lineweight_label(lw: document::types::LineWeight) -> String {
+    use document::types::LineWeight as L;
     match lw {
         L::ByLayer => "ByLayer".into(),
         L::ByBlock => "ByBlock".into(),
@@ -399,8 +404,8 @@ pub fn lineweight_label(lw: codec::types::LineWeight) -> String {
     }
 }
 
-pub fn parse_lineweight(label: &str) -> Option<codec::types::LineWeight> {
-    use codec::types::LineWeight as L;
+pub fn parse_lineweight(label: &str) -> Option<document::types::LineWeight> {
+    use document::types::LineWeight as L;
     let s = label.trim();
     match s.to_ascii_lowercase().as_str() {
         "bylayer" => Some(L::ByLayer),
@@ -421,7 +426,7 @@ fn lineweight_options() -> Vec<String> {
         .chain(
             LINEWEIGHTS
                 .iter()
-                .map(|v| lineweight_label(codec::types::LineWeight::Value(*v))),
+                .map(|v| lineweight_label(document::types::LineWeight::Value(*v))),
         )
         .collect()
 }
@@ -572,7 +577,7 @@ fn choice_row<'a>(
 fn segmented<'a>(current: EditTab) -> Element<'a, Message> {
     let tabs = [
         (EditTab::Attribute, t!("Attribute").into_owned()),
-        (EditTab::Text, t!("Text").into_owned()),
+        (EditTab::Text, t!("Text Options").into_owned()),
         (EditTab::Properties, t!("Properties").into_owned()),
     ];
     let buttons = tabs.into_iter().map(|(tab, label)| {
@@ -692,12 +697,10 @@ fn edit_card<'a>(state: &'a AttManState, row_: &'a AttManRow) -> Element<'a, Mes
                 .spacing(6),
                 row![
                     mode("preset", "Preset", def.flags.preset),
-                    mode("multiline", "Multiple lines", def.is_multiline),
+                    pill(t!("Constant").into_owned(), constant, None),
                 ]
                 .spacing(6),
-                text(t!("The Constant mode cannot be changed in the definition."))
-                    .size(10)
-                    .style(muted_style),
+                row![mode("multiline", "Multiple lines", def.is_multiline)].spacing(6),
             ]
             .spacing(6)
             .width(Length::Fixed(230.0));
@@ -829,6 +832,14 @@ fn edit_card<'a>(state: &'a AttManState, row_: &'a AttManRow) -> Element<'a, Mes
                         lineweight_options(),
                         Some(AttManMsg::Lineweight),
                     ),
+                    // The definition carries no plot style of its own, so the
+                    // row reports the default and offers no choice.
+                    choice_row(
+                        t!("Plot style").into_owned(),
+                        "ByLayer".to_string(),
+                        vec!["ByLayer".to_string()],
+                        None,
+                    ),
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -844,7 +855,7 @@ fn edit_card<'a>(state: &'a AttManState, row_: &'a AttManRow) -> Element<'a, Mes
             segmented(state.tab),
             body,
             labeled_switch(
-                t!("Show changes in the drawing as they are made").into_owned(),
+                t!("Auto preview changes").into_owned(),
                 live,
                 AttManMsg::Live
             ),
@@ -1040,4 +1051,140 @@ pub fn view<'a>(
             ..Default::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use document::entities::AttributeDefinition;
+
+    fn state_with(def: AttributeDefinition) -> AttManState {
+        AttManState {
+            blocks: vec![AttManBlock {
+                name: "SAMPLE".into(),
+                found: 1,
+                in_space: 1,
+            }],
+            block: 0,
+            rows: vec![AttManRow {
+                handle: document::Handle::NULL,
+                original_tag: def.tag.clone(),
+                live_tag: def.tag.clone(),
+                def,
+            }],
+            removed: Vec::new(),
+            selected: Some(0),
+            tab: EditTab::Attribute,
+            edit_open: true,
+            drafts: Drafts::default(),
+            dirty: false,
+            live_steps: 0,
+            more_columns: false,
+            styles: Vec::new(),
+            layers: Vec::new(),
+            linetypes: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn the_edit_fields_print_at_drawing_precision() {
+        let mut def = AttributeDefinition::new("TAG".into(), "Prompt".into(), "Default".into());
+        def.height = 2.5;
+        def.width_factor = 1.0;
+        let mut state = state_with(def);
+        state.load_drafts();
+        assert_eq!(state.drafts.height, "2.5000");
+        assert_eq!(state.drafts.width, "1.0000");
+        assert_eq!(state.drafts.boundary, "0.0000");
+        assert_eq!(state.drafts.rotation, "0");
+    }
+
+    /// Whether `label` is laid out and in view in the dialog.
+    fn shows(state: &AttManState, label: &str) -> bool {
+        use iced_test::Selector;
+        use iced_test::core::widget;
+        use iced_test::runtime::user_interface::{Cache, UserInterface};
+        let _one = crate::headless_ui_lock();
+        let mut renderer = iced_test::futures::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                std::env::var("ICED_TEST_BACKEND").ok().as_deref(),
+            ),
+        )
+        .expect("headless renderer");
+        let sizing = crate::ui::modal::ModalSizing {
+            width: Length::Fixed(620.0),
+            height: Length::Fixed(600.0),
+        };
+        let mut ui = UserInterface::build(
+            view(state, sizing),
+            iced::Size::new(620.0, 100_000.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut find = Selector::find(label);
+        ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+        matches!(
+            widget::Operation::finish(&find),
+            widget::operation::Outcome::Some(Some(target)) if target.visible_bounds().is_some()
+        )
+    }
+
+    #[test]
+    fn the_edit_card_keeps_constant_visible_and_names_the_text_options_tab() {
+        let mut state = state_with(AttributeDefinition::new(
+            "TAG".into(),
+            "Prompt".into(),
+            "Default".into(),
+        ));
+        state.tab = EditTab::Attribute;
+        assert!(
+            shows(&state, "Constant"),
+            "the Constant mode stays visible in the mode group"
+        );
+        assert!(
+            !shows(
+                &state,
+                "The Constant mode cannot be changed in the definition."
+            ),
+            "prose does not replace the disabled control"
+        );
+        state.tab = EditTab::Text;
+        assert!(
+            shows(&state, "Text Options"),
+            "the tab is named as in the reference"
+        );
+    }
+
+    #[test]
+    fn the_live_toggle_reads_auto_preview_changes() {
+        let state = state_with(AttributeDefinition::new(
+            "TAG".into(),
+            "Prompt".into(),
+            "Default".into(),
+        ));
+        assert!(
+            shows(&state, "Auto preview changes"),
+            "the toggle names what it does in two words"
+        );
+        assert!(
+            !shows(&state, "Show changes in the drawing as they are made"),
+            "the long sentence is gone"
+        );
+    }
+
+    #[test]
+    fn the_properties_tab_lists_a_plot_style_row() {
+        let mut def = AttributeDefinition::new("TAG".into(), "Prompt".into(), "Default".into());
+        def.common.linetype = "Continuous".into();
+        def.common.color = document::types::Color::Index(1);
+        let mut state = state_with(def);
+        state.tab = EditTab::Properties;
+        assert!(shows(&state, "Plot style"), "the row is listed");
+        assert!(
+            shows(&state, "ByLayer"),
+            "the row reports the definition's plot style"
+        );
+    }
 }

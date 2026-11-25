@@ -15,17 +15,20 @@
 //   offset at once on the cursor's side; a negative one, on the other side.
 
 use crate::entities::curve::{entity_curve, lwpolyline_world_xy};
-use codec::entities::LwVertex;
-use codec::entities::{
+use document::entities::LwVertex;
+use document::entities::{
     Arc as ArcEnt, Circle as CircleEnt, Ellipse as EllipseEnt, Line as LineEnt, LwPolyline,
     Spline as SplineEnt, XLine as XLineEnt,
 };
-use codec::{EntityType, Handle};
+use document::types::Vector3;
+use document::{EntityType, Handle};
 // Polyline offsetting, and the angle normalisation that goes with it, come
 // from the kernel; only the entity conversion stays here.
 use crate::t;
 use glam::{DVec3, Vec3};
-use kernel::geom2d::{offset_polyline_with_gap, Polyline as KernelPolyline, PolylineVertex as KernelVertex};
+use ocs_geom::geom2d::{
+    offset_polyline_with_gap, Polyline as KernelPolyline, PolylineVertex as KernelVertex,
+};
 
 use crate::command::{CadCommand, CmdResult};
 use crate::modules::draw::defaults;
@@ -75,31 +78,38 @@ fn offset_line(l: &LineEnt, dist: f64, side_pt: Vec3) -> Option<EntityType> {
     Some(EntityType::Line(new_l))
 }
 
-// ── XLine (infinite construction line) offset ────────────────────────────────
-// A parallel infinite line: same direction, base point shifted perpendicular by
-// `dist` toward the side the cursor is on. (#296)
+// ── XLine / Ray offset ───────────────────────────────────────────────────────
+// A parallel line of the same kind: same direction, base point shifted
+// perpendicular by `dist` toward the side the cursor is on. (#296, #2969)
 
-fn offset_xline(x: &XLineEnt, dist: f64, side_pt: Vec3) -> Option<EntityType> {
-    let dx = x.direction.x;
-    let dy = x.direction.y;
+fn shifted_base(base: Vector3, direction: Vector3, dist: f64, side_pt: Vec3) -> Option<Vector3> {
+    let (dx, dy) = (direction.x, direction.y);
     let len = (dx * dx + dy * dy).sqrt();
     if len < 1e-12 {
         return None;
     }
-
-    let nx = -dy / len; // left-perpendicular
-    let ny = dx / len;
-
-    let vx = side_pt.x as f64 - x.base_point.x;
-    let vy = side_pt.y as f64 - x.base_point.y;
-    let cross = dx * vy - dy * vx;
+    let (nx, ny) = (-dy / len, dx / len); // left-perpendicular
+    let cross = dx * (side_pt.y as f64 - base.y) - dy * (side_pt.x as f64 - base.x);
     let sign = if cross >= 0.0 { 1.0 } else { -1.0 };
+    Some(Vector3::new(
+        base.x + sign * nx * dist,
+        base.y + sign * ny * dist,
+        base.z,
+    ))
+}
 
+fn offset_xline(x: &XLineEnt, dist: f64, side_pt: Vec3) -> Option<EntityType> {
     let mut new_x = x.clone();
     new_x.common.handle = Handle::NULL;
-    new_x.base_point.x += sign * nx * dist;
-    new_x.base_point.y += sign * ny * dist;
+    new_x.base_point = shifted_base(x.base_point, x.direction, dist, side_pt)?;
     Some(EntityType::XLine(new_x))
+}
+
+fn offset_ray(r: &document::entities::Ray, dist: f64, side_pt: Vec3) -> Option<EntityType> {
+    let mut new_r = r.clone();
+    new_r.common.handle = Handle::NULL;
+    new_r.base_point = shifted_base(r.base_point, r.direction, dist, side_pt)?;
+    Some(EntityType::Ray(new_r))
 }
 
 // ── Circle offset ──────────────────────────────────────────────────────────
@@ -176,9 +186,9 @@ fn offset_lwpolylines(p: &LwPolyline, dist: f64, side_pt: Vec3) -> Vec<EntityTyp
     };
 
     let gap = match gap_type() {
-        1 => kernel::geom2d::OffsetGap::Fillet,
-        2 => kernel::geom2d::OffsetGap::Chamfer,
-        _ => kernel::geom2d::OffsetGap::Extend,
+        1 => ocs_geom::geom2d::OffsetGap::Fillet,
+        2 => ocs_geom::geom2d::OffsetGap::Chamfer,
+        _ => ocs_geom::geom2d::OffsetGap::Extend,
     };
     offset_polyline_with_gap(&source, dist, [side_pt.x as f64, side_pt.y as f64], gap)
         .into_iter()
@@ -254,8 +264,8 @@ fn offset_curved(
     let left = along[0] * toward[1] - along[1] * toward[0] > 0.0;
     let signed = if left { dist.abs() } else { -dist.abs() };
     let tolerance = (curve.length() * 1e-6).max(1e-9);
-    let kernel::geom2d::Curve::Nurbs(parallel) =
-        kernel::geom2d::offset_curve(curve, signed, tolerance)?
+    let ocs_geom::geom2d::Curve::Nurbs(parallel) =
+        ocs_geom::geom2d::offset_curve(curve, signed, tolerance)?
     else {
         return None;
     };
@@ -267,7 +277,7 @@ fn offset_curved(
         .iter()
         .map(|uv| {
             let [x, y, z] = planar.plane.point_at(*uv);
-            codec::types::Vector3::new(x, y, z)
+            document::types::Vector3::new(x, y, z)
         })
         .collect();
     template.weights = if parallel.is_rational() {
@@ -279,12 +289,12 @@ fn offset_curved(
     template.flags.periodic = false;
     template.flags.closed = curve.is_closed();
     if let Some([x, y, z]) = planar.plane.normal() {
-        template.normal = codec::types::Vector3::new(x, y, z);
+        template.normal = document::types::Vector3::new(x, y, z);
     }
     // A parallel is no longer the curve through the source's fit points.
     template.fit_points.clear();
-    template.begin_tangent = codec::types::Vector3::new(0.0, 0.0, 0.0);
-    template.end_tangent = codec::types::Vector3::new(0.0, 0.0, 0.0);
+    template.begin_tangent = document::types::Vector3::new(0.0, 0.0, 0.0);
+    template.end_tangent = document::types::Vector3::new(0.0, 0.0, 0.0);
     Some(EntityType::Spline(template))
 }
 
@@ -299,6 +309,7 @@ pub(crate) fn compute_offsets(entity: &EntityType, dist: f64, side_pt: Vec3) -> 
         EntityType::Ellipse(e) => offset_ellipse(e, dist, side_pt).into_iter().collect(),
         EntityType::Spline(s) => offset_spline(s, dist, side_pt).into_iter().collect(),
         EntityType::XLine(x) => offset_xline(x, dist, side_pt).into_iter().collect(),
+        EntityType::Ray(r) => offset_ray(r, dist, side_pt).into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -373,7 +384,7 @@ fn far_side(entity: &EntityType, pt: Vec3, dist: f64) -> Option<Vec3> {
 // ── Wire preview points ─────────────────────────────────────────────────────
 
 /// Preview density, matching the figure the drawn wires use.
-const PREVIEW_SEGMENTS_PER_RADIAN: f64 = kernel::geom2d::DEFAULT_SEGMENTS_PER_RADIAN;
+const PREVIEW_SEGMENTS_PER_RADIAN: f64 = ocs_geom::geom2d::DEFAULT_SEGMENTS_PER_RADIAN;
 
 /// Preview points for an entity, from its own curve.
 ///
@@ -469,7 +480,11 @@ pub fn set_gap_type(value: u8) {
 /// line OFFSET prints as it starts.
 pub fn current_settings_line() -> String {
     let erase = if ERASE_SOURCE.get() { "Yes" } else { "No" };
-    let layer = if LAYER_CURRENT.get() { "Current" } else { "Source" };
+    let layer = if LAYER_CURRENT.get() {
+        "Current"
+    } else {
+        "Source"
+    };
     t!(
         "Current settings: Erase source=%{erase}  Layer=%{layer}  OFFSETGAPTYPE=%{gap}",
         erase = erase,
@@ -525,6 +540,7 @@ pub fn is_offsettable(e: &EntityType) -> bool {
             | EntityType::Ellipse(_)
             | EntityType::Spline(_)
             | EntityType::XLine(_)
+            | EntityType::Ray(_)
     )
 }
 
@@ -668,15 +684,30 @@ impl CadCommand for OffsetCommand {
         "OFFSET"
     }
 
+    /// The offset distance and the second point of a picked distance refuse
+    /// as a distance prompt with keywords (measured).
+    fn point_rejection(&self) -> Option<String> {
+        matches!(self.step, Step::Distance | Step::ReferenceSecond { .. }).then(|| {
+            t!("Requires numeric distance, two points, or option keyword.").into_owned()
+        })
+    }
+
     fn prompt(&self) -> String {
         match self.awaiting {
             Some(Await::Erase) => {
                 let d = if self.erase_source { "Yes" } else { "No" };
-                return t!("OFFSET  Erase source object after offsetting? [Yes/No] <%{d}>:", d = d)
-                    .into_owned();
+                return t!(
+                    "OFFSET  Erase source object after offsetting? [Yes/No] <%{d}>:",
+                    d = d
+                )
+                .into_owned();
             }
             Some(Await::Layer) => {
-                let d = if self.layer_current { "Current" } else { "Source" };
+                let d = if self.layer_current {
+                    "Current"
+                } else {
+                    "Source"
+                };
                 return t!(
                     "OFFSET  Enter layer option for offset objects [Current/Source] <%{d}>:",
                     d = d
@@ -692,12 +723,15 @@ impl CadCommand for OffsetCommand {
                 } else {
                     format!("{:.4}", defaults::get_offset_dist())
                 };
-                t!("OFFSET  Specify offset distance or [Through/Erase/Layer] <%{d}>:", d = d)
-                    .into_owned()
+                t!(
+                    "OFFSET  Specify offset distance or [Through/Erase/Layer] <%{d}>:",
+                    d = d
+                )
+                .into_owned()
             }
 
             Step::ReferenceSecond { .. } => {
-                t!("OFFSET  Specify second reference point:").into_owned()
+                t!("OFFSET  Specify second point:").into_owned()
             }
             Step::SelectObject { .. } => {
                 t!("OFFSET  Select object to offset or [Exit/Undo] <Exit>:").into_owned()
@@ -793,7 +827,11 @@ impl CadCommand for OffsetCommand {
                     opts.push(CmdOption::new("Multiple", "M"));
                 }
                 opts.push(CmdOption::new("Undo", "U"));
-                opts.push(CmdOption::enter(if *multiple { "next object" } else { "Exit" }));
+                opts.push(CmdOption::enter(if *multiple {
+                    "next object"
+                } else {
+                    "Exit"
+                }));
                 opts
             }
             Step::ReferenceSecond { .. } => Vec::new(),
@@ -1102,7 +1140,7 @@ inventory::submit!(crate::command::CommandRegistration { names: &["OFFSET"] }); 
 #[cfg(test)]
 mod offset_tests {
     use super::*;
-    use codec::types::Vector2;
+    use document::types::Vector2;
 
     fn rect(corners: &[[f64; 2]]) -> LwPolyline {
         LwPolyline {
@@ -1166,7 +1204,7 @@ mod option_tests {
     use super::*;
 
     fn line(x1: f64, y1: f64, x2: f64, y2: f64, handle: u64) -> EntityType {
-        let mut line = codec::entities::Line::from_coords(x1, y1, 0.0, x2, y2, 0.0);
+        let mut line = document::entities::Line::from_coords(x1, y1, 0.0, x2, y2, 0.0);
         line.common.handle = Handle::new(handle);
         EntityType::Line(line)
     }
@@ -1226,10 +1264,10 @@ mod option_tests {
 #[cfg(test)]
 mod drag_tests {
     use super::*;
-    use codec::types::Vector2;
+    use document::types::Vector2;
 
     fn line_y0() -> EntityType {
-        let mut line = codec::entities::Line::from_coords(0.0, 0.0, 0.0, 10.0, 0.0, 0.0);
+        let mut line = document::entities::Line::from_coords(0.0, 0.0, 0.0, 10.0, 0.0, 0.0);
         line.common.handle = Handle::new(1);
         EntityType::Line(line)
     }
@@ -1287,7 +1325,7 @@ mod drag_tests {
     #[test]
     fn negative_distance_inside_a_circle_grows_it() {
         let circle = EntityType::Circle(CircleEnt {
-            center: codec::types::Vector3::new(0.0, 0.0, 0.0),
+            center: document::types::Vector3::new(0.0, 0.0, 0.0),
             radius: 10.0,
             ..Default::default()
         });

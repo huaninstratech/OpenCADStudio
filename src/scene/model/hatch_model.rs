@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use kernel::geom2d::{
+use ocs_geom::geom2d::{
     contains, distance_to, inside_spans, intersect, Curve as KernelCurve, Line as KernelLine,
     Ray as KernelRay, Tolerance, Vec2 as KernelVec2, XLine as KernelXLine,
 };
@@ -209,6 +209,14 @@ pub struct FillPlane {
 /// A hatched region defined by a closed polygon boundary.
 #[derive(Clone, Debug)]
 pub struct HatchModel {
+    /// The hatch entity this model plots for. Hatch models carry the pattern
+    /// catalog name (not an entity handle) in `name`, so plot exports resolve
+    /// the fill's drawing layer through this handle.
+    pub entity: Option<document::Handle>,
+    /// Fully resolved display/export layer for this occurrence. This is
+    /// placement-specific because one block definition can be inserted on many
+    /// layers; `None` retains the entity-handle fallback for direct hatches.
+    pub effective_layer: Option<std::sync::Arc<str>>,
     /// Recorded hatch origin in its fill plane, independent of intrinsic PAT line bases.
     pub pattern_origin: Option<[f64; 2]>,
     pub render_instance: Option<super::instance_model::RenderInstance>,
@@ -245,11 +253,11 @@ pub struct HatchModel {
     /// Per-ring DXF role, aligned with the NaN-separated boundary paths.
     pub boundary_exterior: Option<Arc<Vec<bool>>>,
     /// Source entity handles for each boundary ring.
-    pub boundary_sources: Option<Arc<Vec<Vec<codec::Handle>>>>,
+    pub boundary_sources: Option<Arc<Vec<Vec<document::Handle>>>>,
     /// Exact boundary paths retained for persistence and editing.
-    pub boundary_paths: Option<Arc<Vec<codec::entities::BoundaryPath>>>,
+    pub boundary_paths: Option<Arc<Vec<document::entities::BoundaryPath>>>,
     /// Island handling used by the persisted hatch entity.
-    pub style: codec::entities::HatchStyleType,
+    pub style: document::entities::HatchStyleType,
     /// Fill pattern.
     pub pattern: HatchPattern,
     /// Catalog name for this pattern (e.g. "ANSI31", "SOLID", "LINEAR").
@@ -274,6 +282,40 @@ pub struct HatchModel {
 }
 
 impl HatchModel {
+    /// Height of the fill over a boundary vertex (`world_origin`-relative
+    /// XY). The boundary is the fill plane seen from above, so each vertex
+    /// lies at the plane's height over its point. A plane standing on edge
+    /// has no single height there and keeps its origin's; a hatch without a
+    /// plane lies on Z = 0.
+    pub(crate) fn plane_height(&self) -> impl Fn([f32; 2]) -> f32 + Copy {
+        let [base, per_x, per_y] = self.plane_height_terms();
+        move |[x, y]: [f32; 2]| (base + per_x * x as f64 + per_y * y as f64) as f32
+    }
+
+    /// Whether the fill lies on Z = 0 everywhere, where the screen cull
+    /// measures its XY box.
+    pub(crate) fn lies_on_ground(&self) -> bool {
+        self.plane_height_terms() == [0.0; 3]
+    }
+
+    /// `[height at the anchor, slope along X, slope along Y]` of the plane.
+    fn plane_height_terms(&self) -> [f64; 3] {
+        let Some(plane) = self.fill_plane else {
+            return [0.0; 3];
+        };
+        let normal = glam::DVec3::from_array(plane.x_axis)
+            .cross(glam::DVec3::from_array(plane.y_axis))
+            .normalize_or_zero();
+        if normal.z.abs() < 1e-9 {
+            return [plane.origin[2], 0.0, 0.0];
+        }
+        let (per_x, per_y) = (-normal.x / normal.z, -normal.y / normal.z);
+        let base = plane.origin[2]
+            + per_x * (self.world_origin[0] - plane.origin[0])
+            + per_y * (self.world_origin[1] - plane.origin[1]);
+        [base, per_x, per_y]
+    }
+
     /// Apply an entity's resolved opacity to every colour stop. Gradient stop
     /// colours come from the HATCH payload, but transparency remains a common
     /// entity property and must affect both ends equally.
@@ -285,19 +327,100 @@ impl HatchModel {
     }
 }
 
+/// The frame a gradient fill is shaded in: the boundary's extent along the
+/// gradient's angle (`u`) and across it (`w`, to the left of `u`), about the
+/// middle of that extent, in the boundary's local coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GradientBox {
+    pub center: [f64; 2],
+    pub cos: f64,
+    pub sin: f64,
+    /// Half the extent along `u` and along `w`.
+    pub half_u: f64,
+    pub half_w: f64,
+    /// Half the diagonal of the boundary's axis-aligned extent.
+    pub half_diagonal: f64,
+}
+
+impl GradientBox {
+    /// The local point at (`u`, `w`).
+    pub fn local(&self, u: f64, w: f64) -> [f64; 2] {
+        [
+            self.center[0] + u * self.cos - w * self.sin,
+            self.center[1] + u * self.sin + w * self.cos,
+        ]
+    }
+
+    /// Where between its two colours a gradient of `kind` is at (`u`, `w`):
+    /// 0 is the first colour, 1 the second.
+    ///
+    /// The shapes are those BricsCAD V26 plots, measured on its PDF output
+    /// over boxes of 50×30, 30×50, 40×40 and 80×20 at 0°, 30°, 90° and 180°
+    /// (the colour mixes match within 1–2 %, a shifted curved one within
+    /// about 5 %). With `A`/`B` the half extents along/across the angle and
+    /// `M` the larger: linear runs from −A to A; cylinder rises as a sine to
+    /// the middle and falls back; spherical falls off as a cosine from the
+    /// middle to a circle of radius M; hemispherical is the top of a sphere
+    /// of twice the half diagonal whose centre lies a half diagonal below
+    /// the middle; curved runs across the angle with parabolic contours.
+    /// `shift` (0 centred … 1 shifted) moves the light towards the upper
+    /// left of the angle's frame. Inverted shapes swap the colours.
+    pub fn mix(&self, kind: GradientKind, invert: bool, shift: f32, u: f64, w: f64) -> f64 {
+        let (a, b, d) = (self.half_u, self.half_w, self.half_diagonal);
+        let m = a.max(b);
+        let shift = (shift as f64).clamp(0.0, 1.0);
+        let rise = |x: f64| (std::f64::consts::FRAC_PI_2 * x.clamp(0.0, 1.0)).sin();
+        let t = match kind {
+            GradientKind::Linear => {
+                let start = shift / 4.0;
+                start + (1.0 - start) * ((u + a) / (2.0 * a)).clamp(0.0, 1.0)
+            }
+            GradientKind::Cylinder => {
+                let peak = -shift * a / 2.0;
+                if u < peak {
+                    rise((u + a) / (peak + a))
+                } else {
+                    rise((a - u) / (a - peak))
+                }
+            }
+            GradientKind::Spherical => {
+                let offset = shift * m / 2.0;
+                rise(1.0 - (u + offset).hypot(w - offset) / m)
+            }
+            GradientKind::Hemispherical => {
+                let (cu, cw) = (-0.745 * shift * d, -1.034 * d + 0.307 * shift * d);
+                rise(1.0 - (u - cu).hypot(w - cw) / (2.018 * d))
+            }
+            GradientKind::Curved => {
+                let q = (a / m) * (a / m);
+                let (u, w) = (u + 0.631 * shift * a, w - 0.124 * shift * b);
+                rise(
+                    (b * (1.0 + 0.133 * q) - w) / (b * (2.0 + 0.198 * q))
+                        - 0.0708 * q * (u / a) * (u / a),
+                )
+            }
+        };
+        if invert {
+            1.0 - t
+        } else {
+            t
+        }
+    }
+}
+
 impl HatchModel {
     pub(crate) fn gradient_frame(
         &self,
         angle_deg: f32,
         shift: f32,
-    ) -> Option<kernel::geom2d::GradientFrame> {
+    ) -> Option<ocs_geom::geom2d::GradientFrame> {
         let boundary: Vec<[f64; 2]> = self
             .boundary
             .iter()
             .filter(|point| point[0].is_finite() && point[1].is_finite())
             .map(|point| [point[0] as f64, point[1] as f64])
             .collect();
-        kernel::geom2d::gradient_frame(
+        ocs_geom::geom2d::gradient_frame(
             &boundary,
             (angle_deg as f64).to_radians(),
             shift as f64,
@@ -305,24 +428,72 @@ impl HatchModel {
         )
     }
 
+    /// The frame a gradient at `angle_deg` is shaded in; `None` for a
+    /// boundary without area along or across the angle.
+    pub(crate) fn gradient_box(&self, angle_deg: f32) -> Option<GradientBox> {
+        let (sin, cos) = (angle_deg as f64).to_radians().sin_cos();
+        let mut u = [f64::INFINITY, f64::NEG_INFINITY];
+        let mut w = u;
+        let mut x = u;
+        let mut y = u;
+        for point in self.boundary.iter() {
+            if !(point[0].is_finite() && point[1].is_finite()) {
+                continue;
+            }
+            let (px, py) = (point[0] as f64, point[1] as f64);
+            let (pu, pw) = (px * cos + py * sin, -px * sin + py * cos);
+            for (range, value) in [(&mut u, pu), (&mut w, pw), (&mut x, px), (&mut y, py)] {
+                range[0] = range[0].min(value);
+                range[1] = range[1].max(value);
+            }
+        }
+        let (half_u, half_w) = ((u[1] - u[0]) / 2.0, (w[1] - w[0]) / 2.0);
+        if !(half_u > 1.0e-9 && half_w > 1.0e-9 && half_u.is_finite() && half_w.is_finite()) {
+            return None;
+        }
+        let (mid_u, mid_w) = ((u[0] + u[1]) / 2.0, (w[0] + w[1]) / 2.0);
+        Some(GradientBox {
+            center: [mid_u * cos - mid_w * sin, mid_u * sin + mid_w * cos],
+            cos,
+            sin,
+            half_u,
+            half_w,
+            half_diagonal: ((x[1] - x[0]) / 2.0).hypot((y[1] - y[0]) / 2.0),
+        })
+    }
+
     /// Indexed local-space fill mesh with even-odd loop containment.
     pub(crate) fn fill_mesh(&self) -> (Vec<[f32; 2]>, Vec<u32>) {
+        // Some DWGs contain closed paths that run from A to B and back to A.
+        // They have no area, but passing them to the polygon triangulator can
+        // make it reject the other, valid rings as well. Discard only paths
+        // with fewer than three distinct points; keep the source boundary
+        // intact for picking, editing, and serialization.
+        let has_three_points = |ring: &[[f64; 2]]| {
+            let Some(first) = ring.first() else {
+                return false;
+            };
+            let Some(second) = ring.iter().find(|point| *point != first) else {
+                return false;
+            };
+            ring.iter().any(|point| point != first && point != second)
+        };
         let mut rings = Vec::new();
         let mut ring = Vec::new();
         for &[x, y] in self.boundary.iter() {
             if x.is_finite() && y.is_finite() {
                 ring.push([x as f64, y as f64]);
-            } else if ring.len() >= 3 {
+            } else if has_three_points(&ring) {
                 rings.push(std::mem::take(&mut ring));
             } else {
                 ring.clear();
             }
         }
-        if ring.len() >= 3 {
+        if has_three_points(&ring) {
             rings.push(ring);
         }
 
-        let (points, triangles) = kernel::geom2d::triangulate_rings(&rings);
+        let (points, triangles) = ocs_geom::geom2d::triangulate_rings(&rings);
         let vertices = points
             .into_iter()
             .map(|[x, y]| [x as f32, y as f32])
@@ -424,7 +595,9 @@ impl HatchModel {
         // the span containment tests. Small boundaries keep the kernel's
         // direct path; the grid costs more than it saves there.
         let edge_index = EdgeIndex::build(&edges);
-        let mut query = edge_index.as_ref().map(|index| EdgeQuery::new(index, edges.len()));
+        let mut query = edge_index
+            .as_ref()
+            .map(|index| EdgeQuery::new(index, edges.len()));
 
         // ── AABB of the boundary in world coords.
         let mut min_x = f64::INFINITY;
@@ -608,6 +781,98 @@ impl HatchModel {
     }
 }
 
+impl HatchModel {
+    /// Whether the fill lies level, at one height: its pattern then reads on
+    /// the screen as [`Self::pattern_segments`] lays it out in world XY.
+    pub(crate) fn lies_level(&self) -> bool {
+        self.fill_plane.is_none_or(|plane| {
+            let normal = glam::DVec3::from_array(plane.x_axis)
+                .cross(glam::DVec3::from_array(plane.y_axis))
+                .normalize_or_zero();
+            normal.z.abs() > 1.0 - 1e-9
+        })
+    }
+
+    /// Distance from `point` to the nearest stroke of the pattern, in the
+    /// frame of [`Self::pattern_segments`] (absolute WCS XY) and with its
+    /// line families, taken as if the pattern ran on past the boundary.
+    /// `None` for a fill with no lines to measure: a solid, a gradient, or a
+    /// pattern none of whose families has a spacing.
+    pub(crate) fn pattern_distance(&self, point: [f64; 2]) -> Option<f64> {
+        let HatchPattern::Pattern(families) = &self.pattern else {
+            return None;
+        };
+        let scale = self.scale.max(1e-6) as f64;
+        let angle_offset = self.angle_offset as f64;
+        let (cos_off, sin_off) = (angle_offset.cos(), angle_offset.sin());
+        let mut nearest: Option<f64> = None;
+        for family in families {
+            let angle = (family.angle_deg as f64).to_radians() + angle_offset;
+            let (cos_a, sin_a) = (angle.cos(), angle.sin());
+            let (fdx, fdy) = (family.dx as f64, family.dy as f64);
+            let step = [
+                (fdx * cos_a - fdy * sin_a) * scale,
+                (fdx * sin_a + fdy * cos_a) * scale,
+            ];
+            let step_perp = -step[0] * sin_a + step[1] * cos_a;
+            if step_perp.abs() < 1e-6 {
+                continue; // degenerate spacing
+            }
+            let (fx0, fy0) = (family.x0 as f64, family.y0 as f64);
+            let origin = [
+                self.world_origin[0] + (fx0 * cos_off - fy0 * sin_off) * scale,
+                self.world_origin[1] + (fx0 * sin_off + fy0 * cos_off) * scale,
+            ];
+            let rel = [point[0] - origin[0], point[1] - origin[1]];
+            let across = -rel[0] * sin_a + rel[1] * cos_a;
+            let line = (across / step_perp).round();
+            let period: f64 = family.dashes.iter().map(|d| d.abs() as f64).sum::<f64>() * scale;
+            let distance = if family.dashes.is_empty() || period <= 1e-6 {
+                (across - line * step_perp).abs()
+            } else {
+                // The nearest dash can be on the line to either side when
+                // the cursor sits beside a gap of the nearest line.
+                [line - 1.0, line, line + 1.0]
+                    .into_iter()
+                    .map(|line| {
+                        let along =
+                            (rel[0] - line * step[0]) * cos_a + (rel[1] - line * step[1]) * sin_a;
+                        (across - line * step_perp).hypot(dash_gap(
+                            &family.dashes,
+                            scale,
+                            period,
+                            along,
+                        ))
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+            nearest = Some(nearest.map_or(distance, |nearest| nearest.min(distance)));
+        }
+        nearest
+    }
+}
+
+/// How far the point `along` a dashed pattern line is from the line's nearest
+/// dash or dot; zero on a dash. The dashes repeat every `period` from the
+/// line's base point, as [`HatchModel::pattern_segments`] walks them.
+fn dash_gap(dashes: &[f32], scale: f64, period: f64, along: f64) -> f64 {
+    let phase = along.rem_euclid(period);
+    let mut start = 0.0;
+    let mut gap = f64::INFINITY;
+    for &dash in dashes {
+        let length = dash.abs() as f64 * scale;
+        // A positive entry is a dash, a zero one a dot, a negative one a gap.
+        if dash >= 0.0 {
+            for shift in [-period, 0.0, period] {
+                let (from, to) = (start + shift, start + length + shift);
+                gap = gap.min((from - phase).max(phase - to).max(0.0));
+            }
+        }
+        start += length;
+    }
+    gap
+}
+
 /// Uniform grid over a hatch's boundary edges.
 ///
 /// `pattern_segments` asks two questions of every pattern line — which edges
@@ -647,8 +912,12 @@ impl EdgeIndex {
         if edges.len() < 64 {
             return None;
         }
-        let (mut min_x, mut max_x, mut min_y, mut max_y) =
-            (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
         for &(a, b) in edges {
             for [x, y] in [a, b] {
                 min_x = min_x.min(x);
@@ -905,7 +1174,12 @@ impl<'a> EdgeQuery<'a> {
 
     /// Whether `point` lies inside the boundary — the kernel's `contains`,
     /// with the edge sweep and the ray casts enumerated through the grid.
-    fn contains(&mut self, point: [f64; 2], boundary: &[KernelCurve], tolerance: Tolerance) -> bool {
+    fn contains(
+        &mut self,
+        point: [f64; 2],
+        boundary: &[KernelCurve],
+        tolerance: Tolerance,
+    ) -> bool {
         let linear = tolerance.linear();
         // A midpoint between two boundary crossings sits between points on
         // edges, so it is inside the grid; the kernel fallback below only
@@ -1108,7 +1382,10 @@ mod tests {
         let tolerance = Tolerance::new(CLIP_TOLERANCE_LINEAR);
 
         let dirs: [[f64; 2]; 3] = [
-            [std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2],
+            [
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+            ],
             [0.0, 1.0],
             [1.0, 0.0],
         ];
@@ -1131,5 +1408,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Colour mixes BricsCAD V26 plots for a 50×30 box at 0°, centred, read
+    /// from its PDF (0 = first colour, 1 = second), at fractions of the box
+    /// from its left and its bottom.
+    #[test]
+    fn gradient_shapes_mix_as_bricscad_plots_them() {
+        let frame = GradientBox {
+            center: [0.0, 0.0],
+            cos: 1.0,
+            sin: 0.0,
+            half_u: 25.0,
+            half_w: 15.0,
+            half_diagonal: 25.0f64.hypot(15.0),
+        };
+        let at = |fx: f64, fy: f64| ((fx - 0.5) * 50.0, (fy - 0.5) * 30.0);
+        let cases: [(GradientKind, bool, f64, f64, f64); 20] = [
+            (GradientKind::Linear, false, 0.045, 0.5, 0.05),
+            (GradientKind::Linear, false, 0.5, 0.5, 0.50),
+            (GradientKind::Cylinder, false, 0.045, 0.5, 0.14),
+            (GradientKind::Cylinder, false, 0.227, 0.5, 0.65),
+            (GradientKind::Cylinder, false, 0.5, 0.5, 1.00),
+            (GradientKind::Cylinder, true, 0.5, 0.5, 0.00),
+            (GradientKind::Spherical, false, 0.5, 0.5, 1.00),
+            (GradientKind::Spherical, false, 0.5, 0.929, 0.68),
+            (GradientKind::Spherical, false, 0.045, 0.5, 0.14),
+            (GradientKind::Spherical, false, 0.045, 0.929, 0.00),
+            (GradientKind::Hemispherical, false, 0.045, 0.929, 0.27),
+            (GradientKind::Hemispherical, false, 0.5, 0.929, 0.42),
+            (GradientKind::Hemispherical, false, 0.5, 0.071, 0.90),
+            (GradientKind::Hemispherical, true, 0.045, 0.071, 0.28),
+            (GradientKind::Curved, false, 0.045, 0.929, 0.10),
+            (GradientKind::Curved, false, 0.5, 0.929, 0.20),
+            (GradientKind::Curved, false, 0.5, 0.5, 0.74),
+            (GradientKind::Curved, false, 0.5, 0.071, 0.98),
+            (GradientKind::Curved, true, 0.5, 0.929, 0.80),
+            (GradientKind::Curved, false, 0.045, 0.5, 0.66),
+        ];
+        for (kind, invert, fx, fy, expected) in cases {
+            let (u, w) = at(fx, fy);
+            let mix = frame.mix(kind, invert, 0.0, u, w);
+            assert!(
+                (mix - expected).abs() < 0.04,
+                "{kind:?} invert {invert} at ({fx}, {fy}): {mix:.3}, BricsCAD {expected}"
+            );
+        }
+        // Shifted: the light moves to the upper left (spherical centre at
+        // (-12.5, 12.5), a shifted linear one starts a quarter of the way).
+        assert!(frame.mix(GradientKind::Spherical, false, 1.0, -12.5, 12.5) > 0.99);
+        assert!((frame.mix(GradientKind::Linear, false, 1.0, -25.0, 0.0) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_gradient_box_spans_the_boundary_along_and_across_its_angle() {
+        let mut hatch = HatchModel {
+            entity: None,
+            effective_layer: None,
+            pattern_origin: None,
+            render_instance: None,
+            world_origin: [0.0, 0.0],
+            boundary: Arc::new(vec![[0.0, 0.0], [50.0, 0.0], [50.0, 30.0], [0.0, 30.0]]),
+            boundary_wcs: None,
+            fill_plane: None,
+            fill_plane_boundary: None,
+            boundary_exterior: None,
+            boundary_sources: None,
+            boundary_paths: None,
+            style: document::entities::HatchStyleType::Normal,
+            pattern: HatchPattern::Solid,
+            name: "SOLID".into(),
+            color: [0.0, 0.0, 0.0, 1.0],
+            aci: 0,
+            line_weight_px: 1.0,
+            angle_offset: 0.0,
+            scale: 1.0,
+            draw_depth: 0.0,
+        };
+        let frame = hatch.gradient_box(90.0).unwrap();
+        assert!((frame.half_u - 15.0).abs() < 1e-6 && (frame.half_w - 25.0).abs() < 1e-6);
+        let [x, y] = frame.local(0.0, 0.0);
+        assert!((x - 25.0).abs() < 1e-6 && (y - 15.0).abs() < 1e-6);
+        // Along the angle (up) and to its left (towards -x).
+        let [x, y] = frame.local(15.0, 25.0);
+        assert!(x.abs() < 1e-6 && (y - 30.0).abs() < 1e-6);
+        hatch.boundary = Arc::new(vec![[0.0, 0.0], [50.0, 0.0]]);
+        assert!(
+            hatch.gradient_box(0.0).is_none(),
+            "no area across the angle"
+        );
     }
 }

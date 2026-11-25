@@ -15,14 +15,14 @@
 // as the reference words them; CLose in arc mode closes with a tangent arc.
 
 use crate::t;
-use codec::entities::{LwPolyline, LwVertex, Viewport};
-use codec::tables::View;
-use codec::types::{Vector2, Vector3};
-use codec::{EntityType, Handle};
+use document::entities::{LwPolyline, LwVertex, Viewport};
+use document::tables::View;
+use document::types::{Vector2, Vector3};
+use document::{EntityType, Handle};
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
 use crate::modules::draw::draw::polyline::{
-    arc_for, arc_sample_points, compute_bulge, seg_exit_tangent, update_tangent_after_arc, Sub,
+    arc_sample_points, compute_bulge, seg_exit_tangent, update_tangent_after_arc, ArcStep, Sub,
 };
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
@@ -57,6 +57,11 @@ enum Step {
     ClipChoice,
     /// VPCLIP Length: a line of that length along the last direction.
     ClipLength,
+    /// 2 / 3: how the viewports are arranged.
+    TileArrangement(u8),
+    /// The area the viewports fill: first corner or Fit.
+    TileFirst,
+    TileSecond,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -82,6 +87,8 @@ pub struct MviewCommand {
     picked: Option<EntityType>,
     /// VPCLIP arc mode: the arc option being answered.
     arc_sub: Sub,
+    /// 2 / 3 / 4: the arrangement (a VPORTS code such as `3R`).
+    tiles: &'static str,
 }
 
 impl MviewCommand {
@@ -104,7 +111,43 @@ impl MviewCommand {
             clip: None,
             picked: None,
             arc_sub: Sub::None,
+            tiles: "",
         }
+    }
+
+    /// MVIEW with the arrangement already chosen (VPORTS in a layout): asks
+    /// for the area the viewports fill. `None` for an unknown code.
+    pub fn with_tiles(
+        original_layout: String,
+        paper_bounds: ((f64, f64), (f64, f64)),
+        code: &str,
+    ) -> Option<Self> {
+        let code = tile_code(code)?;
+        let mut command = Self::new(original_layout, paper_bounds, Vec::new());
+        command.tiles = code;
+        command.step = Step::TileFirst;
+        Some(command)
+    }
+
+    /// The viewports of the chosen arrangement filling the rectangle `a`–`b`,
+    /// edge to edge.
+    fn tiled_viewports(&self, a: DVec3, b: DVec3) -> Option<CmdResult> {
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+        let at = |u: f64, v: f64| DVec3::new(x0 + (x1 - x0) * u, y0 + (y1 - y0) * v, a.z);
+        let viewports: Vec<EntityType> = tile_fractions(self.tiles)
+            .iter()
+            .filter_map(|&(u0, v0, u1, v1)| {
+                Self::viewport_from_corners(at(u0, v0), at(u1, v1))
+            })
+            .map(|viewport| EntityType::Viewport(Box::new(viewport)))
+            .collect();
+        (!viewports.is_empty()).then_some(CmdResult::CommitEntitiesAndExit(viewports))
+    }
+
+    fn fit_tiles(&self) -> Option<CmdResult> {
+        let ((x0, y0), (x1, y1)) = self.paper_bounds;
+        self.tiled_viewports(DVec3::new(x0, y0, 0.0), DVec3::new(x1, y1, 0.0))
     }
 
     /// VPCLIP asking for the viewport.
@@ -146,35 +189,15 @@ impl MviewCommand {
         self.polygon.last().map(|p| DVec2::new(p.x, p.y))
     }
 
-    /// VPCLIP arc option answered with a typed value.
-    fn arc_value(&mut self, value: f64) -> Option<CmdResult> {
-        let a = self.last2()?;
-        let tangent = self.polygon_last_tangent;
-        let angle_ok = |r: f64| r.abs() > 1e-9 && r.abs() < std::f64::consts::TAU;
-        let next = match self.arc_sub {
-            Sub::ArcAngle if angle_ok(value.to_radians()) => Sub::ArcAngleEnd {
-                angle: value.to_radians(),
-            },
-            Sub::ArcAngleRadius { angle } if value > 0.0 => {
-                Sub::ArcAngleRadiusDir { angle, r: value }
+    /// What an arc option step made of an input.
+    fn arc_step(&mut self, step: ArcStep) -> CmdResult {
+        match step {
+            ArcStep::Next(sub) => {
+                self.arc_sub = sub;
+                CmdResult::NeedPoint
             }
-            Sub::ArcRadius if value > 0.0 => Sub::ArcRadiusEnd { r: value },
-            Sub::ArcRadiusAngle { r } if angle_ok(value.to_radians()) => Sub::ArcRadiusAngleDir {
-                r,
-                angle: value.to_radians(),
-            },
-            sub @ Sub::ArcCenterAngle { .. } => {
-                let (e, bulge) = arc_for(sub, a, DVec2::new(value.to_radians(), 0.0), tangent)?;
-                return Some(self.push_arc(e, bulge));
-            }
-            sub @ Sub::ArcCenterLength { .. } => {
-                let (e, bulge) = arc_for(sub, a, DVec2::new(value, 0.0), tangent)?;
-                return Some(self.push_arc(e, bulge));
-            }
-            _ => return None,
-        };
-        self.arc_sub = next;
-        Some(CmdResult::NeedPoint)
+            ArcStep::Arc(e, bulge) => self.push_arc(e, bulge),
+        }
     }
 
     /// VPCLIP arc option answered with a point.
@@ -182,35 +205,13 @@ impl MviewCommand {
         let Some(a) = self.last2() else {
             return CmdResult::NeedPoint;
         };
-        let p = DVec2::new(pt.x, pt.y);
-        let sub = self.arc_sub;
-        if sub.is_scalar() {
-            let value = if sub.is_angle() {
-                (p - a).y.atan2((p - a).x).to_degrees()
-            } else {
-                (p - a).length()
-            };
-            return self.arc_value(value).unwrap_or(CmdResult::NeedPoint);
+        match self
+            .arc_sub
+            .arc_point(DVec2::new(pt.x, pt.y), a, self.polygon_last_tangent)
+        {
+            Some(step) => self.arc_step(step),
+            None => CmdResult::NeedPoint,
         }
-        match sub {
-            Sub::ArcCenter if (p - a).length_squared() > 1e-12 => {
-                self.arc_sub = Sub::ArcCenterEnd { c: p }
-            }
-            Sub::ArcDirection => {
-                if let Some(dir) = (p - a).try_normalize() {
-                    self.arc_sub = Sub::ArcDirectionEnd { dir };
-                }
-            }
-            Sub::ArcSecond if (p - a).length_squared() > 1e-12 => {
-                self.arc_sub = Sub::ArcSecondEnd { s: p }
-            }
-            _ => {
-                if let Some((e, bulge)) = arc_for(sub, a, p, self.polygon_last_tangent) {
-                    return self.push_arc(e, bulge);
-                }
-            }
-        }
-        CmdResult::NeedPoint
     }
 
     /// VPCLIP CLose in arc mode: a tangent arc back to the start.
@@ -239,82 +240,25 @@ impl MviewCommand {
     /// VPCLIP chord direction (degrees) for the arc option being answered.
     fn arc_chord(&mut self, degrees: f64) -> Option<CmdResult> {
         let a = self.last2()?;
-        let p = a + DVec2::from_angle(degrees.to_radians());
-        let (e, bulge) = arc_for(self.arc_sub, a, p, self.polygon_last_tangent)?;
-        Some(self.push_arc(e, bulge))
+        let step = self
+            .arc_sub
+            .arc_chord(degrees, a, self.polygon_last_tangent)?;
+        Some(self.arc_step(step))
     }
 
     fn chord_step(&self) -> bool {
-        matches!(
-            self.arc_sub,
-            Sub::ArcAngleRadiusDir { .. } | Sub::ArcRadiusAngleDir { .. }
-        )
+        self.arc_sub.is_chord_step()
     }
 
     fn arc_prompt(&self) -> Option<String> {
-        if self.chord_step() {
-            let default = format!("{:.4}", self.tangent_degrees());
-            let default = default.trim_end_matches('0').trim_end_matches('.');
-            return Some(
-                t!(
-                    "Specify direction of chord for arc (hold Ctrl to switch direction) <%{default}>:",
-                    default = default
-                )
-                .into_owned(),
-            );
-        }
-        Some(
-            t!(match self.arc_sub {
-                Sub::ArcCenterAngle { .. } =>
-                    "Specify included angle (hold Ctrl to switch direction):",
-                Sub::ArcAngle | Sub::ArcRadiusAngle { .. } => "Specify included angle:",
-                Sub::ArcAngleEnd { .. } =>
-                    "Specify endpoint of arc (hold Ctrl to switch direction) or [CEnter/Radius]:",
-                Sub::ArcCenter | Sub::ArcAngleCenter { .. } => "Specify center point of arc:",
-                Sub::ArcCenterEnd { .. } =>
-                    "Specify endpoint of arc (hold Ctrl to switch direction) or [Angle/Length]:",
-                Sub::ArcCenterLength { .. } =>
-                    "Specify length of chord (hold Ctrl to switch direction):",
-                Sub::ArcDirection => "Specify the tangent direction for the start point of arc:",
-                Sub::ArcDirectionEnd { .. } =>
-                    "Specify endpoint of the arc (hold Ctrl to switch direction):",
-                Sub::ArcRadius | Sub::ArcAngleRadius { .. } => "Specify radius of arc:",
-                Sub::ArcRadiusEnd { .. } =>
-                    "Specify endpoint of arc (hold Ctrl to switch direction) or [Angle]:",
-                Sub::ArcSecond => "Specify second point on arc:",
-                Sub::ArcSecondEnd { .. } => "Specify end point of arc:",
-                _ => return None,
-            })
-            .into_owned(),
-        )
+        self.arc_sub.arc_prompt(self.polygon_last_tangent)
     }
 
     fn clip_text(&mut self, upper: &str) -> Option<CmdResult> {
-        if self.step == Step::Polygon && self.chord_step() {
-            let degrees = crate::entities::common::parse_typed_angle(upper)?.to_degrees();
-            return self.arc_chord(degrees);
-        }
         if self.step == Step::Polygon && self.arc_sub != Sub::None {
-            let next = match (self.arc_sub, upper) {
-                (Sub::ArcAngleEnd { angle }, "CE" | "CENTER" | "CENTRE") => {
-                    Sub::ArcAngleCenter { angle }
-                }
-                (Sub::ArcAngleEnd { angle }, "R" | "RADIUS") => Sub::ArcAngleRadius { angle },
-                (Sub::ArcCenterEnd { c }, "A" | "ANGLE") => Sub::ArcCenterAngle { c },
-                (Sub::ArcCenterEnd { c }, "L" | "LENGTH") => Sub::ArcCenterLength { c },
-                (Sub::ArcRadiusEnd { r }, "A" | "ANGLE") => Sub::ArcRadiusAngle { r },
-                (sub, text) if sub.is_scalar() => {
-                    let value = if sub.is_angle() {
-                        crate::entities::common::parse_typed_angle(text).map(f64::to_degrees)
-                    } else {
-                        crate::entities::common::parse_typed_length(text)
-                    };
-                    return value.and_then(|v| self.arc_value(v));
-                }
-                _ => return None,
-            };
-            self.arc_sub = next;
-            return Some(CmdResult::NeedPoint);
+            let a = self.last2()?;
+            let step = self.arc_sub.arc_text(upper, a, self.polygon_last_tangent)?;
+            return Some(self.arc_step(step));
         }
         match self.step {
             Step::ClipChoice => match upper {
@@ -340,15 +284,8 @@ impl MviewCommand {
             }
             Step::Polygon if self.polygon_mode == PolygonMode::Arc => match upper {
                 "CL" | "CLOSE" if self.polygon.len() >= 2 => Some(self.close_with_arc()),
-                "A" | "ANGLE" | "CE" | "CENTER" | "CENTRE" | "D" | "DIRECTION" | "R" | "RADIUS"
-                | "S" | "SECOND" | "SECOND PT" => {
-                    self.arc_sub = match upper {
-                        "A" | "ANGLE" => Sub::ArcAngle,
-                        "CE" | "CENTER" | "CENTRE" => Sub::ArcCenter,
-                        "D" | "DIRECTION" => Sub::ArcDirection,
-                        "R" | "RADIUS" => Sub::ArcRadius,
-                        _ => Sub::ArcSecond,
-                    };
+                _ if Sub::arc_option(upper).is_some() => {
+                    self.arc_sub = Sub::arc_option(upper)?;
                     Some(CmdResult::NeedPoint)
                 }
                 "L" | "LINE" => {
@@ -413,8 +350,8 @@ impl MviewCommand {
         viewport.width = width;
         viewport.height = height;
         viewport.id = 2;
-        viewport.view_target = view.target.clone();
-        viewport.view_direction = view.direction.clone();
+        viewport.view_target = view.target;
+        viewport.view_direction = view.direction;
         viewport.view_height = source_height;
         viewport.custom_scale = height / source_height;
         viewport.lens_length = view.lens_length;
@@ -586,7 +523,7 @@ impl CadCommand for MviewCommand {
         }
         match self.step {
             Step::RectangleFirst => {
-                t!("MVIEW  Specify corner of viewport or [Polygonal/Object/Fit/Insert view]:")
+                t!("MVIEW  Specify corner of viewport or [Polygonal/Object/Fit/Insert view/2/3/4]:")
                     .into_owned()
             }
             Step::RectangleSecond => t!("MVIEW  Specify opposite corner:").into_owned(),
@@ -619,6 +556,16 @@ impl CadCommand for MviewCommand {
                 t!("MVIEW New view  Specify opposite model-space corner:").into_owned()
             }
             Step::PlaceView => t!("MVIEW Insert view  Specify placement point:").into_owned(),
+            Step::TileArrangement(2) => {
+                t!("MVIEW  Enter viewport arrangement [Horizontal/Vertical] <Vertical>:")
+                    .into_owned()
+            }
+            Step::TileArrangement(_) => t!(
+                "MVIEW  Enter viewport arrangement [Horizontal/Vertical/Above/Below/Left/Right] <Right>:"
+            )
+            .into_owned(),
+            Step::TileFirst => t!("MVIEW  Specify first corner or [Fit] <Fit>:").into_owned(),
+            Step::TileSecond => t!("MVIEW  Specify opposite corner:").into_owned(),
             Step::ClipSelect | Step::ClipChoice | Step::ClipLength => String::new(),
         }
     }
@@ -627,17 +574,7 @@ impl CadCommand for MviewCommand {
         if self.clip.is_some() {
             return match self.step {
                 Step::ClipChoice => vec![CmdOption::new("Polygonal", "P")],
-                Step::Polygon if self.arc_sub != Sub::None => match self.arc_sub {
-                    Sub::ArcAngleEnd { .. } => vec![
-                        CmdOption::new("CEnter", "CE"),
-                        CmdOption::new("Radius", "R"),
-                    ],
-                    Sub::ArcCenterEnd { .. } => {
-                        vec![CmdOption::new("Angle", "A"), CmdOption::new("Length", "L")]
-                    }
-                    Sub::ArcRadiusEnd { .. } => vec![CmdOption::new("Angle", "A")],
-                    _ => Vec::new(),
-                },
+                Step::Polygon if self.arc_sub != Sub::None => self.arc_sub.arc_options(),
                 Step::Polygon if self.polygon_mode == PolygonMode::Arc => vec![
                     CmdOption::new("Angle", "A"),
                     CmdOption::new("CEnter", "CE"),
@@ -666,7 +603,26 @@ impl CadCommand for MviewCommand {
                 CmdOption::new(t!("Object").as_ref(), "OBJECT"),
                 CmdOption::new(t!("Fit").as_ref(), "FIT"),
                 CmdOption::new(t!("Insert view").as_ref(), "INSERT"),
+                CmdOption::new("2", "2"),
+                CmdOption::new("3", "3"),
+                CmdOption::new("4", "4"),
             ],
+            Step::TileArrangement(count) => {
+                let mut options = vec![
+                    CmdOption::new(t!("Horizontal").as_ref(), "HORIZONTAL"),
+                    CmdOption::new(t!("Vertical").as_ref(), "VERTICAL"),
+                ];
+                if count == 3 {
+                    options.extend([
+                        CmdOption::new(t!("Above").as_ref(), "ABOVE"),
+                        CmdOption::new(t!("Below").as_ref(), "BELOW"),
+                        CmdOption::new(t!("Left").as_ref(), "LEFT"),
+                        CmdOption::new(t!("Right").as_ref(), "RIGHT"),
+                    ]);
+                }
+                options
+            }
+            Step::TileFirst => vec![CmdOption::new(t!("Fit").as_ref(), "FIT")],
             Step::Polygon if !self.polygon.is_empty() => vec![
                 CmdOption::new(t!("Arc").as_ref(), "ARC"),
                 CmdOption::new(t!("Line").as_ref(), "LINE"),
@@ -777,9 +733,20 @@ impl CadCommand for MviewCommand {
                 },
                 None => CmdResult::Cancel,
             },
-            Step::Object | Step::ChooseView | Step::ClipSelect | Step::ClipChoice => {
+            Step::TileFirst => {
+                self.first = Some(pt);
+                self.step = Step::TileSecond;
                 CmdResult::NeedPoint
             }
+            Step::TileSecond => self
+                .first
+                .and_then(|first| self.tiled_viewports(first, pt))
+                .unwrap_or(CmdResult::NeedPoint),
+            Step::Object
+            | Step::ChooseView
+            | Step::ClipSelect
+            | Step::ClipChoice
+            | Step::TileArrangement(_) => CmdResult::NeedPoint,
             Step::ClipLength => CmdResult::NeedPoint,
         }
     }
@@ -799,6 +766,12 @@ impl CadCommand for MviewCommand {
             Step::DefineNewFirst | Step::DefineNewSecond => {
                 CmdResult::MviewCancelToLayout(self.original_layout.clone())
             }
+            Step::TileArrangement(count) => {
+                self.tiles = if count == 2 { "2V" } else { "3R" };
+                self.step = Step::TileFirst;
+                CmdResult::NeedPoint
+            }
+            Step::TileFirst => self.fit_tiles().unwrap_or(CmdResult::Cancel),
             _ => CmdResult::Cancel,
         }
     }
@@ -857,7 +830,10 @@ impl CadCommand for MviewCommand {
             InputKind::FreeText
         } else if self.step == Step::ChooseView {
             InputKind::FreeText
+        } else if matches!(self.step, Step::TileArrangement(_)) {
+            InputKind::SingleToken
         } else if self.step == Step::RectangleFirst
+            || self.step == Step::TileFirst
             || self.step == Step::ClipChoice
             || (self.step == Step::Polygon && !self.polygon.is_empty())
         {
@@ -869,12 +845,16 @@ impl CadCommand for MviewCommand {
 
     fn point_step_accepts_keywords(&self) -> bool {
         self.step == Step::RectangleFirst
+            || self.step == Step::TileFirst
             || self.step == Step::ClipChoice
             || (self.step == Step::Polygon && !self.polygon.is_empty())
     }
 
     fn window_corner_pick(&self) -> bool {
-        matches!(self.step, Step::RectangleSecond | Step::DefineNewSecond)
+        matches!(
+            self.step,
+            Step::RectangleSecond | Step::DefineNewSecond | Step::TileSecond
+        )
     }
 
     fn window_first_corner(&self) -> Option<DVec3> {
@@ -905,6 +885,33 @@ impl CadCommand for MviewCommand {
                     self.step = Step::ChooseView;
                     Some(CmdResult::NeedPoint)
                 }
+                "2" | "3" => {
+                    self.step = Step::TileArrangement(if upper == "2" { 2 } else { 3 });
+                    Some(CmdResult::NeedPoint)
+                }
+                "4" => {
+                    self.tiles = "4";
+                    self.step = Step::TileFirst;
+                    Some(CmdResult::NeedPoint)
+                }
+                _ => None,
+            },
+            Step::TileArrangement(count) => {
+                let side = match upper.as_str() {
+                    "H" | "HORIZONTAL" => "H",
+                    "V" | "VERTICAL" => "V",
+                    "A" | "ABOVE" if count == 3 => "A",
+                    "B" | "BELOW" if count == 3 => "B",
+                    "L" | "LEFT" if count == 3 => "L",
+                    "R" | "RIGHT" if count == 3 => "R",
+                    _ => return None,
+                };
+                self.tiles = tile_code(&format!("{count}{side}"))?;
+                self.step = Step::TileFirst;
+                Some(CmdResult::NeedPoint)
+            }
+            Step::TileFirst => match upper.as_str() {
+                "F" | "FIT" => self.fit_tiles(),
                 _ => None,
             },
             Step::Polygon => match upper.as_str() {
@@ -962,6 +969,30 @@ impl CadCommand for MviewCommand {
                 ])
             }
             Step::Polygon => self.polygon_preview(pt),
+            Step::TileSecond => {
+                let first = self.first?;
+                let (x0, x1) = (first.x.min(pt.x), first.x.max(pt.x));
+                let (y0, y1) = (first.y.min(pt.y), first.y.max(pt.y));
+                let at = |u: f64, v: f64| {
+                    DVec3::new(x0 + (x1 - x0) * u, y0 + (y1 - y0) * v, first.z)
+                };
+                // One closed loop per viewport, NaN between them.
+                let mut points = Vec::new();
+                for &(u0, v0, u1, v1) in tile_fractions(self.tiles) {
+                    if !points.is_empty() {
+                        points.push([f64::NAN; 3]);
+                    }
+                    for p in [at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1), at(u0, v0)] {
+                        points.push([p.x, p.y, p.z]);
+                    }
+                }
+                Some(WireModel::solid_f64(
+                    "mview_preview".to_string(),
+                    points,
+                    WireModel::CYAN,
+                    false,
+                ))
+            }
             Step::PlaceView => {
                 let viewport = self.placed_viewport(pt)?;
                 let half_width = viewport.width / 2.0;
@@ -976,6 +1007,49 @@ impl CadCommand for MviewCommand {
             }
             _ => None,
         }
+    }
+}
+
+/// The arrangement codes VPORTS and MVIEW 2/3/4 know, in their canonical
+/// spelling.
+fn tile_code(code: &str) -> Option<&'static str> {
+    Some(match code.to_ascii_uppercase().as_str() {
+        "SINGLE" | "SI" | "1" => "SINGLE",
+        "2H" => "2H",
+        "2V" | "2" => "2V",
+        "3R" | "3" => "3R",
+        "3L" => "3L",
+        "3A" => "3A",
+        "3B" => "3B",
+        "3H" => "3H",
+        "3V" => "3V",
+        "4" => "4",
+        _ => return None,
+    })
+}
+
+/// The viewports of an arrangement as (u0, v0, u1, v1) fractions of the area,
+/// v up. Horizontal stacks them, Vertical sets them side by side; a
+/// three-viewport side names where the large one goes.
+fn tile_fractions(code: &str) -> &'static [(f64, f64, f64, f64)] {
+    const T: f64 = 1.0 / 3.0;
+    const U: f64 = 2.0 / 3.0;
+    match code {
+        "2H" => &[(0.0, 0.5, 1.0, 1.0), (0.0, 0.0, 1.0, 0.5)],
+        "2V" => &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 1.0, 1.0)],
+        "3R" => &[(0.0, 0.5, 0.5, 1.0), (0.0, 0.0, 0.5, 0.5), (0.5, 0.0, 1.0, 1.0)],
+        "3L" => &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.5, 1.0, 1.0), (0.5, 0.0, 1.0, 0.5)],
+        "3A" => &[(0.0, 0.5, 1.0, 1.0), (0.0, 0.0, 0.5, 0.5), (0.5, 0.0, 1.0, 0.5)],
+        "3B" => &[(0.0, 0.5, 0.5, 1.0), (0.5, 0.5, 1.0, 1.0), (0.0, 0.0, 1.0, 0.5)],
+        "3H" => &[(0.0, U, 1.0, 1.0), (0.0, T, 1.0, U), (0.0, 0.0, 1.0, T)],
+        "3V" => &[(0.0, 0.0, T, 1.0), (T, 0.0, U, 1.0), (U, 0.0, 1.0, 1.0)],
+        "4" => &[
+            (0.0, 0.5, 0.5, 1.0),
+            (0.5, 0.5, 1.0, 1.0),
+            (0.0, 0.0, 0.5, 0.5),
+            (0.5, 0.0, 1.0, 0.5),
+        ],
+        _ => &[(0.0, 0.0, 1.0, 1.0)],
     }
 }
 

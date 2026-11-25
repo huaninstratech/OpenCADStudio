@@ -1,14 +1,14 @@
-use codec::entities::{Helix, HelixConstraint, Spline};
-use codec::types::Vector3;
+use document::entities::{Helix, HelixConstraint, Spline};
+use document::types::Vector3;
 use glam::DVec3;
-use kernel::space::{HelixCurve, HelixDirection, NurbsCurve3, Vec3};
+use ocs_geom::space::{HelixCurve, HelixDirection, NurbsCurve3, Vec3};
 
-use crate::command::EntityTransform;
 use crate::entities::common::{
     center_grip, edit_prop as edit, format_angle, format_length, parse_f64, ro_prop as ro,
     square_grip,
 };
 use crate::entities::traits::{Grippable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::RenderEntity;
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::t;
@@ -491,7 +491,7 @@ fn apply_grip(helix: &mut Helix, grip_id: usize, apply: GripApply) {
 fn apply_transform(helix: &mut Helix, transform: &EntityTransform) {
     match transform {
         EntityTransform::Translate(delta) => {
-            codec::Entity::translate(helix, Vector3::new(delta.x, delta.y, delta.z));
+            document::Entity::translate(helix, Vector3::new(delta.x, delta.y, delta.z));
         }
         EntityTransform::Rotate {
             center,
@@ -515,14 +515,14 @@ fn apply_transform(helix: &mut Helix, transform: &EntityTransform) {
                 *p2,
                 *working_normal,
             );
-            codec::Entity::apply_transform(helix, &reflection);
+            document::Entity::apply_transform(helix, &reflection);
         }
-        EntityTransform::Affine(value) => codec::Entity::apply_transform(helix, value),
+        EntityTransform::Affine(value) => document::Entity::apply_transform(helix, value),
     }
 }
 
 impl RenderConvertible for Helix {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         self.spline.to_render(document)
     }
 }

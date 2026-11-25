@@ -354,7 +354,7 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `REFCLOSE` | — | Closes in-place reference editing. † |
 | `REFEDIT` | — | Edits a block or xref in place. † |
 | `REFSET` | — | Adds or removes objects from the working set of an in-place edit. † |
-| `STEPOUT` | — | Export 3D meshes to STEP AP203 format. |
+| `STEPOUT` | — | Export 3D objects to STEP (AP214; `STEPOUT AP203` / `AP242`), solids as exact B-reps. |
 | `UNDERLAY` | — | Edit properties of selected PDF/DWF/DGN underlay entities. Usage: UNDERLAY FADE <0-80> UNDERLAY CONTRAST <0-100> UNDERLAY ON \| OFF UNDERLAY CLIP ON \| OFF UNDERLAY MONO ON \| OFF. |
 | `WMFIN` | — | Imports a Windows metafile (WMF). † |
 
@@ -396,6 +396,8 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `LAYTRANS` | — | Translates layer names and standards in the current drawing to match another company or AIA layer standard file. *Tip:* Save translation mappings to a .dws or .dwg standard file for recurrin project conversion. |
 | `LAYUNISO` | — | Restores all layers that were turned off, frozen, or locked by the most recent LAYISO command. *Tip:* Quickly returns your workspace to its full visible state after isolated editing. |
 | `LAYWALK` | — | Opens an interactive layer inspector dialog to quickly walk through and view objects on individual layers. *Tip:* The ultimate tool for CAD quality assurance and checking what rogue entities sit on unexpected layers. |
+| `LOGFILEOFF` | — | Stops writing the command line to the log file and shows where the file is. |
+| `LOGFILEON` | — | Writes everything the command line shows to a log file in LOGFILEPATH, one file per session. |
 | `LINETYPE` | `LT` | Menu: Linetype.... |
 | `MATCHPROP` | `MA` | Applies the properties (layer, color, linetype, text style, dimension style) of a selected source object to other target objects. *Tip:* Type S (Settings) after selecting source to toggle exactly which properties to copy (e.g. only layer without changing hatch scale). |
 | `PROPERTIES` | `CH`, `MO`, `PR`, `PROPS` | Opens the Properties palette (Ctrl+1) to inspect and modify all geometric and styling parameters of selected objects. *Tip:* Aliases CH, MO also open this palette. Use the Quick Select (funnel icon) button at top-right for precision filtering. |
@@ -627,11 +629,11 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `DBLIST` | — | List data for every entity in the drawing (LIST over the whole database rather than the current selection). |
 | `DSETTINGS` | `DS` | Menu: Drafting Settings.... |
 | `DWGPROPS` | — | Sets and displays file properties (Title, Subject, Author, Keywords, Custom fields) of the current drawing. *Tip:* Custom fields can be dynamically referenced by fields in title blocks and Sheet Sets. |
-| `ETRANSMIT` | `ZIP` | Packages a drawing and all its associated external references, fonts, plot styles (CTB), and images into a single zip file. *Tip:* The standard protocol before emailing drawings to clients or contractors to ensure no missing Xrefs or fonts. |
+| `ETRANSMIT` | `ZIP` | Packages the drawing, recursive xrefs, images, underlays, point clouds, fonts, SHX shapes, custom plot tables, and external CENTERLTYPEFILE sources into one ZIP. Options selects source-folder preservation, type-based folders, or a flat package; references are rewritten and name collisions receive unique names. |
 | `EXIT` | — | Exits the application window after confirming unsaved changes. |
 | `FILEASSOC` | — | Registers the app as the handler of DWG/DXF files. † |
 | `FINDNONPURGEABLE` | — | Ribbon: Find Non-\nPurgeable Items. |
-| `GEOGRAPHICLOCATION` | — | Assigns real-world GIS coordinates and loads live aerial satellite maps directly under your CAD geometry. *Tip:* Enables accurate civil, site layout, and sun-study simulations aligned with real geographic coordinates. |
+| `GEOGRAPHICLOCATION` | — | Sets the root drawing coordinate reference system in GEODATA from an EPSG code or WKT. Geometry and drawing units are unchanged; the setting is undoable and persists in DWG/DXF. |
 | `HYPERLINKBASE` | — | Sets the base path for relative hyperlinks. † |
 | `HYPERLINKOPTIONS` | — | Sets hyperlink cursor and tooltip display. † |
 | `IM` | — | Alias of IMAGE. † |
@@ -717,6 +719,7 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `SYNCPVIEWPORTS` | — | Copy the first selected viewport's display settings (view direction/target, scale, snap/grid, frozen layers) to the rest. |
 | `TILEMODE` | — | 1: model space; 0: the paper layout that was last current (the drawing's own `CTAB`), else the first one. |
 | `TOOLPALETTES` | `TP` | Menu: Tool Palettes. |
+| `TOOLPALETTESCLOSE` | — | Close Tool Palettes. † |
 | `UCS` | — | Bare UCS → interactive front-end (option then value as steps), so `UCS Z 90` is typable in the command line and works headlessly. The front-end delegates back to the inline handler below. (#169) |
 | `UCSFOLLOW` | — | Toggles UCS follow: the view follows the UCS. † |
 | `VERTICAL` | — | Ribbon: Tile\nVert.. |
@@ -737,7 +740,7 @@ Generated from the command registry of OpenCADStudio `main` (commit f664c42, 202
 | `-WB` | — | Command-line (no dialog) form of WB. |
 | `ADDSELECTED` | — | Starts the creation command corresponding to selected object with matching layer and properties. |
 | `AFLAGS` | — | Sets the attribute display flags (invisible, constant, verify, preset). † |
-| `ARCHIVE` | — | Package the drawing and its referenced files (xrefs + raster images) into a sibling "<name>_archive" folder. Web: there is no folder to copy into — the same dependency set is collected from the session's bytes registries and delivered as a "<name>_transmit.zip" download (`archive_web` below). |
+| `ARCHIVE` | — | Packages the drawing and its resolvable dependencies into a sibling `<name>_archive` folder on desktop, or a downloaded ZIP on the web. Includes an itemized dependency report. |
 | `ARRAY3D` | — | Multi-tier 3D arraying. Synonym for 3DARRAY command. |
 | `ARRAYPATH` | — | Menu: Path Array. |
 | `ARRAYPOLAR` | — | Menu: Polar Array. |
@@ -909,6 +912,8 @@ Type a name to read it and be prompted for a new value (`OSMODE <4133>`). A dash
 | `ISOLINES` | 4 | Integer Read/Write | Specifies number of wireframe contour lines displayed on curved surfaces of 3D solids (0 to 2047). Tip: Increase to 16 or 32 for higher visual surface fidelity on curved solids. |
 | `LAYOUTCREATEVIEWPORT` | — | — | — |
 | `LIMCHECK` | — | — | — |
+| `LOGFILEMODE` | 0 (Off) | Boolean Read/Write | Writes the command line to a log file (LOGFILEON / LOGFILEOFF). |
+| `LOGFILEPATH` | (settings folder)/logs | String Read/Write | Folder the log files go to; `.` restores the default. |
 | `LOGINNAME` | (Windows User) | String Read-Only | Stores the Windows or Autodesk account user login name. Tip: Used in title blocks and plot stamps to track "Drawn By" and approval records automatically. |
 | `LTSCALE` | 1.0 | Real Read/Write | Sets global linetype scale factor for all dotted, dashed, and patterned lines across the entire drawing. Tip: In Model Space, set LTSCALE to match your intended plot scale factor (e.g. 48 for 1/4"=1'-0", 100 for 1:100). |
 | `LUNITS` | 2 (Decimal) | Integer Read/Write | Sets linear coordinate display unit format: 1=Scientific, 2=Decimal, 3=Engineering (feet & decimal inches), 4=Architectural (feet & fractional inches), 5=Fractional. Tip: Architects and interior designers use 4; civil and mechanical engineers use 2. |
@@ -919,6 +924,7 @@ Type a name to read it and be prompted for a new value (`OSMODE <4133>`). A dash
 | `MENUBAR` | — | — | — |
 | `MIRRTEXT` | 0 (Off) | Boolean Read/Write | Controls how the MIRROR command reflects text: 0=retains text reading direction (left-to- right), 1=mirrors text backwards like a mirror image. Tip: Always keep MIRRTEXT=0 so mirrored floor plans or symmetrical parts do not produce backwards unreadable notes. |
 | `MSLTSCALE` | 1 (On) | Boolean Read/Write | Scales linetypes displayed on the model tab by the current annotation scale (CANNOSCALE). Tip: Set to 1 so dashed lines preview accurately in Model Space as you change annotation scale. |
+| `NAVVCUBEOPACITY` | 50 | Integer Read/Write | Opacity of the ViewCube in percent (0–100) while the cursor is away from it; it turns fully opaque when the cursor reaches its corner. |
 | `ORTHOMODE` | 0 (Off) | Boolean Read/Write | Constrains cursor movement strictly to horizontal and vertical axes (F8 toggle). Tip: Hold Shift temporarily while drawing to invert Ortho mode on the fly. |
 | `OSMODE` | 4133 | Bitmask Read/Write | Sets running Object Snap (Osnap) modes using bitcode sum (1=Endpoint, 2=Midpoint, 4=Center, 8=Node, 16=Quadrant, 32=Intersection, 64=Insertion, 128=Perpendicular, 256=Tangent, 512=Nearest, 1024=Apparent, 2048=Extension, 4096=Parallel). Tip: Add 16384 to suppress running osnaps without losing your configured bitmask. 0 turns all osnaps off. |
 | `OSNAPZ` | — | — | — |
@@ -936,7 +942,7 @@ Type a name to read it and be prompted for a new value (`OSMODE <4133>`). A dash
 | `PICKADD` | 2 | Integer Read/Write | Controls whether subsequent object selections replace or add to the current selection set (0=replace, 1=add, 2=add and retain selection after command ends). Tip: If clicking a new object deselects your previous object, PICKADD was accidentally changed to 0; set back to 2. |
 | `PICKAUTO` | 5 | Integer Read/Write | Controls automatic window selection when clicking open space (window, crossing, fence, lasso). Tip: Set to 1 for classic window/crossing without accidental lasso dragging. |
 | `PICKBOX` | 3 (Pixels) | Integer Read/Write | Sets the object selection target pickbox height in device pixels (0 to 50). Tip: Increase on 4K high-DPI displays to make selecting fine lines effortless. |
-| `PICKDRAG` | 2 | Boolean Read/Write | Controls how selection windows are drawn: 0=two clicks, 1=press and drag, 2=auto-detect both. Tip: Set to 0 if you find yourself accidentally dragging selection windows. |
+| `PICKDRAG` | 2 | Integer Read/Write | Controls automatic area gestures. Use 0 for two clicks, 1 for press and drag, or 2 for either. PICKAUTO controls which gestures are enabled and where they can start. |
 | `PICKFIRST` | 1 (On) | Boolean Read/Write | Controls whether you can select objects before starting a command (Noun/Verb selection). Tip: If pressing Delete key or running MOVE no longer works on pre-selected objects, set PICKFIRST to 1. |
 | `PICKSTYLE` | — | — | — |
 | `PLIMCHECK` | — | — | — |

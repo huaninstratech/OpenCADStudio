@@ -1,7 +1,7 @@
 // HYPERLINK object selection, -HYPERLINK and HYPERLINKOPTIONS.
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 fn hex(handles: &[Handle]) -> String {
@@ -13,7 +13,9 @@ fn hex(handles: &[Handle]) -> String {
 }
 
 fn keyword(text: &str) -> String {
-    text.trim().trim_start_matches(['_', '.']).to_ascii_uppercase()
+    text.trim()
+        .trim_start_matches(['_', '.'])
+        .to_ascii_uppercase()
 }
 
 /// HYPERLINK without a pickfirst selection: `Select objects:`, then the
@@ -47,6 +49,62 @@ impl CadCommand for HyperlinkSelectCommand {
     fn on_enter(&mut self) -> CmdResult {
         CmdResult::Cancel
     }
+}
+
+/// PASTEASHYPERLINK without a pickfirst selection: `Select objects:`, then
+/// the clipboard's `url` becomes their hyperlink.
+pub struct PasteAsHyperlinkSelect {
+    url: String,
+}
+
+impl PasteAsHyperlinkSelect {
+    pub fn new(url: String) -> Self {
+        Self { url }
+    }
+}
+
+impl CadCommand for PasteAsHyperlinkSelect {
+    fn name(&self) -> &'static str {
+        "PASTEASHYPERLINK"
+    }
+
+    fn prompt(&self) -> String {
+        crate::t!("Select objects:").into_owned()
+    }
+
+    fn is_selection_gathering(&self) -> bool {
+        true
+    }
+
+    fn on_selection_complete(&mut self, handles: Vec<Handle>) -> CmdResult {
+        if handles.is_empty() {
+            return CmdResult::Cancel;
+        }
+        CmdResult::Dispatch(paste_as_hyperlink_apply(&handles, &self.url))
+    }
+
+    fn on_point(&mut self, _pt: DVec3) -> CmdResult {
+        CmdResult::NeedPoint
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        CmdResult::Cancel
+    }
+}
+
+/// The internal command that attaches `url` to `handles`: the handles first,
+/// then the address, which may hold spaces.
+pub fn paste_as_hyperlink_apply(handles: &[Handle], url: &str) -> String {
+    format!("_PASTEASHYPERLINKAPPLY {} {url}", hex(handles))
+}
+
+/// The address PASTEASHYPERLINK takes from the clipboard text: its first
+/// line that is not blank, trimmed. `None` when the text holds none.
+pub fn clipboard_hyperlink(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,11 +266,9 @@ impl CadCommand for DashHyperlinkCommand {
 
     fn on_enter(&mut self) -> CmdResult {
         match self.step {
-            Step::Option
-            | Step::InsertOption
-            | Step::Url
-            | Step::Location
-            | Step::Description => self.on_text_input("").unwrap_or(CmdResult::NeedPoint),
+            Step::Option | Step::InsertOption | Step::Url | Step::Location | Step::Description => {
+                self.on_text_input("").unwrap_or(CmdResult::NeedPoint)
+            }
             _ => CmdResult::NeedPoint,
         }
     }
@@ -338,5 +394,11 @@ impl CadCommand for HyperlinkOptionsCommand {
 }
 
 inventory::submit!(crate::command::CommandRegistration {
-    names: &["HYPERLINK", "-HYPERLINK", "HYPERLINKOPTIONS", "HYPERLINKBASE"]
+    names: &[
+        "HYPERLINK",
+        "-HYPERLINK",
+        "HYPERLINKOPTIONS",
+        "HYPERLINKBASE",
+        "PASTEASHYPERLINK"
+    ]
 });

@@ -18,9 +18,7 @@ pub fn laycur_tool() -> ToolDef {
     ToolDef {
         id: "LAYCUR",
         label: "Change to Current Layer",
-        icon: IconKind::Svg(include_bytes!(
-            "../../../../assets/icons/layers/laycur.svg"
-        )),
+        icon: IconKind::Svg(include_bytes!("../../../../assets/icons/layers/laycur.svg")),
         event: ModuleEvent::Command("LAYCUR".to_string()),
     }
 }
@@ -39,7 +37,7 @@ pub fn copy_to_layer_tool() -> ToolDef {
 
 // ── CadCommand implementation ─────────────────────────────────────────────
 
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};

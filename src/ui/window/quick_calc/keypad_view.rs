@@ -3,14 +3,15 @@
 
 use iced::widget::text::Span;
 use iced::widget::{
-    button, column, container, mouse_area, opaque, rich_text, row, scrollable, stack, text, Space,
+    Space, button, column, container, mouse_area, opaque, rich_text, row, scrollable, stack, text,
 };
-use iced::{font, mouse, Background, Border, Color, Element, Fill, Font, Padding, Shadow, Theme};
+use iced::{Background, Border, Color, Element, Fill, Font, Padding, Shadow, Theme, font, mouse};
 
-use super::view::{icon, m, mix, muted, strong, tip, tokens, CHEVRON_DOWN, POINT, STRONG};
+use super::view::{POINT, STRONG, icon, m, mix, muted, strong, tip, tokens};
 use super::{Flyout, Key, KeypadMode, MemoryOp, QuickCalcMsg, QuickCalcPalette};
-use crate::app::calc::Value;
 use crate::app::Message;
+use crate::app::calc::Value;
+use crate::ui::icons::TRI_DOWN;
 
 const BACKSPACE: &[u8] = include_bytes!("../../../../assets/icons/quickcalc/backspace.svg");
 const TRIGONOMETRY: &[u8] = include_bytes!("../../../../assets/icons/quickcalc/trigonometry.svg");
@@ -316,21 +317,25 @@ fn memory_button<'a>(
 
 fn memory_row<'a>(p: &QuickCalcPalette) -> Element<'a, Message> {
     let has = !p.memory.is_empty();
-    let label =
-        |s: &str| -> Element<'a, Message> { text(s.to_string()).size(11.5).font(STRONG).into() };
+    let label = |s: &str| -> Element<'a, Message> {
+        text(s.to_string())
+            .size(crate::ui::style::text::UI)
+            .font(STRONG)
+            .into()
+    };
     let op = |s: &str, op: MemoryOp, enabled: bool| {
         memory_button(label(s), QuickCalcMsg::Memory(op), enabled, false)
     };
     let list_open = p.flyout == Some(Flyout::Memory);
     let list = memory_button(
         row![
-            text("M").size(11.5).font(STRONG),
+            text("M").size(crate::ui::style::text::UI).font(STRONG),
             // The svg doesn't take the button's text colour, so it is
             // dimmed here to match the disabled label.
             if has {
-                icon(CHEVRON_DOWN, 10.0, |t| t.text)
+                icon(TRI_DOWN, 10.0, |t| t.text)
             } else {
-                icon(CHEVRON_DOWN, 10.0, super::view::disabled)
+                icon(TRI_DOWN, 10.0, super::view::disabled)
             }
         ]
         .spacing(2)
@@ -363,7 +368,7 @@ fn flyout_button<'a>(
         row![
             lead,
             text(label).size(12).font(STRONG),
-            icon(CHEVRON_DOWN, 10.0, |t| t.muted),
+            icon(TRI_DOWN, 10.0, |t| t.muted),
         ]
         .spacing(6)
         .align_y(iced::Center),

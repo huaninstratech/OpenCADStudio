@@ -139,7 +139,82 @@
 /// v15: quad panels + custom icons — the declarative quad-cursor-menu surface
 /// (`QuadPanelDef` / `PluginRequest::RegisterQuadPanels` /
 /// `HostNotification::QuadAction`), appending to the protocol enums only.
-pub const API_VERSION: u32 = 15;
+/// v16: `PluginRequest::ValidateParametricChain` checks a parametric chain
+/// without staging it, appended to the protocol enums. A v15 host cannot
+/// decode the request and drops the connection, so a plugin that calls it
+/// declares v16 and the older host refuses to load it. Custom grips now
+/// snap (object snap, tracking, ortho, polar) and settle click-move-click
+/// like native grips.
+/// v17: reactive modal dialogs — `InteractiveCommand::on_dialog_action` (a new
+/// vtable slot, so the runner only calls it for v17 plugins), the
+/// `DialogValue::ChoiceOptions` / `Enabled` / `Visible` updates and the
+/// `DialogControl::Label` control, all appended to their enums. A v16 host
+/// cannot decode them, so a plugin that uses them declares v17.
+/// v18: complete dock-panel snapshots. An ordinary document-bound panel
+/// command synchronously reads typed values, exact text and validation errors
+/// through `HostApi::panel_snapshot`; the host authenticates panel ownership
+/// from the IPC transport and attaches the session's real tab. The appended
+/// request requires v18: a v17 host refuses the new plugin at load rather
+/// than accepting it and failing to decode the request. v17 plugins remain
+/// supported. Asynchronous `PanelAction` notifications remain read-only.
+/// v19: presentation controls for dialogs and dock panels —
+/// `DialogControl::StyledText` (heading / strong / muted / success / warning /
+/// danger text, mapped onto the host theme) and `DialogControl::Svg` (a static
+/// plugin-rendered SVG image, e.g. a chart), appended to the enum. A v18 host
+/// cannot decode them, so a plugin that sends them declares v19; v18 and
+/// older plugins remain supported unchanged.
+/// v20 adds `PluginClassInstance::selectable_custom`: flagged display entities
+/// stay selectable for plugin custom grips/panels, expose a class-only label,
+/// and refuse native geometry editing. Unflagged instances keep the legacy
+/// reference-only staging behavior.
+/// v21 adds `PluginGrip::xy_plane`: every custom-grip event is constrained to
+/// the grip's original world-XY plane. The default preserves legacy behavior.
+/// v22 adds `HostApi::set_geo_location` / `remove_geo_location`, writing the
+/// drawing's model-space GEODATA object (appended requests).
+/// v22 also adds `HostNotification::SelectionChangedDigest`: an O(1) selection
+/// notification (`tab_id`, monotonic per-tab `revision`, exact `count`) routed
+/// INSTEAD OF the legacy handle-list selection variants to plugins that report
+/// v22+; older plugins keep the exact legacy streams.
+/// v23 appends `TableOperation::LayoutSetTabOrder`: a plugin sets the order of
+/// the paper-space layout tabs in one undo step. A v22 host cannot decode it,
+/// so a plugin that sends it declares v23.
+/// Also additive on `PanelDef`: `PanelDef::style` (`PanelStyle::Palette`
+/// default, `PanelStyle::Form` for dialog-like form rendering); older payloads
+/// decode as `PanelStyle::Palette` via `deserialize_panel_style`.
+/// v24 appends `InteractiveCommand::on_undo_step`, the mid-command Ctrl+Z
+/// hook, with the `HostRequest::UndoStep` / `HostResponse::UndoStep` pair. A
+/// v23 runner cannot decode the request, so the host sends it only to plugins
+/// whose manifest declares v24; older plugins keep the document undo.
+/// v25 appends `BuiltinPlugin::tools` / `BuiltinPlugin::call_tool`, typed
+/// operations AI clients call over the automation bridge, with the
+/// `HostRequest::ListTools` / `CallTool` pair. Older runners cannot decode
+/// them, so the host asks only plugins whose manifest declares v25.
+/// v26 appends `TableOperation::CustomPropertiesSet`: a plugin sets the
+/// drawing's custom properties (DWGPROPS Custom) in one undo step. A v25 host
+/// cannot decode it, so a plugin that sends it declares v26.
+/// v27 adds `HostNotification::DocumentChangedDelta` (wire tag 15): the
+/// categorized, exact successor of the v13 `DocumentChangedRegions` boundary
+/// notification — `added` / `modified` / `deleted` entity handle lists plus
+/// the same record tuples, an optional V4 snapshot correlation, and an
+/// explicit `full_refresh_required` flag for boundaries whose incremental
+/// sets the host cannot prove complete. The host routes per endpoint: plugins
+/// reporting v27+ receive the delta INSTEAD OF the Regions notification at
+/// every document boundary (no duplicate stream), while plugins reporting
+/// v26 or older keep their exact legacy Regions streams. A v26 runner cannot
+/// decode tag 15, so the host never sends the variant to it — the
+/// `notification_api_version` gate drops it.
+/// v28 appends `InteractiveCommand::input_kind` and
+/// `InteractiveCommand::on_text_input` (with `InteractiveInputKind`,
+/// `HostRequest::GetInputKind`, `HostResponse::InputKind`, and
+/// `InteractiveEvent::TextInput`) for command-line text prompts; plugins on
+/// v3–v27 remain supported unchanged.
+/// v29 appends `PluginRequest::PanelSurfacePublish`: a plugin publishes a
+/// bounded `PanelScene` (`PanelSurface::Scene`) for a panel it registered and
+/// gets the stored revision or a typed `SurfaceReject` back.
+/// v30 appends `ModuleEvent::PluginFolderDialog`: a ribbon tool asks the host
+/// for a native folder picker and gets `"<command> <folder>"` dispatched back.
+/// A v29 host cannot decode the event, so a plugin that sends it declares v30.
+pub const API_VERSION: u32 = 30;
 
 /// Oldest plugin API major the current host still loads. This keeps previously
 /// compiled cdylibs usable as long as their vtable layout is a prefix of the
@@ -220,6 +295,7 @@ pub struct EntityClasses {
 #[cfg(test)]
 mod tests {
     use crate::test_lock::ENV_LOCK;
+    use serial_test::serial;
 
     use super::*;
 
@@ -247,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn effective_max_defaults_to_api_version() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(MAX_API_VERSION_ENV);
@@ -254,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn effective_max_can_disable_v4() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "3");
@@ -265,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn effective_max_below_minimum_is_v3_only_mode() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "2");
@@ -276,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn effective_max_clamps_to_supported_range() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MAX_API_VERSION_ENV, "99");
@@ -286,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn host_accepts_supported_range() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(MAX_API_VERSION_ENV);

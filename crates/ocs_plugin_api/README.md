@@ -132,7 +132,9 @@ The frame format supports:
 
 Because the socket is full-duplex, the host can push
 `HostNotification::DocumentChangedV4`, `SelectionChangedV4`, or
-`DocumentTabClosed` to a plugin at any time, and the plugin can stream
+`DocumentTabClosed` to a plugin at any time (API 27+ plugins receive
+`DocumentChangedDelta` instead of the legacy `DocumentChangedRegions`
+boundary notification), and the plugin can stream
 `PluginNotification::Output`/`Progress`/`Log` back while a long command is still
 running.
 
@@ -359,8 +361,8 @@ struct SnapshotWorker {
 
 impl SnapshotWorker {
     fn add_point(&self, x: f64, y: f64, z: f64) -> anyhow::Result<u64> {
-        use opencadcodec::entities::Point;
-        use opencadcodec::EntityType;
+        use ocs_plugin_api::host::document::entities::Point;
+        use ocs_plugin_api::host::document::EntityType;
 
         let mut p = Point::from_coords(x, y, z);
         p.common.layer = "0".to_string();

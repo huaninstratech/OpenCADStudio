@@ -57,6 +57,7 @@ be security theater, not a real control.
 |---------|-------------|
 | `PY_EVAL <expr>` | Evaluate one Python expression and print the result (or error) to the command line. Example: `PY_EVAL 1 + 1`. |
 | `PY_RUN <path.py>` | Run a `.py` file as a script (statements, not just one expression). Reports an error the same way as `PY_EVAL` (missing file, syntax error, exception) — never a silent no-op. |
+| `PY_RESUME <token> <path.py>` | Run the file again after a `request_drag` it started has its points. The plugin issues this itself; `doc.resume()` then returns the result. |
 
 ## The `ocs` module
 
@@ -68,6 +69,16 @@ expression, not statements). Phases 1.2 (read), 1.3 (2D write) and part of
 | Function | Returns |
 |----------|---------|
 | `ocs.selection()` | List of the selected entities' handles (`int`), as of the last selection change — see note below. |
+| `ocs.get_entity_color(handle)` | Color of one top-level entity in the records-schema shape: `None` if the handle is absent, else `{"kind": "ByLayer"}`, `{"kind": "Index", "value": n}` or `{"kind": "Rgb", "value": {"r","g","b"}}`. |
+| `ocs.entity_kind(handle)` | The entity's variant name (`"Hatch"`, `"Solid"`, `"Line"`, …; `"Other"` for rarer kinds), or `None` if absent. The subset is documented in the source; `record_schema` is the exhaustive catalogue. |
+| `ocs.entities_on_layer(layer)` | Handles of the top-level entities currently on that layer (layer names compare case-insensitively). |
+| `ocs.get_entity_layer(handle)` | The carrying layer name of one top-level entity, or `None` if absent. |
+| `ocs.set_entity_color(handle, color)` | Rewrite one top-level entity's color. `color` is an `int` ACI index (1..=255), an `(r, g, b)` triple, or `"ByLayer"`. Raises when the entity does not exist. |
+| `ocs.set_entity_colors(updates, label)` | Batched: `[{"handle": …, "color": …}, …]` in **one undo step and one transaction**. Raises on the first missing handle. Reads happen against the dispatch snapshot — filter no-ops yourself before batching. |
+| `ocs.set_entity_layers(updates, label)` | Batched layer moves — the `set_entity_colors` twin for `/common/layer`. Same shape/one-undo-step contract; raises on a layer the drawing does not carry. |
+| `ocs.ensure_layer(name, color)` | Create the layer record when missing (with `color`), or rewrite its color. Idempotent. |
+| `ocs.freeze_layer(name, frozen)` | Set one layer record's freeze flag alone (missing layers stay absent). |
+| `ocs.thaw_layer(name)` | Un-freeze and un-lock one layer record alone. |
 | `ocs.get(handle)` | Dict of `{handle, kind, layer, point}` for that entity, or `None` if it doesn't exist. `point` is `{x, y, z}` or `None` for non-point entities. |
 | `ocs.get_text(handle)` | For single-line TEXT, returns its active alignment point, OCS normal, rotation, direction, and height; otherwise `None`. Reads the host's full document snapshot. |
 | `ocs.text_entities()` | Lists top-level TEXT/MTEXT entities as `{handle, kind, value}` dictionaries from the active document. |
@@ -181,7 +192,7 @@ positive, and `dimtxsty` must name an existing text style. `Standard` is never
 renamed or deleted; a style that is current or still referenced is never deleted;
 a case-only rename is refused. Style operations act on the active document.
 
-Known persistence limits (opencadcodec, see `docs/cadcodec-reader-gaps.md`; the first two are fixed in
+Known persistence limits (codec, see `docs/cadcodec-reader-gaps.md`; the first two are fixed in
 an open upstream pull request but OCS has not yet adopted it): a DXF
 save drops the backward/upside-down flags of a text style and does not restore a
 dimension style's `dimtxsty` name (the handle link survives); DWG keeps both.
@@ -211,7 +222,7 @@ anonymous or externally referenced blocks, and a case-only rename. Deleting also
 removes the definition's contents. Records list user blocks only (`handle`,
 `name`, `description`, `explodable`, `scale_uniformly`, `base_point`,
 `insert_count`, `entities` as `{handle, kind}`). A DXF save drops the block
-description (opencadcodec); DWG keeps it.
+description (codec); DWG keeps it.
 
 **Block contents.** Add to a definition with `create_entity(kind, block="Part",
 ...)`. It is validated exactly like a model-space entity and the host sets the
@@ -240,6 +251,7 @@ LY.set_page("Sheet1", paper_size=(420, 297), rotation=0, scale=(1, 50))
 LY.current = "Sheet1"                                     # create_entity now draws on the sheet
 doc.create_entity("Circle", center={"x": 50, "y": 50, "z": 0}, radius=5)
 LY.current = "Model"
+LY.create("Sheet2"); LY.set_tab_order(["Sheet2", "Sheet1"])  # every paper-space layout once
 LY.rename("Sheet1", "Plan"); LY.delete("Plan")            # deletes the sheet's entities too
 LY.names(), LY.current["name"], LY["Plan"]["paper_size"]
 ```
@@ -255,9 +267,12 @@ style or the current setting is never deleted. Layouts: `Model` cannot be create
 renamed or deleted; deleting the current layout falls back to `Model`; a
 case-only rename is refused. `set_page` takes the sheet in millimetres, a rotation
 of 0/90/180/270 and a custom scale `(numerator, denominator)`, and updates the
-layout limits. Layout operations act on the active document. Records list
+layout limits. `set_tab_order` lists every paper-space layout exactly once
+(matched ignoring case; `Model` stays first and is not listed), reorders the tabs
+in one undo step and returns the new `names()`; an unknown, missing or repeated
+name is refused. Layout operations act on the active document. Records list
 `current`, `tab_order`, `entity_count`, `viewport_count`, `paper_size`, `rotation`
-and `scale`. Reordering layouts and plot devices or styles are not available yet.
+and `scale`. Plot devices and plot styles are not available yet.
 
 ### Running OCS commands: `doc.command`, `doc.start_command`, `doc.modify`
 

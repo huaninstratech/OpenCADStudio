@@ -1,4 +1,4 @@
-use codec::Handle;
+use document::Handle;
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
@@ -42,7 +42,7 @@ impl CadCommand for BlockPickBasePointCommand {
 /// Enforces standard command ordering: Base point is ALWAYS prompted before object selection.
 pub struct BlockOnScreenCommand {
     options: crate::scene::CreateBlockOptions,
-    ucs: crate::app::helpers::UcsXform,
+    ucs: crate::entities::ucs_xform::UcsXform,
     need_base: bool,
     need_objects: bool,
 }
@@ -50,7 +50,7 @@ pub struct BlockOnScreenCommand {
 impl BlockOnScreenCommand {
     pub fn new(
         options: crate::scene::CreateBlockOptions,
-        ucs: crate::app::helpers::UcsXform,
+        ucs: crate::entities::ucs_xform::UcsXform,
         need_base: bool,
         need_objects: bool,
     ) -> Self {
@@ -125,20 +125,20 @@ mod tests {
     use super::*;
     use crate::scene::{CreateBlockOptions, Scene};
     use crate::ui::window::block_definition::BlockObjectMode;
-    use codec::entities::Line;
-    use codec::types::{Transform, Vector3};
+    use document::entities::Line;
+    use document::types::{Transform, Vector3};
 
     fn make_test_scene() -> (Scene, Handle) {
         let mut scene = Scene::new();
         let mut line = Line::new();
         line.start = Vector3::new(0.0, 0.0, 0.0);
         line.end = Vector3::new(10.0, 10.0, 0.0);
-        let h = scene.add_entity(codec::EntityType::Line(line));
+        let h = scene.add_entity(document::EntityType::Line(line));
         (scene, h)
     }
 
     #[test]
-    fn test_create_block_retain_mode() {
+    fn create_block_retain_mode() {
         let (mut scene, line_h) = make_test_scene();
         let options = CreateBlockOptions {
             name: "BLK_RETAIN".to_string(),
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_block_convert_mode() {
+    fn create_block_convert_mode() {
         let (mut scene, line_h) = make_test_scene();
         let options = CreateBlockOptions {
             name: "BLK_CONVERT".to_string(),
@@ -199,7 +199,7 @@ mod tests {
         // Insert entity exists in drawing
         let insert_entity = scene.document.get_entity(insert_h);
         assert!(insert_entity.is_some());
-        if let Some(codec::EntityType::Insert(ins)) = insert_entity {
+        if let Some(document::EntityType::Insert(ins)) = insert_entity {
             assert_eq!(ins.block_name, "BLK_CONVERT");
         } else {
             panic!("Expected Insert entity");
@@ -219,8 +219,8 @@ mod tests {
     /// file has to show the same shape, so it is read back from bytes.
     #[test]
     fn convert_mode_gives_the_reference_an_attribute_per_definition() {
-        use codec::entities::AttributeDefinition;
-        use codec::EntityType;
+        use document::entities::AttributeDefinition;
+        use document::EntityType;
         let (mut scene, line_h) = make_test_scene();
         let mut attdef =
             AttributeDefinition::new("WIDTH".to_string(), "Width:".to_string(), "100".to_string());
@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_block_delete_mode() {
+    fn create_block_delete_mode() {
         let (mut scene, line_h) = make_test_scene();
         let options = CreateBlockOptions {
             name: "BLK_DELETE".to_string(),
@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_block_redefinition() {
+    fn create_block_redefinition() {
         let (mut scene, line1_h) = make_test_scene();
         let options1 = CreateBlockOptions {
             name: "REDEF_BLOCK".to_string(),
@@ -372,7 +372,7 @@ mod tests {
             let mut line2 = Line::new();
             line2.start = Vector3::new(5.0, 5.0, 0.0);
             line2.end = Vector3::new(15.0, 15.0, 0.0);
-            scene.add_entity(codec::EntityType::Line(line2))
+            scene.add_entity(document::EntityType::Line(line2))
         };
 
         let options2 = CreateBlockOptions {
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_block_validation() {
+    fn create_block_validation() {
         let (mut scene, line_h) = make_test_scene();
 
         // Empty name
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_on_screen_command_ordering() {
+    fn block_on_screen_command_ordering() {
         let dummy_options = CreateBlockOptions {
             name: "ON_SCREEN_TEST".to_string(),
             handles: vec![],
@@ -495,7 +495,7 @@ mod tests {
         };
 
         // When both base point and objects are to be specified on-screen:
-        let ucs = crate::app::helpers::UcsXform::identity();
+        let ucs = crate::entities::ucs_xform::UcsXform::identity();
         let mut cmd = BlockOnScreenCommand::new(dummy_options, ucs, true, true);
 
         // 1. Initial step must be insertion base point
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_on_screen_base_point_sets_correct_transforms() {
+    fn block_on_screen_base_point_sets_correct_transforms() {
         let (mut scene, line_h) = make_test_scene();
         let initial_options = CreateBlockOptions {
             name: "ON_SCREEN_BASE_TEST".to_string(),
@@ -551,7 +551,7 @@ mod tests {
         };
 
         // User picked objects upfront in dialog, but checked "Specify base point on screen"
-        let ucs = crate::app::helpers::UcsXform::identity();
+        let ucs = crate::entities::ucs_xform::UcsXform::identity();
         let mut cmd = BlockOnScreenCommand::new(initial_options, ucs, true, false);
 
         // Pick base point at (10, 10, 0) (end of the line in make_test_scene)
@@ -581,7 +581,7 @@ mod tests {
 
         // In Convert mode, the insert entity must be placed at the picked base point
         let insert_entity = scene.document.get_entity(insert_h).unwrap();
-        if let codec::EntityType::Insert(ins) = insert_entity {
+        if let document::EntityType::Insert(ins) = insert_entity {
             assert_eq!(ins.block_name, "ON_SCREEN_BASE_TEST");
             assert!((ins.insert_point.x - 10.0).abs() < 1e-6);
             assert!((ins.insert_point.y - 10.0).abs() < 1e-6);
@@ -601,10 +601,10 @@ mod tests {
             .document
             .entities()
             .find(|e| {
-                e.common().owner_handle == br.handle && matches!(e, codec::EntityType::Line(_))
+                e.common().owner_handle == br.handle && matches!(e, document::EntityType::Line(_))
             })
             .unwrap();
-        if let codec::EntityType::Line(l) = block_line {
+        if let document::EntityType::Line(l) = block_line {
             assert!((l.start.x - (-10.0)).abs() < 1e-6);
             assert!((l.start.y - (-10.0)).abs() < 1e-6);
             assert!((l.end.x - 0.0).abs() < 1e-6);
@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explodable_flag_prevents_explode() {
+    fn explodable_flag_prevents_explode() {
         let (mut scene, line_h) = make_test_scene();
         let options = CreateBlockOptions {
             name: "BLK_NO_EXPLODE".to_string(),
@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explodable_flag_allows_explode() {
+    fn explodable_flag_allows_explode() {
         let (mut scene, line_h) = make_test_scene();
         let options = CreateBlockOptions {
             name: "BLK_CAN_EXPLODE".to_string(),

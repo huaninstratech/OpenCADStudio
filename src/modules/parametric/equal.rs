@@ -1,4 +1,4 @@
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult};
@@ -26,6 +26,12 @@ enum Step {
 pub struct EqualConstraintCommand {
     step: Step,
     picked_entity: Option<EntityType>,
+}
+
+impl Default for EqualConstraintCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EqualConstraintCommand {
@@ -230,8 +236,8 @@ inventory::submit!(crate::command::CommandRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::Line;
-    use codec::types::Vector3;
+    use document::entities::Line;
+    use document::types::Vector3;
 
     fn line() -> EntityType {
         EntityType::Line(Line::from_points(

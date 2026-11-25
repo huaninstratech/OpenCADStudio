@@ -9,8 +9,8 @@ use crate::modules::annotate::field_cmd::FieldPlaceCommand;
 use crate::ui::window::count_palette::{
     aci_rgba, CountMode, CountMsg, CountTarget, RowAction, AREA_LAYER,
 };
-use codec::count::{area_json, block_json, single_json, CountKey};
-use codec::{EntityType, Handle};
+use document::count::{area_json, block_json, single_json, CountKey};
+use document::{EntityType, Handle};
 use iced::Task;
 
 /// The variables this family answers for.
@@ -36,7 +36,7 @@ fn parse_xy(s: &str) -> Option<[f64; 2]> {
 }
 
 /// A field referring to `boundary` keeps the count area's polyline.
-fn boundary_in_use(doc: &codec::Document, boundary: Handle) -> bool {
+fn boundary_in_use(doc: &document::Document, boundary: Handle) -> bool {
     let needle = format!("\"boundaryObjectHandle\":\"{}\"", hex(boundary));
     doc.fields.values().any(|f| f.code.contains(&needle))
 }
@@ -248,7 +248,7 @@ impl OpenCADStudio {
                 self.apply_count_display(i);
             }
             _ => {
-                self.command_line.push_error(&if max == 1 {
+                self.command_line.push_rejection(&if max == 1 {
                     crate::t!("Requires 0 or 1 only.")
                 } else {
                     crate::tf!("Requires an integer between {min} and {max}.")
@@ -461,7 +461,7 @@ impl OpenCADStudio {
             }
             "O" => {
                 let h = parse_handle(tokens.get(1)?)?;
-                let ring = codec::count::boundary_polygon(&self.tabs[i].scene.document, h)?;
+                let ring = document::count::boundary_polygon(&self.tabs[i].scene.document, h)?;
                 Some((Some(ring), Some((h, false))))
             }
             _ => None,
@@ -474,18 +474,18 @@ impl OpenCADStudio {
         self.push_undo_snapshot(i, "COUNT");
         let doc = &mut self.tabs[i].scene.document;
         if !doc.layers.contains(AREA_LAYER) {
-            let mut layer = codec::tables::Layer::new(AREA_LAYER);
+            let mut layer = document::tables::Layer::new(AREA_LAYER);
             layer.handle = doc.allocate_handle();
-            layer.color = codec::types::Color::from_index(152);
+            layer.color = document::types::Color::from_index(152);
             layer.is_plottable = false;
             layer.flags.locked = true;
             layer.line_type = "Continuous".into();
             let _ = doc.layers.add(layer);
         }
-        let mut pl = codec::entities::LwPolyline::new();
+        let mut pl = document::entities::LwPolyline::new();
         pl.vertices = ring
             .iter()
-            .map(|p| codec::entities::LwVertex::new(codec::types::Vector2::new(p[0], p[1])))
+            .map(|p| document::entities::LwVertex::new(document::types::Vector2::new(p[0], p[1])))
             .collect();
         pl.is_closed = true;
         pl.common.layer = AREA_LAYER.into();
@@ -652,7 +652,7 @@ impl OpenCADStudio {
                 hosts.extend(record.entity_handles.iter().copied());
             }
         }
-        let attributes: Vec<&codec::entities::EntityCommon> = handles
+        let attributes: Vec<&document::entities::EntityCommon> = handles
             .iter()
             .filter_map(|h| match doc.get_entity(*h) {
                 Some(EntityType::Insert(insert)) => {
@@ -693,9 +693,9 @@ impl OpenCADStudio {
     fn place_count_table(&mut self, i: usize, point: [f64; 3], names: Vec<String>) {
         let doc = &self.tabs[i].scene.document;
         let area = self.tabs[i].count.as_ref().and_then(|m| m.area.clone());
-        let instances = codec::count::block_instances(doc, area.as_deref());
+        let instances = document::count::block_instances(doc, area.as_deref());
         let mut names: Vec<String> = if names.is_empty() {
-            codec::count::block_counts(&instances)
+            document::count::block_counts(&instances)
                 .into_iter()
                 .map(|c| c.name)
                 .collect()
@@ -712,16 +712,33 @@ impl OpenCADStudio {
         };
         names.sort_by_key(|n| n.to_ascii_uppercase());
         names.dedup_by_key(|n| n.to_ascii_uppercase());
-        let mut table = codec::entities::TableBuilder::new(names.len() + 1, 2)
-            .at(codec::types::Vector3::new(point[0], point[1], point[2]))
-            .row_height(0.36)
-            .column_width(3.6)
+        // The grid follows the current table style's text: rows as the
+        // TABLE command sizes them, columns scaled from the 0.18 default.
+        let style = crate::app::annotation_data::current_table_style(doc);
+        let heights = crate::modules::annotate::table_cmd::row_heights_for(
+            style.as_ref().map(|c| &c.style),
+            ["Header", "Data", "Data"],
+            false,
+            true,
+            names.len(),
+            1,
+        );
+        let data_height = heights.last().copied().unwrap_or(0.36);
+        let k = (data_height / 0.36).max(1e-6);
+        let mut table = document::entities::TableBuilder::new(names.len() + 1, 2)
+            .at(document::types::Vector3::new(point[0], point[1], point[2]))
+            .row_height(data_height)
+            .column_width(3.6 * k)
             .build();
-        table.set_column_width(1, 1.08);
+        table.set_column_width(1, 1.08 * k);
+        for (row, h) in table.rows.iter_mut().zip(&heights) {
+            row.height = *h;
+        }
+        table.table_style_handle = style.map(|c| c.handle);
         // As the reference writes it: no title row, data rows centred
         // (table and cell overrides), header cells without overrides.
         table.value_flags = 22;
-        table.legacy_style_override = Some(codec::entities::table::LegacyTableStyleOverride {
+        table.legacy_style_override = Some(document::entities::table::LegacyTableStyleOverride {
             flags: 0x10001,
             title_suppressed: Some(true),
             row_alignments: vec![5],
@@ -733,10 +750,10 @@ impl OpenCADStudio {
             table.set_cell_text(r + 1, 0, name);
             if let Some(cell) = table.cell_mut(r + 1, 1) {
                 // The count comes from the field; the cell keeps no text.
-                let mut content = codec::entities::table::CellContent::text("");
+                let mut content = document::entities::table::CellContent::text("");
                 content.value.flags = 1;
                 cell.contents = vec![content];
-                cell.cell_type = codec::entities::table::CellType::Text;
+                cell.cell_type = document::entities::table::CellType::Text;
             }
         }
         for (r, row) in table.rows.iter_mut().enumerate() {
@@ -748,7 +765,7 @@ impl OpenCADStudio {
                     cell.flag = 0x40000;
                 } else {
                     cell.flag = 0x40001;
-                    let mut style = codec::entities::CellStyle::new();
+                    let mut style = document::entities::CellStyle::new();
                     style.override_flags = 0x01;
                     style.alignment = 5;
                     cell.style = Some(style);
@@ -776,7 +793,7 @@ impl OpenCADStudio {
                     r + 1,
                     1,
                     r"%<\_FldIdx 0>%".to_string(),
-                    vec![codec::fields::NewField::new(code.clone(), value)],
+                    vec![document::fields::NewField::new(code.clone(), value)],
                 )
             })
             .collect();
@@ -793,12 +810,12 @@ impl OpenCADStudio {
         let Some(entity) = doc.get_entity(h) else {
             return;
         };
-        let outline = codec::count::entity_outline(doc, entity);
+        let outline = document::count::entity_outline(doc, entity);
         if outline.is_empty() {
             return;
         }
         let (mut lo, mut hi) = (glam::DVec3::splat(f64::MAX), glam::DVec3::splat(f64::MIN));
-        for c in outline.iter().flat_map(codec::count::Piece::points) {
+        for c in outline.iter().flat_map(document::count::Piece::points) {
             let p = glam::DVec3::new(c.x, c.y, c.z);
             lo = lo.min(p);
             hi = hi.max(p);
@@ -836,15 +853,15 @@ impl OpenCADStudio {
     /// The Field dialog's Show Count Instances: count mode on what the
     /// expression counts.
     pub(in crate::app) fn show_count_instances(&mut self, i: usize, json: &str) {
-        match codec::count::parse_query(json) {
-            Some(codec::count::CountQuery::Block {
+        match document::count::parse_query(json) {
+            Some(document::count::CountQuery::Block {
                 name,
                 key,
                 boundary,
             }) => {
                 if let Some(b) = boundary {
                     if let Some(ring) =
-                        codec::count::boundary_polygon(&self.tabs[i].scene.document, b)
+                        document::count::boundary_polygon(&self.tabs[i].scene.document, b)
                     {
                         let mut mode = self.tabs[i].count.take().unwrap_or_default();
                         if mode.boundary.map(|(h, _)| h) != Some(b) {
@@ -857,7 +874,7 @@ impl OpenCADStudio {
                 }
                 self.open_count_target(i, name, key);
             }
-            Some(codec::count::CountQuery::Single(handles)) if !handles.is_empty() => {
+            Some(document::count::CountQuery::Single(handles)) if !handles.is_empty() => {
                 let hexes: Vec<String> = handles.iter().map(|h| hex(*h)).collect();
                 let area = if self.tabs[i].count.is_some() {
                     "K"
@@ -919,7 +936,7 @@ impl OpenCADStudio {
             CountMsg::TableAll(on) => {
                 let names: Vec<String> = if on {
                     let area = self.tabs[i].count.as_ref().and_then(|m| m.area.clone());
-                    let instances = codec::count::block_instances(
+                    let instances = document::count::block_instances(
                         &self.tabs[i].scene.document,
                         area.as_deref(),
                     );
@@ -1001,5 +1018,156 @@ impl OpenCADStudio {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod count_table_tests {
+    use crate::app::OpenCADStudio;
+    use document::entities::{Insert, Line};
+    use document::types::Vector3;
+    use document::EntityType;
+
+    /// A drawing with three CHAIR and one DESK references.
+    fn app() -> (OpenCADStudio, usize) {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        for name in ["CHAIR", "DESK"] {
+            app.tabs[i].scene.define_block_raw(
+                name,
+                Vector3::ZERO,
+                vec![EntityType::Line(Line::from_points(
+                    Vector3::ZERO,
+                    Vector3::new(1.0, 0.0, 0.0),
+                ))],
+            );
+        }
+        for (k, name) in ["CHAIR", "CHAIR", "CHAIR", "DESK"].iter().enumerate() {
+            let insert = Insert::new(*name, Vector3::new(k as f64 * 5.0, 0.0, 0.0));
+            app.tabs[i].scene.add_entity(EntityType::Insert(insert));
+        }
+        (app, i)
+    }
+
+    fn count_table(app: &OpenCADStudio, i: usize) -> document::entities::Table {
+        app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .find_map(|e| match e {
+                EntityType::Table(t) => Some((**t).clone()),
+                _ => None,
+            })
+            .expect("count table")
+    }
+
+    /// While a placed count table is dragged by a grip, the
+    /// drag-start picture shows each cell text in its own cell. A grid made
+    /// for 0.18 text under a 2.5 text style wrapped every text into one
+    /// small box at the table's corner.
+    #[test]
+    fn count_table_grip_preview_keeps_texts_apart() {
+        use crate::entities::traits::Grippable;
+        use document::objects::{ObjectType, TableStyle};
+        let (mut app, i) = app();
+        app.snapper.snap_enabled = false;
+        app.snapper.grid_snap_on = false;
+        app.snapper.otrack_enabled = false;
+        app.ortho_mode = false;
+        app.polar_mode = false;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        let doc = &mut app.tabs[i].scene.document;
+        let style_handle = doc.allocate_handle();
+        doc.header.current_table_style_name = "Standard".into();
+        let mut style = TableStyle::standard();
+        style.handle = style_handle;
+        style.title_row_style.text_height = 3.5;
+        style.header_row_style.text_height = 2.5;
+        style.data_row_style.text_height = 2.5;
+        style.vertical_margin = 1.0;
+        doc.objects
+            .insert(style_handle, ObjectType::TableStyle(style));
+        app.place_count_table(i, [100.0, 0.0, 0.0], Vec::new());
+        let table = count_table(&app, i);
+        let handle = table.common.handle;
+        let origin = table
+            .grips()
+            .into_iter()
+            .find(|g| g.id == 1)
+            .expect("width grip")
+            .world;
+        let cursor = app.tabs[i]
+            .scene
+            .camera
+            .borrow()
+            .project(
+                origin + glam::DVec3::new(10.0, 0.0, 0.0),
+                iced::Rectangle::with_size(iced::Size::new(800.0, 600.0)),
+            )
+            .unwrap();
+        app.tabs[i].active_grip = Some(crate::scene::pick::grip::GripEdit::single(
+            handle, 1, false, origin,
+        ));
+        let _ = app.on_viewport_move(iced::Point::new(cursor.x, cursor.y));
+        // The faded drag-start picture: one box per cell text.
+        let boxes: Vec<[f32; 4]> = app.tabs[i]
+            .scene
+            .preview_wires
+            .iter()
+            .filter(|w| w.color[3] < 1.0 && !w.text_verts.is_empty())
+            .map(|w| {
+                w.text_verts.iter().fold(
+                    [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+                    |b, v| {
+                        [
+                            b[0].min(v.pos[0]),
+                            b[1].min(v.pos[1]),
+                            b[2].max(v.pos[0]),
+                            b[3].max(v.pos[1]),
+                        ]
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(boxes.len(), 6, "six cell texts in the drag-start picture");
+        for (a, x) in boxes.iter().enumerate() {
+            for y in &boxes[a + 1..] {
+                let overlap = x[0] < y[2] && y[0] < x[2] && x[1] < y[3] && y[1] < x[3];
+                assert!(!overlap, "cell texts overlap: {x:?} {y:?} of {boxes:?}");
+            }
+        }
+        assert!(app.cancel_active_grip_edit());
+    }
+
+    /// The count table takes the current table style and sizes
+    /// its grid to that style's text, as TABLE does (a metric style's 2.5
+    /// text in a grid made for 0.18 text overflowed every cell).
+    #[test]
+    fn count_table_grid_fits_the_current_table_style_text() {
+        use document::objects::{ObjectType, TableStyle};
+        let (mut app, i) = app();
+        let doc = &mut app.tabs[i].scene.document;
+        let handle = doc.allocate_handle();
+        doc.header.current_table_style_name = "Metric".into();
+        let mut style = TableStyle::standard();
+        style.name = "Metric".into();
+        style.handle = handle;
+        style.title_row_style.text_height = 3.5;
+        style.header_row_style.text_height = 2.5;
+        style.data_row_style.text_height = 2.5;
+        style.vertical_margin = 1.0;
+        doc.objects.insert(handle, ObjectType::TableStyle(style));
+        app.place_count_table(i, [100.0, 0.0, 0.0], Vec::new());
+        let table = count_table(&app, i);
+        assert_eq!(table.table_style_handle, Some(handle), "current table style");
+        let text = crate::entities::table::data_text_height(&table, &app.tabs[i].scene.document);
+        assert!((text - 2.5).abs() < 1e-9, "drawn with the style's text: {text}");
+        for row in &table.rows {
+            assert!(row.height >= 2.5 * 4.0 / 3.0 + 2.0, "row {} too low", row.height);
+        }
+        // The item column holds about twenty characters, the count column six.
+        assert!(table.columns[0].width >= 20.0 * 2.5 - 1e-9, "{}", table.columns[0].width);
+        assert!(table.columns[1].width >= 6.0 * 2.5 - 1e-9, "{}", table.columns[1].width);
     }
 }

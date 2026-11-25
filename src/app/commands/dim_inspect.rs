@@ -4,17 +4,21 @@ use crate::app::{Message, OpenCADStudio};
 use crate::entities::dim_inspect::{self as inspect, Inspection, Shape};
 use crate::modules::annotate::dim_inspect::{DimInspectCommand, SEP};
 use crate::ui::window::dim_inspect_dialog::{DimInspectMsg, DimInspectState};
-use codec::Handle;
+use document::Handle;
 use iced::Task;
 
-fn is_dimension(entity: &codec::EntityType) -> bool {
-    matches!(entity, codec::EntityType::Dimension(_))
+fn is_dimension(entity: &document::EntityType) -> bool {
+    matches!(entity, document::EntityType::Dimension(_))
 }
 
 impl OpenCADStudio {
     pub(super) fn dispatch_dim_inspect(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         let (name, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
-        match name.trim_start_matches(['_', '.']).to_ascii_uppercase().as_str() {
+        match name
+            .trim_start_matches(['_', '.'])
+            .to_ascii_uppercase()
+            .as_str()
+        {
             "DIMINSPECT" => {
                 let handles = self.selected_dimension_handles(i);
                 self.open_dim_inspect(i, handles);
@@ -26,7 +30,8 @@ impl OpenCADStudio {
             }
             "-DIMINSPECT" => {
                 let command = DimInspectCommand::new();
-                self.command_line.push_info(&crate::command::CadCommand::prompt(&command));
+                self.command_line
+                    .push_info(&crate::command::CadCommand::prompt(&command));
                 self.command_line
                     .set_step_options(crate::command::CadCommand::options(&command));
                 self.tabs[i].active_cmd = Some(Box::new(command));

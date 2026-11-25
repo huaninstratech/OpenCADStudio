@@ -10,7 +10,7 @@ fn points(wires: &[WireModel]) -> Vec<[f64; 3]> {
     let mut points = Vec::new();
     for wire in wires {
         for (i, p) in wire.points.iter().enumerate() {
-            let lo = wire.points_low.get(i).copied().unwrap_or([0.; 3]);
+            let lo = wire.points_low.get(i).unwrap_or([0.; 3]);
             let point = std::array::from_fn(|j| f64::from(p[j]) + f64::from(lo[j]));
             // NaN vertices separate batched wire segments; they are not geometry.
             if point.iter().all(|coordinate| coordinate.is_finite()) {
@@ -81,14 +81,14 @@ fn setup(family: usize, testing: bool) -> (OpenCADStudio, Handle, Handle, Handle
     )
     .unwrap();
     // An unchanged fill must remain visible while the whole reference is hidden.
-    let mut hatch = codec::entities::Hatch::new();
+    let mut hatch = document::entities::Hatch::new();
     hatch.is_solid = true;
-    let mut path = codec::entities::BoundaryPath::new();
-    path.add_edge(codec::entities::BoundaryEdge::Polyline(
-        codec::entities::PolylineEdge::new(
+    let mut path = document::entities::BoundaryPath::new();
+    path.add_edge(document::entities::BoundaryEdge::Polyline(
+        document::entities::PolylineEdge::new(
             [[30., 30.], [32., 30.], [32., 32.], [30., 32.]]
                 .into_iter()
-                .map(|p| codec::types::Vector2::new(p[0], p[1]))
+                .map(|p| document::types::Vector2::new(p[0], p[1]))
                 .collect(),
             true,
         ),
@@ -272,7 +272,9 @@ fn block_parameter_geometry_preview_drops_stale_locked_and_disassociated_targets
             assert!(!app.tabs[i].scene.preview_wires.is_empty());
             match invalid {
                 0 => app.tabs[i].id += 1,
-                1 => app.tabs[i].selected_handle = None,
+                1 => {
+                    app.tabs[i].scene.selected.remove(&insert);
+                }
                 2 => {
                     app.tabs[i]
                         .scene
@@ -285,12 +287,12 @@ fn block_parameter_geometry_preview_drops_stale_locked_and_disassociated_targets
                 }
                 _ => {
                     let action = actions::actions(&app.tabs[i].scene.document, def)[0].0;
-                    let codec::objects::ObjectType::DynamicBlock(object) =
+                    let document::objects::ObjectType::DynamicBlock(object) =
                         app.tabs[i].scene.document.objects.get_mut(&action).unwrap()
                     else {
                         panic!()
                     };
-                    let codec::objects::DynamicBlockData::MoveAction(action) = &mut object.data
+                    let document::objects::DynamicBlockData::MoveAction(action) = &mut object.data
                     else {
                         panic!()
                     };
@@ -316,6 +318,21 @@ fn block_parameter_geometry_preview_drops_stale_locked_and_disassociated_targets
         }
     }
 }
+/// With several objects selected no single `selected_handle` is set; a
+/// grip of a selected reference still previews (#3506).
+#[test]
+fn block_parameter_geometry_preview_works_with_several_objects_selected() {
+    for testing in [false, true] {
+        let (mut app, insert, _, _) = setup(0, testing);
+        let i = app.active_tab;
+        app.tabs[i].selected_handle = None;
+        assert!(app.tabs[i].scene.selected.contains(&insert));
+        app.tabs[i].last_cursor_world = DVec3::new(120., 220., 30.);
+        app.refresh_active_cmd_preview(i);
+        assert!(!app.tabs[i].scene.preview_wires.is_empty());
+    }
+}
+
 #[test]
 fn block_array_over_budget_preview_restores_source_and_preserves_history() {
     for testing in [false, true] {
@@ -456,19 +473,19 @@ fn setup_point_transport(
         .unwrap()
         .0;
     let doc = &mut app.tabs[i].scene.document;
-    let codec::objects::ObjectType::DynamicBlock(object) = &doc.objects[&root_action] else {
+    let document::objects::ObjectType::DynamicBlock(object) = &doc.objects[&root_action] else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::MoveAction(action) = &object.data else {
+    let document::objects::DynamicBlockData::MoveAction(action) = &object.data else {
         panic!()
     };
     let targets = action.action.dependencies.clone();
     let child = point::create(doc, def, Vector3::UNIT_Y * 5., Vector3::UNIT_Y * 7.).unwrap();
-    let codec::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&child).unwrap()
+    let document::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&child).unwrap()
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
+    let document::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
         panic!()
     };
     parameter.parameter.parameter.chain_actions = chained;
@@ -484,12 +501,12 @@ fn setup_point_transport(
         None,
     )
     .unwrap();
-    let codec::objects::ObjectType::DynamicBlock(object) =
+    let document::objects::ObjectType::DynamicBlock(object) =
         doc.objects.get_mut(&root_action).unwrap()
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
+    let document::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
         panic!()
     };
     action.action.dependencies = vec![child];
@@ -578,7 +595,7 @@ fn block_move_point_chain_preview_events_commit_and_undo_effective_point_caches(
 fn block_move_point_chain_properties_refresh_existing_references_and_preserve_undo() {
     let (mut app, insert, _, root, child, action) = setup_point_transport(false, false);
     let i = app.active_tab;
-    let read_line = |doc: &codec::Document| {
+    let read_line = |doc: &document::Document| {
         let EntityType::Insert(reference) = doc.get_entity(insert).unwrap() else {
             panic!()
         };
@@ -693,16 +710,16 @@ fn block_mixed_order_and_parameter_transport_grip_undo_redo() {
         };
         let second_parent = point::create(doc, def, Vector3::ZERO, Vector3::UNIT_Y * 2.).unwrap();
         for handle in [parent, child] {
-            let codec::objects::ObjectType::DynamicBlock(object) =
+            let document::objects::ObjectType::DynamicBlock(object) =
                 doc.objects.get_mut(&handle).unwrap()
             else {
                 panic!()
             };
             match &mut object.data {
-                codec::objects::DynamicBlockData::LinearParameter(p) => {
+                document::objects::DynamicBlockData::LinearParameter(p) => {
                     p.parameter.parameter.chain_actions = true
                 }
-                codec::objects::DynamicBlockData::PointParameter(p) => {
+                document::objects::DynamicBlockData::PointParameter(p) => {
                     p.parameter.parameter.chain_actions = true
                 }
                 _ => panic!(),
@@ -736,20 +753,21 @@ fn block_mixed_order_and_parameter_transport_grip_undo_redo() {
             DVec3::ZERO,
         )
         .unwrap();
-        let codec::objects::ObjectType::DynamicBlock(object) =
+        let document::objects::ObjectType::DynamicBlock(object) =
             doc.objects.get_mut(&second_move).unwrap()
         else {
             panic!()
         };
-        let codec::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
+        let document::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
             panic!()
         };
         action.action.dependencies = vec![child];
-        let codec::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&moved).unwrap()
+        let document::objects::ObjectType::DynamicBlock(object) =
+            doc.objects.get_mut(&moved).unwrap()
         else {
             panic!()
         };
-        let codec::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
+        let document::objects::DynamicBlockData::MoveAction(action) = &mut object.data else {
             panic!()
         };
         action.action.dependencies = vec![member, child];
@@ -781,7 +799,7 @@ fn block_mixed_order_and_parameter_transport_grip_undo_redo() {
         assert!(app.start_test_action_grip(insert, grip));
         let before = app.tabs[i].scene.document.clone();
         let depth = app.tabs[i].history.undo_stack.len();
-        let line = |doc: &codec::Document, handle: Handle| {
+        let line = |doc: &document::Document, handle: Handle| {
             let EntityType::Insert(reference) = doc.get_entity(handle).unwrap() else {
                 panic!()
             };
@@ -1000,7 +1018,7 @@ fn block_mixed_order_and_parameter_transport_grip_undo_redo() {
 fn block_action_set_edits_point_targets_and_refreshes_reference_history() {
     let (mut app, insert, def, root, mut child, action) = setup_point_transport(false, true);
     let i = app.active_tab;
-    let read_line = |doc: &codec::Document| {
+    let read_line = |doc: &document::Document| {
         let EntityType::Insert(reference) = doc.get_entity(insert).unwrap() else {
             panic!()
         };
@@ -1034,7 +1052,7 @@ fn block_action_set_edits_point_targets_and_refreshes_reference_history() {
     assert!(read_line(&app.tabs[i].scene.document).distance(original + offset) < 1e-8);
     begin(&mut app, insert);
     child.name = "  Door \"A\"  ".to_owned();
-    let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
+    let document::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
         .scene
         .document
         .objects
@@ -1043,7 +1061,7 @@ fn block_action_set_edits_point_targets_and_refreshes_reference_history() {
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
+    let document::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
         panic!()
     };
     parameter.position_name = child.name.clone();
@@ -1107,13 +1125,13 @@ fn block_action_set_edits_point_targets_and_refreshes_reference_history() {
     let _ = app.dispatch_command("BSAVE");
     let _ = app.dispatch_command("BCLOSE");
     for saved in [
-        codec::DwgReader::from_stream(std::io::Cursor::new(
-            codec::DwgWriter::write_to_vec(&app.tabs[i].scene.document).unwrap(),
+        document::DwgReader::from_stream(std::io::Cursor::new(
+            document::DwgWriter::write_to_vec(&app.tabs[i].scene.document).unwrap(),
         ))
         .read()
         .unwrap(),
-        codec::DxfReader::from_reader(std::io::Cursor::new(
-            codec::DxfWriter::new(&app.tabs[i].scene.document)
+        document::DxfReader::from_reader(std::io::Cursor::new(
+            document::DxfWriter::new(&app.tabs[i].scene.document)
                 .write_to_vec()
                 .unwrap(),
         ))
@@ -1156,7 +1174,7 @@ fn block_action_set_rejects_ambiguous_points_and_transport_cycles_atomically() {
         Vector3::UNIT_Y * 10.,
     )
     .unwrap();
-    let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
+    let document::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
         .scene
         .document
         .objects
@@ -1165,7 +1183,7 @@ fn block_action_set_rejects_ambiguous_points_and_transport_cycles_atomically() {
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
+    let document::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
         panic!()
     };
     parameter.position_name = child.name.clone();
@@ -1234,7 +1252,7 @@ fn block_action_set_rejects_stale_point_name_choices() {
     let _ = app.dispatch_command("BACTIONSET");
     feed(&mut app, "Remove");
     feed(&mut app, &format!("Parameter {}", child.name));
-    let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
+    let document::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
         .scene
         .document
         .objects
@@ -1243,7 +1261,7 @@ fn block_action_set_rejects_stale_point_name_choices() {
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
+    let document::objects::DynamicBlockData::PointParameter(parameter) = &mut object.data else {
         panic!()
     };
     parameter.position_name = "Changed while selecting".to_owned();
@@ -1347,7 +1365,7 @@ fn block_move_creation_rejects_stale_point_choices() {
         &format!("Parameter {}", serde_json::to_string(&child.name).unwrap()),
     );
     let _ = app.feed_command(crate::command::StepInput::Enter);
-    let codec::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
+    let document::objects::ObjectType::DynamicBlock(object) = app.tabs[i]
         .scene
         .document
         .objects
@@ -1356,7 +1374,7 @@ fn block_move_creation_rejects_stale_point_choices() {
     else {
         panic!()
     };
-    let codec::objects::DynamicBlockData::PointParameter(point) = &mut object.data else {
+    let document::objects::DynamicBlockData::PointParameter(point) = &mut object.data else {
         panic!()
     };
     point.position_name = "Changed".to_owned();
@@ -1509,7 +1527,8 @@ fn block_move_point_targets_support_window_and_lasso_selection() {
             .name;
         begin(&mut app, insert);
         app.pick_add = pick_add;
-        app.pick_drag_rect = method == 2;
+        app.pick_drag_mode = if method == 2 { 1 } else { 2 };
+        app.pick_auto = if method == 2 { 1 } else { 5 };
         let i = app.active_tab;
         app.tabs[i].scene.selection.borrow_mut().view.vp_size = (1600., 900.);
         app.tabs[i].scene.camera.borrow_mut().fit_to_bounds_f64(
@@ -1601,6 +1620,9 @@ fn block_move_point_targets_support_window_and_lasso_selection() {
                 let _ = app.update(Message::ViewportLeftRelease);
             } else if method == 2 {
                 let _ = app.update(Message::ViewportLeftPressAt(lo));
+                // A slow earlier pass (a loaded CI runner) must not withhold
+                // this move: the drag starts on it.
+                app.move_pass_due = None;
                 let _ = app.update(Message::ViewportMove(hi));
                 assert!(app.tabs[i].scene.selection.borrow().input.left_dragging);
                 let _ = app.update(Message::ViewportLeftRelease);
@@ -1757,6 +1779,173 @@ fn block_move_marker_click_respects_pickadd_replacement() {
 }
 
 #[test]
+fn block_flip_action_targets_support_commands_and_reference_history() {
+    use crate::command::StepInput;
+
+    let (mut app, insert) = fixture();
+    begin(&mut app, insert);
+    let i = app.active_tab;
+    let def = app.tabs[i].active_block_edit_session().unwrap().br_handle;
+    let member = members(&app)[0];
+    let doc = &mut app.tabs[i].scene.document;
+    let linear = distance::create(
+        doc,
+        def,
+        distance::Kind::Linear,
+        Vector3::UNIT_Y * 4.,
+        Vector3::new(8., 4., 0.),
+        Vector3::UNIT_Y * 5.,
+    )
+    .unwrap();
+    let flip = orientation::create(
+        doc,
+        def,
+        orientation::Kind::Flip,
+        Vector3::ZERO,
+        Vector3::UNIT_X * 10.,
+        Vector3::UNIT_Y,
+    )
+    .unwrap();
+    actions::create(
+        doc,
+        def,
+        actions::Kind::Move,
+        linear,
+        &[member],
+        DVec3::ZERO,
+    )
+    .unwrap();
+    let parameters = actions::all_parameters(doc, def);
+    let axis = parameters.iter().find(|p| p.handle == flip).unwrap();
+    let child = parameters.iter().find(|p| p.handle == linear).unwrap();
+    let name = format!("Parameter {}", serde_json::to_string(&child.name).unwrap());
+    let _ = app.dispatch_command("BACTIONBARMODE 0");
+    let before = app.tabs[i].scene.document.clone();
+    let depth = app.tabs[i].history.undo_stack.len();
+    for complete in [false, true] {
+        let _ = app.dispatch_command("BACTION FLIP");
+        feed(&mut app, &axis.name);
+        feed(&mut app, &name);
+        assert!(app.tabs[i]
+            .active_cmd
+            .as_ref()
+            .unwrap()
+            .selection_marker_selected(linear));
+        if complete {
+            let _ = app.feed_command(StepInput::SelectionComplete(vec![member]));
+        }
+        let _ = app.feed_command(StepInput::Enter);
+        let _ = app.feed_command(StepInput::Point(DVec3::new(2., 2., 0.)));
+        if !complete {
+            assert!(app
+                .command_line
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("linked parameters"));
+            assert_eq!(app.tabs[i].scene.document, before);
+            assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
+            let _ = app.update(Message::CommandEscape);
+        }
+    }
+    assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+    let action = actions::actions(&app.tabs[i].scene.document, def)
+        .into_iter()
+        .find(|(_, _, kind, _)| *kind == actions::Kind::Flip)
+        .unwrap()
+        .0;
+    let _ = app.dispatch_command("BSAVE");
+    let _ = app.dispatch_command("BCLOSE");
+    app.tabs[i].scene.document = actions::instance::evaluate_value(
+        &app.tabs[i].scene.document,
+        insert,
+        flip,
+        actions::Value::Flip(true),
+    )
+    .unwrap()
+    .unwrap();
+    let frame = |app: &OpenCADStudio| {
+        actions::instance::frame(&app.tabs[i].scene.document, insert, child).unwrap()
+    };
+    let reflected = frame(&app);
+    assert_eq!(reflected.base, -DVec3::Y * 4.);
+    assert_eq!(reflected.end, DVec3::new(8., -4., 0.));
+    begin(&mut app, insert);
+    app.tabs[i].selected_authoring = Some(action);
+    let _ = app.dispatch_command("BACTIONSET");
+    feed(&mut app, "Remove");
+    let size = iced::Size::new(1600., 900.);
+    let scene = &app.tabs[i].scene;
+    scene.selection.borrow_mut().view.vp_size = (size.width, size.height);
+    scene.camera.borrow_mut().fit_to_bounds_f64(
+        DVec3::new(-2., -2., 0.),
+        DVec3::new(12., 7., 0.),
+        size.width / size.height,
+    );
+    let marker = scene
+        .camera
+        .borrow()
+        .project(child.end, iced::Rectangle::with_size(size))
+        .unwrap();
+    let _ = app.update(Message::ViewportLeftPressAt(iced::Point::new(
+        marker.x, marker.y,
+    )));
+    let _ = app.update(Message::ViewportLeftRelease);
+    assert!(app.tabs[i]
+        .active_cmd
+        .as_ref()
+        .unwrap()
+        .selection_marker_selected(linear));
+    let _ = app.feed_command(StepInput::Enter);
+    assert!(
+        app.tabs[i].active_cmd.is_none(),
+        "{:?}",
+        app.command_line.last_error
+    );
+    assert_eq!(
+        frame(&app),
+        actions::instance::ParameterFrame {
+            base: child.base,
+            end: child.end
+        }
+    );
+    app.undo_steps(1);
+    assert_eq!(frame(&app), reflected);
+    app.redo_steps(1);
+    assert_eq!(frame(&app).base, child.base);
+
+    app.tabs[i].selected_authoring = Some(action);
+    app.pick_drag_mode = 1;
+    app.pick_auto = 1;
+    let _ = app.dispatch_command("BACTIONSET");
+    feed(&mut app, "Add");
+    let _ = app.update(Message::ViewportLeftPressAt(iced::Point::new(
+        marker.x + 20.,
+        marker.y - 10.,
+    )));
+    let _ = app.update(Message::ViewportMove(iced::Point::new(
+        marker.x - 20.,
+        marker.y + 10.,
+    )));
+    let _ = app.update(Message::ViewportLeftRelease);
+    assert!(app.tabs[i]
+        .active_cmd
+        .as_ref()
+        .unwrap()
+        .selection_marker_selected(linear));
+    let _ = app.feed_command(StepInput::Enter);
+    assert!(
+        app.tabs[i].active_cmd.is_none(),
+        "{:?}",
+        app.command_line.last_error
+    );
+    assert_eq!(frame(&app), reflected);
+    let _ = app.dispatch_command("BSAVE");
+    let _ = app.dispatch_command("BCLOSE");
+    assert_eq!(frame(&app), reflected);
+}
+
+#[test]
 fn block_move_linear_targets_support_names_markers_and_history() {
     check_move_parameter_targets(false);
 }
@@ -1790,15 +1979,15 @@ fn check_move_parameter_targets(flip: bool) {
         distance::create(doc, def, distance::Kind::Linear, base, end, label)
     }
     .unwrap();
-    let codec::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&handle).unwrap()
+    let document::objects::ObjectType::DynamicBlock(object) = doc.objects.get_mut(&handle).unwrap()
     else {
         panic!()
     };
     match &mut object.data {
-        codec::objects::DynamicBlockData::LinearParameter(p) => {
+        document::objects::DynamicBlockData::LinearParameter(p) => {
             p.distance_name = r#"Door "width""#.into();
         }
-        codec::objects::DynamicBlockData::FlipParameter(p) => {
+        document::objects::DynamicBlockData::FlipParameter(p) => {
             p.flip_label = r#"Door "handing""#.into();
         }
         _ => panic!(),
@@ -1910,9 +2099,11 @@ fn check_move_parameter_targets(flip: bool) {
         .selection_marker_selected(handle));
     let _ = app.feed_command(crate::command::StepInput::Enter);
     assert_eq!(
-        actions::instance::frame(&app.tabs[i].scene.document, insert, &target)
-            .unwrap(),
-        actions::instance::ParameterFrame { base: target.base, end: target.end }
+        actions::instance::frame(&app.tabs[i].scene.document, insert, &target).unwrap(),
+        actions::instance::ParameterFrame {
+            base: target.base,
+            end: target.end
+        }
     );
     let count = actions::actions(&app.tabs[i].scene.document, def).len();
     let _ = app.dispatch_command("BACTION MOVE");
@@ -1962,12 +2153,12 @@ fn block_move_linear_target_choices_reject_ambiguity_and_stale_names() {
         )
         .unwrap();
         let rename = |app: &mut OpenCADStudio, name: &str| {
-            let codec::objects::ObjectType::DynamicBlock(object) =
+            let document::objects::ObjectType::DynamicBlock(object) =
                 app.tabs[i].scene.document.objects.get_mut(&linear).unwrap()
             else {
                 panic!()
             };
-            let codec::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data
+            let document::objects::DynamicBlockData::LinearParameter(parameter) = &mut object.data
             else {
                 panic!()
             };

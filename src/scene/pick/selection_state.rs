@@ -47,9 +47,26 @@ pub struct SelectionGesture {
     pub poly_active: bool,
     pub poly_points: Vec<Point>,
     pub poly_crossing: bool,
+    pub poly_fence: bool,
 }
 
 impl SelectionGesture {
+    pub fn lasso_path(&self, cursor: Point) -> Vec<Point> {
+        let mut points = self.poly_points.clone();
+        if points.last() != Some(&cursor) {
+            points.push(cursor);
+        }
+        points
+    }
+
+    pub fn cycle_lasso(&mut self) {
+        (self.poly_crossing, self.poly_fence) = match (self.poly_crossing, self.poly_fence) {
+            (_, true) => (true, false),
+            (true, false) => (false, false),
+            (false, false) => (false, true),
+        };
+    }
+
     /// End the in-progress box/lasso gesture (left-button release path).
     pub fn clear_left(&mut self) {
         self.box_anchor = None;
@@ -60,6 +77,7 @@ impl SelectionGesture {
         self.poly_active = false;
         self.poly_points.clear();
         self.poly_crossing = false;
+        self.poly_fence = false;
     }
 }
 
@@ -75,6 +93,7 @@ pub struct SelectionInput {
     pub left_press_pos: Option<Point>,
     pub left_press_time: Option<Instant>,
     pub left_dragging: bool,
+    pub area_drag_blocked: bool,
     pub right_down: bool,
     pub right_press_pos: Option<Point>,
     pub right_press_time: Option<Instant>,
@@ -105,6 +124,7 @@ impl SelectionInput {
         self.left_press_pos = None;
         self.left_press_time = None;
         self.left_dragging = false;
+        self.area_drag_blocked = false;
     }
 }
 
@@ -123,6 +143,8 @@ pub struct SelectionMenu {
     /// belongs to the selection boundary, and [`SelectionMenu::open`] /
     /// [`SelectionMenu::close`] reset it exactly like the context-menu state.
     pub quad: Option<crate::ui::popup::quad_menu::QuadUi>,
+    /// The open menu is POPMENU's: only the user's own commands.
+    pub user: bool,
 }
 
 impl SelectionMenu {
@@ -133,6 +155,7 @@ impl SelectionMenu {
         self.open_at = Some(at);
         self.ui = ContextMenuUi::default();
         self.quad = None;
+        self.user = false;
     }
 
     /// Close the context menu (no-op when it is not open). A disruptive
@@ -142,6 +165,7 @@ impl SelectionMenu {
         self.open_at = None;
         self.ui = ContextMenuUi::default();
         self.quad = None;
+        self.user = false;
     }
 }
 
@@ -169,8 +193,20 @@ impl SelectionState {
     /// End every left-button selection gesture without disturbing the previous
     /// completed-window record or command-owned preview marquee. Grip editing
     /// owns the left button while engaged and calls this before/after placement
-    /// so a small pointer move cannot also arm a box or lasso selection.
+    /// so a small pointer move cannot also arm a box or lasso selection. A
+    /// PERF trace names the caller that ended a drag the user did not end
+    /// themselves (#3339).
+    #[track_caller]
     pub fn clear_left_selection_gesture(&mut self) {
+        if crate::perf::enabled() && self.gesture.box_anchor.is_some() {
+            crate::perf_record_diagnostic!(
+                "[perf] gesture-clear {} anchor={:?} left_down={} pointer_away={}",
+                std::panic::Location::caller(),
+                self.gesture.box_anchor,
+                self.input.left_down,
+                self.input.pointer_away,
+            );
+        }
         self.input.clear_left_buttons();
         self.gesture.clear_left();
     }

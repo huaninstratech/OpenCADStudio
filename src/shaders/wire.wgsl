@@ -12,8 +12,8 @@
 //     (distance_a, distance_b) by `which_end`.
 //   • pattern_length > 0 enables the dash test; 0 = solid (no discard).
 //   • pat0/pat1 encode up to 8 elements: positive=dash, negative=gap,
-//     exactly 0=dot (rendered as a fixed ~1 px mark). Trailing 0.0 slots are
-//     padding; the real element count is (index of last non-zero) + 1.
+//     exactly 0=dot (rendered round at the stroke's width). Trailing 0.0 slots
+//     are padding; the real element count is (index of last non-zero) + 1.
 
 struct Uniforms {
     viewport_size:    vec2<f32>,
@@ -68,8 +68,8 @@ struct InstanceIn {
     @location(3) dists:          vec4<f32>,
     @location(4) pat0:           vec4<f32>,
     @location(5) pat1:           vec4<f32>,
-    // draw_depth, align_end ("A"-type end-dash length), align_total (total
-    // wire length), world_half_width (wide-polyline band; 0 = normal wire)
+    // draw_depth, reserved, run layout (see dash_layout.wgsl), world_half_width
+    // (wide-polyline band; 0 = normal wire)
     @location(6) misc:           vec4<f32>,
     // Double-single low residuals of the endpoints.
     @location(7) pos_a_low:      vec3<f32>,
@@ -85,9 +85,11 @@ const MODEL_LINEWEIGHT_BOOST: f32 = 2.0;
 const MODEL_LINEWEIGHT_MAX_PX: f32 = 10.0;
 // Must match `MITER_LIMIT` in wire_gpu.rs.
 const MITER_LIMIT: f32 = 8.0;
+// Anti-aliasing pad: the quad reaches this many pixels past the stroke.
+const AA_PAD: f32 = 1.0;
 
 struct VertexOut {
-    @builtin(position)              clip_pos:       vec4<f32>,
+    @invariant @builtin(position)              clip_pos:       vec4<f32>,
     @location(0)                    color:          vec4<f32>,
     @location(1)                    distance:       f32,
     @location(2)                    pattern_length: f32,
@@ -107,6 +109,8 @@ struct VertexOut {
     @location(8)                    cap:            vec2<f32>,
     // (segment pixel length, end half-width at A, end half-width at B).
     @location(9) @interpolate(flat) cap_ends:       vec3<f32>,
+    // Dot half-width and signed across distance, both in world units.
+    @location(10)                   dot:            vec2<f32>,
 }
 
 // Half-width of one segment end: a tapered band's own end width wins, then a
@@ -157,6 +161,50 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
     return origin_relative + axial + planar * world_size;
 }
 
+// How far along a segment its end (clip w `w`, other end `other`) moves to
+// lie in front of the eye. An end behind it — a ray or xline in perspective —
+// would flip through w <= 0 and stretch the band over the screen (#2801).
+fn front_t(w: f32, other: f32) -> f32 {
+    let eps = max(max(w, other) * 1e-4, 1e-6);
+    if w >= eps || other <= w {
+        return 0.0;
+    }
+    return (eps - w) / (other - w);
+}
+
+// How much of the screen, as a multiple of its half-size, a thin segment
+// keeps around the view after `view_span` cuts it.
+const VIEW_REACH: f32 = 3.0;
+
+// The part of the segment a→b (clip space) within `VIEW_REACH` of the view,
+// as parameters along it. Deep in a zoom a far end lies millions of pixels
+// away, and the cap coordinate interpolated over that length loses its f32
+// precision near the visible end: the pixels there failed the cap test and
+// the line broke up near its vertex (#3610). A segment wholly outside keeps
+// its ends (nothing of it is drawn).
+fn view_span(a: vec4<f32>, b: vec4<f32>) -> vec2<f32> {
+    let ea = vec4<f32>(a.w, a.w, a.w, a.w) * VIEW_REACH + vec4<f32>(-a.x, a.x, -a.y, a.y);
+    let eb = vec4<f32>(b.w, b.w, b.w, b.w) * VIEW_REACH + vec4<f32>(-b.x, b.x, -b.y, b.y);
+    var lo = 0.0;
+    var hi = 1.0;
+    for (var i = 0; i < 4; i++) {
+        let da = ea[i];
+        let db = eb[i];
+        if da < 0.0 && db < 0.0 {
+            return vec2<f32>(0.0, 1.0);
+        }
+        if da < 0.0 {
+            lo = max(lo, da / (da - db));
+        } else if db < 0.0 {
+            hi = min(hi, da / (da - db));
+        }
+    }
+    if lo >= hi {
+        return vec2<f32>(0.0, 1.0);
+    }
+    return vec2<f32>(lo, hi);
+}
+
 @vertex fn vs_main(@builtin(vertex_index) vid: u32, in: InstanceIn) -> VertexOut {
     // Two-triangle quad corner table:
     //   vid 0,1,2 = (A,-1) (B,-1) (B,+1)
@@ -180,6 +228,7 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
     var out_dist: f32;
     var out_cap: vec2<f32>;
     var out_cap_ends: vec3<f32>;
+    var out_dot: vec2<f32>;
 
     if is_world {
         // Wide polylines have physical world-unit width (in.misc.w or in.taper > 0).
@@ -190,7 +239,10 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
         let world_hw_a = select(in.misc.w, in.taper.x, in.taper.x >= 0.0);
         let world_hw_b = select(in.misc.w, in.taper.y, in.taper.y >= 0.0);
         let cur_world_hw = mix(world_hw_a, world_hw_b, which_end);
-        let eff_hw = cur_world_hw + 0.5 * u.world_per_pixel;
+        // The quad reaches one pixel past the band; the fragment fades the
+        // outer pixel by coverage (edge anti-aliasing), so the band still
+        // draws half a pixel wider each side as before.
+        let eff_hw = cur_world_hw + AA_PAD * u.world_per_pixel;
 
         let world_delta = rel_b - rel_a;
         let world_len = length(world_delta);
@@ -225,11 +277,21 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
         final_clip = clip_pos;
         out_dist = mix(in.dists.x, in.dists.y, which_end) + along * (in.dists.y - in.dists.x) / max(world_len, 1e-6);
         out_cap = vec2<f32>(which_end * world_len, eff_hw * side);
-        out_cap_ends = vec3<f32>(world_len, world_hw_a, world_hw_b);
+        out_cap_ends = vec3<f32>(world_len, world_hw_a + 0.5 * u.world_per_pixel, world_hw_b + 0.5 * u.world_per_pixel);
+        out_dot = vec2<f32>(max(cur_world_hw, 0.75 * u.world_per_pixel), eff_hw * side);
     } else {
         // Thin wires expand in screen pixels facing the camera with rounded end caps / joints.
-        let clip_a = u.view_rot * vec4<f32>(rel_a, 1.0);
-        let clip_b = u.view_rot * vec4<f32>(rel_b, 1.0);
+        let raw_a = u.view_rot * vec4<f32>(rel_a, 1.0);
+        let raw_b = u.view_rot * vec4<f32>(rel_b, 1.0);
+        let front_ta = front_t(raw_a.w, raw_b.w);
+        let front_tb = front_t(raw_b.w, raw_a.w);
+        let front_a = mix(raw_a, raw_b, front_ta);
+        let front_b = mix(raw_b, raw_a, front_tb);
+        let span = view_span(front_a, front_b);
+        let clip_a = mix(front_a, front_b, span.x);
+        let clip_b = mix(front_a, front_b, span.y);
+        let t_a = mix(front_ta, 1.0 - front_tb, span.x);
+        let t_b = 1.0 - mix(front_ta, 1.0 - front_tb, span.y);
 
         let ndc_a = clip_a.xy / clip_a.w;
         let ndc_b = clip_b.xy / clip_b.w;
@@ -250,16 +312,19 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
         let clip_pos = mix(clip_a, clip_b, which_end);
 
         let hw = resolve_hw(-1.0, in.misc.w, in.dists.z);
+        // Quad padded for the anti-aliased edge; `hw` stays the stroke radius.
+        let qhw = hw + AA_PAD - 0.5;
         let ext = which_end * 2.0 - 1.0;
-        let offset_px = perp * hw * side + dir * hw * ext;
+        let offset_px = perp * qhw * side + dir * qhw * ext;
         let ndc_offset = offset_px / (u.viewport_size * 0.5);
         var clip_pos_out = clip_pos + vec4<f32>(ndc_offset * clip_pos.w, 0.0, 0.0);
         clip_pos_out = apply_draw_order(clip_pos_out, in.misc.x);
 
         final_clip = clip_pos_out;
-        out_dist = mix(in.dists.x, in.dists.y, which_end) + ext * hw * u.world_per_pixel;
-        out_cap = vec2<f32>(which_end * seg_len + ext * hw, hw * side);
+        out_dist = mix(in.dists.x, in.dists.y, mix(t_a, 1.0 - t_b, which_end)) + ext * qhw * u.world_per_pixel;
+        out_cap = vec2<f32>(which_end * seg_len + ext * qhw, qhw * side);
         out_cap_ends = vec3<f32>(seg_len, hw, hw);
+        out_dot = vec2<f32>(max(hw, 0.75) * u.world_per_pixel, qhw * side * u.world_per_pixel);
     }
 
     // Smallest non-zero dash / gap element, in world units. Used by
@@ -284,17 +349,22 @@ fn marker_relative(position_high: vec3<f32>, position_low: vec3<f32>, instance: 
     out.distance       = out_dist;
     out.cap            = out_cap;
     out.cap_ends       = out_cap_ends;
+    out.dot            = out_dot;
     out.pattern_length = in.dists.w * lt_scale;
     out.pat0           = in.pat0 * lt_scale;
     out.pat1           = in.pat1 * lt_scale;
     out.min_elem       = min_elem;
-    out.align_end      = in.misc.y * lt_scale;
+    out.align_end      = aligned_end_dash(
+        in.misc.z,
+        out.pattern_length,
+        max(out.pat0.x, 0.0),
+    );
     out.align_total    = in.misc.z;
     return out;
 }
 
 // Returns true if arc-length `dist` falls inside a dash or on a dot.
-fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32, align_total: f32) -> bool {
+fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32, align_total: f32, dot: vec2<f32>) -> bool {
     let elems = array<f32, 8>(p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w);
     // Real element count = (index of last non-zero) + 1. Trailing 0.0 slots
     // are padding; a 0.0 within this range is a real dot.
@@ -316,6 +386,13 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32
         // resumes right after that element.
         let first_dash = max(elems[0], 0.0);
         d = ((dist - align_end + first_dash) % pat_len + pat_len) % pat_len;
+    } else if align_total < 0.0 {
+        // A closed path: whole periods, stretched to fit. One shorter than a
+        // period is drawn solid.
+        if closed_dash_solid(-align_total, pat_len) {
+            return true;
+        }
+        d = closed_dash_phase(dist, -align_total, pat_len);
     } else {
         // The round cap reaches a few pixels before the line's start; read it
         // as the start, or a dash-first run shorter than its pattern (drawn as
@@ -326,18 +403,15 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32
     }
 
     var pos = 0.0f;
-    // A dot is a zero-length element: render it as a fixed ~1.5 px mark
-    // (half-width ~0.75 px in world units) so it stays visible at any zoom
-    // instead of vanishing with its zero world-length. Mirrors the hatch
-    // shader's pixel-snapped dot. (#149)
-    let dot_half = u.world_per_pixel * 0.75;
     for (var i = 0u; i < count; i++) {
         let elem = elems[i];
         if elem == 0.0 {
-            // Dot centred at `pos` (zero length); light a small mark, wrapped
-            // around the pattern so a dot at 0 also covers the seam at pat_len.
+            // A zero-length element is a round dot with the stroke's own
+            // half-width (and a hairline-sized minimum). Include the fragment's
+            // across distance so a weighted line gets a circle, not a rectangle.
             let dd = abs(d - pos);
-            if min(dd, pat_len - dd) <= dot_half { return true; }
+            let along = min(dd, pat_len - dd);
+            if along * along + dot.y * dot.y <= dot.x * dot.x { return true; }
         } else if elem > 0.0 {
             if d >= pos && d < pos + elem { return true; }   // inside a dash
             pos += elem;
@@ -348,25 +422,38 @@ fn in_dash(dist: f32, pat_len: f32, p0: vec4<f32>, p1: vec4<f32>, align_end: f32
     return false;
 }
 
-// Round the cap overhang off: outside the segment span only pixels within
-// the end's half-width radius survive, giving round joints and end caps.
-fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
+// Edge coverage (anti-aliasing): distance of the fragment from the stroke
+// (round joints / end caps outside the segment span) against the stroke
+// radius, in device pixels via the screen gradient of `cap.y`. 0 = outside
+// (discard), 1 = inside, a one-pixel ramp across the edge.
+fn edge_coverage(cap: vec2<f32>, cap_ends: vec3<f32>, px: f32) -> f32 {
+    var d = abs(cap.y);
+    var r = mix(cap_ends.y, cap_ends.z, clamp(cap.x / max(cap_ends.x, 1e-6), 0.0, 1.0));
     if cap.x < 0.0 {
-        return length(cap) > cap_ends.y;
+        d = length(cap);
+        r = cap_ends.y;
+    } else if cap.x > cap_ends.x {
+        d = length(vec2<f32>(cap.x - cap_ends.x, cap.y));
+        r = cap_ends.z;
     }
-    if cap.x > cap_ends.x {
-        return length(vec2<f32>(cap.x - cap_ends.x, cap.y)) > cap_ends.z;
-    }
-    return false;
+    return clamp(0.5 + (r - d) / px, 0.0, 1.0);
+}
+
+// Size of one device pixel in `cap` units. Called first in the fragment
+// entry points (derivatives need uniform control flow, before any discard).
+fn cap_pixel(cap: vec2<f32>) -> f32 {
+    return max(length(vec2<f32>(dpdx(cap.y), dpdy(cap.y))), 1e-6);
 }
 
 @fragment fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Negative pattern length is the persistent-arena tombstone sentinel.
     // Discard before cap/alpha work so deleted slabs cannot write color/depth.
+    let px = cap_pixel(in.cap);
     if in.pattern_length < 0.0 {
         discard;
     }
-    if cap_clipped(in.cap, in.cap_ends) {
+    let cov = edge_coverage(in.cap, in.cap_ends, px);
+    if cov <= 0.0 {
         discard;
     }
     if in.pattern_length > 0.0 {
@@ -376,13 +463,13 @@ fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
         // test and return solid colour — also saves the per-fragment
         // arc-length math + `discard`.
         if in.min_elem >= u.world_per_pixel {
-            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total) {
+            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total, in.dot) {
                 discard;
             }
         }
     }
     // Transparency display off → force the line opaque.
-    let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5);
+    let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5) * cov;
     return vec4<f32>(in.color.rgb, alpha);
 }
 
@@ -390,19 +477,21 @@ fn cap_clipped(cap: vec2<f32>, cap_ends: vec3<f32>) -> bool {
 // mesh reads as a shaded surface framed by black edges. Keeps the dash/LOD
 // logic identical to `fs_main`; only the RGB is forced to the edge colour.
 @fragment fn fs_black(in: VertexOut) -> @location(0) vec4<f32> {
+    let px = cap_pixel(in.cap);
     if in.pattern_length < 0.0 {
         discard;
     }
-    if cap_clipped(in.cap, in.cap_ends) {
+    let cov = edge_coverage(in.cap, in.cap_ends, px);
+    if cov <= 0.0 {
         discard;
     }
     if in.pattern_length > 0.0 {
         if in.min_elem >= u.world_per_pixel {
-            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total) {
+            if !in_dash(in.distance, in.pattern_length, in.pat0, in.pat1, in.align_end, in.align_total, in.dot) {
                 discard;
             }
         }
     }
-    let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5);
+    let alpha = select(1.0, in.color.a, u.transparency_enable > 0.5) * cov;
     return vec4<f32>(edge_color(), alpha);
 }

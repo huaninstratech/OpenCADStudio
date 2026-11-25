@@ -1,16 +1,16 @@
 use super::*;
 
 fn restore_layiso_layer(
-    current: &mut codec::tables::Layer,
-    saved: &crate::app::document::LayisoLayerSnapshot,
-    mode: crate::app::document::LayisoMode,
+    current: &mut document::tables::Layer,
+    saved: &crate::app::tab_document::LayisoLayerSnapshot,
+    mode: crate::app::tab_document::LayisoMode,
 ) -> bool {
     let mut changed = false;
     if current.flags.off == saved.after.flags.off {
         current.flags.off = saved.before.flags.off;
         changed = true;
     }
-    if mode == crate::app::document::LayisoMode::LockAndFade
+    if mode == crate::app::tab_document::LayisoMode::LockAndFade
         && current.flags.locked == saved.after.flags.locked
     {
         current.flags.locked = saved.before.flags.locked;
@@ -23,6 +23,18 @@ impl OpenCADStudio {
     /// A command turned one layer off (or back on): one undo step, and the
     /// command stays for its next pick.
     pub(in crate::app) fn set_layer_on_from_command(&mut self, i: usize, layer: &str, on: bool) {
+        // The current layer cannot be turned off: the next object drawn would
+        // land on a hidden layer. `-LAYER` refuses the same request.
+        if !on && layer == self.tabs[i].scene.document.header.current_layer_name {
+            self.command_line.push_error(
+                crate::tf!("Cannot turn off layer \"{}\". It is the CURRENT layer.", layer)
+                    .as_ref(),
+            );
+            if let Some(prompt) = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt()) {
+                self.command_line.push_info(&prompt);
+            }
+            return;
+        }
         let names = vec![layer.to_string()];
         let undo = self.begin_layer_undo(i, "LAYOFF", &names);
         if let Some(record) = self.tabs[i].scene.document.layers.get_mut(layer) {
@@ -76,12 +88,28 @@ impl OpenCADStudio {
                         .into_iter()
                         .map(|(_, e)| e.common().layer.clone())
                         .collect();
-                    let names: Vec<String> = layers.iter().cloned().collect();
+                    let current = self.tabs[i]
+                        .scene
+                        .document
+                        .header
+                        .current_layer_name
+                        .clone();
+                    if layers.contains(&current) {
+                        self.command_line.push_error(
+                            crate::tf!(
+                                "Cannot turn off layer \"{}\". It is the CURRENT layer.",
+                                current
+                            )
+                            .as_ref(),
+                        );
+                    }
+                    let names: Vec<String> = layers
+                        .iter()
+                        .filter(|name| name.as_str() != "0" && name.as_str() != current)
+                        .cloned()
+                        .collect();
                     let undo = self.begin_layer_undo(i, "LAYOFF", &names);
-                    for name in &layers {
-                        if name == "0" {
-                            continue;
-                        }
+                    for name in &names {
                         if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
                             dl.turn_off();
                         }
@@ -114,12 +142,38 @@ impl OpenCADStudio {
                         .into_iter()
                         .map(|(_, e)| e.common().layer.clone())
                         .collect();
-                    let names: Vec<String> = layers.iter().cloned().collect();
-                    let undo = self.begin_layer_undo(i, "LAYFRZ", &names);
-                    for name in &layers {
-                        if name == "0" {
-                            continue;
+                    // Inside a layout viewport the pick freezes the layer in
+                    // that viewport only, the way VPLAYER Freeze does. (#3401)
+                    let scene = &self.tabs[i].scene;
+                    if scene.current_layout != "Model" {
+                        if let Some(vp) = scene.active_viewport {
+                            self.handle_vp_layer_update(vp, layers.into_iter().collect(), vec![]);
+                            self.tabs[i].scene.deselect_all();
+                            return Some(Task::none());
                         }
+                    }
+                    let current = self.tabs[i]
+                        .scene
+                        .document
+                        .header
+                        .current_layer_name
+                        .clone();
+                    if layers.contains(&current) {
+                        self.command_line.push_error(
+                            crate::tf!(
+                                "Cannot freeze layer \"{}\". It is the CURRENT layer.",
+                                current
+                            )
+                            .as_ref(),
+                        );
+                    }
+                    let names: Vec<String> = layers
+                        .iter()
+                        .filter(|name| name.as_str() != "0" && name.as_str() != current)
+                        .cloned()
+                        .collect();
+                    let undo = self.begin_layer_undo(i, "LAYFRZ", &names);
+                    for name in &names {
                         if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
                             dl.freeze();
                         }
@@ -235,7 +289,7 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 }
-                let handles: Vec<codec::Handle> = self.tabs[i]
+                let handles: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .document
                     .entities()
@@ -248,7 +302,6 @@ impl OpenCADStudio {
                     self.tabs[i].scene.erase_entities(&handles);
                 }
                 self.tabs[i].scene.document.layers.remove(&layer);
-                self.tabs[i].scene.bump_geometry();
                 self.tabs[i].dirty = true;
                 self.refresh_layer_panel();
                 self.command_line.push_output(
@@ -398,8 +451,9 @@ impl OpenCADStudio {
                     }
                     "RESTORE" | "R" => {
                         if arg.is_empty() {
-                            self.command_line
-                                .push_info(crate::t!("Usage: LAYERSTATE RESTORE <name> [filter]").as_ref());
+                            self.command_line.push_info(
+                                crate::t!("Usage: LAYERSTATE RESTORE <name> [filter]").as_ref(),
+                            );
                         } else if self.tabs[i].scene.document.layer_state(arg).is_none() {
                             self.command_line.push_error(
                                 crate::tf!("LAYERSTATE: no saved state named \"{arg}\".").as_ref(),
@@ -449,20 +503,16 @@ impl OpenCADStudio {
                             self.command_line.push_error(
                                 crate::tf!("LAYERSTATE: no saved state named \"{arg}\".").as_ref(),
                             );
-                        } else if self.tabs[i]
-                            .scene
-                            .document
-                            .layer_state(new_name)
-                            .is_some()
-                        {
+                        } else if self.tabs[i].scene.document.layer_state(new_name).is_some() {
                             self.command_line.push_error(
-                                crate::tf!("LAYERSTATE: a state named \"{new_name}\" already exists.")
-                                    .as_ref(),
+                                crate::tf!(
+                                    "LAYERSTATE: a state named \"{new_name}\" already exists."
+                                )
+                                .as_ref(),
                             );
                         } else {
                             self.push_undo_snapshot(i, "LAYERSTATE RENAME");
-                            if self
-                                .tabs[i]
+                            if self.tabs[i]
                                 .scene
                                 .document
                                 .rename_layer_state(arg, new_name)
@@ -506,16 +556,19 @@ impl OpenCADStudio {
                                 Some(state) => {
                                     match std::fs::write(path_text, layer_state_to_las(&state)) {
                                         Ok(()) => self.command_line.push_output(
-                                            crate::tf!("LAYERSTATE: exported \"{arg}\" to {path_text}.")
-                                                .as_ref(),
+                                            crate::tf!(
+                                                "LAYERSTATE: exported \"{arg}\" to {path_text}."
+                                            )
+                                            .as_ref(),
                                         ),
-                                        Err(error) => self.command_line.push_error(
-                                            crate::tf!("LAYERSTATE: {error}").as_ref(),
-                                        ),
+                                        Err(error) => self
+                                            .command_line
+                                            .push_error(crate::tf!("LAYERSTATE: {error}").as_ref()),
                                     }
                                 }
                                 None => self.command_line.push_error(
-                                    crate::tf!("LAYERSTATE: no saved state named \"{arg}\".").as_ref(),
+                                    crate::tf!("LAYERSTATE: no saved state named \"{arg}\".")
+                                        .as_ref(),
                                 ),
                             }
                         }
@@ -527,24 +580,15 @@ impl OpenCADStudio {
                                 crate::t!("Usage: LAYERSTATE IMPORT <file.las>").as_ref(),
                             );
                         } else {
-                            match std::fs::read_to_string(path_text)
-                                .map_err(|error| error.to_string())
-                                .and_then(|text| layer_state_from_las(&text))
-                            {
-                                Ok(state) => {
-                                    let name = state.name.clone();
-                                    self.push_undo_snapshot(i, "LAYERSTATE IMPORT");
-                                    self.tabs[i].scene.document.store_layer_state(state);
-                                    self.tabs[i].dirty = true;
-                                    self.command_line.push_output(
-                                        crate::tf!("LAYERSTATE: imported \"{name}\" from {path_text}.")
-                                            .as_ref(),
-                                    );
-                                }
-                                Err(error) => self.command_line.push_error(
-                                    crate::tf!("LAYERSTATE: {error}").as_ref(),
-                                ),
-                            }
+                            use super::layer_file_reads::{LayerFileJob, LayerFiles};
+                            return Some(self.read_layer_files(
+                                i,
+                                LayerFileJob::LayerStateImport,
+                                LayerFiles {
+                                    layer_state: Some(path_text.into()),
+                                    ..LayerFiles::default()
+                                },
+                            ));
                         }
                     }
                     _ => {
@@ -616,7 +660,7 @@ impl OpenCADStudio {
                         .layers
                         .get(&layer)
                         .map(|l| l.handle)
-                        .unwrap_or(codec::types::Handle::NULL);
+                        .unwrap_or(document::types::Handle::NULL);
                     self.tabs[i].scene.document.header.current_layer_name = layer.clone();
                     self.tabs[i].scene.document.header.current_layer_handle = handle;
                     self.tabs[i].active_layer = layer.clone();
@@ -639,7 +683,7 @@ impl OpenCADStudio {
                     .collect::<Vec<_>>();
                 let undo = self.begin_layer_undo(i, "LAYON", &names);
                 for name in &names {
-                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(&name) {
+                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
                         dl.turn_on();
                     }
                 }
@@ -661,7 +705,7 @@ impl OpenCADStudio {
                     .collect::<Vec<_>>();
                 let undo = self.begin_layer_undo(i, "LAYTHW", &names);
                 for name in &names {
-                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(&name) {
+                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
                         dl.thaw();
                     }
                 }
@@ -713,6 +757,7 @@ impl OpenCADStudio {
 
             // LAYISO — isolate the layers used by the selected entities.
             "LAYISO" => self.start_layiso(i),
+            "LAYERP" => self.layer_previous(i),
 
             // LAYISO Settings is kept as a command-line subcommand so it is
             // available both from the selection prompt and from scripts.
@@ -721,10 +766,7 @@ impl OpenCADStudio {
                 let command = KeywordCommand::new(
                     "LAYISO SETTINGS",
                     "LAYISO  Settings [Off / Lock and Fade]:",
-                    vec![
-                        ("Off", "OFF", None),
-                        ("Lock and Fade", "LOCKANDFADE", None),
-                    ],
+                    vec![("Off", "OFF", None), ("Lock and Fade", "LOCKANDFADE", None)],
                 );
                 self.command_line.push_info(&command.prompt());
                 self.command_line.set_step_options(command.options());
@@ -732,14 +774,14 @@ impl OpenCADStudio {
             }
 
             "LAYISO SETTINGS OFF" => {
-                self.tabs[i].layiso_mode = crate::app::document::LayisoMode::Off;
+                self.tabs[i].layiso_mode = crate::app::tab_document::LayisoMode::Off;
                 self.command_line
                     .push_info(crate::t!("LAYISO Settings: Off.").as_ref());
                 self.start_layiso(i);
             }
 
             "LAYISO SETTINGS LOCKANDFADE" => {
-                self.tabs[i].layiso_mode = crate::app::document::LayisoMode::LockAndFade;
+                self.tabs[i].layiso_mode = crate::app::tab_document::LayisoMode::LockAndFade;
                 self.command_line
                     .push_info(crate::t!("LAYISO Settings: Lock and Fade.").as_ref());
                 self.start_layiso(i);
@@ -861,12 +903,7 @@ impl OpenCADStudio {
                 }
                 self.tabs[i].layiso_state = None;
                 self.commit_layer_undo(i, undo);
-                self.record_layiso_history(
-                    i,
-                    history_len,
-                    layiso_history_before,
-                    None,
-                );
+                self.record_layiso_history(i, history_len, layiso_history_before, None);
                 self.refresh_layer_panel();
                 self.command_line
                     .push_info(crate::t!("LAYUNISO: all layers restored.").as_ref());
@@ -885,7 +922,7 @@ impl OpenCADStudio {
                     .map(|layer| {
                         QuickLayerEntry::new(
                             layer.name.clone(),
-                            layer.color.clone(),
+                            layer.color,
                             layer.visible,
                             layer.frozen,
                             layer.locked,
@@ -893,7 +930,7 @@ impl OpenCADStudio {
                     })
                     .collect();
 
-                let selected: Vec<codec::Handle> = self.tabs[i]
+                let selected: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .into_iter()
@@ -930,7 +967,7 @@ impl OpenCADStudio {
                     return Some(Task::none());
                 };
 
-                let handles: Vec<codec::Handle> = self.tabs[i]
+                let handles: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .into_iter()
@@ -1036,14 +1073,14 @@ impl OpenCADStudio {
                 // ambiguous, so keep the explicit source-pick prompt for them.
                 let src = match self.tabs[i].scene.selected_entities().as_slice() {
                     [(handle, _)] => *handle,
-                    _ => codec::Handle::NULL,
+                    _ => document::Handle::NULL,
                 };
                 // Consume the preselection so it cannot become a destination.
                 self.tabs[i].scene.deselect_all();
                 let last = self.tabs[i].last_matchprop_src;
                 let last = match self.tabs[i].scene.document.get_entity(last) {
                     Some(_) => last,
-                    None => codec::Handle::NULL,
+                    None => document::Handle::NULL,
                 };
                 let cmd = MatchPropCommand::new(src).with_last(last);
                 if !src.is_null() {
@@ -1058,6 +1095,169 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(cmd));
                 self.refresh_active_cmd_preview(i);
             }
+
+            // Named group editing: rename a group, or add/remove members
+            // without dissolving it. `GROUP` on its own still creates one.
+            cmd if cmd.starts_with("GROUP ") => {
+                let rest = cmd.strip_prefix("GROUP").unwrap_or("").trim();
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                let sub = parts
+                    .first()
+                    .map(|p| p.to_ascii_uppercase())
+                    .unwrap_or_default();
+                match sub.as_str() {
+                    "LIST" | "?" => {
+                        let mut rows: Vec<String> = self.tabs[i]
+                            .scene
+                            .groups()
+                            .map(|group| {
+                                format!("{} ({} object(s))", group.name, group.entities.len())
+                            })
+                            .collect();
+                        rows.sort();
+                        if rows.is_empty() {
+                            self.command_line
+                                .push_info(crate::t!("GROUP: no groups in this drawing.").as_ref());
+                        } else {
+                            self.command_line.push_output(
+                                crate::tf!("Groups:\n  {}", rows.join("\n  ")).as_ref(),
+                            );
+                        }
+                    }
+                    "RENAME" | "NAME" => {
+                        let old = parts.get(1).copied().unwrap_or("");
+                        let new = parts.get(2).copied().unwrap_or("");
+                        if old.is_empty() || new.is_empty() {
+                            self.command_line.push_error(
+                                crate::t!("Usage: GROUP RENAME <old name> <new name>").as_ref(),
+                            );
+                        } else if !self.tabs[i]
+                            .scene
+                            .groups()
+                            .any(|group| group.name.eq_ignore_ascii_case(old))
+                        {
+                            self.command_line
+                                .push_error(crate::tf!("GROUP: no group named '{old}'.").as_ref());
+                        } else if self.tabs[i]
+                            .scene
+                            .groups()
+                            .any(|group| group.name.eq_ignore_ascii_case(new))
+                        {
+                            self.command_line.push_error(
+                                crate::tf!("GROUP: a group named '{new}' already exists.").as_ref(),
+                            );
+                        } else {
+                            let undo = self.begin_group_undo(i, "GROUP RENAME");
+                            let renamed = self.tabs[i].scene.rename_group_named(old, new);
+                            self.tabs[i].dirty = true;
+                            self.commit_group_undo(i, undo);
+                            if renamed {
+                                self.command_line.push_output(
+                                    crate::tf!("GROUP: renamed '{old}' to '{new}'.").as_ref(),
+                                );
+                            }
+                        }
+                    }
+                    "ADD" | "REMOVE" => {
+                        let adding = sub == "ADD";
+                        let name = parts.get(1).copied().unwrap_or("");
+                        if name.is_empty() {
+                            self.command_line.push_error(
+                                crate::tf!(
+                                    "Usage: GROUP {} <group name> [handle ...]",
+                                    if adding { "ADD" } else { "REMOVE" }
+                                )
+                                .as_ref(),
+                            );
+                        } else if !self.tabs[i]
+                            .scene
+                            .groups()
+                            .any(|group| group.name.eq_ignore_ascii_case(name))
+                        {
+                            self.command_line
+                                .push_error(crate::tf!("GROUP: no group named '{name}'.").as_ref());
+                        } else {
+                            let mut handles: Vec<document::Handle> = parts
+                                .get(2..)
+                                .unwrap_or(&[])
+                                .iter()
+                                .filter_map(|token| {
+                                    u64::from_str_radix(token.trim_start_matches(['_', '.']), 16)
+                                        .ok()
+                                        .map(document::Handle::new)
+                                })
+                                .collect();
+                            if handles.is_empty() {
+                                handles = self.tabs[i]
+                                    .scene
+                                    .selected_entities()
+                                    .into_iter()
+                                    .map(|(handle, _)| handle)
+                                    .collect();
+                            }
+                            let members = self.tabs[i]
+                                .scene
+                                .groups()
+                                .find(|group| group.name.eq_ignore_ascii_case(name))
+                                .map(|group| group.entities.clone())
+                                .unwrap_or_default();
+                            handles.retain(|handle| {
+                                adding != members.contains(handle)
+                                    && self.tabs[i].scene.document.get_entity(*handle).is_some()
+                            });
+                            if handles.is_empty() {
+                                self.command_line.push_info(
+                                    crate::tf!(
+                                        "GROUP: nothing to {}.",
+                                        if adding { "add" } else { "remove" }
+                                    )
+                                    .as_ref(),
+                                );
+                            } else {
+                                let undo = self.begin_group_undo(
+                                    i,
+                                    if adding { "GROUP ADD" } else { "GROUP REMOVE" },
+                                );
+                                let mut changed = 0usize;
+                                for handle in handles {
+                                    let ok = if adding {
+                                        self.tabs[i].scene.add_entity_to_group_named(name, handle)
+                                    } else {
+                                        self.tabs[i]
+                                            .scene
+                                            .remove_entity_from_group_named(name, handle)
+                                    };
+                                    if ok {
+                                        changed += 1;
+                                    }
+                                }
+                                self.tabs[i].dirty = true;
+                                self.commit_group_undo(i, undo);
+                                self.command_line.push_output(
+                                    crate::tf!(
+                                        "GROUP: {} {} object(s) {} '{name}'.",
+                                        if adding { "added" } else { "removed" },
+                                        changed,
+                                        if adding { "to" } else { "from" }
+                                    )
+                                    .as_ref(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        self.command_line.push_error(
+                            crate::t!(
+                                "Usage: GROUP [LIST | RENAME <old> <new> | ADD <name> [handle ...] | REMOVE <name> [handle ...]]"
+                            )
+                            .as_ref(),
+                        );
+                    }
+                }
+            }
+
+            // The Groups panel's Group Selection button.
+            "TOGGLEGROUPS" => return Some(self.run_action("TOGGLEGROUPS")),
 
             "GROUP" => {
                 let handles: Vec<_> = self.tabs[i]
@@ -1081,6 +1281,24 @@ impl OpenCADStudio {
                 }
             }
 
+            "GROUPEDIT" => {
+                use crate::modules::draw::groups::groupedit::GroupEditCommand;
+                let groups = self.tabs[i]
+                    .scene
+                    .groups()
+                    .map(|group| (group.name.clone(), group.entities.clone()))
+                    .collect();
+                let selected: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_entities()
+                    .into_iter()
+                    .map(|(h, _)| h)
+                    .collect();
+                let cmd = GroupEditCommand::for_selection(groups, &selected);
+                self.command_line.push_info(&cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(cmd));
+            }
+
             "UNGROUP" => {
                 let handles: Vec<_> = self.tabs[i]
                     .scene
@@ -1099,6 +1317,9 @@ impl OpenCADStudio {
                     let count = self.tabs[i].scene.delete_groups_containing(&handles);
                     self.tabs[i].dirty = true;
                     self.commit_group_undo(i, undo);
+                    // The picked members keep their selection, but the group
+                    // box and centre grip they showed belong to no group now.
+                    self.refresh_selected_grips();
                     if count > 0 {
                         self.command_line
                             .push_info(crate::tf!("{} group(s) dissolved.", count).as_ref());
@@ -1118,9 +1339,9 @@ impl OpenCADStudio {
 #[cfg(test)]
 mod layiso_tests {
     use super::*;
-    use crate::app::document::{LayisoLayerSnapshot, LayisoMode};
-    use codec::tables::Layer;
-    use codec::types::Transparency;
+    use crate::app::tab_document::{LayisoLayerSnapshot, LayisoMode};
+    use document::tables::Layer;
+    use document::types::Transparency;
 
     fn snapshot(before: Layer, after: Layer) -> LayisoLayerSnapshot {
         LayisoLayerSnapshot {
@@ -1181,9 +1402,26 @@ impl OpenCADStudio {
     /// line up and only the properties are wrong, so there is nothing to sit in
     /// a dialog and decide.
     pub(in crate::app) fn layer_translate_same(&mut self, path: &std::path::Path) -> Task<Message> {
-        use crate::modules::draw::layers::laytrans;
+        use super::layer_file_reads::{LayerFileJob, LayerFiles};
         let i = self.active_tab;
-        let targets = match laytrans::load_targets(path) {
+        self.read_layer_files(
+            i,
+            LayerFileJob::TranslateSame,
+            LayerFiles {
+                standards: Some(path.to_path_buf()),
+                ..LayerFiles::default()
+            },
+        )
+    }
+
+    /// [`Self::layer_translate_same`] when its standards file is read.
+    pub(in crate::app) fn layer_translate_same_to(
+        &mut self,
+        i: usize,
+        targets: Result<Vec<crate::modules::draw::layers::laytrans::TargetLayer>, String>,
+    ) -> Task<Message> {
+        use crate::modules::draw::layers::laytrans;
+        let targets = match targets {
             Ok(targets) => targets,
             Err(why) => {
                 self.command_line
@@ -1306,6 +1544,7 @@ impl OpenCADStudio {
     /// The `-LAYTRANS` line parser: translate, save a mapping list, load one,
     /// or list the standards layers.
     pub(in crate::app) fn layer_translate_scripted(&mut self, rest: &str) -> Task<Message> {
+        use super::layer_file_reads::{LayerFileJob, LayerFiles};
         use crate::modules::draw::layers::laytrans;
         let i = self.active_tab;
         let mut words = rest.split_whitespace();
@@ -1321,9 +1560,8 @@ impl OpenCADStudio {
         match first.to_ascii_uppercase().as_str() {
             "SAVE" => {
                 let Some(path) = words.next() else {
-                    self.command_line.push_info(
-                        crate::t!("Usage: -LAYTRANS SAVE <file> FROM=TO …").as_ref(),
-                    );
+                    self.command_line
+                        .push_info(crate::t!("Usage: -LAYTRANS SAVE <file> FROM=TO …").as_ref());
                     return Task::none();
                 };
                 let mut mappings = Vec::new();
@@ -1332,11 +1570,8 @@ impl OpenCADStudio {
                         Some(mapping) => mappings.push(mapping),
                         None => {
                             self.command_line.push_error(
-                                crate::tf!(
-                                    "LAYTRANS: '{}' is not a FROM=TO mapping.",
-                                    token
-                                )
-                                .as_ref(),
+                                crate::tf!("LAYTRANS: '{}' is not a FROM=TO mapping.", token)
+                                    .as_ref(),
                             );
                             return Task::none();
                         }
@@ -1366,102 +1601,159 @@ impl OpenCADStudio {
                     );
                     return Task::none();
                 };
-                let mappings = match laytrans::load_mappings(std::path::Path::new(path)) {
-                    Ok(mappings) => mappings,
-                    Err(why) => {
-                        self.command_line.push_error(
-                            crate::tf!("LAYTRANS: could not read — {why}.").as_ref(),
-                        );
-                        return Task::none();
-                    }
+                let files = LayerFiles {
+                    mappings: Some(path.into()),
+                    standards: words.next().map(Into::into),
+                    ..LayerFiles::default()
                 };
-                if mappings.is_empty() {
-                    self.command_line.push_error(
-                        crate::tf!("LAYTRANS: no mappings in {path}.").as_ref(),
-                    );
-                    return Task::none();
-                }
-                let targets = match words.next() {
-                    Some(standards) => match laytrans::load_targets(std::path::Path::new(standards))
-                    {
-                        Ok(targets) => targets,
-                        Err(why) => {
-                            self.command_line.push_error(
-                                crate::tf!("LAYTRANS: {why}.").as_ref(),
-                            );
-                            return Task::none();
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                self.apply_layer_translation(i, targets, &mappings)
+                self.read_layer_files(i, LayerFileJob::TranslateList, files)
             }
             "LIST" => {
                 let Some(path) = words.next() else {
-                    self.command_line.push_info(
-                        crate::t!("Usage: -LAYTRANS LIST <standards>").as_ref(),
-                    );
+                    self.command_line
+                        .push_info(crate::t!("Usage: -LAYTRANS LIST <standards>").as_ref());
                     return Task::none();
                 };
-                match laytrans::load_targets(std::path::Path::new(path)) {
-                    Ok(targets) => {
-                        self.command_line.push_output(
-                            crate::tf!("LAYTRANS: {n} target layer(s) in {path}:", n = targets.len())
-                                .as_ref(),
-                        );
-                        for target in targets {
-                            self.command_line.push_output(
-                                crate::tf!("  {}", target.name).as_ref(),
-                            );
-                        }
-                    }
-                    Err(why) => self
-                        .command_line
-                        .push_error(crate::tf!("LAYTRANS: {why}.").as_ref()),
-                }
-                Task::none()
+                let files = LayerFiles {
+                    standards: Some(path.into()),
+                    ..LayerFiles::default()
+                };
+                self.read_layer_files(i, LayerFileJob::ListTargets, files)
             }
             _ => {
-                let targets = match laytrans::load_targets(std::path::Path::new(first)) {
-                    Ok(targets) => targets,
-                    Err(why) => {
-                        self.command_line
-                            .push_error(crate::tf!("LAYTRANS: {why}.").as_ref());
-                        return Task::none();
-                    }
-                };
                 let mut mappings = Vec::new();
                 for token in words {
                     match laytrans::Mapping::parse(token) {
                         Some(mapping) => mappings.push(mapping),
                         None => {
                             self.command_line.push_error(
-                                crate::tf!(
-                                    "LAYTRANS: '{}' is not a FROM=TO mapping.",
-                                    token
-                                )
-                                .as_ref(),
+                                crate::tf!("LAYTRANS: '{}' is not a FROM=TO mapping.", token)
+                                    .as_ref(),
                             );
                             return Task::none();
                         }
                     }
                 }
-                if mappings.is_empty() {
-                    let current = self.tabs[i].active_layer.clone();
-                    let sources = laytrans::source_layers(&self.tabs[i].scene, &current);
-                    mappings = laytrans::map_same(&sources, &targets);
-                    if mappings.is_empty() {
-                        self.command_line.push_info(
-                            crate::t!(
-                                "LAYTRANS: no layer names in common — name the pairs as FROM=TO."
-                            )
-                            .as_ref(),
-                        );
-                        return Task::none();
-                    }
-                }
-                self.apply_layer_translation(i, targets, &mappings)
+                let files = LayerFiles {
+                    standards: Some(first.into()),
+                    ..LayerFiles::default()
+                };
+                self.read_layer_files(i, LayerFileJob::TranslatePairs(mappings), files)
             }
+        }
+    }
+
+    /// -LAYTRANS <standards> [FROM=TO …] when its standards file is read:
+    /// the pairs, or the layers named alike when there are none.
+    pub(in crate::app) fn layer_translate_pairs(
+        &mut self,
+        i: usize,
+        targets: Result<Vec<crate::modules::draw::layers::laytrans::TargetLayer>, String>,
+        mut mappings: Vec<crate::modules::draw::layers::laytrans::Mapping>,
+    ) -> Task<Message> {
+        use crate::modules::draw::layers::laytrans;
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(why) => {
+                self.command_line
+                    .push_error(crate::tf!("LAYTRANS: {why}.").as_ref());
+                return Task::none();
+            }
+        };
+        if mappings.is_empty() {
+            let current = self.tabs[i].active_layer.clone();
+            let sources = laytrans::source_layers(&self.tabs[i].scene, &current);
+            mappings = laytrans::map_same(&sources, &targets);
+            if mappings.is_empty() {
+                self.command_line.push_info(
+                    crate::t!("LAYTRANS: no layer names in common — name the pairs as FROM=TO.")
+                        .as_ref(),
+                );
+                return Task::none();
+            }
+        }
+        self.apply_layer_translation(i, targets, &mappings)
+    }
+
+    /// -LAYTRANS LOAD <file> [<standards>] when its files are read.
+    pub(in crate::app) fn layer_translate_list(
+        &mut self,
+        i: usize,
+        path: &str,
+        mappings: Result<Vec<crate::modules::draw::layers::laytrans::Mapping>, String>,
+        targets: Option<Result<Vec<crate::modules::draw::layers::laytrans::TargetLayer>, String>>,
+    ) -> Task<Message> {
+        let mappings = match mappings {
+            Ok(mappings) => mappings,
+            Err(why) => {
+                self.command_line
+                    .push_error(crate::tf!("LAYTRANS: could not read — {why}.").as_ref());
+                return Task::none();
+            }
+        };
+        if mappings.is_empty() {
+            self.command_line
+                .push_error(crate::tf!("LAYTRANS: no mappings in {path}.").as_ref());
+            return Task::none();
+        }
+        let targets = match targets {
+            Some(Ok(targets)) => targets,
+            Some(Err(why)) => {
+                self.command_line
+                    .push_error(crate::tf!("LAYTRANS: {why}.").as_ref());
+                return Task::none();
+            }
+            None => Vec::new(),
+        };
+        self.apply_layer_translation(i, targets, &mappings)
+    }
+
+    /// -LAYTRANS LIST <standards> when its standards file is read.
+    pub(in crate::app) fn list_layer_translation_targets(
+        &mut self,
+        path: &str,
+        targets: Result<Vec<crate::modules::draw::layers::laytrans::TargetLayer>, String>,
+    ) {
+        match targets {
+            Ok(targets) => {
+                self.command_line.push_output(
+                    crate::tf!(
+                        "LAYTRANS: {n} target layer(s) in {path}:",
+                        n = targets.len()
+                    )
+                    .as_ref(),
+                );
+                for target in targets {
+                    self.command_line
+                        .push_output(crate::tf!("  {}", target.name).as_ref());
+                }
+            }
+            Err(why) => self
+                .command_line
+                .push_error(crate::tf!("LAYTRANS: {why}.").as_ref()),
+        }
+    }
+
+    /// LAYERSTATE IMPORT when its file is read.
+    pub(in crate::app) fn import_layer_state(
+        &mut self,
+        i: usize,
+        path_text: &str,
+        state: Result<document::layer_state::LayerState, String>,
+    ) {
+        match state {
+            Ok(state) => {
+                let name = state.name.clone();
+                self.push_undo_snapshot(i, "LAYERSTATE IMPORT");
+                self.tabs[i].scene.document.store_layer_state(state);
+                self.tabs[i].dirty = true;
+                self.command_line.push_output(
+                    crate::tf!("LAYERSTATE: imported \"{name}\" from {path_text}.").as_ref(),
+                );
+            }
+            Err(error) => self
+                .command_line
+                .push_error(crate::tf!("LAYERSTATE: {error}").as_ref()),
         }
     }
 
@@ -1492,7 +1784,7 @@ impl OpenCADStudio {
 
         self.push_undo_snapshot(i, "DWGUNITS");
         self.tabs[i].scene.document.header.insertion_units = to;
-        self.tabs[i].scene.sync_annotation_scale_from_header();
+        self.tabs[i].scene.insertion_units_changed(from);
 
         let factor = units::conversion_factor(from, to).filter(|f| (f - 1.0).abs() > 1e-12);
         let (from_label, to_label) = (units::label(from), units::label(to));
@@ -1541,11 +1833,11 @@ impl OpenCADStudio {
 
         // Model framing follows model units; sheet framing stays in paper units.
         let sheets = self.tabs[i].scene.sheet_viewport_handles();
-        let scaled: std::collections::HashSet<codec::Handle> = handles.iter().copied().collect();
+        let scaled: std::collections::HashSet<document::Handle> = handles.iter().copied().collect();
         let mut reframed = 0usize;
         for entity in self.tabs[i].scene.document.entities_mut() {
             let handle = entity.common().handle;
-            let codec::entities::EntityType::Viewport(vp) = entity else {
+            let document::entities::EntityType::Viewport(vp) = entity else {
                 continue;
             };
             let is_sheet = !scaled.contains(&handle) && sheets.contains(&handle);
@@ -1651,11 +1943,11 @@ impl OpenCADStudio {
         &mut self,
         path: &std::path::Path,
         save: bool,
-    ) {
-        use crate::modules::draw::layers::laytrans::Mapping;
+    ) -> Task<Message> {
+        use super::layer_file_reads::{LayerFileJob, LayerFiles};
         if save {
             let Some(state) = self.layer_translator.as_ref() else {
-                return;
+                return Task::none();
             };
             match crate::modules::draw::layers::laytrans::save_mappings(path, &state.mappings) {
                 Ok(()) => self.command_line.push_output(
@@ -1666,10 +1958,21 @@ impl OpenCADStudio {
                     .command_line
                     .push_error(crate::tf!("LAYTRANS: could not save — {why}.").as_ref()),
             }
-            return;
+            return Task::none();
         }
-        let parsed: Vec<Mapping> = match crate::modules::draw::layers::laytrans::load_mappings(path)
-        {
+        let files = LayerFiles {
+            mappings: Some(path.to_path_buf()),
+            ..LayerFiles::default()
+        };
+        self.read_layer_files(self.active_tab, LayerFileJob::WindowMappings, files)
+    }
+
+    /// The Layer Translator window's mapping list when it is read.
+    pub(in crate::app) fn take_layer_translator_mappings(
+        &mut self,
+        parsed: Result<Vec<crate::modules::draw::layers::laytrans::Mapping>, String>,
+    ) {
+        let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(why) => {
                 self.command_line
@@ -1735,16 +2038,16 @@ impl OpenCADStudio {
         &mut self,
         i: usize,
         history_len: usize,
-        before: Option<crate::app::document::LayisoState>,
-        after: Option<crate::app::document::LayisoState>,
+        before: Option<crate::app::tab_document::LayisoState>,
+        after: Option<crate::app::tab_document::LayisoState>,
     ) {
         if self.tabs[i].history.undo_stack.len() == history_len {
             return;
         }
-        if let Some(crate::app::document::HistorySnapshot::Delta(delta)) =
-            self.tabs[i].history.undo_stack.last_mut()
-        {
-            delta.layiso_state = Some((before, after));
+        if let Some(mut entry) = self.tabs[i].history.last_undo_mut() {
+            if let crate::app::tab_document::HistorySnapshot::Delta(delta) = &mut *entry {
+                delta.layiso_state = Some((before, after));
+            }
         }
     }
 
@@ -1773,15 +2076,11 @@ impl OpenCADStudio {
         self.apply_layiso(i, selected_layers);
     }
 
-    fn apply_layiso(
-        &mut self,
-        i: usize,
-        selected_layers: rustc_hash::FxHashSet<String>,
-    ) {
+    fn apply_layiso(&mut self, i: usize, selected_layers: rustc_hash::FxHashSet<String>) {
         let mode = self.tabs[i].layiso_mode;
         let layiso_history_before = self.tabs[i].layiso_state.clone();
         let current_layer = self.tabs[i].active_layer.clone();
-        let before: Vec<(String, codec::tables::Layer)> = self.tabs[i]
+        let before: Vec<(String, document::tables::Layer)> = self.tabs[i]
             .scene
             .document
             .layers
@@ -1798,8 +2097,8 @@ impl OpenCADStudio {
                     && name != &current_layer
                     && name != "0"
                     && match mode {
-                        crate::app::document::LayisoMode::Off => !layer.is_off(),
-                        crate::app::document::LayisoMode::LockAndFade => !layer.is_locked(),
+                        crate::app::tab_document::LayisoMode::Off => !layer.is_off(),
+                        crate::app::tab_document::LayisoMode::LockAndFade => !layer.is_locked(),
                     }
             })
             .map(|(name, _)| name.clone())
@@ -1809,10 +2108,10 @@ impl OpenCADStudio {
         for name in &names {
             if let Some(layer) = self.tabs[i].scene.document.layers.get_mut(name) {
                 match mode {
-                    crate::app::document::LayisoMode::Off => layer.turn_off(),
+                    crate::app::tab_document::LayisoMode::Off => layer.turn_off(),
                     // A locked layer already draws faded; its saved
                     // transparency is left alone.
-                    crate::app::document::LayisoMode::LockAndFade => layer.lock(),
+                    crate::app::tab_document::LayisoMode::LockAndFade => layer.lock(),
                 }
             }
         }
@@ -1827,17 +2126,16 @@ impl OpenCADStudio {
         let snapshots = before
             .into_iter()
             .filter_map(|(name, before)| {
-                after_by_name
-                    .get(&name)
-                    .cloned()
-                    .map(|after| crate::app::document::LayisoLayerSnapshot {
+                after_by_name.get(&name).cloned().map(|after| {
+                    crate::app::tab_document::LayisoLayerSnapshot {
                         name,
                         before,
                         after,
-                    })
+                    }
+                })
             })
             .collect();
-        let layiso_history_after = Some(crate::app::document::LayisoState {
+        let layiso_history_after = Some(crate::app::tab_document::LayisoState {
             mode,
             layers: snapshots,
         });
@@ -1850,16 +2148,10 @@ impl OpenCADStudio {
         }
         let history_len = self.tabs[i].history.undo_stack.len();
         self.commit_layer_undo(i, undo);
-        self.record_layiso_history(
-            i,
-            history_len,
-            layiso_history_before,
-            layiso_history_after,
-        );
+        self.record_layiso_history(i, history_len, layiso_history_before, layiso_history_after);
         self.refresh_layer_panel();
-        self.command_line.push_info(
-            crate::tf!("LAYISO: isolated {} layer(s).", selected_layers.len()).as_ref(),
-        );
+        self.command_line
+            .push_info(crate::tf!("LAYISO: isolated {} layer(s).", selected_layers.len()).as_ref());
     }
 
     /// Restore the saved layer state `name`, returning how many layers it
@@ -1874,11 +2166,17 @@ impl OpenCADStudio {
         &mut self,
         i: usize,
         layer: &str,
-        viewport: codec::Handle,
-        color: codec::types::Color,
+        viewport: document::Handle,
+        color: document::types::Color,
     ) {
-        use codec::objects::{KnownXRecordKind as Kind, XRecordValue as Value};
-        let Some(layer) = self.tabs[i].scene.document.layers.get(layer).map(|l| l.handle) else {
+        use document::objects::{KnownXRecordKind as Kind, XRecordValue as Value};
+        let Some(layer) = self.tabs[i]
+            .scene
+            .document
+            .layers
+            .get(layer)
+            .map(|l| l.handle)
+        else {
             return;
         };
         let Some(packed) = crate::scene::view::render::pack_layer_override_color(&color) else {
@@ -1896,7 +2194,9 @@ impl OpenCADStudio {
         self.tabs[i].dirty = true;
         let doc_layers = self.tabs[i].scene.document.layers.clone();
         let vp_info = self.tabs[i].scene.viewport_list();
-        self.tabs[i].layers.sync_with_viewports(&doc_layers, vp_info);
+        self.tabs[i]
+            .layers
+            .sync_with_viewports(&doc_layers, vp_info);
     }
 
     pub(in crate::app) fn restore_layer_state_here(&mut self, i: usize, name: &str) -> usize {
@@ -1911,11 +2211,11 @@ impl OpenCADStudio {
         &mut self,
         i: usize,
         name: &str,
-        only: Option<codec::layer_state::LayerStateMask>,
+        only: Option<document::layer_state::LayerStateMask>,
     ) -> usize {
-        use codec::layer_state::LayerStateMask as Mask;
-        use codec::objects::{KnownXRecordKind as Kind, XRecordValue as Value};
-        use codec::EntityType;
+        use document::layer_state::LayerStateMask as Mask;
+        use document::objects::{KnownXRecordKind as Kind, XRecordValue as Value};
+        use document::EntityType;
         let scene = &mut self.tabs[i].scene;
         let viewport = scene.active_viewport.filter(|handle| {
             scene.current_layout != "Model"
@@ -2033,12 +2333,7 @@ impl OpenCADStudio {
             // On / off has no per-viewport form; a layer the state turns off
             // is frozen in this viewport instead, so other viewports keep
             // their own visibility.
-            let (by_freeze, by_off) = (
-                state.mask.contains(Mask::FROZEN),
-                state.mask.contains(Mask::ON),
-            );
-            let (by_freeze, by_off) =
-                (mask.contains(Mask::FROZEN), mask.contains(Mask::ON));
+            let (by_freeze, by_off) = (mask.contains(Mask::FROZEN), mask.contains(Mask::ON));
             if by_freeze || by_off {
                 let hidden = (by_freeze && saved.frozen) || (by_off && saved.off);
                 if hidden { &mut freeze } else { &mut thaw }.push(layer.handle);
@@ -2115,13 +2410,12 @@ impl OpenCADStudio {
     }
 }
 
-
 /// Parse the optional property filter of `-LAYERSTATE RESTORE <name> <filter>`.
 /// `None` means "every property the state captured".
 fn parse_layer_state_filter(
     text: &str,
-) -> Result<Option<codec::layer_state::LayerStateMask>, String> {
-    use codec::layer_state::LayerStateMask as Mask;
+) -> Result<Option<document::layer_state::LayerStateMask>, String> {
+    use document::layer_state::LayerStateMask as Mask;
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
@@ -2161,8 +2455,8 @@ fn las_text(value: &str) -> String {
     value.replace(['\t', '\n', '\r'], " ")
 }
 
-fn las_color(color: codec::types::Color) -> String {
-    use codec::types::Color;
+fn las_color(color: document::types::Color) -> String {
+    use document::types::Color;
     match color {
         Color::ByLayer => "bylayer".to_string(),
         Color::ByBlock => "byblock".to_string(),
@@ -2172,10 +2466,13 @@ fn las_color(color: codec::types::Color) -> String {
     }
 }
 
-fn las_parse_color(text: &str) -> codec::types::Color {
-    use codec::types::Color;
+fn las_parse_color(text: &str) -> document::types::Color {
+    use document::types::Color;
     if let Some(rest) = text.strip_prefix("index:") {
-        return rest.parse::<u8>().map(Color::Index).unwrap_or(Color::Index(7));
+        return rest
+            .parse::<u8>()
+            .map(Color::Index)
+            .unwrap_or(Color::Index(7));
     }
     if let Some(rest) = text.strip_prefix("rgb:") {
         let parts: Vec<&str> = rest.split(',').collect();
@@ -2197,8 +2494,8 @@ fn las_parse_color(text: &str) -> codec::types::Color {
     }
 }
 
-fn las_alpha(transparency: Option<codec::types::Transparency>) -> String {
-    use codec::types::Transparency;
+fn las_alpha(transparency: Option<document::types::Transparency>) -> String {
+    use document::types::Transparency;
     match transparency {
         Some(Transparency::ByLayer) => "bylayer".to_string(),
         Some(Transparency::ByBlock) => "byblock".to_string(),
@@ -2207,8 +2504,8 @@ fn las_alpha(transparency: Option<codec::types::Transparency>) -> String {
     }
 }
 
-fn las_parse_alpha(text: &str) -> Option<codec::types::Transparency> {
-    use codec::types::Transparency;
+fn las_parse_alpha(text: &str) -> Option<document::types::Transparency> {
+    use document::types::Transparency;
     if let Some(rest) = text.strip_prefix("explicit:") {
         return rest.parse::<u8>().ok().map(Transparency::Explicit);
     }
@@ -2221,7 +2518,7 @@ fn las_parse_alpha(text: &str) -> Option<codec::types::Transparency> {
 
 /// Write a layer state as the line-oriented `.las` interchange text. Every
 /// property the state captured round-trips, including the current layer.
-fn layer_state_to_las(state: &codec::layer_state::LayerState) -> String {
+fn layer_state_to_las(state: &document::layer_state::LayerState) -> String {
     let mut out = String::from("OCSLAS\t1\n");
     out.push_str(&format!("NAME\t{}\n", las_text(&state.name)));
     out.push_str(&format!("DESC\t{}\n", las_text(&state.description)));
@@ -2247,8 +2544,10 @@ fn layer_state_to_las(state: &codec::layer_state::LayerState) -> String {
     out
 }
 
-fn layer_state_from_las(text: &str) -> Result<codec::layer_state::LayerState, String> {
-    use codec::layer_state::{LayerState, LayerStateLayer, LayerStateMask};
+pub(super) fn layer_state_from_las(
+    text: &str,
+) -> Result<document::layer_state::LayerState, String> {
+    use document::layer_state::{LayerState, LayerStateLayer, LayerStateMask};
     let mut state = LayerState {
         name: String::new(),
         description: String::new(),
@@ -2276,7 +2575,7 @@ fn layer_state_from_las(text: &str) -> Result<codec::layer_state::LayerState, St
                     continue;
                 }
                 state.layers.push(LayerStateLayer {
-                    layer_handle: codec::types::Handle::NULL,
+                    layer_handle: document::types::Handle::NULL,
                     layer_name: values[0].to_string(),
                     off: values[1] == "1",
                     frozen: values[2] == "1",
@@ -2289,7 +2588,7 @@ fn layer_state_from_las(text: &str) -> Result<codec::layer_state::LayerState, St
                     line_type: values[7].to_string(),
                     line_weight: values[8]
                         .parse::<i16>()
-                        .map(codec::types::LineWeight::from_value)
+                        .map(document::types::LineWeight::from_value)
                         .unwrap_or_default(),
                     plot_style: values[9].to_string(),
                     transparency: values.get(10).and_then(|value| las_parse_alpha(value)),

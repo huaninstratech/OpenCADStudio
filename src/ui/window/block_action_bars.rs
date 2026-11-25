@@ -2,10 +2,10 @@ use crate::{
     app::Message,
     scene::block_action_bars::{EntryKind, Group},
 };
-use codec::Handle;
+use document::Handle;
 use iced::{
-    widget::{button, canvas, column, container, row, text, tooltip, Space},
     Color, Element, Fill, Point, Rectangle, Vector,
+    widget::{Space, button, canvas, column, container, row, text, tooltip},
 };
 
 #[derive(Default)]
@@ -51,24 +51,12 @@ impl canvas::Program<Message> for DragHandle {
                     .filter(|point| bounds.contains(*point))?;
                 state.start = Some(point);
                 state.initial = self.offset;
-                Some(
-                    canvas::Action::publish(Message::BlockActionBarMove(
-                        self.parameter,
-                        self.offset,
-                    ))
-                    .and_capture(),
-                )
+                Some(canvas::Action::capture())
             }
             iced::Event::Mouse(Event::ButtonReleased(Button::Left))
                 if state.start.take().is_some() =>
             {
-                Some(
-                    canvas::Action::publish(Message::BlockActionBarMove(
-                        self.parameter,
-                        self.offset,
-                    ))
-                    .and_capture(),
-                )
+                Some(canvas::Action::capture())
             }
             _ => None,
         }
@@ -201,5 +189,4 @@ pub(crate) fn view(
                 ..Default::default()
             }),
     )
-    .into()
 }

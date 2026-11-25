@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use codec::Handle;
-use iced::widget::{button, column, combo_box, container, pick_list, row, text, text_input, Space};
+use document::Handle;
+use iced::widget::{Space, button, column, combo_box, container, pick_list, row, text, text_input};
 use iced::{Background, Border, Element, Fill, Length, Theme};
 
 use crate::app::Message;
@@ -12,36 +12,26 @@ use crate::modules::draw::units;
 use crate::t;
 use crate::ui::style::form::{button_style, dialog_button, field_style, form_radio};
 
-static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/blocks/pick_point.svg");
+static ICON_PICK_POINT: &[u8] = include_bytes!("../../../assets/icons/point.svg");
 static ICON_SELECT_OBJECTS: &[u8] =
     include_bytes!("../../../assets/icons/blocks/select_objects.svg");
 static ICON_QUICK_SELECT: &[u8] = include_bytes!("../../../assets/icons/blocks/quick_select.svg");
 static ICON_WARN: &[u8] = include_bytes!("../../../assets/icons/ui/warning_triangle.svg");
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WblockSourceMode {
     Block,
     EntireDrawing,
+    #[default]
     Objects,
 }
 
-impl Default for WblockSourceMode {
-    fn default() -> Self {
-        WblockSourceMode::Objects
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WblockObjectMode {
+    #[default]
     Retain,
     Convert,
     Delete,
-}
-
-impl Default for WblockObjectMode {
-    fn default() -> Self {
-        WblockObjectMode::Retain
-    }
 }
 
 /// Dropdown entry for the Unit picker.
@@ -177,7 +167,7 @@ fn group<'a>(
             text(title.into())
                 .size(11)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
             body.into(),
         ]
@@ -285,7 +275,7 @@ pub fn view_window<'a>(
             text(axis)
                 .size(11)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 })
                 .width(Length::Fixed(16.0)),
             input,
@@ -376,18 +366,20 @@ pub fn view_window<'a>(
             text(t!("No objects selected"))
                 .size(10)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.base.text.scale_alpha(0.48)),
+                    color: Some(crate::ui::style::readable::hint_text(theme)),
                 }),
         ]
         .spacing(5)
         .align_y(iced::Center)
         .into()
     } else {
-        row![text(crate::tf!("{count} objects selected"))
-            .size(10)
-            .style(|theme: &Theme| text::Style {
-                color: Some(theme.palette().primary.base.color),
-            }),]
+        row![
+            text(crate::tf!("{count} objects selected"))
+                .size(10)
+                .style(|theme: &Theme| text::Style {
+                    color: Some(theme.palette().primary.base.color),
+                }),
+        ]
         .spacing(5)
         .align_y(iced::Center)
         .into()
@@ -465,7 +457,7 @@ pub fn view_window<'a>(
         text(t!("Insert units:"))
             .size(11)
             .style(|theme: &Theme| text::Style {
-                color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                color: Some(crate::ui::style::readable::muted_text(theme)),
             }),
         Space::new().width(8),
         unit_picker,
@@ -480,7 +472,7 @@ pub fn view_window<'a>(
             text(t!("File name and path:"))
                 .size(11)
                 .style(|theme: &Theme| text::Style {
-                    color: Some(theme.palette().background.strongest.text.scale_alpha(0.85)),
+                    color: Some(crate::ui::style::readable::muted_text(theme)),
                 }),
             path_row,
             Space::new().height(4),

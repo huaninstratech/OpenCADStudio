@@ -1,8 +1,8 @@
 use super::{Message, OpenCADStudio};
 use crate::scene::model::object::{PropValue, Property};
-use codec::entities::{Insert, Line};
-use codec::types::Vector3;
-use codec::{Document, EntityType};
+use document::entities::{Insert, Line};
+use document::types::Vector3;
+use document::{Document, EntityType};
 use std::io::Cursor;
 
 fn fixture() -> OpenCADStudio {
@@ -67,11 +67,7 @@ fn block_properties_allow_exploding_refuses_the_explode_command() {
     app.tabs[i].scene.selected.insert(insert);
     let _ = app.dispatch_command("EXPLODE");
     assert!(
-        app.tabs[i]
-            .scene
-            .document
-            .get_entity(insert)
-            .is_some(),
+        app.tabs[i].scene.document.get_entity(insert).is_some(),
         "EXPLODE disassembled a definition the row says cannot be exploded"
     );
 }
@@ -111,11 +107,7 @@ fn block_properties_allow_exploding_survives_the_saved_file() {
         app.tabs[i].scene.selected.insert(reloaded);
         let _ = app.dispatch_command("EXPLODE");
         assert!(
-            app.tabs[i]
-                .scene
-                .document
-                .get_entity(reloaded)
-                .is_some(),
+            app.tabs[i].scene.document.get_entity(reloaded).is_some(),
             "{ext}: EXPLODE disassembled a definition reloaded as not explodable"
         );
     }
@@ -151,11 +143,7 @@ fn block_properties_allow_exploding_refuses_explode_on_a_parametric_block() {
     app.tabs[i].scene.selected.insert(insert);
     let _ = app.dispatch_command("EXPLODE");
     assert!(
-        app.tabs[i]
-            .scene
-            .document
-            .get_entity(insert)
-            .is_some(),
+        app.tabs[i].scene.document.get_entity(insert).is_some(),
         "EXPLODE disassembled a parametric definition the row says cannot be exploded"
     );
 }
@@ -351,8 +339,8 @@ fn block_properties_annotation_gates_orientation_and_preserves_unrelated_xdata()
         .get("PROPERTIES")
         .unwrap()
         .handle;
-    let mut data = codec::xdata::ExtendedDataRecord::new("EXTRA_TAG");
-    data.values = vec![codec::xdata::XDataValue::String("retained".into())];
+    let mut data = document::xdata::ExtendedDataRecord::new("EXTRA_TAG");
+    data.values = vec![document::xdata::XDataValue::String("retained".into())];
     app.tabs[i]
         .scene
         .document
@@ -544,8 +532,8 @@ fn block_properties_metadata_survives_dwg_and_dxf_save_and_reopen() {
     let _ = app.dispatch_command("BSAVE");
     let _ = app.dispatch_command("BCLOSE");
     let doc = &app.tabs[app.active_tab].scene.document;
-    let bytes = codec::DwgWriter::write_to_vec(doc).unwrap();
-    let read = codec::DwgReader::from_stream(Cursor::new(bytes))
+    let bytes = document::DwgWriter::write_to_vec(doc).unwrap();
+    let read = document::DwgReader::from_stream(Cursor::new(bytes))
         .read()
         .unwrap();
     check_round_trip(&read);
@@ -558,8 +546,8 @@ fn block_properties_metadata_survives_dwg_and_dxf_save_and_reopen() {
         "https://example.com/replaced",
         "Replaced",
     );
-    let reopened = codec::DwgReader::from_stream(Cursor::new(
-        codec::DwgWriter::write_to_vec(&changed).unwrap(),
+    let reopened = document::DwgReader::from_stream(Cursor::new(
+        document::DwgWriter::write_to_vec(&changed).unwrap(),
     ))
     .read()
     .unwrap();
@@ -571,8 +559,8 @@ fn block_properties_metadata_survives_dwg_and_dxf_save_and_reopen() {
         crate::scene::block_metadata::hyperlink(&reopened, "PROPERTIES"),
         ("https://example.com/replaced".into(), "Replaced".into())
     );
-    let bytes = codec::DxfWriter::new(doc).write_to_vec().unwrap();
-    let read = codec::DxfReader::from_reader(Cursor::new(bytes))
+    let bytes = document::DxfWriter::new(doc).write_to_vec().unwrap();
+    let read = document::DxfReader::from_reader(Cursor::new(bytes))
         .unwrap()
         .read()
         .unwrap();
@@ -590,8 +578,8 @@ fn block_properties_creation_options_persist_orientation_on_the_definition() {
         name: "CREATED".into(),
         handles: vec![line],
         base_point: glam::DVec3::ZERO,
-        world_to_block: codec::types::Transform::identity(),
-        block_to_world: codec::types::Transform::identity(),
+        world_to_block: document::types::Transform::identity(),
+        block_to_world: document::types::Transform::identity(),
         mode: crate::ui::window::block_definition::BlockObjectMode::Retain,
         annotative: true,
         match_orientation: true,
@@ -608,8 +596,8 @@ fn block_properties_creation_options_persist_orientation_on_the_definition() {
         crate::scene::block_metadata::annotation_flags(&scene.document, "CREATED"),
         (true, true)
     );
-    let bytes = codec::DwgWriter::write_to_vec(&scene.document).unwrap();
-    let read = codec::DwgReader::from_stream(Cursor::new(bytes))
+    let bytes = document::DwgWriter::write_to_vec(&scene.document).unwrap();
+    let read = document::DwgReader::from_stream(Cursor::new(bytes))
         .read()
         .unwrap();
     assert_eq!(
@@ -655,7 +643,7 @@ fn block_properties_hyperlink_cancel_and_stale_context_do_not_modify_a_definitio
     let _ = app.update(Message::HyperlinkUrlChanged(
         "https://example.com/stale".into(),
     ));
-    app.hyperlink_editor_block = Some((app.tabs[i].id + 1, codec::Handle::new(1)));
+    app.hyperlink_editor_block = Some((app.tabs[i].id + 1, document::Handle::new(1)));
     let _ = app.update(Message::HyperlinkApply);
     assert_eq!(app.tabs[i].scene.document, before);
     assert_eq!(app.tabs[i].history.undo_stack.len(), depth);
@@ -713,7 +701,7 @@ fn block_properties_staged_values_do_not_follow_a_different_definition() {
     );
 }
 
-fn select_editor_line(app: &mut OpenCADStudio) -> codec::types::Handle {
+fn select_editor_line(app: &mut OpenCADStudio) -> document::types::Handle {
     let i = app.active_tab;
     let handle = app.tabs[i]
         .scene
@@ -730,7 +718,7 @@ fn select_editor_line(app: &mut OpenCADStudio) -> codec::types::Handle {
 
 /// Select one line of the edited definition by position, replacing whatever
 /// was selected so each call starts from a known selection.
-fn select_editor_line_at(app: &mut OpenCADStudio, index: usize) -> codec::types::Handle {
+fn select_editor_line_at(app: &mut OpenCADStudio, index: usize) -> document::types::Handle {
     let i = app.active_tab;
     let handle = app.tabs[i]
         .scene
@@ -751,9 +739,11 @@ fn block_parameter_key() -> crate::scene::model::object::BlockParameterKey {
     use crate::scene::model::object::{BlockParameterComponent, BlockParameterKey};
     BlockParameterKey {
         document: 0,
-        definition: codec::Handle::new(1),
-        insert: codec::Handle::new(2),
-        parameter: codec::Handle::new(3),
+        definition: document::Handle::new(1),
+        insert: document::Handle::new(2),
+        batch_generation: None,
+        editor_session: None,
+        parameter: document::Handle::new(3),
         component: BlockParameterComponent::Distance,
     }
 }
@@ -930,7 +920,10 @@ fn open_dynamic_value_list_swallows_escape_enter_and_the_arrows() {
             "{msg:?} must not reach the command line or the viewport"
         );
     }
-    assert!(app.tabs[app.active_tab].properties.open_block_picker.is_some());
+    assert!(app.tabs[app.active_tab]
+        .properties
+        .open_block_picker
+        .is_some());
     assert!(app
         .intercept_property_list_key(&Message::PropBlockPickerToggle {
             key: block_parameter_key(),
@@ -941,7 +934,10 @@ fn open_dynamic_value_list_swallows_escape_enter_and_the_arrows() {
 
 #[test]
 fn escape_closes_the_dynamic_value_list_and_keeps_the_selection() {
-    for escape in [Message::CommandEscape, Message::ShortcutPressed("ESCAPE".into())] {
+    for escape in [
+        Message::CommandEscape,
+        Message::ShortcutPressed("ESCAPE".into()),
+    ] {
         let mut app = fixture();
         let handle = select_editor_line(&mut app);
         open_dynamic_value_list(&mut app);
@@ -962,6 +958,41 @@ fn enter_does_not_reach_the_command_line_while_the_list_is_open() {
     // Submitting would close the history and run the typed command.
     assert!(app.command_line.history_open);
     assert_eq!(app.command_line.input, "LINE");
+}
+
+/// A printable key while a property list is open names a row in that list and
+/// must not start a command at the command line. With no list open the same
+/// key still types.
+#[test]
+fn a_printable_key_belongs_to_the_open_list() {
+    for open in [
+        |app: &mut OpenCADStudio| {
+            let _ = open_dynamic_value_list(app);
+        },
+        |app: &mut OpenCADStudio| {
+            let _ = app.update(Message::PropChoiceToggle {
+                field: "bedit_units",
+                quick: false,
+            });
+            assert!(app.tabs[app.active_tab].properties.open_choice.is_some());
+        },
+    ] {
+        let mut app = fixture();
+        open(&mut app);
+        let before = app.command_line.input.clone();
+        let _ = app.update(Message::CommandAppendChar("M".into()));
+        assert_eq!(
+            app.command_line.input, before,
+            "a printable key belongs to the open list"
+        );
+        let _ = app.update(Message::CommandEscape);
+        let _ = app.update(Message::CommandAppendChar("M".into()));
+        assert_eq!(
+            app.command_line.input,
+            format!("{before}M"),
+            "with no list open the key still types"
+        );
+    }
 }
 
 /// A flag naming a row that is not on the panel is dropped by the rebuild
@@ -1116,10 +1147,12 @@ fn a_parameter_value_written_through_the_control_surface_moves_the_reference() {
         record
             .entity_handles
             .iter()
-            .filter_map(|handle| match app.tabs[i].scene.document.get_entity(*handle) {
-                Some(EntityType::Line(line)) => Some((line.start, line.end)),
-                _ => None,
-            })
+            .filter_map(
+                |handle| match app.tabs[i].scene.document.get_entity(*handle) {
+                    Some(EntityType::Line(line)) => Some((line.start, line.end)),
+                    _ => None,
+                },
+            )
             .collect()
     };
     assert_eq!(

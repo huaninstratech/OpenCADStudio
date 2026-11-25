@@ -1,19 +1,482 @@
 // XREF resolution — scan a loaded document for external-reference blocks and
 // populate them with geometry from the referenced DWG/DXF files.
 
-use codec::entities::{Block, BlockEnd};
-use codec::tables::TableEntry;
-use codec::types::{Handle, Vector3};
-use codec::{Document, EntityType};
+use document::entities::{Block, BlockEnd};
+use document::tables::TableEntry;
+use document::types::{Handle, Vector3};
+use document::{Document, EntityType};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+mod graph;
+#[cfg(test)]
+mod graph_tests;
+mod source_read;
 
-#[cfg(not(target_arch = "wasm32"))]
-type SourceFingerprint = crate::io::edit_lock::FileFingerprint;
-#[cfg(target_arch = "wasm32")]
-type SourceFingerprint = ();
+pub(crate) struct ReferenceMergeCheckpoint(Vec<(Handle, Option<HashMap<Handle, Handle>>)>);
+pub(crate) fn capture_reference_merges(handles: &HashSet<Handle>) -> ReferenceMergeCheckpoint {
+    ReferenceMergeCheckpoint(
+        merged_copies()
+            .lock()
+            .map(|m| handles.iter().map(|h| (*h, m.get(h).cloned())).collect())
+            .unwrap_or_default(),
+    )
+}
+pub(crate) fn restore_reference_merges(checkpoint: ReferenceMergeCheckpoint) {
+    if let Ok(mut copies) = merged_copies().lock() {
+        for (handle, previous) in checkpoint.0 {
+            if let Some(previous) = previous {
+                copies.insert(handle, previous);
+            } else {
+                copies.remove(&handle);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_attachment_tests {
+    use super::*;
+    fn native_source_drawing() -> document::ifccad::IfccadDocument {
+        let mut source = Document::new();
+        source.header.insertion_units = 6;
+        source
+            .add_entity(EntityType::Line(document::entities::Line::from_coords(
+                0., 0., 0., 2., 0., 0.,
+            )))
+            .unwrap();
+        document::Ifcx.export_ifccad(&source).unwrap().drawing
+    }
+
+    #[test]
+    fn native_ifccad_source_json_and_cbor_load_with_declared_metadata() {
+        for binary in [false, true] {
+            for registered in [true, false] {
+                let (_, root, _) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+                let source = native_source_drawing();
+                let mut main = document::ifccad::load_ifccad_bytes(
+                    include_bytes!("../../crates/ocs_save/tests/fixtures/xref.ifcx"),
+                    Default::default(),
+                )
+                .unwrap()
+                .into_document();
+                main.external_sources[0].source =
+                    document::ifccad_external_source_content(&source).unwrap();
+                let main_bytes = document::ifccad::encode_ifccad_document(&main).unwrap();
+                let (loaded, session) = ocs_save::read_ifccad_for_edit(main_bytes.bytes()).unwrap();
+                let mut host = loaded.document;
+                let session = session.unwrap();
+                let record = host.block_records.get("grondplan").unwrap().clone();
+                let bytes = if binary {
+                    document::ifccad::encode_ifccad_cbor_document(&source)
+                        .unwrap()
+                        .bytes()
+                        .to_vec()
+                } else {
+                    document::ifccad::encode_ifccad_document(&source)
+                        .unwrap()
+                        .bytes()
+                        .to_vec()
+                };
+                if registered {
+                    session
+                        .bind_external_source_bytes(
+                            record.handle,
+                            &record.xref_path,
+                            "source.dwg".into(),
+                            Arc::new(bytes),
+                        )
+                        .unwrap();
+                } else {
+                    std::fs::write(root.join("Referenties/grondplan.dwg"), bytes).unwrap();
+                }
+                let keys = [record.handle].into_iter().collect();
+                let infos = resolve_xrefs_for_keys_in_session(
+                    &mut host,
+                    &root.join("Tekeningen"),
+                    &keys,
+                    Some(&session),
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+                assert_eq!(
+                    infos[0].status,
+                    XrefStatus::Loaded,
+                    "{:?}",
+                    infos[0].diagnostics
+                );
+                assert!(!infos[0].other_drawing);
+                let line = host
+                    .entities()
+                    .find_map(|entity| match entity {
+                        EntityType::Line(line) if line.common.owner_handle == record.handle => {
+                            Some(line)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(line.start, Vector3::ZERO);
+                assert_eq!(line.end, Vector3::new(2., 0., 0.));
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_native_source_failure_keeps_previous_body() {
+        let (mut host, root, session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let record = host.block_records.get("grondplan").unwrap().clone();
+        let keys = [record.handle].into_iter().collect();
+        let loaded = resolve_xrefs_for_keys_in_session(
+            &mut host,
+            &root.join("Tekeningen"),
+            &keys,
+            Some(&session),
+        );
+        assert_eq!(loaded[0].status, XrefStatus::Loaded);
+        let before = host
+            .entities()
+            .filter(|entity| entity.common().owner_handle == record.handle)
+            .count();
+        session
+            .register_external_source(
+                &host,
+                record.handle,
+                document::ifccad_external_source_content(&native_source_drawing()).unwrap(),
+            )
+            .unwrap();
+        session
+            .bind_external_source_bytes(
+                record.handle,
+                &record.xref_path,
+                "nested.ifccad".into(),
+                Arc::new(b"malformed native source".to_vec()),
+            )
+            .unwrap();
+        let infos = resolve_xrefs_for_keys_in_session(&mut host, &root, &keys, Some(&session));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(infos[0].status, XrefStatus::Failed);
+        assert!(
+            infos[0]
+                .diagnostics
+                .iter()
+                .any(|message| !message.is_empty()),
+            "{:?}",
+            infos[0].diagnostics
+        );
+        assert_eq!(
+            host.entities()
+                .filter(|entity| entity.common().owner_handle == record.handle)
+                .count(),
+            before
+        );
+    }
+
+    #[test]
+    fn native_ifccad_source_direct_self_reference_has_a_clear_diagnostic() {
+        let (mut host, root, session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let record = host.block_records.get("grondplan").unwrap().clone();
+        let path = host.source_path.clone().unwrap();
+        std::fs::write(
+            &path,
+            include_bytes!("../../crates/ocs_save/tests/fixtures/xref.ifcx"),
+        )
+        .unwrap();
+        session
+            .register_external_source(
+                &host,
+                record.handle,
+                document::ifccad_external_source_content(&native_source_drawing()).unwrap(),
+            )
+            .unwrap();
+        host.block_records.get_mut("grondplan").unwrap().xref_path = path;
+        let keys = [record.handle].into_iter().collect();
+        let infos = resolve_xrefs_for_keys_in_session(&mut host, &root, &keys, Some(&session));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(infos[0].status, XrefStatus::Loaded);
+        assert!(
+            infos[0]
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("self-reference")),
+            "{:?}",
+            infos[0].diagnostics
+        );
+    }
+    #[test]
+    fn registered_dxf_source_uses_declared_format_with_misleading_filename() {
+        let (mut host, root, session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let record = host.block_records.get("grondplan").unwrap().clone();
+        let mut source = Document::new();
+        source.header.insertion_units = 6;
+        source.header.model_space_insertion_base = Vector3::new(10., 20., 0.);
+        source.header.fingerprint_guid = "{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}".into();
+        source
+            .add_entity(EntityType::Line(document::entities::Line::from_coords(
+                10., 20., 0., 12., 20., 0.,
+            )))
+            .unwrap();
+        session
+            .register_external_source(
+                &host,
+                record.handle,
+                document::dxf_external_source_content(&source),
+            )
+            .unwrap();
+        let bytes = document::DxfWriter::new(&source).write_to_vec().unwrap();
+        session
+            .bind_external_source_bytes(
+                record.handle,
+                &record.xref_path,
+                "misleading.dwg".into(),
+                Arc::new(bytes),
+            )
+            .unwrap();
+        let keys = [record.handle].into_iter().collect();
+        let infos = resolve_xrefs_for_keys_in_session(
+            &mut host,
+            &root.join("Tekeningen"),
+            &keys,
+            Some(&session),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            infos[0].status,
+            XrefStatus::Loaded,
+            "{:?}",
+            infos[0].diagnostics
+        );
+        let line = host
+            .entities()
+            .find_map(|entity| match entity {
+                EntityType::Line(line) if line.common.owner_handle == record.handle => Some(line),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(line.start, Vector3::ZERO);
+        assert_eq!(line.end, Vector3::new(2., 0., 0.));
+    }
+    fn fixture(guid: &str) -> (Document, PathBuf, ocs_save::IfccadSession) {
+        let root = std::env::temp_dir().join(format!(
+            "ocs-native-xref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("Tekeningen")).unwrap();
+        std::fs::create_dir_all(root.join("Referenties")).unwrap();
+        let mut source = Document::new();
+        source.header.insertion_units = 6;
+        source.header.model_space_insertion_base = Vector3::new(10., 20., 0.);
+        source.header.fingerprint_guid = guid.into();
+        source
+            .add_entity(EntityType::Line(document::entities::Line::from_coords(
+                10., 20., 0., 12., 20., 0.,
+            )))
+            .unwrap();
+        std::fs::write(
+            root.join("Referenties/grondplan.dwg"),
+            document::DwgWriter::write_to_vec(&source).unwrap(),
+        )
+        .unwrap();
+        let (loaded, session) = ocs_save::read_ifccad_for_edit(include_bytes!(
+            "../../crates/ocs_save/tests/fixtures/xref.ifcx"
+        ))
+        .unwrap();
+        let mut host = loaded.document;
+        host.source_path = Some(
+            root.join("Tekeningen/hoofd.ifcx")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        host.header.fingerprint_guid = format!("native-host-{}", root.display());
+        crate::io::normalize_block_origins(&mut host);
+        (host, root, session.unwrap())
+    }
+
+    #[test]
+    fn native_xref_source_base_is_subtracted_once_before_effective_scale() {
+        let (mut host, root, _session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let infos = resolve_xrefs(&mut host, &root.join("Tekeningen"));
+        assert_eq!(infos[0].status, XrefStatus::Loaded);
+        let owner = host.block_records.get("grondplan").unwrap().handle;
+        let line = host
+            .entities()
+            .find_map(|e| match e {
+                EntityType::Line(l) if l.common.owner_handle == owner => Some(l),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(line.start, Vector3::ZERO);
+        assert_eq!(line.end, Vector3::new(2., 0., 0.));
+        let insert = host
+            .model_space_entities()
+            .find_map(|e| match e {
+                EntityType::Insert(i) => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(insert.x_scale(), 500.);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_and_dwg_file_dependency_guid_seed_the_same_warning() {
+        let (mut host, root, _session) = fixture("{11111111-2222-3333-4444-555555555555}");
+        let infos = resolve_xrefs(&mut host, &root.join("Tekeningen"));
+        assert_eq!(infos[0].status, XrefStatus::Loaded);
+        assert!(infos[0].other_drawing);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_source_bytes_are_scoped_and_failed_reload_keeps_body() {
+        let (mut first, root, session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let (second, other_root, other_session) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let record = first.block_records.get("grondplan").unwrap().clone();
+        let bytes = Arc::new(std::fs::read(root.join("Referenties/grondplan.dwg")).unwrap());
+        session
+            .bind_external_source_bytes(
+                record.handle,
+                &record.xref_path,
+                "grondplan.dwg".into(),
+                bytes,
+            )
+            .unwrap();
+        let other_record = second.block_records.get("grondplan").unwrap();
+        assert!(other_session
+            .external_source_bytes(other_record.handle, &other_record.xref_path)
+            .is_none());
+        let keys = [record.handle].into_iter().collect();
+        let infos = resolve_xrefs_for_keys_in_session(&mut first, &root, &keys, Some(&session));
+        assert_eq!(infos[0].status, XrefStatus::Loaded);
+        let before = first
+            .entities()
+            .filter(|e| e.common().owner_handle == record.handle)
+            .count();
+        let mut changed = Document::new();
+        changed.header.insertion_units = 6;
+        changed.header.model_space_insertion_base = Vector3::new(11., 20., 0.);
+        changed
+            .add_entity(EntityType::Line(document::entities::Line::from_coords(
+                11., 20., 0., 14., 20., 0.,
+            )))
+            .unwrap();
+        let bytes = document::DwgWriter::write_to_vec(&changed).unwrap();
+        let mut infos = Vec::new();
+        merge_xref_reads_in_session(
+            &mut first,
+            vec![(
+                record.name.clone(),
+                record.xref_path.clone(),
+                record.handle,
+                read_source_bytes("grondplan.dwg", &bytes),
+            )],
+            &mut infos,
+            None,
+            Some(&session),
+        );
+        assert_eq!(infos[0].status, XrefStatus::Failed);
+        assert!(infos[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("base point")));
+        assert_eq!(
+            first
+                .entities()
+                .filter(|e| e.common().owner_handle == record.handle)
+                .count(),
+            before
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn native_xref_search_order_is_direct_host_structured_then_configured() {
+        let (_, root, _) = fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let host = root.join("Tekeningen");
+        std::fs::create_dir_all(host.join("xref")).unwrap();
+        let configured = root.join("search");
+        std::fs::create_dir_all(&configured).unwrap();
+        let name = "ground.dwg";
+        for path in [
+            configured.join(name),
+            host.join("xref").join(name),
+            host.join(name),
+        ] {
+            std::fs::write(&path, b"chosen").unwrap();
+        }
+        let dirs = [configured.clone()];
+        assert_eq!(
+            resolve_path_in("../missing/ground.dwg", &host, &dirs),
+            Some(host.join(name))
+        );
+        std::fs::remove_file(host.join(name)).unwrap();
+        assert_eq!(
+            resolve_path_in("../missing/ground.dwg", &host, &dirs),
+            Some(host.join("xref").join(name))
+        );
+        std::fs::remove_file(host.join("xref").join(name)).unwrap();
+        assert_eq!(
+            resolve_path_in("../missing/ground.dwg", &host, &dirs),
+            Some(configured.join(name))
+        );
+        assert_eq!(
+            resolve_path_in("../Referenties/grondplan.dwg", &host, &dirs),
+            Some(host.join("../Referenties/grondplan.dwg"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_guid_warning_is_scoped_to_same_named_open_documents() {
+        let (mut first, first_root, first_session) =
+            fixture("{E5B4A9AF-CF20-4FC9-A30F-FFB20FD987E1}");
+        let (mut second, second_root, second_session) =
+            fixture("{11111111-2222-3333-4444-555555555555}");
+        for (doc, root, session) in [
+            (&mut first, &first_root, &first_session),
+            (&mut second, &second_root, &second_session),
+        ] {
+            doc.header.fingerprint_guid.clear();
+            doc.source_path = Some("same.ifcx".into());
+            let record = doc.block_records.get("grondplan").unwrap();
+            session
+                .bind_external_source_bytes(
+                    record.handle,
+                    &record.xref_path,
+                    "grondplan.dwg".into(),
+                    Arc::new(std::fs::read(root.join("Referenties/grondplan.dwg")).unwrap()),
+                )
+                .unwrap();
+        }
+        let keys = [first.block_records.get("grondplan").unwrap().handle]
+            .into_iter()
+            .collect();
+        let first_info =
+            resolve_xrefs_for_keys_in_session(&mut first, &first_root, &keys, Some(&first_session));
+        assert_eq!(first_info[0].status, XrefStatus::Loaded, "{first_info:?}");
+        assert!(!first_info[0].other_drawing);
+        let second_info = resolve_xrefs_for_keys_in_session(
+            &mut second,
+            &second_root,
+            &keys,
+            Some(&second_session),
+        );
+        assert_eq!(second_info[0].status, XrefStatus::Loaded, "{second_info:?}");
+        assert!(second_info[0].other_drawing);
+        let first_reload =
+            resolve_xrefs_for_keys_in_session(&mut first, &first_root, &keys, Some(&first_session));
+        assert!(
+            !first_reload[0].other_drawing,
+            "the second tab must not change the first tab's GUID baseline"
+        );
+        std::fs::remove_dir_all(first_root).unwrap();
+        std::fs::remove_dir_all(second_root).unwrap();
+    }
+}
 
 /// Status of an external reference block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,9 +489,8 @@ pub enum XrefStatus {
     Failed,
     /// File path is set but the file could not be found or read.
     NotFound,
-    /// XRef is marked Unloaded in the host DWG — we honor that and
-    /// skip resolving the external file. The user can re-load via UI.
-    #[allow(dead_code)]
+    /// XRef is marked Unloaded in the host DWG — opening honors that and
+    /// skips resolving the external file. The user can re-load via UI.
     Unloaded,
 }
 
@@ -42,8 +504,12 @@ pub struct XrefInfo {
     pub status: XrefStatus,
     /// Reader diagnostics retained for the recovery report.
     pub diagnostics: Vec<String>,
-    pub read_stats: Option<codec::ReadStats>,
+    pub read_stats: Option<document::ReadStats>,
     pub source_sha256: Option<String>,
+    /// The reference loaded a drawing whose FingerprintGUID differs from
+    /// the one it held before in this session: another drawing took the
+    /// file's place, not a revision of it.
+    pub other_drawing: bool,
 }
 
 /// Names of the xrefs that resolved to nothing (`NotFound`) — the list the
@@ -113,8 +579,258 @@ fn source_cache() -> &'static Mutex<(HashMap<String, Arc<Vec<u8>>>, VecDeque<Str
     SOURCES.get_or_init(|| Mutex::new((HashMap::default(), VecDeque::new())))
 }
 
-fn parsed_cache() -> &'static Mutex<HashMap<String, codec::ReadOutcome>> {
-    static PARSED: OnceLock<Mutex<HashMap<String, codec::ReadOutcome>>> = OnceLock::new();
+/// Source handle → host copy of every entity merged from a DWG xref, per
+/// xref block. The copies get fresh handles on every merge, so a reload
+/// re-links the dimension references that point at the old copies through
+/// the source handle, which the source file keeps. A save writes those
+/// references by that handle ([`store_references_by_source`]).
+// ponytail: process-global and session-only. Hosts whose xref blocks share a
+// handle share a slot (a map that does not match the block is ignored, see
+// `matches_block`) and closed tabs keep theirs. A reopened host starts empty
+// and fills it as its xrefs are merged.
+fn merged_copies() -> &'static Mutex<HashMap<Handle, HashMap<Handle, Handle>>> {
+    static MERGED: OnceLock<Mutex<HashMap<Handle, HashMap<Handle, Handle>>>> = OnceLock::new();
+    MERGED.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// FingerprintGUID of the drawing each xref block last loaded, keyed by the
+/// host's own GUID and the block, so a reload can tell a revision (same
+/// GUID) from another drawing that took the file's place.
+// Observations are session-only; the first load also uses the stored
+// AcDb:FileDepList expectation (native import populates that same list).
+fn loaded_identities() -> &'static Mutex<HashMap<(String, Handle), String>> {
+    static IDS: OnceLock<Mutex<HashMap<(String, Handle), String>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Record `loaded` as the drawing behind `br_handle`; true when the block
+/// held a different known drawing before.
+#[cfg(test)]
+fn replaced_by_other_drawing(host_guid: &str, br_handle: Handle, loaded: &str) -> bool {
+    if host_guid.is_empty() || loaded.is_empty() {
+        return false;
+    }
+    let Ok(mut ids) = loaded_identities().lock() else {
+        return false;
+    };
+    ids.insert((host_guid.to_string(), br_handle), loaded.to_string())
+        .is_some_and(|previous| !previous.eq_ignore_ascii_case(loaded))
+}
+
+/// Point every dimension reference at an old xref copy to the copy of the
+/// same source entity the reload just merged.
+fn relink_reloaded_references(
+    doc: &mut Document,
+    br_handle: Handle,
+    previous: HashMap<Handle, Handle>,
+) {
+    let current = match merged_copies().lock() {
+        Ok(map) => map.get(&br_handle).cloned().unwrap_or_default(),
+        Err(_) => return,
+    };
+    let moved: HashMap<Handle, Handle> = previous
+        .iter()
+        .filter_map(|(source, old)| Some((*old, *current.get(source)?)))
+        .filter(|(old, new)| old != new)
+        .collect();
+    if moved.is_empty() {
+        return;
+    }
+    use document::objects::{AssociativeData, ObjectType};
+    let mut reactors: Vec<(Handle, Handle)> = Vec::new();
+    for (handle, object) in doc.objects.iter_mut() {
+        let ObjectType::Associative(object) = object else {
+            continue;
+        };
+        let AssociativeData::DimensionAssociation(association) = &mut object.data else {
+            continue;
+        };
+        for reference in association.references.iter_mut().flatten() {
+            for slot in reference
+                .xrefs
+                .iter_mut()
+                .chain(reference.intersection_objects.iter_mut())
+            {
+                if let Some(&new) = moved.get(slot) {
+                    *slot = new;
+                    reactors.push((new, *handle));
+                }
+            }
+        }
+    }
+    for (entity, association) in reactors {
+        if let Some(entity) = doc.get_entity_mut(entity) {
+            if !entity.common().reactors.contains(&association) {
+                entity.common_mut().reactors.push(association);
+            }
+        }
+    }
+}
+
+/// Whether `copies` is the map of the copies `doc` holds in `br_handle` now:
+/// every copy is still there, and it names exactly the block's own entities.
+fn matches_block(doc: &Document, br_handle: Handle, copies: &HashMap<Handle, Handle>) -> bool {
+    let owned: HashSet<Handle> = doc
+        .entities()
+        .filter(|e| e.common().owner_handle == br_handle)
+        .map(|e| e.common().handle)
+        .collect();
+    let mut direct = 0usize;
+    for copy in copies.values() {
+        let Some(entity) = doc.get_entity(*copy) else {
+            return false;
+        };
+        if entity.common().owner_handle == br_handle {
+            direct += 1;
+        }
+    }
+    direct == owned.len()
+}
+
+/// The INSERTs that place the xref block `br_handle`.
+fn xref_inserts(doc: &Document, br_handle: Handle) -> HashSet<Handle> {
+    doc.entities()
+        .filter_map(|entity| match entity {
+            EntityType::Insert(insert)
+                if doc
+                    .block_records
+                    .get(&insert.block_name)
+                    .is_some_and(|br| br.handle == br_handle) =>
+            {
+                Some(insert.common.handle)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Write the dimension references that end on a copy of an object of the
+/// xref `br_handle` the way a file keeps them: the chain as far as the INSERT
+/// that places the xref, and the handles the rest of it has in the xref's
+/// own drawing (`xref_paths`). A file does not hold the copies, and their
+/// handles last one session; [`link_stored_references`] is the way back.
+fn store_references_by_source(doc: &mut Document, br_handle: Handle) {
+    let sources: HashMap<Handle, Handle> = match merged_copies().lock() {
+        Ok(map) => match map.get(&br_handle) {
+            Some(copies) if matches_block(doc, br_handle, copies) => copies
+                .iter()
+                .map(|(source, copy)| (*copy, *source))
+                .collect(),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    let inserts = xref_inserts(doc, br_handle);
+    if inserts.is_empty() {
+        return;
+    }
+    let store = |chain: &mut Vec<Handle>, paths: &mut Vec<String>| {
+        let Some(at) = chain.iter().position(|handle| inserts.contains(handle)) else {
+            return;
+        };
+        if at + 1 == chain.len() || !paths.is_empty() {
+            return;
+        }
+        let stored: Option<Vec<String>> = chain[at + 1..]
+            .iter()
+            .map(|copy| {
+                sources
+                    .get(copy)
+                    .map(|source| format!("{:X}", source.value()))
+            })
+            .collect();
+        if let Some(stored) = stored {
+            *paths = stored;
+            chain.truncate(at + 1);
+        }
+    };
+    use document::objects::{AssociativeData, ObjectType};
+    for object in doc.objects.values_mut() {
+        let ObjectType::Associative(object) = object else {
+            continue;
+        };
+        let AssociativeData::DimensionAssociation(association) = &mut object.data else {
+            continue;
+        };
+        for reference in association.references.iter_mut().flatten() {
+            store(&mut reference.xrefs, &mut reference.xref_paths);
+            store(
+                &mut reference.intersection_objects,
+                &mut reference.intersection_xref_paths,
+            );
+        }
+    }
+}
+
+/// Point the dimension references a file kept by source handle (see
+/// [`store_references_by_source`]) at the copies the merge of the xref
+/// `br_handle` just made, and make the dimension's association a reactor of
+/// them. A reference whose object the xref no longer has stays as it was read.
+fn link_stored_references(doc: &mut Document, br_handle: Handle, copies: &HashMap<Handle, Handle>) {
+    use document::objects::{AssociativeData, ObjectType};
+    let stored = doc.objects.values().any(|object| match object {
+        ObjectType::Associative(object) => match &object.data {
+            AssociativeData::DimensionAssociation(association) => {
+                association.references.iter().flatten().any(|reference| {
+                    !reference.xref_paths.is_empty()
+                        || !reference.intersection_xref_paths.is_empty()
+                })
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    if !stored {
+        return;
+    }
+    let inserts = xref_inserts(doc, br_handle);
+    let link = |chain: &mut Vec<Handle>, paths: &mut Vec<String>| -> Vec<Handle> {
+        if paths.is_empty() || !chain.last().is_some_and(|last| inserts.contains(last)) {
+            return Vec::new();
+        }
+        let found: Option<Vec<Handle>> = paths
+            .iter()
+            .map(|path| {
+                let source = u64::from_str_radix(path.trim(), 16).ok()?;
+                copies.get(&Handle::new(source)).copied()
+            })
+            .collect();
+        let Some(found) = found else {
+            return Vec::new();
+        };
+        chain.extend(found.iter().copied());
+        paths.clear();
+        found
+    };
+    let mut reactors: Vec<(Handle, Handle)> = Vec::new();
+    for (handle, object) in doc.objects.iter_mut() {
+        let ObjectType::Associative(object) = object else {
+            continue;
+        };
+        let AssociativeData::DimensionAssociation(association) = &mut object.data else {
+            continue;
+        };
+        for reference in association.references.iter_mut().flatten() {
+            let linked = link(&mut reference.xrefs, &mut reference.xref_paths)
+                .into_iter()
+                .chain(link(
+                    &mut reference.intersection_objects,
+                    &mut reference.intersection_xref_paths,
+                ));
+            reactors.extend(linked.map(|copy| (copy, *handle)));
+        }
+    }
+    for (entity, association) in reactors {
+        if let Some(entity) = doc.get_entity_mut(entity) {
+            if !entity.common().reactors.contains(&association) {
+                entity.common_mut().reactors.push(association);
+            }
+        }
+    }
+}
+
+fn parsed_cache() -> &'static Mutex<HashMap<String, document::ReadOutcome>> {
+    static PARSED: OnceLock<Mutex<HashMap<String, document::ReadOutcome>>> = OnceLock::new();
     PARSED.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
@@ -154,7 +870,7 @@ pub fn register_source(name: &str, bytes: Arc<Vec<u8>>) {
 /// merge. The entry is one-shot: a resolve consumes it, so a later reload
 /// re-reads the registered bytes instead of replaying a stale document.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) fn register_parsed(name: &str, outcome: codec::ReadOutcome) {
+pub(crate) fn register_parsed(name: &str, outcome: document::ReadOutcome) {
     parsed_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -187,7 +903,7 @@ pub(crate) fn registered_bytes(key: &str) -> Option<Arc<Vec<u8>>> {
 
 /// Take the cached parse for `key`, if one is pending.
 #[cfg(any(target_arch = "wasm32", test))]
-fn take_parsed(key: &str) -> Option<codec::ReadOutcome> {
+fn take_parsed(key: &str) -> Option<document::ReadOutcome> {
     parsed_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -203,7 +919,7 @@ fn take_parsed(key: &str) -> Option<codec::ReadOutcome> {
 fn read_registered_outcome(
     key: &str,
     progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
-) -> Result<codec::ReadOutcome, String> {
+) -> Result<document::ReadOutcome, String> {
     if let Some(mut outcome) = take_parsed(key) {
         finalize_xref_outcome(&mut outcome);
         return Ok(outcome);
@@ -216,13 +932,23 @@ fn read_registered_outcome(
     Ok(outcome)
 }
 
+/// Parse a registered drawing for transmittal dependency discovery without
+/// consuming the one-shot parse cache used by XREF resolution.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn registered_document(key: &str) -> Result<Document, String> {
+    let bytes =
+        registered_bytes(key).ok_or_else(|| format!("no registered bytes for xref \"{key}\""))?;
+    let mut outcome = read_outcome_from_bytes(key, bytes, None)?;
+    finalize_xref_outcome(&mut outcome);
+    Ok(outcome.document)
+}
+
 /// Apply the same post-parse fixups the file-open tail applies, so merged
 /// xref content behaves like natively loaded content.
-#[cfg(target_arch = "wasm32")]
-fn finalize_xref_outcome(outcome: &mut codec::ReadOutcome) {
+fn finalize_xref_outcome(outcome: &mut document::ReadOutcome) {
     let doc = &mut outcome.document;
     super::normalize_block_origins(doc);
-    if outcome.stats.source_format == Some(codec::SourceFormat::Dxf) {
+    if outcome.stats.source_format == Some(document::SourceFormat::Dxf) {
         super::fix_dxf_layout_plot_settings(doc);
     }
     super::fix_viewport_status_flags(doc);
@@ -238,9 +964,9 @@ fn read_outcome_from_bytes(
     name: &str,
     bytes: Arc<Vec<u8>>,
     progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
-) -> Result<codec::ReadOutcome, String> {
-    use codec::DwgReader;
-    use codec::DxfReader;
+) -> Result<document::ReadOutcome, String> {
+    use document::DwgReader;
+    use document::DxfReader;
     // The readers keep their stream and want an owned, 'static buffer —
     // take the registry `Arc`'s contents by value (one copy; the worker
     // pre-parse makes this fallback path the exception, not the rule).
@@ -278,7 +1004,7 @@ fn read_outcome_from_bytes(
 ///
 /// Returns a list of [`XrefInfo`] describing each xref block found.
 pub fn resolve_xrefs(doc: &mut Document, base_dir: &Path) -> Vec<XrefInfo> {
-    resolve_xrefs_with_filter(doc, base_dir, None, None)
+    resolve_xrefs_with_filter(doc, base_dir, None, None, false, None)
 }
 
 /// Reload only the direct xref block records identified by `keys`.
@@ -291,10 +1017,20 @@ pub fn resolve_xrefs_for_keys(
     base_dir: &Path,
     keys: &HashSet<Handle>,
 ) -> Vec<XrefInfo> {
-    resolve_xrefs_with_filter(doc, base_dir, None, Some(keys))
+    resolve_xrefs_with_filter(doc, base_dir, None, Some(keys), false, None)
 }
 
-/// Resolve XREFs while reporting completed work units.
+pub fn resolve_xrefs_for_keys_in_session(
+    doc: &mut Document,
+    base_dir: &Path,
+    keys: &HashSet<Handle>,
+    session: Option<&ocs_save::IfccadSession>,
+) -> Vec<XrefInfo> {
+    resolve_xrefs_with_filter(doc, base_dir, None, Some(keys), false, session)
+}
+
+/// Resolve XREFs while reporting completed work units. This is the open
+/// path: a reference the file stores as unloaded stays unloaded.
 ///
 /// Each reference contributes 1000 parse units and 1000 merge units. Parsing
 /// progress comes directly from the DWG reader when available, so one large
@@ -304,7 +1040,16 @@ pub fn resolve_xrefs_with_progress(
     base_dir: &Path,
     progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
 ) -> Vec<XrefInfo> {
-    resolve_xrefs_with_filter(doc, base_dir, progress, None)
+    resolve_xrefs_with_filter(doc, base_dir, progress, None, true, None)
+}
+
+pub fn resolve_xrefs_with_progress_in_session(
+    doc: &mut Document,
+    base_dir: &Path,
+    progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    session: Option<&ocs_save::IfccadSession>,
+) -> Vec<XrefInfo> {
+    resolve_xrefs_with_filter(doc, base_dir, progress, None, true, session)
 }
 
 fn resolve_xrefs_with_filter(
@@ -312,15 +1057,33 @@ fn resolve_xrefs_with_filter(
     base_dir: &Path,
     progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
     only: Option<&HashSet<Handle>>,
+    honor_unloaded: bool,
+    session: Option<&ocs_save::IfccadSession>,
 ) -> Vec<XrefInfo> {
+    let mut result = Vec::new();
     // Auto-resolve every xref — frustum + LOD culling keep GPU cost bounded.
-    let xref_entries: Vec<(String, String, Handle)> = doc
-        .block_records
-        .iter()
-        .filter(|br| (br.flags.is_xref || br.flags.is_xref_overlay) && !br.xref_path.is_empty())
-        .filter(|br| only.is_none_or(|keys| keys.contains(&br.handle)))
-        .map(|br| (br.name.clone(), br.xref_path.clone(), br.handle))
-        .collect();
+    let mut xref_entries: Vec<(String, String, Handle)> = Vec::new();
+    for br in doc.block_records.iter() {
+        if !(br.flags.is_xref || br.flags.is_xref_overlay)
+            || br.xref_path.is_empty()
+            || !only.is_none_or(|keys| keys.contains(&br.handle))
+        {
+            continue;
+        }
+        if honor_unloaded && br.flags.is_xref_unloaded {
+            result.push(XrefInfo {
+                name: br.name.clone(),
+                path: br.xref_path.clone(),
+                status: XrefStatus::Unloaded,
+                diagnostics: Vec::new(),
+                read_stats: None,
+                source_sha256: None,
+                other_drawing: false,
+            });
+            continue;
+        }
+        xref_entries.push((br.name.clone(), br.xref_path.clone(), br.handle));
+    }
     let xref_count = xref_entries.len();
     let total_units = xref_count.saturating_mul(2000);
     if let Some(progress) = &progress {
@@ -338,25 +1101,18 @@ fn resolve_xrefs_with_filter(
             .map(|_| std::sync::atomic::AtomicU16::new(0))
             .collect(),
     );
-    let parsed: Vec<(
-        String,
-        String,
-        Handle,
-        Option<PathBuf>,
-        Option<Result<codec::ReadOutcome, String>>,
-        Option<String>,
-        Option<SourceFingerprint>,
-    )> = xref_entries
+    let parsed: Vec<(String, String, Handle, XrefRead)> = xref_entries
         .into_par_iter()
         .enumerate()
         .map(|(xref_index, (block_name, raw_path, br_handle))| {
-            let resolved = resolve_path(&raw_path, base_dir);
-            #[cfg(not(target_arch = "wasm32"))]
-            let initial_fingerprint = resolved
-                .as_ref()
-                .and_then(|path| crate::io::edit_lock::FileFingerprint::capture(path).ok());
-            #[cfg(target_arch = "wasm32")]
-            let initial_fingerprint = None;
+            let guard = (
+                raw_path.clone(),
+                doc.block_records
+                    .iter()
+                    .find(|r| r.handle == br_handle)
+                    .is_some_and(|r| r.flags.is_xref_unloaded),
+                session.map_or(0, |s| s.source_generation()),
+            );
             let units = std::sync::Arc::clone(&parse_units);
             let nested_progress = progress.as_ref().map(|progress| {
                 let progress = std::sync::Arc::clone(progress);
@@ -372,38 +1128,61 @@ fn resolve_xrefs_with_filter(
                     });
                 callback
             });
-            #[cfg(not(target_arch = "wasm32"))]
-            let xref_outcome = resolved
-                .as_ref()
-                .map(|path| super::load_file_with_progress(path, nested_progress));
-            // Web: read the registry — the cached off-thread parse when the
-            // pick/open pre-pass made one, otherwise the registered bytes.
-            #[cfg(target_arch = "wasm32")]
-            let xref_outcome = resolved
-                .as_ref()
-                .map(|path| read_registered_outcome(&path.to_string_lossy(), nested_progress));
-            let source_sha256 = resolved.as_ref().and_then(|path| {
-                let needs_fingerprint = match &xref_outcome {
-                    Some(Ok(outcome)) => {
-                        outcome.stats.recovered()
-                            || outcome.stats.skipped_source_records > 0
-                            || !outcome.stats.stream_completed
-                    }
-                    Some(Err(_)) => true,
-                    None => false,
+            let format = session
+                .and_then(|s| s.external_source(br_handle))
+                .map(|source| source.source.format());
+            let mut read = if let Some(bytes) =
+                session.and_then(|s| s.external_source_bytes(br_handle, &raw_path))
+            {
+                let mut read = if bytes.resource_id == 1 {
+                    let mut read = read_source_bytes_for_format(
+                        &bytes.file_name,
+                        &bytes.bytes,
+                        format.unwrap_or(document::ifccad::IfccadExternalSourceFormat::Ifccad),
+                        None,
+                    );
+                    read.content = session
+                        .and_then(|s| s.external_source(br_handle))
+                        .map(|s| s.source);
+                    read.outcome = Some(Ok(document::ReadOutcome::new(
+                        Document::new(),
+                        document::ReadStats {
+                            record_stream_read: true,
+                            stream_completed: true,
+                            source_records: 1,
+                            decoded_source_records: 1,
+                            ..Default::default()
+                        },
+                    )));
+                    read
+                } else {
+                    read_source_bytes_for_format(
+                        &bytes.file_name,
+                        &bytes.bytes,
+                        format.unwrap_or_else(|| source_read::inferred_format(&bytes.bytes)),
+                        nested_progress,
+                    )
                 };
-                if !needs_fingerprint {
-                    return None;
+                read.resource_id = Some(bytes.resource_id);
+                read
+            } else if cfg!(target_arch = "wasm32")
+                && session.and_then(|s| s.external_source(br_handle)).is_some()
+            {
+                XrefRead {
+                    resolved: None,
+                    outcome: None,
+                    source_sha256: None,
+                    content: None,
+                    context: None,
+                    resource_id: None,
+                    nested_rows: Vec::new(),
+                    graph_diagnostics: Vec::new(),
+                    guard: None,
+                    circular_root: false,
                 }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    super::stable_sha256_file(path, initial_fingerprint.as_ref())
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    crate::io::recovery::sha256_file(path).ok()
-                }
-            });
+            } else {
+                read_xref_file_for_format(&raw_path, base_dir, nested_progress, format)
+            };
             parse_units[xref_index].store(1000, std::sync::atomic::Ordering::Relaxed);
             if let Some(progress) = &progress {
                 let completed = parse_units
@@ -412,42 +1191,307 @@ fn resolve_xrefs_with_filter(
                     .sum();
                 progress(completed, total_units);
             }
-            (
-                block_name,
-                raw_path,
-                br_handle,
-                resolved,
-                xref_outcome,
-                source_sha256,
-                initial_fingerprint,
-            )
+            read.guard = Some(guard);
+            (block_name, raw_path, br_handle, read)
         })
         .collect();
 
-    // Phase 2 — merge each parsed xref into the host document, in the original
-    // block order (par_iter preserves it), so handle allocation is deterministic.
-    let mut result = Vec::with_capacity(parsed.len());
-    #[allow(unused_mut, unused_variables)]
-    for (
-        merge_index,
-        (
-            block_name,
-            raw_path,
-            br_handle,
-            resolved,
-            xref_outcome,
-            mut source_sha256,
-            initial_fingerprint,
-        ),
-    ) in parsed.into_iter().enumerate()
+    merge_xref_reads_in_session(doc, parsed, &mut result, progress.as_ref(), session);
+    result
+}
+
+/// What the read of one referenced drawing found, before the merge: the
+/// file it resolved to, the reader's outcome (none when no file was found)
+/// and the source hash of a damaged read.
+#[derive(Clone, Debug)]
+pub struct XrefRead {
+    resolved: Option<PathBuf>,
+    outcome: Option<Result<document::ReadOutcome, String>>,
+    source_sha256: Option<String>,
+    content: Option<document::ifccad::IfccadExternalSourceContent>,
+    context: Option<document::IfccadRoundtripContext>,
+    resource_id: Option<u64>,
+    nested_rows: Vec<ocs_save::ExternalReferenceRow>,
+    graph_diagnostics: Vec<String>,
+    guard: Option<(String, bool, u64)>,
+    circular_root: bool,
+}
+
+impl XrefRead {
+    pub(crate) fn insertion_units(&self) -> Option<i16> {
+        Some(
+            self.outcome
+                .as_ref()?
+                .as_ref()
+                .ok()?
+                .document
+                .header
+                .insertion_units,
+        )
+    }
+
+    pub fn source_content(&self) -> Option<document::ifccad::IfccadExternalSourceContent> {
+        let outcome = self.outcome.as_ref()?.as_ref().ok()?;
+        if let Some(content) = &self.content {
+            return Some(content.clone());
+        }
+        match outcome.stats.source_format {
+            Some(document::SourceFormat::Dwg) => {
+                Some(document::dwg_external_source_content(&outcome.document))
+            }
+            Some(document::SourceFormat::Dxf) => {
+                Some(document::dxf_external_source_content(&outcome.document))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn read_source_bytes(name: &str, bytes: &[u8]) -> XrefRead {
+    read_source_bytes_for_format(name, bytes, source_read::inferred_format(bytes), None)
+}
+
+fn read_source_bytes_for_format(
+    name: &str,
+    bytes: &[u8],
+    format: document::ifccad::IfccadExternalSourceFormat,
+    progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
+) -> XrefRead {
+    let mut read = source_read::read(name, bytes, format, progress);
+    if let Some(Ok(outcome)) = read.outcome.as_mut() {
+        finalize_xref_outcome(outcome);
+    }
+    read
+}
+
+/// Read and parse the drawing that a reference stored as `raw_path` names,
+/// resolved against `base_dir`. It touches no host document, so it can run
+/// on any thread; [`merge_xref_reads`] merges the result.
+pub fn read_xref_file(
+    raw_path: &str,
+    base_dir: &Path,
+    progress: Option<std::sync::Arc<dyn Fn(u16) + Send + Sync>>,
+) -> XrefRead {
+    read_xref_file_for_format(raw_path, base_dir, progress, None)
+}
+
+fn read_xref_file_for_format(
+    raw_path: &str,
+    base_dir: &Path,
+    progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
+    format: Option<document::ifccad::IfccadExternalSourceFormat>,
+) -> XrefRead {
+    // Native unknown schemes are retained, but must never reach filename fallback.
+    if let Err(error) = document::external_source_location_from_cad_path(raw_path)
+        .and_then(|location| document::external_source_location_to_cad_path(&location))
     {
+        return XrefRead {
+            resolved: None,
+            outcome: Some(Err(format!(
+                "Unsupported source location {raw_path}: {error}"
+            ))),
+            source_sha256: None,
+            content: None,
+            context: None,
+            resource_id: None,
+            nested_rows: Vec::new(),
+            graph_diagnostics: Vec::new(),
+            guard: None,
+            circular_root: false,
+        };
+    }
+    let resolved = resolve_path(raw_path, base_dir);
+    #[cfg(not(target_arch = "wasm32"))]
+    let initial_fingerprint = resolved
+        .as_ref()
+        .and_then(|path| crate::io::edit_lock::FileFingerprint::capture(path).ok());
+    let mut content = None;
+    let mut context = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let outcome = resolved.as_ref().map(|path| {
+        use document::ifccad::IfccadExternalSourceFormat;
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let ordinary_cad_path = match format {
+            Some(IfccadExternalSourceFormat::Dwg) => matches!(ext.as_str(), "dwg" | "dwt" | "dws"),
+            Some(IfccadExternalSourceFormat::Dxf) => ext == "dxf",
+            Some(IfccadExternalSourceFormat::Ifccad) => false,
+            None => matches!(ext.as_str(), "dwg" | "dwt" | "dws" | "dxf"),
+        };
+        if ordinary_cad_path {
+            return super::load_file_with_progress(path, progress);
+        }
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let read = source_read::read(
+            &path.to_string_lossy(),
+            &bytes,
+            format.unwrap_or_else(|| source_read::inferred_format(&bytes)),
+            progress,
+        );
+        content = read.content;
+        context = read.context;
+        read.outcome
+            .unwrap_or_else(|| Err("Source read returned no outcome".into()))
+            .and_then(|outcome| super::finalize_loaded_outcome(path, outcome))
+    });
+    // Web: read the registry — the cached off-thread parse when the
+    // pick/open pre-pass made one, otherwise the registered bytes.
+    #[cfg(target_arch = "wasm32")]
+    let outcome = resolved.as_ref().map(|path| {
+        let bytes = registered_bytes(&path.to_string_lossy());
+        if format.is_none()
+            && bytes.as_ref().is_some_and(|bytes| {
+                source_read::inferred_format(bytes)
+                    != document::ifccad::IfccadExternalSourceFormat::Ifccad
+            })
+        {
+            return read_registered_outcome(&path.to_string_lossy(), progress);
+        }
+        let format = format.or_else(|| {
+            bytes
+                .as_ref()
+                .map(|bytes| source_read::inferred_format(bytes))
+        });
+        match (format, bytes) {
+            (Some(format), Some(bytes)) => {
+                let read =
+                    read_source_bytes_for_format(&path.to_string_lossy(), &bytes, format, progress);
+                content = read.content;
+                context = read.context;
+                read.outcome
+                    .unwrap_or_else(|| Err("Source read returned no outcome".into()))
+            }
+            _ => read_registered_outcome(&path.to_string_lossy(), progress),
+        }
+    });
+    let source_sha256 = resolved.as_ref().and_then(|path| {
+        let needs_fingerprint = match &outcome {
+            Some(Ok(outcome)) => {
+                outcome.stats.recovered()
+                    || outcome.stats.skipped_source_records > 0
+                    || !outcome.stats.stream_completed
+            }
+            Some(Err(_)) => true,
+            None => false,
+        };
+        if !needs_fingerprint {
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::stable_sha256_file(path, initial_fingerprint.as_ref())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::io::recovery::sha256_file(path).ok()
+        }
+    });
+    XrefRead {
+        resolved,
+        outcome,
+        source_sha256,
+        content,
+        context,
+        resource_id: None,
+        nested_rows: Vec::new(),
+        graph_diagnostics: Vec::new(),
+        guard: None,
+        circular_root: false,
+    }
+}
+
+/// Merge each read into its reference's block (`block_name`, the stored
+/// `raw_path`, the block record `br_handle`), in the order given, so handle
+/// allocation is deterministic. It reads no file.
+pub fn merge_xref_reads(
+    doc: &mut Document,
+    parsed: Vec<(String, String, Handle, XrefRead)>,
+    result: &mut Vec<XrefInfo>,
+    progress: Option<&std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
+) {
+    merge_xref_reads_in_session(doc, parsed, result, progress, None)
+}
+
+pub fn merge_xref_reads_in_session(
+    doc: &mut Document,
+    parsed: Vec<(String, String, Handle, XrefRead)>,
+    result: &mut Vec<XrefInfo>,
+    progress: Option<&Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    session: Option<&ocs_save::IfccadSession>,
+) {
+    let xref_count = parsed.len();
+    let total_units = xref_count.saturating_mul(2000);
+    result.reserve(parsed.len());
+    for (merge_index, (block_name, raw_path, br_handle, mut read)) in parsed.into_iter().enumerate()
+    {
+        if read
+            .guard
+            .as_ref()
+            .is_some_and(|(path, unloaded, generation)| {
+                session.map_or(0, |s| s.source_generation()) != *generation
+                    || !doc.block_records.iter().any(|r| {
+                        r.handle == br_handle
+                            && r.xref_path == *path
+                            && r.flags.is_xref_unloaded == *unloaded
+                    })
+            })
+        {
+            result.push(XrefInfo {
+                name: block_name,
+                path: raw_path,
+                status: XrefStatus::Failed,
+                diagnostics: vec![
+                    "Reference changed while loading; obsolete source result ignored".into(),
+                ],
+                read_stats: None,
+                source_sha256: None,
+                other_drawing: false,
+            });
+            continue;
+        }
+        if let Err(error) = graph::prepare_read(doc, br_handle, &raw_path, &mut read, session) {
+            read.outcome = Some(Err(error));
+        }
+        let source_content = read.source_content();
+        let XrefRead {
+            resolved,
+            outcome: xref_outcome,
+            source_sha256,
+            nested_rows,
+            graph_diagnostics,
+            circular_root,
+            ..
+        } = read;
+        let xref_outcome = {
+            xref_outcome.map(|outcome| {
+                outcome.and_then(|outcome| {
+                    if let Some(record) = doc.block_records.iter().find(|r| r.handle == br_handle) {
+                        document::dwg_xref_fingerprint_guid(doc, record)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(session) = session {
+                        if !circular_root && session.external_source(br_handle).is_some() {
+                            let content = source_content
+                                .as_ref()
+                                .ok_or("Source format metadata is unavailable")?;
+                            session.check_external_source_reload(br_handle, content)?;
+                        }
+                    }
+                    Ok(outcome)
+                })
+            })
+        };
+        let mut other_drawing = false;
         let (status, diagnostics, read_stats) = match xref_outcome {
-            Some(Ok(mut outcome)) => {
+            Some(Ok(outcome)) => {
                 let recovered = outcome.stats.recovered()
                     || outcome.stats.skipped_source_records > 0
                     || !outcome.stats.stream_completed
                     || outcome.document.notifications.iter().any(|item| {
-                        item.notification_type == codec::notification::NotificationType::Error
+                        item.notification_type == document::notification::NotificationType::Error
                     });
                 let mut diagnostics: Vec<String> = outcome
                     .document
@@ -462,6 +1506,7 @@ fn resolve_xrefs_with_filter(
                         .iter()
                         .map(|diagnostic| diagnostic.message.clone()),
                 );
+                diagnostics.extend(graph_diagnostics);
                 if recovered {
                     (XrefStatus::Failed, diagnostics, Some(outcome.stats))
                 } else {
@@ -475,22 +1520,71 @@ fn resolve_xrefs_with_filter(
                     // re-apply onto the freshly merged layers below. Without this
                     // every reload silently reset frozen/off/color tweaks the
                     // user made on `name|*` layers back to file defaults.
+                    let expected = doc
+                        .block_records
+                        .iter()
+                        .find(|r| r.handle == br_handle)
+                        .and_then(|r| document::dwg_xref_fingerprint_guid(doc, r).ok().flatten());
+                    let loaded_guid = match source_content.as_ref() {
+                        Some(content) => content.fingerprint_guid().unwrap_or(""),
+                        None => &outcome.document.header.fingerprint_guid,
+                    };
+                    let observed = session.and_then(|session| {
+                        session.observe_external_source_guid(br_handle, loaded_guid)
+                    });
+                    if let Some(changed) = observed {
+                        other_drawing = changed;
+                    } else if let Some(loaded) =
+                        document::ifccad::normalize_ifccad_fingerprint_guid(loaded_guid)
+                    {
+                        let has_host_identity =
+                            !doc.header.fingerprint_guid.is_empty() || doc.source_path.is_some();
+                        let previous = if has_host_identity {
+                            let host_key = format!(
+                                "{}|{}",
+                                doc.header.fingerprint_guid,
+                                doc.source_path.as_deref().unwrap_or_default()
+                            );
+                            loaded_identities()
+                                .lock()
+                                .ok()
+                                .and_then(|mut ids| {
+                                    ids.insert((host_key, br_handle), loaded.clone())
+                                })
+                                .or(expected)
+                        } else {
+                            expected
+                        };
+                        other_drawing = previous
+                            .is_some_and(|previous| !previous.eq_ignore_ascii_case(&loaded));
+                    }
                     let visretain = doc.header.retain_xref_visibility;
                     let kept_layers = if visretain {
                         snapshot_dependent_layers(doc, &block_name)
                     } else {
                         HashMap::default()
                     };
+                    let previous = merged_copies()
+                        .lock()
+                        .ok()
+                        .and_then(|mut map| map.remove(&br_handle))
+                        .filter(|copies| matches_block(doc, br_handle, copies));
                     let _ = unload_reference(doc, br_handle.value());
                     remove_pipe_symbols(doc, &block_name);
                     ensure_block_entities(doc, &block_name);
                     merge_xref_into_block(doc, &block_name, br_handle, outcome.document);
+                    if let Some(previous) = previous {
+                        relink_reloaded_references(doc, br_handle, previous);
+                    }
                     // The merged body landed above the pre-merge ENDBLK; any
                     // definition whose terminator now trails its body is
                     // re-terminated.
                     crate::scene::normalize_block_terminators(doc);
                     if visretain {
                         restore_dependent_layers(doc, &block_name, kept_layers);
+                    }
+                    if let Some(session) = session {
+                        session.set_nested_source_rows(br_handle, nested_rows);
                     }
                     (XrefStatus::Loaded, diagnostics, Some(outcome.stats))
                 }
@@ -508,6 +1602,7 @@ fn resolve_xrefs_with_filter(
             diagnostics,
             read_stats,
             source_sha256,
+            other_drawing,
         });
         if let Some(progress) = &progress {
             progress(
@@ -518,8 +1613,6 @@ fn resolve_xrefs_with_filter(
             );
         }
     }
-
-    result
 }
 
 /// Underlay files named by a relative (or moved) path: read them from where
@@ -528,7 +1621,7 @@ fn resolve_xrefs_with_filter(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_underlay_sources(doc: &Document, base_dir: &Path) {
     for object in doc.objects.values() {
-        let codec::objects::ObjectType::UnderlayDefinition(def) = object else {
+        let document::objects::ObjectType::UnderlayDefinition(def) = object else {
             continue;
         };
         let stored = def.file_path.as_str();
@@ -541,11 +1634,11 @@ pub fn register_underlay_sources(doc: &Document, base_dir: &Path) {
     }
     // Point cloud scans are large and read lazily: register where they are.
     for object in doc.objects.values() {
-        let codec::objects::ObjectType::ClassObject(object) = object else {
+        let document::objects::ObjectType::ClassObject(object) = object else {
             continue;
         };
-        let (codec::objects::ClassObjectData::PointCloudDefinitionEx(def)
-        | codec::objects::ClassObjectData::PointCloudDefinition(def)) = &object.data
+        let (document::objects::ClassObjectData::PointCloudDefinitionEx(def)
+        | document::objects::ClassObjectData::PointCloudDefinition(def)) = &object.data
         else {
             continue;
         };
@@ -563,9 +1656,9 @@ pub fn register_underlay_sources(doc: &Document, base_dir: &Path) {
 /// "Layer property overrides" row.
 #[derive(Clone, PartialEq)]
 struct LayerLook {
-    color: codec::types::Color,
+    color: document::types::Color,
     line_type: String,
-    line_weight: codec::types::LineWeight,
+    line_weight: document::types::LineWeight,
     off: bool,
     frozen: bool,
     locked: bool,
@@ -573,9 +1666,9 @@ struct LayerLook {
 }
 
 impl LayerLook {
-    fn of(layer: &codec::tables::Layer) -> Self {
+    fn of(layer: &document::tables::Layer) -> Self {
         Self {
-            color: layer.color.clone(),
+            color: layer.color,
             line_type: layer.line_type.to_uppercase(),
             line_weight: layer.line_weight,
             off: layer.flags.off,
@@ -648,38 +1741,29 @@ pub(crate) fn resolve_path(raw: &str, _base_dir: &Path) -> Option<PathBuf> {
 /// Handles absolute paths, relative paths, and Windows-style separators.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve_path(raw: &str, base_dir: &Path) -> Option<PathBuf> {
-    let normalised = raw.replace('\\', "/");
-    let p = PathBuf::from(&normalised);
+    let dirs = std::env::var_os("OCS_XREF_PATH")
+        .map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
+        .unwrap_or_default();
+    resolve_path_in(raw, base_dir, &dirs)
+}
 
-    if p.is_absolute() {
-        if p.exists() {
-            return Some(p);
-        }
-        // Fallback: try the filename in base_dir.
-        if let Some(fname) = p.file_name() {
-            let c = base_dir.join(fname);
-            if c.exists() {
-                return Some(c);
-            }
-        }
-        return None;
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_path_in(raw: &str, base_dir: &Path, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let p = PathBuf::from(raw.replace('\\', "/"));
+    let direct = if p.is_absolute() {
+        p.clone()
+    } else {
+        base_dir.join(&p)
+    };
+    if direct.is_file() {
+        return Some(direct);
     }
-
-    // Relative path against base_dir.
-    let candidate = base_dir.join(&p);
-    if candidate.exists() {
-        return Some(candidate);
-    }
-
-    // Last resort: just the filename.
-    if let Some(fname) = p.file_name() {
-        let c = base_dir.join(fname);
-        if c.exists() {
-            return Some(c);
-        }
-    }
-
-    None
+    let name = p.file_name()?;
+    std::iter::once(base_dir.to_path_buf())
+        .chain(std::iter::once(base_dir.join("xref")))
+        .chain(search_dirs.iter().cloned())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Give a block record its BLOCK / ENDBLK markers, linked through the
@@ -980,6 +2064,7 @@ fn import_xref_symbols(
         let new = naming.name_for(SymbolKind::Block, &old);
         let mut cloned = br.clone();
         cloned.name = new.clone();
+        cloned.flags.is_external = matches!(naming, SymbolNaming::MergePipe { .. });
         cloned.entity_handles.clear();
         cloned.insert_handles.clear();
         cloned.layout = Handle::NULL;
@@ -996,7 +2081,7 @@ fn import_xref_symbols(
     // so without an import every bound image loses its file link. Fresh
     // handle, detached owner; the path stays verbatim here.
     {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         for (handle, obj) in xref_doc.objects.iter() {
             match obj {
                 ObjectType::ImageDefinition(def) => {
@@ -1067,7 +2152,7 @@ fn remap_xref_entity(host: &Document, entity: &mut EntityType, maps: &XrefSymbol
     }
 
     // ── Text-style names (incl. embedded MText in attributes) ──
-    let remap_mtext_style = |mtext: &mut codec::entities::MText, maps: &XrefSymbolMaps| {
+    let remap_mtext_style = |mtext: &mut document::entities::MText, maps: &XrefSymbolMaps| {
         rename(&maps.text_styles, &mut mtext.style);
     };
     match entity {
@@ -1134,7 +2219,7 @@ fn remap_xref_entity(host: &Document, entity: &mut EntityType, maps: &XrefSymbol
                     img.definition_handle = Some(new);
                     // Keep the entity path in sync with its definition (bind
                     // COLLECT retargets the definition before merging).
-                    use codec::objects::ObjectType;
+                    use document::objects::ObjectType;
                     if let Some(ObjectType::ImageDefinition(def)) = host.objects.get(&new) {
                         img.file_path = def.file_name.clone();
                     }
@@ -1161,7 +2246,7 @@ fn copy_xref_sortents(
     br_handle_map: &HashMap<Handle, Handle>,
     entity_handle_map: &HashMap<Handle, Handle>,
 ) {
-    use codec::objects::{ObjectType, SortEntitiesTable};
+    use document::objects::{ObjectType, SortEntitiesTable};
     let xref_ms_handle = xref_doc.header.model_space_block_handle;
     for obj in xref_doc.objects.values() {
         let ObjectType::SortEntitiesTable(t) = obj else {
@@ -1213,6 +2298,25 @@ fn merge_xref_into_block(
     br_handle: Handle,
     xref_doc: Document,
 ) {
+    merge_xref_block_content(doc, xref_block_name, br_handle, xref_doc, true);
+}
+
+fn merge_xref_display_block(
+    doc: &mut Document,
+    xref_block_name: &str,
+    br_handle: Handle,
+    xref_doc: Document,
+) {
+    merge_xref_block_content(doc, xref_block_name, br_handle, xref_doc, false);
+}
+
+fn merge_xref_block_content(
+    doc: &mut Document,
+    xref_block_name: &str,
+    br_handle: Handle,
+    xref_doc: Document,
+    track: bool,
+) {
     let prefix = xref_block_name;
 
     // Carry the xref's INSUNITS onto the host BlockRecord. Used at INSERT
@@ -1253,6 +2357,12 @@ fn merge_xref_into_block(
     // The unremapped-handle count is ignored on the load path (BIND reports
     // it per bind).
     let (_, entity_handle_map) = merge_source_entities(doc, &xref_doc, br_handle, &maps);
+    if track {
+        if let Ok(mut merged) = merged_copies().lock() {
+            merged.insert(br_handle, entity_handle_map.clone());
+        }
+        link_stored_references(doc, br_handle, &entity_handle_map);
+    }
 
     // ── Draw-order overrides (shared helper) ──────────────────────────────
     copy_xref_sortents(
@@ -1317,6 +2427,8 @@ fn merge_source_entities(
         // Paper-space / unknown owners are skipped.
         let old_owner = entity.common().owner_handle;
         let new_owner = if old_owner == source_ms_handle {
+            let base = source.header.model_space_insertion_base;
+            entity.translate(Vector3::new(-base.x, -base.y, -base.z));
             target_br
         } else if let Some(&h) = maps.br_handles.get(&old_owner) {
             h
@@ -1324,7 +2436,7 @@ fn merge_source_entities(
             continue;
         };
         entity.common_mut().owner_handle = new_owner;
-        // Clear the foreign handle so opencadcodec assigns a new one.
+        // Clear the foreign handle so document assigns a new one.
         set_handle(&mut entity, Handle::NULL);
         if let Ok(new_h) = target.add_entity(entity) {
             entity_handle_map.insert(old_h, new_h);
@@ -1370,15 +2482,13 @@ pub use crate::io::xref_model::child_key;
 /// through this fn, and the palette keys rows off `(key, saved_path)`, so
 /// nested rows keep resolving.
 ///
-/// Nested enumeration (SPIKE5): each LOADED DwgXref whose file resolved is
-/// opened read-only and its *direct* xref block-records are appended as child
-/// entries (no geometry merge). Parsed docs live in a per-path
-/// cache inside the call; already-seen normalized `saved_path`s are skipped,
-/// so a self- or cyclic reference enumerates once and never recurses. A
-/// nested file that fails to parse is skipped silently. Synchronous by
-/// design; async stat is Task 8.
+/// Nested rows use the same finite production traversal as dependent graphics.
+/// Parsed resources and the active ancestor chain remain separate, so shared
+/// descendants are not cycles. A direct self-reference reports Circular on its
+/// own row; a closing edge deeper in the graph reports it on that nested row.
+/// Native sessions replace filesystem-derived rows with their owner-scoped report.
 pub fn collect_entries(
-    doc: &codec::Document,
+    doc: &document::Document,
     base_dir: &Path,
     unloaded: &std::collections::HashSet<crate::io::xref_model::UnloadKey>,
 ) -> Vec<crate::io::xref_model::ReferenceEntry> {
@@ -1388,16 +2498,156 @@ pub fn collect_entries(
 /// [`collect_entries`] with a load-time mtime baseline for `Stale` detection.
 /// See [`collect_entries`] for the full contract.
 pub fn collect_entries_with_prev(
-    doc: &codec::Document,
+    doc: &document::Document,
     base_dir: &Path,
     unloaded: &std::collections::HashSet<crate::io::xref_model::UnloadKey>,
     prev: &std::collections::HashMap<u64, std::time::SystemTime>,
 ) -> Vec<crate::io::xref_model::ReferenceEntry> {
-    use crate::io::xref_model::{
-        child_key, decide_status, normalize_lexical, RefKind, RefStatus, RefType, ReferenceEntry,
-        UnloadKey,
+    collect_entries_impl(doc, base_dir, unloaded, prev, true)
+}
+
+/// Apply explicit per-tab source choices to the existing manager/report rows.
+pub fn apply_native_source_status(
+    entries: &mut Vec<crate::io::xref_model::ReferenceEntry>,
+    session: Option<&ocs_save::IfccadSession>,
+) {
+    use crate::io::xref_model::{RefKind, RefStatus};
+    let Some(session) = session else {
+        return;
     };
-    use codec::objects::ObjectType;
+    let roots: HashSet<u64> = session
+        .nested_source_rows()
+        .iter()
+        .map(|(h, _)| h.value())
+        .collect();
+    let mut remove: HashSet<u64> = HashSet::default();
+    loop {
+        let before = remove.len();
+        for entry in entries.iter() {
+            if entry
+                .parent_key
+                .is_some_and(|p| roots.contains(&p) || remove.contains(&p))
+            {
+                remove.insert(entry.key);
+            }
+        }
+        if before == remove.len() {
+            break;
+        }
+    }
+    entries.retain(|e| !remove.contains(&e.key));
+    for entry in entries.iter_mut() {
+        if entry.kind != RefKind::DwgXref || entry.parent_key.is_some() {
+            continue;
+        }
+        if let Some(source) = session.external_source(Handle::new(entry.key)) {
+            entry.owner_resource = Some(1);
+            entry.source_id = Some(source.id.0);
+        }
+        if let Some(source) =
+            session.external_source_bytes(Handle::new(entry.key), &entry.saved_path)
+        {
+            entry.found_at = Some(source.file_name);
+            entry.size_bytes = Some(source.bytes.len() as u64);
+            if entry.status != RefStatus::Unloaded {
+                // Resource 1 is the current drawing, explicitly reused in the
+                // browser. Report its cycle on this authored row, not a fake child.
+                if source.resource_id == 1 {
+                    entry.status = RefStatus::Circular;
+                    entry.diagnostic = Some(
+                        "Circular XREF: direct self-reference interrupted for this session".into(),
+                    );
+                } else if entry.status != RefStatus::Circular {
+                    entry.status = RefStatus::Loaded;
+                }
+            }
+        } else if cfg!(target_arch = "wasm32")
+            && session.external_source(Handle::new(entry.key)).is_some()
+        {
+            entry.found_at = None;
+            entry.size_bytes = None;
+            if entry.status != RefStatus::Unloaded {
+                entry.status = RefStatus::NotFound;
+            }
+        }
+    }
+    let active_roots: HashSet<u64> = entries
+        .iter()
+        .filter(|e| {
+            e.parent_key.is_none()
+                && e.status != RefStatus::Unloaded
+                && e.status != RefStatus::NotFound
+        })
+        .map(|e| e.key)
+        .collect();
+    for (root, row) in session.nested_source_rows() {
+        if !active_roots.contains(&root.value()) {
+            continue;
+        }
+        let entry = reference_entry_from_row(row);
+        entries.push(entry);
+    }
+}
+
+fn reference_entry_from_row(
+    row: ocs_save::ExternalReferenceRow,
+) -> crate::io::xref_model::ReferenceEntry {
+    use crate::io::xref_model::{RefKind, RefStatus};
+    let mut entry = crate::io::xref_model::ReferenceEntry::new(row.key, row.name, RefKind::DwgXref);
+    entry.parent_key = Some(row.parent_key);
+    entry.saved_path = row.locator;
+    entry.found_at = row.found_at;
+    entry.owner_resource = row.owner_resource;
+    entry.source_id = Some(row.source_id);
+    entry.diagnostic = row.diagnostic;
+    entry.status = match row.status.as_str() {
+        "Loaded" => RefStatus::Loaded,
+        "Circular" => RefStatus::Circular,
+        "Unloaded" => RefStatus::Unloaded,
+        "Failed" => RefStatus::Failed,
+        "Stale" => RefStatus::Stale,
+        "Unreferenced" => RefStatus::Unreferenced,
+        _ => RefStatus::NotFound,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(meta) = entry
+        .found_at
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+    {
+        entry.size_bytes = Some(meta.len());
+        entry.modified = meta.modified().ok();
+    }
+    entry
+}
+
+/// Resolve one host-owned row without applying the manager's nested-row
+/// deduplication filter. A direct, uninserted record can intentionally be
+/// hidden by that filter immediately after a path edit; lifecycle responses
+/// still need to serialize the row they just changed.
+pub(crate) fn collect_direct_entry_with_prev(
+    doc: &document::Document,
+    base_dir: &Path,
+    unloaded: &std::collections::HashSet<crate::io::xref_model::UnloadKey>,
+    prev: &std::collections::HashMap<u64, std::time::SystemTime>,
+    key: u64,
+) -> Option<crate::io::xref_model::ReferenceEntry> {
+    collect_entries_impl(doc, base_dir, unloaded, prev, false)
+        .into_iter()
+        .find(|entry| entry.key == key && entry.parent_key.is_none())
+}
+
+fn collect_entries_impl(
+    doc: &document::Document,
+    base_dir: &Path,
+    unloaded: &std::collections::HashSet<crate::io::xref_model::UnloadKey>,
+    prev: &std::collections::HashMap<u64, std::time::SystemTime>,
+    deduplicate_nested: bool,
+) -> Vec<crate::io::xref_model::ReferenceEntry> {
+    use crate::io::xref_model::{
+        decide_status, RefKind, RefStatus, RefType, ReferenceEntry, UnloadKey,
+    };
+    use document::objects::ObjectType;
 
     /// Resolve `raw` via `base_dir`; on success record `found_at`, stat
     /// size/mtime, and flip the entry to Loaded. Missing/empty stays NotFound.
@@ -1556,7 +2806,7 @@ pub fn collect_entries_with_prev(
     let mut referenced_clouds: HashSet<Handle> = HashSet::default();
     for e in doc.entities() {
         if let EntityType::Extended(extended) = e {
-            if let codec::entities::ExtendedEntityData::PointCloudEx(data) = &extended.data {
+            if let document::entities::ExtendedEntityData::PointCloudEx(data) = &extended.data {
                 referenced_clouds.insert(data.definition_handle);
             }
         }
@@ -1579,7 +2829,7 @@ pub fn collect_entries_with_prev(
         let ObjectType::ClassObject(object) = obj else {
             continue;
         };
-        let codec::objects::ClassObjectData::PointCloudDefinitionEx(def) = &object.data else {
+        let document::objects::ClassObjectData::PointCloudDefinitionEx(def) = &object.data else {
             continue;
         };
         let key = handle.value();
@@ -1605,72 +2855,101 @@ pub fn collect_entries_with_prev(
         entries.push(entry);
     }
 
-    // ── Nested enumeration: full transitive closure, read-only, no merge ──
-    // Paths stored in a nested drawing are relative to *that drawing*, not to
-    // the host.  The work queue carries each parent's resolved file so every
-    // level gets the correct base directory.  `seen` is keyed by resolved
-    // absolute identity and breaks A→B→A cycles as well as shared closures.
-    let mut seen: HashSet<String> = HashSet::default();
-    let mut work: Vec<(u64, PathBuf)> = Vec::new();
-    for e in &entries {
-        if e.kind == RefKind::DwgXref && matches!(e.status, RefStatus::Loaded | RefStatus::Stale) {
-            if let Some(found) = &e.found_at {
-                let path = PathBuf::from(found);
-                seen.insert(normalize_lexical(&path.to_string_lossy()));
-                work.push((e.key, path));
+    // Use the same typed production traversal as geometry loading. Native
+    // tab reports replace these rows in apply_native_source_status, including
+    // explicitly selected browser resources which have no filesystem path.
+    let roots = entries.clone();
+    for root in roots.iter().filter(|e| {
+        e.kind == RefKind::DwgXref
+            && e.parent_key.is_none()
+            && matches!(e.status, RefStatus::Loaded | RefStatus::Stale)
+    }) {
+        let Some(path) = &root.found_at else {
+            continue;
+        };
+        let mut read = read_xref_file_for_format(path, base_dir, None, None);
+        if graph::prepare_read(
+            doc,
+            Handle::new(root.key),
+            &root.saved_path,
+            &mut read,
+            None,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        if read.circular_root {
+            if let Some(entry) = entries.iter_mut().find(|e| e.key == root.key) {
+                entry.status = RefStatus::Circular;
+                entry.diagnostic = read.graph_diagnostics.first().cloned();
             }
+        }
+        for row in read.nested_rows {
+            let mut entry = reference_entry_from_row(row);
+            entry.status = decide_status(
+                entry.status,
+                entry.modified,
+                prev.get(&entry.key).copied(),
+                false,
+            );
+            if unloaded.contains(&UnloadKey::Nested(entry.key)) {
+                entry.status = RefStatus::Unloaded;
+            }
+            entries.push(entry);
         }
     }
-    // Cached nested documents are shared via `Arc`: the enumeration below is
-    // strictly read-only, so a hit clones the pointer instead of deep-copying
-    // the whole document (entities, objects, block records) per access.
-    let mut nested_cache: HashMap<String, Arc<Document>> = HashMap::default();
-    while let Some((parent_key, parent_path)) = work.pop() {
-        let cache_key = normalize_lexical(&parent_path.to_string_lossy());
-        let nested_doc = if let Some(cached) = nested_cache.get(&cache_key) {
-            Arc::clone(cached)
-        } else {
-            match super::load_file(&parent_path) {
-                Ok(nested) => {
-                    let shared = Arc::new(nested);
-                    nested_cache.insert(cache_key, Arc::clone(&shared));
-                    shared
+
+    // A drawing saved by AutoCAD also keeps its nested xrefs' block records,
+    // so a nested reference showed up twice: once at the top, once under its
+    // parent (#2838). A top-level row the host never inserts itself, whose
+    // file the walk found under a parent, is that nested row.
+    if deduplicate_nested {
+        let nested_files: HashSet<graph::XrefResourceId> = entries
+            .iter()
+            .filter(|e| e.parent_key.is_some())
+            .filter_map(|e| {
+                e.found_at
+                    .as_deref()
+                    .map(|path| graph::desktop_identity(Path::new(path)))
+            })
+            .collect();
+        // The host's copy of a nested record keeps the path it had where the
+        // parent was last saved (another machine's folder), so it may resolve
+        // to another file than the walk did; its name is the nested row's.
+        let nested_names: HashSet<String> = entries
+            .iter()
+            .filter(|e| e.parent_key.is_some())
+            .map(|e| e.name.to_uppercase())
+            .collect();
+        // An insert inside a loaded xref's definition is the parent's own
+        // placement of its nested reference, not the host's (#2838).
+        let xref_records: HashSet<Handle> = doc
+            .block_records
+            .iter()
+            .filter(|br| br.flags.is_xref || br.flags.is_xref_overlay)
+            .map(|br| br.handle)
+            .collect();
+        let inserted: HashSet<String> = doc
+            .entities()
+            .filter_map(|e| match e {
+                document::EntityType::Insert(insert)
+                    if !xref_records.contains(&insert.common.owner_handle) =>
+                {
+                    Some(insert.block_name.to_uppercase())
                 }
-                Err(_) => continue,
-            }
-        };
-        let parent_dir = parent_path.parent().unwrap_or(base_dir);
-        for br in nested_doc.block_records.iter() {
-            if !(br.flags.is_xref || br.flags.is_xref_overlay) {
-                continue;
-            }
-            let key = child_key(parent_key, &br.name, &br.xref_path);
-            let mut child = ReferenceEntry::new(key, br.name.clone(), RefKind::DwgXref);
-            child.parent_key = Some(parent_key);
-            child.ref_type = if br.flags.is_xref_overlay {
-                RefType::Overlay
-            } else {
-                RefType::Attach
-            };
-            child.saved_path = br.xref_path.clone();
-            if unloaded.contains(&UnloadKey::Nested(key)) {
-                child.status = RefStatus::Unloaded;
-            } else {
-                stat_into(&mut child, &br.xref_path, parent_dir);
-                // Nested baselines live in the same stat cache under the
-                // child's high-bit-tagged key, which can never alias a host
-                // handle (see `child_key`) — so the lookup below is safe.
-                child.status =
-                    decide_status(child.status, child.modified, prev.get(&key).copied(), false);
-            }
-            if let Some(found) = &child.found_at {
-                let resolved_id = normalize_lexical(found);
-                if seen.insert(resolved_id) {
-                    work.push((key, PathBuf::from(found)));
-                }
-            }
-            entries.push(child);
-        }
+                _ => None,
+            })
+            .collect();
+        entries.retain(|e| {
+            e.parent_key.is_some()
+                || e.kind != RefKind::DwgXref
+                || inserted.contains(&e.name.to_uppercase())
+                || !(nested_names.contains(&e.name.to_uppercase())
+                    || e.found_at.as_deref().is_some_and(|found| {
+                        nested_files.contains(&graph::desktop_identity(Path::new(found)))
+                    }))
+        });
     }
 
     // Stale propagation (plan §3.1): a Loaded parent with a Stale descendant
@@ -1722,7 +3001,7 @@ fn find_target(doc: &Document, key: u64) -> Option<RefTarget> {
         }
     }
     for (handle, obj) in doc.objects.iter() {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         match obj {
             ObjectType::ImageDefinition(def) if handle.value() == key => {
                 return Some(RefTarget::Image {
@@ -1731,7 +3010,9 @@ fn find_target(doc: &Document, key: u64) -> Option<RefTarget> {
                 });
             }
             ObjectType::ClassObject(object) if handle.value() == key => {
-                if let codec::objects::ClassObjectData::PointCloudDefinitionEx(def) = &object.data {
+                if let document::objects::ClassObjectData::PointCloudDefinitionEx(def) =
+                    &object.data
+                {
                     return Some(RefTarget::PointCloud {
                         handle: *handle,
                         name: def.source_filename.clone(),
@@ -1782,7 +3063,7 @@ pub fn unload_reference(doc: &mut Document, key: u64) -> Result<String, String> 
             }
             // Drop draw-order overrides owned by the unloaded block.
             {
-                use codec::objects::ObjectType;
+                use document::objects::ObjectType;
                 let dead: Vec<Handle> = doc
                     .objects
                     .iter()
@@ -1802,7 +3083,7 @@ pub fn unload_reference(doc: &mut Document, key: u64) -> Result<String, String> 
         RefTarget::Image { name, .. } => Ok(name),
         // A PDF keeps its unloaded state on the definition (saved with it).
         RefTarget::Pdf { handle, name } => {
-            if let Some(codec::objects::ObjectType::UnderlayDefinition(def)) =
+            if let Some(document::objects::ObjectType::UnderlayDefinition(def)) =
                 doc.objects.get_mut(&handle)
             {
                 def.unloaded = true;
@@ -1819,8 +3100,8 @@ pub fn unload_reference(doc: &mut Document, key: u64) -> Result<String, String> 
 
 /// A point cloud definition's loaded flag (Unload / Reload).
 pub fn set_point_cloud_loaded(doc: &mut Document, handle: Handle, loaded: bool) {
-    if let Some(codec::objects::ObjectType::ClassObject(object)) = doc.objects.get_mut(&handle) {
-        if let codec::objects::ClassObjectData::PointCloudDefinitionEx(def) = &mut object.data {
+    if let Some(document::objects::ObjectType::ClassObject(object)) = doc.objects.get_mut(&handle) {
+        if let document::objects::ClassObjectData::PointCloudDefinitionEx(def) = &mut object.data {
             def.is_loaded = loaded;
         }
     }
@@ -1868,7 +3149,7 @@ pub fn detach_reference(doc: &mut Document, key: u64) -> Result<String, String> 
             remove_pipe_symbols(doc, &name);
             // Draw-order tables owned by the detached block.
             {
-                use codec::objects::ObjectType;
+                use document::objects::ObjectType;
                 let dead: Vec<Handle> = doc
                     .objects
                     .iter()
@@ -1921,7 +3202,7 @@ pub fn detach_reference(doc: &mut Document, key: u64) -> Result<String, String> 
         // The clouds, their reactors, the definition and its dictionary
         // entry.
         RefTarget::PointCloud { handle, name } => {
-            use codec::entities::ExtendedEntityData;
+            use document::entities::ExtendedEntityData;
             let clouds: Vec<(Handle, Handle)> = doc
                 .entities()
                 .filter_map(|e| match e {
@@ -1941,7 +3222,7 @@ pub fn detach_reference(doc: &mut Document, key: u64) -> Result<String, String> 
                 doc.objects.remove(&reactor);
             }
             for object in doc.objects.values_mut() {
-                if let codec::objects::ObjectType::Dictionary(dictionary) = object {
+                if let document::objects::ObjectType::Dictionary(dictionary) = object {
                     dictionary.entries.retain(|(_, h)| *h != handle);
                 }
             }
@@ -2159,10 +3440,7 @@ pub fn xbind_symbols(
         let Some(source_layer) = source.layers.get(source_name) else {
             continue;
         };
-        let Some(new_linetype) = maps
-            .linetypes
-            .get(&source_layer.line_type.to_uppercase())
-        else {
+        let Some(new_linetype) = maps.linetypes.get(&source_layer.line_type.to_uppercase()) else {
             continue;
         };
         if let Some(host_layer) = doc.layers.get_mut(host_name) {
@@ -2287,9 +3565,7 @@ fn collect_xbind_dependencies(source: &Document, selection: &mut XbindSelection)
                 EntityType::Dimension(dimension) => {
                     let base = dimension.base();
                     if !base.style_name.is_empty() {
-                        selection
-                            .dim_styles
-                            .insert(base.style_name.to_uppercase());
+                        selection.dim_styles.insert(base.style_name.to_uppercase());
                     }
                     queue_bindable_block(source, &base.block_name, selection, &mut queue);
                 }
@@ -2462,12 +3738,12 @@ fn prune_source_for_xbind(source: &Document, selection: &XbindSelection) -> Docu
         .objects
         .iter()
         .filter_map(|(handle, object)| match object {
-            codec::objects::ObjectType::ImageDefinition(_)
+            document::objects::ObjectType::ImageDefinition(_)
                 if !selection.image_defs.contains(handle) =>
             {
                 Some(*handle)
             }
-            codec::objects::ObjectType::UnderlayDefinition(_)
+            document::objects::ObjectType::UnderlayDefinition(_)
                 if !selection.underlay_defs.contains(handle) =>
             {
                 Some(*handle)
@@ -2561,8 +3837,8 @@ fn load_bind_source(ref_name: &str, found: &Path) -> Result<Document, String> {
 /// Reject PDF underlays anywhere in a bind closure: vector import is
 /// unavailable, and silently dropping them would lose data.
 fn check_no_pdf_underlays(source: &Document) -> Result<(), String> {
-    use codec::entities::UnderlayType;
-    use codec::objects::ObjectType;
+    use document::entities::UnderlayType;
+    use document::objects::ObjectType;
     let has_pdf = source.objects.values().any(
         |o| matches!(o, ObjectType::UnderlayDefinition(d) if d.underlay_type == UnderlayType::Pdf),
     );
@@ -2588,7 +3864,10 @@ fn bind_nested_closure(
     let children: Vec<(String, Handle, String)> = source
         .block_records
         .iter()
-        .filter(|br| (br.flags.is_xref || br.flags.is_xref_overlay) && !br.xref_path.is_empty())
+        // An overlay never re-exports through the host: it has no business
+        // being bound when the host is bound. Only drawing attachments join
+        // the closure.
+        .filter(|br| br.flags.is_xref && !br.flags.is_xref_overlay && !br.xref_path.is_empty())
         .map(|br| (br.name.clone(), br.handle, br.xref_path.clone()))
         .collect();
     let mut taken = BindTaken::capture(source);
@@ -2671,7 +3950,7 @@ fn collect_bind_images(
     host_dir: &Path,
     only: Option<Handle>,
 ) -> Result<(), String> {
-    use codec::objects::ObjectType;
+    use document::objects::ObjectType;
     let defs: Vec<(Handle, String)> = source
         .objects
         .iter()
@@ -2795,6 +4074,9 @@ pub fn strip_resolved_xref_content(doc: &mut Document) {
         .map(|br| (br.name.clone(), br.handle))
         .collect();
     for (name, handle) in xrefs {
+        // Before the copies go: what refers to them is written by the
+        // handles their objects have in the xref's drawing.
+        store_references_by_source(doc, handle);
         let (begin, end) = doc
             .block_records
             .get(&name)
@@ -2856,7 +4138,7 @@ fn remove_dependent_symbols(doc: &mut Document, name: &str, layers_too: bool) {
         doc.remove_entity(h);
     }
     {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         let dead: Vec<Handle> = doc
             .objects
             .iter()
@@ -2943,7 +4225,7 @@ fn remove_dependent_symbols(doc: &mut Document, name: &str, layers_too: bool) {
 fn snapshot_dependent_layers(
     doc: &Document,
     name: &str,
-) -> HashMap<String, codec::tables::Layer> {
+) -> HashMap<String, document::tables::Layer> {
     let prefix = format!("{}|", name.to_uppercase());
     doc.layers
         .names()
@@ -2965,7 +4247,7 @@ fn snapshot_dependent_layers(
 fn restore_dependent_layers(
     doc: &mut Document,
     name: &str,
-    kept: HashMap<String, codec::tables::Layer>,
+    kept: HashMap<String, document::tables::Layer>,
 ) {
     if kept.is_empty() {
         return;
@@ -2981,15 +4263,15 @@ fn restore_dependent_layers(
         let (Some(cur), Some(old)) = (doc.layers.get_mut(&n), kept.get(&n.to_uppercase())) else {
             continue;
         };
-        cur.flags = old.flags.clone();
-        cur.color = old.color.clone();
+        cur.flags = old.flags;
+        cur.color = old.color;
         cur.color_name = old.color_name.clone();
         cur.book_name = old.book_name.clone();
         cur.line_type = old.line_type.clone();
-        cur.line_weight = old.line_weight.clone();
+        cur.line_weight = old.line_weight;
         cur.plot_style = old.plot_style.clone();
         cur.is_plottable = old.is_plottable;
-        cur.transparency = old.transparency.clone();
+        cur.transparency = old.transparency;
     }
 }
 
@@ -3007,17 +4289,38 @@ pub fn set_ref_path(doc: &mut Document, key: u64, new_raw: &str) -> Result<Strin
             Err(crate::t!("XREF: no loaded reference with that key.").to_string())
         }
         RefTarget::Image { handle, name } => {
-            use codec::objects::ObjectType;
+            use document::objects::ObjectType;
             match doc.objects.get_mut(&handle) {
                 Some(ObjectType::ImageDefinition(def)) => {
                     def.file_name = new_raw.to_string();
+                    // Each image entity carries the file it was resolved to at
+                    // open and draws from that, so it follows the new path too
+                    // (#3515); otherwise the old picture stays until re-attach.
+                    let images: Vec<document::Handle> = doc
+                        .entities()
+                        .filter_map(|entity| match entity {
+                            document::EntityType::RasterImage(image)
+                                if image.definition_handle == Some(handle) =>
+                            {
+                                Some(entity.common().handle)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for image in images {
+                        if let Some(document::EntityType::RasterImage(image)) =
+                            doc.get_entity_mut(image)
+                        {
+                            image.file_path = new_raw.to_string();
+                        }
+                    }
                     Ok(name)
                 }
                 _ => Err(crate::t!("XREF: no loaded reference with that key.").to_string()),
             }
         }
         RefTarget::Pdf { handle, name } => {
-            use codec::objects::ObjectType;
+            use document::objects::ObjectType;
             match doc.objects.get_mut(&handle) {
                 Some(ObjectType::UnderlayDefinition(def)) => {
                     def.file_path = new_raw.to_string();
@@ -3027,7 +4330,7 @@ pub fn set_ref_path(doc: &mut Document, key: u64, new_raw: &str) -> Result<Strin
             }
         }
         RefTarget::PointCloud { handle, name } => {
-            use codec::objects::{ClassObjectData, ObjectType};
+            use document::objects::{ClassObjectData, ObjectType};
             match doc.objects.get_mut(&handle) {
                 Some(ObjectType::ClassObject(object)) => match &mut object.data {
                     ClassObjectData::PointCloudDefinitionEx(def) => {
@@ -3042,14 +4345,21 @@ pub fn set_ref_path(doc: &mut Document, key: u64, new_raw: &str) -> Result<Strin
     }
 }
 
-/// Convert one reference's stored path to `pathtype` against `host_path`.
-/// Verbatim store on success; neutral errors otherwise.
-pub fn apply_pathtype(
+#[derive(Debug)]
+pub(crate) enum ApplyPathtypeError {
+    MissingReference,
+    Conversion(crate::io::xref_model::PathtypeError),
+    Store(String),
+}
+
+/// Typed implementation shared by the UI wrapper and automation. Keeping the
+/// conversion variant intact prevents stable API errors depending on locale.
+pub(crate) fn apply_pathtype_typed(
     doc: &mut Document,
     key: u64,
     pathtype: crate::io::xref_model::Pathtype,
     host_path: &Path,
-) -> Result<String, String> {
+) -> Result<String, ApplyPathtypeError> {
     let saved = match find_target(doc, key) {
         Some(RefTarget::DwgXref { name, .. }) => doc
             .block_records
@@ -3057,21 +4367,21 @@ pub fn apply_pathtype(
             .map(|b| b.xref_path.clone())
             .unwrap_or_default(),
         Some(RefTarget::Image { handle, .. }) => {
-            use codec::objects::ObjectType;
+            use document::objects::ObjectType;
             match doc.objects.get(&handle) {
                 Some(ObjectType::ImageDefinition(def)) => def.file_name.clone(),
                 _ => String::new(),
             }
         }
         Some(RefTarget::Pdf { handle, .. }) => {
-            use codec::objects::ObjectType;
+            use document::objects::ObjectType;
             match doc.objects.get(&handle) {
                 Some(ObjectType::UnderlayDefinition(def)) => def.file_path.clone(),
                 _ => String::new(),
             }
         }
         Some(RefTarget::PointCloud { name, .. }) => name,
-        None => return Err(crate::t!("XREF: no loaded reference with that key.").to_string()),
+        None => return Err(ApplyPathtypeError::MissingReference),
     };
     // A stored relative path first has to be resolved against its current host
     // folder.  Passing it straight to `to_pathtype_result` made `Full` a
@@ -3092,17 +4402,33 @@ pub fn apply_pathtype(
     };
     match crate::io::xref_model::to_pathtype_result(&effective, host_path, pathtype) {
         Ok(next) => {
-            set_ref_path(doc, key, &next)?;
+            set_ref_path(doc, key, &next).map_err(ApplyPathtypeError::Store)?;
             Ok(next)
         }
-        Err(crate::io::xref_model::PathtypeError::AcrossDrives) => {
-            Err(crate::t!("XREF: cannot make path relative across drives.").to_string())
-        }
-        Err(crate::io::xref_model::PathtypeError::UnsavedHost) => Err(crate::t!(
-            "XREF  Save the drawing first to resolve relative XREF paths."
-        )
-        .to_string()),
+        Err(error) => Err(ApplyPathtypeError::Conversion(error)),
     }
+}
+
+/// Convert one reference's stored path to `pathtype` against `host_path`.
+/// Verbatim store on success; localized UI errors otherwise.
+pub fn apply_pathtype(
+    doc: &mut Document,
+    key: u64,
+    pathtype: crate::io::xref_model::Pathtype,
+    host_path: &Path,
+) -> Result<String, String> {
+    apply_pathtype_typed(doc, key, pathtype, host_path).map_err(|error| match error {
+        ApplyPathtypeError::MissingReference => {
+            crate::t!("XREF: no loaded reference with that key.").to_string()
+        }
+        ApplyPathtypeError::Conversion(crate::io::xref_model::PathtypeError::AcrossDrives) => {
+            crate::t!("XREF: cannot make path relative across drives.").to_string()
+        }
+        ApplyPathtypeError::Conversion(crate::io::xref_model::PathtypeError::UnsavedHost) => {
+            crate::t!("XREF  Save the drawing first to resolve relative XREF paths.").to_string()
+        }
+        ApplyPathtypeError::Store(error) => error,
+    })
 }
 
 /// Find & Replace: rewrite `old` → `new` as a component-wise prefix replace
@@ -3151,7 +4477,7 @@ pub fn replace_path_prefix(doc: &mut Document, old: &str, new: &str) -> usize {
         }
     }
     {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         for obj in doc.objects.values_mut() {
             match obj {
                 ObjectType::ImageDefinition(def) if !def.file_name.is_empty() => {
@@ -3257,7 +4583,7 @@ pub fn rebase_relative_paths_for_save_as(
         rebase(&mut br.xref_path);
     }
     {
-        use codec::objects::ObjectType;
+        use document::objects::ObjectType;
         for obj in doc.objects.values_mut() {
             match obj {
                 ObjectType::ImageDefinition(def) if !def.file_name.is_empty() => {
@@ -3299,8 +4625,8 @@ mod tests {
         std::fs::write(&tmp, b"").unwrap();
         let saved = tmp.to_string_lossy().into_owned();
 
-        let mut doc = codec::Document::new();
-        let mut br = codec::tables::BlockRecord::new("PLAN");
+        let mut doc = document::Document::new();
+        let mut br = document::tables::BlockRecord::new("PLAN");
         br.flags.is_xref = true;
         br.xref_path = saved.clone();
         br.handle = doc.allocate_handle();
@@ -3317,9 +4643,9 @@ mod tests {
         assert_eq!(entries[0].kind, RefKind::DwgXref);
     }
 
-    fn xref_doc_with(name: &str, saved: &str) -> (codec::Document, u64) {
-        let mut doc = codec::Document::new();
-        let mut br = codec::tables::BlockRecord::new(name);
+    fn xref_doc_with(name: &str, saved: &str) -> (document::Document, u64) {
+        let mut doc = document::Document::new();
+        let mut br = document::tables::BlockRecord::new(name);
         br.flags.is_xref = true;
         br.xref_path = saved.to_string();
         br.handle = doc.allocate_handle();
@@ -3344,12 +4670,27 @@ mod tests {
     fn write_nested_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         // mid.dwgxrefs inner.dwg; both must parse (enumeration reads the
         // mid file's block-record table). Returns (mid, inner) abs paths.
-        std::fs::write(dir.join("inner.dwg"), b"inner-bytes").unwrap();
-        let mut mid = codec::Document::new();
-        let mut br = codec::tables::BlockRecord::new("INNER");
+        let mut inner = document::Document::new();
+        inner
+            .add_entity(EntityType::Line(document::entities::Line::from_coords(
+                0., 0., 0., 1., 0., 0.,
+            )))
+            .unwrap();
+        std::fs::write(
+            dir.join("inner.dwg"),
+            crate::io::save_to_bytes(&inner, "dwg", inner.version).unwrap(),
+        )
+        .unwrap();
+        let mut mid = document::Document::new();
+        let mut br = document::tables::BlockRecord::new("INNER");
         br.flags.is_xref = true;
         br.xref_path = dir.join("inner.dwg").to_string_lossy().into_owned();
         mid.block_records.add(br).unwrap();
+        mid.add_entity(EntityType::Insert(document::entities::Insert::new(
+            "INNER",
+            Vector3::ZERO,
+        )))
+        .unwrap();
         let bytes = crate::io::save_to_bytes(&mid, "dwg", mid.version).unwrap();
         std::fs::write(dir.join("mid.dwg"), &bytes).unwrap();
         (dir.join("mid.dwg"), dir.join("inner.dwg"))
@@ -3389,7 +4730,7 @@ mod tests {
         // referenced image + unreferenced PDF): attach-equivalent list →
         // unload → targeted reload → detach. Catches integration skew that
         // unit tests on single ops cannot.
-        use codec::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
+        use document::objects::{ImageDefinition, ObjectType, UnderlayDefinition};
         let dir = xref_tmpdir("e2e");
         let (mid_path, _) = write_nested_fixture(&dir);
         std::fs::write(dir.join("img.png"), b"fake-png").unwrap();
@@ -3400,10 +4741,15 @@ mod tests {
         img_def.handle = img_h;
         doc.objects
             .insert(img_h, ObjectType::ImageDefinition(img_def));
-        let mut img =
-            codec::entities::RasterImage::new("img.png", codec::types::Vector3::ZERO, 8.0, 8.0);
+        let mut img = document::entities::RasterImage::new(
+            "img.png",
+            document::types::Vector3::ZERO,
+            8.0,
+            8.0,
+        );
         img.definition_handle = Some(img_h);
-        doc.add_entity(codec::EntityType::RasterImage(img)).unwrap();
+        doc.add_entity(document::EntityType::RasterImage(img))
+            .unwrap();
         // Unreferenced PDF definition → listed, never merged.
         let pdf_h = doc.allocate_handle();
         let mut pdf_def = UnderlayDefinition::pdf("doc.pdf", "1");
@@ -3492,8 +4838,8 @@ mod tests {
 
     #[test]
     fn overlay_on_image_errors() {
-        use codec::objects::{ImageDefinition, ObjectType};
-        let mut doc = codec::Document::new();
+        use document::objects::{ImageDefinition, ObjectType};
+        let mut doc = document::Document::new();
         let h = doc.allocate_handle();
         let mut def = ImageDefinition::with_dimensions("img.png", 8, 8);
         def.handle = h;
@@ -3519,10 +4865,10 @@ mod tests {
     fn unload_drops_merged_entities_keeps_definition() {
         let (mut doc, key) = xref_doc_with("PLAN", "missing.dwg");
         let br_h = doc.block_records.get("PLAN").unwrap().handle;
-        let mut line = codec::entities::Line::new();
-        line.common.handle = codec::types::Handle::NULL;
+        let mut line = document::entities::Line::new();
+        line.common.handle = document::types::Handle::NULL;
         line.common.owner_handle = br_h;
-        doc.add_entity(codec::EntityType::Line(line)).unwrap();
+        doc.add_entity(document::EntityType::Line(line)).unwrap();
         assert_eq!(
             doc.block_records.get("PLAN").unwrap().entity_handles.len(),
             1
@@ -3537,23 +4883,432 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_relinks_dimension_references_to_the_new_copies() {
+        use document::objects::{
+            AssocDimensionAssociation, AssocDimensionReference, AssociativeData, AssociativeObject,
+            ObjectType,
+        };
+        let dir = xref_tmpdir("relink");
+        let mut source = document::Document::new();
+        let mut line = document::entities::Line::new();
+        line.end = document::types::Vector3::new(5.0, 0.0, 0.0);
+        line.common.owner_handle = source.header.model_space_block_handle;
+        let source_line = source.add_entity(document::EntityType::Line(line)).unwrap();
+        let path = dir.join("walls.dwg");
+        let write = |doc: &document::Document| {
+            std::fs::write(
+                &path,
+                crate::io::save_to_bytes(doc, "dwg", doc.version).unwrap(),
+            )
+            .unwrap();
+        };
+        write(&source);
+
+        // Handles of its own, so the session map is not shared with other tests.
+        let mut doc = document::Document::new();
+        for _ in 0..4096 {
+            doc.allocate_handle();
+        }
+        let mut br = document::tables::BlockRecord::new("WALLS");
+        br.flags.is_xref = true;
+        br.xref_path = path.to_string_lossy().into_owned();
+        br.handle = doc.allocate_handle();
+        let br_handle = br.handle;
+        doc.block_records.add(br).unwrap();
+        let keys: HashSet<_> = [br_handle].into_iter().collect();
+        let copy = |doc: &document::Document| {
+            doc.entities()
+                .find(|e| {
+                    e.common().owner_handle == br_handle
+                        && matches!(e, document::EntityType::Line(_))
+                })
+                .map(|e| e.common().handle)
+                .unwrap()
+        };
+        resolve_xrefs_for_keys(&mut doc, &dir, &keys);
+        let first = copy(&doc);
+        let association_handle = doc.allocate_handle();
+        let mut association = AssociativeObject::new("ACDBDIMASSOC", "AcDbDimAssoc");
+        association.handle = association_handle;
+        let mut references: [Vec<AssocDimensionReference>; 4] = Default::default();
+        references[0].push(AssocDimensionReference {
+            xrefs: vec![first],
+            ..Default::default()
+        });
+        association.data = AssociativeData::DimensionAssociation(AssocDimensionAssociation {
+            references,
+            ..Default::default()
+        });
+        doc.objects
+            .insert(association_handle, ObjectType::Associative(association));
+
+        if let Some(document::EntityType::Line(line)) = source.get_entity_mut(source_line) {
+            line.end.x = 6.0;
+        }
+        write(&source);
+        resolve_xrefs_for_keys(&mut doc, &dir, &keys);
+        let second = copy(&doc);
+        assert_ne!(first, second, "the reload merged a fresh copy");
+        let Some(ObjectType::Associative(object)) = doc.objects.get(&association_handle) else {
+            panic!("association kept");
+        };
+        let AssociativeData::DimensionAssociation(association) = &object.data else {
+            panic!("dimension association");
+        };
+        assert_eq!(association.references[0][0].xrefs, vec![second]);
+        let relinked = doc.get_entity(second).unwrap();
+        assert!(relinked.common().reactors.contains(&association_handle));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use super::{ensure_block_entities, merged_copies, strip_resolved_xref_content};
+    use document::types::{Handle, Vector3};
+    use document::EntityType;
+
+    /// A host with a dimension association on the line of a DWG xref, as a
+    /// session leaves it: the INSERT that places the xref, then the host's
+    /// copy of the line.
+    struct DimensionedXref {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        source: document::Document,
+        source_line: Handle,
+        host: document::Document,
+        br_handle: Handle,
+        insert: Handle,
+        association: Handle,
+    }
+
+    impl DimensionedXref {
+        /// `spare` handles are allocated first, so the session map of the
+        /// copies is this fixture's own.
+        fn new(tag: &str, spare: usize) -> Self {
+            use document::objects::{
+                AssocDimensionAssociation, AssocDimensionReference, AssociativeData,
+                AssociativeObject, ObjectType,
+            };
+            let dir = xref_tmpdir(tag);
+            let mut source = document::Document::new();
+            let mut line = document::entities::Line::new();
+            line.end = Vector3::new(5.0, 0.0, 0.0);
+            line.common.owner_handle = source.header.model_space_block_handle;
+            let source_line = source.add_entity(EntityType::Line(line)).unwrap();
+            let path = dir.join("walls.dwg");
+            let mut host = document::Document::new();
+            for _ in 0..spare {
+                host.allocate_handle();
+            }
+            let mut br = document::tables::BlockRecord::new("WALLS");
+            br.flags.is_xref = true;
+            br.xref_path = path.to_string_lossy().into_owned();
+            br.handle = host.allocate_handle();
+            let br_handle = br.handle;
+            host.block_records.add(br).unwrap();
+            ensure_block_entities(&mut host, "WALLS");
+            let mut insert = document::entities::Insert::new("WALLS", Vector3::ZERO);
+            insert.common.owner_handle = host.header.model_space_block_handle;
+            let insert = host.add_entity(EntityType::Insert(insert)).unwrap();
+            let mut fixture = Self {
+                dir,
+                path,
+                source,
+                source_line,
+                host,
+                br_handle,
+                insert,
+                association: Handle::NULL,
+            };
+            fixture.write_source();
+            let keys: HashSet<_> = [br_handle].into_iter().collect();
+            resolve_xrefs_for_keys(&mut fixture.host, &fixture.dir, &keys);
+            let copy = Self::copy_of_the_line(&fixture.host);
+
+            let association = fixture.host.allocate_handle();
+            let mut object = AssociativeObject::new("DIMASSOC", "AcDbDimAssoc");
+            object.handle = association;
+            let mut references: [Vec<AssocDimensionReference>; 4] = Default::default();
+            references[0].push(AssocDimensionReference {
+                class_name: "AcDbOsnapPointRef".to_owned(),
+                osnap_type: 1,
+                xrefs: vec![insert, copy],
+                ..Default::default()
+            });
+            object.data = AssociativeData::DimensionAssociation(AssocDimensionAssociation {
+                associativity: 1,
+                references,
+                ..Default::default()
+            });
+            fixture
+                .host
+                .objects
+                .insert(association, ObjectType::Associative(object));
+            fixture.association = association;
+            fixture
+        }
+
+        fn write_source(&self) {
+            let bytes = crate::io::save_to_bytes(&self.source, "dwg", self.source.version).unwrap();
+            std::fs::write(&self.path, bytes).unwrap();
+        }
+
+        /// The host's copy of the xref's line.
+        fn copy_of_the_line(host: &document::Document) -> Handle {
+            let br = host.block_records.get("WALLS").unwrap().handle;
+            host.entities()
+                .find(|e| e.common().owner_handle == br && matches!(e, EntityType::Line(_)))
+                .map(|e| e.common().handle)
+                .expect("the xref is loaded")
+        }
+
+        /// The first reference of the only dimension association of `doc`.
+        fn reference(doc: &document::Document) -> document::objects::AssocDimensionReference {
+            Self::reference_at(doc, 0)
+        }
+
+        /// The reference in `slot` of the only dimension association of `doc`.
+        fn reference_at(
+            doc: &document::Document,
+            slot: usize,
+        ) -> document::objects::AssocDimensionReference {
+            use document::objects::{AssociativeData, ObjectType};
+            doc.objects
+                .values()
+                .find_map(|object| match object {
+                    ObjectType::Associative(object) => match &object.data {
+                        AssociativeData::DimensionAssociation(association) => {
+                            association.references[slot].first().cloned()
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("the dimension association")
+        }
+
+        /// The host as a save writes it and another session reads it.
+        fn reopened(&self, format: &str) -> document::Document {
+            let mut saved = self.host.clone();
+            strip_resolved_xref_content(&mut saved);
+            let bytes = crate::io::save_to_bytes(&saved, format, saved.version).unwrap();
+            // Nothing is left of the copies of the session that saved it.
+            merged_copies().lock().unwrap().remove(&self.br_handle);
+            let host_path = self.dir.join(format!("host.{format}"));
+            let mut reopened = crate::io::load_bytes_finalized(&host_path, bytes).unwrap();
+            let br = reopened.block_records.get("WALLS").unwrap().handle;
+            let keys: HashSet<_> = [br].into_iter().collect();
+            resolve_xrefs_for_keys(&mut reopened, &self.dir, &keys);
+            reopened
+        }
+    }
+
+    /// A file does not hold the objects of an xref, and the copies a session
+    /// works with have handles of that session. What the file keeps of a
+    /// reference to one is the INSERT of the xref and the handle the object
+    /// has in the xref's own drawing.
+    #[test]
+    fn a_saved_host_keeps_a_dimension_reference_by_the_handle_in_the_xref_drawing() {
+        let fixture = DimensionedXref::new("stored", 8192);
+        let mut saved = fixture.host.clone();
+        strip_resolved_xref_content(&mut saved);
+        let stored = DimensionedXref::reference(&saved);
+        assert_eq!(stored.xrefs, vec![fixture.insert]);
+        assert_eq!(
+            stored.xref_paths,
+            vec![format!("{:X}", fixture.source_line.value())]
+        );
+        // The open drawing is not touched: it still follows its copy.
+        let open = DimensionedXref::reference(&fixture.host);
+        assert_eq!(
+            open.xrefs,
+            vec![
+                fixture.insert,
+                DimensionedXref::copy_of_the_line(&fixture.host)
+            ]
+        );
+        assert!(open.xref_paths.is_empty());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_reopened_host_points_the_dimension_reference_at_the_xref_copy() {
+        for (format, spare) in [("dwg", 12288), ("dxf", 16384)] {
+            let fixture = DimensionedXref::new(&format!("reopen_{format}"), spare);
+            let reopened = fixture.reopened(format);
+            let copy = DimensionedXref::copy_of_the_line(&reopened);
+            let reference = DimensionedXref::reference(&reopened);
+            assert_eq!(reference.xrefs, vec![fixture.insert, copy], "{format}");
+            assert!(reference.xref_paths.is_empty(), "{format}");
+            let reactors = &reopened.get_entity(copy).unwrap().common().reactors;
+            assert!(reactors.contains(&fixture.association), "{format}");
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+    }
+
+    /// The case of the report: the host is saved and reopened, the source
+    /// changes, and the xref is reloaded.
+    #[test]
+    fn a_reload_after_the_host_was_reopened_keeps_the_dimension_on_the_xref_line() {
+        let mut fixture = DimensionedXref::new("reopen_reload", 20480);
+        let mut reopened = fixture.reopened("dwg");
+        let first = DimensionedXref::copy_of_the_line(&reopened);
+        if let Some(EntityType::Line(line)) = fixture.source.get_entity_mut(fixture.source_line) {
+            line.end.x = 6.0;
+        }
+        fixture.write_source();
+        let br = reopened.block_records.get("WALLS").unwrap().handle;
+        let keys: HashSet<_> = [br].into_iter().collect();
+        resolve_xrefs_for_keys(&mut reopened, &fixture.dir, &keys);
+        let second = DimensionedXref::copy_of_the_line(&reopened);
+        assert_ne!(first, second, "the reload merged a fresh copy");
+        let Some(EntityType::Line(line)) = reopened.get_entity(second) else {
+            panic!("the copy is a line");
+        };
+        assert_eq!(line.end.x, 6.0);
+        let reference = DimensionedXref::reference(&reopened);
+        assert_eq!(reference.xrefs, vec![fixture.insert, second]);
+        let reactors = &reopened.get_entity(second).unwrap().common().reactors;
+        assert!(reactors.contains(&fixture.association));
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// An object the xref no longer has leaves the reference as it was read.
+    #[test]
+    fn a_reference_to_an_object_the_xref_lost_stays_as_it_was_saved() {
+        let mut fixture = DimensionedXref::new("lost", 24576);
+        let mut saved = fixture.host.clone();
+        strip_resolved_xref_content(&mut saved);
+        let bytes = crate::io::save_to_bytes(&saved, "dwg", saved.version).unwrap();
+        merged_copies().lock().unwrap().remove(&fixture.br_handle);
+        // The source is drawn again: its line has another handle.
+        let stored = format!("{:X}", fixture.source_line.value());
+        fixture.source = document::Document::new();
+        for _ in 0..64 {
+            fixture.source.allocate_handle();
+        }
+        let mut line = document::entities::Line::new();
+        line.end = Vector3::new(5.0, 0.0, 0.0);
+        line.common.owner_handle = fixture.source.header.model_space_block_handle;
+        let redrawn = fixture.source.add_entity(EntityType::Line(line)).unwrap();
+        assert_ne!(redrawn, fixture.source_line);
+        fixture.write_source();
+        let host_path = fixture.dir.join("host.dwg");
+        let mut reopened = crate::io::load_bytes_finalized(&host_path, bytes).unwrap();
+        let br = reopened.block_records.get("WALLS").unwrap().handle;
+        let keys: HashSet<_> = [br].into_iter().collect();
+        resolve_xrefs_for_keys(&mut reopened, &fixture.dir, &keys);
+        let reference = DimensionedXref::reference(&reopened);
+        assert_eq!(reference.xrefs, vec![fixture.insert]);
+        assert_eq!(reference.xref_paths, vec![stored]);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A reference to an object in a block of the xref goes through the
+    /// INSERT of that block inside the xref. The file keeps a handle for each
+    /// step after the INSERT of the xref itself.
+    #[test]
+    fn a_reference_through_a_block_of_the_xref_keeps_a_handle_for_each_step() {
+        use document::objects::{AssocDimensionReference, AssociativeData, ObjectType};
+        let mut fixture = DimensionedXref::new("nested", 28672);
+        // The source gets a block that holds a line, and a reference of it.
+        let mut post = document::tables::BlockRecord::new("POST");
+        post.handle = fixture.source.allocate_handle();
+        let post_handle = post.handle;
+        fixture.source.block_records.add(post).unwrap();
+        ensure_block_entities(&mut fixture.source, "POST");
+        let mut inner = document::entities::Line::new();
+        inner.end = Vector3::new(0.0, 3.0, 0.0);
+        inner.common.owner_handle = post_handle;
+        let inner = fixture.source.add_entity(EntityType::Line(inner)).unwrap();
+        let mut placed = document::entities::Insert::new("POST", Vector3::new(2.0, 0.0, 0.0));
+        placed.common.owner_handle = fixture.source.header.model_space_block_handle;
+        let placed = fixture
+            .source
+            .add_entity(EntityType::Insert(placed))
+            .unwrap();
+        fixture.write_source();
+        let keys: HashSet<_> = [fixture.br_handle].into_iter().collect();
+        resolve_xrefs_for_keys(&mut fixture.host, &fixture.dir, &keys);
+
+        // The host's copies of those two: the INSERT in the xref's block and
+        // the line in the block it places.
+        let steps = |host: &document::Document| -> Vec<Handle> {
+            let walls = host.block_records.get("WALLS").unwrap().handle;
+            let (insert, block) = host
+                .entities()
+                .find_map(|e| match e {
+                    EntityType::Insert(insert) if insert.common.owner_handle == walls => Some((
+                        insert.common.handle,
+                        host.block_records.get(&insert.block_name)?.handle,
+                    )),
+                    _ => None,
+                })
+                .expect("the copy of the INSERT");
+            let line = host
+                .entities()
+                .find(|e| e.common().owner_handle == block && matches!(e, EntityType::Line(_)))
+                .map(|e| e.common().handle)
+                .expect("the copy of the line");
+            vec![insert, line]
+        };
+        let chain: Vec<Handle> = std::iter::once(fixture.insert)
+            .chain(steps(&fixture.host))
+            .collect();
+        let Some(ObjectType::Associative(object)) =
+            fixture.host.objects.get_mut(&fixture.association)
+        else {
+            panic!("the association");
+        };
+        let AssociativeData::DimensionAssociation(association) = &mut object.data else {
+            panic!("a dimension association");
+        };
+        association.associativity |= 2;
+        association.references[1].push(AssocDimensionReference {
+            class_name: "AcDbOsnapPointRef".to_owned(),
+            osnap_type: 1,
+            xrefs: chain,
+            ..Default::default()
+        });
+
+        let mut saved = fixture.host.clone();
+        strip_resolved_xref_content(&mut saved);
+        let stored = DimensionedXref::reference_at(&saved, 1);
+        assert_eq!(stored.xrefs, vec![fixture.insert]);
+        assert_eq!(
+            stored.xref_paths,
+            vec![
+                format!("{:X}", placed.value()),
+                format!("{:X}", inner.value())
+            ]
+        );
+
+        let reopened = fixture.reopened("dwg");
+        let linked = DimensionedXref::reference_at(&reopened, 1);
+        let expected: Vec<Handle> = std::iter::once(fixture.insert)
+            .chain(steps(&reopened))
+            .collect();
+        assert_eq!(linked.xrefs, expected);
+        assert!(linked.xref_paths.is_empty());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
     fn a_reloaded_reference_ends_its_definition_after_the_merged_body() {
         // A reload replaces the definition body. The terminator written before
         // the merge belongs after the imported entities, not below them.
         let dir = xref_tmpdir("endorder");
-        let mut source = codec::Document::new();
-        let mut line = codec::entities::Line::new();
-        line.start = codec::types::Vector3::ZERO;
-        line.end = codec::types::Vector3::new(5.0, 0.0, 0.0);
+        let mut source = document::Document::new();
+        let mut line = document::entities::Line::new();
+        line.start = document::types::Vector3::ZERO;
+        line.end = document::types::Vector3::new(5.0, 0.0, 0.0);
         line.common.owner_handle = source.header.model_space_block_handle;
-        source.add_entity(codec::EntityType::Line(line)).unwrap();
+        source.add_entity(document::EntityType::Line(line)).unwrap();
         let bytes = crate::io::save_to_bytes(&source, "dwg", source.version).unwrap();
         let path = dir.join("order.dwg");
         std::fs::write(&path, &bytes).unwrap();
 
         let (mut doc, key) = xref_doc_with("ORDER", &path.to_string_lossy());
         let mut keys = HashSet::default();
-        keys.insert(codec::types::Handle::new(key));
+        keys.insert(document::types::Handle::new(key));
         let infos = resolve_xrefs_for_keys(&mut doc, &dir, &keys);
         assert!(infos
             .iter()
@@ -3575,8 +5330,8 @@ mod tests {
             "the ENDBLK follows the merged body: body {body:?}, end {end}"
         );
         assert!(matches!(
-            doc.get_entity(codec::types::Handle::new(end)),
-            Some(codec::EntityType::BlockEnd(_))
+            doc.get_entity(document::types::Handle::new(end)),
+            Some(document::EntityType::BlockEnd(_))
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3584,13 +5339,13 @@ mod tests {
     #[test]
     fn detach_erases_inserts_and_definition() {
         let (mut doc, key) = xref_doc_with("PLAN", "missing.dwg");
-        let ins = codec::entities::Insert::new("PLAN", codec::types::Vector3::ZERO);
-        doc.add_entity(codec::EntityType::Insert(ins)).unwrap();
+        let ins = document::entities::Insert::new("PLAN", document::types::Vector3::ZERO);
+        doc.add_entity(document::EntityType::Insert(ins)).unwrap();
         detach_reference(&mut doc, key).expect("detach");
         assert!(doc.block_records.get("PLAN").is_none());
         assert!(!doc.entities().any(|e| matches!(
             e,
-            codec::EntityType::Insert(i) if i.block_name.eq_ignore_ascii_case("PLAN")
+            document::EntityType::Insert(i) if i.block_name.eq_ignore_ascii_case("PLAN")
         )));
     }
 
@@ -3600,23 +5355,23 @@ mod tests {
         // must survive purge + re-merge. Exercises the mechanism directly:
         // snapshot → mutate to defaults → restore → overrides back.
         let (mut doc, _) = xref_doc_with("PLAN", "plan.dwg");
-        let mut layer = codec::tables::Layer::new("PLAN|WALLS");
+        let mut layer = document::tables::Layer::new("PLAN|WALLS");
         layer.flags.off = true;
         layer.flags.frozen = true;
-        layer.color = codec::types::Color::from_index(1);
+        layer.color = document::types::Color::from_index(1);
         doc.layers.add_or_replace(layer);
         let kept = snapshot_dependent_layers(&doc, "PLAN");
         assert!(kept.contains_key("PLAN|WALLS"));
         // Simulate the purge + file-default re-merge.
         doc.layers.remove("PLAN|WALLS");
         doc.layers
-            .add_or_replace(codec::tables::Layer::new("PLAN|WALLS"));
+            .add_or_replace(document::tables::Layer::new("PLAN|WALLS"));
         assert!(!doc.layers.get("PLAN|WALLS").unwrap().flags.off);
         restore_dependent_layers(&mut doc, "PLAN", kept);
         let back = doc.layers.get("PLAN|WALLS").unwrap();
         assert!(back.flags.off, "off override restored");
         assert!(back.flags.frozen, "frozen override restored");
-        assert_eq!(back.color, codec::types::Color::from_index(1));
+        assert_eq!(back.color, document::types::Color::from_index(1));
     }
 
     #[test]
@@ -3624,7 +5379,7 @@ mod tests {
         // Layers gone from the new file version stay gone — restore only
         // touches entries present post-merge, never resurrects.
         let (mut doc, _) = xref_doc_with("PLAN", "plan.dwg");
-        let mut layer = codec::tables::Layer::new("PLAN|GONE");
+        let mut layer = document::tables::Layer::new("PLAN|GONE");
         layer.flags.off = true;
         doc.layers.add_or_replace(layer);
         let kept = snapshot_dependent_layers(&doc, "PLAN");
@@ -3733,9 +5488,9 @@ mod tests {
         fn write_xref_file(
             dir: &std::path::Path,
             name: &str,
-            build: impl FnOnce(&mut codec::Document),
+            build: impl FnOnce(&mut document::Document),
         ) -> String {
-            let mut doc = codec::Document::new();
+            let mut doc = document::Document::new();
             build(&mut doc);
             let bytes = crate::io::save_to_bytes(&doc, "dwg", doc.version).expect("save xref");
             let path = dir.join(name);
@@ -3743,15 +5498,15 @@ mod tests {
             path.to_string_lossy().into_owned()
         }
 
-        fn line_on(layer: &str) -> codec::EntityType {
-            let mut line = codec::entities::Line::new();
+        fn line_on(layer: &str) -> document::EntityType {
+            let mut line = document::entities::Line::new();
             line.common.layer = layer.to_string();
-            codec::EntityType::Line(line)
+            document::EntityType::Line(line)
         }
 
-        fn add_layer(doc: &mut codec::Document, name: &str) {
+        fn add_layer(doc: &mut document::Document, name: &str) {
             doc.layers
-                .add(codec::tables::Layer::new(name))
+                .add(document::tables::Layer::new(name))
                 .expect("add layer");
         }
 
@@ -3762,7 +5517,7 @@ mod tests {
             let xref_path = write_xref_file(&dir, "plan.dwg", |doc| {
                 add_layer(doc, "WALLS");
                 add_layer(doc, "HIDDEN");
-                let mut title = codec::tables::BlockRecord::new("TITLE");
+                let mut title = document::tables::BlockRecord::new("TITLE");
                 title.handle = doc.allocate_handle();
                 doc.block_records.add(title).expect("add title");
                 doc.add_entity(line_on("HIDDEN")).unwrap();
@@ -3795,30 +5550,31 @@ mod tests {
                 add_layer(doc, "WALLS");
                 add_layer(doc, "HIDDEN");
                 doc.text_styles
-                    .add(codec::tables::TextStyle::new("NOTE"))
+                    .add(document::tables::TextStyle::new("NOTE"))
                     .expect("add text style");
                 // TITLE: one line on WALLS and one note in NOTE.
-                let mut title = codec::tables::BlockRecord::new("TITLE");
+                let mut title = document::tables::BlockRecord::new("TITLE");
                 title.handle = doc.allocate_handle();
                 let title_handle = title.handle;
                 doc.block_records.add(title).expect("add title");
-                let mut line = codec::entities::Line::new();
+                let mut line = document::entities::Line::new();
                 line.common.layer = "WALLS".to_string();
                 line.common.owner_handle = title_handle;
-                doc.add_entity(codec::EntityType::Line(line)).unwrap();
-                let mut text = codec::entities::Text::new();
+                doc.add_entity(document::EntityType::Line(line)).unwrap();
+                let mut text = document::entities::Text::new();
                 text.style = "NOTE".to_string();
                 text.common.owner_handle = title_handle;
-                doc.add_entity(codec::EntityType::Text(text)).unwrap();
+                doc.add_entity(document::EntityType::Text(text)).unwrap();
                 // OTHER: not selected.
-                let mut other = codec::tables::BlockRecord::new("OTHER");
+                let mut other = document::tables::BlockRecord::new("OTHER");
                 other.handle = doc.allocate_handle();
                 let other_handle = other.handle;
                 doc.block_records.add(other).expect("add other");
-                let mut other_line = codec::entities::Line::new();
+                let mut other_line = document::entities::Line::new();
                 other_line.common.layer = "HIDDEN".to_string();
                 other_line.common.owner_handle = other_handle;
-                doc.add_entity(codec::EntityType::Line(other_line)).unwrap();
+                doc.add_entity(document::EntityType::Line(other_line))
+                    .unwrap();
             });
             let (mut host, key) = xref_doc_with("PLAN", &xref_path);
 
@@ -3852,7 +5608,7 @@ mod tests {
             let styles: Vec<_> = owned
                 .iter()
                 .filter_map(|entity| match entity {
-                    codec::EntityType::Text(text) => Some(text.style.clone()),
+                    document::EntityType::Text(text) => Some(text.style.clone()),
                     _ => None,
                 })
                 .collect();
@@ -3862,8 +5618,11 @@ mod tests {
             detach_reference(&mut host, key).expect("detach");
             assert!(host.block_records.get("PLAN").is_none());
             assert!(host.block_records.get("PLAN$0$TITLE").is_some());
-            let insert = codec::entities::Insert::new("PLAN$0$TITLE", codec::types::Vector3::ZERO);
-            let handle = host.add_entity(codec::EntityType::Insert(insert)).expect("insert");
+            let insert =
+                document::entities::Insert::new("PLAN$0$TITLE", document::types::Vector3::ZERO);
+            let handle = host
+                .add_entity(document::EntityType::Insert(insert))
+                .expect("insert");
             assert!(host.get_entity(handle).is_some());
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -3951,7 +5710,7 @@ mod tests {
             let plan_path = write_xref_file(&dir, "plan.dwg", |doc| {
                 add_layer(doc, "PLANLAYER");
                 doc.add_entity(line_on("PLANLAYER")).unwrap();
-                let mut br = codec::tables::BlockRecord::new("DETAIL");
+                let mut br = document::tables::BlockRecord::new("DETAIL");
                 br.flags.is_xref = true;
                 br.xref_path = detail_path.clone();
                 doc.block_records.add(br).expect("add nested xref");
@@ -3974,33 +5733,79 @@ mod tests {
         }
 
         #[test]
+        fn bind_skips_nested_overlays() {
+            let dir = bind_dir("overlay");
+            let detail_path = write_xref_file(&dir, "detail.dwg", |doc| {
+                add_layer(doc, "WALLS");
+                doc.add_entity(line_on("WALLS")).unwrap();
+            });
+            let overlay_path = write_xref_file(&dir, "labels.dwg", |doc| {
+                add_layer(doc, "LABELS");
+                doc.add_entity(line_on("LABELS")).unwrap();
+            });
+            let plan_path = write_xref_file(&dir, "plan.dwg", |doc| {
+                add_layer(doc, "PLANLAYER");
+                doc.add_entity(line_on("PLANLAYER")).unwrap();
+                let mut detail = document::tables::BlockRecord::new("DETAIL");
+                detail.flags.is_xref = true;
+                detail.xref_path = detail_path.clone();
+                doc.block_records.add(detail).expect("add nested attach");
+                let mut labels = document::tables::BlockRecord::new("LABELS");
+                labels.flags.is_xref_overlay = true;
+                labels.xref_path = overlay_path.clone();
+                doc.block_records.add(labels).expect("add nested overlay");
+            });
+            let (mut host, key) = xref_doc_with("PLAN", &plan_path);
+            let outcome = bind_reference(&mut host, key, &dir, &dir).expect("bind");
+            assert_eq!(outcome.name, "PLAN");
+            assert!(
+                host.layers.get("PLAN$0$DETAIL$0$WALLS").is_some(),
+                "the attachment's layers join the binding"
+            );
+            assert!(
+                !host.layers.get("PLAN$0$LABELS").is_some(),
+                "the overlay's layers stay out of the binding"
+            );
+            let overlay = host
+                .block_records
+                .iter()
+                .find(|record| record.name == "PLAN$0$LABELS");
+            assert!(
+                overlay.is_none(),
+                "an overlay reference is not rewritten by the binding"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
         fn bind_remaps_hatch_dim_block_refs() {
             let dir = bind_dir("refs");
             let xref_path = write_xref_file(&dir, "plan.dwg", |doc| {
                 add_layer(doc, "WALLS");
                 // Nested block with content + a model-space INSERT of it.
-                let mut door = codec::tables::BlockRecord::new("DOOR");
+                let mut door = document::tables::BlockRecord::new("DOOR");
                 door.handle = doc.allocate_handle();
                 let door_h = door.handle;
                 doc.block_records.add(door).expect("add door");
-                let mut inner = codec::entities::Line::new();
+                let mut inner = document::entities::Line::new();
                 inner.common.layer = "WALLS".to_string();
                 inner.common.owner_handle = door_h;
-                doc.add_entity(codec::EntityType::Line(inner)).unwrap();
-                let ins = codec::entities::Insert::new("DOOR", codec::types::Vector3::ZERO);
-                doc.add_entity(codec::EntityType::Insert(ins)).unwrap();
+                doc.add_entity(document::EntityType::Line(inner)).unwrap();
+                let ins = document::entities::Insert::new("DOOR", document::types::Vector3::ZERO);
+                doc.add_entity(document::EntityType::Insert(ins)).unwrap();
                 // Hatch (pattern names have no table — preserved verbatim).
-                let mut hatch = codec::entities::Hatch::new();
+                let mut hatch = document::entities::Hatch::new();
                 hatch.pattern.name = "ANSI31".to_string();
-                doc.add_entity(codec::EntityType::Hatch(Box::new(hatch)))
+                doc.add_entity(document::EntityType::Hatch(Box::new(hatch)))
                     .unwrap();
                 // Dim-style reference via a tolerance entity.
                 doc.dim_styles
-                    .add(codec::tables::DimStyle::new("ARCH"))
+                    .add(document::tables::DimStyle::new("ARCH"))
                     .expect("add dimstyle");
-                let mut tol = codec::entities::Tolerance::new();
+                let mut tol = document::entities::Tolerance::new();
                 tol.dimension_style_name = "ARCH".to_string();
-                doc.add_entity(codec::EntityType::Tolerance(tol)).unwrap();
+                doc.add_entity(document::EntityType::Tolerance(tol))
+                    .unwrap();
             });
             let (mut host, key) = xref_doc_with("PLAN", &xref_path);
             bind_reference(&mut host, key, &dir, &dir).expect("bind");
@@ -4009,7 +5814,7 @@ mod tests {
             let inserts: Vec<_> = host
                 .entities()
                 .filter_map(|e| match e {
-                    codec::EntityType::Insert(i) => Some(i.block_name.clone()),
+                    document::EntityType::Insert(i) => Some(i.block_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -4024,7 +5829,8 @@ mod tests {
             let hatches: Vec<_> = host
                 .entities()
                 .filter(|e| {
-                    e.common().owner_handle == br.handle && matches!(e, codec::EntityType::Hatch(_))
+                    e.common().owner_handle == br.handle
+                        && matches!(e, document::EntityType::Hatch(_))
                 })
                 .collect();
             assert_eq!(hatches.len(), 1);
@@ -4032,7 +5838,7 @@ mod tests {
             let tols: Vec<_> = host
                 .entities()
                 .filter_map(|e| match e {
-                    codec::EntityType::Tolerance(t) => Some(t.dimension_style_name.clone()),
+                    document::EntityType::Tolerance(t) => Some(t.dimension_style_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -4045,22 +5851,22 @@ mod tests {
             let dir = bind_dir("styles");
             let xref_path = write_xref_file(&dir, "plan.dwg", |doc| {
                 doc.text_styles
-                    .add(codec::tables::TextStyle::new("NOTE"))
+                    .add(document::tables::TextStyle::new("NOTE"))
                     .expect("add text style");
-                let mut text = codec::entities::Text::new();
+                let mut text = document::entities::Text::new();
                 text.style = "NOTE".to_string();
-                doc.add_entity(codec::EntityType::Text(text)).unwrap();
+                doc.add_entity(document::EntityType::Text(text)).unwrap();
                 // Two foreign handles that cannot be remapped (plotstyle_flags
                 // set as a real writer would — otherwise the round-trip
                 // drops the handle).
-                let mut line = codec::entities::Line::new();
+                let mut line = document::entities::Line::new();
                 line.common.plotstyle_flags = 0b11;
                 line.common.plotstyle_handle = Some(doc.allocate_handle());
-                doc.add_entity(codec::EntityType::Line(line)).unwrap();
-                let mut mline = codec::entities::MLine::new();
+                doc.add_entity(document::EntityType::Line(line)).unwrap();
+                let mut mline = document::entities::MLine::new();
                 mline.style_name = "STD".to_string();
                 mline.style_handle = Some(doc.allocate_handle());
-                doc.add_entity(codec::EntityType::MLine(mline)).unwrap();
+                doc.add_entity(document::EntityType::MLine(mline)).unwrap();
             });
             let (mut host, key) = xref_doc_with("PLAN", &xref_path);
             let outcome = bind_reference(&mut host, key, &dir, &dir).expect("bind");
@@ -4069,7 +5875,7 @@ mod tests {
             let styles: Vec<_> = host
                 .entities()
                 .filter_map(|e| match e {
-                    codec::EntityType::Text(t) => Some(t.style.clone()),
+                    document::EntityType::Text(t) => Some(t.style.clone()),
                     _ => None,
                 })
                 .collect();
@@ -4078,7 +5884,8 @@ mod tests {
             let lines: Vec<_> = host
                 .entities()
                 .filter(|e| {
-                    e.common().owner_handle == br.handle && matches!(e, codec::EntityType::Line(_))
+                    e.common().owner_handle == br.handle
+                        && matches!(e, document::EntityType::Line(_))
                 })
                 .collect();
             assert_eq!(lines.len(), 1);
@@ -4086,7 +5893,7 @@ mod tests {
             let mlines: Vec<_> = host
                 .entities()
                 .filter_map(|e| match e {
-                    codec::EntityType::MLine(m) => Some(m.style_handle),
+                    document::EntityType::MLine(m) => Some(m.style_handle),
                     _ => None,
                 })
                 .collect();
@@ -4096,7 +5903,7 @@ mod tests {
 
         #[test]
         fn bind_image_collect_copies_file() {
-            use codec::objects::{ImageDefinition, ObjectType};
+            use document::objects::{ImageDefinition, ObjectType};
             let src_dir = bind_dir("imgsrc");
             let host_dir = bind_dir("imghost");
             std::fs::write(src_dir.join("pixel.png"), b"fakepng").unwrap();
@@ -4105,14 +5912,15 @@ mod tests {
                 let mut def = ImageDefinition::with_dimensions("pixel.png", 8, 8);
                 def.handle = h;
                 doc.objects.insert(h, ObjectType::ImageDefinition(def));
-                let mut img = codec::entities::RasterImage::new(
+                let mut img = document::entities::RasterImage::new(
                     "pixel.png",
-                    codec::types::Vector3::ZERO,
+                    document::types::Vector3::ZERO,
                     8.0,
                     8.0,
                 );
                 img.definition_handle = Some(h);
-                doc.add_entity(codec::EntityType::RasterImage(img)).unwrap();
+                doc.add_entity(document::EntityType::RasterImage(img))
+                    .unwrap();
             });
             let (mut host, key) = xref_doc_with("PLAN", &xref_path);
             bind_reference(&mut host, key, &src_dir, &host_dir).expect("bind");
@@ -4134,21 +5942,22 @@ mod tests {
 
         #[test]
         fn bind_image_missing_errors_without_partial_state() {
-            use codec::objects::{ImageDefinition, ObjectType};
+            use document::objects::{ImageDefinition, ObjectType};
             let dir = bind_dir("imgmissing");
             let xref_path = write_xref_file(&dir, "plan.dwg", |doc| {
                 let h = doc.allocate_handle();
                 let mut def = ImageDefinition::with_dimensions("ghost.png", 8, 8);
                 def.handle = h;
                 doc.objects.insert(h, ObjectType::ImageDefinition(def));
-                let mut img = codec::entities::RasterImage::new(
+                let mut img = document::entities::RasterImage::new(
                     "ghost.png",
-                    codec::types::Vector3::ZERO,
+                    document::types::Vector3::ZERO,
                     8.0,
                     8.0,
                 );
                 img.definition_handle = Some(h);
-                doc.add_entity(codec::EntityType::RasterImage(img)).unwrap();
+                doc.add_entity(document::EntityType::RasterImage(img))
+                    .unwrap();
             });
             let (mut host, key) = xref_doc_with("PLAN", &xref_path);
             let err = bind_reference(&mut host, key, &dir, &dir).unwrap_err();
@@ -4163,8 +5972,8 @@ mod tests {
 
         #[test]
         fn bind_pdf_errors() {
-            use codec::objects::{ObjectType, UnderlayDefinition};
-            let mut host = codec::Document::new();
+            use document::objects::{ObjectType, UnderlayDefinition};
+            let mut host = document::Document::new();
             let h = host.allocate_handle();
             let mut def = UnderlayDefinition::pdf("doc.pdf", "1");
             def.handle = h;
@@ -4202,10 +6011,11 @@ mod tests {
 /// stays full.
 fn relative_point_cloud_path(doc: &mut Document, handle: Handle, host: &Path) {
     use crate::io::xref_model::{to_pathtype_result, Pathtype};
-    let Some(codec::objects::ObjectType::ClassObject(object)) = doc.objects.get_mut(&handle) else {
+    let Some(document::objects::ObjectType::ClassObject(object)) = doc.objects.get_mut(&handle)
+    else {
         return;
     };
-    let codec::objects::ClassObjectData::PointCloudDefinitionEx(def) = &mut object.data else {
+    let document::objects::ClassObjectData::PointCloudDefinitionEx(def) = &mut object.data else {
         return;
     };
     if let Ok(relative) = to_pathtype_result(&def.source_filename, host, Pathtype::Relative) {
@@ -4234,8 +6044,8 @@ mod web_registry_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn outcome() -> codec::ReadOutcome {
-        codec::ReadOutcome::new(Document::new(), codec::ReadStats::default())
+    fn outcome() -> document::ReadOutcome {
+        document::ReadOutcome::new(Document::new(), document::ReadStats::default())
     }
 
     #[test]
@@ -4349,6 +6159,7 @@ mod web_registry_tests {
                 diagnostics: Vec::new(),
                 read_stats: None,
                 source_sha256: None,
+                other_drawing: false,
             },
             XrefInfo {
                 name: "Missing A.dwg".into(),
@@ -4357,6 +6168,7 @@ mod web_registry_tests {
                 diagnostics: Vec::new(),
                 read_stats: None,
                 source_sha256: None,
+                other_drawing: false,
             },
             XrefInfo {
                 name: "Broken.dwg".into(),
@@ -4365,6 +6177,7 @@ mod web_registry_tests {
                 diagnostics: Vec::new(),
                 read_stats: None,
                 source_sha256: None,
+                other_drawing: false,
             },
             XrefInfo {
                 name: "Missing B.dxf".into(),
@@ -4373,6 +6186,7 @@ mod web_registry_tests {
                 diagnostics: Vec::new(),
                 read_stats: None,
                 source_sha256: None,
+                other_drawing: false,
             },
         ];
         assert_eq!(

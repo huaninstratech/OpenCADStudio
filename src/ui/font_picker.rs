@@ -7,7 +7,7 @@
 use crate::app::Message;
 use crate::t;
 use crate::ui::style::common::{muted_style, readable_accent};
-use codec::Document;
+use document::Document;
 use iced::widget::{button, container, row, text, text_input, Space};
 use iced::{Background, Border, Color, Element, Font, Length, Theme};
 use std::borrow::Cow;
@@ -182,9 +182,64 @@ pub fn catalogue(doc: &Document, style_default: bool) -> Vec<FontEntry> {
     entries
 }
 
+/// Every big font the text style manager lists: big fonts in the drawing,
+/// SHX files next to the drawing, and SHX files in the font folders.
+pub fn catalogue_bigfont(doc: &Document) -> Vec<FontEntry> {
+    let entry = |choice, section| FontEntry {
+        choice,
+        section,
+        missing: None,
+    };
+    let mut entries: Vec<FontEntry> = Vec::new();
+    let base = doc
+        .source_path
+        .as_deref()
+        .map(Path::new)
+        .and_then(|p| p.parent());
+
+    // 1. Big fonts referenced in this drawing:
+    for style in doc.text_styles.iter().filter(|style| !style.is_shape_file) {
+        let big = style.big_font_file.trim();
+        if !big.is_empty() && big.to_ascii_lowercase().ends_with(".shx") {
+            let choice = FontChoice::Stroke(big.to_string());
+            if !entries.iter().any(|e| e.choice.same_font(&choice)) {
+                entries.push(entry(choice, Section::Drawing));
+            }
+        }
+    }
+
+    // 2. SHX files next to the drawing:
+    if let Some(base) = base {
+        if let Ok(dir) = std::fs::read_dir(base) {
+            let mut local_files: Vec<String> = dir
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.to_ascii_lowercase().ends_with(".shx"))
+                .collect();
+            local_files.sort_by_key(|n| n.to_ascii_lowercase());
+            for file in local_files {
+                let choice = FontChoice::Stroke(file);
+                if !entries.iter().any(|e| e.choice.same_font(&choice)) {
+                    entries.push(entry(choice, Section::Drawing));
+                }
+            }
+        }
+    }
+
+    // 3. SHX files in font/support folders:
+    for file in crate::io::font_repo::folder_shx_fonts() {
+        let choice = FontChoice::Stroke(file);
+        if !entries.iter().any(|e| e.choice.same_font(&choice)) {
+            entries.push(entry(choice, Section::Folders));
+        }
+    }
+
+    entries
+}
+
 /// The font `style` draws with, as the picker names it; `None` when the
 /// style names none.
-pub fn style_font(style: &codec::tables::TextStyle) -> Option<FontChoice> {
+pub fn style_font(style: &document::tables::TextStyle) -> Option<FontChoice> {
     let family = style.true_type_font.trim();
     if !family.is_empty() {
         return Some(FontChoice::TrueType(family.to_string()));
@@ -294,6 +349,38 @@ impl FontPickerState {
             FontPickerEvent::Search(query) => {
                 if !self.open {
                     self.refresh(doc, style_default);
+                }
+                self.open = true;
+                self.query = query;
+                None
+            }
+            FontPickerEvent::Pick(choice) => {
+                self.open = false;
+                self.query.clear();
+                Some(choice)
+            }
+        }
+    }
+
+    /// List the big fonts again, from `doc` and the folders as they are now.
+    pub fn refresh_bigfont(&mut self, doc: &Document) {
+        self.entries = catalogue_bigfont(doc);
+    }
+
+    /// Follow `event` for a big font picker; a pick closes the list and is returned.
+    pub fn update_bigfont(&mut self, event: FontPickerEvent, doc: &Document) -> Option<FontChoice> {
+        match event {
+            FontPickerEvent::Toggle => {
+                self.open = !self.open;
+                self.query.clear();
+                if self.open {
+                    self.refresh_bigfont(doc);
+                }
+                None
+            }
+            FontPickerEvent::Search(query) => {
+                if !self.open {
+                    self.refresh_bigfont(doc);
                 }
                 self.open = true;
                 self.query = query;
@@ -453,17 +540,19 @@ fn entry_row<'a>(
         );
     } else if let FontChoice::Stroke(file) = &entry.choice {
         if *file != entry.choice.label() {
-            line = line.push(text(file.clone()).size(10).style(move |theme: &Theme| {
-                text::Style {
-                    color: Some(secondary_text(theme, active)),
-                }
-            }));
+            line = line.push(
+                text(file.clone())
+                    .size(10)
+                    .style(move |theme: &Theme| text::Style {
+                        color: Some(secondary_text(theme, active)),
+                    }),
+            );
         }
     }
     button(line)
         .on_press(on_event(FontPickerEvent::Pick(entry.choice.clone())))
         .style(move |theme: &Theme, status| {
-            let style = crate::ui::color_select::list_row_style(theme, status);
+            let style = crate::ui::kit::dropdown_row_style(theme, status);
             if active && !matches!(status, button::Status::Hovered) {
                 let palette = theme.palette();
                 button::Style {
@@ -552,7 +641,7 @@ pub fn view<'a>(picker: FontPicker<'a>) -> Element<'a, Message> {
         rows.push(DropdownRow::item(
             button(text(crate::tf!("Use “{name}”")).size(11))
                 .on_press(msg.clone())
-                .style(crate::ui::color_select::list_row_style)
+                .style(crate::ui::kit::dropdown_row_style)
                 .padding([2, 6])
                 .height(ROW_H)
                 .width(Length::Fill),
@@ -603,10 +692,15 @@ pub fn view<'a>(picker: FontPicker<'a>) -> Element<'a, Message> {
     .query(state.query.clone());
     let popup = container(list).style(container::bordered_box).padding(2);
     // The list opens centred under the field: as wide as the field, it lines
-    // up with it and stays in the field's column.
+    // up with it and stays in the field's column. A narrower fixed field gets
+    // the narrowest list. A field that fills its column has no width here
+    // (it can be 114 px in a card of a wide window), so it gets the
+    // narrowest list too, at its left edge: as wide as the field, the
+    // missing note had no room.
     let popup_width = match width {
         Length::Fixed(field) if field < POPUP_MIN_W => Some(Length::Fixed(POPUP_MIN_W)),
-        _ => None,
+        Length::Fixed(_) => None,
+        _ => Some(Length::Fixed(POPUP_MIN_W)),
     };
     crate::ui::color_select::editable_drop_down_below(
         head.into(),

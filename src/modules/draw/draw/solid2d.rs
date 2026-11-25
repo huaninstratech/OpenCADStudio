@@ -7,9 +7,9 @@
 // triangle.
 
 use crate::t;
-use codec::entities::Solid;
-use codec::types::Vector3;
-use codec::EntityType;
+use document::entities::Solid;
+use document::types::Vector3;
+use document::EntityType;
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -34,6 +34,12 @@ pub struct Solid2dCommand {
     /// Corner points picked so far (3 → triangle, 4 → quadrilateral).
     points: Vec<DVec3>,
     plane: WorkingPlane,
+}
+
+impl Default for Solid2dCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Solid2dCommand {

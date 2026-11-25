@@ -23,9 +23,9 @@
 // to f32 loses several hundredths of a unit at survey-scale coordinates).
 
 use crate::t;
-use codec::entities::{LwPolyline, LwVertex};
-use codec::types::Vector2;
-use codec::{EntityType, Handle};
+use document::entities::{LwPolyline, LwVertex};
+use document::types::Vector2;
+use document::{EntityType, Handle};
 use glam::{DVec2, DVec3, Vec2};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -49,9 +49,10 @@ pub fn tool() -> ToolDef {
 
 // ── Mode option (profile) ──────────────────────────────────────────────────
 
-static QUICK_DEFAULT: AtomicBool = AtomicBool::new(true);
+static QUICK_DEFAULT: AtomicBool = AtomicBool::new(false);
 
-/// "Always default to quick measure behavior?" — MEASUREGEOM's Mode answer.
+/// MEASUREMODE, a profile value: "Always default to quick measure
+/// behavior?" — MEASUREGEOM's Mode answer. Off for a new profile.
 pub fn quick_default() -> bool {
     QUICK_DEFAULT.load(Ordering::Relaxed)
 }
@@ -106,39 +107,54 @@ pub struct MeasureGeomCommand {
     name: &'static str,
     hovered: Option<(Handle, EntityType)>,
     first_line: Option<(Handle, DVec3)>,
+    /// Angle from a picked circle: the vertex is its centre and the first
+    /// endpoint the pick point, so Enter at the second endpoint measures 0.
+    angle_from_circle: bool,
     mode: Mode,
     /// The option prompt's default: the last option chosen.
     last: &'static str,
     /// Picked points for the active point-pick mode.
     points: Vec<DVec3>,
-    /// ARea / Volume: per picked point, the bulge of the segment leaving it
-    /// and whether it was drawn as an arc.
-    segs: Vec<(f64, bool)>,
+    /// Per picked point, the bulge of the segment leaving it (the last
+    /// one closes an ARea / Volume boundary).
+    segs: Vec<f64>,
     /// ARea / Volume: Arc segment mode and its sub-option.
     arc: bool,
     arc_sub: Sub,
     /// Exit direction of the last segment, in the working plane.
     tangent: Option<Vec2>,
+    /// Direction the drawing's last line or arc ended in (world): where a
+    /// first arc or length segment leaves.
+    start_direction: Option<DVec3>,
     volume: bool,
     sum: Sum,
     step: AreaStep,
     total: f64,
-    /// Area waiting for its height (Volume).
+    /// Area waiting for its height (Volume), and the point a picked
+    /// height is measured from.
     base_area: f64,
+    height_base: DVec3,
     /// The last Add / Subtract report, printed again by Enter at the
     /// object prompt.
     last_report: Option<String>,
     /// Distance: Multiple points.
     multiple: bool,
+    /// The last finished result, printed again after an invalid option.
+    last_result: Option<String>,
     /// The picked entity for RADIUS, injected before `on_entity_pick`.
     picked: Option<EntityType>,
     plane: WorkingPlane,
     /// QUICK readout for the last hovered cursor position.
     quick: std::cell::RefCell<Option<String>>,
     /// QUICK: the closed areas a click can measure, gathered on first hover.
-    quick_sources: std::cell::RefCell<
-        Option<rustc_hash::FxHashMap<Handle, crate::scene::BoundarySource>>,
-    >,
+    quick_sources:
+        std::cell::RefCell<Option<rustc_hash::FxHashMap<Handle, crate::scene::BoundarySource>>>,
+}
+
+impl Default for MeasureGeomCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MeasureGeomCommand {
@@ -147,6 +163,7 @@ impl MeasureGeomCommand {
             name: "MEASUREGEOM",
             hovered: None,
             first_line: None,
+            angle_from_circle: false,
             mode: if quick_default() {
                 Mode::Quick
             } else {
@@ -158,18 +175,27 @@ impl MeasureGeomCommand {
             arc: false,
             arc_sub: Sub::None,
             tangent: None,
+            start_direction: None,
             volume: false,
             sum: Sum::Single,
             step: AreaStep::Points,
             total: 0.0,
             base_area: 0.0,
+            height_base: DVec3::ZERO,
             last_report: None,
             multiple: false,
+            last_result: None,
             picked: None,
             plane: WorkingPlane::default(),
             quick: std::cell::RefCell::new(None),
             quick_sources: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The direction the drawing's last line or arc ended in.
+    pub fn with_last_direction(mut self, direction: Option<DVec3>) -> Self {
+        self.start_direction = direction;
+        self
     }
 
     pub fn radius() -> Self {
@@ -183,7 +209,7 @@ impl MeasureGeomCommand {
     pub fn angle() -> Self {
         Self {
             name: "MEASUREANGLE",
-            mode: Mode::Angle,
+            mode: Mode::AngleLines,
             ..Self::new()
         }
     }
@@ -192,6 +218,7 @@ impl MeasureGeomCommand {
     fn reset(&mut self) {
         self.hovered = None;
         self.first_line = None;
+        self.angle_from_circle = false;
         self.points.clear();
         self.segs.clear();
         self.arc = false;
@@ -211,8 +238,12 @@ impl MeasureGeomCommand {
         if self.name != "MEASUREGEOM" {
             return CmdResult::Measurement(message);
         }
+        // A refused option prints a finished area or volume again; a
+        // finished distance is not repeated.
+        let repeat = self.mode != Mode::Distance;
         self.reset();
         self.mode = Mode::Choose;
+        self.last_result = repeat.then(|| message.clone());
         CmdResult::ReportMeasurement(message)
     }
 
@@ -238,7 +269,7 @@ impl MeasureGeomCommand {
         self.volume = option == "Volume";
         self.mode = match option {
             "Radius" => Mode::Radius,
-            "Angle" => Mode::Angle,
+            "Angle" => Mode::AngleLines,
             "ARea" | "Volume" => Mode::Area,
             "Quick" => Mode::Quick,
             "Mode" => Mode::AskMode,
@@ -263,6 +294,82 @@ impl MeasureGeomCommand {
         ]
     }
 
+    /// `Invalid option keyword.` at the option prompt, with the last result
+    /// printed again.
+    fn invalid_option(&self) -> CmdResult {
+        let error = t!("Invalid option keyword.").into_owned();
+        match self.last_result.clone() {
+            Some(result) => CmdResult::ReportErrorAndMeasurement(error, result),
+            None => CmdResult::ReportError(error),
+        }
+    }
+
+    /// The error a sub-prompt of a chain (line length, an arc option)
+    /// prints for a word or for Enter (`enter`); None where Enter takes the
+    /// default (the tangent direction, the chord direction) or where no
+    /// sub-prompt is open.
+    fn sub_prompt_error(&self, enter: bool) -> Option<String> {
+        if self.step == AreaStep::Length {
+            return Some(t!("Requires numeric distance or second point.").into_owned());
+        }
+        if !self.arc {
+            return None;
+        }
+        let angle = || t!("Requires valid numeric angle or second point.").into_owned();
+        Some(match self.arc_sub {
+            Sub::None => return None,
+            Sub::ArcDirection if enter => return None,
+            _ if enter && self.chord_step() => return None,
+            Sub::ArcAngle | Sub::ArcRadiusAngle { .. } | Sub::ArcDirection => angle(),
+            Sub::ArcRadius | Sub::ArcAngleRadius { .. } => {
+                t!("Requires numeric distance or two points.").into_owned()
+            }
+            Sub::ArcAngleEnd { .. } | Sub::ArcCenterEnd { .. } | Sub::ArcRadiusEnd { .. } => {
+                crate::tr!("measurement", "point-or-keyword")
+            }
+            _ => crate::tr!("measurement", "invalid-2d-point"),
+        })
+    }
+
+    /// A line-length or arc sub-prompt of a boundary or a Multiple points
+    /// chain is open.
+    fn chain_sub_prompt(&self) -> bool {
+        let chain = self.mode == Mode::Area || (self.mode == Mode::Distance && self.multiple);
+        chain
+            && (self.step == AreaStep::Length
+                || (self.step == AreaStep::Points && self.arc && self.arc_sub != Sub::None))
+    }
+
+    /// Enter at a sub-prompt: the chord and tangent directions take their
+    /// default (the direction the chain leaves in), every other one is
+    /// refused and asked again.
+    fn sub_prompt_enter(&mut self) -> CmdResult {
+        if let Some(error) = self.sub_prompt_error(true) {
+            return CmdResult::ReportError(error);
+        }
+        if self.chord_step() {
+            return self
+                .arc_chord(self.tangent_degrees())
+                .unwrap_or(CmdResult::NeedPoint);
+        }
+        self.arc_sub = Sub::ArcDirectionEnd {
+            dir: self.heading(),
+        };
+        CmdResult::NeedPoint
+    }
+
+    /// Leave Angle without a measurement, printing `message` if any: back
+    /// to the option prompt (MEASUREGEOM) or out of MEASUREANGLE.
+    fn leave_angle(&mut self, message: Option<String>) -> CmdResult {
+        let message = message.unwrap_or_default();
+        let result = self.done(message.clone());
+        self.last_result = None;
+        if message.is_empty() && self.name == "MEASUREGEOM" {
+            return CmdResult::NeedPoint;
+        }
+        result
+    }
+
     fn keyword_error() -> CmdResult {
         CmdResult::ReportError(t!("Point or option keyword required.").into_owned())
     }
@@ -270,15 +377,31 @@ impl MeasureGeomCommand {
     /// Text that starts with a letter is an option keyword; anything else
     /// (a coordinate, a distance) is left to the point reader.
     fn is_keyword(input: &str) -> bool {
-        input.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        input
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
     }
 
     // ── ARea / Volume boundary ─────────────────────────────────────────────
 
-    /// Line segments in the boundary: Total is offered from two on.
+    /// Total is offered once the boundary has an arc segment or two
+    /// segments of non-zero length, even when they are collinear (the
+    /// closed boundary may then enclose no area); a repeated point adds a
+    /// zero-length segment that does not count.
     fn total_offered(&self) -> bool {
-        let segments = self.points.len().saturating_sub(1);
-        self.segs[..segments].iter().filter(|(_, arc)| !arc).count() >= 2
+        if self.points.len() < 2 {
+            return false;
+        }
+        let segments = self.points.len() - 1;
+        if self.segs.iter().take(segments).any(|bulge| *bulge != 0.0) {
+            return true;
+        }
+        self.points
+            .windows(2)
+            .filter(|pair| (pair[1] - pair[0]).length() > 1e-9)
+            .count()
+            >= 2
     }
 
     fn local(&self, point: DVec3) -> DVec3 {
@@ -298,7 +421,7 @@ impl MeasureGeomCommand {
             self.tangent = seg_exit_tangent(last, self.local(point), 0.0).or(self.tangent);
         }
         self.points.push(point);
-        self.segs.push((0.0, false));
+        self.segs.push(0.0);
         CmdResult::NeedPoint
     }
 
@@ -309,19 +432,23 @@ impl MeasureGeomCommand {
         };
         let end = DVec3::new(e.x, e.y, last.z);
         let index = self.points.len() - 1;
-        self.segs[index] = (bulge, true);
+        self.segs[index] = bulge;
         self.tangent = seg_exit_tangent(last, end, bulge);
         self.arc_sub = Sub::None;
         self.points.push(self.plane.to_world(end));
-        self.segs.push((0.0, false));
+        self.segs.push(0.0);
         CmdResult::NeedPoint
     }
 
     fn undo_point(&mut self) -> CmdResult {
+        // Undo goes back to the mode of the segment it removes: undoing an
+        // arc stays in arc mode, undoing a line returns to line mode.
+        let n = self.segs.len();
+        self.arc = n >= 2 && self.segs[n - 2] != 0.0;
         self.points.pop();
         self.segs.pop();
         if let Some(last) = self.segs.last_mut() {
-            *last = (0.0, false);
+            *last = 0.0;
         }
         self.arc_sub = Sub::None;
         let count = self.points.len();
@@ -330,7 +457,7 @@ impl MeasureGeomCommand {
                 seg_exit_tangent(
                     self.local(self.points[count - 2]),
                     self.local(self.points[count - 1]),
-                    self.segs[count - 2].0,
+                    self.segs[count - 2],
                 )
             })
             .flatten();
@@ -338,7 +465,17 @@ impl MeasureGeomCommand {
     }
 
     fn heading(&self) -> DVec2 {
-        self.tangent.map_or(DVec2::X, |tangent| tangent.as_dvec2())
+        self.entry_tangent()
+            .map_or(DVec2::X, |tangent| tangent.as_dvec2())
+    }
+
+    /// Direction the next segment leaves in: the last segment's, or for the
+    /// first one the drawing's last line or arc direction.
+    fn entry_tangent(&self) -> Option<Vec2> {
+        self.tangent.or_else(|| {
+            let local = self.plane.vector_to_local(self.start_direction?).truncate();
+            local.try_normalize().map(|direction| direction.as_vec2())
+        })
     }
 
     /// Arc option answered with a typed value.
@@ -358,12 +495,16 @@ impl MeasureGeomCommand {
                 angle: value.to_radians(),
             },
             sub @ Sub::ArcCenterAngle { .. } => {
-                let (e, bulge) =
-                    arc_for(sub, a, DVec2::new(value.to_radians(), 0.0), self.tangent)?;
+                let (e, bulge) = arc_for(
+                    sub,
+                    a,
+                    DVec2::new(value.to_radians(), 0.0),
+                    self.entry_tangent(),
+                )?;
                 return Some(self.push_arc(e, bulge));
             }
             sub @ Sub::ArcCenterLength { .. } => {
-                let (e, bulge) = arc_for(sub, a, DVec2::new(value, 0.0), self.tangent)?;
+                let (e, bulge) = arc_for(sub, a, DVec2::new(value, 0.0), self.entry_tangent())?;
                 return Some(self.push_arc(e, bulge));
             }
             _ => return None,
@@ -388,9 +529,15 @@ impl MeasureGeomCommand {
             return self.arc_value(value).unwrap_or(CmdResult::NeedPoint);
         }
         match sub {
-            // The endpoint of an arc leaving along the last segment.
+            // The endpoint of an arc leaving along the last segment. One
+            // lying on that direction makes no arc: the point is dropped and
+            // the arc prompt is not printed again.
             Sub::None if (p - a).length_squared() > 1e-12 => {
-                return self.push_arc(p, compute_bulge(a, self.heading(), p));
+                let bulge = compute_bulge(a, self.heading(), p);
+                if bulge == 0.0 {
+                    return CmdResult::NeedPointQuiet;
+                }
+                return self.push_arc(p, bulge);
             }
             Sub::ArcCenter if (p - a).length_squared() > 1e-12 => {
                 self.arc_sub = Sub::ArcCenterEnd { c: p }
@@ -405,7 +552,7 @@ impl MeasureGeomCommand {
             }
             Sub::None | Sub::ArcCenter | Sub::ArcSecond => {}
             _ => {
-                if let Some((e, bulge)) = arc_for(sub, a, p, self.tangent) {
+                if let Some((e, bulge)) = arc_for(sub, a, p, self.entry_tangent()) {
                     return self.push_arc(e, bulge);
                 }
             }
@@ -422,7 +569,7 @@ impl MeasureGeomCommand {
     fn arc_chord(&mut self, degrees: f64) -> Option<CmdResult> {
         let a = self.last2()?;
         let p = a + DVec2::from_angle(degrees.to_radians());
-        let (e, bulge) = arc_for(self.arc_sub, a, p, self.tangent)?;
+        let (e, bulge) = arc_for(self.arc_sub, a, p, self.entry_tangent())?;
         Some(self.push_arc(e, bulge))
     }
 
@@ -437,45 +584,33 @@ impl MeasureGeomCommand {
         if self.chord_step() {
             let default = format!("{:.4}", self.tangent_degrees());
             let default = default.trim_end_matches('0').trim_end_matches('.');
-            return t!(
-                "Specify direction of chord for arc (hold Ctrl to switch direction) <%{default}>:",
-                default = default
-            )
-            .into_owned();
+            return crate::tr!("measurement", "arc-chord-direction", default = default);
         }
-        let source = match self.arc_sub {
-            Sub::ArcCenterAngle { .. } => "Specify included angle (hold Ctrl to switch direction):",
-            Sub::ArcAngle | Sub::ArcRadiusAngle { .. } => "Specify included angle:",
-            Sub::ArcAngleEnd { .. } => {
-                "Specify endpoint of arc (hold Ctrl to switch direction) or [CEnter/Radius]:"
+        match self.arc_sub {
+            // MEASUREGEOM shows no Ctrl hint here, after CEnter included.
+            Sub::ArcAngle | Sub::ArcRadiusAngle { .. } | Sub::ArcCenterAngle { .. } => {
+                crate::tr!("measurement", "arc-included-angle")
             }
-            Sub::ArcCenter | Sub::ArcAngleCenter { .. } => "Specify center point of arc:",
-            Sub::ArcCenterEnd { .. } => {
-                "Specify endpoint of arc (hold Ctrl to switch direction) or [Angle/Length]:"
-            }
-            Sub::ArcCenterLength { .. } => {
-                "Specify length of chord (hold Ctrl to switch direction):"
-            }
-            Sub::ArcDirection => "Specify the tangent direction for the start point of arc:",
-            Sub::ArcDirectionEnd { .. } => {
-                "Specify endpoint of the arc (hold Ctrl to switch direction):"
-            }
-            Sub::ArcRadius | Sub::ArcAngleRadius { .. } => "Specify radius of arc:",
-            Sub::ArcRadiusEnd { .. } => {
-                "Specify endpoint of arc (hold Ctrl to switch direction) or [Angle]:"
-            }
-            Sub::ArcSecond => "Specify second point on arc:",
-            Sub::ArcSecondEnd { .. } => "Specify end point of arc:",
-            _ => return crate::tr!("measurement", "arc-endpoint"),
-        };
-        t!(source).into_owned()
+            Sub::ArcAngleEnd { .. } => crate::tr!("measurement", "arc-end-center-radius"),
+            Sub::ArcCenter | Sub::ArcAngleCenter { .. } => crate::tr!("measurement", "arc-center"),
+            Sub::ArcCenterEnd { .. } => crate::tr!("measurement", "arc-end-angle-length"),
+            Sub::ArcCenterLength { .. } => crate::tr!("measurement", "arc-chord-length"),
+            Sub::ArcDirection => crate::tr!("measurement", "arc-tangent-direction"),
+            Sub::ArcDirectionEnd { .. } => crate::tr!("measurement", "arc-end-direction"),
+            Sub::ArcRadius | Sub::ArcAngleRadius { .. } => crate::tr!("measurement", "arc-radius"),
+            Sub::ArcRadiusEnd { .. } => crate::tr!("measurement", "arc-end-angle"),
+            Sub::ArcSecond => crate::tr!("measurement", "arc-second"),
+            Sub::ArcSecondEnd { .. } => crate::tr!("measurement", "arc-end"),
+            _ if self.points.len() >= 2 => crate::tr!("measurement", "arc-endpoint-close"),
+            _ => crate::tr!("measurement", "arc-endpoint"),
+        }
     }
 
     /// Area and perimeter of the boundary (closed back to its first point),
     /// with `cursor` as a further line point when given.
     fn boundary_measurement(&self, cursor: Option<DVec3>) -> AreaMeasurement {
         let mut points = self.points.clone();
-        let mut bulges: Vec<f64> = self.segs.iter().map(|(bulge, _)| *bulge).collect();
+        let mut bulges = self.segs.clone();
         if let Some(cursor) = cursor {
             if let Some(last) = bulges.last_mut() {
                 *last = 0.0;
@@ -484,7 +619,7 @@ impl MeasureGeomCommand {
             bulges.push(0.0);
         }
         if bulges.iter().all(|bulge| *bulge == 0.0) {
-            return AreaCommand::point_measurement(&points, true);
+            return AreaCommand::plane_measurement(self.plane, &points);
         }
         // Arcs: measured exactly as a closed bulged polyline in the plane.
         let mut polyline = LwPolyline::new();
@@ -500,7 +635,7 @@ impl MeasureGeomCommand {
             })
             .collect();
         AreaCommand::entity_measurement(&EntityType::LwPolyline(polyline))
-            .unwrap_or_else(|| AreaCommand::point_measurement(&points, true))
+            .unwrap_or_else(|| AreaCommand::plane_measurement(self.plane, &points))
     }
 
     fn area_message(measurement: AreaMeasurement, circle: bool) -> String {
@@ -561,6 +696,7 @@ impl MeasureGeomCommand {
         let measurement = self.boundary_measurement(None);
         if self.volume {
             self.base_area = measurement.area;
+            self.height_base = self.points.last().copied().unwrap_or_default();
             self.step = AreaStep::Height;
             return CmdResult::NeedPoint;
         }
@@ -568,11 +704,7 @@ impl MeasureGeomCommand {
     }
 
     fn finish_volume(&mut self, volume: f64) -> CmdResult {
-        let message = crate::tr!(
-            "measurement",
-            "volume-result",
-            volume = area_text(volume)
-        );
+        let message = crate::tr!("measurement", "volume-result", volume = area_text(volume));
         self.report(volume, message)
     }
 
@@ -583,9 +715,9 @@ impl MeasureGeomCommand {
             EntityType::Body(body) => &body.acis_data,
             _ => return None,
         };
-        crate::scene::convert::solid3d_tess::kernel_acis_body(acis)
-            .and_then(|body| kernel::brep::mass_properties(&body))
-            .map(|properties| properties.volume.abs())
+        crate::scene::convert::solid3d_tess::acis_record(acis)
+            .and_then(|body| ocs_solid::model::volume(&body).ok())
+            .map(f64::abs)
     }
 
     /// eXit at the first-corner prompt: Add / Subtract print the total once
@@ -603,40 +735,84 @@ impl MeasureGeomCommand {
     fn area_text(&mut self, input: &str) -> Option<CmdResult> {
         match self.step {
             AreaStep::Height => {
+                // A point gives the height from the base point.
+                if Self::is_point_text(input) {
+                    return None;
+                }
                 return Some(match crate::entities::common::parse_typed_length(input) {
-                    Some(height) => {
-                        let volume = self.base_area * height;
-                        // Back to the step the height was asked from.
-                        self.step = if self.points.is_empty() {
-                            AreaStep::Objects
-                        } else {
-                            AreaStep::Points
-                        };
-                        self.finish_volume(volume)
-                    }
+                    Some(height) => self.finish_height(height),
                     None => CmdResult::ReportError(
                         t!("Requires numeric distance or two points.").into_owned(),
                     ),
                 });
             }
-            AreaStep::Length => {
-                let Some(length) = crate::entities::common::parse_typed_length(input) else {
-                    return Some(CmdResult::ReportError(
-                        t!("Requires numeric distance or two points.").into_owned(),
-                    ));
-                };
-                let last = self.last_local()?;
-                let direction = self.heading();
-                self.step = AreaStep::Points;
-                let end = last + DVec3::new(direction.x, direction.y, 0.0) * length;
-                return Some(self.push_point(self.plane.to_world(end)));
+            AreaStep::Objects => {
+                // Points and Last are object picks; any other keyword is not.
+                if !Self::is_keyword(input) || matches!(input, "L" | "LAST") {
+                    return None;
+                }
+                return Some(CmdResult::ReportError(crate::tr!(
+                    "measurement",
+                    "invalid-selection"
+                )));
             }
-            AreaStep::Objects => return None,
-            AreaStep::Points => {}
+            AreaStep::Points | AreaStep::Length => {}
+        }
+        if !self.points.is_empty() {
+            return self.chain_text(input);
+        }
+        if !Self::is_keyword(input) {
+            return None;
+        }
+        match input {
+            "O" | "OBJECT" => self.step = AreaStep::Objects,
+            "A" | "ADD" | "ADD AREA" | "ADD VOLUME" if self.sum != Sum::Add => {
+                if self.sum == Sum::Single {
+                    self.total = 0.0;
+                }
+                self.sum = Sum::Add;
+            }
+            "S" | "SUBTRACT" | "SUBTRACT AREA" | "SUBTRACT VOLUME" if self.sum != Sum::Subtract => {
+                if self.sum == Sum::Single {
+                    self.total = 0.0;
+                }
+                self.sum = Sum::Subtract;
+            }
+            "X" | "EXIT" => return Some(self.exit_area()),
+            _ => return Some(Self::keyword_error()),
+        }
+        Some(CmdResult::NeedPoint)
+    }
+
+    /// A typed coordinate rather than a single value.
+    fn is_point_text(input: &str) -> bool {
+        input.contains(',') || input.starts_with('@') || input.contains('<')
+    }
+
+    /// Keywords and values of a chain of picked points (an ARea / Volume
+    /// boundary or Distance's Multiple points): Arc, Length, Undo, Close,
+    /// Total and the arc options.
+    fn chain_text(&mut self, input: &str) -> Option<CmdResult> {
+        if self.step == AreaStep::Length {
+            if Self::is_point_text(input) {
+                return None;
+            }
+            let Some(length) = crate::entities::common::parse_typed_length(input) else {
+                return self.sub_prompt_error(false).map(CmdResult::ReportError);
+            };
+            let last = self.last_local()?;
+            let end = last + self.heading().extend(0.0) * length;
+            self.step = AreaStep::Points;
+            return Some(self.push_point(self.plane.to_world(end)));
         }
         if self.arc && self.chord_step() {
-            let degrees = crate::entities::common::parse_typed_angle(input)?.to_degrees();
-            return self.arc_chord(degrees);
+            if Self::is_point_text(input) {
+                return None;
+            }
+            let Some(radians) = crate::entities::common::parse_typed_angle(input) else {
+                return self.sub_prompt_error(false).map(CmdResult::ReportError);
+            };
+            return self.arc_chord(radians.to_degrees());
         }
         if self.arc && self.arc_sub != Sub::None {
             let next = match (self.arc_sub, input) {
@@ -647,15 +823,20 @@ impl MeasureGeomCommand {
                 (Sub::ArcCenterEnd { c }, "A" | "ANGLE") => Sub::ArcCenterAngle { c },
                 (Sub::ArcCenterEnd { c }, "L" | "LENGTH") => Sub::ArcCenterLength { c },
                 (Sub::ArcRadiusEnd { r }, "A" | "ANGLE") => Sub::ArcRadiusAngle { r },
-                (sub, text) if sub.is_scalar() => {
+                (sub, text) if sub.is_scalar() && !Self::is_point_text(text) => {
                     let value = if sub.is_angle() {
                         crate::entities::common::parse_typed_angle(text).map(f64::to_degrees)
                     } else {
                         crate::entities::common::parse_typed_length(text)
                     };
-                    return value.and_then(|v| self.arc_value(v));
+                    return match value {
+                        Some(v) => self.arc_value(v),
+                        None => self.sub_prompt_error(false).map(CmdResult::ReportError),
+                    };
                 }
-                (_, text) if Self::is_keyword(text) => return Some(Self::keyword_error()),
+                (_, text) if Self::is_keyword(text) => {
+                    return self.sub_prompt_error(false).map(CmdResult::ReportError);
+                }
                 _ => return None,
             };
             self.arc_sub = next;
@@ -664,27 +845,19 @@ impl MeasureGeomCommand {
         if !Self::is_keyword(input) {
             return None;
         }
-        if self.points.is_empty() {
-            match input {
-                "O" | "OBJECT" => self.step = AreaStep::Objects,
-                "A" | "ADD" | "ADD AREA" | "ADD VOLUME" if self.sum != Sum::Add => {
-                    if self.sum == Sum::Single {
-                        self.total = 0.0;
-                    }
-                    self.sum = Sum::Add;
-                }
-                "S" | "SUBTRACT" | "SUBTRACT AREA" | "SUBTRACT VOLUME"
-                    if self.sum != Sum::Subtract =>
-                {
-                    if self.sum == Sum::Single {
-                        self.total = 0.0;
-                    }
-                    self.sum = Sum::Subtract;
-                }
-                "X" | "EXIT" => return Some(self.exit_area()),
-                _ => return Some(Self::keyword_error()),
-            }
-            return Some(CmdResult::NeedPoint);
+        let distance = self.mode == Mode::Distance;
+        // The first point stays: Undo there has nothing left to undo.
+        let can_undo = self.points.len() > 1;
+        if matches!(input, "U" | "UNDO") && !can_undo {
+            let message = crate::tr!("measurement", "all-undone");
+            // A Distance chain prints only the first line; an area boundary
+            // adds "Command has been completely undone.".
+            let message = if distance {
+                message.lines().next().unwrap_or_default().to_string()
+            } else {
+                message
+            };
+            return Some(CmdResult::ReportMessage(message));
         }
         if self.arc {
             self.arc_sub = match input {
@@ -697,7 +870,8 @@ impl MeasureGeomCommand {
                     self.arc = false;
                     Sub::None
                 }
-                "U" | "UNDO" => return Some(self.undo_point()),
+                "CL" | "CLOSE" if self.points.len() >= 2 => return Some(self.close(true)),
+                "U" | "UNDO" if can_undo => return Some(self.undo_point()),
                 _ => return Some(Self::keyword_error()),
             };
             return Some(CmdResult::NeedPoint);
@@ -711,23 +885,124 @@ impl MeasureGeomCommand {
                 self.step = AreaStep::Length;
                 CmdResult::NeedPoint
             }
-            "U" | "UNDO" => self.undo_point(),
-            "T" | "TOTAL" if self.total_offered() => self.finish_boundary(),
+            "U" | "UNDO" if can_undo => self.undo_point(),
+            "C" | "CLOSE" if distance && self.points.len() >= 2 => self.close(false),
+            "T" | "TOTAL" if distance || self.total_offered() => self.finish_chain(),
             _ => Self::keyword_error(),
         })
     }
 
-    fn area_object(&mut self, entity: EntityType) -> CmdResult {
+    /// Close the chain back to its first point (with a tangent arc in arc
+    /// mode) and finish it.
+    fn close(&mut self, arc: bool) -> CmdResult {
+        let (Some(first), Some(last)) = (self.points.first().copied(), self.last2()) else {
+            return CmdResult::NeedPoint;
+        };
+        let start = self.local(first).truncate();
+        let bulge = if arc {
+            compute_bulge(last, self.heading(), start)
+        } else {
+            0.0
+        };
+        if self.mode == Mode::Distance {
+            self.push_arc(start, bulge);
+        } else if let Some(closing) = self.segs.last_mut() {
+            *closing = bulge;
+        }
+        self.finish_chain()
+    }
+
+    /// Total / Enter: Distance prints the chain length, ARea measures the
+    /// boundary, Volume asks its height.
+    fn finish_chain(&mut self) -> CmdResult {
+        if self.mode == Mode::Distance {
+            let message = self.running_distance();
+            return self.done(message);
+        }
+        self.finish_boundary()
+    }
+
+    /// Length of the picked chain, arcs included, with `cursor` as a further
+    /// line point when given.
+    fn chain_length(&self, cursor: Option<DVec3>) -> f64 {
+        let mut points: Vec<DVec3> = self.points.iter().map(|p| self.local(*p)).collect();
+        let mut bulges = self.segs.clone();
+        if let Some(cursor) = cursor {
+            points.push(self.local(cursor));
+            bulges.push(0.0);
+        }
+        points
+            .windows(2)
+            .zip(bulges)
+            .map(|(pair, bulge)| {
+                if bulge == 0.0 {
+                    return (pair[1] - pair[0]).length();
+                }
+                let sweep = 4.0 * bulge.atan();
+                (pair[1] - pair[0]).truncate().length() * (sweep * 0.5) / (sweep * 0.5).sin()
+            })
+            .sum()
+    }
+
+    fn running_distance(&self) -> String {
+        crate::tr!(
+            "measurement",
+            "distance",
+            value = length_text(self.chain_length(None))
+        )
+    }
+
+    /// Multiple points: every change of the chain prints its length.
+    /// Switching between line and arc mode prints it too, and a refused
+    /// entry prints it again after the error. With only the first point
+    /// there is no chain yet and nothing is printed.
+    fn report_chain_change(&mut self, before: (usize, bool), result: CmdResult) -> CmdResult {
+        if self.mode != Mode::Distance || !self.multiple || self.points.len() < 2 {
+            return result;
+        }
+        let changed = self.points.len() != before.0 || self.arc != before.1;
+        match result {
+            CmdResult::NeedPoint | CmdResult::NeedPointQuiet if changed => {
+                CmdResult::ReportMeasurement(self.running_distance())
+            }
+            // A sub-prompt (line length, an arc option) only repeats itself.
+            CmdResult::ReportError(error) if self.sub_prompt_error(false).is_some() => {
+                CmdResult::ReportError(error)
+            }
+            CmdResult::ReportError(error) => {
+                CmdResult::ReportErrorAndMeasurement(error, self.running_distance())
+            }
+            result => result,
+        }
+    }
+
+    /// The height typed (or measured from the base point) for Volume.
+    fn finish_height(&mut self, height: f64) -> CmdResult {
+        let volume = self.base_area * height;
+        // Back to the step the height was asked from.
+        self.step = if self.points.is_empty() {
+            AreaStep::Objects
+        } else {
+            AreaStep::Points
+        };
+        self.finish_volume(volume)
+    }
+
+    fn area_object(&mut self, entity: EntityType, point: DVec3) -> CmdResult {
         if self.volume {
             if let Some(volume) = Self::solid_volume(&entity) {
                 return self.finish_volume(volume);
             }
         }
-        let Some(measurement) = AreaCommand::entity_measurement(&entity) else {
+        // A line (no enclosed area) is refused like a text.
+        let Some(measurement) =
+            AreaCommand::entity_measurement(&entity).filter(|measurement| measurement.area > 0.0)
+        else {
             return CmdResult::ReportError(crate::tr!("measurement", "not-measurable"));
         };
         if self.volume {
             self.base_area = measurement.area;
+            self.height_base = point;
             self.step = AreaStep::Height;
             return CmdResult::NeedPoint;
         }
@@ -803,17 +1078,32 @@ impl MeasureGeomCommand {
                 Sum::Subtract => vec![objects, add, exit],
             };
         }
+        self.chain_options()
+    }
+
+    /// Options of a point chain step (ARea / Volume boundary, Multiple points).
+    fn chain_options(&self) -> Vec<CmdOption> {
+        if self.step != AreaStep::Points {
+            return Vec::new();
+        }
+        let distance = self.mode == Mode::Distance;
         if self.arc {
             return match self.arc_sub {
-                Sub::None => vec![
-                    CmdOption::new("Angle", "A"),
-                    CmdOption::new("CEnter", "CE"),
-                    CmdOption::new("Direction", "D"),
-                    CmdOption::new("Line", "L"),
-                    CmdOption::new("Radius", "R"),
-                    CmdOption::new("Second pt", "S"),
-                    CmdOption::new("Undo", "U"),
-                ],
+                Sub::None => {
+                    let mut options =
+                        vec![CmdOption::new("Angle", "A"), CmdOption::new("CEnter", "CE")];
+                    if self.points.len() >= 2 {
+                        options.push(CmdOption::new("CLose", "CL"));
+                    }
+                    options.extend([
+                        CmdOption::new("Direction", "D"),
+                        CmdOption::new("Line", "L"),
+                        CmdOption::new("Radius", "R"),
+                        CmdOption::new("Second pt", "S"),
+                        CmdOption::new("Undo", "U"),
+                    ]);
+                    options
+                }
                 Sub::ArcAngleEnd { .. } => vec![
                     CmdOption::new("CEnter", "CE"),
                     CmdOption::new("Radius", "R"),
@@ -825,12 +1115,13 @@ impl MeasureGeomCommand {
                 _ => Vec::new(),
             };
         }
-        let mut options = vec![
-            CmdOption::new("Arc", "A"),
-            CmdOption::new("Length", "L"),
-            CmdOption::new("Undo", "U"),
-        ];
-        if self.total_offered() {
+        let mut options = vec![CmdOption::new("Arc", "A")];
+        if distance && self.points.len() >= 2 {
+            options.push(CmdOption::new("Close", "C"));
+        }
+        options.push(CmdOption::new("Length", "L"));
+        options.push(CmdOption::new("Undo", "U"));
+        if distance || self.total_offered() {
             options.push(CmdOption::new("Total", "T"));
         }
         options
@@ -841,7 +1132,7 @@ impl MeasureGeomCommand {
         let mut out = Vec::new();
         for (index, point) in self.points.iter().enumerate() {
             out.push(*point);
-            let bulge = self.segs[index].0;
+            let bulge = self.segs[index];
             let Some(next) = self.points.get(index + 1) else {
                 break;
             };
@@ -890,16 +1181,6 @@ impl MeasureGeomCommand {
         Some(a.cross(b).length().atan2(a.dot(b)).to_degrees())
     }
 
-    fn line_direction(entity: &EntityType) -> Option<DVec3> {
-        let EntityType::Line(line) = entity else {
-            return None;
-        };
-        Self::direction(
-            DVec3::new(line.end.x, line.end.y, line.end.z)
-                - DVec3::new(line.start.x, line.start.y, line.start.z),
-        )
-    }
-
     // Unoriented lines: the smaller angle, independent of endpoint order.
     fn line_angle(a: DVec3, b: DVec3) -> Option<f64> {
         Self::angle_degrees(a, b).map(|angle| angle.min(180.0 - angle))
@@ -938,7 +1219,7 @@ impl MeasureGeomCommand {
             EntityType::Region(_) => {
                 let source = crate::scene::dimension_assoc::radial_source_at(
                     entity,
-                    codec::types::Vector3::new(point.x, point.y, point.z),
+                    document::types::Vector3::new(point.x, point.y, point.z),
                 )?;
                 (source.radius.is_finite()
                     && source.radius > 0.0
@@ -971,11 +1252,6 @@ impl MeasureGeomCommand {
             dz = format_length(delta.z)
         );
         format!("{first}\n{second}")
-    }
-
-    /// Length of the Multiple points chain.
-    fn chain_length(points: &[DVec3]) -> f64 {
-        points.windows(2).map(|pair| (pair[1] - pair[0]).length()).sum()
     }
 
     /// The Area readout for an area and perimeter measured outright.
@@ -1069,11 +1345,18 @@ impl MeasureGeomCommand {
     /// (world): a line or straight polyline segment's length, as that edge,
     /// or an arc's or circle's radius, as a line from the centre. The edge
     /// comes back too, for the distance between two parallel ones.
-    fn quick_object(entity: &EntityType, hit: DVec3) -> Option<(Vec<DVec3>, String, Option<[DVec3; 2]>)> {
-        let v = |p: codec::Vector3| DVec3::new(p.x, p.y, p.z);
+    fn quick_object(
+        entity: &EntityType,
+        hit: DVec3,
+    ) -> Option<(Vec<DVec3>, String, Option<[DVec3; 2]>)> {
+        let v = |p: document::Vector3| DVec3::new(p.x, p.y, p.z);
         let length = |a: DVec3, b: DVec3| {
             let value = crate::entities::common::format_length(a.distance(b));
-            (vec![a, b], crate::tr!("measurement", "quick-length", value = value), Some([a, b]))
+            (
+                vec![a, b],
+                crate::tr!("measurement", "quick-length", value = value),
+                Some([a, b]),
+            )
         };
         let radius = |center: DVec3, r: f64| (vec![center, hit], Self::radius_msg(r), None);
         match entity {
@@ -1135,7 +1418,8 @@ impl MeasureGeomCommand {
             };
             let mut local = c;
             local[slot / 2] += offset;
-            let Some((points, line, edge)) = Self::quick_object(entity, plane.to_world(local)) else {
+            let Some((points, line, edge)) = Self::quick_object(entity, plane.to_world(local))
+            else {
                 continue;
             };
             edges[slot] = edge;
@@ -1163,7 +1447,10 @@ impl MeasureGeomCommand {
             let foot = |x: DVec3, a: DVec3| a + dir * (x - a).dot(dir);
             let mid = foot(cursor, a);
             let across = foot(mid, p);
-            wires.push(Self::preview_wire("measuregeom_quick_parallel", vec![mid, across]));
+            wires.push(Self::preview_wire(
+                "measuregeom_quick_parallel",
+                vec![mid, across],
+            ));
             let value = crate::entities::common::format_length(mid.distance(across));
             lines.push(crate::tr!("measurement", "quick-parallel", value = value));
         }
@@ -1240,9 +1527,7 @@ impl CadCommand for MeasureGeomCommand {
 
     fn prompt(&self) -> String {
         match self.mode {
-            Mode::Choose => {
-                return crate::tr!("measurement", "option-prompt", default = self.last)
-            }
+            Mode::Choose => return crate::tr!("measurement", "option-prompt", default = self.last),
             Mode::AskMode => return crate::tr!("measurement", "mode-prompt"),
             Mode::Quick => return crate::tr!("measurement", "quick-options", command = self.name),
             Mode::Area => return self.area_prompt(),
@@ -1250,22 +1535,29 @@ impl CadCommand for MeasureGeomCommand {
                 return match (self.points.len(), self.multiple) {
                     (0, _) => crate::tr!("measurement", "first-point"),
                     (_, false) => crate::tr!("measurement", "second-point"),
-                    (_, true) => crate::tr!("measurement", "next-point-multiple"),
+                    _ if self.step == AreaStep::Length => {
+                        crate::tr!("measurement", "length-of-line")
+                    }
+                    _ if self.arc => self.arc_prompt(),
+                    (1, true) => crate::tr!("measurement", "next-point-multiple"),
+                    (_, true) => crate::tr!("measurement", "next-point-multiple-close"),
                 }
             }
-            Mode::Angle => match self.points.len() {
-                0 => return crate::tr!("measurement", "angle-start", command = self.name),
-                1 => t!("MEASUREGEOM  Specify first ray point:").into_owned(),
-                _ => t!("MEASUREGEOM  Specify second ray point:").into_owned(),
-            },
+            Mode::Angle => {
+                return match self.points.len() {
+                    0 => crate::tr!("measurement", "angle-vertex"),
+                    1 => crate::tr!("measurement", "angle-first-end"),
+                    _ => crate::tr!("measurement", "angle-second-end"),
+                }
+            }
             Mode::Radius => {
                 t!("MEASUREGEOM  Select arc, circle, or circular region edge:").into_owned()
             }
             Mode::AngleLines => {
                 return if self.first_line.is_none() {
-                    crate::tr!("measurement", "first-line", command = self.name)
+                    crate::tr!("measurement", "angle-start")
                 } else {
-                    crate::tr!("measurement", "second-line", command = self.name)
+                    crate::tr!("measurement", "second-line")
                 }
             }
         }
@@ -1286,10 +1578,9 @@ impl CadCommand for MeasureGeomCommand {
 
     fn point_step_accepts_keywords(&self) -> bool {
         match self.mode {
-            Mode::Quick | Mode::Distance => true,
-            Mode::Area => self.step == AreaStep::Points,
-            Mode::Angle => self.points.is_empty(),
-            Mode::AngleLines => self.first_line.is_none(),
+            Mode::Quick => true,
+            Mode::Distance | Mode::Area => self.step == AreaStep::Points,
+            Mode::Angle | Mode::AngleLines => true,
             _ => false,
         }
     }
@@ -1301,13 +1592,11 @@ impl CadCommand for MeasureGeomCommand {
     fn measurement_readout(&self, cursor: DVec3) -> Option<String> {
         match self.mode {
             Mode::Quick => self.quick.borrow().clone(),
-            Mode::Distance if !self.points.is_empty() && cursor.is_finite() => {
-                let mut points = self.points.clone();
-                points.push(cursor);
+            Mode::Distance if !self.points.is_empty() && !self.arc && cursor.is_finite() => {
                 Some(crate::tr!(
                     "measurement",
                     "distance",
-                    value = length_text(Self::chain_length(&points))
+                    value = length_text(self.chain_length(Some(cursor)))
                 ))
             }
             Mode::Area
@@ -1329,13 +1618,16 @@ impl CadCommand for MeasureGeomCommand {
                 .as_ref()
                 .and_then(|(_, e)| Self::radius_at(e, cursor))
                 .map(Self::radius_msg),
+            // As the pick reads it: a polyline's straight segment counts,
+            // another segment of the same polyline too.
             Mode::AngleLines => {
-                let (first_handle, first) = self.first_line?;
-                let (handle, entity) = self.hovered.as_ref()?;
-                if first_handle == *handle {
+                use crate::modules::annotate::angular_dim::{picked_shape, PickedShape};
+                let (_, first) = self.first_line?;
+                let (_, entity) = self.hovered.as_ref()?;
+                let Some(PickedShape::Line { direction }) = picked_shape(entity, cursor) else {
                     return None;
-                }
-                Self::line_angle(first, Self::line_direction(entity)?).map(Self::angle_value_msg)
+                };
+                Self::line_angle(first, direction).map(Self::angle_value_msg)
             }
             _ => None,
         }
@@ -1350,17 +1642,7 @@ impl CadCommand for MeasureGeomCommand {
                 label: crate::tr!("measurement", "option-multiple-points"),
                 keyword: "M".into(),
             }],
-            Mode::Distance if self.multiple => {
-                vec![CmdOption::new("Undo", "U"), CmdOption::new("Total", "T")]
-            }
-            Mode::Angle if self.points.is_empty() => vec![CmdOption {
-                label: crate::tr!("measurement", "lines"),
-                keyword: "LINES".into(),
-            }],
-            Mode::AngleLines if self.first_line.is_none() => vec![CmdOption {
-                label: crate::tr!("measurement", "points"),
-                keyword: "POINTS".into(),
-            }],
+            Mode::Distance if self.multiple => self.chain_options(),
             _ => Vec::new(),
         }
     }
@@ -1369,12 +1651,10 @@ impl CadCommand for MeasureGeomCommand {
         let input = text.trim().to_ascii_uppercase();
         match self.mode {
             Mode::Choose => {
-                if !Self::is_keyword(&input) {
-                    return None;
-                }
-                return Some(self.choose(&input).unwrap_or_else(|| {
-                    CmdResult::ReportError(t!("Invalid option keyword.").into_owned())
-                }));
+                return Some(match self.choose(&input) {
+                    Some(result) => result,
+                    None => self.invalid_option(),
+                });
             }
             // A letter that is no option is left alone: quick measure keeps
             // following the cursor.
@@ -1383,52 +1663,57 @@ impl CadCommand for MeasureGeomCommand {
                 let quick = match input.as_str() {
                     "Y" | "YES" => true,
                     "N" | "NO" => false,
-                    _ => return Some(CmdResult::ReportError(t!("Invalid option keyword.").into_owned())),
+                    _ => {
+                        return Some(CmdResult::ReportError(
+                            t!("Invalid option keyword.").into_owned(),
+                        ))
+                    }
                 };
                 set_quick_default(quick);
-                self.mode = Mode::Choose;
+                // Yes goes straight on to quick measure; No to the option
+                // prompt, which then offers Mode again.
+                self.mode = if quick { Mode::Quick } else { Mode::Choose };
                 return Some(CmdResult::NeedPoint);
             }
             Mode::Area => return self.area_text(&input),
             Mode::Distance => {
+                if self.multiple {
+                    let before = (self.points.len(), self.arc);
+                    let result = self.chain_text(&input)?;
+                    return Some(self.report_chain_change(before, result));
+                }
                 if !Self::is_keyword(&input) {
                     return None;
                 }
                 return Some(match input.as_str() {
-                    "M" | "MULTIPLE" | "MULTIPLE POINTS"
-                        if self.points.len() == 1 && !self.multiple =>
-                    {
+                    "M" | "MULTIPLE" | "MULTIPLE POINTS" if self.points.len() == 1 => {
                         self.multiple = true;
                         CmdResult::NeedPoint
                     }
-                    "U" | "UNDO" if self.multiple => {
-                        if self.points.len() > 1 {
-                            self.points.pop();
-                        }
-                        CmdResult::NeedPoint
-                    }
-                    "T" | "TOTAL" if self.multiple => self.on_enter(),
                     _ => Self::keyword_error(),
                 });
             }
             _ => {}
         }
-        if self.mode == Mode::Angle
-            && self.points.is_empty()
-            && matches!(input.as_str(), "L" | "LINES")
-        {
-            self.mode = Mode::AngleLines;
-            return Some(CmdResult::NeedPoint);
+        // Angle's prompts take no keyword: a word is refused, the object
+        // prompts naming what they expect.
+        match self.mode {
+            // A typed point picks the object under it.
+            Mode::AngleLines if Self::is_point_text(&input) => None,
+            Mode::AngleLines if self.first_line.is_none() => Some(CmdResult::ReportError(
+                crate::tr!("measurement", "angle-invalid-object"),
+            )),
+            Mode::AngleLines => Some(CmdResult::ReportError(crate::tr!(
+                "measurement",
+                "angle-invalid-second"
+            ))),
+            Mode::Angle if Self::is_point_text(&input) => None,
+            Mode::Angle if self.points.len() < 2 => {
+                Some(CmdResult::ReportError(t!("Invalid point.").into_owned()))
+            }
+            Mode::Angle => Some(Self::keyword_error()),
+            _ => None,
         }
-        if self.mode == Mode::AngleLines
-            && self.first_line.is_none()
-            && matches!(input.as_str(), "P" | "POINTS")
-        {
-            self.mode = Mode::Angle;
-            self.hovered = None;
-            return Some(CmdResult::NeedPoint);
-        }
-        None
     }
 
     fn needs_entity_pick(&self) -> bool {
@@ -1438,6 +1723,10 @@ impl CadCommand for MeasureGeomCommand {
 
     fn typed_point_picks_entity(&self) -> bool {
         self.needs_entity_pick()
+    }
+
+    fn entity_pick_accepts_last(&self) -> bool {
+        self.mode == Mode::Area
     }
 
     // QUICK reads the scene under the cursor; it never resolves an object, so
@@ -1455,14 +1744,18 @@ impl CadCommand for MeasureGeomCommand {
             return Vec::new();
         }
         if self.quick_sources.borrow().is_none() {
-            *self.quick_sources.borrow_mut() = Some(scene.boundary_sources_on_plane(self.plane, 1e-6));
+            *self.quick_sources.borrow_mut() =
+                Some(scene.boundary_sources_on_plane(self.plane, 1e-6));
         }
         let (hits, handles) = Self::quick_hits(scene, self.plane, cursor);
         let (mut wires, readout) = Self::quick_result(self.plane, cursor, hits);
-        let (object_wires, object_lines) = Self::quick_objects(scene, self.plane, cursor, hits, handles);
+        let (object_wires, object_lines) =
+            Self::quick_objects(scene, self.plane, cursor, hits, handles);
         wires.extend(object_wires);
         let readout = match readout {
-            Some(text) if !object_lines.is_empty() => Some(format!("{text}\n{}", object_lines.join("\n"))),
+            Some(text) if !object_lines.is_empty() => {
+                Some(format!("{text}\n{}", object_lines.join("\n")))
+            }
             other => other,
         };
         *self.quick.borrow_mut() = readout;
@@ -1506,7 +1799,7 @@ impl CadCommand for MeasureGeomCommand {
         }
         match self.mode {
             Mode::Area => match picked {
-                Some(entity) => self.area_object(entity),
+                Some(entity) => self.area_object(entity, point),
                 None => CmdResult::NeedPoint,
             },
             Mode::Radius => match picked.as_ref().and_then(|e| Self::radius_at(e, point)) {
@@ -1514,20 +1807,33 @@ impl CadCommand for MeasureGeomCommand {
                 None => CmdResult::ReportError(crate::tr!("measurement", "invalid-radius")),
             },
             Mode::AngleLines => {
-                let Some(direction) = picked.as_ref().and_then(Self::line_direction) else {
-                    return CmdResult::ReportError(crate::tr!("measurement", "invalid-line"));
-                };
-                if let Some((first_handle, first)) = self.first_line {
-                    if first_handle == handle {
-                        return CmdResult::ReportError(crate::tr!("measurement", "different-line"));
-                    }
-                    match Self::line_angle(first, direction) {
+                use crate::modules::annotate::angular_dim::{picked_shape, PickedShape};
+                let shape = picked.as_ref().and_then(|e| picked_shape(e, point));
+                if let Some((_, first)) = self.first_line {
+                    let Some(PickedShape::Line { direction }) = shape else {
+                        return CmdResult::ReportError(crate::tr!("measurement", "not-a-line"));
+                    };
+                    // The same line again or a parallel one measures nothing.
+                    return match Self::line_angle(first, direction).filter(|a| *a > 1e-9) {
                         Some(angle) => self.done(Self::angle_value_msg(angle)),
-                        None => CmdResult::ReportError(crate::tr!("measurement", "invalid-line")),
+                        None => self.done(crate::tr!("measurement", "lines-parallel")),
+                    };
+                }
+                match shape {
+                    Some(PickedShape::Line { direction }) => {
+                        self.first_line = Some((handle, direction));
+                        CmdResult::NeedPoint
                     }
-                } else {
-                    self.first_line = Some((handle, direction));
-                    CmdResult::NeedPoint
+                    Some(PickedShape::Arc { sweep }) => self.done(Self::angle_value_msg(sweep)),
+                    Some(PickedShape::Circle { center }) => {
+                        self.mode = Mode::Angle;
+                        self.angle_from_circle = true;
+                        self.points = vec![center, point];
+                        CmdResult::NeedPoint
+                    }
+                    None => {
+                        CmdResult::ReportError(crate::tr!("measurement", "not-line-arc-circle"))
+                    }
                 }
             }
             _ => CmdResult::NeedPoint,
@@ -1535,6 +1841,10 @@ impl CadCommand for MeasureGeomCommand {
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        // A point is no option either.
+        if self.mode == Mode::Choose {
+            return self.invalid_option();
+        }
         if self.mode == Mode::Quick {
             if let Some(area) = self.quick_area(pt) {
                 return CmdResult::ReportMeasurement(area);
@@ -1554,9 +1864,21 @@ impl CadCommand for MeasureGeomCommand {
             return CmdResult::ReportError(crate::tr!("measurement", "degenerate-ray"));
         }
         match self.mode {
+            Mode::Distance if self.multiple => {
+                if self.step != AreaStep::Points {
+                    return CmdResult::NeedPoint;
+                }
+                let before = (self.points.len(), self.arc);
+                let result = if self.arc {
+                    self.arc_point(pt)
+                } else {
+                    self.push_point(pt)
+                };
+                self.report_chain_change(before, result)
+            }
             Mode::Distance => {
-                self.points.push(pt);
-                if self.points.len() == 2 && !self.multiple {
+                self.push_point(pt);
+                if self.points.len() == 2 {
                     let message = Self::distance_msg(self.plane, self.points[0], self.points[1]);
                     self.done(message)
                 } else {
@@ -1584,6 +1906,11 @@ impl CadCommand for MeasureGeomCommand {
                     self.push_point(pt)
                 }
             }
+            // A picked height runs from the base point.
+            Mode::Area if self.step == AreaStep::Height => {
+                let height = (pt - self.height_base).length();
+                self.finish_height(height)
+            }
             _ => CmdResult::NeedPoint,
         }
     }
@@ -1598,48 +1925,70 @@ impl CadCommand for MeasureGeomCommand {
                 CmdResult::NeedPoint
             }
             Mode::Quick => CmdResult::Measurement(String::new()),
-            Mode::Distance if self.multiple && self.points.len() >= 2 => {
-                let length = Self::chain_length(&self.points);
-                self.done(crate::tr!(
-                    "measurement",
-                    "distance",
-                    value = length_text(length)
-                ))
+            Mode::Distance | Mode::Area if self.chain_sub_prompt() => {
+                let before = (self.points.len(), self.arc);
+                let result = self.sub_prompt_enter();
+                self.report_chain_change(before, result)
             }
-            Mode::Distance if self.multiple => Self::keyword_error(),
+            Mode::Distance if self.multiple => self.finish_chain(),
             Mode::Area => match self.step {
+                // Enter with nothing measured just leaves the object prompt.
+                AreaStep::Objects if self.sum == Sum::Single => self.exit_area(),
                 AreaStep::Objects => {
                     self.step = AreaStep::Points;
                     match self.last_report.clone() {
-                        Some(report) if self.sum != Sum::Single => {
-                            CmdResult::ReportMeasurement(report)
-                        }
-                        _ => CmdResult::NeedPoint,
+                        Some(report) => CmdResult::ReportMeasurement(report),
+                        None => CmdResult::NeedPoint,
                     }
                 }
-                AreaStep::Height | AreaStep::Length => CmdResult::ReportError(
-                    t!("Requires numeric distance or two points.").into_owned(),
-                ),
+                AreaStep::Height => CmdResult::ReportError(t!("Invalid point.").into_owned()),
+                AreaStep::Length => self.sub_prompt_enter(),
                 AreaStep::Points if self.points.is_empty() => {
                     self.step = AreaStep::Objects;
                     CmdResult::NeedPoint
                 }
-                AreaStep::Points if self.arc && self.chord_step() => self
-                    .arc_chord(self.tangent_degrees())
-                    .unwrap_or(CmdResult::NeedPoint),
-                AreaStep::Points if !self.arc && self.total_offered() => self.finish_boundary(),
+                // In arc mode Enter finishes like Total, whatever the boundary.
+                AreaStep::Points if self.arc || self.total_offered() => self.finish_boundary(),
                 AreaStep::Points => Self::keyword_error(),
             },
+            // Enter at the object prompt measures from a vertex; at the
+            // second line, the vertex or the first endpoint it leaves Angle.
+            Mode::AngleLines if self.first_line.is_none() => {
+                self.mode = Mode::Angle;
+                CmdResult::NeedPoint
+            }
+            Mode::AngleLines => self.leave_angle(None),
+            Mode::Angle if self.points.len() < 2 => self.leave_angle(None),
+            // The second endpoint defaults to the first: a circle's angle is
+            // 0, the vertex path has no angle.
+            Mode::Angle if self.angle_from_circle => self.done(Self::angle_value_msg(0.0)),
+            Mode::Angle => self.leave_angle(Some(crate::tr!("measurement", "arc-endpoints-equal"))),
             _ => CmdResult::Cancel,
         }
     }
 
     fn on_escape(&mut self) -> CmdResult {
+        // Esc at a sub-prompt of a chain only leaves it: back to the line
+        // or arc prompt, Distance printing the chain length again. A second
+        // Esc ends the command.
+        if self.chain_sub_prompt() {
+            self.step = AreaStep::Points;
+            self.arc_sub = Sub::None;
+            if self.mode == Mode::Distance {
+                return CmdResult::ReportMeasurement(self.running_distance());
+            }
+            return CmdResult::NeedPoint;
+        }
         CmdResult::Cancel
     }
 
     fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> {
         match self.mode {
+            Mode::Distance if self.multiple && !self.points.is_empty() => {
+                let mut pts = self.boundary_display();
+                pts.push(pt);
+                Some(Self::preview_wire("measuregeom_preview", pts))
+            }
             Mode::Distance | Mode::Angle => {
                 if self.points.is_empty() {
                     return None;
@@ -1671,7 +2020,7 @@ inventory::submit!(crate::command::CommandRegistration {
 mod measurement_tests {
     use super::*;
     use crate::entities::common::{set_unit_context, unit_context};
-    use codec::{
+    use document::{
         entities::{Arc, Circle, Line},
         types::Vector3,
     };
@@ -1700,7 +2049,7 @@ mod measurement_tests {
     #[test]
     fn region_radius_uses_the_hovered_and_picked_boundary() {
         units();
-        use kernel::geom2d::{Circle as KernelCircle, Curve};
+        use ocs_geom::geom2d::{Circle as KernelCircle, Curve};
         let region = crate::scene::model::presspull_model::region_from_loops(
             &[
                 vec![Curve::Circle(KernelCircle {
@@ -1812,6 +2161,7 @@ mod measurement_tests {
     fn invalid_angle_points_do_not_advance_and_survey_precision_is_retained() {
         units();
         let mut command = MeasureGeomCommand::angle();
+        command.on_enter();
         let vertex = DVec3::new(500000.001, 600000.002, 100.0);
         assert!(matches!(
             command.on_point(DVec3::NAN),
@@ -1837,6 +2187,7 @@ mod measurement_tests {
     fn angle_preview_two_rays_and_live_value() {
         units();
         let mut command = MeasureGeomCommand::angle();
+        command.on_enter();
         command.on_point(DVec3::ZERO);
         assert!(command.measurement_readout(DVec3::Y).is_none());
         command.on_point(DVec3::X);
@@ -1858,7 +2209,6 @@ mod measurement_tests {
     fn two_lines_smaller_angle_and_invalid_selections() {
         units();
         let mut command = MeasureGeomCommand::angle();
-        command.on_text_input("LINES");
         assert!(command.needs_entity_pick());
         assert!(matches!(
             pick(&mut command, line(Vector3::ZERO), 1),
@@ -1867,10 +2217,6 @@ mod measurement_tests {
         assert!(matches!(
             pick(&mut command, line(Vector3::UNIT_X), 1),
             CmdResult::NeedPoint
-        ));
-        assert!(matches!(
-            pick(&mut command, line(Vector3::UNIT_X), 1),
-            CmdResult::ReportError(_)
         ));
         assert!(matches!(
             pick(
@@ -1929,6 +2275,8 @@ mod measurement_tests {
         assert!(text.contains("6.0000") && text.contains("12.0000"));
         let mut command = MeasureGeomCommand::new();
         command.on_text_input("A");
+        // Angle opens on the object prompt; Enter goes to the vertex.
+        command.on_enter();
         command.on_point(DVec3::ZERO);
         command.on_point(DVec3::X);
         assert!(result(command.on_point(DVec3::Y)).contains("90.00°"));

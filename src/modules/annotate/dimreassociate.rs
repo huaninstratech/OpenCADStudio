@@ -2,7 +2,7 @@
 // are asked in turn. A point (or a picked object) moves that point onto the
 // object and associates it; Enter (<next>) leaves the point as it is.
 
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind, ReassociateTarget};
@@ -233,9 +233,13 @@ impl CadCommand for DimReassociateCommand {
             Some(ReassociateKind::Angular3) if whole => {
                 self.apply(ReassociateTarget::Arc(handle), true)
             }
-            Some(ReassociateKind::Angular2) => {
-                self.apply(ReassociateTarget::Line { index: step, object: handle }, false)
-            }
+            Some(ReassociateKind::Angular2) => self.apply(
+                ReassociateTarget::Line {
+                    index: step,
+                    object: handle,
+                },
+                false,
+            ),
             Some(ReassociateKind::Radial) => self.apply(ReassociateTarget::Radial(handle), true),
             _ => CmdResult::NeedPoint,
         }

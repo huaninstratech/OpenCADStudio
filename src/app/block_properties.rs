@@ -1,6 +1,6 @@
 use super::{Message, OpenCADStudio};
 use crate::scene::model::object::{PropSection, PropValue, Property};
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use iced::Task;
 
 impl OpenCADStudio {
@@ -63,7 +63,10 @@ impl OpenCADStudio {
                 },
             );
             if current != next {
-                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block hyperlink"));
+                self.push_undo_snapshot(
+                    i,
+                    super::tab_document::HistoryLabel::Message("Block hyperlink"),
+                );
                 crate::scene::block_metadata::set_hyperlink(
                     &mut self.tabs[i].scene.document,
                     definition,
@@ -71,7 +74,7 @@ impl OpenCADStudio {
                     &next.1,
                 );
                 self.tabs[i].dirty = true;
-                self.tabs[i].scene.bump_geometry();
+                self.tabs[i].scene.bump_block_definition(definition);
                 self.finish_pending_history(i);
                 self.refresh_properties();
             }
@@ -193,7 +196,10 @@ impl OpenCADStudio {
             return Task::none();
         }
         let fresh = !self.block_palette_stale();
-        self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block properties"));
+        self.push_undo_snapshot(
+            i,
+            super::tab_document::HistoryLabel::Message("Block properties"),
+        );
         let doc = &mut self.tabs[i].scene.document;
         match field {
             "bedit_annotative" | "bedit_match_orientation" => {
@@ -235,7 +241,7 @@ impl OpenCADStudio {
             _ => return Task::none(),
         }
         self.tabs[i].dirty = true;
-        self.tabs[i].scene.bump_geometry();
+        self.tabs[i].scene.bump_block_definition(definition);
         self.finish_pending_history(i);
         self.refresh_properties();
         // Only this block's definition changed.

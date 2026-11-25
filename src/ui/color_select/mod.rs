@@ -4,7 +4,7 @@
 //! behaves the same everywhere.
 
 pub mod book;
-pub mod document;
+pub mod drawing_colors;
 pub mod editor;
 pub mod eyedropper;
 pub mod math;
@@ -17,8 +17,9 @@ pub use picker::{ColorPicker, ColorPickerMsg, Outcome};
 use crate::app::Message;
 use crate::t;
 use crate::ui::properties::acad_color_display;
-use crate::ui::ROW_H;
-use codec::types::Color as AcadColor;
+use crate::ui::style::form::ROW_H;
+use crate::ui::style::{chrome, text as ui_text};
+use document::types::Color as AcadColor;
 use iced::widget::{button, container, row, text};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
@@ -30,6 +31,12 @@ pub struct ColorExtras {
     pub by_block: bool,
     pub none: bool,
     pub background: bool,
+    /// The closed selector as a plain table cell: swatch and name, no
+    /// button colour or arrow (the Layer manager's Color column).
+    pub flat: bool,
+    /// Only the seven standard colours (no greys, no recent colours) before
+    /// Select Color..., as a style dialog's colour list.
+    pub standard_only: bool,
 }
 
 thread_local! {
@@ -93,8 +100,8 @@ pub fn swatch<'a>(bg: Color) -> Element<'a, Message> {
         .style(move |theme: &Theme| container::Style {
             background: Some(Background::Color(bg)),
             border: Border {
-                color: theme.palette().background.neutral.color,
-                width: 1.0,
+                color: chrome::border(theme),
+                width: crate::ui::style::kit_metrics::line(),
                 radius: 2.0.into(),
             },
             ..Default::default()
@@ -156,19 +163,16 @@ pub fn color_selector_varies<'a>(
     on_toggle: Message,
     on_more: Message,
 ) -> Element<'a, Message> {
-    let indicator = container(text(crate::t!("?")).size(10))
-        .style(|theme: &Theme| {
-            let palette = theme.palette();
-            container::Style {
-                background: Some(Background::Color(palette.background.strong.color)),
-                border: Border {
-                    color: palette.background.neutral.color,
-                    width: 1.0,
-                    radius: 2.0.into(),
-                },
-                text_color: Some(palette.background.strong.text),
-                ..Default::default()
-            }
+    let indicator = container(text(crate::t!("?")).size(ui_text::UI_SMALL))
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(chrome::hover(theme))),
+            border: Border {
+                color: chrome::border(theme),
+                width: crate::ui::style::kit_metrics::line(),
+                radius: 2.0.into(),
+            },
+            text_color: Some(chrome::strong(theme)),
+            ..Default::default()
         })
         .width(13)
         .height(13)
@@ -200,28 +204,37 @@ fn color_selector_with_indicator<'a>(
     let on_dismiss = on_toggle.clone();
 
     // Closed button: current swatch + name + caret.
-    let head = button(
-        row![
-            indicator,
-            text(name).size(11),
-            iced::widget::Space::new().width(Length::Fill),
-            crate::ui::icons::themed_arrow_toggle(open, 9.0),
-        ]
-        .spacing(5)
-        .align_y(iced::Center),
-    )
-    .on_press(on_toggle)
-    .padding([3, 6])
-    .height(ROW_H)
-    .width(Length::Fill);
+    let mut head_row = row![
+        indicator,
+        crate::ui::kit::one_line(text(name)).size(ui_text::UI),
+        iced::widget::Space::new().width(Length::Fill),
+    ]
+    .spacing(5)
+    .align_y(iced::Center);
+    if !extras.flat || open {
+        head_row = head_row.push(crate::ui::icons::themed_arrow_toggle(open, 9.0));
+    }
+    let mut head = button(head_row)
+        .on_press(on_toggle)
+        .padding([3, 6])
+        .height(ROW_H)
+        .width(Length::Fill);
+    if extras.flat {
+        head = head.style(|theme: &Theme, status| button::Style {
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then(|| Background::Color(chrome::hover(theme))),
+            text_color: chrome::text(theme),
+            ..Default::default()
+        });
+    }
 
     if !open {
         return head.into();
     }
 
     let popup = container(color_list_with_current(current, extras, on_select, on_more))
-        .style(popup_panel_style)
-        .padding(2);
+        .style(crate::ui::kit::menu::frame_style)
+        .padding(crate::ui::style::kit_metrics::DROPDOWN_PAD);
 
     // `DropDown` keeps the popup outside the surrounding form layout and
     // handles viewport placement, Escape, and outside-click dismissal.
@@ -235,34 +248,6 @@ fn color_selector_with_indicator<'a>(
             .offset(2.0)
             .on_dismiss(on_dismiss),
     )
-}
-
-pub(crate) fn popup_panel_style(theme: &Theme) -> container::Style {
-    let palette = theme.palette();
-    container::Style {
-        background: Some(Background::Color(palette.background.weak.color)),
-        border: Border {
-            color: palette.background.neutral.color,
-            width: 1.0,
-            radius: 2.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
-pub(crate) fn list_row_style(theme: &Theme, status: button::Status) -> button::Style {
-    let palette = theme.palette();
-    let hovered = matches!(status, button::Status::Hovered);
-    let text_color = if hovered {
-        palette.background.strong.text
-    } else {
-        palette.background.base.text
-    };
-    button::Style {
-        background: hovered.then_some(Background::Color(palette.background.strong.color)),
-        text_color,
-        ..Default::default()
-    }
 }
 
 /// The colour list shown inside a picker popup: named ACI colours (with
@@ -293,14 +278,18 @@ pub fn color_list_with_current<'a>(
         if initial_selected.is_none() && current == Some(color) {
             initial_selected = Some(rows.len());
         }
+        let is_current = current == Some(color);
         let el: Element<'a, Message> = button(
-            row![swatch(bg), text(label_str.clone()).size(11)]
-                .spacing(5)
-                .align_y(iced::Center),
+            row![
+                swatch(bg),
+                crate::ui::kit::one_line(text(label_str.clone())).size(ui_text::UI)
+            ]
+            .spacing(5)
+            .align_y(iced::Center),
         )
         .on_press(msg.clone())
-        .style(list_row_style)
-        .padding([2, 4])
+        .style(crate::ui::kit::dropdown_option_style(is_current))
+        .padding([2.0, crate::ui::style::kit_metrics::DROPDOWN_ITEM_PAD_X])
         .width(Length::Fill)
         .into();
         rows.push(DropdownRow::item(el, label_str, msg));
@@ -321,13 +310,18 @@ pub fn color_list_with_current<'a>(
         let (_, name) = acad_color_display(AcadColor::ByBlock);
         push_color(AcadColor::ByBlock, t!(name).into_owned());
     }
-    for i in 1u8..=9 {
+    let last = if extras.standard_only { 7u8 } else { 9 };
+    for i in 1u8..=last {
         let color = AcadColor::Index(i);
         let (_, name) = acad_color_display(color);
         push_color(color, t!(name).into_owned());
     }
     // Colours picked recently beyond the nine standard ones.
-    let recent = RECENT.with(|recent| recent.borrow().clone());
+    let recent = if extras.standard_only {
+        Vec::new()
+    } else {
+        RECENT.with(|recent| recent.borrow().clone())
+    };
     for color in recent
         .into_iter()
         .filter(|color| !matches!(color, AcadColor::Index(1..=9)))
@@ -336,10 +330,10 @@ pub fn color_list_with_current<'a>(
     }
     let more_label = t!("Select Color...").into_owned();
     rows.push(DropdownRow::item(
-        button(text(more_label.clone()).size(11))
+        button(text(more_label.clone()).size(ui_text::UI))
             .on_press(on_more.clone())
-            .style(list_row_style)
-            .padding([2, 4])
+            .style(crate::ui::kit::dropdown_row_style)
+            .padding([2.0, crate::ui::style::kit_metrics::DROPDOWN_ITEM_PAD_X])
             .width(Length::Fill),
         more_label,
         on_more,
@@ -371,13 +365,15 @@ pub fn editable_drop_down_below<'a>(
     on_dismiss: Message,
     expanded: bool,
 ) -> Element<'a, Message> {
-    let mut dd = iced_aw::DropDown::new(base, popup, expanded)
+    let dd = iced_aw::DropDown::new(base, popup, expanded)
         .height(popup_height)
         .alignment(iced_aw::drop_down::Alignment::Bottom)
         .offset(2.0)
         .on_dismiss(on_dismiss);
-    if let Some(w) = popup_width {
-        dd = dd.width(w);
+    // A list wider than its field starts at the field's left edge, as the
+    // other lists do (they are as wide as their field).
+    match popup_width {
+        Some(w) => crate::ui::drop_down_fit::drop_down_fit_start(dd.width(w)),
+        None => crate::ui::drop_down_fit::drop_down_fit(dd),
     }
-    crate::ui::drop_down_fit::drop_down_fit(dd)
 }

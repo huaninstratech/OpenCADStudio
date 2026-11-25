@@ -23,14 +23,14 @@ struct VertexIn {
 }
 
 struct VertexOut {
-    @builtin(position) clip_pos: vec4<f32>,
+    @invariant @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
 }
 
 @vertex
 fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let rel = (v.position + v.translation - u.eye_high)
+    let rel = (v.position - u.eye_high + v.translation)
         + (v.position_low + v.translation_low - u.eye_low);
     out.clip_pos = u.view_rot * vec4<f32>(rel, 1.0);
     out.color = v.color;

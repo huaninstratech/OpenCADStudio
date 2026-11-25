@@ -3,11 +3,11 @@
 
 use super::{Message, ModalKind, OpenCADStudio};
 use crate::ui::window::drawing_properties::{DwgPropsMsg, State, SummaryField, Tab};
-use codec::document::SummaryInfo;
+use document::document::SummaryInfo;
 use iced::Task;
 
 /// Why a custom property table cannot be stored.
-fn check_custom_names(properties: &[(String, String)]) -> Result<(), String> {
+pub(crate) fn check_custom_names(properties: &[(String, String)]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for (index, (name, _)) in properties.iter().enumerate() {
         // Validated trimmed and case-folded; stored as typed.
@@ -37,7 +37,7 @@ fn format_julian(jd: f64) -> String {
     }
     let locale = crate::entities::field::os_date_locale();
     let picture = format!("{}  HH:mm:ss", locale.long_date);
-    codec::fields::format_dt_in(codec::fields::julian_parts(jd), &picture, &locale)
+    document::fields::format_dt_in(document::fields::julian_parts(jd), &picture, &locale)
 }
 
 /// Editing time kept in days, shown as `D days H:MM:SS`.
@@ -51,7 +51,12 @@ fn format_editing_time(days: f64) -> String {
     );
     let time = format!("{h}:{m:02}:{s:02}");
     if d > 0 {
-        crate::tr!("dwgprops-dialog", "editing-days", days = d.to_string(), time = time)
+        crate::tr!(
+            "dwgprops-dialog",
+            "editing-days",
+            days = d.to_string(),
+            time = time
+        )
     } else {
         time
     }
@@ -60,7 +65,7 @@ fn format_editing_time(days: f64) -> String {
 /// The summary as the dialog shows it. The hyperlink base is one drawing
 /// value kept in the summary and in the header (HYPERLINKBASE sets both); the
 /// DXF writer prefers the summary and falls back to the header, so do the same.
-fn summary_as_shown(doc: &codec::Document) -> SummaryInfo {
+fn summary_as_shown(doc: &document::Document) -> SummaryInfo {
     let mut info = doc.summary_info.clone();
     if info.hyperlink_base.is_empty() {
         info.hyperlink_base = doc.header.hyperlink_base.clone();
@@ -76,11 +81,9 @@ impl OpenCADStudio {
             Some(path) => (
                 path.file_name().map(|n| n.to_string_lossy().into_owned()),
                 path.parent().map(|p| p.display().to_string()),
-                std::fs::metadata(path)
-                    .ok()
-                    .map(|m| {
-                        crate::tr!("dwgprops-dialog", "size-bytes", bytes = m.len().to_string())
-                    }),
+                std::fs::metadata(path).ok().map(|m| {
+                    crate::tr!("dwgprops-dialog", "size-bytes", bytes = m.len().to_string())
+                }),
             ),
             None => (None, None, None),
         };
@@ -197,11 +200,7 @@ impl OpenCADStudio {
         document.summary_info = edited;
         self.tabs[i].dirty = true;
         // Fields showing Title, Author or a custom property read it again.
-        let hosts = crate::entities::field::acvar_hosts(&self.tabs[i].scene.document);
-        if !hosts.is_empty() {
-            self.tabs[i].scene.update_fields(32, Some(&hosts));
-        }
-        self.tabs[i].scene.bump_geometry();
+        self.tabs[i].scene.update_summary_field_hosts();
         Task::none()
     }
 }
@@ -315,7 +314,7 @@ mod tests {
     /// the dialog's OK has stored it.
     #[test]
     fn ok_updates_the_text_showing_a_custom_property_field() {
-        use codec::entities::{EntityType, MText};
+        use document::entities::{EntityType, MText};
         let mut app = app_with_summary();
         let i = app.active_tab;
         let document = &mut app.tabs[i].scene.document;
@@ -340,12 +339,14 @@ mod tests {
     /// S2: undo puts back the summary and the text showing a field of it.
     #[test]
     fn undo_restores_summary_and_field_text() {
-        use codec::entities::{EntityType, MText};
+        use document::entities::{EntityType, MText};
         let mut app = app_with_summary();
         let i = app.active_tab;
         app.tabs[i].scene.document.summary_info.custom_properties[0].1 = "A".into();
         let doc = &mut app.tabs[i].scene.document;
-        let t = doc.add_entity(EntityType::MText(Box::new(MText::new()))).unwrap();
+        let t = doc
+            .add_entity(EntityType::MText(Box::new(MText::new())))
+            .unwrap();
         crate::entities::field::set_text_field(
             doc,
             t,

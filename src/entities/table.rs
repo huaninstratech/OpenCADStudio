@@ -1,12 +1,14 @@
-use codec::entities::Table;
+mod cell_editor;
+pub(crate) use cell_editor::{cell_picture, CellPicture};
+use document::entities::Table;
 use glam::Vec3;
 
-use crate::command::EntityTransform;
 use crate::entities::common::{ro_prop as ro, square_grip};
 use crate::entities::text_support::{
     layout_mtext, MTextRenderOpts, MTextVAnchor, ResolvedTextStyle,
 };
 use crate::entities::traits::{Grippable, PropertyEditable, RenderConvertible, Transformable};
+use crate::entities::transform::EntityTransform;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection, PropValue, Property};
 use crate::scene::model::wire_model::SnapHint;
@@ -41,8 +43,8 @@ pub const CELL_COLOR_NAMES: [&str; 9] = [
     "ByBlock", "ByLayer", "Red", "Yellow", "Green", "Cyan", "Blue", "Magenta", "White",
 ];
 
-pub fn cell_color_name(color: codec::types::Color) -> String {
-    use codec::types::Color;
+pub fn cell_color_name(color: document::types::Color) -> String {
+    use document::types::Color;
     match color {
         Color::ByBlock => "ByBlock".into(),
         Color::ByLayer => "ByLayer".into(),
@@ -53,8 +55,8 @@ pub fn cell_color_name(color: codec::types::Color) -> String {
     }
 }
 
-pub fn parse_cell_color(text: &str) -> Option<codec::types::Color> {
-    use codec::types::Color;
+pub fn parse_cell_color(text: &str) -> Option<document::types::Color> {
+    use document::types::Color;
     let text = text.trim();
     if let Some(index) = CELL_COLOR_NAMES
         .iter()
@@ -103,7 +105,11 @@ pub fn cell_data_category(data_type: i32, unit_type: i32) -> &'static str {
     CELL_DATA_CATEGORIES
         .iter()
         .find(|(_, d, u)| *d == data_type && (*u == unit_type || *d != 2))
-        .or_else(|| CELL_DATA_CATEGORIES.iter().find(|(_, d, _)| *d == data_type))
+        .or_else(|| {
+            CELL_DATA_CATEGORIES
+                .iter()
+                .find(|(_, d, _)| *d == data_type)
+        })
         .map_or("General", |(name, _, _)| name)
 }
 
@@ -123,7 +129,7 @@ fn prop_current_cell_active() -> bool {
     PROPERTY_CELL_ACTIVE.with(std::cell::Cell::get)
 }
 
-fn v3(v: &codec::types::Vector3) -> Vec3 {
+fn v3(v: &document::types::Vector3) -> Vec3 {
     Vec3::new(v.x as f32, v.y as f32, v.z as f32)
 }
 
@@ -197,11 +203,20 @@ pub fn cell_role_kind(
 }
 
 /// The row role a row's index gives it, or its stored row style id.
-pub fn row_role_kind(table: &Table, title_suppressed: bool, header_suppressed: bool, row: usize) -> u8 {
+pub fn row_role_kind(
+    table: &Table,
+    title_suppressed: bool,
+    header_suppressed: bool,
+    row: usize,
+) -> u8 {
     table
         .rows
         .get(row)
-        .and_then(|r| (1..=3).contains(&r.style_id).then(|| (r.style_id - 1) as u8))
+        .and_then(|r| {
+            (1..=3)
+                .contains(&r.style_id)
+                .then(|| (r.style_id - 1) as u8)
+        })
         .unwrap_or(match (title_suppressed, header_suppressed, row) {
             (false, _, 0) => 0,
             (false, false, 1) | (true, false, 0) => 1,
@@ -211,11 +226,11 @@ pub fn row_role_kind(table: &Table, title_suppressed: bool, header_suppressed: b
 
 pub(crate) fn style_for_property<'a>(
     table: &'a Table,
-    row: &'a codec::entities::table::TableRow,
+    row: &'a document::entities::table::TableRow,
     column: usize,
-    cell: &'a codec::entities::table::TableCell,
-    property: codec::entities::table::CellStylePropertyFlags,
-) -> Option<&'a codec::entities::table::CellStyle> {
+    cell: &'a document::entities::table::TableCell,
+    property: document::entities::table::CellStylePropertyFlags,
+) -> Option<&'a document::entities::table::CellStyle> {
     // The cell's own overrides, as either layout (DXF or binary) states them.
     if let Some(style) = cell.style.as_ref().filter(|style| style.sets(property)) {
         return Some(style);
@@ -226,15 +241,11 @@ pub(crate) fn style_for_property<'a>(
         .and_then(|column| column.style.as_ref());
     // A column's style wins over its row's (measured with named cell styles
     // on both: the column's applies where they cross).
-    for style in [column_style, row.style.as_ref(), table.base_style.as_ref()]
+    [column_style, row.style.as_ref(), table.base_style.as_ref()]
         .into_iter()
         .flatten()
-    {
-        if style.property_flags.contains(property) {
-            return Some(style);
-        }
-    }
-    None
+        .find(|&style| style.property_flags.contains(property))
+        .map(|v| v as _)
 }
 
 /// A cell's text height: the content's own format when it overrides it,
@@ -242,13 +253,13 @@ pub(crate) fn style_for_property<'a>(
 /// cell style (`row_height`), else the content's value.
 fn cell_text_height(
     table: &Table,
-    row: &codec::entities::table::TableRow,
+    row: &document::entities::table::TableRow,
     column: usize,
-    cell: &codec::entities::table::TableCell,
-    content: &codec::entities::table::CellContent,
+    cell: &document::entities::table::TableCell,
+    content: &document::entities::table::CellContent,
     row_height: Option<f64>,
 ) -> Option<f64> {
-    use codec::entities::table::CellStylePropertyFlags as P;
+    use document::entities::table::CellStylePropertyFlags as P;
     let set = |h: f64| (h > 1e-6).then_some(h);
     let own = content.sets(P::TEXT_HEIGHT);
     own.then(|| set(content.text_height))
@@ -264,14 +275,14 @@ fn cell_text_height(
 /// A cell's text style: the content's own, else the cell, row, column or
 /// table style that sets it (by handle, or by name for a cell override).
 fn cell_text_style(
-    document: &codec::Document,
+    document: &document::Document,
     table: &Table,
-    row: &codec::entities::table::TableRow,
+    row: &document::entities::table::TableRow,
     column: usize,
-    cell: &codec::entities::table::TableCell,
-    content: Option<&codec::entities::table::CellContent>,
-) -> Option<codec::Handle> {
-    use codec::entities::table::CellStylePropertyFlags as P;
+    cell: &document::entities::table::TableCell,
+    content: Option<&document::entities::table::CellContent>,
+) -> Option<document::Handle> {
+    use document::entities::table::CellStylePropertyFlags as P;
     content.and_then(|c| c.text_style_handle).or_else(|| {
         let style = style_for_property(table, row, column, cell, P::TEXT_STYLE)?;
         style.text_style_handle.or_else(|| {
@@ -288,9 +299,9 @@ fn cell_text_style(
 /// The text style a table style's row style names: its handle, else the
 /// style of its name (a DXF file names it).
 fn row_style_text_style(
-    document: &codec::Document,
-    style: Option<&codec::objects::RowCellStyle>,
-) -> Option<codec::Handle> {
+    document: &document::Document,
+    style: Option<&document::objects::RowCellStyle>,
+) -> Option<document::Handle> {
     let style = style?;
     style.text_style_handle.or_else(|| {
         let name = style.text_style_name.trim();
@@ -305,13 +316,15 @@ fn row_style_text_style(
 /// The face each text style draws with, resolved the way text of that style
 /// resolves anywhere else (a .shx file on disk before the built-in stroke
 /// font of its name), so a table's cells match the text of its picture.
-fn table_style_fonts(document: &codec::Document) -> rustc_hash::FxHashMap<codec::Handle, String> {
+fn table_style_fonts(
+    document: &document::Document,
+) -> rustc_hash::FxHashMap<document::Handle, String> {
     document
         .text_styles
         .iter()
         .map(|style| {
-            let font = crate::entities::text_support::resolve_text_style(&style.name, document)
-                .font_name;
+            let font =
+                crate::entities::text_support::resolve_text_style(&style.name, document).font_name;
             (style.handle, font)
         })
         .collect()
@@ -319,11 +332,11 @@ fn table_style_fonts(document: &codec::Document) -> rustc_hash::FxHashMap<codec:
 
 fn style_for_border<'a>(
     table: &'a Table,
-    row: &'a codec::entities::table::TableRow,
+    row: &'a document::entities::table::TableRow,
     column: usize,
-    cell: &'a codec::entities::table::TableCell,
-    edge: codec::entities::table::CellEdgeFlags,
-) -> Option<&'a codec::entities::table::CellStyle> {
+    cell: &'a document::entities::table::TableCell,
+    edge: document::entities::table::CellEdgeFlags,
+) -> Option<&'a document::entities::table::CellStyle> {
     let column_style = table
         .columns
         .get(column)
@@ -341,7 +354,7 @@ fn style_for_border<'a>(
 
 pub(crate) fn resolved_title_suppressed(
     table: &Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table_style: Option<&document::objects::TableStyle>,
 ) -> bool {
     table
         .legacy_style_override
@@ -353,7 +366,7 @@ pub(crate) fn resolved_title_suppressed(
 
 pub(crate) fn resolved_header_suppressed(
     table: &Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table_style: Option<&document::objects::TableStyle>,
 ) -> bool {
     table
         .legacy_style_override
@@ -365,9 +378,9 @@ pub(crate) fn resolved_header_suppressed(
 
 pub(crate) fn resolved_flow_up(
     table: &Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table_style: Option<&document::objects::TableStyle>,
 ) -> bool {
-    use codec::entities::table::CellStylePropertyFlags;
+    use document::entities::table::CellStylePropertyFlags;
 
     table
         .legacy_style_override
@@ -385,14 +398,14 @@ pub(crate) fn resolved_flow_up(
         .unwrap_or_else(|| {
             matches!(
                 table_style.map(|style| style.flow_direction),
-                Some(codec::objects::TableFlowDirection::Up)
+                Some(document::objects::TableFlowDirection::Up)
             )
         })
 }
 
 pub(crate) fn resolved_table_margins(
     table: &Table,
-    table_style: Option<&codec::objects::TableStyle>,
+    table_style: Option<&document::objects::TableStyle>,
 ) -> (f64, f64) {
     let horizontal = table
         .legacy_style_override
@@ -407,6 +420,20 @@ pub(crate) fn resolved_table_margins(
         .or_else(|| table_style.map(|style| style.vertical_margin))
         .unwrap_or(0.0);
     (horizontal, vertical)
+}
+
+/// The margin a cell's text keeps from a side that neither the cell nor
+/// its cell style sets: the table's, as the table's stored picture keeps
+/// it, and half the text height only where the table has none.
+fn side_margin<T>(table_margin: T, text_height: T) -> T
+where
+    T: Copy + Default + PartialOrd + From<u8> + std::ops::Div<Output = T>,
+{
+    if table_margin > T::default() {
+        table_margin
+    } else {
+        text_height / T::from(2)
+    }
 }
 
 fn table_offsets(table: &Table, scale: f32) -> (Vec<f32>, Vec<f32>) {
@@ -433,20 +460,24 @@ struct TableBreakSegment {
 
 /// The space between a broken table's fragments: the table's own, else five
 /// and a half data text heights (what the table shows when it stores none).
-pub(crate) fn resolved_break_spacing(table: &Table, document: &codec::Document) -> f64 {
+pub(crate) fn resolved_break_spacing(table: &Table, document: &document::Document) -> f64 {
     if table.break_spacing > 0.0 {
         return table.break_spacing;
     }
-    let data_height = if table.rows.len() > 2 { data_text_height(table, document) } else { 0.18 };
+    let data_height = if table.rows.len() > 2 {
+        data_text_height(table, document)
+    } else {
+        0.18
+    };
     5.5 * data_height
 }
 
 /// The text height of the table style's data cells (0.18 without a style).
-pub(crate) fn data_text_height(table: &Table, document: &codec::Document) -> f64 {
+pub(crate) fn data_text_height(table: &Table, document: &document::Document) -> f64 {
     table
         .table_style_handle
         .and_then(|handle| match document.objects.get(&handle) {
-            Some(codec::objects::ObjectType::TableStyle(style)) => Some(style),
+            Some(document::objects::ObjectType::TableStyle(style)) => Some(style),
             _ => None,
         })
         .map_or(0.18, |style| style.data_row_style.text_height)
@@ -454,13 +485,13 @@ pub(crate) fn data_text_height(table: &Table, document: &codec::Document) -> f64
 
 fn table_break_segments(
     table: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     h: Vec3,
     down: Vec3,
     row_offsets: &[f32],
     scale: f32,
 ) -> Vec<TableBreakSegment> {
-    use codec::entities::table::BreakOptionFlags;
+    use document::entities::table::BreakOptionFlags;
 
     let insertion = v3(&table.insertion_point);
     if table.rows.is_empty() {
@@ -477,7 +508,7 @@ fn table_break_segments(
         }];
     }
 
-    let offset_to_world = |offset: &codec::types::Vector3| insertion + v3(offset);
+    let offset_to_world = |offset: &document::types::Vector3| insertion + v3(offset);
     let mut cached: Vec<_> = table
         .break_ranges
         .iter()
@@ -547,13 +578,13 @@ fn table_break_segments(
                 table.total_height() as f32 * scale + spacing
             };
             match table.break_flow_direction {
-                codec::entities::table::BreakFlowDirection::Left => {
+                document::entities::table::BreakFlowDirection::Left => {
                     insertion - h * segment as f32 * horizontal_step
                 }
-                codec::entities::table::BreakFlowDirection::Vertical => {
+                document::entities::table::BreakFlowDirection::Vertical => {
                     insertion + down * segment as f32 * vertical_step
                 }
-                codec::entities::table::BreakFlowDirection::Right => {
+                document::entities::table::BreakFlowDirection::Right => {
                     insertion + h * segment as f32 * horizontal_step
                 }
             }
@@ -572,7 +603,7 @@ fn table_break_segments(
 
 fn break_frame_for_row(
     table: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     row: usize,
     h: Vec3,
     down: Vec3,
@@ -596,7 +627,7 @@ fn break_frame_for_row(
 
 fn break_frames_for_row(
     table: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     row: usize,
     h: Vec3,
     down: Vec3,
@@ -605,7 +636,7 @@ fn break_frames_for_row(
     top_label_rows: usize,
     bottom_label_rows: usize,
 ) -> Vec<(Vec3, f32)> {
-    use codec::entities::table::BreakOptionFlags;
+    use document::entities::table::BreakOptionFlags;
 
     let segments = table_break_segments(table, document, h, down, row_offsets, scale);
     let Some((segment_index, segment)) = segments
@@ -613,7 +644,15 @@ fn break_frames_for_row(
         .enumerate()
         .find(|(_, segment)| row >= segment.start_row && row <= segment.end_row)
     else {
-        return vec![break_frame_for_row(table, document, row, h, down, row_offsets, scale)];
+        return vec![break_frame_for_row(
+            table,
+            document,
+            row,
+            h,
+            down,
+            row_offsets,
+            scale,
+        )];
     };
     let repeat_top = table
         .break_options
@@ -671,12 +710,12 @@ fn break_frames_for_row(
     frames
 }
 
-fn format_cell_value(value: &codec::entities::table::CellValue) -> String {
+fn format_cell_value(value: &document::entities::table::CellValue) -> String {
     let display = value.display();
     if !display.is_empty() {
         return display.to_string();
     }
-    use codec::entities::table::CellValueType;
+    use document::entities::table::CellValueType;
     match value.value_type {
         CellValueType::Long => format!("{}", value.numeric_value as i64),
         CellValueType::Double | CellValueType::Date => format!("{}", value.numeric_value),
@@ -718,31 +757,32 @@ fn table_cell_reference(reference: &str) -> Option<(usize, usize)> {
     Some((row, column.checked_sub(1)?))
 }
 
-fn evaluate_table_formula(table: &Table, expression: &str) -> Option<String> {
-    let body = expression.trim().strip_prefix('=')?.trim();
-    if let Some((row, column)) = table_cell_reference(body) {
-        return table
-            .cell(row, column)
-            .map(|cell| cell.text_value().to_string());
+/// A cell as an arithmetic operand: a blank cell is 0, text that is not a
+/// number makes the whole expression fail (the cell keeps its literal text).
+fn formula_cell_number(table: &Table, reference: &str) -> Option<f64> {
+    let (row, column) = table_cell_reference(reference)?;
+    let text = table
+        .cell(row, column)
+        .map(|cell| cell.text_value().trim())
+        .unwrap_or("");
+    if text.is_empty() {
+        Some(0.0)
+    } else {
+        text.parse::<f64>().ok()
     }
-    let open = body.find('(')?;
-    let close = body.rfind(')')?;
-    let function = body[..open].trim().to_ascii_uppercase();
-    // `find('(')` scans forward while `rfind(')')` scans backward, so a
-    // malformed body like `)(` orders them reversed; the safe `get` yields
-    // None (fall back to the literal text) instead of a slice panic.
-    let range = body.get(open + 1..close)?;
-    let (first, last) = range.split_once(':').unwrap_or((range, range));
+}
+
+/// The numeric cells a `SUM(A1:B2)` style range contributes. The walk is
+/// clamped to the table: a range can name any `usize`
+/// (`A1:A18446744073709551615`), and `cell()` would return None for every
+/// out-of-bounds index anyway, so stopping at the last real row and column
+/// collects the same values without an unbounded loop on the render path.
+fn formula_range_values(table: &Table, first: &str, last: &str) -> Option<Vec<f64>> {
     let (r1, c1) = table_cell_reference(first)?;
     let (r2, c2) = table_cell_reference(last)?;
-    let mut values = Vec::new();
-    // A range can name any `usize` (`A1:A18446744073709551615`): `cell()`
-    // returns None outside the table, so clamping the walk to the table's
-    // own rows/columns collects exactly the same values — every skipped
-    // cell would have been None — while keeping an unbounded walk off the
-    // render path (1.8e19 iterations of `..=`).
     let row_end = r1.max(r2).min(table.rows.len().saturating_sub(1));
     let col_end = c1.max(c2).min(table.columns.len().saturating_sub(1));
+    let mut values = Vec::new();
     for row in r1.min(r2)..=row_end {
         for column in c1.min(c2)..=col_end {
             if let Some(value) = table
@@ -753,29 +793,200 @@ fn evaluate_table_formula(table: &Table, expression: &str) -> Option<String> {
             }
         }
     }
-    match function.as_str() {
-        "SUM" => Some(values.iter().sum::<f64>().to_string()),
-        "AVERAGE" | "AVG" if !values.is_empty() => {
-            Some((values.iter().sum::<f64>() / values.len() as f64).to_string())
-        }
-        "COUNT" => Some(values.len().to_string()),
-        "MIN" if !values.is_empty() => {
-            Some(values.into_iter().fold(f64::INFINITY, f64::min).to_string())
-        }
-        "MAX" if !values.is_empty() => Some(
-            values
-                .into_iter()
-                .fold(f64::NEG_INFINITY, f64::max)
-                .to_string(),
-        ),
-        _ => None,
+    Some(values)
+}
+
+/// Recursive-descent parser for the arithmetic half of a table formula:
+/// numbers, cell references, `+ - * / ^`, parentheses and the aggregate
+/// functions. A returned `None` means the body is not a well-formed
+/// expression, so the cell keeps its literal text.
+struct FormulaParser<'a> {
+    table: &'a Table,
+    body: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FormulaParser<'a> {
+    fn parse(table: &'a Table, body: &str) -> Option<f64> {
+        let mut parser = FormulaParser {
+            table,
+            body: body.as_bytes(),
+            pos: 0,
+        };
+        let value = parser.expression()?;
+        parser.skip_space();
+        (parser.pos == parser.body.len()).then_some(value)
     }
+
+    fn skip_space(&mut self) {
+        while self
+            .body
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_space();
+        self.body.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expression(&mut self) -> Option<f64> {
+        let mut value = self.term()?;
+        loop {
+            match self.peek() {
+                Some(b'+') => {
+                    self.pos += 1;
+                    value += self.term()?;
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    value -= self.term()?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<f64> {
+        let mut value = self.power()?;
+        loop {
+            match self.peek() {
+                Some(b'*') => {
+                    self.pos += 1;
+                    value *= self.power()?;
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    value /= self.power()?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn power(&mut self) -> Option<f64> {
+        let value = self.unary()?;
+        if self.eat(b'^') {
+            Some(value.powf(self.power()?))
+        } else {
+            Some(value)
+        }
+    }
+
+    fn unary(&mut self) -> Option<f64> {
+        match self.peek() {
+            Some(b'+') => {
+                self.pos += 1;
+                self.unary()
+            }
+            Some(b'-') => {
+                self.pos += 1;
+                self.unary().map(|value| -value)
+            }
+            _ => self.primary(),
+        }
+    }
+
+    fn primary(&mut self) -> Option<f64> {
+        match self.peek()? {
+            b'(' => {
+                self.pos += 1;
+                let value = self.expression()?;
+                self.eat(b')').then_some(value)
+            }
+            b'0'..=b'9' | b'.' => self.number(),
+            byte if byte.is_ascii_alphabetic() => self.name(),
+            _ => None,
+        }
+    }
+
+    fn number(&mut self) -> Option<f64> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9' | b'.')) {
+            self.pos += 1;
+        }
+        std::str::from_utf8(&self.body[start..self.pos])
+            .ok()?
+            .parse::<f64>()
+            .ok()
+    }
+
+    fn name(&mut self) -> Option<f64> {
+        let start = self.pos;
+        while matches!(
+            self.peek(),
+            Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_'
+        ) {
+            self.pos += 1;
+        }
+        let token = std::str::from_utf8(&self.body[start..self.pos]).ok()?;
+        if self.eat(b'(') {
+            self.function(token)
+        } else {
+            formula_cell_number(self.table, token)
+        }
+    }
+
+    fn function(&mut self, name: &str) -> Option<f64> {
+        let start = self.pos;
+        while matches!(
+            self.peek(),
+            Some(byte) if byte.is_ascii_alphanumeric() || byte == b':'
+        ) {
+            self.pos += 1;
+        }
+        let range = std::str::from_utf8(&self.body[start..self.pos]).ok()?;
+        if !self.eat(b')') {
+            return None;
+        }
+        let (first, last) = range.split_once(':').unwrap_or((range, range));
+        let values = formula_range_values(self.table, first, last)?;
+        match name.to_ascii_uppercase().as_str() {
+            "SUM" => Some(values.iter().sum()),
+            "AVERAGE" | "AVG" if !values.is_empty() => {
+                Some(values.iter().sum::<f64>() / values.len() as f64)
+            }
+            "COUNT" => Some(values.len() as f64),
+            "MIN" if !values.is_empty() => {
+                Some(values.iter().copied().fold(f64::INFINITY, f64::min))
+            }
+            "MAX" if !values.is_empty() => Some(
+                values
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max),
+            ),
+            _ => None,
+        }
+    }
+}
+
+fn evaluate_table_formula(table: &Table, expression: &str) -> Option<String> {
+    let body = expression.trim().strip_prefix('=')?.trim();
+    if let Some((row, column)) = table_cell_reference(body) {
+        return table
+            .cell(row, column)
+            .map(|cell| cell.text_value().to_string());
+    }
+    FormulaParser::parse(table, body).map(|value| value.to_string())
 }
 
 fn fallback_content_centers(
     bounds: [f32; 4],
     sizes: &[(f32, f32)],
-    layout: codec::entities::table::ContentLayoutFlags,
+    layout: document::entities::table::ContentLayoutFlags,
     alignment: i32,
     horizontal_spacing: f32,
     vertical_spacing: f32,
@@ -788,11 +999,11 @@ fn fallback_content_centers(
     let horiz = ((alignment - 1).rem_euclid(3)) + 1;
     let vert = ((alignment - 1) / 3) + 1;
     let mut rows: Vec<Vec<usize>> = Vec::new();
-    if layout.contains(codec::entities::table::ContentLayoutFlags::STACKED_VERTICAL) {
+    if layout.contains(document::entities::table::ContentLayoutFlags::STACKED_VERTICAL) {
         for index in 0..sizes.len() {
             rows.push(vec![index]);
         }
-    } else if layout.contains(codec::entities::table::ContentLayoutFlags::STACKED_HORIZONTAL) {
+    } else if layout.contains(document::entities::table::ContentLayoutFlags::STACKED_HORIZONTAL) {
         rows.push((0..sizes.len()).collect());
     } else {
         let mut row = Vec::new();
@@ -853,10 +1064,27 @@ fn fallback_content_centers(
     result
 }
 
-fn content_display_value(
-    document: &codec::Document,
+/// What a cell shows: each content's value, field or formula result.
+#[cfg(test)]
+pub(crate) fn shown_cell_text(
+    document: &document::Document,
     table: &Table,
-    content: &codec::entities::table::CellContent,
+    row: usize,
+    column: usize,
+) -> String {
+    table.cell(row, column).map_or_else(String::new, |cell| {
+        cell.contents
+            .iter()
+            .map(|content| content_display_value(document, table, content))
+            .collect::<Vec<_>>()
+            .join("|")
+    })
+}
+
+fn content_display_value(
+    document: &document::Document,
+    table: &Table,
+    content: &document::entities::table::CellContent,
 ) -> String {
     if let Some(handle) = content.field_handle {
         if let Some(value) =
@@ -864,7 +1092,7 @@ fn content_display_value(
         {
             return value;
         }
-        if let Some(codec::objects::ObjectType::Field(field)) = document.objects.get(&handle) {
+        if let Some(document::objects::ObjectType::Field(field)) = document.objects.get(&handle) {
             if !field.value_string.is_empty() {
                 return field.value_string.clone();
             }
@@ -878,14 +1106,195 @@ fn content_display_value(
     evaluate_table_formula(table, &value).unwrap_or(value)
 }
 
-fn resolved_content_geometry(
-    document: &codec::Document,
+/// A formula typed into a cell ("=A1+C1") is plain text, which other
+/// programs keep showing as typed. Turns the cell into a formula field
+/// (`\AcExpr (A1+C1)`), the form a formula cell is stored in, holding the
+/// value the screen shows. A formula that does not evaluate stays as text.
+/// Returns whether the cell changed.
+pub(crate) fn typed_formula_to_field(
+    document: &mut document::Document,
+    table: document::Handle,
+    row: usize,
+    column: usize,
+) -> bool {
+    let Some(document::EntityType::Table(source)) = document.get_entity(table) else {
+        return false;
+    };
+    let Some([content]) = source
+        .cell(row, column)
+        .map(|cell| cell.contents.as_slice())
+    else {
+        return false;
+    };
+    if content.field_handle.is_some() {
+        return false;
+    }
+    let raw = format_cell_value(&content.value);
+    let Some(body) = raw.trim().strip_prefix('=').map(str::trim) else {
+        return false;
+    };
+    if body.is_empty() {
+        return false;
+    }
+    let Some(shown) = evaluate_table_formula(source, &raw) else {
+        return false;
+    };
+    let code = format!("\\AcExpr ({body})");
+    document
+        .set_table_cell_field(
+            table,
+            row,
+            column,
+            "%<\\_FldIdx 0>%",
+            vec![document::fields::NewField::new(code, shown)],
+        )
+        .is_some()
+}
+
+/// The formula a formula-field cell holds, as typed ("=A1+C1"): the cell's
+/// only content is a field whose one child is `\AcExpr (body)`. `None` for
+/// any other cell, a nested or mixed field included.
+pub(crate) fn cell_formula_text(
+    document: &document::Document,
     table: &Table,
     row: usize,
     column: usize,
-    cell: &codec::entities::table::TableCell,
+) -> Option<String> {
+    let [content] = table.cell(row, column)?.contents.as_slice() else {
+        return None;
+    };
+    let field = |h| match document.objects.get(&h) {
+        Some(document::objects::ObjectType::Field(f)) => Some(f),
+        _ => None,
+    };
+    let mut current = field(content.field_handle?)?;
+    // The container carries the template; the formula sits in its child.
+    if current.evaluator_id == "_text" {
+        if current.code.trim() != "%<\\_FldIdx 0>%" {
+            return None;
+        }
+        let [child] = current.child_fields.as_slice() else {
+            return None;
+        };
+        current = field(*child)?;
+    }
+    let body = current
+        .code
+        .trim()
+        .strip_prefix("\\AcExpr")?
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    if body.is_empty() || body.contains("%<") || !current.child_fields.is_empty() {
+        return None;
+    }
+    Some(format!("={body}"))
+}
+
+/// Rewrite a formula cell's picture text to its computed value: the picture
+/// block is what a file stores and other programs draw, and it must show the
+/// same result the screen shows, not the raw "=A1+C1". Returns the picture
+/// MTEXT handles whose text changed.
+pub(crate) fn refresh_picture_formulas(
+    document: &mut document::Document,
+    table: document::Handle,
+) -> Vec<document::Handle> {
+    let Some(document::EntityType::Table(source)) = document.get_entity(table) else {
+        return Vec::new();
+    };
+    let mut source = (**source).clone();
+    // An edited table lets go of its picture handle but keeps the name; the
+    // block is still there, and the picture lookup resolves through it.
+    if source.block_record_handle.is_none() {
+        if let Some(record) = document.block_records.get(&source.block_name) {
+            source.block_record_handle = Some(record.handle);
+        }
+    }
+    let mut updates: Vec<(document::Handle, String)> = Vec::new();
+    let mut cells: Vec<(usize, usize, String)> = Vec::new();
+    for row in 0..source.rows.len() {
+        for column in 0..source.columns.len() {
+            let Some(cell) = source.cell(row, column) else {
+                continue;
+            };
+            let Some(content) = cell.contents.first() else {
+                continue;
+            };
+            let raw = format_cell_value(&content.value);
+            // A formula field keeps the value it had when last evaluated;
+            // the cell and its picture follow the cells it reads.
+            let formula_field = content
+                .field_handle
+                .is_some_and(|handle| is_formula_field(document, handle));
+            if !formula_field && !raw.trim_start().starts_with('=') {
+                continue;
+            }
+            let shown = content_display_value(document, &source, content);
+            if shown == raw {
+                continue;
+            }
+            if formula_field {
+                cells.push((row, column, shown.clone()));
+            }
+            if let Some(picture) = cell_picture(document, &source, row, column) {
+                for &member in &picture.members {
+                    updates.push((member, shown.clone()));
+                }
+            }
+        }
+    }
+    if let Some(document::EntityType::Table(target)) = document.get_entity_mut(table) {
+        for (row, column, shown) in cells {
+            if let Some(content) = target
+                .cell_mut(row, column)
+                .and_then(|cell| cell.contents.first_mut())
+            {
+                content.value.text = shown.clone();
+                content.value.formatted_value = shown;
+            }
+        }
+    }
+    let mut changed = Vec::new();
+    for (handle, text) in updates {
+        if let Some(document::EntityType::MText(entity)) = document.get_entity_mut(handle) {
+            if entity.value != text {
+                entity.value = text;
+                changed.push(handle);
+            }
+        }
+    }
+    changed
+}
+
+/// Whether a cell's field is one formula: a `_text` container whose only
+/// child is an `AcExpr` field.
+fn is_formula_field(document: &document::Document, container: document::Handle) -> bool {
+    use document::objects::ObjectType;
+    let Some(ObjectType::Field(container)) = document.objects.get(&container) else {
+        return false;
+    };
+    let [child] = container.child_fields.as_slice() else {
+        return false;
+    };
+    matches!(
+        document.objects.get(child),
+        Some(ObjectType::Field(child)) if child.evaluator_id == "AcExpr"
+    )
+}
+
+fn resolved_content_geometry(
+    document: &document::Document,
+    table: &Table,
+    row: usize,
+    column: usize,
+    cell: &document::entities::table::TableCell,
     content_index: usize,
-) -> Option<codec::entities::table::CellContentGeometry> {
+) -> Option<document::entities::table::CellContentGeometry> {
+    // The stored placement is the file's layout of the table as saved; an
+    // edit drops the table's picture block, and from then on alignment,
+    // margins and text place the content (as for a table drawn here).
+    table.block_record_handle?;
     if let Some(geometry) = cell
         .contents
         .get(content_index)
@@ -904,8 +1313,8 @@ fn resolved_content_geometry(
     let flat_index = row
         .saturating_mul(table.columns.len())
         .saturating_add(column);
-    if let Some(codec::objects::ObjectType::DataObject(object)) = document.objects.get(&handle) {
-        if let codec::objects::DataObjectData::TableGeometry(geometry) = &object.data {
+    if let Some(document::objects::ObjectType::DataObject(object)) = document.objects.get(&handle) {
+        if let document::objects::DataObjectData::TableGeometry(geometry) = &object.data {
             return geometry
                 .cells
                 .get(flat_index)
@@ -914,10 +1323,10 @@ fn resolved_content_geometry(
         }
     }
     document.objects.values().find_map(|object| {
-        let codec::objects::ObjectType::DataObject(object) = object else {
+        let document::objects::ObjectType::DataObject(object) = object else {
             return None;
         };
-        let codec::objects::DataObjectData::TableGeometry(geometry) = &object.data else {
+        let document::objects::DataObjectData::TableGeometry(geometry) = &object.data else {
             return None;
         };
         geometry
@@ -931,12 +1340,12 @@ fn resolved_content_geometry(
 
 pub(crate) fn block_cell_inserts(
     table: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     anno_scale: f32,
-) -> Vec<codec::entities::Insert> {
-    use codec::entities::table::ContentLayoutFlags;
-    use codec::entities::{AttributeEntity, EntityType, Insert};
-    use codec::types::Vector3;
+) -> Vec<document::entities::Insert> {
+    use document::entities::table::ContentLayoutFlags;
+    use document::entities::{AttributeEntity, EntityType, Insert};
+    use document::types::Vector3;
 
     if table.rows.is_empty() || table.columns.is_empty() {
         return Vec::new();
@@ -947,7 +1356,7 @@ pub(crate) fn block_cell_inserts(
             .objects
             .get(&handle)
             .and_then(|object| match object {
-                codec::objects::ObjectType::TableStyle(style) => Some(style),
+                document::objects::ObjectType::TableStyle(style) => Some(style),
                 _ => None,
             })
     });
@@ -979,8 +1388,15 @@ pub(crate) fn block_cell_inserts(
             if block_contents.is_empty() {
                 continue;
             }
-            let (origin, row_top) =
-                break_frame_for_row(table, document, row_index, h, flow, &row_offsets, anno_scale);
+            let (origin, row_top) = break_frame_for_row(
+                table,
+                document,
+                row_index,
+                h,
+                flow,
+                &row_offsets,
+                anno_scale,
+            );
             let row_bottom = row_top
                 + row_offsets
                     .get(row_end + 1)
@@ -997,7 +1413,7 @@ pub(crate) fn block_cell_inserts(
                 row,
                 column_index,
                 cell,
-                codec::entities::table::CellStylePropertyFlags::CONTENT_LAYOUT,
+                document::entities::table::CellStylePropertyFlags::CONTENT_LAYOUT,
             );
             let layout = layout_style
                 .map(|style| style.layout_flags)
@@ -1044,14 +1460,14 @@ pub(crate) fn block_cell_inserts(
                     row,
                     column_index,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::BLOCK_SCALE,
+                    document::entities::table::CellStylePropertyFlags::BLOCK_SCALE,
                 );
                 let style_scale = scale_style
                     .map(|style| style.scale)
                     .filter(|scale| scale.abs() > 1e-9)
                     .unwrap_or(1.0);
                 let content_scale = if content.format_property_flags
-                    & codec::entities::table::CellStylePropertyFlags::BLOCK_SCALE.bits() as i32
+                    & document::entities::table::CellStylePropertyFlags::BLOCK_SCALE.bits() as i32
                     != 0
                     && content.scale.abs() > 1e-9
                 {
@@ -1062,7 +1478,7 @@ pub(crate) fn block_cell_inserts(
                     1.0
                 };
                 let mut scale = if content.format_property_flags
-                    & codec::entities::table::CellStylePropertyFlags::BLOCK_SCALE.bits() as i32
+                    & document::entities::table::CellStylePropertyFlags::BLOCK_SCALE.bits() as i32
                     != 0
                 {
                     content_scale
@@ -1075,12 +1491,12 @@ pub(crate) fn block_cell_inserts(
                         row,
                         column_index,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::AUTO_SCALE,
+                        document::entities::table::CellStylePropertyFlags::AUTO_SCALE,
                     )
                     .is_some_and(|style| {
                         style
                             .property_flags
-                            .contains(codec::entities::table::CellStylePropertyFlags::AUTO_SCALE)
+                            .contains(document::entities::table::CellStylePropertyFlags::AUTO_SCALE)
                     });
                 let mut block_min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
                 let mut block_max = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
@@ -1109,13 +1525,13 @@ pub(crate) fn block_cell_inserts(
                     table,
                     table.table_style_handle.and_then(|handle| {
                         match document.objects.get(&handle) {
-                            Some(codec::objects::ObjectType::TableStyle(style)) => Some(style),
+                            Some(document::objects::ObjectType::TableStyle(style)) => Some(style),
                             _ => None,
                         }
                     }),
                 );
                 let margin = |property| {
-                    use codec::entities::table::CellStylePropertyFlags as P;
+                    use document::entities::table::CellStylePropertyFlags as P;
                     let horizontal = matches!(property, P::MARGIN_LEFT | P::MARGIN_RIGHT);
                     style_for_property(table, row, column_index, cell, property)
                         .map(|style| match property {
@@ -1124,14 +1540,21 @@ pub(crate) fn block_cell_inserts(
                             P::MARGIN_TOP => style.margin_top,
                             _ => style.margin_bottom,
                         })
-                        .unwrap_or(if horizontal { table_h_margin } else { table_v_margin })
+                        .unwrap_or(if horizontal {
+                            table_h_margin
+                        } else {
+                            table_v_margin
+                        })
                         * anno_scale as f64
                 };
-                let margin_left = margin(codec::entities::table::CellStylePropertyFlags::MARGIN_LEFT);
-                let margin_right = margin(codec::entities::table::CellStylePropertyFlags::MARGIN_RIGHT);
-                let margin_top = margin(codec::entities::table::CellStylePropertyFlags::MARGIN_TOP);
+                let margin_left =
+                    margin(document::entities::table::CellStylePropertyFlags::MARGIN_LEFT);
+                let margin_right =
+                    margin(document::entities::table::CellStylePropertyFlags::MARGIN_RIGHT);
+                let margin_top =
+                    margin(document::entities::table::CellStylePropertyFlags::MARGIN_TOP);
                 let margin_bottom =
-                    margin(codec::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM);
+                    margin(document::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM);
                 if auto_scale && has_block_bounds {
                     let width = (block_max.x - block_min.x).abs();
                     let height = (block_max.y - block_min.y).abs();
@@ -1148,10 +1571,10 @@ pub(crate) fn block_cell_inserts(
                     row,
                     column_index,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::ROTATION,
+                    document::entities::table::CellStylePropertyFlags::ROTATION,
                 );
                 let content_rotation_explicit = content.format_property_flags
-                    & codec::entities::table::CellStylePropertyFlags::ROTATION.bits() as i32
+                    & document::entities::table::CellStylePropertyFlags::ROTATION.bits() as i32
                     != 0;
                 let content_rotation = if content_rotation_explicit {
                     content.rotation
@@ -1163,22 +1586,24 @@ pub(crate) fn block_cell_inserts(
                 let rotation = table_rotation + content_rotation;
                 // A lone block sits where the cell's alignment puts it: its
                 // rotated, scaled extents against the cell's margins.
-                if has_block_bounds && count <= 1.0 && resolved_content_geometry(
-                    document,
-                    table,
-                    row_index,
-                    column_index,
-                    cell,
-                    content_index,
-                )
-                .is_none()
+                if has_block_bounds
+                    && count <= 1.0
+                    && resolved_content_geometry(
+                        document,
+                        table,
+                        row_index,
+                        column_index,
+                        cell,
+                        content_index,
+                    )
+                    .is_none()
                 {
                     let alignment = style_for_property(
                         table,
                         row,
                         column_index,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::ALIGNMENT,
+                        document::entities::table::CellStylePropertyFlags::ALIGNMENT,
                     )
                     .map(|style| style.alignment)
                     .unwrap_or(5);
@@ -1198,7 +1623,7 @@ pub(crate) fn block_cell_inserts(
                         _ => (row_top + row_bottom) as f64 * 0.5,
                     };
                     let shift = h * (cell_x as f32 - x) + flow * (cell_y as f32 - y);
-                    position = position + shift;
+                    position += shift;
                 }
                 let mut insert = Insert::new(
                     record.name.clone(),
@@ -1244,7 +1669,7 @@ pub(crate) fn block_cell_inserts(
                     };
                     let mut entity =
                         AttributeEntity::from_definition(definition, Some(attribute.value.clone()));
-                    codec::Entity::apply_transform(
+                    document::Entity::apply_transform(
                         &mut entity,
                         &crate::scene::render_graph::insert_transform(document, &insert),
                     );
@@ -1259,7 +1684,7 @@ pub(crate) fn block_cell_inserts(
 }
 
 impl RenderConvertible for Table {
-    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
+    fn to_render(&self, document: &document::Document) -> Option<RenderEntity> {
         if self.rows.is_empty() || self.columns.is_empty() {
             return None;
         }
@@ -1382,13 +1807,13 @@ impl RenderConvertible for Table {
         // Row classification: row 0 is Title (when not suppressed), row 1 is
         // Header (when not suppressed), everything else is Data. The two
         // suppressed flags shift the leading rows down to Data.
-        let lookup_style = |h: codec::Handle| -> Option<&codec::tables::TextStyle> {
+        let lookup_style = |h: document::Handle| -> Option<&document::tables::TextStyle> {
             document.text_styles.iter().find(|s| s.handle == h)
         };
-        let table_style: Option<&codec::objects::TableStyle> =
+        let table_style: Option<&document::objects::TableStyle> =
             self.table_style_handle.and_then(|h| {
                 document.objects.get(&h).and_then(|obj| match obj {
-                    codec::objects::ObjectType::TableStyle(ts) => Some(ts),
+                    document::objects::ObjectType::TableStyle(ts) => Some(ts),
                     _ => None,
                 })
             });
@@ -1396,14 +1821,14 @@ impl RenderConvertible for Table {
         let header_suppressed = resolved_header_suppressed(self, table_style);
 
         let style_fonts = table_style_fonts(document);
-        let font_for_handle = |handle: Option<codec::Handle>| -> Option<String> {
+        let font_for_handle = |handle: Option<document::Handle>| -> Option<String> {
             handle.and_then(|h| style_fonts.get(&h).cloned())
         };
         // Build a ResolvedTextStyle for the cell — needed by the shared MText
         // pipeline so inline `\W`, `\Q`, etc. compose with the style baseline.
         let resolved_style_for_handle =
-            |handle: Option<codec::Handle>, font_name: String| -> ResolvedTextStyle {
-                let style = handle.and_then(|h| lookup_style(h));
+            |handle: Option<document::Handle>, font_name: String| -> ResolvedTextStyle {
+                let style = handle.and_then(&lookup_style);
                 ResolvedTextStyle {
                     font_name,
                     width_factor: style.map(|s| s.width_factor as f32).unwrap_or(1.0),
@@ -1423,19 +1848,20 @@ impl RenderConvertible for Table {
             let row_mid = (row_top + row_bot) * 0.5;
 
             // Pick the appropriate row_style from TableStyle for this row's role.
-            let legacy_row_style: Option<&codec::objects::RowCellStyle> = table_style.map(|ts| {
-                let kind = match (title_suppressed, header_suppressed, ri) {
-                    (false, _, 0) => 0,     // title
-                    (false, false, 1) => 1, // header
-                    (true, false, 0) => 1,  // header pulled up
-                    _ => 2,                 // data
-                };
-                match kind {
-                    0 => &ts.title_row_style,
-                    1 => &ts.header_row_style,
-                    _ => &ts.data_row_style,
-                }
-            });
+            let legacy_row_style: Option<&document::objects::RowCellStyle> =
+                table_style.map(|ts| {
+                    let kind = match (title_suppressed, header_suppressed, ri) {
+                        (false, _, 0) => 0,     // title
+                        (false, false, 1) => 1, // header
+                        (true, false, 0) => 1,  // header pulled up
+                        _ => 2,                 // data
+                    };
+                    match kind {
+                        0 => &ts.title_row_style,
+                        1 => &ts.header_row_style,
+                        _ => &ts.data_row_style,
+                    }
+                });
             // A row naming a cell style of the table style draws with it.
             let named_row_style = table_style
                 .filter(|_| row.style_id != 0)
@@ -1444,7 +1870,14 @@ impl RenderConvertible for Table {
             let row_style = named_row_style.as_ref().or(legacy_row_style);
 
             for (ci, cell) in row.cells.iter().enumerate() {
-                let text = cell.text_value();
+                // What the cell shows (a field's value, a formula's result),
+                // as for a table drawn from its cells outside a block.
+                let shown = cell
+                    .contents
+                    .first()
+                    .map(|content| content_display_value(document, self, content))
+                    .unwrap_or_default();
+                let text = shown.as_str();
                 if text.is_empty() {
                     continue;
                 }
@@ -1465,7 +1898,8 @@ impl RenderConvertible for Table {
                     .as_ref()
                     .or_else(|| {
                         table_style.map(|ts| {
-                            match cell_role_kind(self, title_suppressed, header_suppressed, ri, ci) {
+                            match cell_role_kind(self, title_suppressed, header_suppressed, ri, ci)
+                            {
                                 0 => &ts.title_row_style,
                                 1 => &ts.header_row_style,
                                 _ => &ts.data_row_style,
@@ -1481,7 +1915,9 @@ impl RenderConvertible for Table {
                 // Resolve text height: content → cell-style → row-style → 0.18.
                 let content = cell.contents.first();
                 let cell_h = content
-                    .and_then(|c| cell_text_height(self, row, ci, cell, c, row_style.map(|s| s.text_height)))
+                    .and_then(|c| {
+                        cell_text_height(self, row, ci, cell, c, row_style.map(|s| s.text_height))
+                    })
                     .or_else(|| {
                         cell.style
                             .as_ref()
@@ -1613,7 +2049,7 @@ impl RenderConvertible for Table {
 /// Builds colored geometry for tables without a stored display block.
 pub fn tessellate_table(
     tab: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     selected: bool,
     entity_color: [f32; 4],
     line_weight_px: f32,
@@ -1624,7 +2060,7 @@ pub fn tessellate_table(
 ) -> Vec<crate::scene::model::wire_model::WireModel> {
     use crate::scene::convert::tess_util::aci_to_rgba;
     use crate::scene::model::wire_model::WireModel;
-    use codec::types::Color;
+    use document::types::Color;
     use rustc_hash::FxHashMap as HashMap;
 
     if tab.rows.is_empty() || tab.columns.is_empty() {
@@ -1652,21 +2088,22 @@ pub fn tessellate_table(
             (c[3] * 255.0) as u8,
         ]
     };
-    let lw_px = |w: &codec::types::LineWeight| -> f32 {
+    let lw_px = |w: &document::types::LineWeight| -> f32 {
         match w {
-            codec::types::LineWeight::Value(v) if *v >= 0 => (*v as f32 / 100.0) * (96.0 / 25.4),
+            document::types::LineWeight::Value(v) if *v >= 0 => (*v as f32 / 100.0) * (96.0 / 25.4),
             _ => line_weight_px,
         }
     };
 
     let (h, v_down) = table_axes(tab);
     // Flow direction: `Up` stacks rows upward instead of downward.
-    let table_style: Option<&codec::objects::TableStyle> = tab.table_style_handle.and_then(|h| {
-        document.objects.get(&h).and_then(|obj| match obj {
-            codec::objects::ObjectType::TableStyle(ts) => Some(ts),
-            _ => None,
-        })
-    });
+    let table_style: Option<&document::objects::TableStyle> =
+        tab.table_style_handle.and_then(|h| {
+            document.objects.get(&h).and_then(|obj| match obj {
+                document::objects::ObjectType::TableStyle(ts) => Some(ts),
+                _ => None,
+            })
+        });
     let flow_up = resolved_flow_up(tab, table_style);
     let v_flow = if flow_up { -v_down } else { v_down };
 
@@ -1681,15 +2118,15 @@ pub fn tessellate_table(
     let h_margin = horizontal_margin as f32 * anno_scale;
     let v_margin = vertical_margin as f32 * anno_scale;
 
-    let lookup_style = |hh: codec::Handle| -> Option<&codec::tables::TextStyle> {
+    let lookup_style = |hh: document::Handle| -> Option<&document::tables::TextStyle> {
         document.text_styles.iter().find(|s| s.handle == hh)
     };
     let style_fonts = table_style_fonts(document);
-    let font_for_handle = |handle: Option<codec::Handle>| -> Option<String> {
+    let font_for_handle = |handle: Option<document::Handle>| -> Option<String> {
         handle.and_then(|h| style_fonts.get(&h).cloned())
     };
     let resolved_style_for_handle =
-        |handle: Option<codec::Handle>, font_name: String| -> ResolvedTextStyle {
+        |handle: Option<document::Handle>, font_name: String| -> ResolvedTextStyle {
             let style = handle.and_then(lookup_style);
             ResolvedTextStyle {
                 font_name,
@@ -1748,17 +2185,18 @@ pub fn tessellate_table(
 
     let normal = v3(&tab.normal).normalize_or(Vec3::Z);
     // Each row's named cell style: the one its id names, else the title,
-    // header or data style its place gives it.
-    let row_cells: Vec<Option<&codec::objects::NamedTableCellStyle>> = tab
+    // header or data style of its role — the one its id names (1 to 3),
+    // else the one its place gives it.
+    let row_cells: Vec<Option<&document::objects::NamedTableCellStyle>> = tab
         .rows
         .iter()
         .enumerate()
         .map(|(ri, row)| {
             let ts = table_style?;
-            let kind = match (title_suppressed, header_suppressed, ri) {
-                (false, _, 0) => codec::objects::TITLE_CELL_STYLE,
-                (false, false, 1) | (true, false, 0) => codec::objects::HEADER_CELL_STYLE,
-                _ => codec::objects::DATA_CELL_STYLE,
+            let kind = match row_role_kind(tab, title_suppressed, header_suppressed, ri) {
+                0 => document::objects::TITLE_CELL_STYLE,
+                1 => document::objects::HEADER_CELL_STYLE,
+                _ => document::objects::DATA_CELL_STYLE,
             };
             (row.style_id != 0)
                 .then(|| ts.cell_style_by_id(row.style_id))
@@ -1766,28 +2204,24 @@ pub fn tessellate_table(
                 .or_else(|| ts.cell_style(kind))
         })
         .collect();
-    let row_projections: Vec<Option<codec::objects::RowCellStyle>> = row_cells
+    let row_projections: Vec<Option<document::objects::RowCellStyle>> = row_cells
         .iter()
         .map(|cell| cell.map(|cell| cell.cell_style.to_row_style()))
         .collect();
     let column_count = tab.columns.len();
     let line_types = &document.line_types;
     for (ri, row) in tab.rows.iter().enumerate() {
-        let legacy_row_style: Option<&codec::objects::RowCellStyle> = table_style.map(|ts| {
-            let kind = match (title_suppressed, header_suppressed, ri) {
-                (false, _, 0) => 0,
-                (false, false, 1) => 1,
-                (true, false, 0) => 1,
-                _ => 2,
-            };
-            match kind {
+        // A table style with its three row styles only has no cell style
+        // for a row's id to name: the row's role still picks among them.
+        let legacy_row_style: Option<&document::objects::RowCellStyle> = table_style.map(|ts| {
+            match row_role_kind(tab, title_suppressed, header_suppressed, ri) {
                 0 => &ts.title_row_style,
                 1 => &ts.header_row_style,
                 _ => &ts.data_row_style,
             }
         });
         let row_cell = row_cells[ri];
-        let row_style: Option<&codec::objects::RowCellStyle> =
+        let row_style: Option<&document::objects::RowCellStyle> =
             row_projections[ri].as_ref().or(legacy_row_style);
         // The cell style's margins, where it has its own.
         let cell_margins = row_cell.and_then(|cell| cell.cell_style.margins());
@@ -1844,7 +2278,7 @@ pub fn tessellate_table(
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::BACKGROUND_COLOR,
+                    document::entities::table::CellStylePropertyFlags::BACKGROUND_COLOR,
                 );
                 let (fill_on, fill_color) = if let Some(cs) = fill_style {
                     (cs.fill_enabled, cs.background_color)
@@ -1887,10 +2321,10 @@ pub fn tessellate_table(
                 // (visible, colour, weight, double spacing, linetype).
                 let edge = |which: u8| -> (bool, [f32; 4], f32, f32, u64) {
                     let edge_flag = match which {
-                        0 => codec::entities::table::CellEdgeFlags::TOP,
-                        1 => codec::entities::table::CellEdgeFlags::RIGHT,
-                        2 => codec::entities::table::CellEdgeFlags::BOTTOM,
-                        _ => codec::entities::table::CellEdgeFlags::LEFT,
+                        0 => document::entities::table::CellEdgeFlags::TOP,
+                        1 => document::entities::table::CellEdgeFlags::RIGHT,
+                        2 => document::entities::table::CellEdgeFlags::BOTTOM,
+                        _ => document::entities::table::CellEdgeFlags::LEFT,
                     };
                     if let Some(cs) = style_for_border(tab, row, ci, cell, edge_flag) {
                         let b = match which {
@@ -1907,7 +2341,7 @@ pub fn tessellate_table(
                                 resolve_col(&b.color, entity_color)
                             },
                             lw_px(&b.line_weight),
-                            if b.border_type == codec::entities::table::BorderType::Double {
+                            if b.border_type == document::entities::table::BorderType::Double {
                                 b.double_spacing as f32 * anno_scale
                             } else {
                                 0.0
@@ -1919,7 +2353,7 @@ pub fn tessellate_table(
                         let data = &cs.cell_style;
                         let grid = data.grid(mask);
                         let double = grid.is_some_and(|g| {
-                            g.border.border_type == codec::objects::TableBorderType::Double
+                            g.border.border_type == document::objects::TableBorderType::Double
                         });
                         (
                             !data.edge_hidden(mask),
@@ -1977,8 +2411,22 @@ pub fn tessellate_table(
                     if spacing > 0.0 {
                         let along = (b - a).normalize_or(h);
                         let offset = normal.cross(along) * (spacing * 0.5);
-                        add_edge(a + offset, b + offset, color, weight, linetype, &mut borders);
-                        add_edge(a - offset, b - offset, color, weight, linetype, &mut borders);
+                        add_edge(
+                            a + offset,
+                            b + offset,
+                            color,
+                            weight,
+                            linetype,
+                            &mut borders,
+                        );
+                        add_edge(
+                            a - offset,
+                            b - offset,
+                            color,
+                            weight,
+                            linetype,
+                            &mut borders,
+                        );
                     } else {
                         add_edge(a, b, color, weight, linetype, &mut borders);
                     }
@@ -2002,7 +2450,7 @@ pub fn tessellate_table(
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::TEXT_HEIGHT,
+                    document::entities::table::CellStylePropertyFlags::TEXT_HEIGHT,
                 )
                 .map(|style| style.text_height as f32)
                 .or_else(|| row_style.map(|style| style.text_height as f32))
@@ -2014,52 +2462,52 @@ pub fn tessellate_table(
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_LEFT,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_LEFT,
                 )
                 .map(|style| style.margin_left as f32 * anno_scale)
-                .unwrap_or(h_margin.max(fallback_text_height * 0.5));
+                .unwrap_or(side_margin(h_margin, fallback_text_height));
                 let fallback_margin_right = style_for_property(
                     tab,
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_RIGHT,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_RIGHT,
                 )
                 .map(|style| style.margin_right as f32 * anno_scale)
-                .unwrap_or(h_margin.max(fallback_text_height * 0.5));
+                .unwrap_or(side_margin(h_margin, fallback_text_height));
                 let fallback_margin_top = style_for_property(
                     tab,
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_TOP,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_TOP,
                 )
                 .map(|style| style.margin_top as f32 * anno_scale)
-                .unwrap_or(v_margin.max(fallback_text_height * 0.5));
+                .unwrap_or(side_margin(v_margin, fallback_text_height));
                 let fallback_margin_bottom = style_for_property(
                     tab,
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM,
                 )
                 .map(|style| style.margin_bottom as f32 * anno_scale)
-                .unwrap_or(v_margin.max(fallback_text_height * 0.5));
+                .unwrap_or(side_margin(v_margin, fallback_text_height));
                 let fallback_layout = style_for_property(
                     tab,
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::CONTENT_LAYOUT,
+                    document::entities::table::CellStylePropertyFlags::CONTENT_LAYOUT,
                 )
                 .map(|style| style.layout_flags)
-                .unwrap_or(codec::entities::table::ContentLayoutFlags::FLOW);
+                .unwrap_or(document::entities::table::ContentLayoutFlags::FLOW);
                 let fallback_alignment = style_for_property(
                     tab,
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::ALIGNMENT,
+                    document::entities::table::CellStylePropertyFlags::ALIGNMENT,
                 )
                 .map(|style| style.alignment)
                 .or_else(|| row_style.map(|style| style.alignment as i32))
@@ -2069,7 +2517,7 @@ pub fn tessellate_table(
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_HORIZONTAL_SPACING,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_HORIZONTAL_SPACING,
                 )
                 .map(|style| style.horizontal_spacing as f32 * anno_scale)
                 .unwrap_or(0.0);
@@ -2078,15 +2526,22 @@ pub fn tessellate_table(
                     row,
                     ci,
                     cell,
-                    codec::entities::table::CellStylePropertyFlags::MARGIN_VERTICAL_SPACING,
+                    document::entities::table::CellStylePropertyFlags::MARGIN_VERTICAL_SPACING,
                 )
                 .map(|style| style.vertical_spacing as f32 * anno_scale)
                 .unwrap_or(0.0);
                 let fallback_sizes: Vec<_> = value_contents
                     .iter()
                     .map(|(_, content, text)| {
-                        let height = cell_text_height(tab, row, ci, cell, content, row_style.map(|s| s.text_height))
-                            .map_or(fallback_text_height, |h| h as f32 * anno_scale);
+                        let height = cell_text_height(
+                            tab,
+                            row,
+                            ci,
+                            cell,
+                            content,
+                            row_style.map(|s| s.text_height),
+                        )
+                        .map_or(fallback_text_height, |h| h as f32 * anno_scale);
                         let mut max_chars = 0usize;
                         let mut line_count = 0usize;
                         for line in text.split("\\P") {
@@ -2115,55 +2570,62 @@ pub fn tessellate_table(
                 for (slot_index, (content_index, content, text)) in
                     value_contents.iter().enumerate()
                 {
-                    let cell_h = cell_text_height(tab, row, ci, cell, content, row_style.map(|s| s.text_height))
-                        .or_else(|| {
-                            row_style
-                                .map(|style| style.text_height)
-                                .filter(|height| *height > 1e-6)
-                        })
-                        .map(|height| height as f32)
-                        .unwrap_or(0.18)
+                    let cell_h = cell_text_height(
+                        tab,
+                        row,
+                        ci,
+                        cell,
+                        content,
+                        row_style.map(|s| s.text_height),
+                    )
+                    .or_else(|| {
+                        row_style
+                            .map(|style| style.text_height)
+                            .filter(|height| *height > 1e-6)
+                    })
+                    .map(|height| height as f32)
+                    .unwrap_or(0.18)
                         * anno_scale;
                     let margin_left = style_for_property(
                         tab,
                         row,
                         ci,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::MARGIN_LEFT,
+                        document::entities::table::CellStylePropertyFlags::MARGIN_LEFT,
                     )
                     .map(|style| style.margin_left as f32 * anno_scale)
                     .filter(|margin| *margin > 1e-6)
-                    .unwrap_or_else(|| h_margin.max(cell_h * 0.5));
+                    .unwrap_or_else(|| side_margin(h_margin, cell_h));
                     let margin_right = style_for_property(
                         tab,
                         row,
                         ci,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::MARGIN_RIGHT,
+                        document::entities::table::CellStylePropertyFlags::MARGIN_RIGHT,
                     )
                     .map(|style| style.margin_right as f32 * anno_scale)
                     .filter(|margin| *margin > 1e-6)
-                    .unwrap_or_else(|| h_margin.max(cell_h * 0.5));
+                    .unwrap_or_else(|| side_margin(h_margin, cell_h));
                     let margin_top = style_for_property(
                         tab,
                         row,
                         ci,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::MARGIN_TOP,
+                        document::entities::table::CellStylePropertyFlags::MARGIN_TOP,
                     )
                     .map(|style| style.margin_top as f32 * anno_scale)
                     .filter(|margin| *margin > 1e-6)
-                    .unwrap_or_else(|| v_margin.max(cell_h * 0.5));
+                    .unwrap_or_else(|| side_margin(v_margin, cell_h));
                     let margin_bottom = style_for_property(
                         tab,
                         row,
                         ci,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM,
+                        document::entities::table::CellStylePropertyFlags::MARGIN_BOTTOM,
                     )
                     .map(|style| style.margin_bottom as f32 * anno_scale)
                     .filter(|margin| *margin > 1e-6)
-                    .unwrap_or_else(|| v_margin.max(cell_h * 0.5));
+                    .unwrap_or_else(|| side_margin(v_margin, cell_h));
                     let style_handle = cell_text_style(document, tab, row, ci, cell, Some(content))
                         .or_else(|| row_style_text_style(document, row_style));
                     let font_owned =
@@ -2208,7 +2670,7 @@ pub fn tessellate_table(
                     }
                     let to = origin + h * x_offset + v_flow * y_offset + normal * z_offset;
                     let content_rotation_explicit = content.format_property_flags
-                        & codec::entities::table::CellStylePropertyFlags::ROTATION.bits() as i32
+                        & document::entities::table::CellStylePropertyFlags::ROTATION.bits() as i32
                         != 0;
                     let rot = if content_rotation_explicit {
                         content.rotation as f32
@@ -2218,7 +2680,7 @@ pub fn tessellate_table(
                             row,
                             ci,
                             cell,
-                            codec::entities::table::CellStylePropertyFlags::ROTATION,
+                            document::entities::table::CellStylePropertyFlags::ROTATION,
                         )
                         .map(|style| style.rotation as f32)
                         .unwrap_or(cell.rotation as f32)
@@ -2232,25 +2694,10 @@ pub fn tessellate_table(
                         value: text,
                         insertion: [to.x as f64, to.y as f64, to.z as f64],
                         height: cell_h,
-                        // Wraps inside the cell's own margins (the table's
-                        // where it sets none), as its row height is fitted.
-                        rect_w: {
-                            use codec::entities::table::CellStylePropertyFlags as P;
-                            let side = |property: P| {
-                                style_for_property(tab, row, ci, cell, property)
-                                    .map(|style| {
-                                        if property == P::MARGIN_LEFT {
-                                            style.margin_left
-                                        } else {
-                                            style.margin_right
-                                        }
-                                    })
-                                    .unwrap_or(horizontal_margin)
-                                    as f32
-                                    * anno_scale
-                            };
-                            (col_width - side(P::MARGIN_LEFT) - side(P::MARGIN_RIGHT)).max(0.0)
-                        },
+                        // Wraps between the same margins the text is placed
+                        // against, as its row height is fitted, so a line
+                        // never runs past the cell's edge.
+                        rect_w: (col_width - margin_left - margin_right).max(0.0),
                         rotation: rot,
                         style: &resolved,
                         attach_h_anchor,
@@ -2304,7 +2751,7 @@ pub fn tessellate_table(
                         row,
                         ci,
                         cell,
-                        codec::entities::table::CellStylePropertyFlags::CONTENT_COLOR,
+                        document::entities::table::CellStylePropertyFlags::CONTENT_COLOR,
                     ) {
                         resolve_col(&style.content_color, entity_color)
                     } else if let Some(style) = row_style {
@@ -2403,8 +2850,6 @@ pub fn tessellate_table(
             WireModel {
                 bg_adapt: None,
                 point_marker: None,
-                taper_widths: Vec::new(),
-                pattern_stations: Vec::new(),
                 world_width: 0.0,
                 depth_override: None,
                 display_visible: true,
@@ -2412,34 +2857,39 @@ pub fn tessellate_table(
                 plot_visible: true,
                 fill_is_3d: false,
                 fill_is_2d_solid: false,
+                solid_normal: None,
                 render_instance: None,
-                pick_tris: Vec::new(),
-                pick_tris_low: Vec::new(),
                 dash_from_start: false,
-                dash_align_end: None,
-                text_verts: Vec::new(),
                 name: name.clone(),
-                points,
-                points_low: Vec::new(),
                 color,
                 selected,
                 pattern_length: 0.0,
                 pattern: [0.0; 8],
                 line_weight_px: lw,
                 aci: 0,
-                snap_pts: vec![],
-                tangent_geoms: vec![],
-                key_vertices: vec![],
                 aabb: WireModel::UNBOUNDED_AABB,
                 plinegen: true,
-                fill_tris,
-                // fill_tris_low intentionally empty: this fill renders on the
-                // top-level path, where consumers (face3d_gpu, xclip) treat a
-                // short low half as all-zero, so it draws at f32 precision
-                // (sub-metre error at UTM scale) — not a crash. Follow-up:
-                // double-single-split via points_to_ds to match emit_wire.
-                fill_tris_low: Vec::new(),
-
+                geom: std::sync::Arc::new(crate::scene::WireGeom {
+                    taper_widths: Vec::new(),
+                    pattern_stations: Vec::new(),
+                    text_verts: Vec::new(),
+                    points,
+                    points_low: Default::default(),
+                    snap_pts: vec![],
+                    tangent_geoms: vec![],
+                    key_vertices: vec![],
+                    // fill_tris_low intentionally empty: this fill renders on the
+                    // top-level path, where consumers (face3d_gpu, xclip) treat a
+                    // short low half as all-zero, so it draws at f32 precision
+                    // (sub-metre error at UTM scale) — not a crash. Follow-up:
+                    // double-single-split via points_to_ds to match emit_wire.
+                    surfaces: crate::scene::model::wire_model::WireSurfaces {
+                        fill_tris,
+                        ..Default::default()
+                    }
+                    .into_optional(),
+                    ..crate::scene::WireGeom::default()
+                }),
                 ..Default::default()
             }
         };
@@ -2502,7 +2952,9 @@ impl Grippable for Table {
         use crate::entities::common::oriented_triangle_grip;
         let (origin, horizontal, down) = grip_frame(self);
         let width = self.total_width();
-        let height = self.total_height();
+        // A broken table shows its grips on the first piece: the break
+        // arrow sits at the break height.
+        let height = first_piece_height(self).unwrap_or_else(|| self.total_height());
         let mut grips = vec![
             square_grip(0, origin),
             oriented_triangle_grip(1, origin + horizontal * width, horizontal),
@@ -2528,22 +2980,34 @@ impl Grippable for Table {
         grips
     }
 
+    /// The hover label says what the grip changes, in a few words.
+    fn grip_menu(&self, grip_id: usize) -> Vec<crate::scene::model::object::GripMenuItem> {
+        use crate::scene::model::object::{GripMenuAction, GripMenuItem};
+        let label = match grip_id {
+            0 => "Move table",
+            1 => "Table width",
+            2 => "Table height",
+            3 => "Table width and height",
+            4 => "Break table",
+            CELL_GRIP_LEFT | CELL_GRIP_RIGHT => "Column width",
+            CELL_GRIP_TOP | CELL_GRIP_BOTTOM => "Row height",
+            CELL_GRIP_FILL => "Autofill cells",
+            id if id >= 100 => "Column width",
+            _ => "Stretch",
+        };
+        vec![GripMenuItem {
+            label,
+            action: GripMenuAction::Stretch,
+        }]
+    }
+
     fn apply_grip(&mut self, grip_id: usize, apply: GripApply) {
         if grip_id >= CELL_GRIP_LEFT {
             let Some(range) = prop_cell_range() else {
                 return;
             };
-            let point = match apply {
-                GripApply::Absolute(point) => point,
-                GripApply::Translate(delta) => {
-                    let Some(grip) = cell_range_grips(self, range)
-                        .into_iter()
-                        .find(|grip| grip.id == grip_id)
-                    else {
-                        return;
-                    };
-                    grip.world + delta
-                }
+            let Some(point) = cell_grip_point(self, range, grip_id, apply) else {
+                return;
             };
             apply_cell_grip(self, range, grip_id, point);
             // The saved picture is drawn again from the cells.
@@ -2577,7 +3041,7 @@ impl Grippable for Table {
             }
         };
         let scale_rows = |table: &mut Self, height: f64| {
-            let current = table.total_height();
+            let current = first_piece_height(table).unwrap_or_else(|| table.total_height());
             if current > 1.0e-12 {
                 for row in &mut table.rows {
                     row.height *= height.max(1.0e-6) / current;
@@ -2592,10 +3056,16 @@ impl Grippable for Table {
                 scale_rows(self, below);
             }
             // Breaking: the table splits where the arrow is left.
+            // Left at or below the table's bottom, the pieces join again.
             4 => {
-                use codec::entities::table::BreakOptionFlags;
-                if below > 1.0e-6 && below < self.total_height() {
+                use document::entities::table::BreakOptionFlags;
+                if below >= self.total_height() {
+                    self.break_options.remove(BreakOptionFlags::ENABLE_BREAKS);
+                    self.break_ranges.clear();
+                } else if below > 1.0e-6 {
                     self.break_options.insert(BreakOptionFlags::ENABLE_BREAKS);
+                    self.break_options
+                        .remove(BreakOptionFlags::ALLOW_MANUAL_HEIGHTS);
                     self.apply_geom_prop("tbl_break_height", &below.to_string());
                 }
             }
@@ -2626,6 +3096,30 @@ impl Grippable for Table {
     }
 }
 
+/// Height of the first piece of a broken table: the rows that fit in the
+/// break height (at least one). None when the table is whole.
+fn first_piece_height(table: &Table) -> Option<f64> {
+    use document::entities::table::BreakOptionFlags;
+    if !table
+        .break_options
+        .contains(BreakOptionFlags::ENABLE_BREAKS)
+    {
+        return None;
+    }
+    let limit = table.break_data.first().map(|data| data.height)?;
+    if limit <= 1.0e-6 || limit >= table.total_height() {
+        return None;
+    }
+    let mut height = 0.0;
+    for (index, row) in table.rows.iter().enumerate() {
+        if index > 0 && height + row.height > limit {
+            break;
+        }
+        height += row.height;
+    }
+    Some(height)
+}
+
 /// Insertion point and the table's across and downward directions.
 fn grip_frame(table: &Table) -> (glam::DVec3, glam::DVec3, glam::DVec3) {
     let origin = glam::DVec3::new(
@@ -2639,8 +3133,8 @@ fn grip_frame(table: &Table) -> (glam::DVec3, glam::DVec3, glam::DVec3) {
         table.horizontal_direction.z,
     )
     .normalize_or(glam::DVec3::X);
-    let normal =
-        glam::DVec3::new(table.normal.x, table.normal.y, table.normal.z).normalize_or(glam::DVec3::Z);
+    let normal = glam::DVec3::new(table.normal.x, table.normal.y, table.normal.z)
+        .normalize_or(glam::DVec3::Z);
     let down = horizontal.cross(normal).normalize_or(glam::DVec3::NEG_Y);
     (origin, horizontal, down)
 }
@@ -2664,7 +3158,7 @@ fn column_grip_offset(table: &Table) -> f64 {
 impl PropertyEditable for Table {
     fn geometry_properties(&self, text_style_names: &[String]) -> Vec<PropSection> {
         use crate::entities::common::edit_prop as edit;
-        use codec::entities::table::{BreakOptionFlags, CellStateFlags, CellStylePropertyFlags};
+        use document::entities::table::{BreakOptionFlags, CellStateFlags, CellStylePropertyFlags};
         let bool_text = |value: bool| if value { t!("Yes") } else { t!("No") }.into_owned();
         let toggle = |label: &str, field: &'static str, value: bool, enabled: bool| -> Property {
             Property {
@@ -2711,16 +3205,16 @@ impl PropertyEditable for Table {
                 },
             }
         };
-        let color_text = |color: codec::types::Color| match color {
-            codec::types::Color::None => "None".to_string(),
-            codec::types::Color::ByLayer => "ByLayer".to_string(),
-            codec::types::Color::ByBlock => "ByBlock".to_string(),
-            codec::types::Color::Index(index) => index.to_string(),
-            codec::types::Color::Rgb { r, g, b } => format!("{r},{g},{b}"),
+        let color_text = |color: document::types::Color| match color {
+            document::types::Color::None => "None".to_string(),
+            document::types::Color::ByLayer => "ByLayer".to_string(),
+            document::types::Color::ByBlock => "ByBlock".to_string(),
+            document::types::Color::Index(index) => index.to_string(),
+            document::types::Color::Rgb { r, g, b } => format!("{r},{g},{b}"),
         };
         let color = |label: &str,
                      field: &'static str,
-                     value: codec::types::Color,
+                     value: document::types::Color,
                      enabled: bool|
          -> Property {
             Property {
@@ -2847,27 +3341,34 @@ impl PropertyEditable for Table {
                         row,
                         cell_column,
                         cell,
-                        codec::entities::table::CellEdgeFlags::TOP,
+                        document::entities::table::CellEdgeFlags::TOP,
                     )
                 })
             });
             let border_color =
-                border.map_or(codec::types::Color::ByBlock, |s| s.top_border.color);
-            let border_lw = border.map_or(codec::types::LineWeight::ByBlock, |s| {
+                border.map_or(document::types::Color::ByBlock, |s| s.top_border.color);
+            let border_lw = border.map_or(document::types::LineWeight::ByBlock, |s| {
                 s.top_border.line_weight
             });
             let named_colors = |current: String| {
-                let mut options: Vec<String> =
-                    CELL_COLOR_NAMES.iter().map(|name| name.to_string()).collect();
+                let mut options: Vec<String> = CELL_COLOR_NAMES
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect();
                 if !options.contains(&current) {
                     options.push(current);
                 }
                 options
             };
             let mut fill_options = vec!["None".to_string()];
-            fill_options.extend(named_colors(fill_name.clone()).into_iter().filter(|o| o != "None"));
+            fill_options.extend(
+                named_colors(fill_name.clone())
+                    .into_iter()
+                    .filter(|o| o != "None"),
+            );
             let locking = match (
-                state.intersects(CellStateFlags::CONTENT_LOCKED | CellStateFlags::CONTENT_READ_ONLY),
+                state
+                    .intersects(CellStateFlags::CONTENT_LOCKED | CellStateFlags::CONTENT_READ_ONLY),
                 state.intersects(CellStateFlags::FORMAT_LOCKED | CellStateFlags::FORMAT_READ_ONLY),
             ) {
                 (false, false) => "Unlocked",
@@ -2896,8 +3397,8 @@ impl PropertyEditable for Table {
                 .or_else(|| cell.map(|cell| cell.rotation))
                 .unwrap_or(0.0)
                 .to_degrees();
-            let linked = cell
-                .is_some_and(|cell| cell.has_linked_data || cell.data_link_handle.is_some());
+            let linked =
+                cell.is_some_and(|cell| cell.has_linked_data || cell.data_link_handle.is_some());
             let alignments: Vec<String> = [
                 "Top Left",
                 "Top Center",
@@ -2941,8 +3442,18 @@ impl PropertyEditable for Table {
                             column_styles,
                             true,
                         ),
-                        number(t!("Cell width").as_ref(), "tbl_cell_width", span_width, true),
-                        number(t!("Cell height").as_ref(), "tbl_cell_height", span_height, true),
+                        number(
+                            t!("Cell width").as_ref(),
+                            "tbl_cell_width",
+                            span_width,
+                            true,
+                        ),
+                        number(
+                            t!("Cell height").as_ref(),
+                            "tbl_cell_height",
+                            span_height,
+                            true,
+                        ),
                         choice(
                             t!("Alignment").as_ref(),
                             "tbl_cell_alignment",
@@ -3025,7 +3536,7 @@ impl PropertyEditable for Table {
                             t!("Cell type").as_ref(),
                             "tbl_cell_type",
                             match cell.map(|cell| cell.cell_type) {
-                                Some(codec::entities::table::CellType::Block) => "Block",
+                                Some(document::entities::table::CellType::Block) => "Block",
                                 _ => "Text",
                             },
                         ),
@@ -3063,7 +3574,7 @@ impl PropertyEditable for Table {
                             "tbl_cell_content_color",
                             style_for(CellStylePropertyFlags::CONTENT_COLOR)
                                 .map(|style| style.content_color)
-                                .unwrap_or(codec::types::Color::ByBlock),
+                                .unwrap_or(document::types::Color::ByBlock),
                             format_editable,
                         ),
                         choice(
@@ -3141,18 +3652,18 @@ impl PropertyEditable for Table {
 
         if prop_current_cell_active() {
             let cell_type = match cell.map(|cell| cell.cell_type) {
-                Some(codec::entities::table::CellType::Block) => "Block",
+                Some(document::entities::table::CellType::Block) => "Block",
                 _ => "Text",
             };
             let data_type = cell
                 .and_then(|cell| cell.contents.first())
                 .map(|content| match content.value.value_type {
-                    codec::entities::table::CellValueType::Long => "Integer",
-                    codec::entities::table::CellValueType::Double => "Decimal",
-                    codec::entities::table::CellValueType::Date => "Date",
-                    codec::entities::table::CellValueType::Point2D => "Point 2D",
-                    codec::entities::table::CellValueType::Point3D => "Point 3D",
-                    codec::entities::table::CellValueType::Handle => "Handle",
+                    document::entities::table::CellValueType::Long => "Integer",
+                    document::entities::table::CellValueType::Double => "Decimal",
+                    document::entities::table::CellValueType::Date => "Date",
+                    document::entities::table::CellValueType::Point2D => "Point 2D",
+                    document::entities::table::CellValueType::Point3D => "Point 3D",
+                    document::entities::table::CellValueType::Handle => "Handle",
                     _ => "Text",
                 })
                 .unwrap_or("Text");
@@ -3263,7 +3774,7 @@ impl PropertyEditable for Table {
                         "tbl_cell_content_color",
                         style_for(CellStylePropertyFlags::CONTENT_COLOR)
                             .map(|style| style.content_color)
-                            .unwrap_or(codec::types::Color::ByBlock),
+                            .unwrap_or(document::types::Color::ByBlock),
                         format_editable,
                     ),
                     color(
@@ -3271,7 +3782,7 @@ impl PropertyEditable for Table {
                         "tbl_cell_background_color",
                         style_for(CellStylePropertyFlags::BACKGROUND_COLOR)
                             .map(|style| style.background_color)
-                            .unwrap_or(codec::types::Color::ByBlock),
+                            .unwrap_or(document::types::Color::ByBlock),
                         format_editable,
                     ),
                     choice(
@@ -3347,7 +3858,7 @@ impl PropertyEditable for Table {
                                         row,
                                         cell_column,
                                         cell,
-                                        codec::entities::table::CellEdgeFlags::TOP,
+                                        document::entities::table::CellEdgeFlags::TOP,
                                     )
                                 })
                             })
@@ -3365,7 +3876,7 @@ impl PropertyEditable for Table {
                                         row,
                                         cell_column,
                                         cell,
-                                        codec::entities::table::CellEdgeFlags::RIGHT,
+                                        document::entities::table::CellEdgeFlags::RIGHT,
                                     )
                                 })
                             })
@@ -3383,7 +3894,7 @@ impl PropertyEditable for Table {
                                         row,
                                         cell_column,
                                         cell,
-                                        codec::entities::table::CellEdgeFlags::BOTTOM,
+                                        document::entities::table::CellEdgeFlags::BOTTOM,
                                     )
                                 })
                             })
@@ -3401,7 +3912,7 @@ impl PropertyEditable for Table {
                                         row,
                                         cell_column,
                                         cell,
-                                        codec::entities::table::CellEdgeFlags::LEFT,
+                                        document::entities::table::CellEdgeFlags::LEFT,
                                     )
                                 })
                             })
@@ -3431,9 +3942,9 @@ impl PropertyEditable for Table {
                     t!("Direction").as_ref(),
                     "tbl_break_direction",
                     match self.break_flow_direction {
-                        codec::entities::table::BreakFlowDirection::Right => "Right",
-                        codec::entities::table::BreakFlowDirection::Left => "Left",
-                        codec::entities::table::BreakFlowDirection::Vertical => "Down",
+                        document::entities::table::BreakFlowDirection::Right => "Right",
+                        document::entities::table::BreakFlowDirection::Left => "Left",
+                        document::entities::table::BreakFlowDirection::Vertical => "Down",
                     }
                     .to_string(),
                     vec!["Right".into(), "Left".into(), "Down".into()],
@@ -3485,7 +3996,7 @@ impl PropertyEditable for Table {
 
     fn apply_geom_prop(&mut self, field: &str, value: &str) {
         use crate::entities::common::parse_f64;
-        use codec::entities::table::{
+        use document::entities::table::{
             BreakOptionFlags, CellStateFlags, CellStyle, CellStylePropertyFlags,
         };
         // A picked range shows its whole width and height: a new value
@@ -3499,9 +4010,15 @@ impl PropertyEditable for Table {
             {
                 let (r0, c0, r1, c1) = widen_to_merged(self, range);
                 let sizes: Vec<&mut f64> = if field == "tbl_cell_width" {
-                    self.columns[c0..=c1].iter_mut().map(|c| &mut c.width).collect()
+                    self.columns[c0..=c1]
+                        .iter_mut()
+                        .map(|c| &mut c.width)
+                        .collect()
                 } else {
-                    self.rows[r0..=r1].iter_mut().map(|r| &mut r.height).collect()
+                    self.rows[r0..=r1]
+                        .iter_mut()
+                        .map(|r| &mut r.height)
+                        .collect()
                 };
                 let span: f64 = sizes.iter().map(|size| **size).sum();
                 if span > 1e-12 {
@@ -3634,9 +4151,9 @@ impl PropertyEditable for Table {
                     }
                     if let Some(cell) = self.cell_mut(row, column) {
                         cell.cell_type = if value.trim().eq_ignore_ascii_case("block") {
-                            codec::entities::table::CellType::Block
+                            document::entities::table::CellType::Block
                         } else {
-                            codec::entities::table::CellType::Text
+                            document::entities::table::CellType::Text
                         };
                     }
                     return;
@@ -3661,7 +4178,7 @@ impl PropertyEditable for Table {
                         style.alignment = alignment;
                         style
                             .property_flags
-                            .insert(codec::entities::table::CellStylePropertyFlags::ALIGNMENT);
+                            .insert(document::entities::table::CellStylePropertyFlags::ALIGNMENT);
                     }
                     return;
                 }
@@ -3704,13 +4221,13 @@ impl PropertyEditable for Table {
                         if let Some(content) = cell.contents.first_mut() {
                             content.value.value_type =
                                 match value.trim().to_ascii_uppercase().as_str() {
-                                    "INTEGER" => codec::entities::table::CellValueType::Long,
-                                    "DECIMAL" => codec::entities::table::CellValueType::Double,
-                                    "DATE" => codec::entities::table::CellValueType::Date,
-                                    "POINT 2D" => codec::entities::table::CellValueType::Point2D,
-                                    "POINT 3D" => codec::entities::table::CellValueType::Point3D,
-                                    "HANDLE" => codec::entities::table::CellValueType::Handle,
-                                    _ => codec::entities::table::CellValueType::String,
+                                    "INTEGER" => document::entities::table::CellValueType::Long,
+                                    "DECIMAL" => document::entities::table::CellValueType::Double,
+                                    "DATE" => document::entities::table::CellValueType::Date,
+                                    "POINT 2D" => document::entities::table::CellValueType::Point2D,
+                                    "POINT 3D" => document::entities::table::CellValueType::Point3D,
+                                    "HANDLE" => document::entities::table::CellValueType::Handle,
+                                    _ => document::entities::table::CellValueType::String,
                                 };
                             content.value.raw_type_code = content.value.value_type as i32;
                         }
@@ -3731,7 +4248,7 @@ impl PropertyEditable for Table {
                         style.value_format = value.to_string();
                         style
                             .property_flags
-                            .insert(codec::entities::table::CellStylePropertyFlags::DATA_FORMAT);
+                            .insert(document::entities::table::CellStylePropertyFlags::DATA_FORMAT);
                     }
                     return;
                 }
@@ -3747,7 +4264,7 @@ impl PropertyEditable for Table {
                             value == "true"
                         };
                         style.property_flags.insert(
-                            codec::entities::table::CellStylePropertyFlags::BACKGROUND_COLOR,
+                            document::entities::table::CellStylePropertyFlags::BACKGROUND_COLOR,
                         );
                     }
                     return;
@@ -3760,7 +4277,7 @@ impl PropertyEditable for Table {
                         return;
                     }
                     if let Some(cell) = self.cell_mut(row, column) {
-                        use codec::entities::table::{BorderPropertyFlags, CellEdgeFlags};
+                        use document::entities::table::{BorderPropertyFlags, CellEdgeFlags};
                         let style = cell.style.get_or_insert_with(CellStyle::new);
                         let (border, edge) = match field {
                             "tbl_cell_border_top" => (&mut style.top_border, CellEdgeFlags::TOP),
@@ -3839,7 +4356,7 @@ impl PropertyEditable for Table {
                     if let Some(color) = parse_cell_color(value) {
                         self.edit_cell_borders(row, column, |border| {
                             border.color = color;
-                            codec::entities::table::BorderPropertyFlags::COLOR
+                            document::entities::table::BorderPropertyFlags::COLOR
                         });
                     }
                     return;
@@ -3913,9 +4430,9 @@ impl PropertyEditable for Table {
                     return;
                 }
                 self.break_flow_direction = match value.trim().to_ascii_uppercase().as_str() {
-                    "LEFT" => codec::entities::table::BreakFlowDirection::Left,
-                    "DOWN" | "VERTICAL" => codec::entities::table::BreakFlowDirection::Vertical,
-                    _ => codec::entities::table::BreakFlowDirection::Right,
+                    "LEFT" => document::entities::table::BreakFlowDirection::Left,
+                    "DOWN" | "VERTICAL" => document::entities::table::BreakFlowDirection::Vertical,
+                    _ => document::entities::table::BreakFlowDirection::Right,
                 };
                 self.break_ranges.clear();
             }
@@ -4086,7 +4603,7 @@ impl PropertyEditable for Table {
                         style.text_height = number;
                         style
                             .property_flags
-                            .insert(codec::entities::table::CellStylePropertyFlags::TEXT_HEIGHT);
+                            .insert(document::entities::table::CellStylePropertyFlags::TEXT_HEIGHT);
                     }
                 }
             }
@@ -4139,8 +4656,8 @@ impl PropertyEditable for Table {
             {
                 if self.break_data.is_empty() {
                     self.break_data
-                        .push(codec::entities::table::TableBreakData {
-                            position: codec::types::Vector3::ZERO,
+                        .push(document::entities::table::TableBreakData {
+                            position: document::types::Vector3::ZERO,
                             height: number,
                             flags: 0,
                         });
@@ -4166,8 +4683,11 @@ impl PropertyEditable for Table {
     }
 }
 
+pub(crate) mod scaling;
+
 impl Transformable for Table {
     fn apply_transform(&mut self, t: &EntityTransform) {
+        scaling::prepare_unstyled(self, t);
         transform::apply_standard_entity_transform(self, t, |entity, p1, p2| {
             transform::reflect_xy_point(
                 &mut entity.insertion_point.x,
@@ -4182,6 +4702,7 @@ impl Transformable for Table {
             entity.horizontal_direction.x = tip_x - entity.insertion_point.x;
             entity.horizontal_direction.y = tip_y - entity.insertion_point.y;
         });
+        scaling::finish(self, t);
     }
 }
 
@@ -4229,7 +4750,7 @@ pub fn column_label(mut column: usize) -> String {
 /// A copy of a table keeps the text its fields show as plain values: the
 /// FIELD objects belong to the table it was copied from.
 pub fn detach_fields(table: &mut Table) {
-    use codec::entities::table::TableCellContentType;
+    use document::entities::table::TableCellContentType;
     let contents = table
         .rows
         .iter_mut()
@@ -4304,32 +4825,40 @@ pub struct TableIndicator {
 
 pub fn table_indicator(
     tab: &Table,
-    document: &codec::Document,
+    document: &document::Document,
     range: Option<(usize, usize, usize, usize)>,
 ) -> Option<TableIndicator> {
     if tab.rows.is_empty() || tab.columns.is_empty() {
         return None;
     }
-    let table_style: Option<&codec::objects::TableStyle> = tab.table_style_handle.and_then(|h| {
-        match document.objects.get(&h)? {
-            codec::objects::ObjectType::TableStyle(ts) => Some(ts),
-            _ => None,
-        }
-    });
+    let table_style: Option<&document::objects::TableStyle> =
+        tab.table_style_handle
+            .and_then(|h| match document.objects.get(&h)? {
+                document::objects::ObjectType::TableStyle(ts) => Some(ts),
+                _ => None,
+            });
     let (h, down) = table_axes(tab);
-    let flow = if resolved_flow_up(tab, table_style) { -down } else { down };
+    let flow = if resolved_flow_up(tab, table_style) {
+        -down
+    } else {
+        down
+    };
     let (col_offsets, row_offsets) = table_offsets(tab, 1.0);
     let (hm, vm) = resolved_table_margins(tab, table_style);
     let title_suppressed = resolved_title_suppressed(tab, table_style);
     let header_suppressed = resolved_header_suppressed(tab, table_style);
-    use codec::entities::table::CellStylePropertyFlags as P;
+    use document::entities::table::CellStylePropertyFlags as P;
     let mut text_height = f64::MAX;
     let mut style_handle = None;
     for (ri, row) in tab.rows.iter().enumerate() {
-        let legacy = table_style.map(|ts| match (title_suppressed, header_suppressed, ri) {
-            (false, _, 0) => &ts.title_row_style,
-            (false, false, 1) | (true, false, 0) => &ts.header_row_style,
-            _ => &ts.data_row_style,
+        // The style the row's first cell draws with: the role its ids
+        // name, else the one the row's place gives it.
+        let legacy = table_style.map(|ts| {
+            match cell_role_kind(tab, title_suppressed, header_suppressed, ri, 0) {
+                0 => &ts.title_row_style,
+                1 => &ts.header_row_style,
+                _ => &ts.data_row_style,
+            }
         });
         let height = row
             .cells
@@ -4355,7 +4884,27 @@ pub fn table_indicator(
         .and_then(|handle| document.text_styles.iter().find(|s| s.handle == handle))
         .map_or_else(|| "Standard".to_string(), |s| s.name.clone());
     let style = crate::entities::text_support::resolve_text_style(&style_name, document);
-    let text_h = text_height as f32;
+    // The grid's typical row / column (the median), not its smallest: one
+    // row or column dragged down to almost nothing must not shrink every
+    // band and label with it.
+    let typical = |sizes: &mut dyn Iterator<Item = f32>| {
+        let mut sizes: Vec<f32> = sizes.filter(|size| *size > 0.0).collect();
+        if sizes.is_empty() {
+            return f32::INFINITY;
+        }
+        sizes.sort_by(f32::total_cmp);
+        sizes[sizes.len() / 2]
+    };
+    let min_row = typical(&mut tab.rows.iter().map(|row| row.height as f32));
+    let min_column = typical(&mut tab.columns.iter().map(|column| column.width as f32));
+    let label_chars = column_label(tab.columns.len() - 1).len().max(3) as f32;
+    // Labels and padding must fit the current grid, including multi-letter
+    // columns and tables whose inherited text style is much larger than a cell.
+    let text_h = (text_height as f32)
+        .min(min_row * 0.3)
+        .min(min_column / (label_chars * 2.0));
+    let hm = (hm as f32).min(min_column * 0.1);
+    let vm = (vm as f32).min(min_row * 0.1);
     // The row numbers' column: the ink width of three of the font's widest
     // digits, plus the cell margins (measured at height 4.5: txt 12, romans
     // 11.57, Arial 9.95 — twice that at height 9).
@@ -4368,34 +4917,40 @@ pub fn table_indicator(
     )
     .map(|bounds| bounds.ink_max[0] - bounds.ink_min[0])
     .filter(|width| *width > 0.0);
-    let digits = ink.unwrap_or_else(|| layout_mtext(&MTextRenderOpts {
-        layer_color: None,
-        columns: Default::default(),
-        value: "000",
-        insertion: [0.0; 3],
-        height: text_h,
-        rect_w: 0.0,
-        rotation: 0.0,
-        style: &style,
-        attach_h_anchor: 0.0,
-        v_anchor: MTextVAnchor::Middle,
-        line_spacing_factor: 1.0,
-        exact_line_spacing: false,
-        rectangle_height: 0.0,
-        vertical_text: false,
-        want_glyph_boxes: false,
-        break_long_words: true,
-    })
-    .line_widths
-    .first()
-    .copied()
-    .unwrap_or(text_h * 3.0));
-    let band_h = text_h + 2.0 * vm as f32;
-    let band_w = digits + 2.0 * hm as f32;
+    let digits = ink.unwrap_or_else(|| {
+        layout_mtext(&MTextRenderOpts {
+            layer_color: None,
+            columns: Default::default(),
+            value: "000",
+            insertion: [0.0; 3],
+            height: text_h,
+            rect_w: 0.0,
+            rotation: 0.0,
+            style: &style,
+            attach_h_anchor: 0.0,
+            v_anchor: MTextVAnchor::Middle,
+            line_spacing_factor: 1.0,
+            exact_line_spacing: false,
+            rectangle_height: 0.0,
+            vertical_text: false,
+            want_glyph_boxes: false,
+            break_long_words: true,
+        })
+        .line_widths
+        .first()
+        .copied()
+        .unwrap_or(text_h * 3.0)
+    });
+    let band_h = (text_h + 2.0 * vm).min(min_row);
+    let band_w = (digits + 2.0 * hm).min(min_column);
     let range = range.map(|r| widen_to_merged(tab, r));
     let in_range = |index: usize, row: bool| {
         range.is_some_and(|(r0, c0, r1, c1)| {
-            if row { (r0..=r1).contains(&index) } else { (c0..=c1).contains(&index) }
+            if row {
+                (r0..=r1).contains(&index)
+            } else {
+                (c0..=c1).contains(&index)
+            }
         })
     };
     let width = *col_offsets.last()?;
@@ -4444,27 +4999,48 @@ pub fn table_indicator(
             .iter()
             .map(|&(ri, top)| top + (row_offsets[ri + 1] - row_offsets[ri]))
             .fold(0.0f32, f32::max);
-        indicator.boxes.push((quad(-band_w, -band_h, 0.0, 0.0), false));
+        indicator
+            .boxes
+            .push((quad(-band_w, -band_h, 0.0, 0.0), false));
         for (ci, pair) in col_offsets.windows(2).enumerate() {
-            indicator.boxes.push((quad(pair[0], -band_h, pair[1], 0.0), in_range(ci, false)));
-            indicator.labels.push((column_label(ci), at((pair[0] + pair[1]) * 0.5, -band_h * 0.5)));
+            indicator
+                .boxes
+                .push((quad(pair[0], -band_h, pair[1], 0.0), in_range(ci, false)));
+            indicator.labels.push((
+                column_label(ci),
+                at((pair[0] + pair[1]) * 0.5, -band_h * 0.5),
+            ));
         }
         for &(ri, top) in rows {
             let bottom = top + (row_offsets[ri + 1] - row_offsets[ri]);
-            indicator.boxes.push((quad(-band_w, top, 0.0, bottom), in_range(ri, true)));
-            indicator.labels.push(((ri + 1).to_string(), at(-band_w * 0.5, (top + bottom) * 0.5)));
+            indicator
+                .boxes
+                .push((quad(-band_w, top, 0.0, bottom), in_range(ri, true)));
+            indicator.labels.push((
+                (ri + 1).to_string(),
+                at(-band_w * 0.5, (top + bottom) * 0.5),
+            ));
             indicator.lines.push([at(-band_w, bottom), at(0.0, bottom)]);
             indicator.lines.push([at(-band_w, top), at(0.0, top)]);
         }
         for x in std::iter::once(-band_w).chain(col_offsets.iter().copied()) {
             indicator.lines.push([at(x, -band_h), at(x, 0.0)]);
         }
-        indicator.lines.push([at(-band_w, -band_h), at(0.0, -band_h)]);
-        indicator.lines.push([at(-band_w, -band_h), at(width, -band_h)]);
-        indicator.lines.push([at(-band_w, -band_h), at(-band_w, bottom)]);
+        indicator
+            .lines
+            .push([at(-band_w, -band_h), at(0.0, -band_h)]);
+        indicator
+            .lines
+            .push([at(-band_w, -band_h), at(width, -band_h)]);
+        indicator
+            .lines
+            .push([at(-band_w, -band_h), at(-band_w, bottom)]);
         // The picked range's part in this fragment.
         if let Some((r0, c0, r1, c1)) = range {
-            let picked: Vec<_> = rows.iter().filter(|(ri, _)| (r0..=r1).contains(ri)).collect();
+            let picked: Vec<_> = rows
+                .iter()
+                .filter(|(ri, _)| (r0..=r1).contains(ri))
+                .collect();
             if let (Some(first), Some(last)) = (
                 picked.iter().map(|(_, top)| *top).reduce(f32::min),
                 picked
@@ -4485,8 +5061,450 @@ pub fn table_indicator(
 mod tests {
     use super::*;
 
+    /// The fill diamond also runs up and left, a number series backwards.
+    #[test]
+    fn fill_grip_fills_up_and_left_too() {
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 6, 6);
+        for (row, column, text) in [(3, 3, "5"), (4, 3, "6")] {
+            table.set_cell_text(row, column, text);
+            let cell = table.cell_mut(row, column).unwrap();
+            cell.contents[0].value.value_type = document::entities::table::CellValueType::Long;
+        }
+        let (origin, horizontal, down) = grip_frame(&table);
+        let centre = |t: &Table, row: usize, column: usize| {
+            let x: f64 = t.columns.iter().take(column).map(|c| c.width).sum::<f64>()
+                + t.columns[column].width / 2.0;
+            let y: f64 =
+                t.rows.iter().take(row).map(|r| r.height).sum::<f64>() + t.rows[row].height / 2.0;
+            origin + horizontal * x + down * y
+        };
+        let mut up = table.clone();
+        apply_cell_grip(&mut up, (3, 3, 4, 3), CELL_GRIP_FILL, centre(&table, 1, 3));
+        let text = |t: &Table, r: usize, c: usize| t.cell(r, c).unwrap().text_value().to_string();
+        assert_eq!((text(&up, 2, 3), text(&up, 1, 3)), ("4".into(), "3".into()));
+        assert_eq!(text(&up, 0, 3), "", "only up to the cursor's row");
+
+        let mut left = table.clone();
+        left.set_cell_text(3, 3, "A");
+        apply_cell_grip(
+            &mut left,
+            (3, 3, 3, 3),
+            CELL_GRIP_FILL,
+            centre(&table, 3, 1),
+        );
+        assert_eq!(
+            (text(&left, 3, 2), text(&left, 3, 1), text(&left, 3, 0)),
+            ("A".into(), "A".into(), String::new())
+        );
+    }
+
+    /// A row that names the data cell style is a data row wherever it is.
+    /// Drawn from its cells, the first and second rows of a table of data
+    /// rows take the data text height, as the rows below them do — also
+    /// when the table style has its three row styles and no cell styles to
+    /// look the name up in.
+    #[test]
+    fn rows_that_name_the_data_style_are_drawn_as_data_rows_wherever_they_are() {
+        use document::types::Vector3;
+        let mut document = document::Document::new();
+        let mut style = document::objects::TableStyle::standard();
+        style.title_row_style.text_height = 6.0;
+        style.header_row_style.text_height = 4.5;
+        style.data_row_style.text_height = 2.0;
+        assert!(
+            style.modern_overrides.is_empty(),
+            "the style has its three row styles only"
+        );
+        let handle = document.allocate_handle();
+        document
+            .objects
+            .insert(handle, document::objects::ObjectType::TableStyle(style));
+        let mut table = Table::new(Vector3::ZERO, 3, 1);
+        table.table_style_handle = Some(handle);
+        table.columns[0].width = 60.0;
+        for row in &mut table.rows {
+            row.height = 12.0;
+            // The data cell style, by its id.
+            row.style_id = 3;
+        }
+        // How high the text of `row` is drawn, alone in the table.
+        let drawn = |row: usize| {
+            let mut table = table.clone();
+            table.set_cell_text(row, 0, "H");
+            let wires = tessellate_table(&table, &document, false, [1.0; 4], 1.0, 1.0);
+            let text = wires
+                .iter()
+                .find(|wire| !wire.text_verts.is_empty())
+                .expect("the cell's text is drawn");
+            text.aabb[3] - text.aabb[1]
+        };
+        let (first, second, third) = (drawn(0), drawn(1), drawn(2));
+        assert!(
+            (first - third).abs() < 1e-3 && (second - third).abs() < 1e-3,
+            "the first rows' text is {first} and {second} high, a data row's {third}"
+        );
+    }
+
+    /// The band of row numbers and column letters around a table being
+    /// edited is as high as the smallest text of its rows. A table of data
+    /// rows measures it by the data style alone: not by the title or header
+    /// style when it has one or two rows, nor by a smaller title text when
+    /// it has more.
+    #[test]
+    fn the_indicator_of_a_table_of_data_rows_takes_the_data_text_height() {
+        use document::types::Vector3;
+        // The indicator's text height for `rows` data rows, in a table style
+        // with these title, header and data text heights.
+        let indicator = |heights: [f64; 3], rows: usize| {
+            let mut document = document::Document::new();
+            let mut style = document::objects::TableStyle::standard();
+            style.title_row_style.text_height = heights[0];
+            style.header_row_style.text_height = heights[1];
+            style.data_row_style.text_height = heights[2];
+            let handle = document.allocate_handle();
+            document
+                .objects
+                .insert(handle, document::objects::ObjectType::TableStyle(style));
+            let mut table = Table::new(Vector3::ZERO, rows, 1);
+            table.table_style_handle = Some(handle);
+            // Cells large enough for the text, so the band is not shrunk to fit them.
+            table.columns[0].width = 100.0;
+            for row in &mut table.rows {
+                row.style_id = 3;
+                row.height = 30.0;
+            }
+            table_indicator(&table, &document, None)
+                .expect("the table has cells")
+                .text_height
+        };
+        let small_data = [1, 2, 3].map(|rows| indicator([6.0, 4.5, 2.0], rows));
+        let large_data = indicator([2.0, 2.0, 6.0], 3);
+        assert!(
+            small_data.iter().all(|height| (height - 2.0).abs() < 1e-6)
+                && (large_data - 6.0).abs() < 1e-6,
+            "data text 2 high: {small_data:?} for one, two and three rows; \
+             data text 6 high under a title of 2: {large_data}"
+        );
+    }
+
+    /// A new table shows its stored picture, whose cell text sits the table
+    /// style's margins in from the cell's edges. Drawn from its cells, as it
+    /// is once edited, the text stays where the picture put it: the style's
+    /// margins are not raised to half the text height.
+    #[test]
+    fn a_table_drawn_from_its_cells_puts_its_text_where_its_picture_does() {
+        use document::types::Vector3;
+        use document::EntityType;
+        let mut scene = crate::scene::Scene::new();
+        // Margins 0.06 and data text 0.18 high, top-centred: a margin
+        // smaller than half the text height.
+        let style = scene.document.allocate_handle();
+        scene.document.objects.insert(
+            style,
+            document::objects::ObjectType::TableStyle(document::objects::TableStyle::standard()),
+        );
+        let mut table = Table::new(Vector3::ZERO, 1, 2);
+        table.table_style_handle = Some(style);
+        for column in &mut table.columns {
+            column.width = 2.0;
+        }
+        table.rows[0].height = 0.36;
+        table.rows[0].style_id = 3;
+        table.set_cell_text(0, 0, "Mark");
+        table.set_cell_text(0, 1, "Qty");
+        // The first cell top-left, so its left margin shows too.
+        let cell = table.cell_mut(0, 0).unwrap();
+        let own = cell.style.get_or_insert_with(Default::default);
+        own.alignment = 1;
+        own.property_flags
+            .insert(document::entities::table::CellStylePropertyFlags::ALIGNMENT);
+        let handle = scene.add_entity(EntityType::Table(Box::new(table)));
+        let Some(EntityType::Table(placed)) = scene.document.get_entity(handle) else {
+            panic!("the table is in the drawing");
+        };
+        assert!(
+            placed.block_record_handle.is_some(),
+            "a new table has a picture"
+        );
+        let mut from_cells = (**placed).clone();
+        from_cells.block_record_handle = None;
+        // The box of the text drawn for `table`: left, bottom, right, top.
+        let text_box = |table: &Table| {
+            let entity = EntityType::Table(Box::new(table.clone()));
+            let wires = crate::scene::tessellate_entity(
+                &scene.document,
+                &Default::default(),
+                None,
+                [0.0, 0.0, 0.0, 1.0],
+                1.0,
+                None,
+                &entity,
+                None,
+                None,
+                None,
+                None,
+                &Default::default(),
+            );
+            let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            for vertex in wires.iter().flat_map(|wire| &wire.text_verts) {
+                let x = vertex.pos[0] as f64 + vertex.pos_low[0] as f64;
+                let y = vertex.pos[1] as f64 + vertex.pos_low[1] as f64;
+                bounds = [
+                    bounds[0].min(x),
+                    bounds[1].min(y),
+                    bounds[2].max(x),
+                    bounds[3].max(y),
+                ];
+            }
+            assert!(bounds[0] <= bounds[2], "the cells' text is drawn");
+            bounds
+        };
+        let (picture, cells) = (text_box(placed), text_box(&from_cells));
+        assert!(
+            picture
+                .iter()
+                .zip(&cells)
+                .all(|(a, b)| (a - b).abs() < 1e-4),
+            "picture text {picture:?}, drawn from the cells {cells:?}"
+        );
+    }
+
+    /// Text wraps between the margins it is placed against: a long
+    /// left-aligned line ends inside the cell, not past the
+    /// cell's edge (with no table margin the text sits half its height in).
+    #[test]
+    fn wrapped_cell_text_stays_inside_the_cell() {
+        use document::entities::table::CellStylePropertyFlags as P;
+        let document = document::Document::new();
+        let mut table = Table::new(document::types::Vector3::ZERO, 1, 1);
+        table.columns[0].width = 2.0;
+        table.rows[0].height = 2.0;
+        table.set_cell_text(0, 0, &"l".repeat(200));
+        let style = table
+            .cell_mut(0, 0)
+            .unwrap()
+            .style
+            .get_or_insert_with(Default::default);
+        style.alignment = 4;
+        style.property_flags.insert(P::ALIGNMENT);
+        let wires = tessellate_table(&table, &document, false, [1.0; 4], 1.0, 1.0);
+        let text = wires
+            .iter()
+            .find(|wire| !wire.text_verts.is_empty())
+            .expect("the cell's text is drawn");
+        // The glyph quads' bounds (a little wider than the ink) stay
+        // inside the cell's edges at 0 and 2.
+        assert!(
+            text.aabb[2] <= 2.0,
+            "text ends at {} past the cell's edge",
+            text.aabb[2]
+        );
+        assert!(text.aabb[0] >= 0.0, "text starts at {}", text.aabb[0]);
+    }
+
+    /// A row fitted to wrapped text holds every line: the last line ends
+    /// above the cell's bottom edge, as the text is placed against the
+    /// same margins it is fitted with.
+    #[test]
+    fn fitted_row_holds_all_wrapped_lines() {
+        let document = document::Document::new();
+        let mut table = Table::new(document::types::Vector3::ZERO, 1, 1);
+        table.columns[0].width = 2.0;
+        table.rows[0].height = 0.1;
+        table.set_cell_text(0, 0, &"l ".repeat(40));
+        assert!(settle_table(&mut table, &document));
+        let wires = tessellate_table(&table, &document, false, [1.0; 4], 1.0, 1.0);
+        let text = wires
+            .iter()
+            .find(|wire| !wire.text_verts.is_empty())
+            .expect("the cell's text is drawn");
+        let bottom = f64::from(text.aabb[1]);
+        let height = table.rows[0].height;
+        assert!(
+            bottom >= -height,
+            "text reaches {bottom}, below the cell's bottom edge at {}",
+            -height
+        );
+    }
+
+    /// An empty row keeps the height of one line of its text and its
+    /// margins, like a row with text: a row grip dragged onto the row above
+    /// must not squeeze it to nothing, or its grips sit on the neighbour's
+    /// and it can no longer be dragged back.
+    #[test]
+    fn an_empty_row_squeezed_by_its_grip_keeps_one_line() {
+        let document = document::Document::new();
+        let mut table = Table::new(document::types::Vector3::ZERO, 2, 1);
+        table.columns[0].width = 20.0;
+        for row in &mut table.rows {
+            row.height = 10.0;
+        }
+        table.set_cell_text(0, 0, "x");
+        let (origin, _, down) = grip_frame(&table);
+        apply_cell_grip(
+            &mut table,
+            (1, 0, 1, 0),
+            CELL_GRIP_BOTTOM,
+            origin + down * 10.0,
+        );
+        assert!(table.rows[1].height < 1e-3, "the drag squeezes the row");
+        settle_table(&mut table, &document);
+        let mut one_line = Table::new(document::types::Vector3::ZERO, 1, 1);
+        one_line.columns[0].width = 20.0;
+        one_line.rows[0].height = 1e-6;
+        one_line.set_cell_text(0, 0, "x");
+        settle_table(&mut one_line, &document);
+        let need = one_line.rows[0].height;
+        assert!(need > 0.1, "a line of text needs {need}");
+        assert!(
+            (table.rows[1].height - need).abs() < 1e-9,
+            "the empty row is {} high, a line needs {need}",
+            table.rows[1].height
+        );
+    }
+
+    /// A file keeps where each cell's text sat when it was saved. That
+    /// placement holds only while the table is as the file left it: once
+    /// the table is edited (its picture block dropped), the cell's
+    /// alignment places the content again.
+    #[test]
+    fn a_files_stored_cell_placement_is_dropped_once_the_table_is_edited() {
+        use document::types::{Handle, Vector3};
+        let document = document::Document::new();
+        let mut table = Table::new(Vector3::ZERO, 2, 2);
+        table.set_cell_text(1, 1, "x");
+        let at = Vector3::new(1.0, -0.5, 0.0);
+        table.cell_mut(1, 1).unwrap().contents[0].geometry =
+            Some(document::entities::table::CellContentGeometry {
+                distance_to_top_left: at,
+                distance_to_center: at,
+                width: 0.2,
+                height: 0.2,
+                outer_width: 0.2,
+                outer_height: 0.2,
+                flags: 0,
+            });
+        table.block_record_handle = Some(Handle::new(0x2A));
+        let placed = |t: &Table| {
+            let cell = t.cell(1, 1).unwrap();
+            resolved_content_geometry(&document, t, 1, 1, cell, 0).is_some()
+        };
+        assert!(placed(&table), "as opened: the file's placement");
+        let style = table
+            .cell_mut(1, 1)
+            .unwrap()
+            .style
+            .get_or_insert_with(Default::default);
+        style.alignment = 1;
+        style
+            .property_flags
+            .insert(document::entities::table::CellStylePropertyFlags::ALIGNMENT);
+        table.block_record_handle = None;
+        assert!(
+            !placed(&table),
+            "after an edit the cell's alignment places the text"
+        );
+    }
+
+    #[test]
+    fn table_grips_say_what_they_change() {
+        let table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 3, 3);
+        let label = |id: usize| table.grip_menu(id)[0].label;
+        assert_eq!(label(0), "Move table");
+        assert_eq!(label(4), "Break table");
+        assert_eq!(label(101), "Column width");
+        assert_eq!(label(CELL_GRIP_BOTTOM), "Row height");
+        assert_eq!(label(CELL_GRIP_FILL), "Autofill cells");
+        for id in table.grips().iter().map(|grip| grip.id) {
+            assert_ne!(label(id), "Stretch", "grip {id}");
+        }
+    }
+
+    fn grip_at(table: &Table, id: usize) -> glam::DVec3 {
+        table
+            .grips()
+            .into_iter()
+            .find(|grip| grip.id == id)
+            .expect("grip")
+            .world
+    }
+
+    /// The bottom-middle arrow breaks the table where it is left, then sits
+    /// on the first piece's bottom; left below the table it joins it again.
+    #[test]
+    fn break_grip_sits_on_the_first_piece_and_joins_below_the_table() {
+        use document::entities::table::BreakOptionFlags;
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 8, 2);
+        let total = table.total_height();
+        let (origin, _, down) = grip_frame(&table);
+        let depth = |p: glam::DVec3| (p - origin).dot(down);
+        assert!((depth(grip_at(&table, 4)) - total).abs() < 1e-9);
+
+        let row = table.rows[0].height;
+        table.apply_grip(4, GripApply::Absolute(origin + down * (row * 2.4)));
+        assert!(table
+            .break_options
+            .contains(BreakOptionFlags::ENABLE_BREAKS));
+        for id in [2, 3, 4] {
+            assert!(
+                (depth(grip_at(&table, id)) - row * 2.0).abs() < 1e-9,
+                "grip {id}"
+            );
+        }
+        // dragging it again moves the break instead of doing nothing
+        table.apply_grip(4, GripApply::Translate(down * row));
+        assert!((depth(grip_at(&table, 4)) - row * 3.0).abs() < 1e-9);
+
+        table.apply_grip(4, GripApply::Absolute(origin + down * (total + 1.0)));
+        assert!(!table
+            .break_options
+            .contains(BreakOptionFlags::ENABLE_BREAKS));
+        assert!((depth(grip_at(&table, 4)) - total).abs() < 1e-9);
+    }
+
+    /// The top and left grips of a picked cell move the edge it shares with
+    /// the row above / the column to its left: dragging the third row's top
+    /// edge up shrinks the second row by what the third gains, and the
+    /// table keeps its height (and width for the left edge).
+    #[test]
+    fn a_cells_top_and_left_grips_move_the_edge_shared_with_its_neighbour() {
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 4, 3);
+        for row in &mut table.rows {
+            row.height = 10.0;
+        }
+        for column in &mut table.columns {
+            column.width = 20.0;
+        }
+        let (origin, horizontal, down) = grip_frame(&table);
+        let at = |x: f64, y: f64| origin + horizontal * x + down * y;
+        let heights = |table: &Table| table.rows.iter().map(|row| row.height).collect::<Vec<_>>();
+        let widths = |table: &Table| {
+            table
+                .columns
+                .iter()
+                .map(|column| column.width)
+                .collect::<Vec<_>>()
+        };
+
+        // Third row's top edge (y = 20) dragged up by 4.
+        apply_cell_grip(&mut table, (2, 1, 2, 1), CELL_GRIP_TOP, at(30.0, 16.0));
+        assert_eq!(heights(&table), vec![10.0, 6.0, 14.0, 10.0]);
+        // Second column's left edge (x = 20) dragged left by 5.
+        apply_cell_grip(&mut table, (2, 1, 2, 1), CELL_GRIP_LEFT, at(15.0, 23.0));
+        assert_eq!(widths(&table), vec![15.0, 25.0, 20.0]);
+        // Dragged down past the cell's own bottom: the edge stops just short
+        // of it, and the total height still holds.
+        apply_cell_grip(&mut table, (2, 1, 2, 1), CELL_GRIP_TOP, at(30.0, 60.0));
+        let h = heights(&table);
+        assert!(h[2] > 0.0 && h[2] < 1.0e-3, "{h:?}");
+        assert!((h.iter().sum::<f64>() - 40.0).abs() < 1.0e-9, "{h:?}");
+        // The first row has no neighbour above: its top edge still narrows it.
+        apply_cell_grip(&mut table, (0, 0, 0, 0), CELL_GRIP_TOP, at(10.0, 3.0));
+        assert_eq!(table.rows[0].height, 7.0);
+    }
+
     fn sample_table() -> Table {
-        let mut table = Table::new(codec::types::Vector3::new(0.0, 0.0, 0.0), 2, 2);
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 2, 2);
         table.set_cell_text(0, 0, "10");
         table.set_cell_text(0, 1, "20");
         table.set_cell_text(1, 0, "30");
@@ -4530,6 +5548,74 @@ mod tests {
         assert_eq!(evaluate_table_formula(&table, "not a formula"), None);
     }
 
+    /// M048: a table formula is an expression, not just a lone aggregate.
+    /// The reference accepts cell references, numbers, parentheses and the
+    /// `+ - * / ^` operators (with `SUM`/`AVERAGE`/… callable inside them);
+    /// this build only understood a single `SUM(A1:B2)`-shaped call, so
+    /// `=A1*B1` or `=SUM(A1:B2)*2` showed their literal text in the cell.
+    #[test]
+    fn formula_arithmetic_combines_cells_numbers_and_aggregates() {
+        let table = sample_table();
+        for (expression, expected) in [
+            ("=A1+B1", "30"),
+            ("=A1*B1-A2", "170"),
+            ("=(A1+B1)/2", "15"),
+            ("=SUM(A1:B2)*2", "200"),
+            ("=-A1", "-10"),
+            ("=2^3", "8"),
+            ("=A1+B1*2", "50"),
+            ("=A1 * (B1 - A2)", "-100"),
+        ] {
+            assert_eq!(
+                evaluate_table_formula(&table, expression),
+                Some(expected.to_string()),
+                "{expression}"
+            );
+        }
+    }
+
+    /// A table inside a block is drawn by `to_render`: a formula cell shows
+    /// its result there too, not the formula as typed.
+    #[test]
+    fn a_table_drawn_inside_a_block_shows_a_formula_result() {
+        let document = document::Document::new();
+        let drawn = |third: &str| -> Vec<[u64; 3]> {
+            let mut table = Table::new(document::types::Vector3::ZERO, 2, 2);
+            table.set_cell_text(0, 0, "2");
+            table.set_cell_text(0, 1, "3");
+            table.set_cell_text(1, 0, third);
+            match table.to_render(&document).map(|entity| entity.object) {
+                Some(RenderObject::Lines(points)) => points
+                    .iter()
+                    .map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])
+                    .collect(),
+                _ => panic!("a table draws as lines"),
+            }
+        };
+        assert_ne!(
+            drawn("6"),
+            drawn("7"),
+            "the cell text is part of the drawing"
+        );
+        assert_eq!(drawn("=A1*B1"), drawn("6"));
+    }
+
+    /// The same expression reaches the rendered cell text: `content_display_value`
+    /// is what the tessellator draws for the cell.
+    #[test]
+    fn formula_arithmetic_is_what_the_cell_draws() {
+        let document = document::Document::new();
+        let mut table = Table::new(document::types::Vector3::ZERO, 2, 2);
+        table.set_cell_text(0, 0, "2");
+        table.set_cell_text(0, 1, "3");
+        table.set_cell_text(1, 0, "=A1*B1");
+        let cell = table.cell(1, 0).unwrap();
+        assert_eq!(
+            content_display_value(&document, &table, &cell.contents[0]),
+            "6"
+        );
+    }
+
     /// A cell range can name any `usize` — `A1:A18446744073709551615`
     /// parses to row ≈ 1.8e19. `cell()` returns None for out-of-bounds
     /// indices, but the range loop still *walked* every index on the
@@ -4537,6 +5623,29 @@ mod tests {
     /// must collect exactly the same values (each skipped cell would
     /// have been None) and stay instant; the elapsed guard keeps a
     /// future un-clamped loop from creeping back in.
+    #[test]
+    fn a_filled_formula_moves_its_cell_references_with_the_cell() {
+        assert_eq!(
+            shift_formula_references("=SUM(A5:C5)", 1, 0).as_deref(),
+            Some("=SUM(A6:C6)")
+        );
+        assert_eq!(
+            shift_formula_references("=a1*Z2+3.5e2-AVERAGE(B1:B3)", 2, 1).as_deref(),
+            Some("=B3*AA4+3.5e2-AVERAGE(C3:C5)")
+        );
+        assert_eq!(
+            shift_formula_references("=SUM(B2:B4)", -1, -1).as_deref(),
+            Some("=SUM(A1:A3)")
+        );
+        assert_eq!(shift_formula_references("=A1+1", -1, 0), None);
+        assert_eq!(shift_formula_references("=B1+1", 0, -2), None);
+        assert_eq!(column_letters(0), "A");
+        assert_eq!(column_letters(25), "Z");
+        assert_eq!(column_letters(26), "AA");
+        assert_eq!(column_letters(701), "ZZ");
+        assert_eq!(column_letters(702), "AAA");
+    }
+
     #[test]
     fn formula_range_evaluation_is_bounded_by_the_table() {
         let table = sample_table();
@@ -4572,7 +5681,7 @@ mod tests {
     /// instead — column growth is limited by the rows already present.
     #[test]
     fn tbl_column_count_stays_within_budget() {
-        let mut table = Table::new(codec::types::Vector3::new(0.0, 0.0, 0.0), 1, 1);
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 1, 1);
         let cap = MAX_TABLE_CELLS / table.rows.len().max(1);
         table.apply_geom_prop("tbl_cols", &(cap + 10).to_string());
         assert!(
@@ -4594,7 +5703,7 @@ mod tests {
     /// hold `MAX_TABLE_CELLS / 10` rows, never the requested 1e15.
     #[test]
     fn tbl_row_count_stays_within_budget() {
-        let mut table = Table::new(codec::types::Vector3::new(0.0, 0.0, 0.0), 1, 1);
+        let mut table = Table::new(document::types::Vector3::new(0.0, 0.0, 0.0), 1, 1);
         table.apply_geom_prop("tbl_cols", "10");
         let cap = MAX_TABLE_CELLS / table.columns.len().max(1);
         table.apply_geom_prop("tbl_rows", &(cap + 10).to_string());
@@ -4614,7 +5723,6 @@ mod tests {
     }
 }
 
-
 /// Border edits on one cell: each of its four borders starts from the border
 /// it draws with now (cell, row, column or table style), takes the change and
 /// becomes the cell's own override for that edge.
@@ -4624,10 +5732,10 @@ pub trait TableCellBordersExt {
         row: usize,
         column: usize,
         edit: impl Fn(
-            &mut codec::entities::table::CellBorder,
-        ) -> codec::entities::table::BorderPropertyFlags,
+            &mut document::entities::table::CellBorder,
+        ) -> document::entities::table::BorderPropertyFlags,
     ) {
-        use codec::entities::table::CellEdgeFlags as E;
+        use document::entities::table::CellEdgeFlags as E;
         self.edit_cell_borders_on(row, column, E::TOP | E::RIGHT | E::BOTTOM | E::LEFT, edit);
     }
 
@@ -4636,10 +5744,10 @@ pub trait TableCellBordersExt {
         &mut self,
         row: usize,
         column: usize,
-        edges: codec::entities::table::CellEdgeFlags,
+        edges: document::entities::table::CellEdgeFlags,
         edit: impl Fn(
-            &mut codec::entities::table::CellBorder,
-        ) -> codec::entities::table::BorderPropertyFlags,
+            &mut document::entities::table::CellBorder,
+        ) -> document::entities::table::BorderPropertyFlags,
     );
 }
 
@@ -4648,12 +5756,12 @@ impl TableCellBordersExt for Table {
         &mut self,
         row: usize,
         column: usize,
-        wanted: codec::entities::table::CellEdgeFlags,
+        wanted: document::entities::table::CellEdgeFlags,
         edit: impl Fn(
-            &mut codec::entities::table::CellBorder,
-        ) -> codec::entities::table::BorderPropertyFlags,
+            &mut document::entities::table::CellBorder,
+        ) -> document::entities::table::BorderPropertyFlags,
     ) {
-        use codec::entities::table::{CellBorder, CellEdgeFlags, CellStyle};
+        use document::entities::table::{CellBorder, CellEdgeFlags, CellStyle};
         let edges = [
             CellEdgeFlags::TOP,
             CellEdgeFlags::RIGHT,
@@ -4680,14 +5788,14 @@ impl TableCellBordersExt for Table {
                 .map(|edge| {
                     style_for_border(self, table_row, column, cell, *edge)
                         .map(|style| pick(style, *edge))
-                        .unwrap_or_else(CellBorder::new)
+                        .unwrap_or_default()
                 })
                 .collect()
         };
         let Some(cell) = self.cell_mut(row, column) else {
             return;
         };
-        use codec::entities::table::CellStateFlags;
+        use document::entities::table::CellStateFlags;
         if cell
             .state
             .intersects(CellStateFlags::FORMAT_LOCKED | CellStateFlags::FORMAT_READ_ONLY)
@@ -4769,20 +5877,230 @@ pub fn cell_range_grips(table: &Table, range: (usize, usize, usize, usize)) -> V
     ]
 }
 
-/// A cell grip moved to `point`: an edge grip sizes the column / row on its
-/// side of the range by how far the edge moves (the left and top edges as
-/// well: the column / row narrows as its edge moves in, the others keep
-/// their size), the diamond fills the cells it is dragged over from the
-/// picked ones.
+/// How far a shared edge may move: neither side goes under `min`. Two sides
+/// already too thin for that (a file can store them) keep the edge put
+/// rather than give `clamp` a range it panics on.
+fn shared_edge_shift(moved: f64, before: f64, after: f64, min: f64) -> f64 {
+    let (lo, hi) = (min - before, after - min);
+    if lo <= hi {
+        moved.clamp(lo, hi)
+    } else {
+        0.0
+    }
+}
+
+/// A cell grip moved to `point`: the right and bottom edge grips size the
+/// column / row on their side of the range by how far the edge moves. The
+/// left and top edge grips move the edge the range shares with the column /
+/// row before it: one narrows by what the other gains, so the edge follows
+/// the cursor and the table keeps its size. The first column / row has no
+/// neighbour there and narrows as its edge moves in. The diamond fills the
+/// cells it is dragged over from the picked ones.
 pub fn apply_cell_grip(
     table: &mut Table,
     range: (usize, usize, usize, usize),
     grip_id: usize,
     point: glam::DVec3,
 ) {
+    apply_cell_grip_with(table, range, grip_id, point, &FillFormulas::new());
+}
+
+/// The point a cell-range grip is dragged to: an absolute point as given, a
+/// move from where the grip sits.
+fn cell_grip_point(
+    table: &Table,
+    range: (usize, usize, usize, usize),
+    grip_id: usize,
+    apply: GripApply,
+) -> Option<glam::DVec3> {
+    match apply {
+        GripApply::Absolute(point) => Some(point),
+        GripApply::Translate(delta) => cell_range_grips(table, range)
+            .into_iter()
+            .find(|grip| grip.id == grip_id)
+            .map(|grip| grip.world + delta),
+    }
+}
+
+/// The formulas of a table's formula-field cells ("=SUM(A5:C5)"), by cell,
+/// as a fill reads them from the cells it copies.
+pub(crate) type FillFormulas = std::collections::HashMap<(usize, usize), String>;
+
+/// A cell a fill copied from a field cell: (source, target).
+pub(crate) type FillPair = ((usize, usize), (usize, usize));
+
+/// The fill diamond dragged on a table in a drawing. Unlike the table on
+/// its own, the drawing knows which cells hold a formula: a formula is
+/// filled with its references moved along with the cell. Returns the cells
+/// filled from a field cell, for `commit_fill_fields`.
+pub(crate) fn apply_fill_grip(
+    document: &mut document::Document,
+    handle: document::Handle,
+    apply: GripApply,
+) -> Option<Vec<FillPair>> {
+    let range = prop_cell_range()?;
+    let document::EntityType::Table(table) = document.get_entity(handle)? else {
+        return None;
+    };
+    let (r0, c0, r1, c1) = widen_to_merged(table, range);
+    let mut formulas = FillFormulas::new();
+    for row in r0..=r1 {
+        for column in c0..=c1 {
+            if let Some(formula) = cell_formula_text(document, table, row, column) {
+                formulas.insert((row, column), formula);
+            }
+        }
+    }
+    let document::EntityType::Table(table) = document.get_entity_mut(handle)? else {
+        return None;
+    };
+    let point = cell_grip_point(table, range, CELL_GRIP_FILL, apply)?;
+    let pairs = apply_cell_grip_with(table, range, CELL_GRIP_FILL, point, &formulas);
+    // The saved picture is drawn again from the cells.
+    table.block_record_handle = None;
+    Some(pairs)
+}
+
+/// Makes the cells a committed fill copied from field cells fields again:
+/// a formula ("=SUM(A6:C6)", already moved) becomes a formula field, as a
+/// typed one does; any other field is copied as it is. Returns whether a
+/// cell changed.
+pub(crate) fn commit_fill_fields(
+    document: &mut document::Document,
+    handle: document::Handle,
+    pairs: &[FillPair],
+) -> bool {
+    use document::objects::ObjectType;
+    let mut changed = false;
+    for &((source_row, source_column), (row, column)) in pairs {
+        let Some(document::EntityType::Table(table)) = document.get_entity(handle) else {
+            return changed;
+        };
+        let typed_formula = table
+            .cell(row, column)
+            .is_some_and(|cell| cell.text_value().trim_start().starts_with('='));
+        if typed_formula {
+            changed |= typed_formula_to_field(document, handle, row, column);
+            continue;
+        }
+        let Some(container) = table
+            .cell(source_row, source_column)
+            .and_then(|cell| cell.contents.first())
+            .and_then(|content| content.field_handle)
+        else {
+            continue;
+        };
+        let field = |handle| match document.objects.get(&handle) {
+            Some(ObjectType::Field(field)) => Some(field),
+            _ => None,
+        };
+        let Some(container) = field(container) else {
+            continue;
+        };
+        if container.evaluator_id != "_text" {
+            continue;
+        }
+        // One level of fields below the container is what a cell field is
+        // made of; a deeper tree stays the text it shows.
+        let children: Option<Vec<document::fields::NewField>> = container
+            .child_fields
+            .iter()
+            .map(|&child| {
+                let child = field(child)?;
+                child.child_fields.is_empty().then(|| {
+                    let mut copy = document::fields::NewField::new(
+                        child.code.clone(),
+                        child.value_string.clone(),
+                    );
+                    copy.evaluator = child.evaluator_id.clone();
+                    copy.objects = child.referenced_objects.clone();
+                    copy.value = child.value.clone();
+                    copy.evaluation_option = child.evaluation_option;
+                    copy
+                })
+            })
+            .collect();
+        let Some(children) = children else {
+            continue;
+        };
+        let template = container.code.clone();
+        changed |= document
+            .set_table_cell_field(handle, row, column, &template, children)
+            .is_some();
+    }
+    changed
+}
+
+/// A formula filled `rows` down and `columns` right: each cell reference
+/// ("A5", not a function name such as "SUM") moves with the cell, as a
+/// spreadsheet's fill does. `None` when a reference would move above the
+/// first row or left of the first column.
+pub(crate) fn shift_formula_references(
+    formula: &str,
+    rows: isize,
+    columns: isize,
+) -> Option<String> {
+    let chars: Vec<char> = formula.chars().collect();
+    let mut out = String::with_capacity(formula.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        let word_start = index == 0 || {
+            let before = chars[index - 1];
+            !(before.is_ascii_alphanumeric() || before == '_' || before == '.')
+        };
+        if !(word_start && ch.is_ascii_alphabetic()) {
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < chars.len() && chars[end].is_ascii_alphanumeric() {
+            end += 1;
+        }
+        let word: String = chars[index..end].iter().collect();
+        let letters = word.chars().take_while(char::is_ascii_alphabetic).count();
+        let is_reference = letters <= 3
+            && letters < word.len()
+            && word[letters..].chars().all(|ch| ch.is_ascii_digit());
+        match is_reference.then(|| table_cell_reference(&word)).flatten() {
+            Some((row, column)) => {
+                let row = row.checked_add_signed(rows)?;
+                let column = column.checked_add_signed(columns)?;
+                out.push_str(&column_letters(column));
+                out.push_str(&(row + 1).to_string());
+            }
+            None => out.push_str(&word),
+        }
+        index = end;
+    }
+    Some(out)
+}
+
+/// A column's letters: 0 is "A", 25 "Z", 26 "AA".
+fn column_letters(mut column: usize) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push((b'A' + (column % 26) as u8) as char);
+        if column < 26 {
+            break;
+        }
+        column = column / 26 - 1;
+    }
+    letters.iter().rev().collect()
+}
+
+fn apply_cell_grip_with(
+    table: &mut Table,
+    range: (usize, usize, usize, usize),
+    grip_id: usize,
+    point: glam::DVec3,
+    formulas: &FillFormulas,
+) -> Vec<FillPair> {
     const MIN: f64 = 1.0e-6;
+    let mut pairs = Vec::new();
     if table.rows.is_empty() || table.columns.is_empty() {
-        return;
+        return pairs;
     }
     let range = widen_to_merged(table, range);
     let (r0, c0, r1, c1) = range;
@@ -4800,53 +6118,133 @@ pub fn apply_cell_grip(
             table.rows[r1].height = (below - before).max(MIN);
         }
         CELL_GRIP_LEFT => {
-            table.columns[c0].width = (table.columns[c0].width - (along - x0)).max(MIN);
+            let moved = along - x0;
+            if c0 > 0 {
+                let before = table.columns[c0 - 1].width;
+                let after = table.columns[c0].width;
+                let moved = shared_edge_shift(moved, before, after, MIN);
+                table.columns[c0 - 1].width = before + moved;
+                table.columns[c0].width = after - moved;
+            } else {
+                table.columns[c0].width = (table.columns[c0].width - moved).max(MIN);
+            }
         }
         CELL_GRIP_TOP => {
-            table.rows[r0].height = (table.rows[r0].height - (below - y0)).max(MIN);
+            let moved = below - y0;
+            if r0 > 0 {
+                let before = table.rows[r0 - 1].height;
+                let after = table.rows[r0].height;
+                let moved = shared_edge_shift(moved, before, after, MIN);
+                table.rows[r0 - 1].height = before + moved;
+                table.rows[r0].height = after - moved;
+            } else {
+                table.rows[r0].height = (table.rows[r0].height - moved).max(MIN);
+            }
         }
         CELL_GRIP_FILL => {
-            // The cell under the point decides how far the fill reaches.
-            let column_at = |x: f64| {
-                let mut edge = 0.0;
-                for (index, column) in table.columns.iter().enumerate() {
-                    edge += column.width;
-                    if x < edge {
-                        return index;
-                    }
-                }
-                table.columns.len() - 1
-            };
-            let row_at = |y: f64| {
-                let mut edge = 0.0;
-                for (index, row) in table.rows.iter().enumerate() {
-                    edge += row.height;
-                    if y < edge {
-                        return index;
-                    }
-                }
-                table.rows.len() - 1
-            };
-            let (to_row, to_column) = (row_at(below.max(0.0)), column_at(along.max(0.0)));
+            let (to_row, to_column) = fill_cell_at(table, below, along);
+            // The fill runs the way the cursor left the range farthest: down,
+            // up, right or left; up and left continue a series backwards.
             let down_rows = to_row.saturating_sub(r1);
+            let up_rows = r0.saturating_sub(to_row);
             let right_columns = to_column.saturating_sub(c1);
-            if down_rows >= right_columns && down_rows > 0 {
+            let left_columns = c0.saturating_sub(to_column);
+            let reach = down_rows.max(up_rows).max(right_columns).max(left_columns);
+            if reach == 0 {
+                return pairs;
+            }
+            if down_rows == reach || up_rows == reach {
                 for column in c0..=c1 {
-                    let sources: Vec<(usize, usize)> = (r0..=r1).map(|row| (row, column)).collect();
-                    let targets: Vec<(usize, usize)> =
-                        (r1 + 1..=to_row).map(|row| (row, column)).collect();
-                    fill_series(table, &sources, &targets);
+                    let (sources, targets): (Vec<_>, Vec<_>) = if down_rows == reach {
+                        ((r0..=r1).collect(), (r1 + 1..=to_row).collect())
+                    } else {
+                        ((r0..=r1).rev().collect(), (to_row..r0).rev().collect())
+                    };
+                    let at = |rows: Vec<usize>| {
+                        rows.into_iter()
+                            .map(|row| (row, column))
+                            .collect::<Vec<_>>()
+                    };
+                    fill_series(table, &at(sources), &at(targets), formulas, &mut pairs);
                 }
-            } else if right_columns > 0 {
+            } else {
                 for row in r0..=r1 {
-                    let sources: Vec<(usize, usize)> = (c0..=c1).map(|column| (row, column)).collect();
-                    let targets: Vec<(usize, usize)> =
-                        (c1 + 1..=to_column).map(|column| (row, column)).collect();
-                    fill_series(table, &sources, &targets);
+                    let (sources, targets): (Vec<_>, Vec<_>) = if right_columns == reach {
+                        ((c0..=c1).collect(), (c1 + 1..=to_column).collect())
+                    } else {
+                        ((c0..=c1).rev().collect(), (to_column..c0).rev().collect())
+                    };
+                    let at = |columns: Vec<usize>| {
+                        columns
+                            .into_iter()
+                            .map(|column| (row, column))
+                            .collect::<Vec<_>>()
+                    };
+                    fill_series(table, &at(sources), &at(targets), formulas, &mut pairs);
                 }
             }
         }
         _ => {}
+    }
+    pairs
+}
+
+/// The cell under a point `below` / `along` the table's first cell corner.
+fn fill_cell_at(table: &Table, below: f64, along: f64) -> (usize, usize) {
+    let index_at = |sizes: &mut dyn Iterator<Item = f64>, at: f64, last: usize| {
+        let mut edge = 0.0;
+        for (index, size) in sizes.enumerate() {
+            edge += size;
+            if at < edge {
+                return index;
+            }
+        }
+        last
+    };
+    (
+        index_at(
+            &mut table.rows.iter().map(|r| r.height),
+            below.max(0.0),
+            table.rows.len() - 1,
+        ),
+        index_at(
+            &mut table.columns.iter().map(|c| c.width),
+            along.max(0.0),
+            table.columns.len() - 1,
+        ),
+    )
+}
+
+/// The picked range and the cells a fill dragged to `point` reaches:
+/// shown while dragging the fill diamond.
+pub fn fill_span(
+    table: &Table,
+    range: (usize, usize, usize, usize),
+    point: glam::DVec3,
+) -> (usize, usize, usize, usize) {
+    if table.rows.is_empty() || table.columns.is_empty() {
+        return range;
+    }
+    let (r0, c0, r1, c1) = widen_to_merged(table, range);
+    let (origin, horizontal, down) = grip_frame(table);
+    let (to_row, to_column) = fill_cell_at(
+        table,
+        (point - origin).dot(down),
+        (point - origin).dot(horizontal),
+    );
+    let reach = [
+        to_row.saturating_sub(r1),
+        r0.saturating_sub(to_row),
+        to_column.saturating_sub(c1),
+        c0.saturating_sub(to_column),
+    ];
+    let most = reach.iter().copied().max().unwrap_or(0);
+    match reach.iter().position(|&r| r == most && most > 0) {
+        Some(0) => (r0, c0, to_row, c1),
+        Some(1) => (to_row, c0, r1, c1),
+        Some(2) => (r0, c0, r1, to_column),
+        Some(3) => (r0, to_column, r1, c1),
+        _ => (r0, c0, r1, c1),
     }
 }
 
@@ -4854,23 +6252,45 @@ pub fn apply_cell_grip(
 /// (a single number counts up by one), anything else — text that reads as a
 /// number too — repeats; the source cell formatting goes along. Locked
 /// targets keep their content.
-fn fill_series(table: &mut Table, sources: &[(usize, usize)], targets: &[(usize, usize)]) {
-    use codec::entities::table::CellStateFlags;
-    let cells: Vec<codec::entities::table::TableCell> = sources
+/// Fills `targets` from `sources`: numbers continue their series, a formula
+/// is copied with its references moved by the distance between the source
+/// and the target cell, anything else is copied as it shows. Each target
+/// filled from a field cell goes into `pairs`.
+fn fill_series(
+    table: &mut Table,
+    sources: &[(usize, usize)],
+    targets: &[(usize, usize)],
+    formulas: &FillFormulas,
+    pairs: &mut Vec<FillPair>,
+) {
+    use document::entities::table::CellStateFlags;
+    let (origins, cells): (
+        Vec<(usize, usize)>,
+        Vec<document::entities::table::TableCell>,
+    ) = sources
         .iter()
-        .filter_map(|&(row, column)| table.cell(row, column).cloned())
-        .collect();
+        .filter_map(|&(row, column)| Some(((row, column), table.cell(row, column).cloned()?)))
+        .unzip();
     if cells.is_empty() {
         return;
     }
+    let has_field = |cell: &document::entities::table::TableCell| {
+        cell.contents
+            .iter()
+            .any(|content| content.field_handle.is_some())
+    };
+    let any_formula = origins.iter().any(|origin| formulas.contains_key(origin));
     let numbers: Option<Vec<f64>> = cells
         .iter()
         .map(|cell| {
+            if any_formula || has_field(cell) {
+                return None;
+            }
             let value = &cell.contents.first()?.value;
             matches!(
                 value.value_type,
-                codec::entities::table::CellValueType::Long
-                    | codec::entities::table::CellValueType::Double
+                document::entities::table::CellValueType::Long
+                    | document::entities::table::CellValueType::Double
             )
             .then(|| cell.text_value().trim().parse::<f64>().ok())
             .flatten()
@@ -4893,8 +6313,17 @@ fn fill_series(table: &mut Table, sources: &[(usize, usize)], targets: &[(usize,
         .unwrap_or(0);
     for (index, &(row, column)) in targets.iter().enumerate() {
         let source = &cells[index % cells.len()];
-        let text = match (&numbers, step) {
-            (Some(values), Some(step)) => {
+        let origin = origins[index % cells.len()];
+        let text = match (&numbers, step, formulas.get(&origin)) {
+            (_, _, Some(formula)) => {
+                let rows = row as isize - origin.0 as isize;
+                let columns = column as isize - origin.1 as isize;
+                let Some(moved) = shift_formula_references(formula, rows, columns) else {
+                    continue;
+                };
+                moved
+            }
+            (Some(values), Some(step), None) => {
                 let value = values[values.len() - 1] + step * (index as f64 + 1.0);
                 format!("{value:.decimals$}")
             }
@@ -4916,6 +6345,9 @@ fn fill_series(table: &mut Table, sources: &[(usize, usize)], targets: &[(usize,
             target.style = source.style.clone();
         }
         target.set_text(&text);
+        if has_field(source) {
+            pairs.push((origin, (row, column)));
+        }
     }
 }
 
@@ -4923,11 +6355,7 @@ fn fill_series(table: &mut Table, sources: &[(usize, usize)], targets: &[(usize,
 /// lists it (0 Angle, 1 Currency, 2 Date, 3 Decimal Number, 4 General,
 /// 5 Percentage, 6 Point, 7 Text, 8 Whole Number), and its picture; `None`
 /// when no style of the cell sets a data type.
-pub(crate) fn cell_data_kind(
-    table: &Table,
-    row: usize,
-    column: usize,
-) -> Option<(usize, String)> {
+pub(crate) fn cell_data_kind(table: &Table, row: usize, column: usize) -> Option<(usize, String)> {
     let table_row = table.rows.get(row)?;
     let cell = table_row.cells.get(column)?;
     let kind_of = |data_type: i32, unit_type: i32| {
@@ -4936,7 +6364,10 @@ pub(crate) fn cell_data_kind(
             .position(|name| *name == cell_data_category(data_type, unit_type))
     };
     let (data_type, unit_type) = cell_value_type(table_row, column, table, cell)?;
-    Some((kind_of(data_type, unit_type)?, cell_value_picture(table_row, column, table, cell)))
+    Some((
+        kind_of(data_type, unit_type)?,
+        cell_value_picture(table_row, column, table, cell),
+    ))
 }
 
 /// Where a cell's content sits in the cell (1 top left … 9 bottom right):
@@ -4945,13 +6376,13 @@ pub(crate) fn cell_data_kind(
 /// that sets it, else the row's cell style, else middle center.
 pub(crate) fn cell_content_alignment(
     table: &Table,
-    row: &codec::entities::table::TableRow,
+    row: &document::entities::table::TableRow,
     column: usize,
-    cell: &codec::entities::table::TableCell,
-    content: Option<&codec::entities::table::CellContent>,
+    cell: &document::entities::table::TableCell,
+    content: Option<&document::entities::table::CellContent>,
     row_style: Option<i32>,
 ) -> i32 {
-    use codec::entities::table::CellStylePropertyFlags as P;
+    use document::entities::table::CellStylePropertyFlags as P;
     content
         .filter(|content| content.alignment != 0 && content.sets(P::ALIGNMENT))
         .map(|content| content.alignment)
@@ -4969,14 +6400,21 @@ pub(crate) fn cell_content_alignment(
 /// most specific setting), else the cell, column, row or table style that
 /// sets them.
 pub(crate) fn cell_value_type(
-    row: &codec::entities::table::TableRow,
+    row: &document::entities::table::TableRow,
     column: usize,
     table: &Table,
-    cell: &codec::entities::table::TableCell,
+    cell: &document::entities::table::TableCell,
 ) -> Option<(i32, i32)> {
-    use codec::entities::table::CellStylePropertyFlags as P;
-    match cell.contents.first().filter(|content| content.sets(P::DATA_TYPE)) {
-        Some(content) => Some((content.format_value_data_type, content.format_value_unit_type)),
+    use document::entities::table::CellStylePropertyFlags as P;
+    match cell
+        .contents
+        .first()
+        .filter(|content| content.sets(P::DATA_TYPE))
+    {
+        Some(content) => Some((
+            content.format_value_data_type,
+            content.format_value_unit_type,
+        )),
         None => style_for_property(table, row, column, cell, P::DATA_TYPE)
             .map(|style| (style.value_data_type, style.value_unit_type)),
     }
@@ -4985,13 +6423,17 @@ pub(crate) fn cell_value_type(
 /// The picture a cell's value is shown with, found as [`cell_value_type`]
 /// finds the type; empty when nothing sets one.
 pub(crate) fn cell_value_picture(
-    row: &codec::entities::table::TableRow,
+    row: &document::entities::table::TableRow,
     column: usize,
     table: &Table,
-    cell: &codec::entities::table::TableCell,
+    cell: &document::entities::table::TableCell,
 ) -> String {
-    use codec::entities::table::CellStylePropertyFlags as P;
-    match cell.contents.first().filter(|content| content.sets(P::DATA_FORMAT)) {
+    use document::entities::table::CellStylePropertyFlags as P;
+    match cell
+        .contents
+        .first()
+        .filter(|content| content.sets(P::DATA_FORMAT))
+    {
         Some(content) => content.value_format.clone(),
         None => style_for_property(table, row, column, cell, P::DATA_FORMAT)
             .map(|style| style.value_format.clone())
@@ -5002,8 +6444,8 @@ pub(crate) fn cell_value_picture(
 /// Before the cell's own style takes a data type or picture, the content
 /// lets go of its own, which would otherwise still win.
 pub(crate) fn release_content_format(
-    cell: &mut codec::entities::table::TableCell,
-    property: codec::entities::table::CellStylePropertyFlags,
+    cell: &mut document::entities::table::TableCell,
+    property: document::entities::table::CellStylePropertyFlags,
 ) {
     let bits = property.bits() as i32;
     for content in &mut cell.contents {
@@ -5026,7 +6468,10 @@ fn parse_cell_date(text: &str, short_date: &str) -> Option<((i64, u32, u32, u32,
         return None;
     }
     let parts: Vec<&str> = date.split(['/', '.', '-']).collect();
-    let numbers: Vec<i64> = parts.iter().map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let numbers: Vec<i64> = parts
+        .iter()
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
     let [a, b, c] = numbers[..] else { return None };
     let (y, m, d) = if parts[0].len() == 4 {
         (a, b, c)
@@ -5064,7 +6509,10 @@ fn parse_cell_date(text: &str, short_date: &str) -> Option<((i64, u32, u32, u32,
     let (h, mi, s) = match time {
         None => (0, 0, 0),
         Some(time) => {
-            let t: Vec<u32> = time.split(':').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+            let t: Vec<u32> = time
+                .split(':')
+                .map(|p| p.parse().ok())
+                .collect::<Option<_>>()?;
             match t[..] {
                 [h, mi] if h < 24 && mi < 60 => (h, mi, 0),
                 [h, mi, s] if h < 24 && mi < 60 && s < 60 => (h, mi, s),
@@ -5080,12 +6528,12 @@ fn parse_cell_date(text: &str, short_date: &str) -> Option<((i64, u32, u32, u32,
 /// millisecond — two bytes each) and the text the picture shows; an empty
 /// picture is the regional short date, or date and time.
 fn date_cell_value(
-    base: &codec::entities::table::CellValue,
+    base: &document::entities::table::CellValue,
     dt: (i64, u32, u32, u32, u32, u32),
     has_time: bool,
     picture: &str,
-) -> codec::entities::table::CellValue {
-    use codec::entities::table::{CellValueType as V, ValueUnitType as U};
+) -> document::entities::table::CellValue {
+    use document::entities::table::{CellValueType as V, ValueUnitType as U};
     let (y, m, d, h, mi, s) = dt;
     let weekday = {
         // Sakamoto: 0 = Sunday.
@@ -5105,22 +6553,26 @@ fn date_cell_value(
     value.raw_unit_type_code = U::NoUnits as i32;
     value.flags = 4;
     value.data_size = 16;
-    value.binary_value = [y, m as i64, weekday, d as i64, h as i64, mi as i64, s as i64, 0]
-        .iter()
-        .flat_map(|x| (*x as u16).to_le_bytes())
-        .collect();
+    value.binary_value = [
+        y, m as i64, weekday, d as i64, h as i64, mi as i64, s as i64, 0,
+    ]
+    .iter()
+    .flat_map(|x| (*x as u16).to_le_bytes())
+    .collect();
     value.format = picture.to_string();
     value.formatted_value =
-        codec::fields::format_dt_in(dt, picture, &crate::entities::field::os_date_locale());
+        document::fields::format_dt_in(dt, picture, &crate::entities::field::os_date_locale());
     value.text.clear();
     value.numeric_value = 0.0;
     value
 }
 
 /// The date and time a date cell value keeps.
-fn stored_cell_date(value: &codec::entities::table::CellValue) -> Option<(i64, u32, u32, u32, u32, u32)> {
+fn stored_cell_date(
+    value: &document::entities::table::CellValue,
+) -> Option<(i64, u32, u32, u32, u32, u32)> {
     let b = &value.binary_value;
-    if value.value_type != codec::entities::table::CellValueType::Date || b.len() < 14 {
+    if value.value_type != document::entities::table::CellValueType::Date || b.len() < 14 {
         return None;
     }
     let w = |k: usize| u16::from_le_bytes([b[2 * k], b[2 * k + 1]]) as u32;
@@ -5128,9 +6580,9 @@ fn stored_cell_date(value: &codec::entities::table::CellValue) -> Option<(i64, u
 }
 
 /// A date cell that read as no date: emptied, typed as a date.
-pub(crate) fn empty_date_cell_value() -> codec::entities::table::CellValue {
-    use codec::entities::table::CellValueType as V;
-    let mut value = codec::entities::table::CellValue::new();
+pub(crate) fn empty_date_cell_value() -> document::entities::table::CellValue {
+    use document::entities::table::CellValueType as V;
+    let mut value = document::entities::table::CellValue::new();
     value.value_type = V::Date;
     value.raw_type_code = V::Date as i32;
     value.flags = 7;
@@ -5154,7 +6606,7 @@ fn parse_cell_point(text: &str) -> Option<[f64; 3]> {
 /// fits a cell without one (General, Text); otherwise the text has to read
 /// as the type, as the cell's editor checks it before it is put in.
 pub(crate) fn typed_text_fits(
-    document: &codec::Document,
+    document: &document::Document,
     table: &Table,
     row: usize,
     column: usize,
@@ -5170,8 +6622,11 @@ pub(crate) fn typed_text_fits(
     if matches!(kind, 0 | 1 | 3 | 5 | 8) && text.contains(',') {
         return false;
     }
-    let value = codec::entities::table::CellValue::text(text);
-    matches!(typed_cell_value(document, &value, kind, &picture), TypedValue::Converted(_))
+    let value = document::entities::table::CellValue::text(text);
+    matches!(
+        typed_cell_value(document, &value, kind, &picture),
+        TypedValue::Converted(_)
+    )
 }
 
 /// A typed number's unit sign: `$` before or after it (currency), `%`
@@ -5200,7 +6655,10 @@ pub(crate) fn entered_value_type(text: &str) -> (i32, i32, String) {
     let text = text.trim();
     let number = |part: &str| {
         let part = part.trim();
-        let plain = !part.is_empty() && part.chars().all(|c| c.is_ascii_digit() || "+-.eE".contains(c));
+        let plain = !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_digit() || "+-.eE".contains(c));
         plain.then(|| part.parse::<f64>().ok()).flatten()
     };
     let (body, unit, affixes) = unit_sign(text);
@@ -5217,7 +6675,9 @@ pub(crate) fn entered_value_type(text: &str) -> (i32, i32, String) {
         [Some(_)] if text.contains(['e', 'E']) => (2, 0, "%lu1"),
         [Some(_)] => (2, 0, "%lu6"),
         [Some(_), Some(_)] | [Some(_), Some(_), Some(_)] => (32, 0, "%lu6%ls[;]"),
-        _ if parse_cell_date(text, &crate::entities::field::os_date_locale().short_date).is_some() => {
+        _ if parse_cell_date(text, &crate::entities::field::os_date_locale().short_date)
+            .is_some() =>
+        {
             (8, 0, "%x")
         }
         _ => (4, 0, ""),
@@ -5232,7 +6692,12 @@ pub(crate) fn entered_value_type(text: &str) -> (i32, i32, String) {
 /// another unit (`$12` in a Decimal cell shows `%lu6`, `12` in a Currency
 /// cell the currency picture), and keeps its picture otherwise. `None`
 /// leaves the cell's type as it is.
-pub(crate) fn typed_entry_type(table: &Table, row: usize, column: usize, text: &str) -> Option<(i32, i32, String)> {
+pub(crate) fn typed_entry_type(
+    table: &Table,
+    row: usize,
+    column: usize,
+    text: &str,
+) -> Option<(i32, i32, String)> {
     if text.trim().is_empty() {
         return None;
     }
@@ -5245,18 +6710,25 @@ pub(crate) fn typed_entry_type(table: &Table, row: usize, column: usize, text: &
     }
     let (_, cell_data_type, cell_unit) = CELL_DATA_CATEGORIES[kind];
     let default = match kind {
-        1 => format!("%lu2%pr2%ps[{},]", crate::entities::field::os_currency_symbol()),
+        1 => format!(
+            "%lu2%pr2%ps[{},]",
+            crate::entities::field::os_currency_symbol()
+        ),
         3 => "%lu6".to_string(),
         5 => "%lu2%pr2%ps[,%]".to_string(),
         _ => String::new(),
     };
-    (entered_value_type(text).1 != cell_unit && !default.is_empty()).then_some((cell_data_type, cell_unit, default))
+    (entered_value_type(text).1 != cell_unit && !default.is_empty()).then_some((
+        cell_data_type,
+        cell_unit,
+        default,
+    ))
 }
 
 /// Outcome of reading a cell value as a data type.
 pub(crate) enum TypedValue {
     /// The value as the type, formatted by the picture.
-    Converted(codec::entities::table::CellValue),
+    Converted(document::entities::table::CellValue),
     /// The type has nothing to convert (General, an empty cell).
     Unchanged,
     /// The text does not read as the type (a date or point that is not one).
@@ -5268,14 +6740,19 @@ pub(crate) enum TypedValue {
 /// radians, a whole number drops its fraction, a date or point is read
 /// from its text.
 pub(crate) fn typed_cell_value(
-    document: &codec::Document,
-    value: &codec::entities::table::CellValue,
+    document: &document::Document,
+    value: &document::entities::table::CellValue,
     kind: usize,
     picture: &str,
 ) -> TypedValue {
-    use codec::entities::table::{CellValueType as V, ValueUnitType as U};
+    use document::entities::table::{CellValueType as V, ValueUnitType as U};
     let shown = value.display().trim().to_string();
-    if shown.is_empty() && !matches!(value.value_type, V::Long | V::Double | V::Point2D | V::Point3D) {
+    if shown.is_empty()
+        && !matches!(
+            value.value_type,
+            V::Long | V::Double | V::Point2D | V::Point3D
+        )
+    {
         return TypedValue::Unchanged;
     }
     let number = match value.value_type {
@@ -5290,7 +6767,9 @@ pub(crate) fn typed_cell_value(
     let mut point = value.point_value;
     let (value_type, unit, numeric, text) = match kind {
         0 => {
-            let Some(number) = number else { return TypedValue::Unchanged };
+            let Some(number) = number else {
+                return TypedValue::Unchanged;
+            };
             let radians = if value.value_type == V::Double && value.unit_type == U::Angle {
                 number
             } else {
@@ -5306,7 +6785,9 @@ pub(crate) fn typed_cell_value(
             (V::Double, U::Angle, radians, text)
         }
         1 | 3 | 5 => {
-            let Some(number) = number else { return TypedValue::Unchanged };
+            let Some(number) = number else {
+                return TypedValue::Unchanged;
+            };
             let unit = match kind {
                 1 => U::Currency,
                 5 => U::Percentage,
@@ -5326,7 +6807,10 @@ pub(crate) fn typed_cell_value(
         2 => {
             let (dt, has_time) = match stored_cell_date(value) {
                 Some(dt) => (dt, dt.3 + dt.4 + dt.5 > 0),
-                None => match parse_cell_date(&shown, &crate::entities::field::os_date_locale().short_date) {
+                None => match parse_cell_date(
+                    &shown,
+                    &crate::entities::field::os_date_locale().short_date,
+                ) {
                     Some(parsed) => parsed,
                     None => return TypedValue::Invalid,
                 },
@@ -5341,15 +6825,26 @@ pub(crate) fn typed_cell_value(
                     None => return TypedValue::Invalid,
                 },
             };
-            point = codec::types::Vector3::new(p[0], p[1], p[2]);
-            (V::Point3D, U::NoUnits, 0.0, document.format_point_with_picture(p, picture))
+            point = document::types::Vector3::new(p[0], p[1], p[2]);
+            (
+                V::Point3D,
+                U::NoUnits,
+                0.0,
+                document.format_point_with_picture(p, picture),
+            )
         }
         7 => (V::String, U::NoUnits, 0.0, value.display().to_string()),
         8 => {
-            let Some(number) = number else { return TypedValue::Unchanged };
+            let Some(number) = number else {
+                return TypedValue::Unchanged;
+            };
             let whole = number.trunc();
             // A picture with only a sign (`%ps[$,]`) puts it around the number.
-            let text = match picture.strip_prefix("%ps[").and_then(|p| p.strip_suffix(']')).and_then(|p| p.split_once(',')) {
+            let text = match picture
+                .strip_prefix("%ps[")
+                .and_then(|p| p.strip_suffix(']'))
+                .and_then(|p| p.split_once(','))
+            {
                 Some((prefix, suffix)) => format!("{prefix}{}{suffix}", whole as i64),
                 None => format!("{}", whole as i64),
             };
@@ -5363,7 +6858,11 @@ pub(crate) fn typed_cell_value(
     next.raw_unit_type_code = unit as i32;
     next.numeric_value = numeric;
     next.point_value = point;
-    next.formatted_value = if value_type == V::String { String::new() } else { text.clone() };
+    next.formatted_value = if value_type == V::String {
+        String::new()
+    } else {
+        text.clone()
+    };
     next.text = text;
     TypedValue::Converted(next)
 }
@@ -5372,8 +6871,8 @@ pub(crate) fn typed_cell_value(
 /// is read as that type and shown in its format, and a row lower than the
 /// wrapped text of its cells grows to hold it (rows never shrink — the
 /// stored height is the row's minimum). Returns whether the table changed.
-pub(crate) fn settle_table(table: &mut Table, document: &codec::Document) -> bool {
-    use codec::entities::table::CellValueType as V;
+pub(crate) fn settle_table(table: &mut Table, document: &document::Document) -> bool {
+    use document::entities::table::CellValueType as V;
     let mut changed = false;
     for row in 0..table.rows.len() {
         for column in 0..table.columns.len() {
@@ -5394,7 +6893,9 @@ pub(crate) fn settle_table(table: &mut Table, document: &codec::Document) -> boo
             if let TypedValue::Converted(value) =
                 typed_cell_value(document, &content.value, kind, &picture)
             {
-                if value.display() != content.value.display() || value.value_type != content.value.value_type {
+                if value.display() != content.value.display()
+                    || value.value_type != content.value.value_type
+                {
                     if let Some(content) = table
                         .cell_mut(row, column)
                         .and_then(|cell| cell.contents.first_mut())
@@ -5426,22 +6927,32 @@ struct CellTextExtent {
     last_row: usize,
     last_column: usize,
     height: f64,
-    empty: bool,
     ink: [f64; 2],
     margins: [f64; 4],
+    /// Top and bottom margins the text is drawn between (half the text
+    /// height where none is set), which a row is fitted with.
+    drawn_margins: [f64; 2],
 }
 
 /// Lays out the text of every text cell in its wrapped width. A cell
 /// whose text content is empty has no ink: no width, one text height.
+/// With `blank_cells`, a cell without any content counts as such an empty
+/// one (row fitting); without, it is left out (stored cell geometry).
 // ponytail: lays out every text cell; cache per cell if large tables slow edits.
-fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextExtent> {
-    use codec::entities::table::CellStylePropertyFlags as P;
-    let table_style = table.table_style_handle.and_then(|handle| {
-        match document.objects.get(&handle) {
-            Some(codec::objects::ObjectType::TableStyle(style)) => Some(style),
-            _ => None,
-        }
-    });
+fn cell_text_extents(
+    table: &Table,
+    document: &document::Document,
+    blank_cells: bool,
+) -> Vec<CellTextExtent> {
+    let blank = document::entities::table::CellContent::new();
+    use document::entities::table::CellStylePropertyFlags as P;
+    let table_style =
+        table
+            .table_style_handle
+            .and_then(|handle| match document.objects.get(&handle) {
+                Some(document::objects::ObjectType::TableStyle(style)) => Some(style),
+                _ => None,
+            });
     let title_suppressed = resolved_title_suppressed(table, table_style);
     let header_suppressed = resolved_header_suppressed(table, table_style);
     let (h_margin, v_margin) = resolved_table_margins(table, table_style);
@@ -5455,12 +6966,11 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
             if r0 != ri || c0 != ci {
                 continue;
             }
-            let Some(content) = cell
-                .contents
-                .first()
-                .filter(|content| content.block_handle.is_none())
-            else {
-                continue;
+            let content = match cell.contents.first() {
+                Some(content) if content.block_handle.is_some() => continue,
+                Some(content) => content,
+                None if blank_cells => &blank,
+                None => continue,
             };
             let text = cell.text_value();
             let role = table_style.map(|ts| {
@@ -5470,14 +6980,16 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
                     _ => &ts.data_row_style,
                 }
             });
-            let height = cell_text_height(table, row, ci, cell, content, role.map(|s| s.text_height))
-                .unwrap_or(0.18);
+            let height =
+                cell_text_height(table, row, ci, cell, content, role.map(|s| s.text_height))
+                    .unwrap_or(0.18);
             let style_handle = cell_text_style(document, table, row, ci, cell, Some(content))
                 .or_else(|| row_style_text_style(document, role));
             let font = style_handle
                 .and_then(|handle| fonts.get(&handle).cloned())
                 .unwrap_or_else(|| "txt".to_string());
-            let record = style_handle.and_then(|h| document.text_styles.iter().find(|s| s.handle == h));
+            let record =
+                style_handle.and_then(|h| document.text_styles.iter().find(|s| s.handle == h));
             let resolved = ResolvedTextStyle {
                 font_name: font,
                 width_factor: record.map(|s| s.width_factor as f32).unwrap_or(1.0),
@@ -5496,16 +7008,27 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
                     })
                     .unwrap_or(fallback)
             };
+            // The side margins the text is drawn between: the cell's own,
+            // else the table's (half the text height when it has none).
+            let side = |property: P| {
+                style_for_property(table, row, ci, cell, property)
+                    .map(|style| match property {
+                        P::MARGIN_LEFT => style.margin_left,
+                        _ => style.margin_right,
+                    })
+                    .filter(|margin| *margin > 1e-6)
+                    .unwrap_or(side_margin(h_margin, height))
+            };
             let width: f64 = table.columns[ci..=c1.min(table.columns.len() - 1)]
                 .iter()
                 .map(|column| column.width)
                 .sum::<f64>()
-                - margin(P::MARGIN_LEFT, h_margin)
-                - margin(P::MARGIN_RIGHT, h_margin);
+                - side(P::MARGIN_LEFT)
+                - side(P::MARGIN_RIGHT);
             let layout = layout_mtext(&MTextRenderOpts {
                 layer_color: None,
                 columns: Default::default(),
-                value: &text,
+                value: text,
                 insertion: [0.0; 3],
                 height: height as f32,
                 rect_w: width.max(0.0) as f32,
@@ -5537,7 +7060,10 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
             // the first line's top to the last baseline (txt "x": 4.5).
             let lines_height = height + (lines - 1.0) * layout.line_height as f64;
             let ink = if low[0] <= high[0] && !text.trim().is_empty() {
-                [high[0] - low[0].max(0.0), high[1].max(0.0) - low[1].min(-lines_height)]
+                [
+                    high[0] - low[0].max(0.0),
+                    high[1].max(0.0) - low[1].min(-lines_height),
+                ]
             } else {
                 [0.0, height]
             };
@@ -5547,7 +7073,6 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
                 last_row: r1,
                 last_column: c1,
                 height: height + (lines - 1.0) * layout.line_height as f64,
-                empty: text.trim().is_empty(),
                 ink,
                 margins: [
                     margin(P::MARGIN_LEFT, h_margin),
@@ -5555,6 +7080,14 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
                     margin(P::MARGIN_TOP, v_margin),
                     margin(P::MARGIN_BOTTOM, v_margin),
                 ],
+                drawn_margins: [P::MARGIN_TOP, P::MARGIN_BOTTOM].map(|property| {
+                    let set = margin(property, 0.0);
+                    if set > 1e-6 {
+                        set
+                    } else {
+                        side_margin(v_margin, height)
+                    }
+                }),
             });
         }
     }
@@ -5565,11 +7098,13 @@ fn cell_text_extents(table: &Table, document: &codec::Document) -> Vec<CellTextE
 /// the text height, the line spacing for each further line, and the
 /// cell's top and bottom margins (measured: 4.5 text, 1.5 margins — two
 /// lines 15, four 30).
-fn fitted_row_heights(table: &Table, document: &codec::Document) -> Vec<f64> {
+fn fitted_row_heights(table: &Table, document: &document::Document) -> Vec<f64> {
     let mut needed = vec![0.0f64; table.rows.len()];
-    for extent in cell_text_extents(table, document) {
-        if extent.last_row == extent.row && !extent.empty {
-            let need = extent.height + extent.margins[2] + extent.margins[3];
+    // A cell without content counts as one blank line, so an empty row
+    // keeps the height of a line and its margins.
+    for extent in cell_text_extents(table, document, true) {
+        if extent.last_row == extent.row {
+            let need = extent.height + extent.drawn_margins[0] + extent.drawn_margins[1];
             needed[extent.row] = needed[extent.row].max(need);
         }
     }
@@ -5585,28 +7120,40 @@ fn fitted_row_heights(table: &Table, document: &codec::Document) -> Vec<f64> {
 /// table changed since it was opened or last saved (`modified`), else the
 /// flag it holds (a file's 7 stays until the table changes and saves), 3
 /// by default.
-pub(crate) fn store_cell_geometry(table: &mut Table, document: &codec::Document, modified: bool) {
-    let table_style = table.table_style_handle.and_then(|handle| {
-        match document.objects.get(&handle) {
-            Some(codec::objects::ObjectType::TableStyle(style)) => Some(style.clone()),
-            _ => None,
-        }
-    });
+pub(crate) fn store_cell_geometry(
+    table: &mut Table,
+    document: &document::Document,
+    modified: bool,
+) {
+    let table_style =
+        table
+            .table_style_handle
+            .and_then(|handle| match document.objects.get(&handle) {
+                Some(document::objects::ObjectType::TableStyle(style)) => Some(style.clone()),
+                _ => None,
+            });
     let (h_margin, v_margin) = resolved_table_margins(table, table_style.as_ref());
     let title_suppressed = resolved_title_suppressed(table, table_style.as_ref());
     let header_suppressed = resolved_header_suppressed(table, table_style.as_ref());
     let mut placed = Vec::new();
-    for extent in cell_text_extents(table, document) {
+    for extent in cell_text_extents(table, document, false) {
         let row = &table.rows[extent.row];
         let cell = &row.cells[extent.column];
         let role = table_style.as_ref().map(|ts| {
-            match cell_role_kind(table, title_suppressed, header_suppressed, extent.row, extent.column) {
+            match cell_role_kind(
+                table,
+                title_suppressed,
+                header_suppressed,
+                extent.row,
+                extent.column,
+            ) {
                 0 => ts.title_row_style.alignment as i32,
                 1 => ts.header_row_style.alignment as i32,
                 _ => ts.data_row_style.alignment as i32,
             }
         });
-        let align = cell_content_alignment(table, row, extent.column, cell, cell.contents.first(), role);
+        let align =
+            cell_content_alignment(table, row, extent.column, cell, cell.contents.first(), role);
         let last_column = extent.last_column.min(table.columns.len() - 1);
         let last_row = extent.last_row.min(table.rows.len() - 1);
         let cell_width: f64 = table.columns[extent.column..=last_column]
@@ -5622,7 +7169,11 @@ pub(crate) fn store_cell_geometry(table: &mut Table, document: &codec::Document,
         // width (measured alike for txt, romans and Arial at heights 2.5 to
         // 10; a single stroke, like txt's "i", stays 0).
         let [ink_width, h] = extent.ink;
-        let w = if ink_width > 1e-9 { ink_width + 0.1 } else { 0.0 };
+        let w = if ink_width > 1e-9 {
+            ink_width + 0.1
+        } else {
+            0.0
+        };
         let (column_step, row_step) = ((align - 1).rem_euclid(3), (align - 1).div_euclid(3));
         let x = match column_step {
             0 => left,
@@ -5639,9 +7190,9 @@ pub(crate) fn store_cell_geometry(table: &mut Table, document: &codec::Document,
             extent.column,
             w + left + right,
             h + top + bottom,
-            codec::entities::table::CellContentGeometry {
-                distance_to_top_left: codec::types::Vector3::new(x, y, 0.0),
-                distance_to_center: codec::types::Vector3::new(
+            document::entities::table::CellContentGeometry {
+                distance_to_top_left: document::types::Vector3::new(x, y, 0.0),
+                distance_to_center: document::types::Vector3::new(
                     x + w * column_step as f64 / 2.0,
                     y - h * row_step as f64 / 2.0,
                     0.0,
@@ -5656,7 +7207,11 @@ pub(crate) fn store_cell_geometry(table: &mut Table, document: &codec::Document,
     }
     for row in &mut table.rows {
         for cell in &mut row.cells {
-            cell.geometry_data_flag = if modified || cell.geometry_data_flag & 4 != 0 { 7 } else { 3 };
+            cell.geometry_data_flag = if modified || cell.geometry_data_flag & 4 != 0 {
+                7
+            } else {
+                3
+            };
             cell.geometry_width_with_gap = 2.0 * h_margin;
             cell.geometry_height_with_gap = 2.0 * v_margin;
             cell.geometries.clear();
@@ -5671,3 +7226,6 @@ pub(crate) fn store_cell_geometry(table: &mut Table, document: &codec::Document,
     }
 }
 
+#[cfg(test)]
+#[path = "table/scaling_tests.rs"]
+mod scaling_tests;

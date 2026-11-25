@@ -4,9 +4,9 @@ use crate::entities::dim_override;
 use crate::scene::viewport_ref::{AcceptedSnap, MeasurementScale, ViewportFrame};
 use crate::scene::Scene;
 use crate::snap::{SnapResult, SnapType};
-use codec::entities::{Circle, Dimension, Line, Viewport};
-use codec::types::{Handle, Vector3};
-use codec::{Document, EntityType};
+use document::entities::{Circle, Dimension, Line, Viewport};
+use document::types::{Handle, Vector3};
+use document::{Document, EntityType};
 use glam::DVec3;
 
 fn fixture() -> (OpenCADStudio, Handle, ViewportFrame) {
@@ -129,7 +129,7 @@ fn viewport_dimension_imported_paper_owner_does_not_require_layout_objects() {
     finish_aligned(&mut app, line, frame);
     let doc = &mut app.tabs[app.active_tab].scene.document;
     doc.objects
-        .retain(|_, object| !matches!(object, codec::objects::ObjectType::Layout(_)));
+        .retain(|_, object| !matches!(object, document::objects::ObjectType::Layout(_)));
     assert!(crate::entities::dimension::dimension_in_paper_space(
         dimension(doc),
         doc
@@ -159,7 +159,7 @@ fn viewport_dimension_curved_clip_includes_the_exact_boundary() {
 #[test]
 fn viewport_dimension_apparent_intersection_extends_only_the_lines() {
     use crate::scene::dimension_assoc_chain::{feature_point, osnap, FeatureContext};
-    use codec::objects::AssocDimensionReference;
+    use document::objects::AssocDimensionReference;
     let mut scene = Scene::new();
     let first = scene.add_entity(EntityType::Line(Line::from_points(
         Vector3::ZERO,
@@ -208,7 +208,7 @@ fn viewport_dimension_creation_preserves_active_units_and_roundtrips() {
     for factor in [25.4, -25.4] {
         let (mut app, line, frame) = fixture();
         let i = app.active_tab;
-        let mut style = codec::tables::DimStyle::new("Millimetres");
+        let mut style = document::tables::DimStyle::new("Millimetres");
         style.dimlfac = factor;
         app.tabs[i].scene.document.dim_styles.add(style).unwrap();
         app.tabs[i].scene.document.header.current_dimstyle_name = "Millimetres".into();
@@ -376,7 +376,7 @@ fn viewport_dimension_preview_uses_candidate_scale_only_before_second_pick() {
     for command in ["DIMLINEAR", "DIMALIGNED"] {
         let (mut app, model, frame) = fixture();
         let i = app.active_tab;
-        let mut style = codec::tables::DimStyle::new("PreviewUnits");
+        let mut style = document::tables::DimStyle::new("PreviewUnits");
         style.dimlfac = 25.4;
         app.tabs[i].scene.document.dim_styles.add(style).unwrap();
         app.tabs[i].scene.document.header.current_dimstyle_name = "PreviewUnits".into();
@@ -450,8 +450,8 @@ fn viewport_dimension_snap_query_matches_pan_scale_and_twist() {
 
 #[test]
 fn viewport_dimension_eligibility_is_shared_and_uses_clipping() {
-    use codec::entities::LwPolyline;
-    use codec::types::Vector2;
+    use document::entities::LwPolyline;
+    use document::types::Vector2;
     let (mut app, _, first) = fixture();
     let scene = &mut app.tabs[app.active_tab].scene;
     let mut overlay = scene.document.get_entity(first.viewport).unwrap().clone();
@@ -630,7 +630,7 @@ fn viewport_dimension_association_scale_edit_picture_and_history() {
 #[test]
 fn viewport_dimension_unsupported_and_erased_sources_keep_last_picture() {
     use crate::scene::dimension_assoc::{resolve_reference_chain, ReferenceStatus};
-    use codec::objects::AssocDimensionReference;
+    use document::objects::AssocDimensionReference;
     let (mut app, line, frame) = fixture();
     let i = app.active_tab;
     finish_aligned(&mut app, line, frame);
@@ -737,8 +737,8 @@ fn viewport_dimension_intersection_tracks_both_entities() {
 #[test]
 fn viewport_dimension_spline_tangency_is_parallel_and_validated() {
     use crate::scene::dimension_assoc_chain::{feature_point, osnap, FeatureContext};
-    use codec::objects::AssocDimensionReference;
-    let mut spline = codec::entities::Spline::new();
+    use document::objects::AssocDimensionReference;
+    let mut spline = document::entities::Spline::new();
     spline.degree = 2;
     spline.control_points = vec![
         Vector3::ZERO,
@@ -783,7 +783,7 @@ fn viewport_dimension_spline_tangency_is_parallel_and_validated() {
 fn viewport_dimension_external_fixture_keeps_unchanged_measurements() {
     use crate::scene::ChangeKind;
     let path = std::env::var("OPENCAD_VIEWPORT_REGRESSION_DXF").expect("regression drawing path");
-    let doc = codec::DxfReader::from_file(std::path::Path::new(&path))
+    let doc = document::DxfReader::from_file(std::path::Path::new(&path))
         .unwrap()
         .read()
         .unwrap();
@@ -888,12 +888,13 @@ fn viewport_dimension_fixture_regenerates_and_tracks_an_intersection() {
         .unwrap()
         .clone();
     for types in [(1, 255), (8, 9)] {
-        let codec::objects::ObjectType::Associative(object) =
+        let document::objects::ObjectType::Associative(object) =
             scene.document.objects.get_mut(&Handle::new(0x304)).unwrap()
         else {
             panic!()
         };
-        let codec::objects::AssociativeData::DimensionAssociation(assoc) = &mut object.data else {
+        let document::objects::AssociativeData::DimensionAssociation(assoc) = &mut object.data
+        else {
             panic!()
         };
         assoc.references[0][0].osnap_type = types.0;
@@ -942,8 +943,8 @@ fn viewport_dimension_nearest_parameter_survives_source_stretch() {
 #[test]
 fn viewport_dimension_nested_block_path_survives_edit_and_copy() {
     use crate::scene::ChangeKind;
-    use codec::entities::Insert;
-    use codec::tables::BlockRecord;
+    use document::entities::Insert;
+    use document::tables::BlockRecord;
     let (mut app, _, frame) = fixture();
     let i = app.active_tab;
     let scene = &mut app.tabs[i].scene;
@@ -1012,7 +1013,7 @@ fn viewport_dimension_nested_block_path_survives_edit_and_copy() {
 fn viewport_dimension_hidden_border_and_lock_keep_content_available() {
     let (mut app, _, frame) = fixture();
     let scene = &mut app.tabs[app.active_tab].scene;
-    let mut layer = codec::tables::Layer::new("Viewport frames");
+    let mut layer = document::tables::Layer::new("Viewport frames");
     layer.flags.off = true;
     scene.document.layers.add(layer).unwrap();
     let Some(EntityType::Viewport(vp)) = scene.document.get_entity_mut(frame.viewport) else {
@@ -1030,9 +1031,9 @@ fn viewport_dimension_hidden_border_and_lock_keep_content_available() {
 #[test]
 fn viewport_dimension_perpendicular_uses_transformed_geometry() {
     use crate::scene::dimension_assoc::{resolve_reference_chain, ReferenceStatus};
-    use codec::entities::Insert;
-    use codec::objects::AssocDimensionReference;
-    use codec::tables::BlockRecord;
+    use document::entities::Insert;
+    use document::objects::AssocDimensionReference;
+    use document::tables::BlockRecord;
     let mut scene = Scene::new();
     let mut block = BlockRecord::new("Stretched");
     block.handle = scene.document.allocate_handle();
@@ -1072,7 +1073,7 @@ fn viewport_dimension_perpendicular_uses_transformed_geometry() {
 
 #[test]
 fn viewport_dimension_refresh_preserves_explicit_overrides() {
-    use codec::xdata::XDataValue;
+    use document::xdata::XDataValue;
     let (mut app, line, frame) = fixture();
     let i = app.active_tab;
     finish_aligned(&mut app, line, frame);
@@ -1119,8 +1120,8 @@ fn viewport_dimension_refresh_preserves_explicit_overrides() {
 
 #[test]
 fn viewport_dimension_block_center_keeps_the_circle_source() {
-    use codec::entities::Insert;
-    use codec::tables::BlockRecord;
+    use document::entities::Insert;
+    use document::tables::BlockRecord;
     let (mut app, _, frame) = fixture();
     let i = app.active_tab;
     let scene = &mut app.tabs[i].scene;
@@ -1162,8 +1163,8 @@ fn viewport_dimension_block_center_keeps_the_circle_source() {
 #[test]
 fn viewport_dimension_angular_object_picks_follow_arc_features() {
     use crate::scene::{ChangeKind, ReferenceStatus};
-    use codec::entities::{Arc, LwPolyline};
-    use codec::types::Vector2;
+    use document::entities::{Arc, LwPolyline};
+    use document::types::Vector2;
     for bulged in [false, true] {
         let (mut app, _, frame) = fixture();
         let i = app.active_tab;
@@ -1267,7 +1268,7 @@ fn start_centerline_dimension(
             Vector3::new(55.0, 40.0, 0.0),
             Vector3::new(55.0, 60.0, 0.0),
         )));
-    let mut style = codec::tables::DimStyle::new("CenterlineUnits");
+    let mut style = document::tables::DimStyle::new("CenterlineUnits");
     style.dimlfac = factor;
     app.tabs[i].scene.document.dim_styles.add(style).unwrap();
     app.tabs[i].scene.document.header.current_dimstyle_name = "CenterlineUnits".into();
@@ -1441,8 +1442,8 @@ fn viewport_dimension_paper_centerline_tracks_each_owning_space() {
 #[test]
 fn viewport_dimension_invalid_paths_leave_no_partial_association() {
     use crate::scene::viewport_ref::SnapSourceRef;
-    use codec::entities::{DimensionAligned, Insert};
-    use codec::tables::BlockRecord;
+    use document::entities::{DimensionAligned, Insert};
+    use document::tables::BlockRecord;
 
     let (mut app, model, frame) = fixture();
     let scene = &mut app.tabs[app.active_tab].scene;
@@ -1504,7 +1505,7 @@ fn layer_state_restored_in_a_viewport_turns_off_only_there() {
     let (mut app, _, frame) = fixture();
     let i = app.active_tab;
     let doc = &mut app.tabs[i].scene.document;
-    let mut red = codec::tables::Layer::new("Red");
+    let mut red = document::tables::Layer::new("Red");
     red.handle = doc.allocate_handle();
     let _ = doc.layers.add(red);
     doc.layers.get_mut("Red").unwrap().flags.off = true;
@@ -1521,4 +1522,47 @@ fn layer_state_restored_in_a_viewport_turns_off_only_there() {
         panic!()
     };
     assert!(vp.frozen_layers.contains(&red.handle));
+}
+
+#[test]
+fn alignspace_puts_model_points_on_paper_points() {
+    use glam::DVec2;
+    let (mut app, _, initial) = fixture();
+    let scene = &mut app.tabs[app.active_tab].scene;
+    let model = [DVec2::new(10.0, 20.0), DVec2::new(110.0, 20.0)];
+    let paper = [DVec2::new(40.0, 50.0), DVec2::new(40.0, 70.0)];
+    assert!(scene.align_viewport_view(initial.viewport, &model, &paper));
+    let frame = scene.viewport_frame(initial.viewport).unwrap();
+    for (m, p) in model.iter().zip(paper) {
+        let got = frame.model_to_paper(m.extend(0.0)).truncate();
+        assert!((got - p).length() < 1e-4, "{m} -> {got}, want {p}");
+    }
+    // One pair pans and keeps the new scale and twist.
+    let paper = [DVec2::new(30.0, 30.0)];
+    assert!(scene.align_viewport_view(initial.viewport, &model[..1], &paper));
+    let after = scene.viewport_frame(initial.viewport).unwrap();
+    assert!((after.model_to_paper(model[0].extend(0.0)).truncate() - paper[0]).length() < 1e-4);
+    assert!((after.scale - frame.scale).abs() < 1e-6 && (after.twist - frame.twist).abs() < 1e-6);
+}
+
+#[test]
+fn alignspace_command_picks_model_then_paper_points() {
+    use super::Message;
+    let (mut app, _, initial) = fixture();
+    let i = app.active_tab;
+    let _ = app.update(Message::Command("ALIGNSPACE".into()));
+    // The command asks for the viewport switch; the runtime would deliver it.
+    let _ = app.update(Message::EnterViewport(initial.viewport));
+    assert_eq!(app.tabs[i].scene.active_viewport, Some(initial.viewport));
+    let _ = app.feed_command(StepInput::Point(DVec3::new(10.0, 20.0, 0.0)));
+    let _ = app.feed_command(StepInput::Point(DVec3::new(110.0, 20.0, 0.0)));
+    let _ = app.update(Message::ExitViewport);
+    assert_eq!(app.tabs[i].scene.active_viewport, None);
+    assert!(app.tabs[i].active_cmd.is_some(), "the paper half survives the switch");
+    let _ = app.feed_command(StepInput::Point(DVec3::new(40.0, 50.0, 0.0)));
+    let _ = app.feed_command(StepInput::Point(DVec3::new(40.0, 70.0, 0.0)));
+    assert!(app.tabs[i].active_cmd.is_none());
+    let frame = app.tabs[i].scene.viewport_frame(initial.viewport).unwrap();
+    let got = frame.model_to_paper(DVec3::new(110.0, 20.0, 0.0));
+    assert!((got - DVec3::new(40.0, 70.0, 0.0)).length() < 1e-4, "{got}");
 }

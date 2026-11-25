@@ -11,11 +11,6 @@ use crate::ui::window::attdef_dialog::{
 };
 use iced::Task;
 
-fn short(v: f64) -> String {
-    let t = format!("{v:.4}");
-    t.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
 impl OpenCADStudio {
     pub(super) fn dispatch_attdef(&mut self, cmd: &str, i: usize) -> Option<Task<Message>> {
         if matches!(cmd, "ATTDEF" | "-ATTDEF") {
@@ -106,7 +101,7 @@ impl OpenCADStudio {
                 Some(v) => attdef::session().aflags = v,
                 None => {
                     self.command_line
-                        .push_error("Requires an integer between 0 and 63.");
+                        .push_rejection("Requires an integer between 0 and 63.");
                     self.command_line
                         .push_output(&crate::ui::command_line::value_prompt("AFLAGS", &current));
                     self.pending_setvar = Some("AFLAGS".to_string());
@@ -137,11 +132,15 @@ impl OpenCADStudio {
             justify: Justify::Left,
             style: defaults.style_name,
             styles,
-            height: short(defaults.height),
+            height: crate::entities::common::format_length(defaults.height),
             rotation: "0".into(),
-            width: "0".into(),
+            width: crate::entities::common::format_length(0.0),
             on_screen: session.on_screen,
-            coords: ["0".into(), "0".into(), "0".into()],
+            coords: [
+                crate::entities::common::format_length(0.0),
+                crate::entities::common::format_length(0.0),
+                crate::entities::common::format_length(0.0),
+            ],
             align_below: false,
             can_align_below: session.last_in(drawing).is_some(),
             error: None,
@@ -153,9 +152,9 @@ impl OpenCADStudio {
     }
 
     /// The Edit Attribute Definition dialog for `handle`.
-    pub(in crate::app) fn open_attdef_edit(&mut self, handle: codec::Handle) {
+    pub(in crate::app) fn open_attdef_edit(&mut self, handle: document::Handle) {
         let i = self.active_tab;
-        let Some(codec::EntityType::AttributeDefinition(a)) =
+        let Some(document::EntityType::AttributeDefinition(a)) =
             self.tabs[i].scene.document.get_entity(handle)
         else {
             return;
@@ -374,12 +373,12 @@ impl OpenCADStudio {
         self.close_active_modal();
         let changed = matches!(
             self.tabs[i].scene.document.get_entity(state.handle),
-            Some(codec::EntityType::AttributeDefinition(a))
+            Some(document::EntityType::AttributeDefinition(a))
                 if a.tag != attdef::normalize_tag(&state.tag) || a.prompt != state.prompt || a.default_value != state.default
         ) || state.field_changed;
         if changed && !self.reject_locked_edit(i, state.handle) {
             self.push_undo_snapshot(i, "DDEDIT");
-            if let Some(codec::EntityType::AttributeDefinition(a)) =
+            if let Some(document::EntityType::AttributeDefinition(a)) =
                 self.tabs[i].scene.document.get_entity_mut(state.handle)
             {
                 a.tag = attdef::normalize_tag(&state.tag);
@@ -403,5 +402,22 @@ impl OpenCADStudio {
             self.refresh_properties();
         }
         self.post_editor_closed(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_attribute_definition_dialog_seeds_its_numbers_at_drawing_precision() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.open_attdef_dialog(0);
+        let state = app.attdef_dialog.as_ref().expect("the dialog is open");
+        assert_eq!(state.height, "2.5000");
+        assert_eq!(state.rotation, "0");
+        assert_eq!(state.width, "0.0000");
+        let coords: Vec<&str> = state.coords.iter().map(String::as_str).collect();
+        assert_eq!(coords, ["0.0000", "0.0000", "0.0000"]);
     }
 }

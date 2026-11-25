@@ -9,11 +9,11 @@
 
 use crate::modules::draw::modify::spline_ops::{spline_cut, spline_nearest_t, spline_range};
 use crate::t;
-use codec::entities::{
+use document::entities::{
     Arc as ArcEnt, Ellipse as EllipseEnt, Line as LineEnt, LwPolyline, Spline as SplineEnt,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdResult};
@@ -88,12 +88,12 @@ fn break_line(line: &LineEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     result
 }
 
-fn picked_spans(curve: &kernel::space::PlanarCurve, p1: DVec3, p2: DVec3) -> Option<Vec<[f64; 2]>> {
+fn picked_spans(curve: &ocs_geom::space::PlanarCurve, p1: DVec3, p2: DVec3) -> Option<Vec<[f64; 2]>> {
     let first = curve.plane.project(p1.to_array())?;
     let second = curve.plane.project(p2.to_array())?;
-    let a = kernel::geom2d::closest_point(&curve.curve, first).t;
-    let b = kernel::geom2d::closest_point(&curve.curve, second).t;
-    kernel::geom2d::break_spans(&curve.curve, a, b, kernel::geom2d::Tolerance::new(1e-9))
+    let a = ocs_geom::geom2d::closest_point(&curve.curve, first).t;
+    let b = ocs_geom::geom2d::closest_point(&curve.curve, second).t;
+    ocs_geom::geom2d::break_spans(&curve.curve, a, b, ocs_geom::geom2d::Tolerance::new(1e-9))
 }
 
 fn break_arc(arc: &ArcEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
@@ -101,7 +101,7 @@ fn break_arc(arc: &ArcEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Arc(arc.clone())];
     };
-    let kernel::geom2d::Curve::Arc(geometry) = &curve.curve else {
+    let ocs_geom::geom2d::Curve::Arc(geometry) = &curve.curve else {
         unreachable!()
     };
     spans
@@ -118,7 +118,7 @@ fn break_arc(arc: &ArcEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
         .collect()
 }
 
-fn break_circle(circle: &codec::entities::Circle, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
+fn break_circle(circle: &document::entities::Circle, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let curve = crate::entities::curve::circle_curve(circle);
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Circle(circle.clone())];
@@ -147,7 +147,7 @@ fn break_lwpolyline(p: &LwPolyline, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return unchanged();
     };
-    let kernel::geom2d::Curve::Polyline(geometry) = &curve.curve else {
+    let ocs_geom::geom2d::Curve::Polyline(geometry) = &curve.curve else {
         unreachable!()
     };
     let mut result = Vec::with_capacity(spans.len());
@@ -169,7 +169,7 @@ fn break_lwpolyline(p: &LwPolyline, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
             } else {
                 segment.source_index
             };
-            let mut output = p.vertices[source].clone();
+            let mut output = p.vertices[source];
             output.location.x = vertex.position[0];
             output.location.y = vertex.position[1];
             if !last || segment.to != 1.0 {
@@ -196,7 +196,7 @@ fn break_ellipse(ell: &EllipseEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
     let Some(spans) = picked_spans(&curve, p1, p2) else {
         return vec![EntityType::Ellipse(ell.clone())];
     };
-    let kernel::geom2d::Curve::Ellipse(geometry) = &curve.curve else {
+    let ocs_geom::geom2d::Curve::Ellipse(geometry) = &curve.curve else {
         unreachable!()
     };
     spans
@@ -270,6 +270,12 @@ fn break_spline(spl: &SplineEnt, p1: DVec3, p2: DVec3) -> Vec<EntityType> {
 pub struct BreakInteractiveCommand {
     target: Option<Handle>,
     p1: Option<DVec3>,
+}
+
+impl Default for BreakInteractiveCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BreakInteractiveCommand {
@@ -367,6 +373,12 @@ pub struct BreakAtPointCommand {
     target: Option<Handle>,
 }
 
+impl Default for BreakAtPointCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BreakAtPointCommand {
     pub fn new() -> Self {
         Self { target: None }
@@ -427,8 +439,8 @@ inventory::submit!(crate::command::CommandRegistration { names: &["BREAK"] }); /
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::entities::LwVertex;
-    use codec::types::Vector2;
+    use document::entities::LwVertex;
+    use document::types::Vector2;
 
     #[test]
     fn first_option_replaces_the_selection_point_and_at_reuses_it() {

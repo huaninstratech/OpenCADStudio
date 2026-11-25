@@ -1,20 +1,20 @@
-use codec::entities::{
+use document::entities::{
     Dimension, DimensionAngular2Ln, DimensionAngular3Pt, DimensionBase, DimensionLinear,
     DimensionOrdinate,
 };
-use codec::types::Vector3;
-use codec::{EntityType, Handle};
+use document::types::Vector3;
+use document::{EntityType, Handle};
 use glam::DVec3;
-use kernel::geom2d::{
+use ocs_geom::geom2d::{
     arc_span, closest_point, intersect, nearest_of, Arc, Curve, Ray, Tolerance, Transform, Vec2,
     XLine,
 };
-use kernel::space::Plane;
+use ocs_geom::space::Plane;
 
+use super::dim_baseline::{OriginPicks, SourceStyle};
 use crate::command::{
     CadCommand, CmdOption, CmdResult, DimensionAssociationInput, DimensionPreview,
 };
-use super::dim_baseline::{OriginPicks, SourceStyle};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
 
@@ -485,7 +485,11 @@ fn text_moves_with_leader(base: &mut DimensionBase, style_text_move: &[(String, 
     for (code, _) in &rest {
         ov::set_on_common(&mut base.common, *code, None);
     }
-    ov::set_on_common(&mut base.common, DIMTMOVE, Some(codec::xdata::XDataValue::Integer16(1)));
+    ov::set_on_common(
+        &mut base.common,
+        DIMTMOVE,
+        Some(document::xdata::XDataValue::Integer16(1)),
+    );
     for (code, value) in rest.into_iter().filter(|(code, _)| *code != DIMTMOVE) {
         ov::set_on_common(&mut base.common, code, Some(value));
     }

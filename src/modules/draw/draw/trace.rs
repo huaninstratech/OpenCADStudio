@@ -12,9 +12,9 @@
 // elevation, taken from the first point's Z).
 
 use crate::t;
-use codec::entities::{LwPolyline, LwVertex};
-use codec::types::{Vector2, Vector3};
-use codec::EntityType;
+use document::entities::{LwPolyline, LwVertex};
+use document::types::{Vector2, Vector3};
+use document::EntityType;
 
 use crate::command::{CadCommand, CmdResult, WorkingPlane};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
@@ -46,6 +46,12 @@ pub struct TraceCommand {
     /// elevation (its Z).
     points: Vec<DVec3>,
     plane: WorkingPlane,
+}
+
+impl Default for TraceCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TraceCommand {

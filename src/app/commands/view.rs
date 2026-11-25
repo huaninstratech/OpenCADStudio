@@ -1,9 +1,181 @@
 use super::*;
 
+const WIKI_URL: &str = "https://github.com/HakanSeven12/OpenCADStudio/wiki";
+
+/// The wiki page for a help topic: a system variable has a page of its own
+/// (`OSMODE-System-Variable`), and so has a registered command (`LINE-Command`;
+/// the `-LINE` command-line form and ribbon tokens such as `ARC_3P` share their
+/// command's page). Anything else is searched for, and no topic opens the
+/// wiki's home page.
+fn help_url(topic: Option<&str>) -> String {
+    let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
+        return WIKI_URL.to_string();
+    };
+    if crate::modules::registry::is_system_variable(topic) {
+        return format!("{WIKI_URL}/{}-System-Variable", topic.to_ascii_uppercase());
+    }
+    let names = crate::command::all_registered_command_names();
+    let registered = |name: &str| names.iter().any(|known| known.eq_ignore_ascii_case(name));
+    let bare = topic.trim_start_matches(['-', '\'', '_']);
+    let base = [bare.split('_').next().unwrap_or(bare), bare]
+        .into_iter()
+        .find(|name| registered(name))
+        .or_else(|| registered(&format!("-{bare}")).then_some(bare));
+    match base {
+        Some(name) => format!("{WIKI_URL}/{}-Command", name.to_ascii_uppercase()),
+        None => format!(
+            "https://github.com/HakanSeven12/OpenCADStudio/search?type=wikis&q={}",
+            topic
+                .bytes()
+                .filter(u8::is_ascii_alphanumeric)
+                .map(char::from)
+                .collect::<String>()
+        ),
+    }
+}
+
+impl OpenCADStudio {
+    /// CUIIMPORT <path>: the shortcuts file is read and parsed off the UI
+    /// thread; the shortcuts are loaded when the read ends
+    /// ([`Self::finish_shortcuts_import`]).
+    pub(in crate::app) fn import_shortcuts_file(&mut self, path: &str) -> Task<Message> {
+        self.import_shortcuts_file_with(path, read_shortcuts_file)
+    }
+
+    /// [`Self::import_shortcuts_file`] with the reader given, so a test can
+    /// give one that panics.
+    pub(in crate::app) fn import_shortcuts_file_with(
+        &mut self,
+        path: &str,
+        reader: ShortcutsReader,
+    ) -> Task<Message> {
+        let path = path.to_string();
+        let worker_path = path.clone();
+        self.command_line.push_info(&format!("Reading {path}…"));
+        crate::app::update::background_task(
+            "CUIIMPORT",
+            move || reader(&worker_path),
+            move |rows| Message::ShortcutsFileRead(path, rows),
+        )
+    }
+
+    /// Loads the shortcuts of a finished CUIIMPORT read, as the command did
+    /// before. Shortcuts belong to the app, not to a drawing.
+    pub(in crate::app) fn finish_shortcuts_import(
+        &mut self,
+        path: &str,
+        rows: Result<Vec<(String, String)>, String>,
+    ) {
+        match rows {
+            Ok(rows) => {
+                let n = rows.len();
+                self.shortcut_bindings.extend(rows);
+                crate::app::shortcuts::sync_space_dispatch_flag(&self.shortcut_bindings);
+                self.persist_settings_if_changed();
+                self.command_line.push_output(
+                    crate::tf!("CUIIMPORT: loaded {n} shortcut(s) from \"{path}\".").as_ref(),
+                );
+            }
+            Err(e) => self
+                .command_line
+                .push_error(crate::tf!("CUIIMPORT: cannot read \"{path}\": {e}").as_ref()),
+        }
+    }
+}
+
+/// A CUIIMPORT reader: the file's shortcuts (key, command), or why it
+/// cannot be read.
+type ShortcutsReader = fn(&str) -> Result<Vec<(String, String)>, String>;
+
+/// The CUIIMPORT reader: the file's shortcuts, or why it cannot be read.
+fn read_shortcuts_file(path: &str) -> Result<Vec<(String, String)>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(crate::app::shortcuts::parse_shortcut_import(&text).0)
+}
+
+#[cfg(test)]
+mod cuiimport_read_tests {
+    use crate::app::OpenCADStudio;
+
+    fn new_app() -> OpenCADStudio {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app
+    }
+
+    /// CUIIMPORT loads the shortcuts only when the read ends.
+    #[test]
+    fn the_shortcuts_load_when_the_read_ends() {
+        let mut app = new_app();
+        let path = std::env::temp_dir().join(format!("ocs-cuiimport-{}.txt", std::process::id()));
+        std::fs::write(&path, "# shortcuts\nCTRL+ALT+K LINE\n").expect("write the shortcuts");
+        let shown = path.display().to_string();
+        let before = app.shortcut_bindings.len();
+        let task = app.dispatch_command(&format!("CUIIMPORT {shown}"));
+        assert_eq!(
+            app.shortcut_bindings.len(),
+            before,
+            "nothing during the read"
+        );
+        app.drive_headless_task(task).expect("the read task");
+        assert_eq!(app.shortcut_bindings.len(), before + 1);
+        assert!(app.command_line.history_plain_text().contains(&format!(
+            "CUIIMPORT: loaded 1 shortcut(s) from \"{shown}\"."
+        )));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A missing file gives the same error as before.
+    #[test]
+    fn a_missing_file_is_an_error() {
+        let mut app = new_app();
+        let task = app.dispatch_command("CUIIMPORT /no/such/shortcuts.txt");
+        app.drive_headless_task(task).expect("the read task");
+        assert!(app
+            .command_line
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("CUIIMPORT: cannot read \"/no/such/shortcuts.txt\"")));
+    }
+
+    /// A reader that panics gives an error, and no shortcut changes.
+    #[test]
+    fn a_reader_panic_is_an_error() {
+        let mut app = new_app();
+        let before = app.shortcut_bindings.clone();
+        let task = app.import_shortcuts_file_with("panics.txt", |_| panic!("a reader bug"));
+        app.drive_headless_task(task).expect("the read task");
+        assert_eq!(
+            app.command_line.last_error.as_deref(),
+            Some("CUIIMPORT failed: a reader bug")
+        );
+        assert_eq!(app.shortcut_bindings, before);
+    }
+}
+
+#[cfg(test)]
+mod help_url_tests {
+    use super::help_url;
+
+    #[test]
+    fn help_opens_the_command_page_or_searches_the_wiki() {
+        assert!(help_url(None).ends_with("/wiki"));
+        assert!(help_url(Some("LINE")).ends_with("/wiki/LINE-Command"));
+        assert!(help_url(Some("-LAYER")).ends_with("/wiki/LAYER-Command"));
+        assert!(help_url(Some("ARC_3P")).ends_with("/wiki/ARC-Command"));
+        assert!(help_url(Some("-LAYOUT")).ends_with("/wiki/LAYOUT-Command"));
+        assert!(help_url(Some("osmode")).ends_with("/wiki/OSMODE-System-Variable"));
+        assert!(help_url(Some("NOSUCHTOPIC")).ends_with("search?type=wikis&q=NOSUCHTOPIC"));
+    }
+}
+
 // Sort tables belong to the block's extension dictionary. Reserve real handles
 // and reconnect older unattached tables without losing their existing entries.
-fn ensure_draw_order_table(doc: &mut codec::Document, block: codec::Handle) -> codec::Handle {
-    use codec::objects::{Dictionary, ObjectType, SortEntitiesTable};
+fn ensure_draw_order_table(
+    doc: &mut document::Document,
+    block: document::Handle,
+) -> document::Handle {
+    use document::objects::{Dictionary, ObjectType, SortEntitiesTable};
 
     // Older commands inserted objects using the unreserved next-handle value.
     // Repair the allocator floor before creating anything beside those objects.
@@ -78,19 +250,32 @@ impl OpenCADStudio {
                 ));
             }
 
-            "HELP" => {
-                self.command_line.push_info(
-                    crate::t!("Opening OCS Discussions for help and questions...").as_ref(),
-                );
-                return Some(crate::sys::open_url(
-                    "https://github.com/HakanSeven12/OpenCADStudio/discussions",
-                    self.main_window,
-                ));
+            // HELP opens the wiki; inside a command ('HELP or F1, which run
+            // transparently) it opens that command's page, and `HELP <name>`
+            // opens the page of a command or alias, or searches the wiki.
+            cmd if cmd == "HELP" || cmd.starts_with("HELP ") => {
+                let topic = match cmd.strip_prefix("HELP").map(str::trim) {
+                    Some(name) if !name.is_empty() => {
+                        let name = name.to_ascii_uppercase();
+                        Some(self.resolve_alias(&name).unwrap_or(name))
+                    }
+                    _ => self.tabs[i]
+                        .active_cmd
+                        .as_ref()
+                        .map(|command| command.name().to_string()),
+                };
+                let url = help_url(topic.as_deref());
+                self.command_line
+                    .push_info(crate::tf!("Opening help: {}", url).as_ref());
+                return Some(crate::sys::open_url(&url, self.main_window));
             }
 
             // ── DWGPROPS — Drawing Properties dialog ─────────────────────
             "DWGPROPS" | "DWGPROP" => {
                 self.open_drawing_properties();
+            }
+            "GEOGRAPHICLOCATION" => {
+                self.open_geographic_location();
             }
 
             // Edit a USERI1..USERI5 / USERR1..USERR5 slot. Lets the user
@@ -185,7 +370,45 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::AboutOpen));
             }
 
-            "PLUGINS" | "PLUGINMANAGER" => {
+            // The user's own commands from the right-click menu, at the
+            // cursor: bound to a key, a menu without leaving the drawing.
+            "POPMENU" => {
+                let i = self.active_tab;
+                let at = self.tabs[i].scene.selection.borrow().input.last_move_pos;
+                let Some(at) = at.filter(|_| !self.context_menu_custom.custom.is_empty()) else {
+                    self.command_line.push_info(
+                        crate::t!("POPMENU  Add commands to the right-click menu with its Customize row first.")
+                            .as_ref(),
+                    );
+                    return Some(Task::none());
+                };
+                {
+                    let mut sel = self.tabs[i].scene.selection.borrow_mut();
+                    sel.menu.open(at);
+                    sel.menu.user = true;
+                }
+                self.menu_bar_popup = None;
+                self.context_menu_editing = None;
+                return Some(self.unfocus_widgets());
+            }
+
+            // The check the program makes at start, on request: the notice
+            // when a newer release is out, a line saying so when not.
+            "CHECKFORUPDATES" => {
+                if cfg!(target_arch = "wasm32") {
+                    self.command_line
+                        .push_output(&crate::tr!("view", "web-always-latest"));
+                    return Some(Task::none());
+                }
+                self.command_line
+                    .push_info(&crate::tr!("view", "checking-for-updates"));
+                return Some(Task::perform(
+                    crate::io::update_check::check_for_update(),
+                    Message::UpdateCheckManual,
+                ));
+            }
+
+            "PLUGINS" | "PLUGINMANAGER" | "APPLOAD" => {
                 return Some(Task::done(Message::PluginManagerOpen));
             }
 
@@ -226,10 +449,9 @@ impl OpenCADStudio {
                     .active_block_edit_session()
                     .is_some()
                 {
-                    let open = !self.show_parameters_manager;
-                    return Some(
-                        self.dock_set_open(crate::ui::dock::PanelId::ParametersManager, open),
-                    );
+                    let id = crate::ui::dock::PanelId::ParametersManager;
+                    let open = !self.dock_panel_visible(id);
+                    return Some(self.dock_set_open(id, open));
                 }
                 return Some(Task::done(Message::NamedParametersOpen));
             }
@@ -305,33 +527,7 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 }
-                match std::fs::read_to_string(path) {
-                    Ok(text) => {
-                        let mut n = 0usize;
-                        for line in text.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') {
-                                continue;
-                            }
-                            if let Some((k, v)) = line.split_once(char::is_whitespace) {
-                                let key = crate::app::shortcuts::normalize_key(k);
-                                if !key.is_empty() {
-                                    self.shortcut_bindings.insert(key, v.trim().to_uppercase());
-                                    n += 1;
-                                }
-                            }
-                        }
-                        crate::app::shortcuts::sync_space_dispatch_flag(&self.shortcut_bindings);
-                        self.persist_settings_if_changed();
-                        self.command_line.push_output(
-                            crate::tf!("CUIIMPORT: loaded {n} shortcut(s) from \"{path}\".")
-                                .as_ref(),
-                        );
-                    }
-                    Err(e) => self
-                        .command_line
-                        .push_error(crate::tf!("CUIIMPORT: cannot read \"{path}\": {e}").as_ref()),
-                }
+                return Some(self.import_shortcuts_file(path));
             }
 
             // ── Keyboard Shortcuts panel ──────────────────────────────────
@@ -433,6 +629,7 @@ impl OpenCADStudio {
                         "DARK LIGHT DRACULA NORD SOLARIZED_LIGHT SOLARIZED_DARK \
                          GRUVBOX_LIGHT GRUVBOX_DARK TOKYONIGHT TOKYONIGHTSTORM TOKYONIGHTLIGHT \
                          KANAGAWAWAVE KANAGAWADRAGON KANAGAWALOTUS MOONFLY NIGHTFLY OXOCARBON FERRA \
+                         FUSION_BLACK FUSION_WHITE STUDIO_DARK \
                          SYSTEM (follows the OS or browser color scheme)",
                     ));
                     return Some(Task::none());
@@ -453,7 +650,7 @@ impl OpenCADStudio {
                         self.saved_custom_palette = Some(self.ui_theme.palette);
                     }
                     let resolved = crate::app::config::resolve_system_theme();
-                    let name = format!("{resolved:?}");
+                    let name = resolved.to_string();
                     self.ui_theme.name = "System".to_string();
                     self.ui_theme.palette =
                         crate::app::config::UiThemePalette::from_iced(resolved.seed());
@@ -471,7 +668,7 @@ impl OpenCADStudio {
                     if self.ui_theme.name == "Custom" {
                         self.saved_custom_palette = Some(self.ui_theme.palette);
                     }
-                    let name = format!("{:?}", t);
+                    let name = t.to_string();
                     self.ui_theme.name = t.to_string();
                     self.ui_theme.palette = crate::app::config::UiThemePalette::from_iced(t.seed());
                     self.theme_color_inputs = self.ui_theme.palette.hex_values();
@@ -519,6 +716,166 @@ impl OpenCADStudio {
                 }
             }
 
+            // ── VPSCALE / VPLOCK — per-viewport plot scale and lock ──────
+            // A layout viewport is the only place a repeatable plot scale can
+            // live, so both commands refuse to run in model space.
+            "VPSCALE" | "-VPSCALE" => {
+                if self.tabs[i].scene.current_layout == "Model" {
+                    self.command_line
+                        .push_error(crate::t!("VPSCALE: switch to a paper layout first.").as_ref());
+                } else {
+                    use crate::command::ValuePromptCommand;
+                    let c = ValuePromptCommand::new(
+                        "VPSCALE",
+                        "VPSCALE  Enter scale (1:50, 0.02 or ? to list) <current>:",
+                    );
+                    self.command_line.push_info(&c.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(c));
+                }
+            }
+            cmd if cmd.starts_with("VPSCALE ") => {
+                let value = cmd
+                    .strip_prefix("VPSCALE")
+                    .map(|rest| rest.trim().to_string())
+                    .unwrap_or_default();
+                let scene = &self.tabs[i].scene;
+                if scene.current_layout == "Model" {
+                    self.command_line
+                        .push_error(crate::t!("VPSCALE: switch to a paper layout first.").as_ref());
+                } else {
+                    let target = scene
+                        .selected
+                        .iter()
+                        .copied()
+                        .find(|handle| {
+                            matches!(
+                                scene.document.get_entity(*handle),
+                                Some(document::EntityType::Viewport(vp)) if vp.id > 1
+                            )
+                        })
+                        .or_else(|| scene.layout_viewport_handles().into_iter().next());
+                    let Some(target) = target else {
+                        self.command_line.push_error(
+                            crate::t!("VPSCALE: no layout viewport to scale.").as_ref(),
+                        );
+                        return Some(Task::none());
+                    };
+                    if value.is_empty() || value == "?" {
+                        let report = describe_viewport_scale(&self.tabs[i].scene, target);
+                        self.command_line.push_output(&report);
+                        return Some(Task::none());
+                    }
+                    // A named scale in the drawing's own list wins; otherwise
+                    // accept a ratio (1:40), a sheet scale like the standard
+                    // ones, or a bare paper/model factor. Either goes through
+                    // the same path ZOOM nXP uses.
+                    // The picker exposes effective viewport factors, whereas
+                    // scale_ratio intentionally exposes the drawing's raw
+                    // paper/drawing units for page setups.
+                    let factor = scene
+                        .scale_list()
+                        .into_iter()
+                        .find(|(name, _, _)| name.eq_ignore_ascii_case(&value))
+                        .map(|(_, _, factor)| factor)
+                        .or_else(|| {
+                            parse_viewport_scale(&value, scene.default_scale_unit_factor())
+                        });
+                    let applied = factor
+                        .map(|factor| {
+                            self.tabs[i]
+                                .scene
+                                .set_viewport_scale_factor_for(target, factor)
+                        })
+                        .unwrap_or(false);
+                    if applied {
+                        self.push_undo_snapshot(i, "VPSCALE");
+                        self.tabs[i].dirty = true;
+                        let report = describe_viewport_scale(&self.tabs[i].scene, target);
+                        self.command_line.push_output(&report);
+                    } else {
+                        self.command_line.push_error(
+                            crate::tf!("VPSCALE: cannot apply '{value}' (locked viewport or unknown scale).")
+                                .as_ref(),
+                        );
+                    }
+                }
+            }
+
+            "VPLOCK" | "-VPLOCK" => {
+                if self.tabs[i].scene.current_layout == "Model" {
+                    self.command_line
+                        .push_error(crate::t!("VPLOCK: switch to a paper layout first.").as_ref());
+                } else {
+                    use crate::command::ValuePromptCommand;
+                    let c =
+                        ValuePromptCommand::new("VPLOCK", "VPLOCK  Enter ON/OFF/TOGGLE <toggle>:");
+                    self.command_line.push_info(&c.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(c));
+                }
+            }
+            cmd if cmd.starts_with("VPLOCK ") => {
+                let value = cmd
+                    .strip_prefix("VPLOCK")
+                    .map(|rest| rest.trim().to_ascii_uppercase())
+                    .unwrap_or_default();
+                let scene = &self.tabs[i].scene;
+                if scene.current_layout == "Model" {
+                    self.command_line
+                        .push_error(crate::t!("VPLOCK: switch to a paper layout first.").as_ref());
+                } else {
+                    let target = scene
+                        .selected
+                        .iter()
+                        .copied()
+                        .find(|handle| {
+                            matches!(
+                                scene.document.get_entity(*handle),
+                                Some(document::EntityType::Viewport(vp)) if vp.id > 1
+                            )
+                        })
+                        .or_else(|| scene.layout_viewport_handles().into_iter().next());
+                    let Some(target) = target else {
+                        self.command_line
+                            .push_error(crate::t!("VPLOCK: no layout viewport to lock.").as_ref());
+                        return Some(Task::none());
+                    };
+                    let current = matches!(
+                        scene.document.get_entity(target),
+                        Some(document::EntityType::Viewport(vp)) if vp.status.locked
+                    );
+                    let next = match value.as_str() {
+                        "" | "TOGGLE" => Some(!current),
+                        "ON" | "YES" | "1" => Some(true),
+                        "OFF" | "NO" | "0" => Some(false),
+                        "?" => None,
+                        _ => {
+                            self.command_line.push_error(
+                                crate::t!("VPLOCK: expected ON, OFF or TOGGLE.").as_ref(),
+                            );
+                            return Some(Task::none());
+                        }
+                    };
+                    if let Some(next) = next {
+                        self.push_undo_snapshot(i, "VPLOCK");
+                        if let Some(document::EntityType::Viewport(vp)) =
+                            self.tabs[i].scene.document.get_entity_mut(target)
+                        {
+                            vp.status.locked = next;
+                        }
+                        self.tabs[i].dirty = true;
+                        self.command_line.push_output(&crate::tf!(
+                            "VPLOCK: viewport display {}.",
+                            if next { "locked" } else { "unlocked" }
+                        ));
+                    } else {
+                        self.command_line.push_output(&crate::tf!(
+                            "VPLOCK: viewport is {}.",
+                            if current { "locked" } else { "unlocked" }
+                        ));
+                    }
+                }
+            }
+
             // MVSETUP — sheet border in model space, viewports on a layout.
             "MVSETUP" => {
                 let scene = &mut self.tabs[i].scene;
@@ -547,6 +904,82 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(command));
             }
 
+            // ── ALIGNSPACE — line a viewport's view up with the sheet: model
+            //    points picked inside the viewport land on paper points
+            //    picked on the sheet (#3132).
+            "ALIGNSPACE" => {
+                let scene = &self.tabs[i].scene;
+                if scene.current_layout == "Model" {
+                    self.command_line.push_error(
+                        crate::t!("ALIGNSPACE: switch to a paper layout first.").as_ref(),
+                    );
+                    return Some(Task::none());
+                }
+                let viewport = scene
+                    .active_viewport
+                    .or_else(|| {
+                        scene.selected.iter().copied().find(|handle| {
+                            matches!(
+                                scene.document.get_entity(*handle),
+                                Some(document::EntityType::Viewport(vp)) if vp.id > 1
+                            )
+                        })
+                    })
+                    .or_else(|| scene.first_user_viewport());
+                let Some(viewport) = viewport.filter(|&vp| {
+                    scene.viewport_frame(vp).is_some_and(|frame| !frame.locked)
+                }) else {
+                    self.command_line.push_error(
+                        crate::t!("ALIGNSPACE: no unlocked plan-view viewport to align.")
+                            .as_ref(),
+                    );
+                    return Some(Task::none());
+                };
+                use crate::modules::layout::alignspace::AlignSpacePointsCommand;
+                let command = AlignSpacePointsCommand::model();
+                self.command_line.push_info(&command.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(command));
+                self.alignspace_pending = Some((viewport, Vec::new()));
+                if self.tabs[i].scene.active_viewport != Some(viewport) {
+                    self.viewport_switch_keeps_command = true;
+                    return Some(Task::done(Message::EnterViewport(viewport)));
+                }
+            }
+            cmd if cmd.starts_with("ALIGNSPACE_MODEL ") || cmd.starts_with("ALIGNSPACE_PAPER ") => {
+                let points: Vec<glam::DVec2> = cmd["ALIGNSPACE_MODEL ".len()..]
+                    .split_whitespace()
+                    .filter_map(|v| v.parse::<f64>().ok())
+                    .collect::<Vec<_>>()
+                    .chunks_exact(3)
+                    .map(|p| glam::DVec2::new(p[0], p[1]))
+                    .collect();
+                let Some((viewport, model)) = self.alignspace_pending.take() else {
+                    return Some(Task::none());
+                };
+                if cmd.starts_with("ALIGNSPACE_MODEL ") {
+                    use crate::modules::layout::alignspace::AlignSpacePointsCommand;
+                    let command = AlignSpacePointsCommand::paper(points.len());
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
+                    self.alignspace_pending = Some((viewport, points));
+                    self.viewport_switch_keeps_command = true;
+                    return Some(Task::done(Message::ExitViewport));
+                }
+                if self.tabs[i]
+                    .scene
+                    .align_viewport_view(viewport, &model, &points)
+                {
+                    self.push_undo_snapshot(i, "ALIGNSPACE");
+                    self.tabs[i].dirty = true;
+                    let report = describe_viewport_scale(&self.tabs[i].scene, viewport);
+                    self.command_line.push_output(&report);
+                } else {
+                    self.command_line.push_error(
+                        crate::t!("ALIGNSPACE: the points must not coincide.").as_ref(),
+                    );
+                }
+            }
+
             // ── MSPACE / PSPACE ───────────────────────────────────────────
             "MSPACE" => {
                 return Some(Task::done(Message::MspaceCommand));
@@ -560,7 +993,7 @@ impl OpenCADStudio {
             //    Inside a viewport the selection goes to the sheet; on the
             //    sheet it goes into the model through the viewport under it.
             "CHSPACE" => {
-                let handles: Vec<codec::Handle> = self.tabs[i]
+                let handles: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .into_iter()
@@ -629,7 +1062,9 @@ impl OpenCADStudio {
                     return Some(Task::none());
                 };
                 let scene = &self.tabs[i].scene;
-                let Some(frame) = scene.active_viewport.and_then(|vp| scene.viewport_frame(vp))
+                let Some(frame) = scene
+                    .active_viewport
+                    .and_then(|vp| scene.viewport_frame(vp))
                 else {
                     self.command_line.push_error(
                         crate::t!("CHSPACE: No plan-view viewport to change space through.")
@@ -656,9 +1091,8 @@ impl OpenCADStudio {
             "VPMAX" | "-VPMAX" => {
                 let scene = &self.tabs[i].scene;
                 if scene.current_layout == "Model" {
-                    self.command_line.push_error(
-                        crate::t!("VPMAX: switch to a paper layout first.").as_ref(),
-                    );
+                    self.command_line
+                        .push_error(crate::t!("VPMAX: switch to a paper layout first.").as_ref());
                     return Some(Task::none());
                 }
                 if self.vpmax_state.is_some() {
@@ -675,22 +1109,18 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 };
-                let Some(codec::EntityType::Viewport(vp)) =
-                    scene.document.get_entity(handle)
+                let Some(document::EntityType::Viewport(vp)) = scene.document.get_entity(handle)
                 else {
                     self.command_line
                         .push_error(crate::t!("VPMAX: the active viewport is gone.").as_ref());
                     return Some(Task::none());
                 };
-                let scale = crate::scene::vp_effective_scale(
-                    vp.custom_scale,
-                    vp.view_height,
-                    vp.height,
-                );
+                let scale =
+                    crate::scene::vp_effective_scale(vp.custom_scale, vp.view_height, vp.height);
                 let saved = crate::app::VpMaxState {
                     layout: scene.current_layout.clone(),
                     handle,
-                    center: vp.center.clone(),
+                    center: vp.center,
                     width: vp.width,
                     height: vp.height,
                     view_height: vp.view_height,
@@ -702,10 +1132,10 @@ impl OpenCADStudio {
                     .unwrap_or(((0.0, 0.0), (297.0, 210.0)));
                 let (uw, uh) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
                 let (cx, cz) = (x0 + uw / 2.0, y0 + uh / 2.0);
-                if let Some(codec::EntityType::Viewport(vp)) =
+                if let Some(document::EntityType::Viewport(vp)) =
                     self.tabs[i].scene.document.get_entity_mut(handle)
                 {
-                    vp.center = codec::types::Vector3::new(cx, 0.0, cz);
+                    vp.center = document::types::Vector3::new(cx, 0.0, cz);
                     vp.width = uw;
                     vp.height = uh;
                     // Keep the paper-per-model scale: height / view_height.
@@ -741,7 +1171,7 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 }
-                let Some(codec::EntityType::Viewport(vp)) =
+                let Some(document::EntityType::Viewport(vp)) =
                     self.tabs[i].scene.document.get_entity_mut(saved.handle)
                 else {
                     self.vpmax_state = None;
@@ -790,8 +1220,9 @@ impl OpenCADStudio {
                 match sub.as_str() {
                     "SAVE" => {
                         let Some(name) = tail.first() else {
-                            self.command_line
-                                .push_error(crate::t!("VPORTS SAVE: name the configuration.").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("VPORTS SAVE: name the configuration.").as_ref(),
+                            );
                             return Some(Task::none());
                         };
                         if scene.current_layout == "Model" {
@@ -805,24 +1236,23 @@ impl OpenCADStudio {
                             .document
                             .entities()
                             .filter_map(|e| match e {
-                                codec::EntityType::Viewport(vp)
+                                document::EntityType::Viewport(vp)
                                     if vp.id > 1 && vp.common.owner_handle == layout_block =>
                                 {
-                                    Some((vp.center.x, vp.center.z, vp.width, vp.height))
+                                    Some((vp.center.x, vp.center.y, vp.width, vp.height))
                                 }
                                 _ => None,
                             })
                             .collect();
                         if rects.is_empty() {
-                            self.command_line
-                                .push_error(crate::t!("VPORTS SAVE: this layout has no viewports.").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("VPORTS SAVE: this layout has no viewports.").as_ref(),
+                            );
                             return Some(Task::none());
                         }
                         let value = rects
                             .iter()
-                            .map(|(x, z, w, h)| {
-                                format!("{x:.9},{z:.9},{w:.9},{h:.9}")
-                            })
+                            .map(|(x, y, w, h)| format!("{x:.9},{y:.9},{w:.9},{h:.9}"))
                             .collect::<Vec<_>>()
                             .join(";");
                         let key = vports_config_key(name);
@@ -905,8 +1335,9 @@ impl OpenCADStudio {
                     }
                     "DELETE" | "DEL" => {
                         let Some(name) = tail.first() else {
-                            self.command_line
-                                .push_error(crate::t!("VPORTS DELETE: name the configuration.").as_ref());
+                            self.command_line.push_error(
+                                crate::t!("VPORTS DELETE: name the configuration.").as_ref(),
+                            );
                             return Some(Task::none());
                         };
                         let key = vports_config_key(name);
@@ -921,11 +1352,7 @@ impl OpenCADStudio {
                             return Some(Task::none());
                         }
                         self.push_undo_snapshot(i, "VPORTS DELETE");
-                        crate::io::set_drawing_variable(
-                            &mut self.tabs[i].scene.document,
-                            &key,
-                            "",
-                        );
+                        crate::io::set_drawing_variable(&mut self.tabs[i].scene.document, &key, "");
                         vports_config_forget(&mut self.tabs[i].scene.document, name);
                         self.tabs[i].dirty = true;
                         self.command_line
@@ -946,16 +1373,61 @@ impl OpenCADStudio {
                     }
                     // Model space: split the tiled viewport layout via pane_grid.
                     use iced::widget::pane_grid::{Axis, Configuration as C};
-                    let split = |axis, a, b| C::Split {
+                    let split_at = |axis, ratio, a, b| C::Split {
                         axis,
-                        ratio: 0.5,
+                        ratio,
                         a: Box::new(a),
                         b: Box::new(b),
+                    };
+                    let split = |axis, a, b| split_at(axis, 0.5, a, b);
+                    // Three equal bands: a third, then half of the rest.
+                    let thirds = |axis| {
+                        split_at(
+                            axis,
+                            1.0 / 3.0,
+                            C::Pane(0),
+                            split(axis, C::Pane(1), C::Pane(2)),
+                        )
                     };
                     let config: Option<(C<usize>, usize)> = match sub.as_str() {
                         "SINGLE" | "SI" | "1" => Some((C::Pane(0), 1)),
                         "2H" | "2" => Some((split(Axis::Horizontal, C::Pane(0), C::Pane(1)), 2)),
                         "2V" => Some((split(Axis::Vertical, C::Pane(0), C::Pane(1)), 2)),
+                        // Three: the big one on the named side.
+                        "3R" | "3" => Some((
+                            split(
+                                Axis::Vertical,
+                                split(Axis::Horizontal, C::Pane(0), C::Pane(1)),
+                                C::Pane(2),
+                            ),
+                            3,
+                        )),
+                        "3L" => Some((
+                            split(
+                                Axis::Vertical,
+                                C::Pane(0),
+                                split(Axis::Horizontal, C::Pane(1), C::Pane(2)),
+                            ),
+                            3,
+                        )),
+                        "3A" => Some((
+                            split(
+                                Axis::Horizontal,
+                                C::Pane(0),
+                                split(Axis::Vertical, C::Pane(1), C::Pane(2)),
+                            ),
+                            3,
+                        )),
+                        "3B" => Some((
+                            split(
+                                Axis::Horizontal,
+                                split(Axis::Vertical, C::Pane(0), C::Pane(1)),
+                                C::Pane(2),
+                            ),
+                            3,
+                        )),
+                        "3V" => Some((thirds(Axis::Vertical), 3)),
+                        "3H" => Some((thirds(Axis::Horizontal), 3)),
                         "4" => Some((
                             split(
                                 Axis::Vertical,
@@ -986,11 +1458,11 @@ impl OpenCADStudio {
                         .document
                         .entities()
                         .filter_map(|e| {
-                            if let codec::EntityType::Viewport(vp) = e {
+                            if let document::EntityType::Viewport(vp) = e {
                                 if vp.id > 1 && vp.common.owner_handle == layout_block {
                                     Some((
                                         vp.id,
-                                        vp.center.clone(),
+                                        vp.center,
                                         vp.width,
                                         vp.height,
                                         crate::scene::vp_effective_scale(
@@ -1033,139 +1505,24 @@ impl OpenCADStudio {
                         }
                     }
                 } else {
-                    // ── Preset viewport layout ───────────────────────────
-                    let layout_name = scene.current_layout.clone();
-                    let ((x0, y0), (x1, y1)) = scene
+                    // ── Preset arrangement: new viewports in an area ─────
+                    // Asks for the area (Fit = the printable area) and adds
+                    // the viewports there; existing ones stay.
+                    use crate::modules::layout::mview::MviewCommand;
+                    let layout = scene.current_layout.clone();
+                    let paper_bounds = scene
                         .printable_area_limits()
+                        .or_else(|| scene.paper_limits())
                         .unwrap_or(((0.0, 0.0), (297.0, 210.0)));
-                    let uw = (x1 - x0).max(1.0);
-                    let uh = (y1 - y0).max(1.0);
-                    let gap = 2.0 * scene.paper_space_unit_factor();
-                    let rects: Vec<(f64, f64, f64, f64)> = match sub.as_str() {
-                        "2H" => {
-                            // Two viewports side by side (horizontal split)
-                            let vw = (uw - gap) / 2.0;
-                            vec![
-                                (x0 + vw / 2.0, y0 + uh / 2.0, vw, uh),
-                                (x0 + vw + gap + vw / 2.0, y0 + uh / 2.0, vw, uh),
-                            ]
+                    match MviewCommand::with_tiles(layout, paper_bounds, &sub) {
+                        Some(new_cmd) => {
+                            self.command_line.push_info(&new_cmd.prompt());
+                            self.tabs[i].active_cmd = Some(Box::new(new_cmd));
                         }
-                        "2V" => {
-                            // Two viewports stacked (vertical split)
-                            let vh = (uh - gap) / 2.0;
-                            vec![
-                                (x0 + uw / 2.0, y0 + vh + gap + vh / 2.0, uw, vh),
-                                (x0 + uw / 2.0, y0 + vh / 2.0, uw, vh),
-                            ]
-                        }
-                        "4" => {
-                            // Four equal viewports (2×2 grid)
-                            let vw = (uw - gap) / 2.0;
-                            let vh = (uh - gap) / 2.0;
-                            vec![
-                                (x0 + vw / 2.0, y0 + vh + gap + vh / 2.0, vw, vh),
-                                (x0 + vw + gap + vw / 2.0, y0 + vh + gap + vh / 2.0, vw, vh),
-                                (x0 + vw / 2.0, y0 + vh / 2.0, vw, vh),
-                                (x0 + vw + gap + vw / 2.0, y0 + vh / 2.0, vw, vh),
-                            ]
-                        }
-                        "SINGLE" | "1" => {
-                            // Single full-page viewport
-                            vec![(x0 + uw / 2.0, y0 + uh / 2.0, uw, uh)]
-                        }
-                        _ => {
-                            self.command_line.push_error(
-                                crate::t!(
-                                    "VPORTS: unknown option. Use VPORTS 2H | 2V | 4 | SINGLE"
-                                )
+                        None => self.command_line.push_error(
+                            crate::t!("VPORTS: unknown option. Use VPORTS 2H | 2V | 4 | SINGLE")
                                 .as_ref(),
-                            );
-                            vec![]
-                        }
-                    };
-                    if !rects.is_empty() {
-                        // Remove existing user viewports in this layout first.
-                        let layout_block = self.tabs[i].scene.current_layout_block_handle_pub();
-                        let to_erase: Vec<codec::Handle> = self.tabs[i]
-                            .scene
-                            .document
-                            .entities()
-                            .filter_map(|e| {
-                                if let codec::EntityType::Viewport(vp) = e {
-                                    if vp.id > 1 && vp.common.owner_handle == layout_block {
-                                        Some(vp.common.handle)
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        if to_erase
-                            .iter()
-                            .any(|handle| self.tabs[i].scene.is_layer_locked(*handle))
-                        {
-                            self.command_line.push_error(
-                                crate::t!("VPORTS: unlock existing viewport layers first.")
-                                    .as_ref(),
-                            );
-                            return Some(Task::none());
-                        }
-                        self.push_undo_snapshot(i, "VPORTS");
-                        self.tabs[i].scene.erase_entities(&to_erase);
-                        // Create new viewports.
-                        for (cx, cz, w, h) in &rects {
-                            let mut vp = codec::entities::Viewport::new();
-                            vp.center = codec::types::Vector3::new(*cx, 0.0, *cz);
-                            vp.width = *w;
-                            vp.height = *h;
-                            vp.id = 2; // commit_entity will assign unique IDs
-                            match self.tabs[i].scene.document.add_entity_to_layout(
-                                codec::EntityType::Viewport(Box::new(vp)),
-                                &layout_name,
-                            ) {
-                                Ok(handle) => {
-                                    self.tabs[i].scene.auto_fit_viewport(handle);
-                                }
-                                Err(e) => {
-                                    self.command_line
-                                        .push_error(crate::tf!("VPORTS: {e}").as_ref());
-                                }
-                            }
-                        }
-                        // Re-assign unique IDs (1 + existing max per viewport).
-                        let layout_block2 = self.tabs[i].scene.current_layout_block_handle_pub();
-                        let mut id_counter = 2_i16;
-                        let handles: Vec<codec::Handle> = self.tabs[i]
-                            .scene
-                            .document
-                            .entities()
-                            .filter_map(|e| {
-                                if let codec::EntityType::Viewport(vp) = e {
-                                    if vp.id >= 2 && vp.common.owner_handle == layout_block2 {
-                                        Some(vp.common.handle)
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        for h in handles {
-                            if let Some(codec::EntityType::Viewport(vp)) =
-                                self.tabs[i].scene.document.get_entity_mut(h)
-                            {
-                                vp.id = id_counter;
-                                id_counter += 1;
-                            }
-                        }
-                        self.tabs[i].dirty = true;
-                        let n = self.apply_viewport_rects(i, &rects, &sub);
-                        self.command_line.push_output(
-                            crate::tf!("VPORTS: created {n} viewport(s) [{}].", sub).as_ref(),
-                        );
+                        ),
                     }
                 }
             }
@@ -1186,7 +1543,7 @@ impl OpenCADStudio {
                     let vp_handle = scene.active_viewport.unwrap();
                     // Collect current frozen layer names for display.
                     let frozen_names: Vec<String> = {
-                        if let Some(codec::EntityType::Viewport(vp)) =
+                        if let Some(document::EntityType::Viewport(vp)) =
                             scene.document.get_entity(vp_handle)
                         {
                             vp.frozen_layers
@@ -1226,7 +1583,7 @@ impl OpenCADStudio {
             "TEXTTOFRONT" | "TEXTTOBACK" => {
                 let to_front = cmd.ends_with("FRONT");
                 let block_handle = self.tabs[i].scene.interaction_block_handle();
-                let handles: rustc_hash::FxHashSet<codec::Handle> = self.tabs[i]
+                let handles: rustc_hash::FxHashSet<document::Handle> = self.tabs[i]
                     .scene
                     .document
                     .entities()
@@ -1235,9 +1592,9 @@ impl OpenCADStudio {
                         (c.owner_handle == block_handle || c.owner_handle.is_null())
                             && matches!(
                                 e,
-                                codec::EntityType::Text(_)
-                                    | codec::EntityType::MText(_)
-                                    | codec::EntityType::Dimension(_)
+                                document::EntityType::Text(_)
+                                    | document::EntityType::MText(_)
+                                    | document::EntityType::Dimension(_)
                             )
                     })
                     .map(|e| e.common().handle)
@@ -1260,7 +1617,7 @@ impl OpenCADStudio {
 
             // HATCHTOBACK ÔÇö move every hatch object in the active space to the back of the draw order.
             "HATCHTOBACK" => {
-                use codec::objects::ObjectType;
+                use document::objects::ObjectType;
                 let block_handle = self.tabs[i].scene.interaction_block_handle();
                 let doc_ref = &self.tabs[i].scene.document;
 
@@ -1291,7 +1648,7 @@ impl OpenCADStudio {
                 let has_locked_layers = !locked_layers.is_empty();
 
                 // 3. Single pass over entities in the active space.
-                let mut hatches_to_move: Vec<codec::Handle> = Vec::new();
+                let mut hatches_to_move: Vec<document::Handle> = Vec::new();
                 let mut min_eff = u64::MAX;
 
                 for e in doc_ref.entities() {
@@ -1300,7 +1657,7 @@ impl OpenCADStudio {
                         continue;
                     }
                     let hv = c.handle.value();
-                    if matches!(e, codec::EntityType::Hatch(_)) {
+                    if matches!(e, document::EntityType::Hatch(_)) {
                         if !has_locked_layers || !locked_layers.contains(c.layer.as_str()) {
                             hatches_to_move.push(c.handle);
                         }
@@ -1343,7 +1700,7 @@ impl OpenCADStudio {
                     self.tabs[i].scene.document.objects.get_mut(&th)
                 {
                     for (h, sort) in &assigns {
-                        table.add_entry(*h, codec::Handle::new(*sort));
+                        table.add_entry(*h, document::Handle::new(*sort));
                     }
                 }
 
@@ -1352,7 +1709,7 @@ impl OpenCADStudio {
                 }
 
                 // 6. Invalidate ONLY draw-depth cache without dropping whole-drawing tessellations or spatial indexes.
-                let changes: Vec<(codec::Handle, crate::scene::ChangeKind)> = hatches_to_move
+                let changes: Vec<(document::Handle, crate::scene::ChangeKind)> = hatches_to_move
                     .iter()
                     .map(|h| (*h, crate::scene::ChangeKind::Modified))
                     .collect();
@@ -1372,7 +1729,7 @@ impl OpenCADStudio {
             }
 
             "DRAWORDER_FRONT" | "DRAWORDER_BACK" | "DRAWORDER_ABOVE" | "DRAWORDER_UNDER" => {
-                let selected: Vec<codec::Handle> = self.tabs[i]
+                let selected: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
@@ -1401,7 +1758,7 @@ impl OpenCADStudio {
                 }
             }
             "DRAWORDER" => {
-                let selected: Vec<codec::Handle> = self.tabs[i]
+                let selected: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
@@ -1412,11 +1769,10 @@ impl OpenCADStudio {
                 self.tabs[i].active_cmd = Some(Box::new(c));
             }
             cmd if cmd.starts_with("DRAWORDER ") => {
-                use codec::objects::ObjectType;
                 let parts: Vec<&str> = cmd.split_whitespace().collect();
                 let option = parts.get(1).unwrap_or(&"").to_uppercase();
                 let i = self.active_tab;
-                let selected: Vec<codec::Handle> = self.tabs[i]
+                let selected: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
@@ -1441,122 +1797,38 @@ impl OpenCADStudio {
                                 16,
                             )
                             .ok()
-                            .map(codec::Handle::new)
+                            .map(document::Handle::new)
                         })
                         .filter(|handle| !selected.contains(handle))
                         .collect();
-                    let relative_assignments = relative_above.and_then(|above| {
-                        assign_relative_group_keys(
-                            &self.tabs[i].scene.document,
-                            self.tabs[i].scene.interaction_block_handle(),
-                            &selected,
-                            &references,
-                            above,
-                        )
-                    });
                     let to_front_opt = match option.as_str() {
                         "F" | "FRONT" => Some(true),
                         "B" | "BACK" => Some(false),
                         _ => None,
                     };
 
-                    if relative_assignments.is_some() || to_front_opt.is_some() {
+                    let relative = relative_above.map(|above| (above, references.as_slice()));
+                    let applicable = to_front_opt.is_some()
+                        || relative.is_some_and(|(above, references)| {
+                            assign_relative_group_keys(
+                                &self.tabs[i].scene.document,
+                                self.tabs[i].scene.interaction_block_handle(),
+                                &selected,
+                                references,
+                                above,
+                            )
+                            .is_some()
+                        });
+                    if applicable {
                         self.push_undo_snapshot(i, "DRAWORDER");
-                        let block_handle = self.tabs[i].scene.interaction_block_handle();
-
-                        // For FRONT/BACK, anchor the new sort handle to the
-                        // block's current effective draw-order range so the moved
-                        // entities land strictly above/below every sibling —
-                        // including ones not yet in the table, which sort by
-                        // their own handle. (min_eff, max_eff) over siblings.
-                        let mut back_assigns: Option<Vec<(codec::Handle, u64)>> = None;
-                        let fb_baseline: Option<(u64, u64)> = if to_front_opt.is_some() {
-                            let selected_set: rustc_hash::FxHashSet<u64> =
-                                selected.iter().map(|h| h.value()).collect();
-                            let doc_ref = &self.tabs[i].scene.document;
-                            let overrides: rustc_hash::FxHashMap<u64, u64> = doc_ref
-                                .objects
-                                .values()
-                                .find_map(|obj| {
-                                    if let ObjectType::SortEntitiesTable(t) = obj {
-                                        if t.block_owner_handle == block_handle {
-                                            return Some(
-                                                t.entries()
-                                                    .map(|e| {
-                                                        (
-                                                            e.entity_handle.value(),
-                                                            e.sort_handle.value(),
-                                                        )
-                                                    })
-                                                    .collect(),
-                                            );
-                                        }
-                                    }
-                                    None
-                                })
-                                .unwrap_or_default();
-                            let mut max_eff = 0u64;
-                            let mut min_eff = u64::MAX;
-                            for e in doc_ref.entities() {
-                                let c = e.common();
-                                let hv = c.handle.value();
-                                if selected_set.contains(&hv) {
-                                    continue;
-                                }
-                                if c.owner_handle != block_handle && !c.owner_handle.is_null() {
-                                    continue;
-                                }
-                                let eff = overrides.get(&hv).copied().unwrap_or(hv);
-                                max_eff = max_eff.max(eff);
-                                min_eff = min_eff.min(eff);
-                            }
-                            if min_eff == u64::MAX {
-                                min_eff = 1;
-                            }
-                            if to_front_opt == Some(false) {
-                                // Same exhausted-floor handling as HATCHTOBACK:
-                                // never clamp the group onto tied keys.
-                                let locked_layers: rustc_hash::FxHashSet<&str> = doc_ref
-                                    .layers
-                                    .iter()
-                                    .filter(|l| l.is_locked())
-                                    .map(|l| l.name.as_str())
-                                    .collect();
-                                back_assigns = Some(assign_back_group_keys(
-                                    doc_ref,
-                                    block_handle,
-                                    &selected,
-                                    min_eff,
-                                    Some(&overrides),
-                                    &locked_layers,
-                                ));
-                            }
-                            Some((min_eff, max_eff))
-                        } else {
-                            None
-                        };
-
-                        let doc = &mut self.tabs[i].scene.document;
-                        let th = ensure_draw_order_table(doc, block_handle);
-                        if let Some(ObjectType::SortEntitiesTable(table)) = doc.objects.get_mut(&th)
-                        {
-                            if let Some(assignments) = &relative_assignments {
-                                for (handle, sort) in assignments {
-                                    table.add_entry(*handle, codec::Handle::new(*sort));
-                                }
-                                self.command_line.push_info(crate::t!("DRAWORDER: selection reordered relative to reference objects.").as_ref());
-                            } else if let Some(to_front) = to_front_opt {
-                                if to_front {
-                                    let (_, max_eff) = fb_baseline.unwrap_or((1, 0));
-                                    for (k, h) in selected.iter().enumerate() {
-                                        let sort = max_eff.saturating_add(1 + k as u64);
-                                        table.add_entry(*h, codec::Handle::new(sort));
-                                    }
-                                } else if let Some(assigns) = &back_assigns {
-                                    for (h, sort) in assigns {
-                                        table.add_entry(*h, codec::Handle::new(*sort));
-                                    }
-                                }
+                        match self.apply_draw_order(i, &selected, to_front_opt, relative) {
+                            Some(None) => self.command_line.push_info(
+                                crate::t!(
+                                    "DRAWORDER: selection reordered relative to reference objects."
+                                )
+                                .as_ref(),
+                            ),
+                            Some(Some(to_front)) => {
                                 let dir = if to_front { "front" } else { "back" };
                                 self.command_line.push_info(
                                     crate::tf!(
@@ -1567,15 +1839,8 @@ impl OpenCADStudio {
                                     .as_ref(),
                                 );
                             }
+                            None => {}
                         }
-                        // Sort order lives in SortEntitiesTable, which the
-                        // render-side `sort_cache` rebuilds per geometry epoch.
-                        // Bump it so the new draw order shows immediately
-                        // instead of waiting for an unrelated geometry change.
-                        // Draw order changes submission order only; all
-                        // per-entity tessellation remains valid.
-                        self.tabs[i].scene.bump_geometry_no_blocks();
-                        self.tabs[i].dirty = true;
                     } else {
                         self.command_line.push_info(
                             crate::t!("Usage: DRAWORDER F|FRONT | B|BACK | A|ABOVE <handle> | U|UNDER <handle>").as_ref()
@@ -1587,11 +1852,11 @@ impl OpenCADStudio {
             // SYNCPVIEWPORTS — copy the first selected viewport's display settings
             // (view direction/target, scale, snap/grid, frozen layers) to the rest.
             "SYNCPVIEWPORTS" | "VPSYNC" => {
-                let vps: Vec<codec::Handle> = self.tabs[i]
+                let vps: Vec<document::Handle> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
-                    .filter(|(_, e)| matches!(e, codec::EntityType::Viewport(_)))
+                    .filter(|(_, e)| matches!(e, document::EntityType::Viewport(_)))
                     .map(|(h, _)| *h)
                     .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
                     .collect();
@@ -1602,7 +1867,7 @@ impl OpenCADStudio {
                     return Some(Task::none());
                 }
                 let src = match self.tabs[i].scene.document.get_entity(vps[0]) {
-                    Some(codec::EntityType::Viewport(vp)) => vp.clone(),
+                    Some(document::EntityType::Viewport(vp)) => vp.clone(),
                     _ => {
                         self.command_line.push_error(
                             crate::t!("SYNCPVIEWPORTS: master is not a viewport.").as_ref(),
@@ -1613,7 +1878,7 @@ impl OpenCADStudio {
                 self.push_undo_snapshot(i, "SYNCPVIEWPORTS");
                 let mut n = 0usize;
                 for h in &vps[1..] {
-                    if let Some(codec::EntityType::Viewport(vp)) =
+                    if let Some(document::EntityType::Viewport(vp)) =
                         self.tabs[i].scene.document.get_entity_mut(*h)
                     {
                         vp.view_direction = src.view_direction;
@@ -1637,7 +1902,7 @@ impl OpenCADStudio {
             // HIDE — hidden-line view of the active viewport.
             "HIDE" => {
                 return Some(Task::done(Message::SetRenderMode(
-                    codec::entities::ViewportRenderMode::HiddenLine,
+                    document::entities::ViewportRenderMode::HiddenLine,
                 )));
             }
 
@@ -1671,12 +1936,12 @@ impl OpenCADStudio {
     ) -> usize {
         let layout_name = self.tabs[i].scene.current_layout.clone();
         let layout_block = self.tabs[i].scene.current_layout_block_handle_pub();
-        let to_erase: Vec<codec::Handle> = self.tabs[i]
+        let to_erase: Vec<document::Handle> = self.tabs[i]
             .scene
             .document
             .entities()
             .filter_map(|e| match e {
-                codec::EntityType::Viewport(vp)
+                document::EntityType::Viewport(vp)
                     if vp.id > 1 && vp.common.owner_handle == layout_block =>
                 {
                     Some(vp.common.handle)
@@ -1688,24 +1953,26 @@ impl OpenCADStudio {
             .iter()
             .any(|handle| self.tabs[i].scene.is_layer_locked(*handle))
         {
-            self.command_line.push_error(
-                crate::t!("VPORTS: unlock existing viewport layers first.").as_ref(),
-            );
+            self.command_line
+                .push_error(crate::t!("VPORTS: unlock existing viewport layers first.").as_ref());
             return 0;
         }
         self.push_undo_snapshot(i, label);
         self.tabs[i].scene.erase_entities(&to_erase);
+        let layer = self.new_variable_layer(i, "VIEWPORTLAYER");
         let mut created = 0usize;
-        for (cx, cz, w, h) in rects {
-            let mut vp = codec::entities::Viewport::new();
-            vp.center = codec::types::Vector3::new(*cx, 0.0, *cz);
+        for (cx, cy, w, h) in rects {
+            let mut vp = document::entities::Viewport::new();
+            vp.common.layer = layer.clone();
+            vp.center = document::types::Vector3::new(*cx, *cy, 0.0);
             vp.width = *w;
             vp.height = *h;
             vp.id = 2; // re-numbered below
-            match self.tabs[i].scene.document.add_entity_to_layout(
-                codec::EntityType::Viewport(Box::new(vp)),
-                &layout_name,
-            ) {
+            match self.tabs[i]
+                .scene
+                .document
+                .add_entity_to_layout(document::EntityType::Viewport(Box::new(vp)), &layout_name)
+            {
                 Ok(handle) => {
                     self.tabs[i].scene.auto_fit_viewport(handle);
                     created += 1;
@@ -1718,12 +1985,12 @@ impl OpenCADStudio {
         }
         let layout_block = self.tabs[i].scene.current_layout_block_handle_pub();
         let mut id_counter = 2_i16;
-        let handles: Vec<codec::Handle> = self.tabs[i]
+        let handles: Vec<document::Handle> = self.tabs[i]
             .scene
             .document
             .entities()
             .filter_map(|e| match e {
-                codec::EntityType::Viewport(vp)
+                document::EntityType::Viewport(vp)
                     if vp.id >= 2 && vp.common.owner_handle == layout_block =>
                 {
                     Some(vp.common.handle)
@@ -1732,7 +1999,7 @@ impl OpenCADStudio {
             })
             .collect();
         for h in handles {
-            if let Some(codec::EntityType::Viewport(vp)) =
+            if let Some(document::EntityType::Viewport(vp)) =
                 self.tabs[i].scene.document.get_entity_mut(h)
             {
                 vp.id = id_counter;
@@ -1752,7 +2019,7 @@ fn vports_config_key(name: &str) -> String {
     format!("VPORTSCONFIG:{}", name.trim().to_uppercase())
 }
 
-fn vports_config_names(doc: &codec::Document) -> Vec<String> {
+fn vports_config_names(doc: &document::Document) -> Vec<String> {
     crate::io::drawing_variable(doc, VPORTSCONFIG_INDEX)
         .map(|value| {
             value
@@ -1765,7 +2032,7 @@ fn vports_config_names(doc: &codec::Document) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn vports_config_remember(doc: &mut codec::Document, name: &str) {
+fn vports_config_remember(doc: &mut document::Document, name: &str) {
     let mut names = vports_config_names(doc);
     if names.iter().any(|n| n.eq_ignore_ascii_case(name.trim())) {
         return;
@@ -1774,7 +2041,7 @@ fn vports_config_remember(doc: &mut codec::Document, name: &str) {
     crate::io::set_drawing_variable(doc, VPORTSCONFIG_INDEX, &names.join("\n"));
 }
 
-fn vports_config_forget(doc: &mut codec::Document, name: &str) {
+fn vports_config_forget(doc: &mut document::Document, name: &str) {
     let names: Vec<String> = vports_config_names(doc)
         .into_iter()
         .filter(|n| !n.eq_ignore_ascii_case(name.trim()))
@@ -1793,7 +2060,8 @@ fn viewport_scale_text(scale: f64) -> String {
     }
 }
 
-fn parse_vport_rects(value: &str) -> Vec<(f64, f64, f64, f64)> {    value
+fn parse_vport_rects(value: &str) -> Vec<(f64, f64, f64, f64)> {
+    value
         .split(';')
         .filter_map(|entry| {
             let mut parts = entry.split(',');
@@ -1806,6 +2074,56 @@ fn parse_vport_rects(value: &str) -> Vec<(f64, f64, f64, f64)> {    value
             (rect.2 > 0.0 && rect.3 > 0.0).then_some(rect)
         })
         .collect()
+}
+
+/// Parse a `VPSCALE` value into a paper-to-model factor (paper units per
+/// model unit). Accepts ratios (`1:50`, `2:1`) and bare factors (`0.02`).
+///
+/// A ratio is a sheet scale, like the standard scales of the list: it is
+/// converted with `sheet_unit`, the paper units in one drawing unit
+/// ([`crate::scene::Scene::default_scale_unit_factor`]). Left raw, a metre
+/// drawing's 1:40 came out a thousand times away from its 1:50. A bare number
+/// is the factor itself, as `ZOOM nXP` takes it.
+fn parse_viewport_scale(value: &str, sheet_unit: f64) -> Option<f64> {
+    let text = value.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("?") {
+        return None;
+    }
+    if let Some((paper, drawing)) = crate::scene::Scene::parse_scale_name_ratio(text) {
+        if paper > 0.0 && drawing > 0.0 {
+            let factor = paper / drawing * sheet_unit;
+            if factor.is_finite() && factor > 0.0 {
+                return Some(factor);
+            }
+        }
+    }
+    let factor = text.parse::<f64>().ok()?;
+    if factor.is_finite() && factor > 0.0 {
+        Some(factor)
+    } else {
+        None
+    }
+}
+
+/// Human-facing report of the scale a viewport is currently displaying at.
+fn describe_viewport_scale(scene: &crate::scene::Scene, handle: document::Handle) -> String {
+    let Some(factor) = scene.viewport_effective_scale(handle) else {
+        return crate::t!("VPSCALE: the viewport is gone.").to_string();
+    };
+    let named = scene
+        .scale_list()
+        .into_iter()
+        .min_by(|a, b| {
+            (a.2 - factor)
+                .abs()
+                .partial_cmp(&(b.2 - factor).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _, _)| name);
+    let at = named
+        .map(|name| format!("{name} ({})", viewport_scale_text(factor)))
+        .unwrap_or_else(|| format!("custom {}", viewport_scale_text(factor)));
+    crate::tf!("VPSCALE: viewport at {at}.").to_string()
 }
 
 // ── Draw Order: interactive command ──────────────────────────
@@ -1828,13 +2146,13 @@ enum DrawOrderStep {
 /// 3. Gather reference objects, excluding the moved selection; Enter applies.
 ///    Typed hexadecimal handles may also be accumulated before confirming.
 pub(crate) struct DrawOrderCommand {
-    selected: Vec<codec::Handle>,
+    selected: Vec<document::Handle>,
     step: DrawOrderStep,
-    references: Vec<codec::Handle>,
+    references: Vec<document::Handle>,
 }
 
 impl DrawOrderCommand {
-    pub(crate) fn new(selected: Vec<codec::Handle>) -> Self {
+    pub(crate) fn new(selected: Vec<document::Handle>) -> Self {
         let step = if selected.is_empty() {
             DrawOrderStep::SelectObjects
         } else {
@@ -1847,7 +2165,7 @@ impl DrawOrderCommand {
         }
     }
 
-    pub(crate) fn for_reference_pick(selected: Vec<codec::Handle>, above: bool) -> Self {
+    pub(crate) fn for_reference_pick(selected: Vec<document::Handle>, above: bool) -> Self {
         Self {
             selected,
             step: DrawOrderStep::PickReference { above },
@@ -1908,7 +2226,10 @@ impl CadCommand for DrawOrderCommand {
         )
     }
 
-    fn on_selection_complete(&mut self, handles: Vec<codec::Handle>) -> crate::command::CmdResult {
+    fn on_selection_complete(
+        &mut self,
+        handles: Vec<document::Handle>,
+    ) -> crate::command::CmdResult {
         if matches!(self.step, DrawOrderStep::PickReference { .. }) {
             self.references = handles
                 .into_iter()
@@ -1993,7 +2314,7 @@ impl CadCommand for DrawOrderCommand {
                 for text in t.split_whitespace() {
                     let hex = text.trim_start_matches("0x").trim_start_matches("0X");
                     if let Ok(value) = u64::from_str_radix(hex, 16) {
-                        let handle = codec::Handle::new(value);
+                        let handle = document::Handle::new(value);
                         if !handle.is_null()
                             && !self.selected.contains(&handle)
                             && !self.references.contains(&handle)
@@ -2009,7 +2330,7 @@ impl CadCommand for DrawOrderCommand {
 
     fn on_entity_pick(
         &mut self,
-        handle: codec::Handle,
+        handle: document::Handle,
         _pt: glam::DVec3,
     ) -> crate::command::CmdResult {
         if matches!(self.step, DrawOrderStep::PickReference { .. })
@@ -2026,16 +2347,154 @@ impl CadCommand for DrawOrderCommand {
     }
 }
 
+impl OpenCADStudio {
+    /// Put `selected` in front of or behind everything in its space
+    /// (`to_front`), or above / under `relative`'s reference objects. The
+    /// order is written to the space's sort table. `Some(None)`: reordered
+    /// relative to the references; `Some(Some(front))`: moved to the front
+    /// or back; `None`: nothing changed.
+    pub(in crate::app) fn apply_draw_order(
+        &mut self,
+        i: usize,
+        selected: &[document::Handle],
+        to_front_opt: Option<bool>,
+        relative: Option<(bool, &[document::Handle])>,
+    ) -> Option<Option<bool>> {
+        use document::objects::ObjectType;
+        let selected: Vec<document::Handle> = selected.to_vec();
+        let relative_assignments = relative.and_then(|(above, references)| {
+            assign_relative_group_keys(
+                &self.tabs[i].scene.document,
+                self.tabs[i].scene.interaction_block_handle(),
+                &selected,
+                references,
+                above,
+            )
+        });
+        let to_front_opt = if relative_assignments.is_some() {
+            None
+        } else {
+            to_front_opt
+        };
+        if relative_assignments.is_none() && to_front_opt.is_none() {
+            return None;
+        }
+        let mut reordered = None;
+
+        let block_handle = self.tabs[i].scene.interaction_block_handle();
+
+        // For FRONT/BACK, anchor the new sort handle to the
+        // block's current effective draw-order range so the moved
+        // entities land strictly above/below every sibling —
+        // including ones not yet in the table, which sort by
+        // their own handle. (min_eff, max_eff) over siblings.
+        let mut back_assigns: Option<Vec<(document::Handle, u64)>> = None;
+        let fb_baseline: Option<(u64, u64)> = if to_front_opt.is_some() {
+            let selected_set: rustc_hash::FxHashSet<u64> =
+                selected.iter().map(|h| h.value()).collect();
+            let doc_ref = &self.tabs[i].scene.document;
+            let overrides: rustc_hash::FxHashMap<u64, u64> = doc_ref
+                .objects
+                .values()
+                .find_map(|obj| {
+                    if let ObjectType::SortEntitiesTable(t) = obj {
+                        if t.block_owner_handle == block_handle {
+                            return Some(
+                                t.entries()
+                                    .map(|e| (e.entity_handle.value(), e.sort_handle.value()))
+                                    .collect(),
+                            );
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_default();
+            let mut max_eff = 0u64;
+            let mut min_eff = u64::MAX;
+            for e in doc_ref.entities() {
+                let c = e.common();
+                let hv = c.handle.value();
+                if selected_set.contains(&hv) {
+                    continue;
+                }
+                if c.owner_handle != block_handle && !c.owner_handle.is_null() {
+                    continue;
+                }
+                let eff = overrides.get(&hv).copied().unwrap_or(hv);
+                max_eff = max_eff.max(eff);
+                min_eff = min_eff.min(eff);
+            }
+            if min_eff == u64::MAX {
+                min_eff = 1;
+            }
+            if to_front_opt == Some(false) {
+                // Same exhausted-floor handling as HATCHTOBACK:
+                // never clamp the group onto tied keys.
+                let locked_layers: rustc_hash::FxHashSet<&str> = doc_ref
+                    .layers
+                    .iter()
+                    .filter(|l| l.is_locked())
+                    .map(|l| l.name.as_str())
+                    .collect();
+                back_assigns = Some(assign_back_group_keys(
+                    doc_ref,
+                    block_handle,
+                    &selected,
+                    min_eff,
+                    Some(&overrides),
+                    &locked_layers,
+                ));
+            }
+            Some((min_eff, max_eff))
+        } else {
+            None
+        };
+
+        let doc = &mut self.tabs[i].scene.document;
+        let th = ensure_draw_order_table(doc, block_handle);
+        if let Some(ObjectType::SortEntitiesTable(table)) = doc.objects.get_mut(&th) {
+            if let Some(assignments) = &relative_assignments {
+                for (handle, sort) in assignments {
+                    table.add_entry(*handle, document::Handle::new(*sort));
+                }
+                reordered = Some(None);
+            } else if let Some(to_front) = to_front_opt {
+                if to_front {
+                    let (_, max_eff) = fb_baseline.unwrap_or((1, 0));
+                    for (k, h) in selected.iter().enumerate() {
+                        let sort = max_eff.saturating_add(1 + k as u64);
+                        table.add_entry(*h, document::Handle::new(sort));
+                    }
+                } else if let Some(assigns) = &back_assigns {
+                    for (h, sort) in assigns {
+                        table.add_entry(*h, document::Handle::new(*sort));
+                    }
+                }
+                reordered = Some(Some(to_front));
+            }
+        }
+        // Sort order lives in SortEntitiesTable, which the
+        // render-side `sort_cache` rebuilds per geometry epoch.
+        // Bump it so the new draw order shows immediately
+        // instead of waiting for an unrelated geometry change.
+        // Draw order changes submission order only; all
+        // per-entity tessellation remains valid.
+        self.tabs[i].scene.bump_geometry_no_blocks();
+        self.tabs[i].dirty = true;
+        reordered
+    }
+}
+
 /// Insert the selected block next to the extremal reference in effective draw
 /// order. Renumber the ordered siblings to avoid ties or saturated sort keys.
 fn assign_relative_group_keys(
-    document: &codec::Document,
-    block: codec::Handle,
-    selected: &[codec::Handle],
-    references: &[codec::Handle],
+    document: &document::Document,
+    block: document::Handle,
+    selected: &[document::Handle],
+    references: &[document::Handle],
     above: bool,
-) -> Option<Vec<(codec::Handle, u64)>> {
-    use codec::objects::ObjectType;
+) -> Option<Vec<(document::Handle, u64)>> {
+    use document::objects::ObjectType;
     let overrides: std::collections::HashMap<_, _> = document
         .objects
         .values()
@@ -2110,15 +2569,15 @@ fn assign_relative_group_keys(
 /// shifted by `n` so lifted siblings keep their relative order. Locked-layer
 /// entities are never moved or lifted.
 fn assign_back_group_keys(
-    doc: &codec::Document,
-    block_handle: codec::Handle,
-    group: &[codec::Handle],
+    doc: &document::Document,
+    block_handle: document::Handle,
+    group: &[document::Handle],
     floor: u64,
     overrides: Option<&rustc_hash::FxHashMap<u64, u64>>,
     locked_layers: &rustc_hash::FxHashSet<&str>,
-) -> Vec<(codec::Handle, u64)> {
+) -> Vec<(document::Handle, u64)> {
     let n = group.len() as u64;
-    let mut out: Vec<(codec::Handle, u64)> = Vec::with_capacity(group.len());
+    let mut out: Vec<(document::Handle, u64)> = Vec::with_capacity(group.len());
     if n == 0 {
         return out;
     }
@@ -2133,7 +2592,7 @@ fn assign_back_group_keys(
     }
     let moved: rustc_hash::FxHashSet<u64> = group.iter().map(|h| h.value()).collect();
     let has_locked = !locked_layers.is_empty();
-    let mut lifts: Vec<(codec::Handle, u64)> = Vec::new();
+    let mut lifts: Vec<(document::Handle, u64)> = Vec::new();
     for e in doc.entities() {
         let c = e.common();
         if c.owner_handle != block_handle && !c.owner_handle.is_null() {
@@ -2159,8 +2618,8 @@ fn assign_back_group_keys(
 mod tests {
     use super::*;
     use crate::app::OpenCADStudio;
-    use codec::objects::ObjectType;
-    use codec::EntityType;
+    use document::objects::ObjectType;
+    use document::EntityType;
 
     fn fresh_app() -> OpenCADStudio {
         let mut app = OpenCADStudio::new_for_test();
@@ -2310,7 +2769,7 @@ mod tests {
     fn hatchtoback_ignores_hatches_in_other_spaces() {
         let mut app = fresh_app();
         let i = app.active_tab;
-        let other_block = codec::Handle::new(0x9999);
+        let other_block = document::Handle::new(0x9999);
         let h_foreign = app.tabs[i]
             .scene
             .add_entity_clone(EntityType::Hatch(Default::default()));
@@ -2472,7 +2931,7 @@ mod tests {
             layer.flags.locked = true;
         }
 
-        let mut locked_hatch = codec::entities::Hatch::default();
+        let mut locked_hatch = document::entities::Hatch::default();
         locked_hatch.common.layer = "LOCKED_LAYER".into();
         let h_locked_hatch = app.tabs[i]
             .scene
@@ -2616,12 +3075,12 @@ mod tests {
         // Pin the line to sort key 2: only ONE slot below the floor exists,
         // but three hatches need to fit behind it.
         {
-            use codec::objects::{ObjectType, SortEntitiesTable};
+            use document::objects::{ObjectType, SortEntitiesTable};
             let doc = &mut app.tabs[i].scene.document;
-            let nh = codec::Handle::new(doc.next_handle());
+            let nh = document::Handle::new(doc.next_handle());
             let mut table = SortEntitiesTable::for_block(block_handle);
             table.handle = nh;
-            table.add_entry(h_line, codec::Handle::new(2));
+            table.add_entry(h_line, document::Handle::new(2));
             doc.objects.insert(nh, ObjectType::SortEntitiesTable(table));
         }
 
@@ -2741,7 +3200,7 @@ mod tests {
         let model = app.tabs[i].scene.model_space_block_handle();
         app.tabs[i].scene.document.add_layout("Sheet").unwrap();
         app.tabs[i].scene.set_current_layout("Sheet".into());
-        let mut viewport = codec::entities::Viewport::new();
+        let mut viewport = document::entities::Viewport::new();
         viewport.id = 2;
         viewport.turn_on();
         let viewport = app.tabs[i]
@@ -2768,7 +3227,7 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default();
-        let key = |h: codec::Handle| order.get(&h.value()).copied().unwrap_or(h.value());
+        let key = |h: document::Handle| order.get(&h.value()).copied().unwrap_or(h.value());
         assert!(
             key(h_moved) < key(h_under),
             "the moved line must sort behind the other model line: {order:?}"
@@ -2843,12 +3302,12 @@ mod tests {
             .add_entity_clone(EntityType::Line(Default::default()));
 
         {
-            use codec::objects::{ObjectType, SortEntitiesTable};
+            use document::objects::{ObjectType, SortEntitiesTable};
             let doc = &mut app.tabs[i].scene.document;
-            let nh = codec::Handle::new(doc.next_handle());
+            let nh = document::Handle::new(doc.next_handle());
             let mut table = SortEntitiesTable::for_block(block_handle);
             table.handle = nh;
-            table.add_entry(h_pinned, codec::Handle::new(2));
+            table.add_entry(h_pinned, document::Handle::new(2));
             doc.objects.insert(nh, ObjectType::SortEntitiesTable(table));
         }
 
@@ -3069,7 +3528,7 @@ mod tests {
 
     #[test]
     fn draw_order_table_reattaches_orphan_and_advances_object_handles() {
-        use codec::objects::SortEntitiesTable;
+        use document::objects::SortEntitiesTable;
 
         let mut app = fresh_app();
         let i = app.active_tab;
@@ -3077,10 +3536,10 @@ mod tests {
         let entity = app.tabs[i]
             .scene
             .add_entity_clone(EntityType::Line(Default::default()));
-        let orphan_handle = codec::Handle::new(0x10_0000);
+        let orphan_handle = document::Handle::new(0x10_0000);
         let mut orphan = SortEntitiesTable::for_block(block);
         orphan.handle = orphan_handle;
-        orphan.add_entry(entity, codec::Handle::new(7));
+        orphan.add_entry(entity, document::Handle::new(7));
         app.tabs[i]
             .scene
             .document
@@ -3542,7 +4001,7 @@ impl OpenCADStudio {
     fn chspace_through(
         &mut self,
         i: usize,
-        handles: Vec<codec::Handle>,
+        handles: Vec<document::Handle>,
         to_paper: bool,
         frame: crate::scene::viewport_ref::ViewportFrame,
     ) {
@@ -3579,7 +4038,7 @@ impl OpenCADStudio {
         };
         self.push_undo_snapshot(i, "CHSPACE");
         let scene = &mut self.tabs[i].scene;
-        let entities: Vec<codec::EntityType> = handles
+        let entities: Vec<document::EntityType> = handles
             .iter()
             .filter_map(|h| scene.document.get_entity(*h).cloned())
             .collect();
@@ -3589,7 +4048,7 @@ impl OpenCADStudio {
         // viewport, the model with one.
         let active = scene.active_viewport;
         scene.active_viewport = if to_paper { None } else { Some(frame.viewport) };
-        let moved: Vec<codec::Handle> = entities
+        let moved: Vec<document::Handle> = entities
             .into_iter()
             .map(|e| scene.add_entity_clone(e))
             .collect();
@@ -3606,6 +4065,225 @@ impl OpenCADStudio {
                 crate::tf!("CHSPACE: {count} object(s) changed to model space.")
             }
             .as_ref(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod vports_dropdown_tests {
+    use crate::app::{Message, OpenCADStudio};
+    use crate::modules::RibbonItem;
+
+    #[test]
+    fn each_viewport_configuration_in_the_dropdown_tiles_the_model_view() {
+        let RibbonItem::LargeDropdown { items, .. } =
+            crate::modules::view::vports_config::dropdown()
+        else {
+            panic!("a dropdown");
+        };
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        for (cmd, label, _) in items {
+            let want = match label.split(':').next().unwrap() {
+                "Single" => 1,
+                "Two" => 2,
+                "Three" => 3,
+                "Four" => 4,
+                other => panic!("{other}"),
+            };
+            let _ = app.update(Message::DropdownSelectItem {
+                dropdown_id: "VPORTS_CONFIG",
+                cmd,
+            });
+            assert_eq!(
+                app.tabs[i].scene.model_tiles.borrow().len(),
+                want,
+                "{label}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod viewport_highlight_tests {
+    use crate::app::{Message, OpenCADStudio};
+
+    fn tool() -> crate::modules::ToolDef {
+        let module = crate::modules::view::ViewModule;
+        crate::modules::CadModule::ribbon_groups(&module)
+            .iter()
+            .find(|g| g.title == "Model Viewports")
+            .and_then(|g| {
+                g.tools.iter().find_map(|t| match t {
+                    crate::modules::RibbonItem::Tool(t) if t.id == "VPHIGHLIGHT" => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .expect("a hover-outline switch in View > Model Viewports")
+    }
+
+    /// On the chip's outline switch the active viewport keeps its outline
+    /// (the pointer is off the drawing there), and a wheel step changes it
+    /// at once.
+    #[test]
+    fn the_outline_switch_keeps_the_active_viewport_outlined_while_its_wheel_turns() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        let _ = app.update(Message::DropdownSelectItem {
+            dropdown_id: "VPORTS_CONFIG",
+            cmd: "VPORTS 2V".into(),
+        });
+        assert_eq!(app.tabs[i].scene.model_tiles.borrow().len(), 2);
+        app.tabs[i].scene.selection.borrow_mut().input.pointer_away = true;
+        assert!(
+            app.model_viewport_outline(&app.tabs[i]).is_none(),
+            "pointer away: no outline"
+        );
+
+        app.tabs[i].scene.sync_tiles_from_panes(800.0, 600.0);
+        app.tabs[i].scene.active_model_tile.set(1);
+
+        let _ = app.update(Message::ViewportOutlineSwitchHover(true));
+        let (rect, alpha) = app
+            .model_viewport_outline(&app.tabs[i])
+            .expect("outline on the switch");
+        assert!(
+            rect.x > 350.0 && rect.width < 450.0 && rect.height > 550.0,
+            "the right-hand viewport: {rect:?}"
+        );
+        assert!((alpha - 0.5).abs() < 1e-6);
+        let _ = app.update(Message::ViewportHighlightOpacity(70));
+        let (_, alpha) = app.model_viewport_outline(&app.tabs[i]).unwrap();
+        assert!((alpha - 0.7).abs() < 1e-6, "the wheel step shows at once");
+
+        let _ = app.update(Message::ViewportOutlineSwitchHover(false));
+        assert!(
+            app.model_viewport_outline(&app.tabs[i]).is_none(),
+            "gone once the pointer leaves"
+        );
+    }
+
+    /// The switch can disappear under a resting pointer and a removed widget
+    /// sends no exit; the outline must not stay pinned afterwards.
+    #[test]
+    fn the_outline_switch_hover_ends_when_the_chip_goes_away() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        let two = |app: &mut OpenCADStudio| {
+            let _ = app.update(Message::DropdownSelectItem {
+                dropdown_id: "VPORTS_CONFIG",
+                cmd: "VPORTS 2V".into(),
+            });
+            app.tabs[app.active_tab]
+                .scene
+                .selection
+                .borrow_mut()
+                .input
+                .pointer_away = true;
+            let _ = app.update(Message::ViewportOutlineSwitchHover(true));
+            assert!(app
+                .model_viewport_outline(&app.tabs[app.active_tab])
+                .is_some());
+        };
+
+        two(&mut app);
+        let _ = app.update(Message::DropdownSelectItem {
+            dropdown_id: "VPORTS_CONFIG",
+            cmd: "VPORTS SINGLE".into(),
+        });
+        let _ = app.update(Message::DropdownSelectItem {
+            dropdown_id: "VPORTS_CONFIG",
+            cmd: "VPORTS 2V".into(),
+        });
+        app.tabs[i].scene.selection.borrow_mut().input.pointer_away = true;
+        assert!(
+            app.model_viewport_outline(&app.tabs[i]).is_none(),
+            "a viewport count change ends the hover"
+        );
+
+        two(&mut app);
+        let _ = app.update(Message::WindowResized(700.0, 500.0));
+        assert!(
+            app.model_viewport_outline(&app.tabs[i]).is_none(),
+            "a resize ends the hover"
+        );
+
+        two(&mut app);
+        let _ = app.update(Message::ViewportHighlightOpacity(60));
+        assert!(
+            app.model_viewport_outline(&app.tabs[i]).is_some(),
+            "a wheel step keeps it"
+        );
+    }
+
+    #[test]
+    fn the_ribbon_switch_and_the_variables_control_the_hover_outline() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        assert!(app.model_space.viewport_hover_highlight, "on by default");
+        assert_eq!(
+            app.model_space.viewport_hover_opacity, 50,
+            "soft by default"
+        );
+        let t = tool();
+        let _ = app.update(Message::RibbonToolClick {
+            tool_id: t.id.to_string(),
+            event: t.event.clone(),
+        });
+        assert!(
+            !app.model_space.viewport_hover_highlight,
+            "the switch turns it off"
+        );
+        assert!(
+            !app.ribbon.show_viewport_highlight,
+            "and its light goes out"
+        );
+        let _ = app.update(Message::RibbonToolClick {
+            tool_id: t.id.to_string(),
+            event: t.event.clone(),
+        });
+        assert!(app.model_space.viewport_hover_highlight, "and on again");
+        assert!(app.ribbon.show_viewport_highlight);
+
+        let _ = app.run_command_line("VPHIGHLIGHT 0");
+        assert!(!app.model_space.viewport_hover_highlight);
+        let _ = app.run_command_line("VPHIGHLIGHTOPACITY 40");
+        assert_eq!(app.model_space.viewport_hover_opacity, 40);
+        let _ = app.run_command_line("VPHIGHLIGHTOPACITY 140");
+        assert_eq!(
+            app.model_space.viewport_hover_opacity, 40,
+            "out of range is refused"
+        );
+    }
+
+    #[test]
+    fn the_hovered_viewport_is_the_one_under_the_cursor() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let at = |app: &OpenCADStudio, x: f32| {
+            app.tabs[i]
+                .scene
+                .hovered_model_pane_px(800.0, 600.0, Some(iced::Point::new(x, 300.0)))
+        };
+        assert_eq!(at(&app, 100.0), None, "one viewport: nothing to tell apart");
+        let _ = app.run_command_line("VPORTS 2V");
+        let left = at(&app, 100.0).expect("left viewport");
+        let right = at(&app, 700.0).expect("right viewport");
+        assert!(left.x < 1.0 && left.x + left.width < 401.0, "{left:?}");
+        assert!(
+            right.x > 399.0 && right.x + right.width > 799.0,
+            "{right:?}"
+        );
+        assert_eq!(
+            at(&app, 400.0),
+            None,
+            "on the divider no viewport is outlined"
         );
     }
 }

@@ -1,11 +1,11 @@
 use crate::scene::model::hatch_model::HatchModel;
 use crate::scene::Scene;
-use codec::entities::hatch::{
+use document::entities::hatch::{
     BoundaryEdge, BoundaryPath, BoundaryPathFlags, Hatch, LineEdge, PolylineEdge, SplineEdge,
 };
-use codec::types::{Vector2, Vector3};
-use kernel::geom2d::{refine_spline_boundary, Curve, NurbsCurve};
-use kernel::tessellation::DEFAULT_ANGLE;
+use document::types::{Vector2, Vector3};
+use ocs_geom::geom2d::{refine_spline_boundary, Curve, NurbsCurve};
+use ocs_geom::tessellation::DEFAULT_ANGLE;
 
 #[test]
 fn gradient_stops_keep_entity_transparency() {
@@ -17,14 +17,14 @@ fn gradient_stops_keep_entity_transparency() {
     hatch.gradient_color.enabled = true;
     hatch.gradient_color.name = "LINEAR".into();
     hatch.gradient_color.colors = vec![
-        codec::entities::hatch::GradientColorEntry {
+        document::entities::hatch::GradientColorEntry {
             value: 0.0,
-            color: codec::types::Color::Rgb { r: 255, g: 0, b: 0 },
+            color: document::types::Color::Rgb { r: 255, g: 0, b: 0 },
             ..Default::default()
         },
-        codec::entities::hatch::GradientColorEntry {
+        document::entities::hatch::GradientColorEntry {
             value: 1.0,
-            color: codec::types::Color::Rgb { r: 0, g: 0, b: 255 },
+            color: document::types::Color::Rgb { r: 0, g: 0, b: 255 },
             ..Default::default()
         },
     ];
@@ -166,7 +166,7 @@ fn narrow_fill_preserves_corners_holes_and_shared_origin() {
             .map(|p| project(p).map(f64::from))
             .collect();
         // The plain sampling crosses itself: as one polygon it has no inside.
-        assert!(kernel::geom2d::triangulate(&original, &[]).1.is_empty());
+        assert!(ocs_geom::geom2d::triangulate(&original, &[]).1.is_empty());
         for i in 0..=6 {
             assert!(model
                 .boundary
@@ -362,15 +362,15 @@ fn loops_flagged_not_closed_are_skipped_like_autocad() {
 #[test]
 fn loops_flagged_not_closed_stay_out_of_the_extents() {
     let mut scene = Scene::new();
-    let mut line = codec::entities::Line::new();
+    let mut line = document::entities::Line::new();
     line.end = Vector3::new(10.0, 10.0, 0.0);
-    scene.add_entity(codec::EntityType::Line(line));
+    scene.add_entity(document::EntityType::Line(line));
     let mut path = rectangle([100.0, 100.0], [110.0, 110.0], [0.0; 2]);
     path.flags = BoundaryPathFlags::from_bits(1 | 32);
     let mut hatch = Hatch::new();
     hatch.is_solid = true;
     hatch.paths.push(path);
-    scene.add_entity(codec::EntityType::Hatch(Box::new(hatch)));
+    scene.add_entity(document::EntityType::Hatch(Box::new(hatch)));
 
     let (_, max) = scene.model_space_extents().unwrap();
     assert!(max.x < 10.5 && max.y < 10.5, "{max:?}");
@@ -378,11 +378,12 @@ fn loops_flagged_not_closed_stay_out_of_the_extents() {
 
 // The island style picks loops by their path flags: Outer keeps loops flagged
 // external (bit 0) or outermost (bit 4), Ignore only those flagged external,
-// Normal all of them. The kept loops fill even-odd. Squares of 40, 24 and 10
+// Normal and Outer those plus any first-level island (a deeper one only when
+// flagged): AutoCAD cuts an unflagged first island under Outer too (#3503). The kept loops fill even-odd. Squares of 40, 24 and 10
 // (two loops: 40 and 20), each centred in the one before.
 #[test]
 fn island_style_keeps_loops_by_their_flags() {
-    use codec::entities::HatchStyleType::{Ignore, Normal, Outer};
+    use document::entities::HatchStyleType::{Ignore, Normal, Outer};
     let square = |half: f64, flags: u32| {
         let mut path = rectangle(
             [20.0 - half, 20.0 - half],
@@ -409,12 +410,14 @@ fn island_style_keeps_loops_by_their_flags() {
         ("ignore 1 1 0", area(Ignore, three(1, 1, 0)), 1024.0),
         ("ignore 1 16 0", area(Ignore, three(1, 16, 0)), 1600.0),
         ("ignore 0 1", area(Ignore, two(0, 1)), 400.0),
-        ("outer 1 0 0", area(Outer, three(1, 0, 0)), 1600.0),
+        ("outer 1 0 0", area(Outer, three(1, 0, 0)), 1024.0),
         ("outer 1 1 1", area(Outer, three(1, 1, 1)), 1124.0),
         ("outer 1 16 0", area(Outer, three(1, 16, 0)), 1024.0),
         ("outer 17 16 0", area(Outer, three(17, 16, 0)), 1024.0),
-        ("outer 1 0 1", area(Outer, three(1, 0, 1)), 1500.0),
-        ("normal 1 0 0", area(Normal, three(1, 0, 0)), 1124.0),
+        ("outer 1 0 1", area(Outer, three(1, 0, 1)), 1124.0),
+        ("normal 1 0 0", area(Normal, three(1, 0, 0)), 1024.0),
+        ("normal 1 16 0", area(Normal, three(1, 16, 0)), 1024.0),
+        ("normal 1 16 4", area(Normal, three(1, 16, 4)), 1124.0),
         ("normal 0 0", area(Normal, two(0, 0)), 1200.0),
     ];
     for (name, area, expected) in cases {
@@ -429,7 +432,7 @@ fn island_style_keeps_loops_by_their_flags() {
 // as before: Ignore the outermost, Outer the outermost and the next.
 #[test]
 fn island_style_without_flags_falls_back_to_nesting_depth() {
-    use codec::entities::HatchStyleType::{Ignore, Outer};
+    use document::entities::HatchStyleType::{Ignore, Outer};
     let square = |half: f64| {
         rectangle(
             [20.0 - half, 20.0 - half],
@@ -465,7 +468,7 @@ fn a_pattern_hatch_keeps_loops_flagged_not_closed() {
         hatch.paths = paths;
         Scene::hatch_model_from_dxf(&hatch, [1.0; 4]).map_or(0.0, |model| filled_area(&model))
     };
-    use codec::entities::HatchStyleType::{Normal, Outer};
+    use document::entities::HatchStyleType::{Normal, Outer};
     let outer = || square([0.0, 0.0], [10.0, 10.0]);
     let island = || square([3.0, 3.0], [7.0, 7.0]);
     let cases = [
@@ -522,5 +525,76 @@ fn a_pattern_hatch_keeps_loops_flagged_not_closed() {
             (area - expected).abs() < 1e-3,
             "{name}: {area}, expected {expected}"
         );
+    }
+}
+
+#[test]
+fn associative_refresh_keeps_the_format_flag_with_the_rederived_contents() {
+    // A DWG/DGN-imported associative hatch stores its derived loop as ONE
+    // closed polyline edge and carries the path's POLYLINE format flag.
+    // Refreshing the fill after an edit of its boundary source re-derives
+    // the loop as plain Line edges; the format flag must follow the
+    // contents, because the DWG writer takes its polyline branch on the
+    // flag alone and, finding no polyline edge in the path, writes an empty
+    // loop and silently loses the fill on the next save.
+    let mut scene = Scene::new();
+
+    let mut outline = document::entities::LwPolyline::new();
+    outline.is_closed = true;
+    outline.vertices = [[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]]
+        .iter()
+        .map(|p| document::entities::LwVertex::from_coords(p[0], p[1]))
+        .collect();
+    let source = scene
+        .document
+        .add_entity(document::EntityType::LwPolyline(outline))
+        .expect("the boundary polyline must be added");
+
+    let mut fill = Hatch::new();
+    fill.is_solid = true;
+    fill.is_associative = true;
+    let mut path =
+        BoundaryPath::with_flags(BoundaryPathFlags::from_bits(
+            BoundaryPathFlags::EXTERNAL.bits() | BoundaryPathFlags::POLYLINE.bits(),
+        ));
+    path.flags.set_polyline(true);
+    path.flags.set_derived(true);
+    path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(
+        [[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]]
+            .iter()
+            .map(|p| Vector2::new(p[0], p[1]))
+            .collect(),
+        true,
+    )));
+    path.boundary_handles.push(source);
+    fill.paths.push(path);
+    let hatch_handle = scene
+        .document
+        .add_entity(document::EntityType::Hatch(Box::new(fill)))
+        .expect("the associative hatch must be added");
+
+    // A boundary-source edit refreshes the fill; the loop geometry stays a
+    // rectangle either way, and the format flag keeps meaning what the
+    // contents are on both sides.
+    let changes = vec![(source, crate::scene::ChangeKind::Modified)];
+    assert!(!scene.refresh_associative_hatches(&changes).is_empty());
+
+    let Some(document::EntityType::Hatch(stored)) = scene.document.get_entity(hatch_handle)
+    else {
+        panic!("the refreshed hatch must stay at its handle");
+    };
+    let path = &stored.paths[0];
+    assert!(
+        !path.edges.is_empty(),
+        "an associative refresh must not leave an empty loop behind"
+    );
+    assert_eq!(
+        path.flags.is_polyline(),
+        path.is_polyline(),
+        "the POLYLINE format flag must agree with the stored contents"
+    );
+    if let Some(BoundaryEdge::Polyline(polyline)) = path.edges.first() {
+        assert!(polyline.vertices.len() >= 3, "the loop must keep its shape");
+        assert!(polyline.is_closed, "re-derived rectangles close their loops");
     }
 }

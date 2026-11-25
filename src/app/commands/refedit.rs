@@ -9,7 +9,7 @@ use crate::modules::draw::modify::refedit::{
     RefEditPickCommand, RefEditSession, RefSetCommand, SymbolKind, NOT_CHECKED_OUT,
 };
 use crate::ui::window::refedit_dialog::{RefEditDialogMsg, RefEditDialogState, RefEditLevel};
-use codec::{EntityType, Handle};
+use document::{EntityType, Handle};
 use iced::Task;
 use std::collections::HashSet;
 
@@ -327,7 +327,7 @@ impl OpenCADStudio {
             };
             let base = crate::scene::render_graph::block_base_point(document, &inner.block_name);
             let local = crate::scene::render_graph::insert_transform_with_base(inner, base);
-            let outer = chain.last().expect("non-empty chain").forward.clone();
+            let outer = chain.last().expect("non-empty chain").forward;
             chain.push(crate::modules::draw::modify::refedit::ChainLevel {
                 insert: handle,
                 block_name: inner.block_name.clone(),
@@ -373,7 +373,7 @@ impl OpenCADStudio {
             extracted: extracted.clone(),
             added: HashSet::new(),
             removed: HashSet::new(),
-            forward: level.forward.clone(),
+            forward: level.forward,
             inverse,
             // Everything allocated from here on is part of the session.
             handle_watermark: document.next_handle().max(document.header.handle_seed),
@@ -685,7 +685,7 @@ impl OpenCADStudio {
         // and go back under their own names.
         let mut deps = crate::app::ClipboardDeps::capture(&self.tabs[i].scene.document, &edited);
         {
-            use codec::TableEntry;
+            use document::TableEntry;
             for layer in &mut deps.layers {
                 let name = strip(layer.name());
                 layer.name = name;
@@ -743,10 +743,12 @@ impl OpenCADStudio {
             .xref_stat_cache
             .0
             .remove(&session.br_handle.value());
-        let _ = crate::io::xref::resolve_xrefs_for_keys(
+        let xref_session = self.tabs[i].ifccad_session.clone();
+        let _ = crate::io::xref::resolve_xrefs_for_keys_in_session(
             &mut self.tabs[i].scene.document,
             &base_dir,
             &keys,
+            xref_session.as_ref(),
         );
         Ok(())
     }
@@ -808,7 +810,7 @@ impl OpenCADStudio {
                 && name[..prefix.len()].eq_ignore_ascii_case(prefix))
             .then(|| name[prefix.len()..].to_string())
         };
-        let exists = |document: &codec::Document, kind: SymbolKind, name: &str| match kind {
+        let exists = |document: &document::Document, kind: SymbolKind, name: &str| match kind {
             SymbolKind::Layer => document.layers.contains(name),
             SymbolKind::Linetype => document.line_types.contains(name),
             SymbolKind::TextStyle => document.text_styles.contains(name),

@@ -1,9 +1,9 @@
 // Arc creation commands.
 
 use crate::t;
-use codec::types::Vector3;
-use codec::{Arc as CadArc, EntityType};
-use kernel::geom2d::{self, Curve as KernelCurve};
+use document::types::Vector3;
+use document::{Arc as CadArc, EntityType};
+use ocs_geom::geom2d::{self, Curve as KernelCurve};
 
 use super::apollonius::{self, Circle2D};
 use crate::command::{CadCommand, CmdResult, TangentObject, WorkingPlane};
@@ -130,6 +130,12 @@ fn arc_result(
         .unwrap_or(CmdResult::NeedPoint)
 }
 
+/// A value the arc cannot be built from ends the command, as the reference
+/// does.
+fn invalid() -> CmdResult {
+    CmdResult::CancelWithMessage("*Invalid*".into())
+}
+
 fn line_wire(a: DVec3, b: DVec3) -> WireModel {
     WireModel::solid_f64(
         "rubber_band".into(),
@@ -246,7 +252,7 @@ pub fn continue_anchor(entity: &EntityType, last: Option<DVec3>) -> Option<(DVec
     let curve = crate::entities::curve::entity_curve(entity)?;
     let start = DVec3::from_array(curve.point_at(0.0));
     let end = DVec3::from_array(curve.point_at(1.0));
-    let use_end = last.map_or(true, |point| point.distance(end) <= point.distance(start));
+    let use_end = last.is_none_or(|point| point.distance(end) <= point.distance(start));
     let (point, tangent) = if use_end {
         (end, DVec3::from_array(curve.tangent_at(1.0)))
     } else {
@@ -1502,6 +1508,12 @@ pub struct ArcCSECommand {
     plane: WorkingPlane,
 }
 
+impl Default for ArcCSECommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcCSECommand {
     pub fn new() -> Self {
         Self {
@@ -1703,6 +1715,12 @@ pub struct ArcCommand {
     cursor: Option<DVec3>,
 }
 
+impl Default for ArcCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcCommand {
     pub fn new() -> Self {
         Self {
@@ -1829,19 +1847,25 @@ impl CadCommand for ArcCommand {
         match self.step {
             ArcStep::Start => t!("ARC  Specify start point of arc:"),
             ArcStep::Second { .. } => t!("ARC  Specify second point of arc:"),
-            ArcStep::End3 { .. } | ArcStep::EndSC { .. } | ArcStep::EndAfterStart { .. } => {
+            ArcStep::End3 { .. } | ArcStep::EndAfterStart { .. } => {
                 t!("ARC  Specify end point of arc:")
             }
-            ArcStep::CenterFirst | ArcStep::CenterAfterStart { .. } | ArcStep::CenterSE { .. } => {
+            ArcStep::EndSC { .. } => {
+                t!("ARC  Specify end point of arc (hold Ctrl to switch direction):")
+            }
+            ArcStep::CenterFirst | ArcStep::CenterAfterStart { .. } => {
                 t!("ARC  Specify center point of arc:")
             }
-            ArcStep::StartAfterCenter { .. } => t!("ARC  Specify start point of arc:"),
-            ArcStep::AngleSC { .. } | ArcStep::AngleSE { .. } => t!("ARC  Specify included angle:"),
-            ArcStep::LengthSC { .. } => t!("ARC  Specify length of chord:"),
-            ArcStep::DirectionSE { .. } => {
-                t!("ARC  Specify tangent direction for the start point of arc:")
+            ArcStep::CenterSE { .. } => {
+                t!("ARC  Specify center point of arc (hold Ctrl to switch direction):")
             }
-            ArcStep::RadiusSE { .. } => t!("ARC  Specify radius of arc:"),
+            ArcStep::StartAfterCenter { .. } => t!("ARC  Specify start point of arc:"),
+            ArcStep::AngleSC { .. } | ArcStep::AngleSE { .. } => t!("ARC  Specify included angle (hold Ctrl to switch direction):"),
+            ArcStep::LengthSC { .. } => t!("ARC  Specify length of chord (hold Ctrl to switch direction):"),
+            ArcStep::DirectionSE { .. } => {
+                t!("ARC  Specify tangent direction for the start point of arc (hold Ctrl to switch direction):")
+            }
+            ArcStep::RadiusSE { .. } => t!("ARC  Specify radius of arc (hold Ctrl to switch direction):"),
         }
         .into_owned()
     }
@@ -1926,6 +1950,7 @@ impl CadCommand for ArcCommand {
                 self.step = ArcStep::EndSC { s, c: pt };
                 Some(CmdResult::NeedPoint)
             }
+            ArcStep::EndSC { c, .. } if c.distance(pt) < 1e-9 => Some(invalid()),
             ArcStep::EndSC { s, c } => Some(self.commit(self.sc_end(s, c, pt))),
             // At a typed prompt a pick reads as commercial solutions do: the cursor's
             // direction from the centre (angle) or its distance (length,
@@ -1953,6 +1978,11 @@ impl CadCommand for ArcCommand {
     }
 
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        // A coordinate typed at an angle, length, direction or radius prompt
+        // is a point, read like a pick: the comma is never a decimal mark.
+        if crate::entities::coord_parse::parse_coord(text).is_some() {
+            return None;
+        }
         let upper = text.trim().to_uppercase();
         match self.step {
             ArcStep::Start => match upper.as_str() {
@@ -2008,10 +2038,24 @@ impl CadCommand for ArcCommand {
                 if self.cw {
                     span = -span;
                 }
-                Some(self.commit(self.sc_angle(s, c, span)))
+                // A typed included angle counts whole turns off (400 = 40);
+                // a whole number of turns sweeps nothing.
+                let turns = span.abs() % TAU;
+                if turns < 1e-9 || TAU - turns < 1e-9 {
+                    return Some(invalid());
+                }
+                Some(self.commit(self.sc_angle(s, c, turns.copysign(span))))
             }
             ArcStep::LengthSC { s, c } => {
                 let len = Self::typed_number(text)?;
+                if len == 0.0 {
+                    return Some(CmdResult::ReportError(
+                        t!("Value must be nonzero.").into_owned(),
+                    ));
+                }
+                if len.abs() > 2.0 * c.distance(s) {
+                    return Some(invalid());
+                }
                 Some(self.commit(self.sc_length(s, c, len)))
             }
             ArcStep::AngleSE { s, e } => {
@@ -2019,6 +2063,13 @@ impl CadCommand for ArcCommand {
                 if self.cw {
                     included = -included;
                 }
+                // As at the Start-Center angle: whole turns count off, and
+                // a whole number of them spans nothing.
+                let turns = included.abs() % TAU;
+                if turns < 1e-9 || TAU - turns < 1e-9 {
+                    return Some(invalid());
+                }
+                let included = turns.copysign(included);
                 Some(self.commit(arc_from_endpoints_angle(s, e, included, self.plane)))
             }
             ArcStep::DirectionSE { s, e } => {
@@ -2213,6 +2264,12 @@ pub struct Arc3PCommand {
     plane: WorkingPlane,
 }
 
+impl Default for Arc3PCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Arc3PCommand {
     pub fn new() -> Self {
         Self {
@@ -2342,6 +2399,12 @@ pub struct ArcSCECommand {
     plane: WorkingPlane,
 }
 
+impl Default for ArcSCECommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcSCECommand {
     pub fn new() -> Self {
         Self {
@@ -2437,6 +2500,12 @@ pub struct ArcSCACommand {
     sa: f64,
     cw: bool,
     plane: WorkingPlane,
+}
+
+impl Default for ArcSCACommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ArcSCACommand {
@@ -2577,6 +2646,12 @@ pub struct ArcSCLCommand {
     plane: WorkingPlane,
 }
 
+impl Default for ArcSCLCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcSCLCommand {
     pub fn new() -> Self {
         Self {
@@ -2710,6 +2785,12 @@ pub struct ArcSEACommand {
     plane: WorkingPlane,
 }
 
+impl Default for ArcSEACommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcSEACommand {
     pub fn new() -> Self {
         Self {
@@ -2817,6 +2898,12 @@ pub struct ArcSERCommand {
     e: DVec3,
     ctrl: bool,
     plane: WorkingPlane,
+}
+
+impl Default for ArcSERCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ArcSERCommand {
@@ -2932,6 +3019,12 @@ pub struct ArcSEDCommand {
     plane: WorkingPlane,
 }
 
+impl Default for ArcSEDCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArcSEDCommand {
     pub fn new() -> Self {
         Self {
@@ -3038,6 +3131,12 @@ pub struct ArcCSACommand {
     sa: f64,
     cw: bool,
     plane: WorkingPlane,
+}
+
+impl Default for ArcCSACommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ArcCSACommand {
@@ -3171,6 +3270,12 @@ pub struct ArcCSLCommand {
     sa: f64,
     cw: bool,
     plane: WorkingPlane,
+}
+
+impl Default for ArcCSLCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ArcCSLCommand {

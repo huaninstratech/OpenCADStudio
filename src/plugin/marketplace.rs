@@ -74,7 +74,9 @@ impl Release {
     /// folder per plugin.
     fn bundle_assets(&self) -> impl Iterator<Item = &Asset> {
         let suffix = format!("-{}.zip", platform_suffix());
-        self.assets.iter().filter(move |a| a.name.ends_with(&suffix))
+        self.assets
+            .iter()
+            .filter(move |a| a.name.ends_with(&suffix))
     }
 
     /// True when this release ships an installable package for this platform.
@@ -266,10 +268,11 @@ pub fn fetch_release_info(repo: &str) -> Result<Vec<ReleaseInfo>, String> {
         }
     }
 
-    if info.is_empty() {
-        Err(last_error.unwrap_or_else(|| "no installable releases found".to_string()))
-    } else {
-        Ok(info)
+    // No release for this platform is an answer (the card files under
+    // Incompatible), not an error; a release that failed to read is one.
+    match last_error {
+        Some(error) if info.is_empty() => Err(error),
+        _ => Ok(info),
     }
 }
 
@@ -307,7 +310,9 @@ fn download_string(url: &str) -> Result<String, String> {
 
 fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    agent()
+    // A package runs to tens of megabytes; the catalog's 15 s would cut a
+    // slow download off midway.
+    crate::network::agent(std::time::Duration::from_secs(600))
         .get(url)
         .header("User-Agent", UA)
         .call()
@@ -362,7 +367,9 @@ fn bundle_packages(bytes: &[u8]) -> Result<Vec<Package>, String> {
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("bundle: {e}"))?;
     let mut files = Vec::new();
     for index in 0..archive.len() {
-        let mut file = archive.by_index(index).map_err(|e| format!("bundle: {e}"))?;
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("bundle: {e}"))?;
         let Some(path) = file.enclosed_name().filter(|_| file.is_file()) else {
             continue;
         };
@@ -427,14 +434,10 @@ fn checked_manifest(toml_text: &str) -> Result<external::ExternalPlugin, String>
 
     if ocs_plugin_api::version_info::uses_acadrust_gate(manifest.api_version) {
         let Some(source) = manifest.acadrust_source.as_deref() else {
-            return Err(
-                "Release has no opencadcodec source; cannot verify ABI compatibility".to_string(),
-            );
+            return Err("Release has no codec source; cannot verify ABI compatibility".to_string());
         };
         if source.is_empty() {
-            return Err(
-                "Release has no opencadcodec source; cannot verify ABI compatibility".to_string(),
-            );
+            return Err("Release has no codec source; cannot verify ABI compatibility".to_string());
         }
         if !ocs_plugin_api::version_info::acadrust_sources_compatible(
             source,
@@ -446,7 +449,7 @@ fn checked_manifest(toml_text: &str) -> Result<external::ExternalPlugin, String>
             let host_hash =
                 ocs_plugin_api::version_info::acadrust_source_hash(host_src).unwrap_or("unknown");
             return Err(format!(
-                "Plugin built for opencadcodec @{plugin_hash}, but this host uses @{host_hash}"
+                "Plugin built for codec @{plugin_hash}, but this host uses @{host_hash}"
             ));
         }
     }
@@ -485,7 +488,8 @@ fn write_package(package: Package, repository: &str) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ext = external_lib_ext();
     let is_library = |path: &Path| {
-        path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+        path.parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
             && path.extension().is_some_and(|e| e == ext)
     };
     let (lib_name, lib_bytes) = package

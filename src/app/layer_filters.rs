@@ -32,36 +32,228 @@ pub(in crate::app) struct LayerFilter {
     pub predicates: Vec<LayerPredicate>,
     /// Nested filters: when present, a layer must match one of them too.
     pub children: Vec<LayerFilter>,
+    /// Conditions made in the Layer manager's editor (FILTER's condition
+    /// editor over layer properties); used instead of the pattern and the
+    /// predicates when present.
+    pub conditions: Option<crate::filter::Filter>,
+}
+
+/// A layer as the shared filter engine reads it (#2610, #2611): the same
+/// comparisons and name patterns as Quick Select and FILTER.
+pub(in crate::app) struct LayerProperties;
+
+impl crate::filter::PropertySource for LayerProperties {
+    type Item = document::tables::Layer;
+
+    fn type_name<'a>(&'a self, _: &'a document::tables::Layer) -> &'a str {
+        "Layer"
+    }
+
+    fn value(&self, layer: &document::tables::Layer, property: &str) -> Option<String> {
+        let flag = |on: bool| if on { "1" } else { "0" }.to_string();
+        Some(match property {
+            "name" => layer.name.clone(),
+            "description" => layer.description.clone(),
+            "color" => layer.color.index()?.to_string(),
+            "linetype" => layer.line_type.clone(),
+            "on" => flag(!layer.is_off()),
+            "frozen" => flag(layer.is_frozen()),
+            "locked" => flag(layer.is_locked()),
+            "plot" => flag(layer.is_plottable),
+            "xref" => flag(layer.name.contains('|') || layer.flags.xref_dependent),
+            _ => return None,
+        })
+    }
 }
 
 impl LayerFilter {
-    pub(in crate::app) fn matches(&self, layer: &codec::tables::Layer) -> bool {
-        if !self.pattern.is_empty() && !wildcard_match(&layer.name, &self.pattern) {
-            return false;
+    /// The name pattern and the predicates as one all-filter.
+    pub(in crate::app) fn to_filter(&self) -> crate::filter::Filter {
+        use crate::filter::{Filter, Group, Item, Match};
+        // Conditions from the editor (or read back from the drawing), with a
+        // name pattern or predicates LAYERFILTER SET added since (#2610).
+        if let Some(conditions) = &self.conditions {
+            let mut extra = self.legacy_filter();
+            if extra.items.is_empty() {
+                return conditions.clone();
+            }
+            if conditions.root == Match::All {
+                let mut items = conditions.items.clone();
+                items.append(&mut extra.items);
+                return Filter {
+                    root: Match::All,
+                    items,
+                };
+            }
+            if conditions
+                .items
+                .iter()
+                .all(|item| matches!(item, Item::Condition(_)))
+            {
+                let group = Group {
+                    mode: Match::Any,
+                    conditions: conditions
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Condition(c) => Some(c.clone()),
+                            Item::Group(_) => None,
+                        })
+                        .collect(),
+                };
+                extra.items.push(Item::Group(group));
+                return extra;
+            }
+            return conditions.clone();
+        }
+        self.legacy_filter()
+    }
+
+    /// The name pattern and the predicates alone, as one all-filter.
+    fn legacy_filter(&self) -> crate::filter::Filter {
+        use crate::filter::{Condition, Filter, Item, Match, Op};
+        let condition = |property: &str, value: String| {
+            Item::Condition(Condition {
+                property: Some(property.to_string()),
+                op: Op::Eq,
+                value,
+                ..Default::default()
+            })
+        };
+        let flag = |on: bool| if on { "1" } else { "0" }.to_string();
+        let mut items = Vec::new();
+        if !self.pattern.is_empty() {
+            items.push(condition("name", self.pattern.clone()));
         }
         for predicate in &self.predicates {
-            let ok = match predicate {
-                LayerPredicate::Color(index) => layer.color.index() == Some(*index),
-                LayerPredicate::Linetype(name) => layer.line_type.eq_ignore_ascii_case(name),
-                LayerPredicate::Off(off) => layer.is_off() == *off,
-                LayerPredicate::Frozen(frozen) => layer.is_frozen() == *frozen,
-                LayerPredicate::Locked(locked) => layer.is_locked() == *locked,
-                LayerPredicate::Plottable(plottable) => layer.is_plottable == *plottable,
-            };
-            if !ok {
-                return false;
-            }
+            items.push(match predicate {
+                LayerPredicate::Color(index) => condition("color", index.to_string()),
+                LayerPredicate::Linetype(name) => condition("linetype", name.clone()),
+                LayerPredicate::Off(off) => condition("on", flag(!off)),
+                LayerPredicate::Frozen(frozen) => condition("frozen", flag(*frozen)),
+                LayerPredicate::Locked(locked) => condition("locked", flag(*locked)),
+                LayerPredicate::Plottable(plot) => condition("plot", flag(*plot)),
+            });
         }
-        if !self.children.is_empty()
-            && !self.children.iter().any(|child| child.matches(layer))
-        {
+        Filter {
+            root: Match::All,
+            items,
+        }
+    }
+
+    /// The layer passes the name pattern and every predicate, and, when the
+    /// filter nests others, one of them too.
+    pub(in crate::app) fn matches(&self, layer: &document::tables::Layer) -> bool {
+        if !self.to_filter().matches(&LayerProperties, layer) {
             return false;
         }
-        true
+        self.children.is_empty() || self.children.iter().any(|child| child.matches(layer))
+    }
+}
+
+/// The filter named `name` anywhere in the tree, nested ones included.
+pub(in crate::app) fn find_filter_mut<'a>(
+    list: &'a mut [LayerFilter],
+    name: &str,
+) -> Option<&'a mut LayerFilter> {
+    for filter in list {
+        if filter.name.eq_ignore_ascii_case(name) {
+            return Some(filter);
+        }
+        if let Some(found) = find_filter_mut(&mut filter.children, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Take the filter named `name` (and the filters under it) out of the tree.
+pub(in crate::app) fn remove_filter(list: &mut Vec<LayerFilter>, name: &str) {
+    list.retain(|filter| !filter.name.eq_ignore_ascii_case(name));
+    for filter in list {
+        remove_filter(&mut filter.children, name);
     }
 }
 
 impl OpenCADStudio {
+    /// The drawing's layer filters as the session works with them: read from
+    /// the drawing, so undo, another drawing and a file just opened are
+    /// right (#2610).
+    pub(in crate::app) fn load_layer_filters(&mut self, i: usize) {
+        let stored = super::layer_filter_store::stored_layer_filters(&self.tabs[i].scene.document);
+        fn build(
+            parent: Option<&str>,
+            stored: &[super::layer_filter_store::StoredLayerFilter],
+            depth: usize,
+        ) -> Vec<LayerFilter> {
+            if depth > 16 {
+                return Vec::new();
+            }
+            stored
+                .iter()
+                .filter(|f| match (&f.parent, parent) {
+                    (None, None) => true,
+                    (Some(p), Some(q)) => p.eq_ignore_ascii_case(q),
+                    _ => false,
+                })
+                .map(|f| LayerFilter {
+                    name: f.name.clone(),
+                    pattern: String::new(),
+                    predicates: Vec::new(),
+                    children: build(Some(&f.name), stored, depth + 1),
+                    conditions: Some(f.filter.clone()),
+                })
+                .collect()
+        }
+        let mut filters = build(None, &stored, 0);
+        // A filter whose parent is gone stays, at the top.
+        for f in &stored {
+            let placed = |list: &[LayerFilter]| {
+                fn any(list: &[LayerFilter], name: &str) -> bool {
+                    list.iter()
+                        .any(|f| f.name.eq_ignore_ascii_case(name) || any(&f.children, name))
+                }
+                any(list, &f.name)
+            };
+            if !placed(&filters) {
+                filters.push(LayerFilter {
+                    name: f.name.clone(),
+                    conditions: Some(f.filter.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        self.layer_filters = filters;
+    }
+
+    /// Write the session's layer filters into the drawing, one undo step
+    /// labelled `label`; nothing when they are already there.
+    pub(in crate::app) fn persist_layer_filters(&mut self, i: usize, label: &str) {
+        fn flatten(
+            list: &[LayerFilter],
+            parent: Option<&str>,
+            out: &mut Vec<super::layer_filter_store::StoredLayerFilter>,
+        ) {
+            for f in list {
+                out.push(super::layer_filter_store::StoredLayerFilter {
+                    name: f.name.clone(),
+                    parent: parent.map(str::to_owned),
+                    filter: f.to_filter(),
+                });
+                flatten(&f.children, Some(&f.name), out);
+            }
+        }
+        let mut wanted = Vec::new();
+        flatten(&self.layer_filters, None, &mut wanted);
+        let document = &self.tabs[i].scene.document;
+        if super::layer_filter_store::stored_layer_filters(document) == wanted {
+            return;
+        }
+        self.push_undo_snapshot(i, label);
+        super::layer_filter_store::write_layer_filters(&mut self.tabs[i].scene.document, &wanted);
+        self.tabs[i].dirty = true;
+    }
+
     pub(in crate::app) fn dispatch_layer_filter(
         &mut self,
         cmd: &str,
@@ -69,8 +261,7 @@ impl OpenCADStudio {
     ) -> Option<Task<Message>> {
         let mut parts = cmd.splitn(2, char::is_whitespace);
         let verb = parts.next().unwrap_or("");
-        if !verb.eq_ignore_ascii_case("LAYERFILTER") && !verb.eq_ignore_ascii_case("-LAYERFILTER")
-        {
+        if !verb.eq_ignore_ascii_case("LAYERFILTER") && !verb.eq_ignore_ascii_case("-LAYERFILTER") {
             return None;
         }
         let rest = parts.next().unwrap_or("").trim();
@@ -79,6 +270,7 @@ impl OpenCADStudio {
             .first()
             .map(|token| token.to_ascii_uppercase())
             .unwrap_or_default();
+        self.load_layer_filters(i);
         match sub.as_str() {
             "" => self.list_layer_filters(i),
             "NEW" | "CREATE" => self.new_layer_filter(i, &tokens[1..]),
@@ -97,6 +289,7 @@ impl OpenCADStudio {
                 );
             }
         }
+        self.persist_layer_filters(i, "LAYERFILTER");
         Some(Task::none())
     }
 
@@ -152,6 +345,7 @@ impl OpenCADStudio {
             pattern,
             predicates: Vec::new(),
             children: Vec::new(),
+            conditions: None,
         };
         let matches = self.matching_layers(i, &filter).len();
         match self.find_layer_filter(name) {
@@ -159,7 +353,12 @@ impl OpenCADStudio {
             None => self.layer_filters.push(filter),
         }
         self.command_line.push_output(
-            crate::tf!("LAYERFILTER: '{}' saved ({} layer(s) match).", name, matches).as_ref(),
+            crate::tf!(
+                "LAYERFILTER: '{}' saved ({} layer(s) match).",
+                name,
+                matches
+            )
+            .as_ref(),
         );
     }
 
@@ -246,7 +445,9 @@ impl OpenCADStudio {
             return;
         };
         self.layer_filters[parent_index].children.push(child_filter);
-        let matches = self.matching_layers(i, &self.layer_filters[parent_index]).len();
+        let matches = self
+            .matching_layers(i, &self.layer_filters[parent_index])
+            .len();
         self.command_line.push_output(
             crate::tf!(
                 "LAYERFILTER: '{}' nests '{}', {} layer(s) match.",
@@ -273,9 +474,8 @@ impl OpenCADStudio {
         };
         let names = self.matching_layers(i, &filter);
         if names.is_empty() {
-            self.command_line.push_output(
-                crate::tf!("LAYERFILTER: '{}' matches no layers.", name).as_ref(),
-            );
+            self.command_line
+                .push_output(crate::tf!("LAYERFILTER: '{}' matches no layers.", name).as_ref());
             return;
         }
         self.command_line
@@ -294,13 +494,12 @@ impl OpenCADStudio {
         match self.find_layer_filter(name) {
             Some(index) => {
                 self.layer_filters.remove(index);
-                self.command_line.push_output(
-                    crate::tf!("LAYERFILTER: '{}' removed.", name).as_ref(),
-                );
+                self.command_line
+                    .push_output(crate::tf!("LAYERFILTER: '{}' removed.", name).as_ref());
             }
-            None => self.command_line.push_error(
-                crate::tf!("LAYERFILTER: '{}' not found.", name).as_ref(),
-            ),
+            None => self
+                .command_line
+                .push_error(crate::tf!("LAYERFILTER: '{}' not found.", name).as_ref()),
         }
     }
 
@@ -324,9 +523,8 @@ impl OpenCADStudio {
         };
         let names = self.matching_layers(i, &filter);
         if names.is_empty() {
-            self.command_line.push_output(
-                crate::tf!("LAYERFILTER: '{}' matches no layers.", name).as_ref(),
-            );
+            self.command_line
+                .push_output(crate::tf!("LAYERFILTER: '{}' matches no layers.", name).as_ref());
             return;
         }
         let operation = operation.to_ascii_uppercase();
@@ -365,7 +563,7 @@ impl OpenCADStudio {
 
 /// Expand a `-LAYER` name list that may contain `FILTER:<name>` entries.
 pub(in crate::app) fn expand_layer_list<'a>(
-    layers: impl IntoIterator<Item = &'a codec::tables::Layer>,
+    layers: impl IntoIterator<Item = &'a document::tables::Layer>,
     filters: &[LayerFilter],
     list: &str,
 ) -> Vec<String> {
@@ -391,4 +589,116 @@ pub(in crate::app) fn expand_layer_list<'a>(
         })
         .map(|layer| layer.name.clone())
         .collect()
+}
+
+/// Bench bridge for the per-message Layer manager refresh
+/// (`benches/layer_refresh_idle.rs`). Builds a hermetic app with the Layers
+/// panel open over a drawing of `layers` layers, `entities` entities spread
+/// across them, `filters` property filters and a small selection, then exposes
+/// the refresh entry production calls after every message.
+#[doc(hidden)]
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub struct LayerRefreshBenchHarness(OpenCADStudio);
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+impl LayerRefreshBenchHarness {
+    fn new_app() -> OpenCADStudio {
+        let mut app = OpenCADStudio::new();
+        app.apply_config(crate::app::config::AppConfig::default());
+        app.last_saved_config = Some(app.current_config());
+        app
+    }
+
+    pub fn setup(layers: usize, entities: usize, filters: usize, selected: usize) -> Self {
+        use document::entities::Line;
+        use document::types::{Color, Vector3};
+        use document::EntityType;
+        let mut app = Self::new_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let mut names = Vec::with_capacity(layers);
+        for k in 0..layers {
+            let name = format!("LAYER_{k:04}");
+            let mut layer = document::tables::Layer::new(&name);
+            layer.handle = app.tabs[i].scene.document.allocate_handle();
+            layer.color = Color::Index((k % 7 + 1) as u8);
+            layer.line_type = if k % 2 == 0 { "Continuous" } else { "Dashed" }.to_string();
+            layer.description = format!("bench layer {k} description text");
+            layer.is_plottable = k % 3 != 0;
+            let _ = app.tabs[i].scene.document.layers.add(layer);
+            names.push(name);
+        }
+        let mut handles = Vec::with_capacity(entities);
+        for e in 0..entities {
+            let mut line = Line::new();
+            let x = e as f64;
+            line.start = Vector3::new(x, 0.0, 0.0);
+            line.end = Vector3::new(x + 1.0, 1.0, 0.0);
+            line.common.layer = names[e % names.len()].clone();
+            handles.push(app.tabs[i].scene.add_entity(EntityType::Line(line)));
+        }
+        for h in handles.iter().take(selected) {
+            app.tabs[i].scene.selected.insert(*h);
+        }
+        let mut built = Vec::with_capacity(filters);
+        for f in 0..filters {
+            built.push(LayerFilter {
+                name: format!("FILTER_{f:02}"),
+                pattern: format!("LAYER_*{}", f % 10),
+                predicates: vec![LayerPredicate::Color((f % 7 + 1) as u16)],
+                ..Default::default()
+            });
+        }
+        app.layer_filters = built;
+        app.persist_layer_filters(i, "BENCH FILTERS");
+        app.show_layers = true;
+        app.dock.float(crate::ui::dock::FloatPanel::new(
+            crate::ui::dock::PanelId::Layers,
+            50.0,
+            50.0,
+            1300.0,
+            700.0,
+        ));
+        app.refresh_layer_counts();
+        Self(app)
+    }
+
+    fn sink(&self) -> usize {
+        let panel = &self.0.tabs[self.0.active_tab].layers;
+        let counts: usize = panel.counts.values().map(|(t, b)| t + b).sum();
+        let members: usize = panel.filters.iter().map(|(_, m)| m.len()).sum();
+        counts
+            + members
+            + panel.selected_object_layers.len()
+            + panel.filter_depths.len()
+            + panel.highlighted
+    }
+
+    /// The steady-state per-message path: nothing changed since the last call,
+    /// exactly as on a hover / timer / redraw message while the panel shows.
+    pub fn refresh_idle(&mut self) -> usize {
+        self.0.refresh_layer_counts();
+        self.sink()
+    }
+
+    /// The changed path: a real layer-property edit through `edit_layers`,
+    /// then the refresh that must rebuild the tree for it.
+    pub fn refresh_after_color_edit(&mut self, step: usize) -> usize {
+        let i = self.0.active_tab;
+        let name = format!("LAYER_{:04}", step % self.layer_count());
+        let color = document::types::Color::Index((step % 7 + 1) as u8);
+        self.0
+            .edit_layers(i, "BENCH COLOR", &[name], |layer| layer.color = color);
+        self.0.refresh_layer_counts();
+        self.sink()
+    }
+
+    fn layer_count(&self) -> usize {
+        self.0.tabs[self.0.active_tab]
+            .scene
+            .document
+            .layers
+            .iter()
+            .count()
+    }
 }
