@@ -129,6 +129,45 @@ A DWG/DXF save is sent as `ocs:save`; the drawing stays modified until the paren
 `ocs:saved` with `ok: true` and the same `saveId`, and only if nothing changed in between.
 Other exports still download (or go to `openCadStudioSaveFile`).
 
+An embedded page shows the viewer (below) unless it adds `&ui=full`.
+
+## What the page shows: the editor, the viewer, and phones
+
+The web build has three interfaces, chosen from the page's address and the window's width
+(`src/io/web_chrome.rs`):
+
+- **The editor**: ribbon, docks, command line and status bar, in a window at least 720
+  logical pixels wide.
+- **The viewer**: the drawing alone. No ribbon, tabs, docks, command line or status bar is
+  drawn, and no Start page. The wheel and the middle button move and zoom the drawing, and
+  the ViewCube turns it.
+- **The phone**: the drawing over a row of large buttons — open a file, undo, redo, zoom
+  out, in and to the extents, and the standard views — with the command line above them. It
+  comes by itself in a window under 720 logical pixels wide.
+
+In the viewer and on the phone a lone finger drags the drawing; two fingers still pan and
+pinch, and three orbit. While a command waits for a point, a finger picks it.
+
+| Address | Shows | Bridge | `?file=` |
+|---|---|---|---|
+| `/app/` | the editor, or the phone's interface in a narrow window | off | opened |
+| `/app/?ui=viewer&file=<drawing url>` | the viewer | off | opened |
+| `/app/?embed=1` | the viewer | on | ignored |
+| `/app/?embed=1&ui=full` | the editor | on | ignored |
+
+To show one drawing in a page, without any scripting:
+
+```html
+<iframe
+  src="https://huaninstratech.github.io/OpenCADStudio/app/?ui=viewer&file=https%3A%2F%2Fexample.com%2Fplan.dxf"
+  style="width: 100%; aspect-ratio: 16 / 9; border: 0"
+></iframe>
+```
+
+The drawing's address follows the rules of every `?file=` link: `http(s)`, and it must end
+in a drawing name (`.dwg` or `.dxf`). A page on another origin must allow the fetch with
+`Access-Control-Allow-Origin`.
+
 ## Startup dialogs
 
 A dialog can be open when the page is ready. While a modal is open `state.modal` is set, and `{"op":"new"}` returns `ok`

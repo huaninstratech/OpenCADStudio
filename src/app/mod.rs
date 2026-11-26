@@ -995,6 +995,9 @@ pub(super) struct OpenCADStudio {
     ribbon_closed: bool,
     /// COMMANDLINEHIDE (Ctrl+9) hid the command line; COMMANDLINE shows it.
     pub(super) command_line_hidden: bool,
+    /// The row of standard views is showing above the phone's buttons (see
+    /// `view::compact`).
+    phone_views_open: bool,
     /// Use REFEDIT rather than BEDIT when double-clicking an attribute-free block.
     double_click_block_refedit: bool,
     /// Open ATTEDIT when double-clicking a block with attributes.
@@ -3032,6 +3035,7 @@ impl OpenCADStudio {
             show_menu_bar: false,
             ribbon_closed: false,
             command_line_hidden: false,
+            phone_views_open: false,
             double_click_block_refedit: false,
             double_click_block_attedit: true,
             right_click_mode: settings::RightClickMode::ShortcutMenu,
@@ -4186,13 +4190,25 @@ impl OpenCADStudio {
     fn boot_web() -> (Self, Task<Message>) {
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut s = Self::new();
+        // The interface of the first frame follows the window's width, which
+        // is known only once the window has been laid out.
+        if let Some(size) = crate::io::web_chrome::window_size() {
+            s.win_size = size;
+        }
         let embed_mode = crate::io::host_bridge::is_embed_mode();
         if embed_mode {
             s.control.enabled = crate::io::host_bridge::is_automation_allowed();
             crate::io::host_bridge::install();
         }
         s.queue_startup_prompts();
-        let focus = s.focus_cmd_input();
+        // The command field takes the keyboard at boot. On a phone that
+        // raises the on-screen keyboard over the drawing at once, and the
+        // viewer has no command line to type in.
+        let focus = if s.chrome().is_compact() {
+            Task::none()
+        } else {
+            s.focus_cmd_input()
+        };
         let primary_font =
             crate::scene::text::web_font::preload_language(&crate::i18n::active_language_tag());
         let fonts = Task::batch([

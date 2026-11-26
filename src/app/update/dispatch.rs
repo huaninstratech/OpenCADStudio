@@ -6980,6 +6980,10 @@ impl OpenCADStudio {
                 self.save_config();
                 Task::none()
             }
+            Message::TogglePhoneViews => {
+                self.phone_views_open ^= true;
+                Task::none()
+            }
             Message::ToggleCleanScreen => {
                 self.clean_screen ^= true;
                 self.clean_screen_properties = false;

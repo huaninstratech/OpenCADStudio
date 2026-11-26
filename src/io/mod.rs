@@ -82,6 +82,9 @@ pub(crate) mod web_link;
 // Same split again: the session-memory serialization half (and its tests)
 // compile everywhere; the localStorage half is wasm-only.
 pub(crate) mod web_session;
+// Which interface the web build shows (the whole editor, a phone's, or the
+// viewer of an embedding page); the decision compiles and is tested everywhere.
+pub(crate) mod web_chrome;
 pub mod windows_media;
 pub mod xref;
 pub mod xref_model;

@@ -1408,6 +1408,8 @@ pub enum Message {
     ToggleStatusPill(crate::ui::statusbar::statusbar_config::StatusPill),
     /// Toggle clean-screen mode (hide ribbon + side panels).
     ToggleCleanScreen,
+    /// Show or hide the standard views above the phone's buttons.
+    TogglePhoneViews,
     /// Toggle whether entity transparency is shown on screen.
     ToggleTransparencyDisplay,
     /// Toggle the Quick Properties floating panel.

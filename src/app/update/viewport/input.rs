@@ -147,6 +147,10 @@ impl OpenCADStudio {
             }
         }
         let mut tasks = Vec::new();
+        // Where there is no ribbon to pick a tool from, a lone finger drags
+        // the drawing; a command waiting for a point still takes it as one.
+        let no_tool_picked = self.chrome().is_compact() && self.tabs[i].active_cmd.is_none();
+        self.touch.drag_with_one_finger(no_tool_picked);
         for action in self.touch.event(event) {
             match action {
                 TouchAction::Cancel => {
@@ -176,6 +180,9 @@ impl OpenCADStudio {
                     tasks.push(self.zoom_view_at_cursor(pinch_zoom_steps(factor - 1.0)));
                 }
                 TouchAction::Orbit(delta) => self.orbit_active_view(i, delta.x, delta.y),
+                // A lone finger's tap only ended its drag: the drawing area
+                // kept out of it, and there is nothing to pick up.
+                TouchAction::Tap(1) => {}
                 TouchAction::Tap(2) => {
                     tasks.push(self.update(Message::ViewportRightPress));
                     tasks.push(self.update(Message::ViewportRightRelease));

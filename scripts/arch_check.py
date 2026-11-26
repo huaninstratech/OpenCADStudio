@@ -44,9 +44,10 @@ LAYERS = {
     "modules": 4,
     # 5 presentation
     "ui": 5, "input": 5,
-    # 6 the app shell and its front doors
+    # 6 the app shell and its front doors; this fork's guard tests read the
+    # whole tree and name the app's types
     "app": 6, "mcp": 6, "mcp_intent": 6, "mcp_ops": 6, "rest": 6, "cli": 6,
-    "discussions": 6, "videos": 6, "locale_catalog": 6,
+    "discussions": 6, "videos": 6, "locale_catalog": 6, "fork_surface": 6,
 }
 
 # Same-layer pairs that are still upward: rendering must not depend on file

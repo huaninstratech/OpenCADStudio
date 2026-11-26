@@ -2,6 +2,7 @@ use super::history::history_dropdown_labels;
 use super::tab_document::DocumentTab;
 use super::tab_document::DynComponent;
 use super::{ArrowKey, Message, OpenCADStudio};
+use crate::io::web_chrome::Chrome;
 use crate::scene::pick::grip::{grips_to_screen, grips_to_screen_paper, grips_to_screen_rte};
 use crate::scene::view::viewport_pane::ViewportPane;
 use crate::scene::{VIEWCUBE_PAD, VIEWCUBE_REGION_PX};
@@ -299,6 +300,7 @@ impl iced::widget::canvas::Program<Message> for PaneDragSurface {
 
 use std::sync::Arc;
 
+mod compact;
 mod controls;
 mod modal;
 pub(in crate::app) mod overlay;
@@ -911,6 +913,10 @@ impl OpenCADStudio {
 
         let i = self.active_tab;
         let tab = &self.tabs[i];
+        // How much of the interface is showing: all of it, the phone's or
+        // the viewer's (see `io::web_chrome`).
+        let interface = self.chrome();
+        let compact = interface.is_compact();
         // Dynamic input is built before the status bar and properties panel,
         // so seed its shared formatter here rather than relying on either of
         // those later views to have done it for this drawing/thread.
@@ -1000,21 +1006,26 @@ impl OpenCADStudio {
             })
             .into()
         } else if tab.is_start {
-            let page = start_page_view(
-                &self.videos,
-                self.videos_loading,
-                &self.video_thumbs,
-                &self.discussions,
-                self.discussions_loading,
-                &self.recent_files,
-                &self.recent_thumbs,
-                self.recent_limit,
-                &self.recent_limit_input,
-                self.recent_view,
-                self.start_action_w.clone(),
-                self.start_section,
-                self.start_templates.as_deref(),
-            );
+            // The viewer has no Start page: it waits for its page's drawing.
+            let page: Element<'_, Message> = if interface == Chrome::Viewer {
+                Space::new().width(Fill).height(Fill).into()
+            } else {
+                start_page_view(
+                    &self.videos,
+                    self.videos_loading,
+                    &self.video_thumbs,
+                    &self.discussions,
+                    self.discussions_loading,
+                    &self.recent_files,
+                    &self.recent_thumbs,
+                    self.recent_limit,
+                    &self.recent_limit_input,
+                    self.recent_view,
+                    self.start_action_w.clone(),
+                    self.start_section,
+                    self.start_templates.as_deref(),
+                )
+            };
             if crate::scene::pipeline::viewport_pipeline_initialized() {
                 stack![
                     page,
@@ -3490,9 +3501,13 @@ bg={bg_ms:.1}ms n={view_count}"
         }
 
         // Docked pallets: each edge's icon strip and shown group (see
-        // `app::dock`).
-        let left_edge = self.build_edge_stack(crate::app::config::DockSide::Left, tab);
-        let right_edge = self.build_edge_stack(crate::app::config::DockSide::Right, tab);
+        // `app::dock`). The compact interfaces have no room for them.
+        let left_edge = (!compact)
+            .then(|| self.build_edge_stack(crate::app::config::DockSide::Left, tab))
+            .flatten();
+        let right_edge = (!compact)
+            .then(|| self.build_edge_stack(crate::app::config::DockSide::Right, tab))
+            .flatten();
 
         // Command-line sits as a bottom-centre overlay on top of the
         // viewport stack rather than as a separate row in the main
@@ -3512,8 +3527,9 @@ bg={bg_ms:.1}ms n={view_count}"
         let viewport: Element<'_, Message> =
             crate::ui::wrap_bar::PosReport::new(VIEWPORT_CAPTURE_BOUNDS_ID, viewport_stack).into();
         // The drawing tabs sit over the drawing, between the docks, unless
-        // they are set to run across the window above the palettes.
-        let center: Element<'_, Message> = if self.doc_tabs_in_center() {
+        // they are set to run across the window above the palettes. Neither
+        // compact interface has them.
+        let center: Element<'_, Message> = if self.doc_tabs_in_center() && !compact {
             column![
                 doc_tab_bar(
                     &self.tabs,
@@ -3548,8 +3564,9 @@ bg={bg_ms:.1}ms n={view_count}"
             // Start page as over a drawing, so no band runs under it.
             // Hidden (COMMANDLINEHIDE / Ctrl+9), the field stays in the tree,
             // collapsed, so it keeps the keyboard; Dynamic Input shows the
-            // prompt and the typing at the cursor.
-            let command_line_overlay = if self.command_line_hidden {
+            // prompt and the typing at the cursor. The viewer has no command
+            // line either.
+            let command_line_overlay = if self.command_line_hidden || interface == Chrome::Viewer {
                 iced::widget::container(command_line)
                     .width(Fill)
                     .height(iced::Length::Fixed(0.0))
@@ -3582,7 +3599,12 @@ bg={bg_ms:.1}ms n={view_count}"
         let center_stack: Element<'_, Message> = row(parts).width(Fill).height(Fill).into();
         // Floating pallets draw over the command line, so the bottom rows of
         // a tall one (Layer Manager with many layers) are not hidden by it.
-        let center_stack = self.dock_overlay(center_stack, tab);
+        // A viewer shows none: its page has no room for them.
+        let center_stack = if interface == Chrome::Viewer {
+            center_stack
+        } else {
+            self.dock_overlay(center_stack, tab)
+        };
 
         // The wrapper stays in the tree while nothing is dragged: adding it on
         // the first press rebuilt the grip's state and lost its double click
@@ -3604,9 +3626,12 @@ bg={bg_ms:.1}ms n={view_count}"
         let main_ui = container({
             // Clean-screen mode drops the ribbon for a full-canvas view; the
             // menu bar and status bar stay so commands remain reachable and
-            // the mode can be toggled back off.
+            // the mode can be toggled back off. The phone and the viewer
+            // drop it too, and with it the menu bar.
             let mut col = column![];
-            if self.clean_screen {
+            if compact {
+                // The drawing starts at the top edge.
+            } else if self.clean_screen {
                 // Clean screen keeps the menu row, led by the compact logo.
                 if self.show_menu_bar {
                     col = col.push(
@@ -3638,7 +3663,7 @@ bg={bg_ms:.1}ms n={view_count}"
             // PERF; zero cost otherwise).
             mark("ribbon");
             // The ribbon's own 1 px bottom line runs across the docks too.
-            if self.show_file_tabs && self.file_tabs_above_docks {
+            if self.show_file_tabs && self.file_tabs_above_docks && !compact {
                 col = col.push(doc_tab_bar(
                     &self.tabs,
                     self.active_tab,
@@ -3648,7 +3673,10 @@ bg={bg_ms:.1}ms n={view_count}"
                 ));
             }
             col.push(center_stack)
-                .push({
+                .push(if compact {
+                    // The phone's buttons stand where the status bar does.
+                    self.compact_bar(interface)
+                } else {
                     let is_model = tab.scene.current_layout == "Model";
                     let scale_pill_enabled = is_model
                         || tab.scene.active_viewport.is_some()

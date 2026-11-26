@@ -4,6 +4,10 @@
 //! two drag to pan and pinch to zoom, three drag to orbit; a quick tap with
 //! two opens the context menu, with three zooms to the extents, and three
 //! swiped up show the isometric view.
+//!
+//! Where there is no ribbon to pick a tool from (the phone and viewer
+//! interfaces, see `io::web_chrome`), a lone finger drags the drawing
+//! instead: [`TouchGestures::drag_with_one_finger`] switches that on.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -39,6 +43,9 @@ struct Gesture {
     swept: Vector,
     centre: Point,
     spread: f32,
+    /// A lone finger started it, so the one left when the others lift
+    /// carries on dragging.
+    one_finger: bool,
 }
 
 /// A tap is quicker and stiller than this.
@@ -56,6 +63,7 @@ pub(crate) struct TouchGestures {
     fingers: BTreeMap<u64, Point>,
     gesture: Option<Gesture>,
     ended: Option<Instant>,
+    one_finger_drags: bool,
 }
 
 impl TouchGestures {
@@ -68,6 +76,12 @@ impl TouchGestures {
     /// Fingers on the screen.
     pub(crate) fn fingers(&self) -> usize {
         self.fingers.len()
+    }
+
+    /// Whether a lone finger drags the drawing (on) or presses in it as the
+    /// left button (off, the default). Read when a finger lands.
+    pub(crate) fn drag_with_one_finger(&mut self, drag: bool) {
+        self.one_finger_drags = drag;
     }
 
     fn centre_and_spread(&self) -> (Point, f32) {
@@ -91,6 +105,20 @@ impl TouchGestures {
             touch::Event::FingerPressed { id, position } => {
                 self.fingers.insert(id.0, position);
                 if self.fingers.len() < 2 {
+                    // Where a finger drags the drawing, the first finger
+                    // starts a gesture too: one the drawing area keeps out of.
+                    if self.one_finger_drags {
+                        self.gesture = Some(Gesture {
+                            started: Instant::now(),
+                            most_fingers: 1,
+                            travel: 0.0,
+                            swept: Vector::new(0.0, 0.0),
+                            centre: position,
+                            spread: 0.0,
+                            one_finger: true,
+                        });
+                        return vec![TouchAction::Cancel];
+                    }
                     return Vec::new();
                 }
                 let (centre, spread) = self.centre_and_spread();
@@ -109,6 +137,7 @@ impl TouchGestures {
                             swept: Vector::new(0.0, 0.0),
                             centre,
                             spread,
+                            one_finger: false,
                         });
                         vec![TouchAction::Cancel]
                     }
@@ -138,6 +167,10 @@ impl TouchGestures {
                     }
                 } else if count >= 3 {
                     actions.push(TouchAction::Orbit(delta));
+                } else if gesture.one_finger {
+                    // The drag of a finger on its own, or the one left of a
+                    // gesture it started.
+                    actions.push(TouchAction::Pan(delta));
                 }
                 gesture.centre = centre;
                 gesture.spread = spread;
@@ -246,5 +279,54 @@ mod tests {
         touch.event(lift(1));
         touch.event(lift(2));
         assert_eq!(touch.event(lift(3)), vec![TouchAction::SwipeUp]);
+    }
+
+    /// Where a finger drags the drawing, the first one pans it, a second
+    /// one joining turns the same gesture into a pinch, and the finger left
+    /// when the other lifts carries on panning.
+    #[test]
+    fn where_one_finger_drags_it_pans_and_two_still_pinch() {
+        let mut touch = TouchGestures::default();
+        touch.drag_with_one_finger(true);
+        assert_eq!(
+            touch.event(press(1, 100.0, 100.0)),
+            vec![TouchAction::Cancel]
+        );
+        assert!(touch.active());
+        let actions = touch.event(moved(1, 130.0, 90.0));
+        assert!(
+            matches!(&actions[..], [TouchAction::Pan(v)] if (v.x - 30.0).abs() < 1e-3 && (v.y + 10.0).abs() < 1e-3),
+            "one finger drags the drawing by its own movement: {actions:?}"
+        );
+        assert!(touch.event(press(2, 200.0, 100.0)).is_empty());
+        let actions = touch.event(moved(2, 260.0, 100.0));
+        assert!(actions.iter().any(|a| matches!(a, TouchAction::Zoom { factor, .. } if *factor > 1.0)));
+        assert!(touch.event(lift(2)).is_empty());
+        let actions = touch.event(moved(1, 140.0, 90.0));
+        assert!(matches!(&actions[..], [TouchAction::Pan(v)] if v.x > 0.0));
+        assert!(touch.event(lift(1)).is_empty());
+    }
+
+    /// A quick, still touch with one finger is a tap of one — not a drag,
+    /// and not a tap of two or three.
+    #[test]
+    fn a_still_lone_finger_is_a_tap_of_one() {
+        let mut touch = TouchGestures::default();
+        touch.drag_with_one_finger(true);
+        touch.event(press(7, 50.0, 50.0));
+        assert_eq!(touch.event(lift(7)), vec![TouchAction::Tap(1)]);
+    }
+
+    /// With the ribbon to pick tools from, a lone finger is the left button
+    /// and starts no gesture, whatever was switched on before.
+    #[test]
+    fn a_lone_finger_starts_no_gesture_unless_it_drags() {
+        let mut touch = TouchGestures::default();
+        touch.drag_with_one_finger(true);
+        touch.drag_with_one_finger(false);
+        assert!(touch.event(press(1, 100.0, 100.0)).is_empty());
+        assert!(!touch.active());
+        assert!(touch.event(moved(1, 140.0, 100.0)).is_empty());
+        assert!(touch.event(lift(1)).is_empty());
     }
 }
