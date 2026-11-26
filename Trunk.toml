@@ -16,12 +16,11 @@ public_url = "/OpenCADStudio/app/"
 html_output = "index.html"
 
 [tools]
-# Binaryen shrinks the module by a third and, more importantly for a phone,
-# leaves far fewer functions and table entries for the browser to compile
-# before the first frame. Point TRUNK_TOOLS_WASM_OPT at a download of
-# https://github.com/WebAssembly/binaryen when it is not on PATH.
-wasm_opt = "version_123"
 wasm_bindgen = "0.2.108"
+# wasm-opt is deliberately not pinned here: on a 208 MB module `-Oz` spends
+# over an hour in a single pass, which does not belong in a build people run
+# repeatedly. Run it by hand before a release when the size matters:
+#   wasm-opt -Oz --strip-debug -o out.wasm in.wasm
 
 [[hooks]]
 stage = "post_build"
