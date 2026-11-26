@@ -108,8 +108,10 @@ jobs:
         with:
           tool: wasm-bindgen@${{ steps.wasm-bindgen-version.outputs.version }}
 
+      # A project page serves the app under the repository's name, so the
+      # build's addresses start there (Trunk.toml has the same value).
       - name: Build web bundle
-        run: trunk build --locked --release --public-url /app/ --dist dist/app --html-output index.html web-app.html
+        run: trunk build --locked --release --public-url /${{ github.event.repository.name }}/app/ --dist dist/app --html-output index.html web-app.html
 
       - name: Stamp the service worker cache version
         # web/sw.js ships a placeholder cache name; each deploy gets one

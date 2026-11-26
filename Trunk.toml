@@ -9,7 +9,10 @@
 [build]
 target = "web-app.html"
 dist = "dist/app"
-public_url = "/app/"
+# This fork's web build is a project page, served under the repository's
+# name; upstream's site has a domain of its own and serves the app from
+# /app/. Every address the build writes is relative to this.
+public_url = "/OpenCADStudio/app/"
 html_output = "index.html"
 # The crate has no Cargo features: the geometry kernel is pure Rust and
 # cross-compiles to wasm, so the web build gets the same solid modelling the
