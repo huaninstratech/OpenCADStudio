@@ -332,6 +332,19 @@ fn bundle_response(file: &File) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if !file.immutable {
+        // Cloudflare rewrites `Cache-Control` on a non-hashed name to a four
+        // hour edge lifetime. For the page that is harmless — index.html is
+        // small — but for `sw.js` it is fatal: the browser keeps the worker
+        // that names the old cache, is served the old bundle from it, and the
+        // Open dialog then asks for a worker script the deploy has replaced
+        // (visible as a 404 in the access log, with every open stalling at
+        // "parsing entities... 10%"). This header outranks the rewrite.
+        response.headers_mut().insert(
+            header::HeaderName::from_static("cloudflare-cdn-cache-control"),
+            HeaderValue::from_static("no-store"),
+        );
+    }
     response
 }
 
