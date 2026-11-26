@@ -741,19 +741,15 @@ pub struct WebOpenOutcome {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn pick_and_load_web(progress: Arc<OpenProgressState>) -> WebOpenOutcome {
+    // No `accept` filter on the web. The dialog is a plain `<input type=file>`,
+    // and a browser can only filter by the MIME types it knows: `.dwg` and
+    // `.dxf` map to nothing, so Chrome on Android showed a picker offering
+    // only Camera and Photos — the file manager never appeared and a drawing
+    // could not be opened at all. Filtering happens after the choice instead:
+    // a file this app cannot read is refused by the parser with its own
+    // message, which is more useful than an empty picker.
     let Some(handle) = crate::sys::file_dialog()
         .set_title(crate::t!("Open CAD file").as_ref())
-        .add_filter(
-            crate::t!("CAD Files").as_ref(),
-            &[
-                "dwg", "dxf", "dwt", "DWG", "DXF", "DWT", "ifccad", "ifcx", "IFCCAD", "IFCX",
-            ],
-        )
-        .add_filter(
-            crate::t!("Drawing Template (*.dwt)").as_ref(),
-            &["dwt", "DWT"],
-        )
-        .add_filter(crate::t!("All Files").as_ref(), &["*"])
         .pick_file()
         .await
     else {
