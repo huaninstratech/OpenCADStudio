@@ -204,13 +204,71 @@ pub async fn remove(name: &str) -> Result<(), String> {
     drawing.map(|_| ())
 }
 
-async fn recent_directory(create: bool) -> Result<web_sys::FileSystemDirectoryHandle, String> {
-    let window = web_sys::window().ok_or_else(|| "browser window unavailable".to_string())?;
-    let root = JsFuture::from(window.navigator().storage().get_directory())
+/// Why the browser's private storage is not there. The whole OPFS family
+/// exists only in a secure context: an `https://` page, or `http://` on a
+/// loopback address. A page served over plain HTTP from a network address
+/// (a LAN host, a Tailscale one) has no `navigator.storage` at all, and
+/// touching it there used to throw from inside a queued task, which reached
+/// the renderer banner as a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageUnavailable {
+    /// No secure context: the page is plain HTTP on a network address.
+    InsecureContext,
+    /// A secure context whose browser has no origin-private file system.
+    Unsupported,
+}
+
+impl StorageUnavailable {
+    /// The line the command history shows: what is off, and how to turn it on.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::InsecureContext => {
+                "Browser storage is off: this page is plain HTTP on a network address. Recent \
+                 files, autosave and the linked-drawing cache need https (or localhost). \
+                 Everything else works, but open and save through the file picker."
+            }
+            Self::Unsupported => {
+                "This browser has no origin-private storage, so recent files, autosave and the \
+                 linked-drawing cache are off. Everything else works."
+            }
+        }
+    }
+}
+
+/// The origin's private directory, or why there is none. Every caller goes
+/// through here, so a browser without the feature is a clear message rather
+/// than a panic.
+pub(crate) async fn storage_root(
+) -> Result<web_sys::FileSystemDirectoryHandle, StorageUnavailable> {
+    let window = web_sys::window().ok_or(StorageUnavailable::Unsupported)?;
+    // `navigator.storage` is undefined outside a secure context; asking for
+    // it in TypeScript-less web-sys yields a proxy whose call throws.
+    let Ok(storage) = js_sys::Reflect::get(&window.navigator(), &"storage".into()) else {
+        return Err(StorageUnavailable::Unsupported);
+    };
+    if storage.is_undefined() || storage.is_null() {
+        let secure = js_sys::Reflect::get(&window, &"isSecureContext".into())
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        return Err(if secure {
+            StorageUnavailable::Unsupported
+        } else {
+            StorageUnavailable::InsecureContext
+        });
+    }
+    let storage: web_sys::StorageManager = storage.unchecked_into();
+    JsFuture::from(storage.get_directory())
         .await
-        .map_err(js_error)?
+        .map_err(|_| StorageUnavailable::Unsupported)?
         .dyn_into::<web_sys::FileSystemDirectoryHandle>()
-        .map_err(js_error)?;
+        .map_err(|_| StorageUnavailable::Unsupported)
+}
+
+async fn recent_directory(create: bool) -> Result<web_sys::FileSystemDirectoryHandle, String> {
+    let root = storage_root().await.map_err(|unavailable| {
+        unavailable.explanation().to_string()
+    })?;
     let options = web_sys::FileSystemGetDirectoryOptions::new();
     options.set_create(create);
     JsFuture::from(root.get_directory_handle_with_options(RECENT_DIRECTORY, &options))

@@ -11,6 +11,12 @@ pub mod edit_lock;
 // its tests) is pure and compiles everywhere; the showSaveFilePicker half
 // inside is wasm-only.
 pub mod brep_build;
+// The mobile build carries no EPSG registry, so `crs` is served by a stub that
+// keeps the same API and refuses only what needs a projection.
+#[cfg(feature = "full")]
+pub mod crs;
+#[cfg(not(feature = "full"))]
+#[path = "crs_stub.rs"]
 pub mod crs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dsd;
@@ -22,7 +28,17 @@ pub(crate) mod fs_access;
 pub mod geopdf;
 pub mod geopdf_export;
 pub mod georef;
+// IFC is a whole schema plus a tessellator; only the `full` build parses it.
+// `ifc_stub` keeps the types so the tree needs no `cfg` at the call sites.
+#[cfg(feature = "full")]
 pub mod ifc;
+#[cfg(not(feature = "full"))]
+#[path = "ifc_stub.rs"]
+pub mod ifc;
+#[cfg(feature = "full")]
+pub mod ifc_write;
+#[cfg(not(feature = "full"))]
+#[path = "ifc_write_stub.rs"]
 pub mod ifc_write;
 pub mod iges_import;
 pub mod iges_surfaces;
@@ -725,19 +741,15 @@ pub struct WebOpenOutcome {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn pick_and_load_web(progress: Arc<OpenProgressState>) -> WebOpenOutcome {
+    // No `accept` filter on the web. The dialog is a plain `<input type=file>`,
+    // and a browser can only filter by the MIME types it knows: `.dwg` and
+    // `.dxf` map to nothing, so Chrome on Android showed a picker offering
+    // only Camera and Photos — the file manager never appeared and a drawing
+    // could not be opened at all. Filtering happens after the choice instead:
+    // a file this app cannot read is refused by the parser with its own
+    // message, which is more useful than an empty picker.
     let Some(handle) = crate::sys::file_dialog()
         .set_title(crate::t!("Open CAD file").as_ref())
-        .add_filter(
-            crate::t!("CAD Files").as_ref(),
-            &[
-                "dwg", "dxf", "dwt", "DWG", "DXF", "DWT", "ifccad", "ifcx", "IFCCAD", "IFCX",
-            ],
-        )
-        .add_filter(
-            crate::t!("Drawing Template (*.dwt)").as_ref(),
-            &["dwt", "DWT"],
-        )
-        .add_filter(crate::t!("All Files").as_ref(), &["*"])
         .pick_file()
         .await
     else {

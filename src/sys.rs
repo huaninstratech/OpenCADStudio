@@ -110,6 +110,32 @@ pub fn open_url<Message>(url: &str, _parent: Option<iced::window::Id>) -> iced::
     iced::Task::none()
 }
 
+/// Whether the page is a secure context: `https://`, or `http://` on a
+/// loopback address. Every browser storage API this app uses (origin-private
+/// files, the service worker, the clipboard, the file pickers) exists only
+/// there; a page served over plain HTTP from a network address — a LAN host,
+/// a VPN or Tailscale one — has none of them, and has to say so instead of
+/// failing at the first call.
+#[cfg(target_arch = "wasm32")]
+pub fn has_secure_context() -> bool {
+    static SECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SECURE.get_or_init(|| {
+        web_sys::window()
+            .map(|window| js_sys::Reflect::has(&window, &"isSecureContext".into()).unwrap_or(false)
+                && js_sys::Reflect::get(&window, &"isSecureContext".into())
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false))
+            .unwrap_or(false)
+    })
+}
+
+/// The native build is always a secure context: it has no browser rules.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn has_secure_context() -> bool {
+    true
+}
+
 /// Web opens the tab synchronously so the browser still sees the click as a
 /// user gesture and does not block it as a pop-up.
 #[cfg(target_arch = "wasm32")]

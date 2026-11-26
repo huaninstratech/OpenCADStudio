@@ -2848,7 +2848,17 @@ impl OpenCADStudio {
         }
         // Boot with only the Welcome/Start tab. The user creates drawings
         // explicitly (File → New); we never auto-spawn Drawing1.
-        let start_tab = DocumentTab::new_start();
+        //
+        // The web build is the exception. A phone has no room for a Start page
+        // whose four tabs are mostly links to the desktop (videos, discussions)
+        // and whose file picker is the browser's, and the page it is opened for
+        // is a drawing. There it boots into a blank drawing, which is also what
+        // NEW does, so the ribbon is usable from the first frame.
+        let (start_tab, tab_counter) = if cfg!(target_arch = "wasm32") {
+            (DocumentTab::new_drawing(1), 1)
+        } else {
+            (DocumentTab::new_start(), 0)
+        };
         let mut app = Self {
             control: control::State::new(),
             start: Instant::now(),
@@ -2858,7 +2868,7 @@ impl OpenCADStudio {
             doc_tab_menu: false,
             doc_tab_layouts: None,
             doc_tab_hover_gen: 0,
-            tab_counter: 0,
+            tab_counter,
             ribbon: Ribbon::new(),
             // Populated from the consolidated config after construction
             // (`apply_config`); default empty here.
@@ -4215,13 +4225,12 @@ impl OpenCADStudio {
             Task::done(Message::PollWebFonts),
             Task::done(Message::ApplyWebFont(primary_font)),
         ]);
-        s.videos_loading = true;
-        let videos = Task::perform(crate::videos::fetch_playlist_web(), Message::VideosFetched);
-        s.discussions_loading = true;
-        let discussions = Task::perform(
-            crate::discussions::fetch_discussions_web(),
-            Message::DiscussionsFetched,
-        );
+        // The web build has no Start page (see `App::new`), so the playlist,
+        // the discussions feed and their thumbnails are not fetched there: the
+        // requests were visible as 404s on a page that could not show the
+        // result, and on a phone they competed with the drawing for bandwidth.
+        let videos = Task::none();
+        let discussions = Task::none();
         let thumbs_fetch = if embed_mode {
             Task::none()
         } else {

@@ -11,6 +11,25 @@ autotests = false
 # Opt-in release audit helpers; has no effect in the application executable.
 performance-audit = []
 
+# Everything the desktop build and the full web build carry.
+default = ["full"]
+full = ["dep:proj4rs", "dep:crs-definitions"]
+
+# The phone interface: open and edit 2D drawings, and nothing else.
+#
+# This exists because of size, not of taste. The full web build is a 163 MB
+# wasm, and mobile Chrome reloaded the page until it gave up while trying to
+# instantiate it. Dropped relative to `full`:
+#
+#   * the embedded EPSG registry and proj4 (io::crs, georeferencing, GeoPDF)
+#   * IFC import
+#   * STEP import and export
+#   * PDF publish, print and plot
+#
+# What stays: the drawing engine, the ribbon and touch interface, the file
+# picker, and DXF/DWG reading and writing.
+mobile = []
+
 [workspace]
 members = [
     "crates/ocs_solid",
@@ -22,6 +41,7 @@ members = [
     "crates/step-export",
     "crates/ocs_geom",
     "crates/ocs_constraints",
+    "crates/ocs_web",
 ]
 
 [target.'cfg(windows)'.build-dependencies]
@@ -77,8 +97,10 @@ hayro = "0.9.0"
 kurbo = "0.13"
 # Pure-Rust CRS resolution and projection for document GEODATA. The embedded
 # EPSG data runs on native and wasm; the WKT parser is native-only (below).
-proj4rs = { version = "0.3", default-features = false, features = ["crs-definitions", "wasm-strict"] }
-crs-definitions = "0.6"
+# The EPSG registry is a few megabytes of wasm; only the `full` build carries
+# it. `io::crs_stub` keeps the API when it is absent.
+proj4rs = { version = "0.3", default-features = false, features = ["crs-definitions", "wasm-strict"], optional = true }
+crs-definitions = { version = "0.6", optional = true }
 # DWF/DWFx packages, their XPS pages and DWF/DGN underlay rasters.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 roxmltree = "0.21"

@@ -1,0 +1,35 @@
+[package]
+name = "ocs_web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.86"
+
+# The small server a self-hosted web build runs behind: it signs users in
+# against the OIDC provider and hands the browser drawings it is allowed to
+# see. It is a separate crate because the app crate is a wasm *client*; this
+# one never compiles to wasm and never links the geometry kernel.
+#
+# Deploy: one static binary plus the web bundle and a folder of drawings
+# (see crates/ocs_web/README.md).
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+# An HTTP client for the provider's token and userinfo endpoints. It carries
+# no cookie jar on purpose: the only credential this server holds is the one
+# the user gave the provider.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tempfile = "3"
