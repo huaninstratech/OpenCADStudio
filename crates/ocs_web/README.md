@@ -195,6 +195,39 @@ server {
 `Host` must be passed through: the logout endpoint compares it against the
 browser's `Origin` to refuse cross-site requests.
 
+Behind Cloudflare the origin certificate is the `CloudFlare Origin Certificate`
+(`*.spmcloud.io`), and the vhost binds the server's public address rather than
+`0.0.0.0` — a host that also runs WireGuard and Tailscale should not answer the
+world on every interface:
+
+```nginx
+server {
+    listen 209.182.237.162:443 ssl;
+    http2 on;
+    server_name cad.spmcloud.io;
+
+    ssl_certificate     /home/huanld/ins-vault/cert/amecc-spmcloud-origin.crt;
+    ssl_certificate_key /home/huanld/ins-vault/cert/amecc-spmcloud-origin.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_read_timeout 600;
+        proxy_buffering off;
+    }
+}
+```
+
+Plain HTTP on 80 still needs to be allowed through the firewall: Cloudflare
+follows the redirect, and an unreachable port 80 shows up as 522 rather than a
+TLS error. Do not set `sslFlags`/SNI games on Linux — binding the address and
+letting `server_name` select the certificate is enough.
+
 ## Using it from the interface
 
 Once signed in, the app opens a private drawing with the address it already

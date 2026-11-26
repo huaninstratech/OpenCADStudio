@@ -11,8 +11,15 @@
 
 /// From this window width in logical pixels down, the web build uses the
 /// phone interface. A phone held sideways is still under it; a tablet is not.
+///
+/// The threshold has to clear the ribbon, not just a phone: at 720 the full
+/// interface was chosen for windows 720-800 wide and the ribbon's panels were
+/// then clipped at their right edge, with no way to reach the tools behind it
+/// (the tab bar wraps, the tool area does not). 960 is below a 1024-wide
+/// tablet in portrait and above the point where the widest module still fits,
+/// so a window narrower than that gets the compact interface deliberately.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub const PHONE_MAX_WIDTH: f32 = 720.0;
+pub const PHONE_MAX_WIDTH: f32 = 960.0;
 
 /// The interface the web build shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +149,17 @@ mod tests {
         assert_eq!(chrome(false, PHONE_MAX_WIDTH - 1.0), Chrome::Phone);
         assert_eq!(chrome(false, 390.0), Chrome::Phone);
         assert_eq!(chrome(false, 1280.0), Chrome::Full);
+    }
+
+    /// The ribbon is fixed-height and clips its panels rather than shrinking
+    /// them, so a window too narrow for it must not be offered the full
+    /// interface. 731 px is the width an embedded page inside a phone-sized
+    /// frame reported when the panels were last seen clipped.
+    #[test]
+    fn a_window_too_narrow_for_the_ribbon_gets_the_compact_interface() {
+        assert_eq!(chrome(false, 731.0), Chrome::Phone);
+        assert_eq!(chrome(false, 800.0), Chrome::Phone);
+        assert_eq!(chrome(false, 1024.0), Chrome::Full);
     }
 
     #[test]
