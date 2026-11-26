@@ -11,6 +11,12 @@ pub mod edit_lock;
 // its tests) is pure and compiles everywhere; the showSaveFilePicker half
 // inside is wasm-only.
 pub mod brep_build;
+// The mobile build carries no EPSG registry, so `crs` is served by a stub that
+// keeps the same API and refuses only what needs a projection.
+#[cfg(feature = "full")]
+pub mod crs;
+#[cfg(not(feature = "full"))]
+#[path = "crs_stub.rs"]
 pub mod crs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dsd;
@@ -22,7 +28,17 @@ pub(crate) mod fs_access;
 pub mod geopdf;
 pub mod geopdf_export;
 pub mod georef;
+// IFC is a whole schema plus a tessellator; only the `full` build parses it.
+// `ifc_stub` keeps the types so the tree needs no `cfg` at the call sites.
+#[cfg(feature = "full")]
 pub mod ifc;
+#[cfg(not(feature = "full"))]
+#[path = "ifc_stub.rs"]
+pub mod ifc;
+#[cfg(feature = "full")]
+pub mod ifc_write;
+#[cfg(not(feature = "full"))]
+#[path = "ifc_write_stub.rs"]
 pub mod ifc_write;
 pub mod iges_import;
 pub mod iges_surfaces;
