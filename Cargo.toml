@@ -22,6 +22,7 @@ members = [
     "crates/step-export",
     "crates/ocs_geom",
     "crates/ocs_constraints",
+    "crates/ocs_web",
 ]
 
 [target.'cfg(windows)'.build-dependencies]

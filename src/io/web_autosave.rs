@@ -276,12 +276,12 @@ async fn write_index(
 
 #[cfg(target_arch = "wasm32")]
 async fn autosave_directory(create: bool) -> Result<web_sys::FileSystemDirectoryHandle, String> {
-    let window = web_sys::window().ok_or_else(|| "browser window unavailable".to_string())?;
-    let root = JsFuture::from(window.navigator().storage().get_directory())
+    // One guarded door for the origin's private storage: a page outside a
+    // secure context has none, and the explanation says so instead of the
+    // page panicking on the missing API.
+    let root = super::web_recent::storage_root()
         .await
-        .map_err(super::web_recent::js_error)?
-        .dyn_into::<web_sys::FileSystemDirectoryHandle>()
-        .map_err(super::web_recent::js_error)?;
+        .map_err(|unavailable| unavailable.explanation().to_string())?;
     let options = web_sys::FileSystemGetDirectoryOptions::new();
     options.set_create(create);
     JsFuture::from(root.get_directory_handle_with_options(AUTOSAVE_DIRECTORY, &options))

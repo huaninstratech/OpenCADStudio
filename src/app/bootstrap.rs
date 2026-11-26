@@ -87,8 +87,10 @@ pub fn run_web() -> iced::Result {
     crate::io::web_drop::install();
     // Best-effort, fire-and-forget: ask the browser not to evict the origin's
     // storage under pressure — settings (localStorage) and the OPFS recent
-    // copies / autosave snapshots live there. A denial changes nothing.
-    if !crate::io::host_bridge::is_embed_mode() {
+    // copies / autosave snapshots live there. A denial changes nothing. The
+    // request itself is skipped outside a secure context, where the storage
+    // object does not exist at all (see `io::web_recent::storage_root`).
+    if !crate::io::host_bridge::is_embed_mode() && crate::sys::has_secure_context() {
         wasm_bindgen_futures::spawn_local(async {
             if let Some(window) = web_sys::window() {
                 if let Ok(promise) = window.navigator().storage().persist() {
