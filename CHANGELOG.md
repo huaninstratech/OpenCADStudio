@@ -8,7 +8,8 @@
 
 | Release | Date | Highlights | Details |
 | :--- | :--- | :--- | :--- |
-| **[Unreleased](changelogs/unreleased.md)** | *2026-11-22 to Present* | — | [changelogs/unreleased.md](changelogs/unreleased.md) |
+| **[Unreleased](changelogs/unreleased.md)** | *2026-11-26 to Present* | — | [changelogs/unreleased.md](changelogs/unreleased.md) |
+| **[v2026.53.3](changelogs/v2026.53.3.md)** | *2026-11-26* | — | [changelogs/v2026.53.3.md](changelogs/v2026.53.3.md) |
 | **[v2026.47](changelogs/v2026.47.md)** | *2026-11-22* | Solidcore B-rep & Surface tab, `SOLIDEDIT`/`STEPOUT`/`EXPORTDWF`, solid LODs & shaded 3D plots, Text Editor/`FIND`/`EATTEDIT` overhauls, `ADCENTER` & `INSERTOBJ`, Civil 3D authoring, Plugin API v24–v27 & `PanelScene` S01, worker-offloaded file reads & panic guard, `--low-memory` & `mimalloc` on Linux/macOS | [changelogs/v2026.47.md](changelogs/v2026.47.md) |
 | **[v2026.46](changelogs/v2026.46.md)** | *2026-11-15* | UI kit & Studio Dark redesign, `GEOGRAPHICLOCATION` & GeoPDF placement/export, `ETRANSMIT` ZIP, annotation scaling & Dim/MLeader/Text Style managers, Civil 3D objects, `LINETYPE` manager, table formulas & `PASTESPEC` data links, `ASSISTANT` AI pallet, Plugin API v19–v23, batched Python `ocs` primitives, `mimalloc` & scene/text LRU caches | [changelogs/v2026.46.md](changelogs/v2026.46.md) |
 | **[v2026.45](changelogs/v2026.45.md)** | *2026-11-08* | Layer Manager with in-drawing filters & Quick Select/FILTER, tables overhaul (cell styles, in-place editing, fill grips), quad cursor menu with plugin surface, Flip parameters & Parameters Manager, `BLOCKREPLACE`/`XPLODE`, HATCH/OFFSET/MATCHPROP/SELECT parity, annotation scale & complex linetypes, SVG import, CUI/Quick Access Toolbar, TRIM/OSNAP/OTRACK performance | [changelogs/v2026.45.md](changelogs/v2026.45.md) |
@@ -22,9 +23,13 @@
 
 ---
 
-## [Unreleased] - 2026-11-22
+## [Unreleased] - 2026-11-26
 
 > **Summary:** Nothing yet. See the [full Unreleased notes](changelogs/unreleased.md).
+
+## [v2026.53.3] - 2026-11-26
+
+> **Summary:** Nothing yet. See the [full v2026.53.3 release notes](changelogs/v2026.53.3.md).
 
 ## [v2026.47] - 2026-11-22
 
