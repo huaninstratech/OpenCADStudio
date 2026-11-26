@@ -188,6 +188,13 @@ def write_index(stage: Path, wasm: Path, javascript: Path) -> None:
         "    </script>"
     )
     html = re.sub(r'<link data-trunk rel="rust"[^>]*>', boot, html)
+    # The icon directive is replaced rather than dropped: without a <link
+    # rel="icon"> the browser asks for /favicon.ico, which no bundle contains.
+    html = re.sub(
+        r'<link data-trunk rel="icon"[^>]*>',
+        '<link rel="icon" href="logo.svg" type="image/svg+xml" />',
+        html,
+    )
     html = re.sub(r"\s*<link data-trunk[^>]*>", "", html)
     (stage / "index.html").write_text(html, encoding="utf-8")
 

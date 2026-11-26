@@ -61,6 +61,11 @@ pub fn router(app: App) -> Router {
         .route("/drawings", get(list_drawings))
         .route("/drawings/{*id}", get(open_drawing))
         .route("/healthz", get(health))
+        // Browsers ask for /favicon.ico whether or not the page declares an
+        // icon, and a 404 for it hides the real ones in a console. The bundle
+        // ships a single SVG icon, so the request is pointed at it instead of
+        // being answered with "not found".
+        .route("/favicon.ico", get(|| async { Redirect::permanent("/logo.svg") }))
         .fallback(serve_bundle)
         .with_state(shared)
 }
