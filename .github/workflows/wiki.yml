@@ -144,16 +144,38 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.source.outputs.ref }}
+      # A wiki repository exists only once someone has created the wiki; on a
+      # fresh clone of this fork it does not, and cloning it fails with
+      # "Repository not found". There is then nowhere to publish to, and that
+      # is a fact about the repository, not a failure of the build: say so and
+      # stop this job instead of turning it red on every weekly release.
       - name: Check out the wiki
+        id: wiki
         run: |
-          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki
-          git -C wiki config user.name "github-actions[bot]"
-          git -C wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki; then
+            git -C wiki config user.name "github-actions[bot]"
+            git -C wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::This repository has no wiki yet, so there is nothing to publish to. Open the Wiki tab once on GitHub to create it, and the next release fills it."
+            {
+              echo "### The wiki is not published"
+              echo ""
+              echo "This repository has no wiki yet, so there is nowhere to publish to."
+              echo "Open the **Wiki** tab once on GitHub to create it; the next release fills it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: No wiki yet
+        if: steps.wiki.outputs.present != 'true'
+        run: echo "Nothing to publish; the checkout above already said why."
 
       # The Code Health page is published on its own, before the reference
       # pages are rebuilt, so neither can hold the other up; if it fails, the
       # last step turns this job red once the reference pages are published.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.wiki.outputs.present == 'true'
         continue-on-error: true
         with:
           pattern: health*
@@ -161,6 +183,7 @@ jobs:
           path: health
       - name: Code Health page
         id: code_health
+        if: steps.wiki.outputs.present == 'true'
         continue-on-error: true
         run: |
           if [ ! -f health/health.json ]; then
@@ -176,8 +199,10 @@ jobs:
           git push
 
       - name: Build
+        if: steps.wiki.outputs.present == 'true'
         run: python3 tools/wiki/build.py wiki
       - name: Publish
+        if: steps.wiki.outputs.present == 'true'
         working-directory: wiki
         run: |
           git add -A
