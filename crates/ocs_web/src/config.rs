@@ -180,7 +180,14 @@ mod tests {
                 "OCS_OIDC_REDIRECT_URI".to_string(),
                 "https://ssdnode.example/auth/callback".to_string(),
             ),
-            ("OCS_DRAWINGS_DIR".to_string(), "/tmp".to_string()),
+            // A folder that exists on every platform the tests run on. The
+            // literal `/tmp` was read as `C:\tmp` on a Windows runner, which has
+            // no such folder, so the folder check refused a configuration these
+            // tests mean to be accepted.
+            (
+                "OCS_DRAWINGS_DIR".to_string(),
+                std::env::temp_dir().to_string_lossy().into_owned(),
+            ),
         ]);
         for (name, value) in overrides {
             values.insert((*name).to_string(), (*value).to_string());
